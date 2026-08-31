@@ -42,6 +42,42 @@ fn commit_domain(store: &KernelStore, index: usize) -> i64 {
 }
 
 #[test]
+fn consumer_insert_maps_only_constraint_failures_to_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("register-once"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .commit(intent("register-twice"), |envelope| {
+                envelope.register_outbox_consumer("search", 2)?;
+                Ok("duplicate".to_string())
+            })
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute_batch("DROP TABLE outbox_consumers")
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        store
+            .commit(intent("register-io"), |envelope| {
+                envelope.register_outbox_consumer("other", 3)?;
+                Ok("unreachable".to_string())
+            })
+            .unwrap_err(),
+        KernelError::Io
+    );
+}
+
+#[test]
 fn acknowledgements_use_commit_boundaries_through_commit_log_tip() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
@@ -245,7 +281,15 @@ fn deregistration_uses_commit_tip_without_publication_and_abandonment_records_fo
         .unwrap();
     store
         .commit(intent("abandon"), |envelope| {
-            envelope.abandon_outbox_consumer("abandoned", "operator-1", "retired", 42)?;
+            envelope.abandon_outbox_consumer(
+                "abandoned",
+                mc_store::kernel::ConsumerAbandonment {
+                    operator_id: "operator-1".to_string(),
+                    reason: "retired".to_string(),
+                    abandoned_at: 42,
+                    barrier_id: None,
+                },
+            )?;
             Ok("abandoned".to_string())
         })
         .unwrap();

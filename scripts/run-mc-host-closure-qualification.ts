@@ -52,10 +52,10 @@ const result = Bun.spawnSync(
         stderr: "inherit",
     },
 );
-// A process killed by a signal reports `exitCode: null` and carries its
-// `signalCode` instead. `process.exit(null)` coerces to 0, so an OOM kill, a
-// segfault, or a CI timeout on the qualification test would report
-// qualification success. Absent an exit status, the qualification did not pass.
+// A signal-terminated process reports `exitCode: null` and `signalCode`.
+// A signal-terminated process reports `signalCode`; `process.exit(null)` exits 0.
+// A signal-terminated process has `exitCode: null`; `process.exit(null)` exits 0.
+// A `null` exit code indicates abnormal termination, which fails qualification.
 if (result.exitCode === null) {
     console.error(
         `closure qualification terminated abnormally (signal ${result.signalCode ?? "unknown"})`,

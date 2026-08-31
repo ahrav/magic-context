@@ -21,13 +21,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { sessionLog } from "@magic-context/core/shared/logger";
 
-/** Exact refusal text shared by Pi's context-management commands. */
+/* */
 export const COMPACTION_OFF_COMMAND_UNAVAILABLE = `Unavailable: magic-context is in compaction-off mode (${COMPACTION_ENABLED_PATH}=false).`;
 
 /**
- * Pi has no OpenCode marker rows to delete. Its MC-owned compaction state is the
- * pending JSONL marker payload plus the in-process deferred-drain signals; the
- * latter are cleared by the context handler after this durable cleanup succeeds.
  */
 export interface PiCompactionModeTransition {
 	recordToWrite: CompactionModeRecord | null;
@@ -59,9 +56,7 @@ export function reconcilePiCompactionMode(args: {
 }): PiCompactionModeTransition {
 	const stored = getCompactionModeRecord(args.db, args.sessionId);
 
-	// A prior transition's notice remains due even if the process restarts with
-	// a different resolved mode. Finish this at-least-once delivery before
-	// reconciling the next flip.
+	// The function delivers pending notices before later mode changes to preserve at-least-once delivery across restarts.
 	if (stored === "on_notice_pending") {
 		return {
 			...NO_TRANSITION,
@@ -95,8 +90,7 @@ export function reconcilePiCompactionMode(args: {
 		updateSessionMeta(args.db, args.sessionId, {
 			compartmentInProgress: true,
 		});
-		// Stage notice delivery before the context handler reaches the UI. This
-		// record is shared with OpenCode and survives a process restart.
+		// The function persists notice intent before returning the notice so delivery survives restarts.
 		setCompactionModeRecord(args.db, args.sessionId, "on_notice_pending");
 		return {
 			recordToWrite: "on",
@@ -140,7 +134,7 @@ export function reconcilePiCompactionMode(args: {
 	);
 	const notice = clearedSomething ? PI_COMPACTION_OFF_NOTICE : null;
 	if (notice) {
-		// Persist the notice intent before returning to the caller for delivery.
+		// The function persists notice intent before returning the notice so delivery survives restarts.
 		setCompactionModeRecord(args.db, args.sessionId, "off_notice_pending");
 	}
 	return {

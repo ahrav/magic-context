@@ -23,16 +23,9 @@ const scenario: ScenarioDeclaration = {
     scenarioId: "var-runner-smoke",
     familyId: "fam-runner",
     title: "Runner smoke",
-    checks: [
-        {
-            id: "check-ladder",
-            appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-        },
-        {
-            id: "check-primary",
-            appliesToArms: ["mc-on", "mc-off", "compaction"],
-        },
-    ],
+    expectedAnswer: "alpha-17",
+    answerMatch: "case-insensitive",
+    checks: ["check-ladder", "check-primary"],
     criticalCheckIds: ["check-ladder"],
     turnScript: [
         { id: "turn-evidence", role: "user", content: "The identifier is alpha-17." },
@@ -41,11 +34,9 @@ const scenario: ScenarioDeclaration = {
     interventions: {
         r1: {
             insertAfterTurnId: "turn-evidence",
-            query: "alpha-17",
             locatorIds: ["mem-alpha"],
         },
         r2: { memories: [{ claim: "Identifier", evidence: "alpha-17" }] },
-        r3: { evidence: "alpha-17" },
     },
     absencePrecondition: { evidenceTurnId: "turn-evidence", minimumBallastBytes: 1024 },
     modelContextLimit: 4096,
@@ -99,9 +90,7 @@ function observation(
     passed = true,
 ): RolloutObservation {
     return {
-        checks: scenario.checks
-            .filter(({ appliesToArms }) => appliesToArms.includes(armId))
-            .map(({ id }) => ({ id, passed })),
+        checks: scenario.checks.map((id) => ({ id, passed })),
         claimedDone: true,
         absencePreconditionHeld: true,
         armIdentityMatches: true,

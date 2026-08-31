@@ -2,44 +2,6 @@
   "entries": [
     {
       "bootstrap_launcher_digest": null,
-      "package": "@cortexkit/mc-host-darwin-arm64",
-      "payload_manifest_digest": null,
-      "platform_floor": {
-        "dev_fd_exec": true,
-        "os_min": "13.5"
-      },
-      "published": false,
-      "qualified": false,
-      "size_budget_bytes": {
-        "compressed_max": 62914560,
-        "unpacked_max": 157286400
-      },
-      "synapse": "unsupported",
-      "target": "darwin-arm64",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
-      "version": "0.38.0"
-    },
-    {
-      "bootstrap_launcher_digest": null,
-      "package": "@cortexkit/mc-host-darwin-x64",
-      "payload_manifest_digest": null,
-      "platform_floor": {
-        "dev_fd_exec": true,
-        "os_min": "13.5"
-      },
-      "published": false,
-      "qualified": false,
-      "size_budget_bytes": {
-        "compressed_max": 62914560,
-        "unpacked_max": 157286400
-      },
-      "synapse": "unsupported",
-      "target": "darwin-x64",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
-      "version": "0.38.0"
-    },
-    {
-      "bootstrap_launcher_digest": null,
       "package": "@cortexkit/mc-host-linux-x64-gnu",
       "payload_manifest_digest": null,
       "platform_floor": {
@@ -59,12 +21,10 @@
       "version": "0.38.0"
     }
   ],
-  "production_inputs_lock_sha256": "d637d8107ba9ed8207346bdc101d1b0af8e3e403490556669ca351deea9aa295",
+  "production_inputs_lock_sha256": "3cbe0295b1d7deb3ab607b480f48e8bc0896c5d1d99fe2dd289a82614d71fce0",
   "production_qualified": false,
   "publication": {
     "order": [
-      "@cortexkit/mc-host-darwin-arm64",
-      "@cortexkit/mc-host-darwin-x64",
       "@cortexkit/mc-host-linux-x64-gnu",
       "@cortexkit/magic-context",
       "@cortexkit/opencode-magic-context",
@@ -77,6 +37,6 @@
     "id": "mc-host-release",
     "version": "0.38.0"
   },
-  "release_contract_sha256": "0d5e2af2b901424ac78a39ff8b674ac8ad8a7f343ba88368037f11a84dcf940d",
+  "release_contract_sha256": "ab3b41c0f4f99f917dc4ac03515a2a36f50d5cb0dde603b4518cf47480e975e2",
   "schema": "magic-context.mc-host-payload-index/v1"
 }

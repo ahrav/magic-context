@@ -3,8 +3,6 @@
  *
  * Every scenario is expressed against the mandatory shared-memory channel.
  *
- * Runtime-neutral: `node:assert/strict` only — no bun:test — so the same
- * scenarios also execute under Node 24 through the existing bundle runner.
  */
 
 import assert from "node:assert/strict";
@@ -60,24 +58,24 @@ export interface ContractPeerFrameFields {
     epoch?: number;
     corr?: bigint;
     body?: Uint8Array;
-    /** Overrides for malformed frames; default to the true values. */
+    /** `len` and `ver` override encoded values for malformed frames; otherwise they use the encoded values. */
     len?: number;
     ver?: number;
 }
 
-/** The remote end of a channel under contract test. */
+/* */
 export interface ContractPeer {
     readonly frames: readonly ContractPeerFrame[];
     send(fields: ContractPeerFrameFields): Promise<void>;
-    /** Deliver several frames as one coalesced burst when the transport allows. */
+    /** sendBurst delivers frames as one coalesced burst when the transport allows. */
     sendBurst(fields: ContractPeerFrameFields[]): Promise<void>;
     waitFor(check: () => boolean, timeoutMs?: number): Promise<void>;
-    /** Backpressure: stop consuming the channel's outbound bytes. */
+    /* */
     pauseReading(): void;
     resumeReading(): void;
-    /** Clean end-of-stream toward the channel. */
+    /** end sends a clean end-of-stream toward the channel. */
     end(): void;
-    /** Abortive teardown toward the channel. */
+    /** destroy performs abortive teardown toward the channel. */
     destroy(): void;
 }
 
@@ -91,18 +89,18 @@ export interface ContractReceivedFrame {
     body: Uint8Array;
 }
 
-/** One live channel/peer pair plus the factory-recorded observations. */
+/* */
 export interface FrameChannelContractHandle {
     channel: FrameChannel;
     budget: ByteBudget;
     peer: ContractPeer;
-    /** Whether releasing a lease must revoke aliases before backing storage is reused. */
+    /** reusesReceiveStorage is true when releasing a lease must revoke aliases before reusing backing storage. */
     reusesReceiveStorage: boolean;
     /** The contract factory retains owned bodies after the channel releases each inbound lease. */
     received: ContractReceivedFrame[];
-    /** Channel-detected closes, in order (owner close never records here). */
+    /** closes records channel-detected closes in order; owner closes do not appear. */
     closes: { reason: FrameChannelCloseReason; error: unknown }[];
-    /** Scenario-installed hook, run before each delivery is recorded. */
+    /** frameHook runs before each delivery is recorded. */
     frameHook: ((frame: InboundFrame) => boolean | undefined) | null;
     cleanup(): Promise<void>;
 }
@@ -116,7 +114,7 @@ export interface FrameChannelContractScenario {
     run(create: FrameChannelContractFactory): Promise<void>;
 }
 
-/** Run one scenario with automatic cleanup of every created handle. */
+/* */
 export async function runFrameChannelContractScenario(
     scenario: FrameChannelContractScenario,
     factory: FrameChannelContractFactory,
@@ -201,7 +199,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
     {
         // Publication start and local completion are distinct and fire
         // exactly once, in order; completion never claims peer receipt —
-        // both fire while the peer is provably not consuming. commentlint: allow(JUDGE)
+        // both fire while the peer is provably not consuming.
         name: "publication and local completion fire exactly once, in order",
         async run(create) {
             const h = await create();

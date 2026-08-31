@@ -1,28 +1,21 @@
 /**
- * v86 claim trust policy DDL (claim-trust-policy plan: U1; KTD1, KTD2,
  * KTD5-KTD7, KTD11-KTD12).
  *
- * Dependency-light on purpose: runtime imports here must carry explicit `.ts`
- * extensions so the Node SQLite smoke
- * (`packages/plugin/scripts/smoke-node-sqlite.ts`) can import this module
- * directly under Node's type-stripping loader.
+ * Runtime imports use explicit `.ts` extensions so Node's type-stripping loader can import this module directly.
  *
- * Every object here is migration-owned (created by migration v86, never by
- * `initializeDatabase()`), following the v82/v84/v85 precedent.
+ * Migration v86 creates every object in this module; `initializeDatabase()` creates none of them.
  *
- * Physical model (KTD1): trust state is an append-only decision ledger, never
- * mutable columns on `claims` or `claim_revisions`. Historical maturity only
- * moves upward within one gapless per-revision stream; the effective state
- * used by retrieval is derived by the TypeScript reducer from current support
- * (verification, approval, artifact validity, dispositions) and materialized
- * into the rebuildable, non-authoritative `claim_effective_policy` projection.
- * Missing policy state reads as `CANDIDATE` / unknown taint / automatic-hidden
- * by contract (R26).
+ * Trust state is an append-only decision ledger, not mutable columns on `claims` or `claim_revisions`.
+ * Historical maturity only moves upward within each gapless per-revision stream.
+ * The TypeScript reducer derives retrieval state from current support.
+ * The TypeScript reducer derives retrieval state from verification, approval, artifact validity, and dispositions.
+ * The reducer materializes retrieval state in the rebuildable, non-authoritative `claim_effective_policy` projection.
+ * Missing policy state reads as `CANDIDATE`, unknown taint, and automatic-hidden.
  */
 
 import type { Database } from "../../shared/sqlite";
 
-/** Versioned policy contract consumed by U8/U18 (R1, R18). */
+/* */
 export const CLAIM_POLICY_VERSION = 1;
 
 export const CLAIM_POLICY_TABLES = [
@@ -37,15 +30,13 @@ export const CLAIM_POLICY_TABLES = [
     "claim_policy_projector_watermarks",
 ] as const;
 
-/** Claim kinds (R2). `unknown` receives directive-strength restrictions. */
+/** `unknown` receives directive-strength restrictions. */
 export const CLAIM_KINDS = ["descriptive", "directive", "unknown"] as const;
 export type ClaimKind = (typeof CLAIM_KINDS)[number];
 
-/** Fine observation-level taint classes (R3). */
-/** The BEFORE UPDATE / BEFORE DELETE append-only guard pair every v86
- * ledger table carries. One template so the seven copies cannot drift on a
- * future edit; each table's insert-collision trigger stays written out
- * individually because its WHEN clause differs by key shape. */
+/* */
+/**
+ * */
 function appendOnlyTriggers(triggerPrefix: string, table: string): string {
     return `    CREATE TRIGGER ${triggerPrefix}_append_only_update
     BEFORE UPDATE ON ${table}
@@ -68,7 +59,7 @@ export const FINE_TAINTS = [
 ] as const;
 export type FineTaint = (typeof FINE_TAINTS)[number];
 
-/** Maturity ladder (R7). Historical assertions only move upward (R15). */
+/* */
 export const MATURITY_LEVELS = [
     "CANDIDATE",
     "CORROBORATED",
@@ -87,28 +78,28 @@ export const MATURITY_RANK: Readonly<Record<MaturityLevel, number>> = {
 };
 
 /**
- * Explicit disposition kinds owned by `claim_disposition_events` (R14).
- * `contradicted` and `superseded` derive from `claim_conflicts`; verification
- * `stale`/`flagged` events additionally feed the reducer's stale/disputed
- * facts. Rejected is review-only; quarantined is hard-hidden (R16-R17).
+ * `claim_disposition_events` owns explicit disposition kinds.
+ * `contradicted` and `superseded` derive from `claim_conflicts`.
+ * `stale` and `disputed` events feed the reducer's stale/disputed state.
+ * Rejected dispositions affect review only; quarantined dispositions are hard-hidden.
  */
 export const DISPOSITION_KINDS = ["stale", "disputed", "rejected", "quarantined"] as const;
 export type DispositionKind = (typeof DISPOSITION_KINDS)[number];
 
 export const DISPOSITION_ACTIONS = ["assert", "clear"] as const;
 
-/** Host-recorded human authority actions (R10, KTD5). */
+/** Approval actions record host-recorded human authority. */
 export const APPROVAL_ACTIONS = ["approve", "revoke"] as const;
 
-/** Content-addressed enforcement artifact kinds (R11, KTD6). */
+/** Artifact kinds identify content-addressed enforcement artifacts. */
 export const ENFORCEMENT_ARTIFACT_KINDS = ["test", "policy", "config"] as const;
 export type EnforcementArtifactKind = (typeof ENFORCEMENT_ARTIFACT_KINDS)[number];
 
 export const ENFORCEMENT_ARTIFACT_RESULTS = ["pass", "fail"] as const;
 export type EnforcementArtifactResult = (typeof ENFORCEMENT_ARTIFACT_RESULTS)[number];
 
-/** Append-only artifact support removal (KTD6). Re-validation appends a new
- * artifact row; there is no mutate-in-place path. */
+/** Re-validation appends a new artifact row; no path mutates an existing row.
+ * */
 export const ENFORCEMENT_ARTIFACT_EVENT_ACTIONS = ["revoked"] as const;
 
 const sqlList = (values: readonly string[]): string =>
@@ -117,10 +108,9 @@ const sqlList = (values: readonly string[]): string =>
 const maturityRankCase = (column: string): string =>
     `CASE ${column} ${MATURITY_LEVELS.map((level) => `WHEN '${level}' THEN ${MATURITY_RANK[level]}`).join(" ")} END`;
 
-/** Full v86 object graph: tables from dependency roots outward, indexes, the
- * head view, then guards. */
+/**
+ * */
 export function createClaimPolicySchema(db: Database): void {
-    // Interpolation is a compile-time const allowlist, not caller input.
     // pi-lens-ignore: sql-injection
     db.exec(`
     -- One immutable policy subject per revision (R1, KTD2): freezes claim

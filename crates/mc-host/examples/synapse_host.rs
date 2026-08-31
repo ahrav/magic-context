@@ -1,12 +1,6 @@
-//! Focused Synapse composition host for the cross-language smoke: starts the
-//! fixed two-target composite (an echoing Magic Context stand-in plus the
-//! real Synapse component over a configured bundle), publishes its
-//! connection file, and serves until SIGINT/SIGTERM.
 //!
 //! Usage:
-//!   synapse_host <data-dir> <bundle-dir> <ort-library> <ort-library-sha256>
 //!
-//! Pass `-` as <bundle-dir> to start with Synapse deliberately unconfigured
 //! (degraded-lane smoke).
 
 use std::time::Duration;

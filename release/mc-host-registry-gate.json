@@ -1,6 +1,6 @@
 {
   "schema": "magic-context.mc-host-registry-gate/v1",
-  "note": "FAIL-CLOSED live audit 2026-08-26: all three parent packages already publish 0.38.0, while each mc-host payload name returns public npm E404 and has no observable inert reservation. @cortexkit/mc-shm-native is a non-optional dependency of all three parents and is likewise unreserved, so an install resolves nothing for it. This file must not return to passing until release engineering reserves the payload and addon names, verifies trusted publishers, revokes the bootstrap credential, and selects one version unpublished across all seven names.",
+  "note": "FAIL-CLOSED live audit 2026-08-26: all three parent packages already publish 0.38.0, while the Linux mc-host payload name returns public npm E404 and has no observable inert reservation. @cortexkit/mc-shm-native is a non-optional dependency of all three parents and is likewise unreserved, so an install resolves nothing for it. This file must not return to passing until release engineering reserves the payload and addon names, verifies trusted publishers, revokes the bootstrap credential, and selects one version unpublished across all five names.",
   "release_version": "0.38.0",
   "packages": [
     {
@@ -23,24 +23,6 @@
       "ownership_verified": true,
       "trusted_publisher_configured": true,
       "synchronized_version_unpublished": false
-    },
-    {
-      "name": "@cortexkit/mc-host-darwin-arm64",
-      "kind": "payload",
-      "ownership_verified": false,
-      "reservation_version": null,
-      "trusted_publisher_configured": false,
-      "bootstrap_credential_revoked": false,
-      "synchronized_version_unpublished": true
-    },
-    {
-      "name": "@cortexkit/mc-host-darwin-x64",
-      "kind": "payload",
-      "ownership_verified": false,
-      "reservation_version": null,
-      "trusted_publisher_configured": false,
-      "bootstrap_credential_revoked": false,
-      "synchronized_version_unpublished": true
     },
     {
       "name": "@cortexkit/mc-host-linux-x64-gnu",

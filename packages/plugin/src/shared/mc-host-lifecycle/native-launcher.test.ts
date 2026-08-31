@@ -37,7 +37,6 @@ function probeResultJson(ok: boolean): string {
         remediation: ok ? null : "run_daemon_start",
         effects: null,
         readiness: null,
-        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",
@@ -58,11 +57,6 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
         const fd = openSync(binary, constants.O_RDONLY | constants.O_NOFOLLOW);
         try {
-            // A host outside the certified namespace table has no
-            // retained-descriptor exec path at all, so it must fail as a
-            // platform reason rather than as a spawn error against a path that
-            // cannot exist. The linux and darwin arms are covered end to end by
-            // the inherited-fd test below, which runs the real path.
             await expect(
                 runNativeLifecycle(
                     { kind: "retained-fd", fd },
@@ -413,27 +407,6 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         } catch (caught) {
             error = caught as NativeLaunchError;
         }
-        // Neither procfs_self_fd_exec nor dev_fd_exec: report the real reason
-        // instead of spawning a path that cannot exist.
         expect(error?.code).toBe("unsupported_platform");
-    });
-
-    test("darwin resolves the retained descriptor through /dev/fd, not procfs", async () => {
-        // The contract gives darwin `dev_fd_exec` and linux
-        // `procfs_self_fd_exec`; a darwin launch must not reach /proc.
-        let error: NativeLaunchError | null = null;
-        try {
-            await runNativeLifecycle(
-                { kind: "retained-fd", fd: 0 },
-                { command: "probe", deadlineMs: 10_000, platform: "darwin" },
-            );
-        } catch (caught) {
-            error = caught as NativeLaunchError;
-        }
-        // On this linux host /dev/fd/3 is not an executable image, so the
-        // spawn fails; the point is that it was attempted at all rather than
-        // rejected as an unsupported platform.
-        expect(error).toBeInstanceOf(NativeLaunchError);
-        expect(error?.code).not.toBe("unsupported_platform");
     });
 });

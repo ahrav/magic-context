@@ -1,10 +1,6 @@
-//! The `LlmExecutionBackend` seam (KTD5, R14, R18).
 //!
-//! The supervisor owns admission, identity, status, replay, and lifecycle;
-//! a backend receives one validated immutable request and returns canonical
-//! events plus exactly one terminal classification. Subprocess adapters
-//! (plan U3) and the deterministic test backend implement the same trait so
-//! supervisor behavior never depends on which one runs.
+//! The supervisor owns admission, identity, status, replay, and lifecycle.
+//! Subprocess adapters and the deterministic test backend implement the same trait, so supervisor behavior never depends on which one runs.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -12,9 +8,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-/// The two supported subprocess harnesses (R4). A closed enum rather than a
-/// string so an unsupported harness can only be rejected at bind, never
-/// carried into a run.
+/// A closed enum rejects unsupported harnesses at bind instead of carrying them into a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Harness {
     OpenCode,
@@ -38,9 +32,7 @@ impl Harness {
     }
 }
 
-/// One validated, immutable run request. Built only from a strictly decoded
-/// `session.send` plus the bind-validated route identity, so a backend never
-/// sees unvalidated bytes.
+/// The supervisor validates `session.send` and route identity before creating a `BackendRequest`.
 #[derive(Clone)]
 pub struct BackendRequest {
     pub prompt: String,
@@ -56,8 +48,6 @@ pub struct BackendRequest {
 
 impl std::fmt::Debug for BackendRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Prompt, system text, and identity claims are sensitive (R19):
-        // diagnostics report bounded structural metadata only.
         f.debug_struct("BackendRequest")
             .field("prompt_len", &self.prompt.len())
             .field("system_len", &self.system.as_ref().map(String::len))
@@ -71,9 +61,7 @@ impl std::fmt::Debug for BackendRequest {
     }
 }
 
-/// Exact length-class finish reasons plus ordinary completion (R18). The
-/// provider spelling is preserved because `HistorianProducer` matches the
-/// wire string, not a normalized class.
+/// Provider spelling is preserved because `HistorianProducer` matches the wire string rather than a normalized finish-reason class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
     Completed,
@@ -91,8 +79,7 @@ impl FinishReason {
     }
 }
 
-/// The producer/consumer error-class contract, mirroring
-/// `ERROR_CLASS_WIRE_SET` in `mc-module`'s historian producer.
+/// The producer/consumer error-class contract mirrors `ERROR_CLASS_WIRE_SET` in `mc-module`'s historian producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     Transient,
@@ -112,26 +99,21 @@ impl ErrorClass {
     }
 }
 
-/// One classified run failure (R18): error class, retry metadata, and the
-/// bounded provider diagnostics current producer policy consumes.
+/// Producer policy consumes `BackendError`'s error class, retry metadata, and bounded provider diagnostics.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BackendError {
     pub class: ErrorClass,
-    /// Always host-authored (R19): provider failure text steers
-    /// classification inside the parsers but is never stored here, because
-    /// this message rides the wire into module state and caller logs and
-    /// provider output can echo prompt, memory-pool, or credential content.
+    /// Always host-authored:
+    /// `BackendError::message` rides the wire into module state and caller logs, where provider output can echo prompt, memory-pool, or credential content.
     pub message: String,
     pub retry_after_secs: Option<u64>,
-    /// Provider-supplied code, admitted only in short identifier shape
     /// (see `sanitized_provider_code`).
     pub provider_code: Option<String>,
 }
 
 impl std::fmt::Debug for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The message can quote provider output, which may echo prompt
-        // content (R19); diagnostics get its length only.
+        // Provider output may echo prompt content, so diagnostics record only its length.
         f.debug_struct("BackendError")
             .field("class", &self.class)
             .field("message_len", &self.message.len())
@@ -141,25 +123,21 @@ impl std::fmt::Debug for BackendError {
     }
 }
 
-/// The single terminal classification every backend run resolves to (R18).
-/// Malformed output, overflow, timeout, and unclassifiable provider failures
-/// must all map to one `Failed`; there is deliberately no "unknown" arm.
+/// Every backend run resolves to exactly one terminal classification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendTerminal {
     Completed {
         finish_reason: FinishReason,
     },
     Failed(BackendError),
-    /// Failed, AND the harness process tree could not be proven stopped, so
-    /// descendants may still be executing a billable request. Commits the
-    /// same failure terminal as [`BackendTerminal::Failed`], but cancel and
-    /// delete must report failure instead of claiming the work stopped.
+    /// Cancellation may leave descendants executing a billable request.
+    /// Cancel and delete commit `BackendTerminal::Failed` when descendants may still be executing a billable request.
+    /// `delete` must report failure rather than claim that the backend stopped.
     FailedUnresolved(BackendError),
 }
 
-/// One canonical nonterminal event. Assistant text is the only unit current
-/// producers consume; the optional finish reason carries a step-level length
-/// cap (R18) without promoting it to the run terminal.
+/// Assistant text is the only payload producers consume.
+/// `finish_reason` carries a step-level length cap without becoming the run terminal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendEvent {
     HarnessDispatch {
@@ -171,18 +149,14 @@ pub enum BackendEvent {
     },
 }
 
-/// Whether an emitted event was retained. `Closed` means the run can accept
-/// nothing further — terminal already committed, replay overflowed, or the
-/// run was cancelled — and the backend should stop producing.
+/// `Closed` rejects further events after a terminal commits, replay overflows, or cancellation.
+/// Cancellation tells the backend to stop producing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkStatus {
     Accepted,
     Closed,
 }
 
-/// Ordered event delivery back into the supervisor's replay log. Emission is
-/// synchronous and nonblocking so a backend can never be wedged by a slow
-/// subscriber; replay fan-out happens on the supervisor side (KTD4).
 #[derive(Clone)]
 pub struct EventSink {
     deliver: Arc<dyn Fn(BackendEvent) -> SinkStatus + Send + Sync>,
@@ -204,16 +178,12 @@ impl std::fmt::Debug for EventSink {
     }
 }
 
-/// Boxed so the supervisor can hold either harness adapter behind one
-/// `Arc<dyn LlmExecutionBackend>` chosen from the route-bound harness.
 pub type BackendFuture = Pin<Box<dyn Future<Output = BackendTerminal> + Send + 'static>>;
 
-/// Execution seam between supervision and the harness (KTD5).
 ///
-/// Contract: emit zero or more events through `events`, observe `cancel`
-/// promptly — a cancelled run's control operations wait for this future to
-/// resolve before they complete (R10) — and resolve to exactly one terminal.
-/// A terminal returned after cancellation is discarded by the supervisor's
+/// Backends emit zero or more events through `events` and observe `cancel`.
+/// After cancellation, control operations wait for this future to resolve.
+/// The supervisor discards terminals returned after cancellation.
 /// first-terminal-wins arbitration.
 pub trait LlmExecutionBackend: Send + Sync + 'static {
     fn execute(
@@ -223,29 +193,16 @@ pub trait LlmExecutionBackend: Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> BackendFuture;
 
-    /// The `harness_unavailable` subreason every run on `harness` would fail
-    /// with, answered without executing anything.
+    /// `unavailable_reason` returns the `harness_unavailable` subreason that every run on `harness` would fail with without executing anything.
     ///
-    /// The release contract orders every descriptor and closure reason ahead of
-    /// every credential reason, so a host that verifies the credential snapshot
-    /// before dispatching has to consult the dispatched backend first. Without
-    /// this, a startup with neither a usable descriptor nor a provider
-    /// credential reported the credential reason and sent the user to
-    /// `restart_with_supported_harness` for a credential they cannot supply,
-    /// while the descriptor was the condition to fix.
+    /// Hosts must report descriptor and closure reasons before credential reasons.
+    /// When the descriptor is unavailable, report its reason before credential reasons so users receive `restart_with_supported_harness`.
     fn unavailable_reason(&self, _harness: Harness) -> Option<&'static str> {
         None
     }
 }
 
-/// Routes each run to the adapter for its ROUTE-BOUND harness.
 ///
-/// `BackendRequest::harness` comes from the session key, so a host wired
-/// with a single adapter would run every route through that one CLI —
-/// executing a Pi-bound run under `opencode` (different provider aliases,
-/// different credentials, different transcript vocabulary) rather than
-/// failing. The supervisor holds one backend by design, so the dispatch
-/// belongs in a backend that owns both.
 pub struct HarnessDispatchBackend {
     opencode: Arc<dyn LlmExecutionBackend>,
     pi: Arc<dyn LlmExecutionBackend>,
@@ -279,10 +236,6 @@ impl LlmExecutionBackend for HarnessDispatchBackend {
     }
 }
 
-/// The terminal for a run whose route-bound harness is not the one this
-/// adapter implements. Wiring that mismatch is a host construction error,
-/// but it must surface as one bounded failed run rather than as a run
-/// executed under the wrong CLI with the wrong credentials (R18/R19).
 pub(crate) fn harness_mismatch(expected: Harness, requested: Harness) -> BackendTerminal {
     BackendTerminal::Failed(BackendError {
         class: ErrorClass::Permanent,

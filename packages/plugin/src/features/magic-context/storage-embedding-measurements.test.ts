@@ -92,8 +92,7 @@ describe("embedding measurement corpus", () => {
             recordEmbeddingMeasurement(db, {
                 sessionId: "ses-cap",
                 projectPath: "/repo",
-                // Unique query text per row: dedup is on (query hash, cohort), so
-                // distinct queries simulate the cohort-transition growth.
+                // Distinct queries bypass `(query hash, cohort)` deduplication so the test exceeds the row cap.
                 queryText: `query ${i}`,
                 cohortKey: "fp-a:0|fp-b:0",
                 primaryResultIds: [],
@@ -115,7 +114,6 @@ describe("embedding measurement corpus", () => {
 
         const rows = listEmbeddingMeasurements(db, "ses-cap");
         expect(rows).toHaveLength(MEASUREMENT_CORPUS_SESSION_ROW_CAP);
-        // The oldest `overflow` rows were pruned; the newest cap rows survive.
         expect(rows[0].query_text_hash).toBe(normalizedQueryHash(`query ${overflow}`));
         expect(rows[rows.length - 1].query_text_hash).toBe(
             normalizedQueryHash(`query ${total - 1}`),
@@ -165,8 +163,7 @@ describe("embedding measurement corpus", () => {
         bind("ses-both", "pi");
         record("ses-other", "other harness query");
         bind("ses-other", "mystery");
-        // Ownership correlates on (session_id, project_path): a session that
-        // is opencode in THIS project and pi in another still resolves here.
+        // Ownership uses both `session_id` and `project_path`; `ses-cross` is `opencode` for `/repo` despite its `pi` binding for `/other-repo`.
         record("ses-cross", "cross project query");
         bind("ses-cross", "opencode");
         bind("ses-cross", "pi", "/other-repo");
@@ -182,7 +179,6 @@ describe("embedding measurement corpus", () => {
         ]);
         expect(owned[0].queryTextHash).toBe(normalizedQueryHash("opencode query"));
 
-        // Keyset paging covers the same rows without overlap or gaps.
         const firstPage = listMeasurementRowsWithOwnership(db, { afterId: 0, limit: 2 });
         expect(firstPage).toHaveLength(2);
         const secondPage = listMeasurementRowsWithOwnership(db, {

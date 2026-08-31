@@ -55,12 +55,9 @@ function fixtureScenario(
         scenarioId,
         familyId: "fam-smoke",
         title,
-        checks: [
-            {
-                id: "check-smoke-outcome",
-                appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-            },
-        ],
+        expectedAnswer: "smoke-id-17",
+        answerMatch: "case-insensitive",
+        checks: ["check-smoke-outcome"],
         criticalCheckIds: ["check-smoke-outcome"],
         turnScript: [
             { id: "turn-smoke-evidence", role: "user", content: "Remember smoke-id-17." },
@@ -69,13 +66,11 @@ function fixtureScenario(
         interventions: {
             r1: {
                 insertAfterTurnId: "turn-smoke-evidence",
-                query: "smoke-id-17",
                 locatorIds: ["mem-smoke"],
             },
             r2: {
                 memories: [{ claim: "The smoke identifier", evidence: "smoke-id-17" }],
             },
-            r3: { evidence: "The smoke identifier is smoke-id-17." },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-smoke-evidence",

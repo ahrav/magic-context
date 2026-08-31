@@ -43,9 +43,35 @@ in the working material, per METHOD.md rule 1.
   `AdmissionController::quarantine` is `:522`. The finding is unaffected: a
   repository-wide search for `quarantine()` under `crates/mc-host/src` returns
   zero call sites.
-- The `#[doc(hidden)]` attribute on the module sits at `lib.rs:20` and
+- The `#[doc(hidden)]` attribute on the module sits at `lib.rs:20` (post-#131: `:17`) and
   `pub mod ring_transport` at `:21`. Both lenses noted this refinement to the
   re-scope and both are right.
+
+## Eventfd reconciliation pass, 2026-08-31
+
+This catalog, `fault-map.md`, and `portfolio-evaluation.md` were reconciled
+against HEAD `ec0f1bbe1` after PR #131 (merge `5d638e3e8`) replaced polling
+with sparse eventfd delivery. `crates/mc-host/src/ring_transport.rs` was
+rewritten (966 to 1,045 lines): `POLL_INTERVAL` no longer exists in the file
+(an inline test, `shared_memory_workers_have_no_periodic_polling` at
+`ring_transport.rs:798-806`, now asserts its absence), the endpoint loop parks
+on an eventfd doorbell (`arm_data_wait` at `:429`, readiness at `:459-471`),
+and the ingress-budget wait awaits an async semaphore charge
+(`ByteBudget::charge`, `wire.rs:397-407`) instead of polling `try_charge`.
+`crates/mc-shm-transport/src/backend/ring.rs` was rewritten too (2,374 lines),
+and `wire.rs` shrank from 973 to 937 lines. Two records were re-derived
+against the new mechanics,
+`ring-a-cancellation-close-requires-an-empty-inbound-observation` and
+`ring-a-ingress-wait-holds-a-lease-while-servicing-egress`, and every
+`ring_transport.rs:`, `ring.rs:`, and `lib.rs:` citation in this catalog and
+in `evidence/` was re-verified at that HEAD, with stale numbers corrected in
+place and removed constructs marked as removed. Citations to other files
+(`connection.rs`, `profile.rs`, `frame_channel.rs`, `wire.rs`, `runtime.rs`,
+`client.rs`, `lease.rs`, `raw_client.rs`) were not swept in this pass; PR #131
+rewrote several of them, so their pre-merge line numbers are suspect and need
+their own pass. The scope paragraph and refactor table above are the original
+authoring-time provenance and are kept as history; the line counts they state
+are pre-#131.
 
 ## What this part is about
 
@@ -61,8 +87,8 @@ correction. **Peer-death teardown** is owned by the sentinel task at
 `connection.rs:195-207`: `observe_peer` returns, a non-`Goodbye` close calls
 `record_peer_death()` (`:200-202`), and the generation's token and read-cancel
 are both cancelled (`:203-204`). **Capacity reclamation** is owned by the
-endpoint thread at `ring_transport.rs:279-292`: `admission.release()` (`:291`)
-and `done_tx.send(())` (`:292`) sit outside the `catch_unwind` at `:279-290`, so
+endpoint thread at `ring_transport.rs:264-277`: `admission.release()` (`:276`)
+and `done_tx.send(())` (`:277`) sit outside the `catch_unwind` at `:264-275`, so
 they run on every exit including a swallowed panic, and `record_reclamation()`
 follows at `connection.rs:209`. The charge comes back unconditionally, which is
 also this catalog's own guarantee in
@@ -79,8 +105,8 @@ anything in the host that calls it. A search for `quarantine` under
 `crates/mc-host/src` returns no call to it; the only mentions are the unrelated
 `LeaseTracker` flag (`frame_channel.rs:392`, `:420-433`), two unrelated
 `instance.rs` doc comments (`:67`, `:250`), the diagnostics reporter that emits
-the field (`ring_transport.rs:182`), and two in-crate assertions that the value
-is zero (`:774`, `:800`). So host quarantined accounting is **structurally**
+the field (`ring_transport.rs:171`), and two in-crate assertions that the value
+is zero (`:855`, `:880`). So host quarantined accounting is **structurally**
 zero, not incidentally zero, and the two assertions that touch it pass
 vacuously. Meanwhile `docs/mc-host-shm-transport.md` presents it as live in
 three places: `:21` "Active and quarantined charges are reported separately",
@@ -89,7 +115,7 @@ within the configured process bound". The last is satisfied by having no
 quarantined charges at all.
 
 The consequence is a policy gap, not an absent owner: because
-`admission.release()` at `:291` is unconditional, a connection that exited
+`admission.release()` at `:276` is unconditional, a connection that exited
 because its ring was condemned returns its charge on exactly the same line as a
 clean one, so the two cases are accounted identically and nothing distinguishes
 them. Part 1 anchored `quarantine-charge-transition-is-atomic` to
@@ -106,14 +132,14 @@ half and it holds: `connection.rs:149-164` is a straight-line
 `activate_server` call is at `:170`, after it. So a failed `prepare` refuses the
 connection before activation and no application frame can flow. The reportability
 half is where it fails. `prepare` has five `Err(RingUnavailable)` returns and
-only the first touches a counter: admission rejection (`ring_transport.rs:239-242`)
-increments `exhaustions`, while runtime-or-ring creation failure (`:264-270`),
-descriptor marshalling failure (`:271-275`), thread-spawn failure (`:294-296`),
-and initialization-channel loss (`:297`) increment nothing. `diagnostics()`
-derives `state` exclusively from `self.accounting()` (`:176-190`), which reads
+only the first touches a counter: admission rejection (`ring_transport.rs:223-226`)
+increments `exhaustions`, while runtime-or-ring creation failure (`:249-255`),
+descriptor marshalling failure (`:256-259`), thread-spawn failure (`:279-281`),
+and initialization-channel loss (`:282`) increment nothing. `diagnostics()`
+derives `state` exclusively from `self.accounting()` (`:165-179`), which reads
 the admission snapshot and cannot observe a failed `prepare` at all, so it
 reports `state: "healthy"` with `error_class: null`. `RingUnavailable`
-(`:114-122`) is a unit struct with a fixed `Display` string and no cause field,
+(`:103-112`) is a unit struct with a fixed `Display` string and no cause field,
 and the `else` branch emits no `ServerMessage`, so the peer sees only a closed
 setup socket and reports the generic `setup_failed`. A host whose `/dev/shm` is
 full therefore presents as a healthy host that refuses every connection for no
@@ -122,10 +148,10 @@ stated reason. That is a silent total outage of the only datapath.
 **No caller retains a committed release identity.** All nine `commit` call sites
 in this surface discard the `ReleaseIdentity` that
 `ProducerReservation::commit` returns. The three non-test producers are
-`ring_transport.rs:591`, `:604`, and `:670`; the first two are
+`ring_transport.rs:615`, `:628`, and `:696`; the first two are
 `reservation.commit(body_len).map_err(|_| ())?`, verified by printing them. The
-three inline tests (`:856`, `:906`, `:943`) and the three integration helpers
-(`tests/support/raw_client.rs:705`, `:750`, `:806`) discard it too. This was
+three inline tests (`:935`, `:985`, `:1022`) and the three integration helpers
+(`tests/support/raw_client.rs:698`, `:743`, `:799`) discard it too. This was
 verified independently by two passes, lens A by enumerating every `.commit(`
 call in the tree and this synthesis by re-printing the six sites in
 `ring_transport.rs`. The consequence is a verdict that carries over rather than
@@ -136,7 +162,7 @@ discarded the identity. The refactor rewrote all of those callers and they still
 discard it, so Part 1's `release-authority-bound-to-lease-ownership` and
 `release-exactly-once-per-sequence` keep their reachability labels on the
 producer side. Only the line numbers move, from `shm_provider.rs:365` to
-`ring_transport.rs:591` and `:604`. See
+`ring_transport.rs:615` and `:628`. See
 [ring-a-no-producer-retains-a-committed-release-identity](#ring-a-no-producer-retains-a-committed-release-identity)
 for the record and Part 1 for the underlying verdict.
 
@@ -145,15 +171,15 @@ The re-scope left the class open because three things looked like test markers.
 All three are misleading and each was resolved against code.
 
 - The profile name `RING_PROFILE = "mc-host-test-ring-v1"`
-  (`ring_transport.rs:31`) has "test" in it, but it is a descriptor field
+  (`ring_transport.rs:30`) has "test" in it, but it is a descriptor field
   compared for equality at attach, and `docs/mc-host-shm-transport.md:11` names
   that exact literal as the release-fixed profile identity. It gates nothing.
 - `RingClientEndpoint` is doc-commented "Thread-confined peer endpoint for
-  integration tests" (`ring_transport.rs:626`). That comment is simply wrong.
+  integration tests" (`ring_transport.rs:650`). That comment is simply wrong.
   `client.rs:1855` constructs it inside `start_ring_bridge`, which
   `Client::connect_info` reaches on the ordinary connect path
   (`client.rs:346-375`), with no `cfg(test)` and no config gate.
-- `lib.rs:20-21` exports the module as `#[doc(hidden)] pub mod ring_transport`.
+- `lib.rs:17-18` exports the module as `#[doc(hidden)] pub mod ring_transport`.
   `#[doc(hidden)]` hides a module from rustdoc and does not restrict linkage.
 
 What decides it is that there is no gate anywhere. `RingTransport` is
@@ -168,12 +194,12 @@ alternate shared-memory backend, compatibility reader, or degraded data path."
 
 Two named sub-surfaces inside the same file are genuinely test-only, and they
 are labelled where they appear rather than in a blanket claim. `PublishHook`
-(`ring_transport.rs:39`, `#[doc(hidden)]` at `:38`) and `set_publish_hook`
-(`:229`) are reached only through `run_with_publish_hook`
+(`ring_transport.rs:36`, `#[doc(hidden)]` at `:35`) and `set_publish_hook`
+(`:213`) are reached only through `run_with_publish_hook`
 (`runtime.rs:641`, `#[doc(hidden)]` at `:640`), whose only callers are
 `tests/support/mod.rs:597`, `:614`, and `:650`. One correction to lens A here:
 it announced two non-default sub-surfaces but then resolved the second,
-`RingClientEndpoint::try_recv_with` (`:694`), as `default-production`, because
+`RingClientEndpoint::try_recv_with` (`:723`), as `default-production`, because
 `client.rs:1878` reaches it in production. That resolution is correct, so the
 test-only surface is the publish hook and its two entry points, not two
 independent surfaces. **No record in this catalog carries a `test-only` label.**
@@ -184,41 +210,52 @@ the same unprotected window; the test-only hook is merely the cheapest way to
 enter it.
 
 One reachability limit is not resolved and is not guessed.
-`RingClientEndpoint::send` and `recv` (`:659`, `:676`) are `pub` on a
+`RingClientEndpoint::send` and `recv` (`:684`, `:702`) are `pub` on a
 `#[doc(hidden)] pub mod`, which hides them from rustdoc but not from linkage.
 Only this repository was inspected, so `default-production` on records touching
 them covers in-tree use only.
 
-### Coverage: 35 in-crate tests, and a correction that adds two
+### Coverage: 37 in-crate tests, and all of them run in CI
 
-**35 in-crate tests reach this sub-part. None of them runs in CI.** Every count
-below was re-derived here by grepping `#[test]` and `#[tokio::test]` in the four
-files at `HEAD`, and all four match lens B exactly.
+**37 in-crate tests reach this sub-part, and CI executes every one.** This
+reverses the authoring-time headline. `ci.yml:115` runs
+`cargo nextest run -p mc-host -p mc-shm-transport --lib` in the "Mandatory ring
+unit and client suites (Linux)" job (`:93`); `--lib` selects the package library
+test target, which is where all three units live —
+`frame_channel/contract_tests.rs` is reachable as `pub(crate) mod contract_tests`
+from `frame_channel.rs:27`, so it is a library module, not an integration
+binary. Counts below were re-derived with `cargo nextest list -p mc-host --lib`
+rather than by grepping attributes, which is what corrects the earlier
+`ring_transport.rs` figure from 7 to 9 and confirms 14 for
+`contract_tests` (9 at the module root plus 5 in its nested
+`ownership_contract` module).
 
 | Unit | Tests | Executed in CI |
 | --- | --- | --- |
-| `wire.rs`, `mod tests` at `:646-973` | **14** | **No** |
-| `frame_channel/contract_tests.rs` | **14** | **No** |
-| `ring_transport.rs`, `mod tests` at `:753-966` | **7** | **No** |
+| `wire.rs`, `mod tests` at `:614-937` | **14** | **Yes** (`ci.yml:115`, `--lib`) |
+| `frame_channel/contract_tests.rs` | **14** | **Yes** (`ci.yml:115`, `--lib`) |
+| `ring_transport.rs`, `mod tests` at `:783-1044` | **9** | **Yes** (`ci.yml:115`, `--lib`) |
 | `frame_channel.rs` | **0** | n/a |
-| **Total in-crate** | **35** | **No** |
+| **Total in-crate** | **37** | **Yes** |
 
-The reason is structural rather than an omission. Every `-p mc-host` invocation
-in `ci.yml` carries a `--test <name>` filter, which selects one integration
-binary and never builds the lib target. The 13 `mc-host` hits are `:87`, `:132`,
-`:133`, `:134`, `:168`, `:169`, `:178`, `:187`, `:190`, `:211`, `:361`, `:442`,
-and `:461`, and none is an unfiltered or `--lib` run.
+The authoring-time claim was that this was structural: that every `-p mc-host`
+invocation in `ci.yml` carries a `--test <name>` filter which selects one
+integration binary and never builds the lib target. That is false at HEAD.
+Re-derived, the `cargo` invocations naming `mc-host` are `:115` (`--lib`), `:119`,
+`:120`, `:121`, `:128`, `:168`, `:175` (`--doc`), and `:236`; `:115` is neither
+filtered by `--test` nor an integration run. Any
+`Existing check: ... does not run in CI` conclusion resting on an inline unit
+test in these three units is therefore stale and should be re-read as CI-covered.
 
-**One correction to the re-scope belongs here, and it changes the headline.**
-The re-scope's statement that no in-crate check executes in CI is true of
-`#[test]` and `#[tokio::test]` functions and false of doctests.
-`cargo test -p mc-host --doc` runs at `ci.yml:190` under the step name "Rust
-lease non-escape" (`:189`), and this sub-part has exactly two doctests, both
+**A second, smaller correction, now subsumed by the above.** The re-scope's
+statement that no in-crate check executes in CI is false of doctests as well:
+`cargo test -p mc-host --doc` runs at `ci.yml:175` under the step name "Rust
+lease non-escape" (`:174`), and this sub-part has exactly two doctests, both
 `compile_fail`, at `frame_channel.rs:296-301` and `:303-308`. Both were printed
 and confirmed: they assert that `ReceiveLease` is neither `Send` nor `'static`.
-**They are this sub-part's only CI-executed source-resident checks.** So the
-correct statement is that no inline unit test in this sub-part runs in CI, and
-two doctests do. `wire.rs:4-14` is a ```text``` fence and is not compiled.
+They were recorded as this sub-part's only CI-executed source-resident checks,
+which the `--lib` finding above supersedes — they are two of many.
+`wire.rs:4-14` is a ```text``` fence and is not compiled.
 
 Coverage does arrive from integration tests, indirectly. **Ten of the 24
 integration binaries use `support::TestHost`, which starts a real host and
@@ -301,13 +338,13 @@ any fault.
 
 Type: safety
 Reachability: default-production — the thread is spawned by `prepare`
-(`ring_transport.rs:254-256`), which every authenticated connection calls at
+(`ring_transport.rs:238-240`), which every authenticated connection calls at
 `connection.rs:148`; `RingTransport` is constructed unconditionally at
 `runtime.rs:876` and stored non-optionally as `HostShared.ring` (`:104`), so
 there is no `Option`, no `cfg`, and no config branch on this path.
 Status: active
 Exercised: partial — `construction_has_no_ring_side_effects`
-(`ring_transport.rs:770-775`) proves the process-level owner holds no ring, and
+(`ring_transport.rs:851-856`) proves the process-level owner holds no ring, and
 the `RingFactory` contract suite drives a real `prepare`, but nothing asserts
 that no `Ring` value is ever observed from a second thread.
 Guarantee: For the whole life of one connection, exactly one OS thread ever
@@ -324,17 +361,18 @@ future refactor returning a ring from `prepare` or storing one in
 `PreparedRing`; `Ring` is `!Send`, so the compiler catches the direct move, but
 a raw pointer, an index into a shared arena, or a `ReceiveLease` smuggled out
 through an `unsafe` block would not be caught. `#![deny(unsafe_code)]`
-(`lib.rs:8`) currently forecloses that inside `mc-host`.
+(`lib.rs:5`) currently forecloses that inside `mc-host`.
 Required faults and enabling state: none for the structural check. For a
 runtime check, an active connection with both directions carrying traffic, so
 that a second thread would actually contend.
 Confidence: high — [evidence](evidence/ring-a-endpoint-thread-solely-owns-both-ring-endpoints.md).
-Verified by inspection: `DuplexRing::create` at `ring_transport.rs:263` is
-inside the thread closure opened at `:256`; `rings` is moved into
-`run_endpoint` by value at `:280`; `PreparedRing` (`:103-111`) has seven fields
-and none is a `Ring`; the only values crossing the `sync_channel` at `:247` are
-a `serde_json::Value` and `[OwnedFd; 2]` (`:276`).
-Existing check: `ring_transport.rs:770-775`
+Verified by inspection: `DuplexRing::create` at `ring_transport.rs:248` is
+inside the thread closure opened at `:240`; `rings` is moved into
+`run_endpoint` by value at `:265`; `PreparedRing` (`:93-101`) has seven fields
+and none is a `Ring`; the only values crossing the `sync_channel` at `:231` are
+a `serde_json::Value` and `[OwnedFd; RING_DESCRIPTOR_COUNT]` — six descriptors
+post-#131, up from two, still no ring — sent at `:261`.
+Existing check: `ring_transport.rs:851-856`
 `construction_has_no_ring_side_effects` — covers the process owner only, and
 does not run in CI. Status unaudited.
 Impact: two threads driving one direction's cursors is a data race on the shared
@@ -342,6 +380,7 @@ control page, which the transport's `try_receive` would surface as descriptor
 validation failure and quarantine at best, and as torn payload delivery at
 worst.
 Open questions:
+
 - Should `PreparedRing` carry a negative marker, or a compile-fail doctest like
   the two on `frame_channel::ReceiveLease` (`frame_channel.rs:296-308`), so the
   confinement is enforced rather than reviewed?
@@ -351,12 +390,13 @@ Open questions:
 Type: safety
 Reachability: default-production — the three producer call sites are on the
 host's publication path, which every activated connection runs:
-`ring_transport.rs:591` and `:604` are inside `publish_one` (`:541`), reached
-from `run_endpoint` (`:445`) and from the ingress-budget wait (`:505`), and
-`:670` is `RingClientEndpoint::send`, reached in production from
+`ring_transport.rs:615` and `:628` are inside `publish_one`'s helpers
+`publish_direct` (`:604`) and `publish_owned` (`:619`), reached from
+`run_endpoint` (`:479-484`) and from the charge wait (`:533-540`), and
+`:696` is inside `RingClientEndpoint::send` (`:684`), reached in production from
 `client.rs:1878` on the ordinary connect path. No `cfg` gate and no config gate
 stands on any of the three. The `Ring::release` end of the property is likewise
-production: `ring_release_callback` (`ring.rs:1255-1262`) runs on every lease
+production: `ring_release_callback` (`ring.rs:1670-1677`) runs on every lease
 drop.
 Status: active
 Exercised: not yet — no test asserts the absence, and the value is dropped at
@@ -366,15 +406,15 @@ Guarantee: No host or client producer path retains the `ReleaseIdentity`
 returned by `ProducerReservation::commit`, so `Ring::release` is never called
 with a producer-derived identity, and the producer-side half of Part 1's
 release contract stays unreachable.
-Check: `always` — `always(!X)` where X is "`Ring::release` (`ring.rs:849`) is
+Check: `always` — `always(!X)` where X is "`Ring::release` (`ring.rs:1175`) is
 entered with an identity that originated from `ProducerReservation::commit`
-(`ring.rs:1354`)". Discharged today by enumerating every `.commit(` site and
+(`ring.rs:1769`)". Discharged today by enumerating every `.commit(` site and
 showing each discards its `Ok` value; optionally backed by a
 `#[cfg(debug_assertions)]` counter on the producer-identity path that must stay
 at zero. **This record previously claimed `unreachable`, which was wrong and is
 corrected here.** `unreachable` is reserved for a code location that must never
 execute, and `Ring::release` executes on every lease drop in production, through
-`ring_release_callback` (`ring.rs:1255-1262`) carrying a lease-derived identity.
+`ring_release_callback` (`ring.rs:1670-1677`) carrying a lease-derived identity.
 What the property forbids is not the location but the *provenance of an
 argument* at a shared function, which is a state with no dedicated detection
 point, and METHOD.md's rule for that is `always(!X)`. The type moves from
@@ -387,15 +427,15 @@ Required faults and enabling state: none. The enumeration needs no fault. A
 runtime form needs only the debug counter and any connection that publishes.
 Confidence: high — [evidence](evidence/ring-a-no-producer-retains-a-committed-release-identity.md).
 Verified by enumerating every `.commit(` call in the tree: the three non-test
-producers are `ring_transport.rs:591`, `:604`, `:670`, all of which apply
-`map_err(..)?` and discard the `Ok` value; the inline tests `:856`, `:906`,
-`:943` and `tests/support/raw_client.rs:705`, `:750`, `:806` also discard it;
+producers are `ring_transport.rs:615`, `:628`, `:696`, all of which apply
+`map_err(..)?` and discard the `Ok` value; the inline tests `:935`, `:985`,
+`:1022` and `tests/support/raw_client.rs:698`, `:743`, `:799` also discard it;
 `contract_tests.rs:567` and `:600` call the unrelated
 `frame_channel::ProducerReservation::commit`, which returns `ProducedBody`. Also
 re-verified for this disposition: `commit` is
 `pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerError>`
-at `ring.rs:1354`, and `ring.rs:849` `Ring::release` is entered in production by
-`ring_release_callback` at `:1255-1262`.
+at `ring.rs:1769`, and `ring.rs:1175` `Ring::release` is entered in production by
+`ring_release_callback` at `:1670-1677`.
 Existing check: none.
 Impact: **Part 1's latency verdict on the producer-side release survives the
 refactor.** Part 1 judged `Ring::release`'s producer-facing form latent because
@@ -404,8 +444,9 @@ of those callers, and they still discard it. So Part 1's
 `release-authority-bound-to-lease-ownership` and
 `release-exactly-once-per-sequence` keep their reachability labels on the
 producer side, and no re-anchoring of the verdict is needed — only of the line
-numbers, from `shm_provider.rs:365` to `ring_transport.rs:591`/`:604`.
+numbers, from `shm_provider.rs:365` to `ring_transport.rs:615`/`:628`.
 Open questions:
+
 - Is the producer-side `ReleaseIdentity` return value intended to stay unused?
   If so, `#[must_use]` on `commit` is currently misleading, and the simpler
   contract would be for `commit` to return `()` and for identities to exist
@@ -426,12 +467,12 @@ clear owner and it does come back; peer-death teardown has an owner too
 (`connection.rs:195-207`). What is missing is the accounting distinction between
 a clean recycle and a condemned one, and whether that distinction should exist is
 a policy question this catalog does not settle. They share one mechanism, the
-`Admission` guard moved into the thread closure at `:256`.
+`Admission` guard moved into the thread closure at `:240`.
 
 ### ring-a-admission-charge-releases-on-every-endpoint-thread-exit
 
 Type: safety
-Reachability: default-production — `admit` (`ring_transport.rs:239`) runs on
+Reachability: default-production — `admit` (`ring_transport.rs:223`) runs on
 every `prepare`, and `prepare` runs on every authenticated connection
 (`connection.rs:148`). All five exit paths this record enumerates are on that
 same unconditional path; none is behind a `cfg` or a config gate.
@@ -450,23 +491,24 @@ Check: `always` — after the endpoint thread for a connection has terminated,
 controller has no sweeper, so the leak persists for the host's lifetime and
 each occurrence permanently lowers `max_connections`.
 Fault/timing angle: the interesting paths are the ones that exit *before* the
-`Admission` guard is consumed at `:291`. Two return early inside the closure:
-runtime or `DuplexRing::create` failure (`:264-270`) and `worker_descriptor`
-failure (`:272-275`). Both drop `admission` rather than calling `release()`, so
-correctness depends on `Admission`'s `Drop` (`profile.rs:581-586`) which
+`Admission` guard is consumed at `:276`. Two return early inside the closure:
+runtime or `DuplexRing::create` failure (`:249-255`) and `worker_descriptor`
+failure (`:256-259`). Both drop `admission` rather than calling `release()`, so
+correctness depends on `Admission`'s `Drop` (`profile.rs:581-586`; not re-swept
+post-#131) which
 releases when the state is still `Active`. A third path, `initialized_tx.send`
-failing at `:276-278`, likewise relies on `Drop`.
+failing at `:261-263`, likewise relies on `Drop`.
 Required faults and enabling state: one fault per path. `DuplexRing::create`
 failure needs shared-memory object creation to fail, reachable by exhausting
 `/dev/shm` or the fd limit. `worker_descriptor` failure needs
-`Ring::attachment()` to fail. Thread-spawn failure (`:294-296`) exits before
+`Ring::attachment()` to fail. Thread-spawn failure (`:279-281`) exits before
 `admit`'s guard leaves the caller, so it needs the guard's `Drop` on the
-`prepare` side. A panic inside `run_endpoint` needs the `catch_unwind` at `:279`
-to still reach `:291`.
+`prepare` side. A panic inside `run_endpoint` needs the `catch_unwind` at `:264`
+to still reach `:276`.
 Confidence: high — [evidence](evidence/ring-a-admission-charge-releases-on-every-endpoint-thread-exit.md).
 Verified by inspection: `Admission` carries an `AdmissionState`
 (`profile.rs:546-557`) and its `Drop` releases when `Active`
-(`profile.rs:581-586`); the explicit `release()` at `ring_transport.rs:291` is
+(`profile.rs:581-586`); the explicit `release()` at `ring_transport.rs:276` is
 outside the `catch_unwind`, so a panic inside `run_endpoint` still reaches it;
 `AdmissionController::release` (`profile.rs:512-520`) is a `checked_sub` that
 silently no-ops on underflow, so a double release cannot go negative but also
@@ -474,12 +516,14 @@ cannot be detected.
 Existing check: none in the 2b file set. `crates/mc-shm-transport/tests/contract.rs:472`
 covers `Admission::release` at the transport layer. Status unaudited.
 Impact: a stranded charge is permanent. Since `process_limits` multiplies the
-per-connection charge by `max_connections` (`ring_transport.rs:75-88`), one
+per-connection charge by the connection count — post-#131 additionally capped
+by `MAX_RING_RESIDENT_BYTES` (`ring_transport.rs:60-80`) — one
 stranded connection's worth of arena bytes permanently removes one connection
 slot, and the failure presents much later as `RingUnavailable` on an unrelated
 connect with `state: "healthy"` in diagnostics (see
 `ring-a-host-doctor-emits-one-of-five-declared-terminal-classes`).
 Open questions:
+
 - `AdmissionController::release` swallows a `checked_sub` underflow
   (`profile.rs:516-519`). Is a double release meant to be silent, or should it
   be a detectable accounting fault?
@@ -489,7 +533,7 @@ Open questions:
 Type: reachability
 Reachability: default-production for the release path this record contrasts
 against, and **compiled-with-no-production-caller** for the subject itself.
-`admission.release()` (`ring_transport.rs:291`) runs on every endpoint exit of
+`admission.release()` (`ring_transport.rs:276`) runs on every endpoint exit of
 every authenticated connection (`connection.rs:148`), with no gate.
 `Admission::quarantine` (`profile.rs:568`) is compiled into every host build
 because `mc-shm-transport` is a non-optional dependency, and it has **no caller
@@ -522,19 +566,19 @@ provenance at an *executed* function and this one's is a function that never
 executes. Resolving the bias decides this semantics choice.
 Fault/timing angle: the window that matters is a `Corrupt` exit. When
 `Ring::try_receive` fails descriptor validation it calls `enter_quarantine()`
-inside the transport (`ring.rs:808`), so the ring is terminally quarantined per
+inside the transport (`ring.rs:1098`), so the ring is terminally quarantined per
 Part 1's `quarantine-authority-survives-peer-writes`. The host maps that to
-`ReadClose::Corrupt` (`ring_transport.rs:467`), exits `run_endpoint` at
-`:404`, and still calls `admission.release()` at `:291`. The process-wide
+`ReadClose::Corrupt` (`ring_transport.rs:499`), exits `run_endpoint` at
+`:406-411`, and still calls `admission.release()` at `:276`. The process-wide
 accounting therefore shows the arena bytes as free while the ring that held
 them is condemned.
 Required faults and enabling state: a quarantined peer-to-host ring plus an
 inspection of `accounting().quarantined` afterwards. Two producers reach it, and
 the second is cheaper than this record originally recorded: a
-descriptor-validation failure inside `try_receive` (`ring.rs:808`), or a peer
-that calls the public `Ring::enter_quarantine` (`ring.rs:1034-1040`) directly on
+descriptor-validation failure inside `try_receive` (`ring.rs:1098`), or a peer
+that calls the public `Ring::enter_quarantine` (`ring.rs:1373-1378`) directly on
 the endpoint it already holds (`RingClientEndpoint.to_host` is a `pub` field,
-`ring_transport.rs:627-632`). See
+`ring_transport.rs:651-656`). See
 [ring-a-lease-release-failure-is-observable-only-on-the-success-path](#ring-a-lease-release-failure-is-observable-only-on-the-success-path).
 Confidence: high — [evidence](evidence/ring-a-host-never-quarantines-an-admission-charge.md).
 Verified by enumerating `Admission::quarantine` calls in the tree: the only two
@@ -543,11 +587,11 @@ grep over `crates/mc-host/src` at `HEAD` returns only unrelated hits: the
 `LeaseTracker` flag (`frame_channel.rs:392`, `:420-433`), two `instance.rs` doc
 comments (`:67`, `:250`), and one contract test on the tracker
 (`contract_tests.rs:690`). `RingTransport` holds no `Admission` value after
-`prepare` returns, because the guard moved into the thread closure at `:256`.
-Existing check: `ring_transport.rs:800` asserts
+`prepare` returns, because the guard moved into the thread closure at `:240`.
+Existing check: `ring_transport.rs:880` asserts
 `accounting.quarantined.arena_bytes == 0` on a fresh transport, which is the
 same value the property says can never change. A second assertion of the same
-fact is at `:774`. Status unaudited.
+fact is at `:855`. Status unaudited.
 Impact: the quarantine accounting that
 `docs/mc-host-shm-transport.md:21`, `:65`, and `:79` present as a live safety
 mechanism is inert on the host. Because the mapping is genuinely unmapped when
@@ -562,6 +606,7 @@ this record and
 can both be right, because one requires the charge to come back on every exit
 and the other asks whether a condemned ring is an exception.
 Open questions:
+
 - Was host-side quarantine accounting deliberately dropped with
   `provider_recovery.rs`, or lost? Part 1's
   `quarantine-charge-transition-is-atomic` cited
@@ -582,10 +627,10 @@ on the erasure of a cause that existed at the failure site.
 ### ring-a-publish-failure-is-reported-as-a-clean-peer-close
 
 Type: safety
-Reachability: default-production — `publish_one` (`ring_transport.rs:541`) is
-called from `run_endpoint` (`:445`) and from the ingress-budget wait (`:505`),
+Reachability: default-production — `publish_one` (`ring_transport.rs:560`) is
+called from `run_endpoint` (`:479-484`) and from the charge wait (`:533-540`),
 both on the endpoint thread every authenticated connection runs
-(`connection.rs:148`). `ShmReceiver::recv`'s `CleanEof` mapping (`:359`) and its
+(`connection.rs:148`). `ShmReceiver::recv`'s `CleanEof` mapping (`:354`) and its
 consumer (`connection.rs:401-404`) are on the same ungated path.
 Status: active
 Exercised: not yet — needs an outbound publication that fails while the
@@ -600,26 +645,27 @@ close disposition is a total function of the cause (Part 2a,
 `close-disposition-is-a-total-function-of-the-read-exit-cause`) and a
 misclassified cause silently selects the wrong teardown every time it occurs.
 Fault/timing angle: no interleaving is needed; the misreport is the
-straight-line behaviour. `run_endpoint:447-451` cancels `queue.retired` and
+straight-line behaviour. `run_endpoint:479-484` cancels `queue.retired` and
 `root` and returns without sending on `inbound`. Dropping the sender closes the
 channel, and `ShmReceiver::recv` maps a closed channel to
-`Err(ReadClose::CleanEof)` (`:359`), which `connection.rs:401-404` maps to
+`Err(ReadClose::CleanEof)` (`:354`), which `connection.rs:401-404` maps to
 `ReadExit::Peer` — a silent retirement with no terminals and no Goodbye
 (`connection.rs:309-315`). The one exception is a publish failure raised from
-inside the ingress-budget wait, which does return a distinguishable cause,
-`ReadClose::Corrupt("shared-memory publish failed")` (`:506-508`). So the same
+inside the charge wait, which does return a distinguishable cause,
+`ReadClose::Corrupt("shared-memory publish failed")` (`:535-537`). So the same
 fault classifies two different ways depending on which loop observed it.
 Required faults and enabling state: an outbound publish failure. Four
 mechanisms reach it: reservation deadline expiry under a full host-to-peer ring
-(`ring.rs:739`), a wire-header/length disagreement rejected by
-`commit_reservation` (`ring.rs:1176-1182`), a panic in the direct serializer
-caught at `:560-563`, and `ReservationWriter` exhaustion (`:612-617`). The
+(`reserve_until`, `ring.rs:980`, deadline exits at `:989`, `:1005`, `:1024`,
+`:1044`), a wire-header/length disagreement rejected by
+`commit_reservation` (`ring.rs:1577-1593`), a panic in the direct serializer
+caught at `:584-587`, and `ReservationWriter` exhaustion (`:635-643`). The
 cheapest to construct is a peer that attaches and then never receives, filling
 the host-to-peer ring until `reserve_until` hits its deadline.
 Confidence: high — [evidence](evidence/ring-a-publish-failure-is-reported-as-a-clean-peer-close.md).
-Verified by inspection: `publish_one` returns `Result<(), ()>` (`:541`), so
+Verified by inspection: `publish_one` returns `Result<(), ()>` (`:560-565`), so
 every distinct cause is erased to a unit before `run_endpoint` sees it; the
-`:447-451` block sends nothing; `:359` is the only `CleanEof` producer in the
+`:479-484` block sends nothing; `:354` is the only `CleanEof` producer in the
 crate; `connection.rs:401` is the only `CleanEof` consumer.
 Existing check: none. `connection.rs:401-404` is the consuming match, not a
 check.
@@ -630,18 +676,19 @@ queued frames (`connection.rs:315-318`), which is the correct handling for a
 peer-caused close but means a host-caused close also produces no terminal, so
 every pending correlation becomes `outcome_unknown` with no recorded reason.
 Open questions:
+
 - Should `publish_one` carry a cause enum rather than `()`? The information
-  exists at each of the four failure sites and is discarded at `:564-566`.
-- Is the asymmetry between `:506-508` (`Corrupt`) and `:447-451` (`CleanEof`)
+  exists at each of the four failure sites and is discarded at `:588-590`.
+- Is the asymmetry between `:535-537` (`Corrupt`) and `:479-484` (`CleanEof`)
   for the identical fault deliberate? (needs human input)
 
 ### ring-a-endpoint-thread-panic-is-reported-as-orderly-completion
 
 Type: safety
 Reachability: default-production — the unprotected window at
-`ring_transport.rs:563-576` is entered on every publication, and the hook that
-runs inside it at `:574` is the production `written` completion hook supplied
-through `frame_channel.rs:630` by `dispatch.rs`. The `PublishHook` at `:570` is
+`ring_transport.rs:587-600` is entered on every publication, and the hook that
+runs inside it at `:598` is the production `written` completion hook supplied
+through `frame_channel.rs:630` by `dispatch.rs`. The `PublishHook` at `:594` is
 test-only (reached only via `run_with_publish_hook`, `runtime.rs:641`, whose
 callers are `tests/support/mod.rs:597`, `:614`, `:650`), and it is named here as
 the cheapest injection point rather than as the record's subject.
@@ -653,17 +700,17 @@ Guarantee: A panic that escapes `run_endpoint` is distinguishable by the
 connection engine from an orderly endpoint exit, and the frame it was
 publishing is not left recorded as complete.
 Check: `always-or-unreached` — if the outer `catch_unwind` at
-`ring_transport.rs:279` observes `Err`, then the connection observes a cause
+`ring_transport.rs:264` observes `Err`, then the connection observes a cause
 other than a clean completion, and no `QueuedOutboundFrame` remains in state
 `COMPLETE` without having reached the ring. `always-or-unreached` fits because
 a panic on this thread is an optional path that a correct build never takes, but
 it must be safe when it does; `always` would overstate a requirement that the
 path be exercised.
-Fault/timing angle: the exposed window is between `:563` and `:576`. The inner
+Fault/timing angle: the exposed window is between `:587` and `:600`. The inner
 `catch_unwind` protects only the reserve-fill-commit block. A panic in the
-publish hook (`:570`), or in the `written` local-completion hook (`:574`),
-unwinds `publish_one` and `run_endpoint`, is swallowed by `let _ =` at `:279`,
-and then `admission.release()` (`:291`) and `done_tx.send(())` (`:292`) run
+publish hook (`:594`), or in the `written` local-completion hook (`:598`),
+unwinds `publish_one` and `run_endpoint`, is swallowed by `let _ =` at `:264`,
+and then `admission.release()` (`:276`) and `done_tx.send(())` (`:277`) run
 exactly as on an orderly exit. Neither `queue.retired` nor `root` is cancelled,
 so `FrameSender::send_ticket_before` keeps admitting frames until its own
 admission timeout fires (`frame_channel.rs:742-750`), and the `io` future
@@ -679,10 +726,10 @@ production one; `dispatch.rs` supplies it through `OutboundFrame::written`
 (`no-writer-hook-panic-poisons-a-generation-lock`); this is the ring thread, a
 different owner, and the panic there has no boundary at all.
 Confidence: high — [evidence](evidence/ring-a-endpoint-thread-panic-is-reported-as-orderly-completion.md).
-Verified by inspection: `:279` discards the `catch_unwind` result; the inner
-`catch_unwind` closes at `:563`; `:567` stores `COMPLETE` before the hooks run
-at `:568-575`; `panic_boundary::redact_sync` wraps only the direct serializer
-(`:586-589`) and not the hooks.
+Verified by inspection: `:264` discards the `catch_unwind` result; the inner
+`catch_unwind` closes at `:587`; `:591` stores `COMPLETE` before the hooks run
+at `:592-598`; `panic_boundary::redact_sync` wraps only the direct serializer
+(`:610-613`) and not the hooks.
 Existing check: none for the ring thread. `panic_boundary.rs` is Part 2a scope.
 Impact: the host loses its only transport thread and reports success. Frames
 admitted after the panic sit in the queue until each hits its admission
@@ -690,7 +737,8 @@ deadline, so the connection degrades over `frame_deadline` per frame rather than
 retiring, and diagnostics records nothing at all: no `peer_death`, no
 `exhaustion`, and `state: "healthy"`.
 Open questions:
-- Should `:567`'s `COMPLETE` store move after the hooks, or should the hooks
+
+- Should `:591`'s `COMPLETE` store move after the hooks, or should the hooks
   move inside the inner `catch_unwind`? The two answers differ on whether a
   hook panic should retire the connection.
 
@@ -698,14 +746,14 @@ Open questions:
 
 Type: safety
 Reachability: default-production — all five `Err(RingUnavailable)` returns are
-inside `prepare` (`ring_transport.rs:239-297`), which every authenticated
+inside `prepare` (`ring_transport.rs:217-303`), which every authenticated
 connection calls at `connection.rs:148`, and the refusal is consumed by the
 straight-line `let ... else` at `connection.rs:149-164`. `diagnostics()`
-(`:176-190`) is reached from the daemon's own status surface with no gate.
+(`:142-196`) is reached from the daemon's own status surface with no gate.
 Status: active
 Exercised: partial — the exhaustion sub-case is covered by
 `docs/mc-host-shm-transport.md:79`'s stated gate and is counted at
-`ring_transport.rs:240`; the other four causes are uncounted and untested.
+`ring_transport.rs:224`; the other four causes are uncounted and untested.
 Guarantee: When the ring cannot be prepared the host refuses the connection
 before any application frame can flow, and the refusal is attributable to a
 cause rather than presenting as an unexplained socket close.
@@ -724,7 +772,7 @@ timing wrinkle: `connection.rs:158-164` wraps `prepare` in `timeout_at`, and
 `spawn_blocking` work cannot be cancelled, so on timeout the blocking task
 continues, `prepare` succeeds, and the resulting `PreparedRing` is dropped
 inside the blocking task. Dropping a `CancellationToken` does not cancel it, so
-teardown falls to the mpsc-closure path at `:438`, and that path is only reached
+teardown falls to the mpsc-closure path at `:455-458`, and that path is only reached
 through the `select!`, which requires `receive_one` to have returned
 `Ok(false)`.
 Required faults and enabling state: one fault per cause. Admission exhaustion
@@ -735,14 +783,14 @@ needs shared-memory creation to fail. `worker_descriptor` failure needs
 handshake. The timeout path needs `prepare` to exceed
 `transport_setup_deadline`.
 Confidence: high — [evidence](evidence/ring-a-ring-unavailability-fails-closed-without-a-classified-reason.md).
-Verified by inspection: `RingUnavailable` (`:113-122`) is a unit struct with a
-fixed `Display` string and no cause field; only `:240` increments a counter;
+Verified by inspection: `RingUnavailable` (`:103-112`) is a unit struct with a
+fixed `Display` string and no cause field; only `:224` increments a counter;
 `connection.rs:149-164`'s `else` branch is a bare `return` that emits no
 `ServerMessage`, so the peer observes a closed setup socket and
 `activate_client` (`client.rs:367`) reports the generic
 `ClientError::new("setup_failed", ...)` at `client.rs:368`.
-Existing check: `ring_transport.rs:805` asserts
-`diagnostics["exhaustion"]["observed"] == 0` on a fresh transport. Nothing
+Existing check: `ring_transport.rs:884` asserts
+`diagnostics["exhaustion"]["observed"] == 0` on a transport with no admissions. Nothing
 covers the other four causes. Status unaudited.
 Impact: the host fails closed, which is the important half and holds. But four
 of five causes are invisible: a host that cannot create shared-memory objects at
@@ -750,6 +798,7 @@ all refuses every connection while reporting `state: "healthy"` with all five
 counters at zero, and the client sees only `setup_failed`. That is a silent
 total outage of the only datapath.
 Open questions:
+
 - Should `RingUnavailable` carry a closed cause class matching the doctor's
   five terminal classes (`docs/mc-host-shm-transport.md:53-59`)?
 - On the `prepare` timeout path, should the connection task cancel the ring it
@@ -793,8 +842,8 @@ release gate, so an operator reading the count as a witness of release draws a
 false conclusion.
 Fault/timing angle: the ordering holds on the normal path and breaks on one
 early return. Normally `serve_generation` awaits `io_task` at
-`connection.rs:347`; `io` is `done_rx.await` (`ring_transport.rs:301-303`) and
-`done_tx.send(())` runs at `:292`, after `admission.release()` at `:291`. So
+`connection.rs:347`; `io` is `done_rx.await` (`ring_transport.rs:286-288`) and
+`done_tx.send(())` runs at `:277`, after `admission.release()` at `:276`. So
 `record_reclamation` at `connection.rs:209` follows the release. But
 `connection.rs:273-276` returns from `serve_generation` without awaiting
 `io_task`, and `io_task` is an `AbortOnDropHandle` (`connection.rs:190`), so the
@@ -811,9 +860,9 @@ authenticated during the shutdown sequence.
 Confidence: high — [evidence](evidence/ring-a-reclamation-count-does-not-witness-charge-release.md).
 Verified by inspection: `connection.rs:208-209` places `record_reclamation`
 after the `serve_generation` await, and an inner `return` at `:275` still
-returns there; `AbortOnDropHandle` aborts on drop; `ring_transport.rs:291-292`
+returns there; `AbortOnDropHandle` aborts on drop; `ring_transport.rs:276-277`
 orders release before the done signal.
-Existing check: `ring_transport.rs:804` asserts
+Existing check: `ring_transport.rs:883` asserts
 `diagnostics["reclamation"]["completed"] == 1` after a direct
 `record_reclamation()` call, which exercises the counter and not the ordering.
 Status unaudited.
@@ -821,6 +870,7 @@ Impact: the exact metric a release gate would read as proof that charges came
 back can be incremented before they did. The gate would pass on a host that is
 in fact still holding the charge.
 Open questions:
+
 - Should `record_reclamation` move onto the endpoint thread, immediately after
   `admission.release()`, so the counter is release-witnessed by construction?
 
@@ -829,13 +879,13 @@ Open questions:
 Type: reachability
 Reachability: default-production for the host counters and the healthy arm; the
 terminal classification itself is **client-side production code**, not host
-code. `diagnostics()` (`ring_transport.rs:176-190`) is ungated, and the plugin
+code. `diagnostics()` (`ring_transport.rs:142-196`) is ungated, and the plugin
 path that classifies is `packages/plugin/src/shared/mc-host-client/shared-memory-failure.ts:10-30`
 reached from `packages/plugin/src/shared/mc-host-lifecycle/policy.ts:648-672`,
 neither behind a flag. See the `Check:` line for why that relocates the whole
 record.
 Status: active
-Exercised: partial — `ring_transport.rs:787-788` asserts the healthy shape end
+Exercised: partial — `ring_transport.rs:867-868` asserts the healthy shape end
 to end; no campaign drives the doctor to a terminal outcome in any of the five
 classes.
 Guarantee: A campaign reaches at least one end-to-end `daemon doctor` outcome in
@@ -856,7 +906,7 @@ an observed error into `SharedMemoryTerminalClass` (`types.ts:68-73`), and
 (`policy.ts:854-872`), which builds the entire terminal object including
 `error_class`, `bounds`, `peer_death`, and `exhaustion` without consulting the
 host at all. Exactly one of the five literals exists in Rust, `"setup_failure"`
-at `ring_transport.rs:187`, and it is the host's own poisoned-mutex arm rather
+at `ring_transport.rs:176`, and it is the host's own poisoned-mutex arm rather
 than a member of the client taxonomy. So `reachable` was location coverage over
 locations that do not exist. The five classes are **situations** — an addon that
 will not load, an identity that does not match, a setup that failed, a peer that
@@ -872,16 +922,19 @@ Required faults and enabling state: one condition per class, and they do not
 share a mechanism. `missing_addon` needs a load that fails to find the packaged
 addon, which is 2c's S6 and is structurally suppressed in CI by `ci.yml:193`'s
 `build:source`. `identity_mismatch` needs a `connect_setup` failure carrying
-that message (`packages/mc-shm-native/src/lib.rs:579-587`, with the message
-itself at `:583`). `setup_failure` is the classifier's default arm and is
+that message. PR #131 split `mc-shm-native`'s `lib.rs` into `lifecycle`,
+`napi_buffers`, `scheduling`, and `setup` modules; the pre-merge citation
+`lib.rs:579-587` now lands in `RingGrant` decode code, and the identity check
+lives at `packages/mc-shm-native/src/setup.rs:229`, with the message itself
+built at `setup.rs:413-416`. `setup_failure` is the classifier's default arm and is
 reachable from any other native startup failure. `peer_death` needs an `ECONNRESET`, `EPIPE`, or unexpected-EOF error
 from a peer that died, which the coarse kill harness already produces. And
 `resource_exhaustion` needs a `memory_cap` code or a capacity message, which
-admission exhaustion produces at `ring_transport.rs:239-242`.
+admission exhaustion produces at `ring_transport.rs:223-226`.
 Confidence: high — [evidence](evidence/ring-a-host-doctor-emits-one-of-five-declared-terminal-classes.md).
 Verified by grepping the five literals across `crates` and `packages` and then
 reading the client path end to end for this disposition: `"setup_failure"`
-appears in Rust only at `ring_transport.rs:187`; the other four appear only in
+appears in Rust only at `ring_transport.rs:176`; the other four appear only in
 TypeScript, at
 `packages/plugin/src/shared/mc-host-client/types.ts:68-73` and
 `shared-memory-failure.ts:14-30`. `policy.ts:669-671` calls
@@ -891,11 +944,13 @@ TypeScript, at
 `peer_death.observed` and `exhaustion.observed` from the class it was handed. So
 the terminal shape is not a host projection at all. `peer_death` and
 `resource_exhaustion` do exist host-side, but only as counters
-(`ring_transport.rs:203`, `:205`), and `state` stays `"healthy"` while
+(`ring_transport.rs:191`, `:193`), and `state` stays `"healthy"` while
 `exhaustion.observed` is non-zero because the host `match` keys on
 `accounting()` alone.
-Existing check: `ring_transport.rs:787-805` covers the host's healthy branch and
-all five counters, and it is a host-side check that cannot reach the client
+Existing check: `ring_transport.rs:859-897` covers the host's healthy branch and
+its lifecycle counters — four post-#131, since `record_attachment` and the
+`attachment` field were removed with the eventfd rewrite — and it is a
+host-side check that cannot reach the client
 taxonomy at all. On the client side,
 `packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts:47-58`
 `shared-memory failures collapse to five terminal diagnostic classes` reaches
@@ -914,11 +969,12 @@ classifier only ever sees a terminal condition when its *own* call fails. A host
 that is unhealthy but still answering produces no terminal class from either
 side.
 Open questions:
+
 - The five-class taxonomy is the client's, and the doc attributes it to
   `magic-context daemon doctor`. Should the host's `diagnostics()` also derive a
   class from its own counters, so an unhealthy-but-answering host is
   classifiable? Today `state` keys on `accounting()` alone
-  (`ring_transport.rs:176-190`) and no counter can move it. (needs human input)
+  (`ring_transport.rs:165-179`) and no counter can move it. (needs human input)
 
 ---
 
@@ -935,10 +991,10 @@ precondition of the first.
 ### ring-a-lease-release-failure-is-observable-only-on-the-success-path
 
 Type: safety
-Reachability: default-production — `receive_one` (`ring_transport.rs:455`) runs
+Reachability: default-production — `receive_one` (`ring_transport.rs:487`) runs
 on the endpoint thread of every authenticated connection, and all five
-lease-holding return points (`:477`, `:493`, `:499`, `:513`, `:524`) are on that
-ungated path. `ReceiveLease::Drop` (`lease.rs:215-221`) is likewise
+lease-holding return points (`:509`, `:525`, `:531`, `:539`, `:548`) are on that
+ungated path. `ReceiveLease::Drop` (`lease.rs:201-206` post-#131) is likewise
 unconditional.
 Status: active
 Exercised: not yet — needs a `release` that fails, which needs a quarantined or
@@ -952,46 +1008,48 @@ the underlying `Ring::release` returns `Err` then the invocation returns a
 `ReadClose` other than the cause it would have returned had the release
 succeeded. `always` fits because a lease that fails to release does not free
 its slot, so the loss is cumulative against `max_leases` = 8
-(`ring_transport.rs:50`) and eight silent failures wedge the direction.
-Fault/timing angle: the two explicit release calls (`:475-477` for the oversize
-rejection and `:522-524` on the delivery path) map `Err` to
+(profile-pinned post-#131; asserted at `ring_transport.rs:904`) and eight
+silent failures wedge the direction.
+Fault/timing angle: the two explicit release calls (`:507-509` for the oversize
+rejection and `:546-548` on the delivery path) map `Err` to
 `ReadClose::Corrupt("shared-memory completion failed")`. The three early
-returns that hold a lease do not: `Cancelled` at `:493`, `Overloaded` at
-`:499`, and `Cancelled` at `:513` all drop the lease, and
-`ReceiveLease::Drop` (`crates/mc-shm-transport/src/lease.rs:215-221`) calls
+returns that hold a lease do not: `Cancelled` at `:525`, `Overloaded` at
+`:531`, and `Cancelled` at `:539` all drop the lease, and
+`ReceiveLease::Drop` (`crates/mc-shm-transport/src/lease.rs:201-206`) calls
 `release_once` and discards its `Result`. So exactly the paths taken under
 cancellation and overload — the paths most likely to coincide with a stressed or
 quarantined ring — are the ones that cannot report a completion failure.
 Required faults and enabling state: a held lease **and** a release failure.
-`Ring::release` returns `Err` on quarantine (`ring.rs:850-851`), wrong incarnation
-(`:853-854`), wrong lane (`:856-857`), stale sequence (`:868-870`), and duplicate
-release (`lease.rs:200`). **Quarantine is reachable directly from the peer, and
+`Ring::release` returns `Err` on quarantine (`ring.rs:1176-1178`), wrong incarnation
+(`:1179-1181`), wrong lane (`:1182-1184`), stale sequence (`:1193-1196`), and duplicate
+release (`lease.rs:186`). **Quarantine is reachable directly from the peer, and
 this record previously said it was not.** The original text required "a peer that
 publishes a malformed descriptor" so `try_receive` would quarantine from inside
 the transport, and recorded that as unavailable. It is not the only route.
-`Ring::enter_quarantine` is a **public** method (`ring.rs:1034-1040`, in
+`Ring::enter_quarantine` is a **public** method (`ring.rs:1373-1378`, in
 `crates/mc-shm-transport/src/backend/ring.rs`) that stores the flag on the shared
 lifecycle page, and a peer already holds the ring it needs: `RingClientEndpoint`
-exposes `to_host` and `from_host` as `pub` fields (`ring_transport.rs:627-632`),
-and the existing fixture at `tests/support/raw_client.rs:644` attaches one and
-already reaches through those fields (`:698`, `:745`, `:788`). So the whole fault
+exposes `to_host` and `from_host` as `pub` fields (`ring_transport.rs:651-656`),
+and the existing fixture at `tests/support/raw_client.rs` attaches one and
+already reaches through those fields (`:691`, `:738`, `:781`). So the whole fault
 is `endpoint.to_host.enter_quarantine()` from the test peer, one line, no seam
 and no malformed producer. `Ring::release` checks `is_quarantined()` before any
-other validation (`ring.rs:850-851`), so the host's next release on that
+other validation (`ring.rs:1176-1178`), so the host's next release on that
 direction fails. Held-lease timing still needs the ingress-wait state below: park
 the host inside the budget wait with a lease held, quarantine from the peer, then
 let the wait exit on `Cancelled` or `Overloaded`.
 Confidence: high — [evidence](evidence/ring-a-lease-release-failure-is-observable-only-on-the-success-path.md).
-Verified by inspection: `receive_one`'s five return points that follow a
-successful `try_receive` are `:477`, `:484`, `:493`, `:499`, `:513`, `:521`,
-`:524`, `:532`, `:533`; of those, only `:477` and `:524` route a release error;
-`lease.rs:215-221` discards the drop-path `Result` with `let _ =`. Re-verified
-for this disposition: `pub fn enter_quarantine(&self)` at `ring.rs:1035` writes
+Verified by inspection: `receive_one`'s return points that follow a
+successful `try_receive` are `:509`, `:516`, `:525`, `:531`, `:536`, `:539`,
+`:545`, `:548`, `:556`, `:557`; of those, only `:509` and `:548` route a release
+error;
+`lease.rs:201-206` discards the drop-path `Result` with `let _ =`. Re-verified
+for this disposition: `pub fn enter_quarantine(&self)` at `ring.rs:1373` writes
 `quarantined` on the lifecycle page with `Ordering::Release`, `is_quarantined`
-reads it with `Ordering::Acquire` (`:1043-1049`), and both directions of one
+reads it with `Ordering::Acquire` (`:1381-1388`), and both directions of one
 duplex pair map the same object, so the peer's store is visible to the host's
 consumer.
-Existing check: `crates/mc-shm-transport/tests/ring.rs:256`
+Existing check: `crates/mc-shm-transport/tests/ring.rs:240`
 `quarantine_rejects_all_operations_and_reports_conservation` covers the
 transport-side `Err(Quarantined)` from `release`, not the host's handling of it.
 Status unaudited.
@@ -1000,7 +1058,7 @@ Impact: this is the host-side counterpart of Part 1's
 its host anchor at `shm_provider.rs:365`. That anchor is gone; the surviving
 host behaviour is the asymmetry above. Scoped correctly after investigation: all
 three untracked paths return an `Err(ReadClose::..)` that ends the read loop
-(`:404`), so a silent release failure always coincides with the connection
+(`:406-411`), so a silent release failure always coincides with the connection
 retiring and cannot accumulate across its life. What is lost is the signal that
 the ring was quarantined rather than merely overloaded, and that matters because
 `ReadClose::Overloaded`'s own doc comment (`frame_channel.rs:40-43`) asserts
@@ -1009,12 +1067,13 @@ the ring was quarantined rather than merely overloaded, and that matters because
 `ReadExit::Peer`, so the gap is latent and becomes live only if that taxonomy is
 split.
 Open questions:
+
 - Should the `Overloaded` and `Cancelled` paths release explicitly and upgrade a
   release failure to `Corrupt`? Investigation found this buys nothing until
   `connection.rs:401-404` stops collapsing the two causes into one `ReadExit`,
   so the two changes travel together or not at all.
 - A peer can condemn the shared ring unilaterally through the public
-  `Ring::enter_quarantine` (`ring.rs:1035`) while the host holds a lease. Is that
+  `Ring::enter_quarantine` (`ring.rs:1373`) while the host holds a lease. Is that
   intended peer authority, or should quarantine be host-initiated only? It is the
   cheapest route to this record's fault and simultaneously a capability the
   threat model may not want. (needs human input)
@@ -1023,16 +1082,20 @@ Open questions:
 
 Type: liveness
 Reachability: default-production — the `received == true` branch
-(`ring_transport.rs:409-415`) and the `select!` at `:422-442` are the endpoint
+(`ring_transport.rs:415-421`) and the `select!` at `:441-474` are the endpoint
 loop every authenticated connection runs, and `read_cancel` is a child token of
-the generation root created in `prepare` (`:243-244`) for every connection.
-`POLL_INTERVAL` (`:33`) and `frame_deadline` (`config.rs:224`, 30 seconds) both
-ship with defaults.
+the generation root created in `prepare` (`:227-228`) for every connection.
+`frame_deadline` (`config.rs:165`, 30 seconds) ships with a default.
 Status: active
 Exercised: partial — `budget_wait_observes_read_cancellation`
-(`ring_transport.rs:928-965`) covers cancellation observed *inside* the
-ingress-budget wait, which is the one path that does not need an empty
-observation. The main loop's path is uncovered.
+(`ring_transport.rs:1008-1043`) covers cancellation observed *inside* the
+ingress-charge wait, which is the one path that does not need an empty
+observation, and the post-#131 test
+`finish_wakes_after_read_cancellation_with_unread_peer_data` (`:809-846`)
+drives the main loop's report once: it cancels `read_cancel` on an empty ring,
+asserts the receiver observes `Err(ReadClose::Cancelled)`, then proves the
+finishing loop still wakes with unread peer data. Neither asserts the
+frame-count drain bound under sustained traffic.
 Guarantee: After the generation is cancelled and the peer stops publishing, the
 endpoint thread reports `ReadClose::Cancelled` and exits within a bounded number
 of further inbound frames, provided the connection task is still draining the
@@ -1044,91 +1107,106 @@ exited. Assert two bounds, both counted in frames rather than in wall-clock
 time. First, the thread performs at most `N + 1` further `receive_one`
 invocations, where `N` is the number of frames the peer committed before the
 cancellation edge: each committed frame costs one `Ok(true)` pass through
-`:409-415`, and the first empty observation returns `Ok(false)` and reaches the
-`read_cancel` check at `:394`. Second, no frame committed *after* the
-cancellation edge is forwarded on the inbound channel. `always` rather than
-`sometimes` because the assertion is a bound that must hold every time the
-window closes, not a state to reach.
-**The wall-clock half of this bound was invented and is withdrawn.** This record
-previously asserted exit "within one `POLL_INTERVAL` of the first empty inbound
-observation and within the connection's `frame_deadline` overall". Neither clause
-holds. `frame_deadline` bounds exactly one thing, the ingress-charge loop inside
-`receive_one` (`:487-500`: `let deadline = StdInstant::now() + frame_deadline` at
-`:487`, tested at `:495`, exiting `Overloaded` at `:499`). It bounds nothing else
-in the loop. In particular the cancellation report itself is an unbounded await:
-`:395-397` does `inbound.send(Err(ReadClose::Cancelled)).await` on a bounded
-`mpsc` channel of `queue_frames` capacity, and if the connection task is not
-draining, that send parks with no deadline. The two frame-delivery sends at
-`:478-482` and `:525-530` have the same shape. `POLL_INTERVAL` (`:33`) is the
-sleep in the *empty-queue* arm of the budget wait (`:511-514`) and of the main
-`select!` (`:442`), not a bound on reporting. So a wall-clock bound would be
-unrefutable in the generous direction and false in the strict one, which is
-exactly what METHOD.md's liveness rule forbids. The frame-count bound above is
-stated in the unit the code actually counts, and the residual wall-clock question
-is recorded as unresolved in the open questions rather than answered.
-Fault/timing angle: the whole property. `run_endpoint`'s `received == true`
-branch (`:409-415`) checks neither `discard`, `finish`, `root`, nor
-`read_cancel`; the `select!` at `:422-442` is the only observer and it is
-skipped whenever `receive_one` returned `Ok(true)`. `read_cancel` is checked
-only on the `Ok(false)` branch (`:394`) and inside the budget wait (`:492`,
-`:513`). The comment at `:429-435` documents this as intent: drain
-pre-cancellation frames, then report `Cancelled` "after the first empty
-observation". The consequence is that a peer that keeps the peer-to-host ring
+`:415-421`, and the first empty observation returns `Ok(false)` and reaches the
+`read_cancel` check at `:400`, which takes the `inbound` sender (`:401`) and
+sends `Cancelled` (`:402`). Second, no frame committed *after* the cancellation
+edge is forwarded on the inbound channel. `always` rather than `sometimes`
+because the assertion is a bound that must hold every time the window closes,
+not a state to reach.
+**Re-derived 2026-08-31 against the eventfd transport (PR #131), which removed
+`POLL_INTERVAL`.** The polling-era record had already withdrawn its invented
+wall-clock bound; the rewrite makes the frame-count unit the only honest one
+left, because the empty-ring wait is now event-driven rather than periodic.
+`frame_deadline` still bounds exactly one thing inside `receive_one`, now the
+charge wait: `let deadline = Instant::now() + frame_deadline` at `:519` is
+consumed by the `sleep_until` arm at `:527-532`, exiting `Overloaded` at
+`:531`. It bounds nothing else in the loop. The cancellation report itself is
+still an unbounded await: `:402` does
+`inbound.send(Err(ReadClose::Cancelled)).await` on a bounded `mpsc` channel of
+`queue_frames` capacity (`:230`), and if the connection task is not draining,
+that send parks with no deadline. The rejection and frame-delivery sends at
+`:510-515` and `:551-556` have the same shape. So the residual wall-clock
+question is unchanged by the rewrite and stays recorded as unresolved in the
+open questions.
+Fault/timing angle: the drain-before-report design survived the rewrite. The
+`received == true` branch (`:415-421`) checks neither `discard`, `finish`,
+`root`, nor `read_cancel`; `read_cancel` is observed in exactly three places:
+the `Ok(false)` branch (`:400-404`), the biased `select!` arm at `:448-454`
+(whose comment restates the intent: re-enter the receive path once, drain
+frames committed before the cancellation edge, then report `Cancelled` "after
+the first empty observation"), and the charge wait inside `receive_one`
+(`:525`). The consequence is unchanged: a peer that keeps the peer-to-host ring
 non-empty defers the cancellation report for as long as it keeps publishing.
-The escape hatch is that the host also stops draining: once the connection task
-drops the `BoxedReceiver`, `inbound.send` fails and `receive_one` returns
-`Cancelled` (`:483`, `:532`). So the true bound is "until the inbound channel
-closes or the ring goes empty", not "until cancellation". And when the channel
-neither closes nor drains, the report blocks on `:395-397` instead, which is the
-third case and the one with no bound at all.
+What the rewrite changed is the empty-ring wait. Instead of sleeping
+`POLL_INTERVAL`, the loop arms the transport's wake protocol
+(`rings.second.arm_data_wait()` at `:429`, `ring.rs:828-854`) and parks on the
+duplicated doorbell descriptor (`duplicate_data_ready` wrapped in an `AsyncFd`
+at `:371-380`; the `readiness.readable()` arm at `:459-471` clears readiness
+and calls `complete_data_wait`). The wake protocol is the new timing surface:
+`arm_data_wait` publishes a parked epoch and re-checks data availability before
+returning `true`, and the producer's `signal_wake` (`ring.rs:1418-1432`) rings
+the doorbell only when a parked epoch is visible, so a frame committed between
+the host's arm and its park is delivered by the doorbell rather than lost. A
+lost or racing wake would not defer the cancellation *report* — the
+`read_cancel.cancelled()` arm is a `CancellationToken`, not an eventfd, and the
+post-cancellation drain calls `try_receive` directly (`:496-498`) — but it
+would strand committed pre-cancellation frames the drain contract says to
+deliver. That failure mode is new with #131 and is covered in the evidence
+file's failure scenario.
 Required faults and enabling state: an attached peer publishing continuously,
-enough ingress budget that each `try_charge` succeeds immediately, and a
-cancellation of `root` or `read_cancel` from the host side while that traffic
-continues. `connection.rs:199-204`'s peer-death handler is one natural trigger,
-since it cancels `peer_gen.token` — which is `root` — while frames may still be
-queued in the ring. Closing the window additionally needs the peer to stop
-publishing, which is a fixture choice, and the connection task to keep draining,
-which is the assumption the bound is conditional on.
+enough ingress budget that each `charge` future (`:520-521`) resolves
+immediately, and a cancellation of `root` or `read_cancel` from the host side
+while that traffic continues. `connection.rs:183-189`'s peer-death handler is
+one natural trigger, since it cancels `peer_gen.token` — the ring's `root` —
+while frames may still be queued in the ring. Closing the window additionally
+needs the peer to stop publishing, which is a fixture choice, and the
+connection task to keep draining, which is the assumption the bound is
+conditional on.
 Confidence: medium — [evidence](evidence/ring-a-cancellation-close-requires-an-empty-inbound-observation.md).
-The code structure is verified by inspection and the intent is stated in the
-comment at `:429-435`. Re-verified for this disposition: `frame_deadline` is
-consumed only at `:487-500` inside `receive_one` and at `publish_one`'s own
-reservation deadline, and all three `inbound.send(..).await` sites (`:395-397`,
-`:478-482`, `:525-530`) are undeadlined. What I did not verify is the exact
-behaviour of `read_loop` under cancellation, so I cannot state whether the host
-reliably stops draining and closes the inbound channel promptly; that is why
-this is medium and not high, and it is the first open question below.
-Existing check: `ring_transport.rs:928-965`
-`budget_wait_observes_read_cancellation` covers only the budget-wait path, and
-`mc-host` inline tests do not run in CI. Status unaudited.
+The code structure is verified by inspection at post-#131 HEAD and the intent
+is stated in the comment at `:449-453`. Re-verified for this pass:
+`frame_deadline` is consumed only at `:519` and `:527-532` inside `receive_one`
+and at `publish_one`'s own reservation deadline (`:583`), and all three
+`inbound.send(..).await` sites (`:402`, `:510-515`, `:551-556`) are
+undeadlined. What I did not verify is the exact behaviour of `read_loop` under
+cancellation, so I cannot state whether the host reliably stops draining and
+closes the inbound channel promptly; that is why this is medium and not high,
+and it is the first open question below.
+Existing check: `ring_transport.rs:1008-1043`
+`budget_wait_observes_read_cancellation` covers the charge-wait path, and
+`:809-846` `finish_wakes_after_read_cancellation_with_unread_peer_data` covers
+the empty-ring report plus the post-cancellation finishing wake. `mc-host`
+inline tests do not run in CI. Status unaudited.
 Impact: a cancelled generation's endpoint thread can keep consuming and
 forwarding peer frames after the close decision. Since the charge is released
-only when the thread exits (`:291`), a peer that floods during teardown extends
-the window in which a retiring connection still holds its full admission charge,
-which is exactly the pressure that turns an ordinary retirement into
+only when the thread exits (`:276`), a peer that floods during teardown extends
+the window in which a retiring connection still holds its full admission
+charge, which is exactly the pressure that turns an ordinary retirement into
 `RingUnavailable` for the next connect.
 Open questions:
+
 - Does `read_loop` stop draining the inbound channel promptly on
   `read_cancel`, closing the channel and bounding this window? That is in
   Part 2a's `connection.rs` scope and I did not resolve it. Until it is resolved,
   the case where the channel neither closes nor drains has **no bound at all**:
-  the `Cancelled` report parks on `inbound.send(..).await` at `:395-397`. That
+  the `Cancelled` report parks on `inbound.send(..).await` at `:402`. That
   residual is recorded as unresolved rather than given a wall-clock stand-in.
 - Should the `received == true` branch check `root.is_cancelled()`, at the cost
   of dropping frames the current comment deliberately drains?
 - Should the three `inbound.send(..).await` sites carry a deadline, so a report
-  cannot outlive the generation that produced it? Today only the ingress-charge
-  loop is deadlined (`:487-500`).
+  cannot outlive the generation that produced it? Today only the charge wait is
+  deadlined (`:519`, `:527-532`).
 
 ### ring-a-ingress-wait-holds-a-lease-while-servicing-egress
 
 Type: reachability
-Reachability: default-production — the budget-wait loop
-(`ring_transport.rs:488-518`) is entered whenever `try_charge` fails against the
-process-wide `ByteBudget` built at `runtime.rs:896-902` and cloned into every
-connection at `connection.rs:144`. The budget is derived from
-`max_resident_bytes` with shipped defaults, so no opt-in is needed to reach the
-loop; sustained ingress pressure is sufficient.
+Reachability: default-production — the charge wait
+(`ring_transport.rs:519-542`) is entered whenever `ingress.charge(header.len)`
+(`:520`) cannot resolve immediately against the process-wide `ByteBudget` built
+at `runtime.rs:761-767` and cloned into every connection at
+`connection.rs:113`. The budget is derived from `max_resident_bytes` with
+shipped defaults, so no opt-in is needed to reach the wait; sustained ingress
+pressure is sufficient.
 Status: active
 Exercised: not yet — no test holds a lease across a saturated ingress budget
 while an outbound frame is published from inside that wait.
@@ -1136,51 +1214,65 @@ Guarantee: The state in which one receive lease is held across a saturated
 ingress-budget wait while the same loop publishes a queued outbound frame occurs
 at least once.
 Check: `sometimes` — at least once per campaign, observe both preconditions
-jointly: `receive_one` is inside the loop at `:488-518`, meaning a lease is held
-and `try_charge` has failed at least once; and the publish branch at `:504-509`
-executed during that same invocation. `sometimes` rather than `reachable`
-because executing those lines is not the point: a campaign can run the
-budget-wait branch and the publish-from-wait branch in separate invocations
+jointly: `receive_one` is parked inside the charge `select!` at `:522-542`,
+meaning a lease is held (bound at `:496-501`) and the `charge` future
+(`:520-521`) has been polled pending at least once; and the publish arm at
+`:533-540` executed during that same invocation. `sometimes` rather than
+`reachable` because executing those lines is not the point: a campaign can run
+the charge-wait branch and the publish-from-wait branch in separate invocations
 without ever producing the operational state in which they coincide. Per the
 METHOD coverage rule this asserts the independent preconditions, not a
 violation, so the marker still fires on a correct implementation.
+**Re-derived 2026-08-31 against the eventfd transport (PR #131), which removed
+`POLL_INTERVAL`.** The wait is no longer a 50-microsecond poll loop over
+`try_charge`: `ByteBudget::charge` (`wire.rs:397-407`) queues on a tokio
+semaphore and resolves when another holder's `ByteCharge` drops, so the wait
+parks instead of spinning, and the third polling-era precondition (covering the
+`POLL_INTERVAL` sleep on a second, empty-queue iteration) no longer exists.
 Fault/timing angle: this is the state where the ingress budget and the outbound
 deadline interact. The ingress budget is process-wide, a single `ByteBudget`
-built at `runtime.rs:896-902` and cloned into every connection at
-`connection.rs:144`, so pressure originating elsewhere in the host stalls this
-receive. The comment at `:501-503` states the design response: the wait services
-queued outbound frames so "a slow ingress drain holds only this receive, not the
-connection's sends, which would otherwise miss their deadlines behind it". The
-wait can run for the full `frame_deadline` before the `Overloaded` exit at
-`:495-500`, polling every `POLL_INTERVAL` (`:33`, 50 microseconds) when the
-outbound queue is empty. Scoped after investigation: an earlier draft also
-required `active_leases == max_leases` on the peer-to-host direction. That is
-unreachable and the clause is dropped. `receive_one` holds at most one lease at
-a time, every return path releases or drops it, and `run_endpoint` calls
-`receive_one` serially, so the host's contribution to `active_leases` is bounded
-by one against a budget of eight (`:32`, `:50`).
-Required faults and enabling state: an ingress budget too small for the frame in
-hand, so `try_charge` fails at least once; and at least one queued outbound
-frame at the moment the loop polls, so `:504-509` runs. A second iteration with
-an empty queue additionally covers the `POLL_INTERVAL` sleep at `:514`.
+built at `runtime.rs:761-767` from `config.limits.max_resident_bytes` minus the
+egress, scratch, catalog, and retained reservations, and cloned into every
+connection at `connection.rs:113`, so pressure originating elsewhere in the
+host stalls this receive. The `select!` at `:522-542` is biased: `read_cancel`
+first (`:525`, exiting `Cancelled`), then the `charge` future, then the
+absolute deadline (`:527-532`, `sleep_until` on the `Instant` taken at `:519`,
+exiting `Overloaded` at `:531`), then queued outbound frames through
+`queue.recv()` (`:533-540`), whose publish failure exits
+`Corrupt("shared-memory publish failed")` at `:536`. The polling-era comment
+that justified servicing egress from inside the wait was removed with the
+rewrite; the surviving statement of the same intent is `run_endpoint`'s
+alternation comment at `:416-420`. Scoped after investigation: an earlier draft
+also required `active_leases == max_leases` on the peer-to-host direction. That
+is unreachable and the clause is dropped. `receive_one` holds at most one lease
+at a time, every return path releases or drops it, and `run_endpoint` calls
+`receive_one` serially, so the host's contribution to `active_leases` is
+bounded by one against a budget of eight — pinned post-#131 by the profile
+rather than by file-local constants, and asserted by
+`ring_profile_pins_per_connection_grant_geometry` (`:901-907`).
+Required faults and enabling state: an ingress budget too small for the frame
+in hand, so the `charge` future stays pending; and at least one queued outbound
+frame while it is pending, so `:533-540` runs. No fault at all: both are
+fixture parameters.
 Confidence: high — [evidence](evidence/ring-a-ingress-wait-holds-a-lease-while-servicing-egress.md).
-Verified by inspection: the lease is bound at `:464` and not released until
-`:524`, so it is live for the whole `:488-518` loop; the publish-from-wait
-branch is `:504-509`; the deadline exit is `:495-500`; `run_endpoint` calls
-`receive_one` serially at `:380-391`, and every `receive_one` return path
-releases or drops its lease.
+Verified by inspection at post-#131 HEAD: the lease is bound at `:496-501` and
+not released until `:546-548`, so it is live for the whole `:519-542` wait; the
+publish-from-wait arm is `:533-540`; the deadline exit is `:527-532`;
+`run_endpoint` calls `receive_one` serially at `:386-397`, and every
+`receive_one` return path releases or drops its lease.
 Existing check: two inline tests are each one precondition short.
-`copied_control_frame_records_one_host_adapter_copy` (`:881-926`) uses
-`ByteBudget::new(1024)` (`:915`), so the loop is never entered.
-`budget_wait_observes_read_cancellation` (`:928-965`) uses `ByteBudget::new(0)`
-(`:949`) and does enter it, but its sender queue is empty (`:944-945`), so
-`:504-509` never runs. Neither runs in CI. Status unaudited.
+`copied_control_frame_records_one_host_adapter_copy` (`:961-1005`) uses
+`ByteBudget::new(1024)` (`:994`), so the charge resolves immediately and the
+wait is never entered. `budget_wait_observes_read_cancellation` (`:1008-1043`)
+uses `ByteBudget::new(0)` (`:1028`) and does park in the wait, but its sender
+queue is empty (`:1024-1026`), so `:533-540` never runs. Neither runs in CI.
+Status unaudited.
 Impact: if this state is never reached, three mechanisms are untested together.
-The `Overloaded` exit at `:495-500`, whose `ReadClose::Overloaded` doc
+The `Overloaded` exit at `:527-532`, whose `ReadClose::Overloaded` doc
 (`frame_channel.rs:40-43`) asserts "the peer and the transport are healthy" — an
-assertion this record's window can falsify. The outbound servicing the comment
-at `:501-503` justifies. And the longest window in which host code holds a
-reference into shared storage, which is where Part 1's
+assertion this record's window can falsify. The outbound servicing whose intent
+the alternation comment at `:416-420` states. And the longest window in which
+host code holds a reference into shared storage, which is where Part 1's
 `quarantine-authority-survives-peer-writes` scenario has the most room. It is
 also the enabling state for
 `ring-a-lease-release-failure-is-observable-only-on-the-success-path` and for
@@ -1188,10 +1280,11 @@ observing the `Corrupt`-versus-`CleanEof` asymmetry in
 `ring-a-publish-failure-is-reported-as-a-clean-peer-close`, so leaving it
 unreached leaves both unfalsifiable.
 Open questions:
+
 - Should `receive_one` distinguish "ring empty" from "leases saturated"? Both
-  arrive as `Ok(None)` from `try_receive` (`ring.rs:770-778`, `:783-785`) and
-  both collapse to `Ok(false)` at `:468-470`. Investigation found this is moot
-  under the current single-active-lease design and would matter only for a
+  arrive as `Ok(None)` from `try_receive` (`ring.rs:1063-1068`, `:1073-1074`)
+  and both collapse to `Ok(false)` at `:500-501`. Investigation found this is
+  moot under the current single-active-lease design and would matter only for a
   concurrently-leasing consumer, so it is a latent API gap rather than a live
   one.
 
@@ -1252,6 +1345,7 @@ promise is satisfied vacuously, since there is no separate body to truncate,
 but the engine still carries the machinery that would have honoured it. The
 risk is not a current defect; it is that the dead arm looks like coverage.
 Open questions:
+
 - Should `RejectedDrainFailed` and `Io` be removed, or retained for a future
   transport? Removing them would make Part 2a's drain records genuinely closed
   rather than superseded.
@@ -1261,7 +1355,7 @@ Open questions:
 Type: reachability
 Reachability: **compiled with no production producer.** Stated rather than
 defaulted. The host inbound path is `default-production` and always takes the
-`owned` constructor (`ring_transport.rs:528`). The subject,
+`owned` constructor (`ring_transport.rs:552`). The subject,
 `InboundFrame::segmented` (`frame_channel.rs:477`), has zero call sites
 tree-wide including tests, so `ReceiveBody::Segmented` (`:448`) is
 unconstructible and `decode_contiguous`'s `None` arm (`connection.rs:586`) is
@@ -1279,19 +1373,19 @@ screen would assert.
 Fault/timing angle: none. Static producer enumeration. The interesting
 consequence is that a body wrapping the arena end is copied twice on the peer
 side of the in-process client (`client.rs:1878` charges then
-`try_recv_with` calls `lease.to_vec()` at `ring_transport.rs:706`) and once on
+`try_recv_with` calls `lease.to_vec()` at `ring_transport.rs:735`) and once on
 the host side, and neither ever takes the segmented path.
 Required faults and enabling state: for the segmented path to matter at all, a
 body whose descriptor spans two arena ranges, which the transport produces when
-`span_count == 2` (`ring.rs:816-823`). That is reachable: it needs a body that
+`span_count == 2` (`ring.rs:1105-1112`). That is reachable: it needs a body that
 straddles the arena wrap point. But `receive_one` collapses it with
-`lease.to_vec()` (`:519`) before the host ever sees the span structure.
+`lease.to_vec()` (`:544`) before the host ever sees the span structure.
 Confidence: high — [evidence](evidence/ring-a-segmented-inbound-body-has-no-production-producer.md).
 Verified by grepping: `InboundFrame::segmented` has zero call sites in the
 tree, including tests. `ReceiveBody::Segmented` (`frame_channel.rs:448`) is
 therefore unconstructible, so `with_lease` (`:506-513`) always takes the
 `Owned` arm and `decode_contiguous`'s `None` arm (`connection.rs:586`) is dead.
-`ring_transport.rs:528` is the only `InboundFrame` constructor call on the
+`ring_transport.rs:552` is the only `InboundFrame` constructor call on the
 host path and it uses `owned`.
 Existing check: `frame_channel/contract_tests.rs:141` calls `with_lease` and
 asserts `lease.segment(0)`, on a hand-built frame. Status unaudited.
@@ -1304,6 +1398,7 @@ descriptor and header before exposing a scoped lease", which is true of the
 transport but not of the host boundary: the host exposes a lease over its own
 copy.
 Open questions:
+
 - Is the segmented path intended to return, or should
   `InboundFrame::segmented`, `ReceiveBody::Segmented`, and
   `frame_channel::LeaseTracker` be deleted together? `LeaseTracker`
@@ -1327,9 +1422,9 @@ these records.
   [ring-a-host-never-quarantines-an-admission-charge](#ring-a-host-never-quarantines-an-admission-charge),
   [ring-a-reclamation-count-does-not-witness-charge-release](#ring-a-reclamation-count-does-not-witness-charge-release),
   [ring-a-cancellation-close-requires-an-empty-inbound-observation](#ring-a-cancellation-close-requires-an-empty-inbound-observation).
-  All four turn on `admission.release()` at `ring_transport.rs:291` being the
+  All four turn on `admission.release()` at `ring_transport.rs:276` being the
   single point where the charge comes back, and on that line sitting outside the
-  `catch_unwind` at `:279-290`. That line is an owner, not an absence: the charge
+  `catch_unwind` at `:264-275`. That line is an owner, not an absence: the charge
   returns on every exit including a swallowed panic. The release record is about
   whether it returns on *every* path, the quarantine record about whether
   returning it is even the right answer for a condemned ring, the reclamation
@@ -1352,10 +1447,10 @@ these records.
   [ring-a-host-doctor-emits-one-of-five-declared-terminal-classes](#ring-a-host-doctor-emits-one-of-five-declared-terminal-classes).
   This is one finding attacked from four sides, and it is the cluster an operator
   would feel first. `publish_one` erases four distinct failure causes to `()`
-  (`:541`, discarded at `:564-566`); the outer `catch_unwind` erases a panic with
-  `let _ =` (`:279`); `RingUnavailable` is a unit struct with no cause field
-  (`:114-122`); and `diagnostics()` has two arms and no counter can move `state`
-  off `"healthy"` (`:176-190`), so the client classifier that owns the five-class
+  (`:560-565`, discarded at `:588-590`); the outer `catch_unwind` erases a panic
+  with `let _ =` (`:264`); `RingUnavailable` is a unit struct with no cause field
+  (`:103-112`); and `diagnostics()` has two arms and no counter can move `state`
+  off `"healthy"` (`:165-179`), so the client classifier that owns the five-class
   taxonomy only ever sees a terminal condition when its own call fails.
   Hypothesis: giving `RingUnavailable` and `publish_one` a shared cause enum,
   surfaced through `diagnostics()`, would dominate all four, because each
@@ -1371,14 +1466,14 @@ these records.
   held across a saturated budget while an outbound frame publishes is the
   enabling state for observing a release failure on a cancellation or overload
   path, and it is also where the `Corrupt`-versus-`CleanEof` asymmetry becomes
-  observable, because `:506-508` is the one publish-failure site that returns a
+  observable, because `:535-537` is the one publish-failure site that returns a
   distinguishable cause. Hypothesis: constructing the ingress-wait state
   *dominates* the enabling half of the other two, in the specific sense that
   neither is falsifiable until it exists. It does not dominate their oracles: a
   release failure additionally needs a quarantined ring. That is now known to be
   cheap rather than blocked — a peer calls the public `Ring::enter_quarantine`
-  (`ring.rs:1035`) through `RingClientEndpoint`'s `pub` ring fields
-  (`ring_transport.rs:627-632`) — so the two records compose into one fixture
+  (`ring.rs:1373`) through `RingClientEndpoint`'s `pub` ring fields
+  (`ring_transport.rs:651-656`) — so the two records compose into one fixture
   rather than two capabilities.
 - **Ownership as the premise, not a finding.**
   [ring-a-endpoint-thread-solely-owns-both-ring-endpoints](#ring-a-endpoint-thread-solely-owns-both-ring-endpoints),
@@ -1462,9 +1557,9 @@ before it hands anything to the host. `wire::decode_header` (`wire.rs:306`) is a
 different function in a different crate over a different byte layout: the 21-byte
 envelope header two hosts exchange, whose frozen prefix is specified at
 `wire.rs:16-18` and whose eleven gates are listed in the first record below. The
-two families meet at exactly one line, `ring_transport.rs:471`, where
+two families meet at exactly one line, `ring_transport.rs:503`, where
 `decode_header` is handed the `[u8; 21]` that `Lease::wire_header`
-(`crates/mc-shm-transport/src/lease.rs:163`) returns *after* the transport's own
+(`crates/mc-shm-transport/src/lease.rs:152` post-#131) returns *after* the transport's own
 decoder has already validated the descriptor. Verified at carry time:
 `WIRE_V2_HEADER_BYTES` is 21 (`crates/mc-shm-transport/src/descriptor.rs:10`)
 and `wire::HEADER_LEN` is 21 (`wire.rs:28`), so the two layouts are the same
@@ -1475,11 +1570,11 @@ other would double-count in the wrong direction.
 
 **Reachability for all four rests on one chain, re-verified at carry time
 rather than inherited.** `decode_header` has three production call sites and one
-behind a test-only hook. Production: `ring_transport.rs:471` in `receive_one`,
-paired with `validate_inbound_header` at `:473`; `ring_transport.rs:701` in
-`RingClientEndpoint::try_recv_with`; and `client.rs:1908` in `decode_outbound`.
-The fourth, `ring_transport.rs:569`, is inside the `if let Some(hook)` branch at
-`:568` and so is reached only through the test-only `PublishHook` this catalog
+behind a test-only hook. Production: `ring_transport.rs:503` in `receive_one`,
+paired with `validate_inbound_header` at `:505`; `ring_transport.rs:730` in
+`RingClientEndpoint::try_recv_with`; and `client.rs:1978` in `decode_outbound`.
+The fourth, `ring_transport.rs:593`, is inside the `if let Some(hook)` branch at
+`:592` and so is reached only through the test-only `PublishHook` this catalog
 already labels. The ungated chain under the first of those is the one this
 sub-part established against three misleading signals, in
 [Reachability is `default-production`, and three signals argued
@@ -1515,14 +1610,14 @@ allocator cannot mint an epoch-0 handle.
 
 Type: safety
 Reachability: default-production — `decode_header` (`wire.rs:306`) has three
-production call sites, all on ungated paths: `ring_transport.rs:471` in
-`receive_one`, `ring_transport.rs:701` in `RingClientEndpoint::try_recv_with`,
-and `client.rs:1908` in `decode_outbound`. The first is under the chain this
+production call sites, all on ungated paths: `ring_transport.rs:503` in
+`receive_one`, `ring_transport.rs:730` in `RingClientEndpoint::try_recv_with`,
+and `client.rs:1978` in `decode_outbound`. The first is under the chain this
 catalog established against three misleading signals: `RingTransport` built
 unconditionally at `runtime.rs:876`, stored non-optionally at `:104`,
 `ring.prepare` called by every authenticated connection at `connection.rs:148`.
-A fourth call site, `ring_transport.rs:569`, is inside the test-only
-`PublishHook` branch at `:568` and is not counted. Neither `#[cfg]` in the file
+A fourth call site, `ring_transport.rs:593`, is inside the test-only
+`PublishHook` branch at `:592` and is not counted. Neither `#[cfg]` in the file
 (`:541`, `:646`) is on this path.
 Status: active
 Exercised: partial — `wire.rs:722-742` covers three specific short and
@@ -1566,10 +1661,10 @@ second test's span is `:745-774`, not `:745-773`; the closing brace is at 774
 and the lens range truncated it by one line.
 Impact: today, none observable, and the reason was refreshed at carry time. All
 three production callers pass an exactly-21-byte array, not a variable-length
-slice: `ring_transport.rs:471` and `:701` pass `&lease.wire_header()`, typed
+slice: `ring_transport.rs:503` and `:730` pass `&lease.wire_header()`, typed
 `[u8; WIRE_V2_HEADER_BYTES]` at `crates/mc-shm-transport/src/lease.rs:163` with
-that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1908` passes
-`header_bytes: &[u8; HEADER_LEN]` narrowed at `:1907`. **The lens said "both
+that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1978` passes
+`header_bytes: &[u8; HEADER_LEN]` narrowed at `:1977`. **The lens said "both
 production callers" and there are three; the count is repaired and the
 conclusion is unchanged.** The value of the record is that the reasoning keeping
 totality true lives nowhere in the tree, and the moment a caller passes a
@@ -1577,6 +1672,7 @@ variable-length slice — a coalescing reader, a batched shared-memory descripto
 a future version with a shorter header — the constant indexes become the only
 thing between a peer and a panic in the read loop.
 Open questions:
+
 - Should `header_len_for_version` be required to return at least the largest
   constant index used by the parse body, so a future version cannot silently
   make the parse out of bounds? (needs human input)
@@ -1635,6 +1731,7 @@ independently written codec can interoperate. A drifted offset that still
 satisfies the eleven gates produces a frame both sides accept and interpret
 differently.
 Open questions:
+
 - Should `encode` and `decode_header` be generated from one offset table so a
   transposition is impossible by construction? (needs human input)
 
@@ -1709,8 +1806,10 @@ Reachability: default-production — the two production encoders are
 from `dispatch.rs:292`, `:329`, `:723`, `:802`, `:1458`, `connection.rs:779`,
 `:866`, and `client.rs:1329`, `:2092`, none of them `cfg`-gated and all on the
 terminal-emission path this catalog's siblings in 2e describe. The illegal
-argument region is reachable from outside the crate: `pub mod wire` (`lib.rs:39`)
-exposes both encoders and `FrameId::routed`, and `pub mod handler` (`:17`)
+argument region is reachable from outside the crate: `pub mod wire` (`lib.rs:36`;
+post-#131 it carries `#[doc(hidden)]` at `:35`, which hides it from rustdoc but
+not from linkage)
+exposes both encoders and `FrameId::routed`, and `pub mod handler` (`:14`)
 exposes `RouteHandle` with both fields `pub` (`handler.rs:36-40`).
 Status: active
 Exercised: not yet — no test feeds encoder output back through
@@ -1792,6 +1891,7 @@ The document shrank from 1,031 lines to 936 and that sentence was rewritten;
 both its clean-close and its retirement clauses now sit in `:296`. `:293` is
 blank at `HEAD`.
 Open questions:
+
 - Should the encoders validate, or should the illegal region be made
   unconstructible by removing the public field from `Flags` and by giving
   pure-header types a body-free encoder? (needs human input)

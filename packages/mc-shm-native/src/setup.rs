@@ -5,15 +5,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
-use rustix::io::{fcntl_setfd, FdFlags};
+use mc_shm_transport::descriptor::SETUP_DESCRIPTOR_COUNT;
 use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use mc_shm_transport::setup_auth::{
     self, CLIENT_AUTH_DOMAIN, DAEMON_ID_LEN, DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN,
-    MAX_SETUP_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, PROTOCOL_VERSION, RING_DESCRIPTOR_COUNT,
-    SERVER_PROOF_DOMAIN,
+    MAX_SETUP_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, PROTOCOL_VERSION, SERVER_PROOF_DOMAIN,
 };
 
 #[derive(Serialize)]
@@ -80,21 +79,24 @@ enum ServerMessage {
     Committed,
 }
 
-pub struct SetupConnection {
-    pub stream: UnixStream,
-    pub host_to_peer_fd: OwnedFd,
-    pub peer_to_host_fd: OwnedFd,
+pub struct PendingSetup {
+    stream: UnixStream,
+    descriptors: Option<[OwnedFd; SETUP_DESCRIPTOR_COUNT]>,
     pub host_to_peer_grant: RingGrant,
     pub peer_to_host_grant: RingGrant,
+    wire_version: u8,
+    descriptor_schema: u16,
+    activation_token: String,
+    deadline: Instant,
 }
 
-pub fn connect(
+pub fn begin_connect(
     path: &Path,
     key: &[u8],
     expected_daemon_id: &[u8],
     expected_daemon_ver: &str,
     timeout: Duration,
-) -> io::Result<SetupConnection> {
+) -> io::Result<PendingSetup> {
     if key.len() != 32 || expected_daemon_id.len() != DAEMON_ID_LEN || timeout.is_zero() {
         return Err(invalid());
     }
@@ -118,45 +120,19 @@ pub fn connect(
     if grant.descriptor.profile != super::PROFILE || host_to_peer_grant == peer_to_host_grant {
         return Err(invalid());
     }
-    write_message(
-        &mut stream,
-        &ClientMessage::Activate {
-            wire_version: grant.wire_version,
-            descriptor_schema: grant.descriptor_schema,
-            activation_token: &grant.activation_token,
-        },
-        deadline,
-        MAX_SETUP_MESSAGE_LEN,
-    )?;
-    if !matches!(
-        read_message::<ServerMessage>(&mut stream, deadline, MAX_SETUP_MESSAGE_LEN)?,
-        ServerMessage::Activated
-    ) {
-        return Err(invalid());
-    }
-    write_message(
-        &mut stream,
-        &ClientMessage::Commit,
-        deadline,
-        MAX_SETUP_MESSAGE_LEN,
-    )?;
-    if !matches!(
-        read_message::<ServerMessage>(&mut stream, deadline, MAX_SETUP_MESSAGE_LEN)?,
-        ServerMessage::Committed
-    ) {
-        return Err(invalid());
-    }
-    let [host_to_peer_fd, peer_to_host_fd] = descriptors;
-    Ok(SetupConnection {
+    Ok(PendingSetup {
         stream,
-        host_to_peer_fd,
-        peer_to_host_fd,
+        descriptors: Some(descriptors),
         host_to_peer_grant,
         peer_to_host_grant,
+        wire_version: grant.wire_version,
+        descriptor_schema: grant.descriptor_schema,
+        activation_token: grant.activation_token,
+        deadline,
     })
 }
 
-/// A ring alone cannot express peer death: a host that exits without a Goodbye frame leaves its rings looking merely idle, so the setup socket is the only liveness signal. `MSG_PEEK` keeps the probe side-effect free and repeatable. commentlint: allow(JUDGE)
+/// A ring alone cannot express peer death: a host that exits without a Goodbye frame leaves its rings looking merely idle, so the setup socket is the only liveness signal. `MSG_PEEK` keeps the probe side-effect free and repeatable.
 pub fn peer_closed(stream: &UnixStream) -> bool {
     let mut probe = [0u8; 1];
     match rustix::net::recv(
@@ -167,6 +143,44 @@ pub fn peer_closed(stream: &UnixStream) -> bool {
         Ok(_) => true,
         Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::INTR) => false,
         Err(_) => true,
+    }
+}
+
+impl PendingSetup {
+    pub fn take_descriptors(&mut self) -> io::Result<[OwnedFd; SETUP_DESCRIPTOR_COUNT]> {
+        self.descriptors.take().ok_or_else(invalid)
+    }
+
+    pub fn activate(mut self) -> io::Result<UnixStream> {
+        write_message(
+            &mut self.stream,
+            &ClientMessage::Activate {
+                wire_version: self.wire_version,
+                descriptor_schema: self.descriptor_schema,
+                activation_token: &self.activation_token,
+            },
+            self.deadline,
+            MAX_SETUP_MESSAGE_LEN,
+        )?;
+        if !matches!(
+            read_message::<ServerMessage>(&mut self.stream, self.deadline, MAX_SETUP_MESSAGE_LEN)?,
+            ServerMessage::Activated
+        ) {
+            return Err(invalid());
+        }
+        write_message(
+            &mut self.stream,
+            &ClientMessage::Commit,
+            self.deadline,
+            MAX_SETUP_MESSAGE_LEN,
+        )?;
+        if !matches!(
+            read_message::<ServerMessage>(&mut self.stream, self.deadline, MAX_SETUP_MESSAGE_LEN)?,
+            ServerMessage::Committed
+        ) {
+            return Err(invalid());
+        }
+        Ok(self.stream)
     }
 }
 
@@ -249,13 +263,22 @@ fn proof(
     )
 }
 
-fn receive_grant(stream: &mut UnixStream, deadline: Instant) -> io::Result<(Grant, [OwnedFd; 2])> {
+fn receive_grant(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> io::Result<(Grant, [OwnedFd; SETUP_DESCRIPTOR_COUNT])> {
     set_timeout(stream, deadline)?;
     let mut bytes = vec![0u8; MAX_SETUP_MESSAGE_LEN + 4];
-    let mut control = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
+    let mut control = [std::mem::MaybeUninit::uninit();
+        rustix::cmsg_space!(ScmRights(SETUP_DESCRIPTOR_COUNT + 1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut control);
     let mut iov = [IoSliceMut::new(&mut bytes)];
-    let received = recvmsg(stream.as_fd(), &mut iov, &mut ancillary, RecvFlags::empty())?;
+    let received = recvmsg(
+        stream.as_fd(),
+        &mut iov,
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+    )?;
     if received.bytes == 0 || received.flags.contains(ReturnFlags::CTRUNC) {
         return Err(invalid());
     }
@@ -267,11 +290,8 @@ fn receive_grant(stream: &mut UnixStream, deadline: Instant) -> io::Result<(Gran
             _ => return Err(invalid()),
         }
     }
-    if descriptors.len() != RING_DESCRIPTOR_COUNT {
+    if descriptors.len() != SETUP_DESCRIPTOR_COUNT {
         return Err(invalid());
-    }
-    for descriptor in &descriptors {
-        fcntl_setfd(descriptor, FdFlags::CLOEXEC)?;
     }
     let descriptors = descriptors.try_into().map_err(|_| invalid())?;
     let message: GrantMessage =

@@ -10,8 +10,6 @@ import {
     aggregateForTarget,
     McHostLifecyclePolicy,
     OUTER_AGGREGATE_MS,
-    OUTER_AGGREGATE_MS_DARWIN,
-    ReadinessProbeControlError,
     type WaiterDetachedError,
 } from "./policy";
 
@@ -22,34 +20,6 @@ function tempDir(prefix: string): string {
 /** A handshake-authenticated peer at a given daemon version. */
 function authenticatedPeerAt(daemonVer: string) {
     return { daemonVer, daemonId: new Uint8Array([7]), proof: "current" as const };
-}
-
-function healthySharedMemory() {
-    const zero = {
-        descriptors: 0,
-        arena_bytes: 0,
-        leases: 0,
-        mappings: 0,
-        file_descriptors: 0,
-        workers: 0,
-        client_instances: 0,
-        pinned_workers: 0,
-    };
-    return {
-        state: "healthy" as const,
-        error_class: null,
-        artifact: {
-            profile: "mc-host-test-ring-v1",
-            wire_version: 2,
-            descriptor_schema: 2,
-        },
-        bounds: zero,
-        accounting: { active: zero, quarantined: zero },
-        activation: { completed: 1 },
-        peer_death: { observed: 0 },
-        reclamation: { completed: 0 },
-        exhaustion: { observed: 0 },
-    };
 }
 
 let counter = 0;
@@ -66,8 +36,7 @@ function startResultJson(command: string): string {
         // reported null here would be rejected by the parser and land as
         // `internal_error` — passing any test that only checks `command`.
         effects: command === "restart" ? { stop_committed: true, start_committed: true } : null,
-        readiness: { shared_memory: { state: "ready", reason: "healthy" } },
-        shared_memory: null,
+        readiness: { transport: { state: "ready", reason: "healthy" } },
         checks: [],
         versions: {
             release: "0.38.0",
@@ -90,7 +59,6 @@ function missingPayloadResultJson(): string {
         remediation: "install_native_payload",
         effects: null,
         readiness: null,
-        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",
@@ -161,21 +129,15 @@ function policyFor(
     options: ConstructorParameters<typeof McHostLifecyclePolicy>[0],
 ): McHostLifecyclePolicy {
     return new McHostLifecyclePolicy({
-        platformReaders: supportedPlatformReaders(),
+        platformReaders: {
+            platform: "linux",
+            arch: "x64",
+            kernelRelease: () => "6.1.0",
+            glibcVersion: () => "2.34",
+            procSelfFdUsable: () => true,
+        },
         ...options,
     });
-}
-
-/** A deterministic host satisfying the shipped Linux contract. */
-function supportedPlatformReaders(): PlatformReaders {
-    return {
-        platform: "linux",
-        arch: "x64",
-        kernelRelease: () => "6.12.0",
-        glibcVersion: () => "2.34",
-        procSelfFdUsable: () => true,
-        macosProductVersion: () => null,
-    };
 }
 
 function catalogEntry(moduleId: string, moduleVersion = "0.1.0"): CatalogEntry {
@@ -209,7 +171,6 @@ function unsupportedPlatformReaders(): PlatformReaders {
         kernelRelease: () => "4.17.0",
         glibcVersion: () => "2.34",
         procSelfFdUsable: () => true,
-        macosProductVersion: () => null,
     };
 }
 
@@ -259,7 +220,6 @@ describe("pre-native outcomes", () => {
                     kernelRelease: () => "4.17.0",
                     glibcVersion: () => "2.34",
                     procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
                 },
                 {
                     platform: "darwin" as const,
@@ -267,7 +227,6 @@ describe("pre-native outcomes", () => {
                     kernelRelease: () => "23.0.0",
                     glibcVersion: () => null,
                     procSelfFdUsable: () => false,
-                    macosProductVersion: () => "13.4",
                 },
                 {
                     platform: "linux" as const,
@@ -275,7 +234,6 @@ describe("pre-native outcomes", () => {
                     kernelRelease: () => "6.8.0",
                     glibcVersion: () => "2.39",
                     procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
                 },
             ]) {
                 const policy = policyFor({
@@ -520,9 +478,8 @@ describe("native invocation mapping", () => {
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
                     ...compatibleObservation(),
-                    sharedMemory: healthySharedMemory(),
                     readiness: {
-                        shared_memory: { state: "ready", reason: "healthy" },
+                        transport: { state: "ready", reason: "healthy" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
                         synapse: { state: "degraded", reason: "synapse_degraded" },
                     },
@@ -539,9 +496,9 @@ describe("native invocation mapping", () => {
                     ["compatibility.daemon", "pass"],
                     ["compatibility.epochs", "pass"],
                     ["compatibility.modules", "pass"],
-                    ["readiness.shared_memory", "pass"],
                     ["readiness.storage", "fail"],
                     ["readiness.synapse", "fail"],
+                    ["readiness.transport", "pass"],
                 ]);
             }
         } finally {
@@ -593,9 +550,8 @@ describe("native invocation mapping", () => {
                     launchTarget: { kind: "test-binary", path: binary },
                     readinessProbe: async () => ({
                         ...observation,
-                        sharedMemory: healthySharedMemory(),
                         readiness: {
-                            shared_memory: { state: "ready", reason: "healthy" },
+                            transport: { state: "ready", reason: "healthy" },
                             storage: { state: "ready", reason: "healthy" },
                             synapse: { state: "ready", reason: "healthy" },
                         },
@@ -634,7 +590,7 @@ describe("native invocation mapping", () => {
                     catalog: [],
                     epochs: {},
                     evaluatedThrough: "daemon" as const,
-                    readiness: { shared_memory: { state: "ready", reason: "healthy" } },
+                    readiness: { transport: { state: "ready", reason: "healthy" } },
                 }),
             });
 
@@ -655,7 +611,11 @@ describe("native invocation mapping", () => {
         }
     });
 
-    test("a failing readiness probe reports one redacted terminal class", async () => {
+    test("a failing readiness probe keeps the observation it already proved", async () => {
+        // The native probe child already answered and was validated, so a
+        // readiness failure on top of it must not be reported as an internal
+        // error for a daemon this call verifiably observed. Same rule the
+        // storage probe follows: degrade, never erase a successful observation.
         const root = tempDir("mc-policy-readiness-failure-");
         const { binary } = fakeBinary(root);
         try {
@@ -667,40 +627,16 @@ describe("native invocation mapping", () => {
                 },
             });
             for (const result of [await policy.status(), await policy.doctor()]) {
-                expect(result.ok).toBe(false);
+                expect(result.ok).toBe(true);
                 expect(result.state).toBe("running");
-                expect(result.reason).toBe("native_probe_unavailable");
-                expect(result.shared_memory?.state).toBe("terminal");
-                expect(result.shared_memory?.error_class).toBe("setup_failure");
-                expect(JSON.stringify(result)).not.toContain("route collapsed mid-probe");
-            }
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    test("a control-probe failure leaves the ring diagnostics unstated", async () => {
-        // Control-probe failures do not diagnose ring health.
-        const root = tempDir("mc-policy-readiness-control-");
-        const { binary } = fakeBinary(root);
-        try {
-            const policy = policyFor({
-                env: { XDG_DATA_HOME: root },
-                launchTarget: { kind: "test-binary", path: binary },
-                readinessProbe: async () => {
-                    throw new ReadinessProbeControlError(
-                        new Error("compatibility probe deadline expired"),
-                    );
-                },
-            });
-            for (const result of [await policy.status(), await policy.doctor()]) {
-                expect(result.state).toBe("running");
-                expect(result.reason).not.toBe("native_probe_unavailable");
-                expect(result.shared_memory).toBeNull();
-                expect(result.checks.some((check) => check.id === "readiness.shared_memory")).toBe(
+                expect(result.reason).not.toBe("internal_error");
+                // The native result's own readiness survives untouched, and no
+                // probe-derived component is invented on top of it.
+                expect(result.readiness?.storage).toBeUndefined();
+                expect(result.readiness?.synapse).toBeUndefined();
+                expect(result.checks.some((check) => check.id.startsWith("readiness."))).toBe(
                     false,
                 );
-                expect(JSON.stringify(result)).not.toContain("deadline expired");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -726,9 +662,8 @@ describe("native invocation mapping", () => {
                     budgets.push(budgetMs);
                     return {
                         ...compatibleObservation(),
-                        sharedMemory: healthySharedMemory(),
                         readiness: {
-                            shared_memory: { state: "ready", reason: "healthy" },
+                            transport: { state: "ready", reason: "healthy" },
                         },
                     };
                 },
@@ -760,9 +695,8 @@ describe("native invocation mapping", () => {
                     ...compatibleObservation(),
                     // Every component is ready, so only the version can fail it.
                     authenticatedPeer: authenticatedPeerAt("mc-host/9.9.9"),
-                    sharedMemory: healthySharedMemory(),
                     readiness: {
-                        shared_memory: { state: "ready", reason: "healthy" },
+                        transport: { state: "ready", reason: "healthy" },
                         storage: { state: "ready", reason: "healthy" },
                     },
                 }),
@@ -789,15 +723,11 @@ describe("native invocation mapping", () => {
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
                     ...compatibleObservation(),
-                    sharedMemory: healthySharedMemory(),
                     readiness: {
-                        // Check-id order differs from reason precedence,
+                        // `readiness.storage` sorts before `readiness.transport`,
                         // but `authentication_failed` outranks `storage_unavailable`
                         // in the release contract's failing-reason precedence.
-                        shared_memory: {
-                            state: "unavailable",
-                            reason: "authentication_failed",
-                        },
+                        transport: { state: "unavailable", reason: "authentication_failed" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
                         synapse: { state: "degraded", reason: "synapse_degraded" },
                     },
@@ -814,9 +744,9 @@ describe("native invocation mapping", () => {
                     "compatibility.daemon",
                     "compatibility.epochs",
                     "compatibility.modules",
-                    "readiness.shared_memory",
                     "readiness.storage",
                     "readiness.synapse",
+                    "readiness.transport",
                 ]);
             }
         } finally {
@@ -985,13 +915,10 @@ describe("native invocation mapping", () => {
                 kernelRelease: () => "6.1.0",
                 glibcVersion: () => {
                     const until = Date.now() + SYNC_MS;
-                    while (Date.now() < until) {
-                        /* stand in for the darwin sw_vers fallback */
-                    }
+                    while (Date.now() < until) {}
                     return "2.34";
                 },
                 procSelfFdUsable: () => true,
-                macosProductVersion: () => null,
             };
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },
@@ -1023,15 +950,7 @@ describe("native invocation mapping", () => {
     }, 20_000);
 
     test("each qualified target gets the aggregate it was qualified for", () => {
-        // release/mc-host-production-inputs.lock.json qualifies
-        // fresh_linux_transport_aggregate.hard at 60s and
-        // fresh_macos_transport_aggregate.hard at 15s. Applying the Linux
-        // aggregate on Darwin lets a hung startup run four times past its
-        // budget, so the value has to come from the gate's resolved target.
-        expect(aggregateForTarget("linux-x64-gnu")).toBe(60_000);
-        expect(aggregateForTarget("darwin-arm64")).toBe(15_000);
-        expect(aggregateForTarget("darwin-x64")).toBe(15_000);
-        expect(OUTER_AGGREGATE_MS_DARWIN).toBeLessThan(OUTER_AGGREGATE_MS);
+        expect(aggregateForTarget("linux-x64-gnu")).toBe(OUTER_AGGREGATE_MS);
     });
 
     test("an explicit aggregate still overrides the platform default", async () => {
@@ -1527,8 +1446,6 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                 arch: "x64",
                 kernelRelease: () => "6.1.0",
                 glibcVersion: () => {
-                    // Synchronous, like the darwin `sw_vers` fallback this
-                    // stands in for.
                     const until = Date.now() + SYNC_MS;
                     while (Date.now() < until) {
                         /* burn the caller's budget before the waiter attaches */
@@ -1536,7 +1453,6 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                     return "2.34";
                 },
                 procSelfFdUsable: () => true,
-                macosProductVersion: () => null,
             };
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },

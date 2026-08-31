@@ -1,43 +1,25 @@
 /**
- * Pi-side counterpart of OpenCode's per-message conversation/tool-call
- * token accounting in `transform.ts:996-1124`.
  *
- * Walks the post-compaction Pi `event.messages` array (same view the LLM
- * receives on the wire) and partitions tokens into two buckets:
  *
- *   - `conversation` — text/thinking/image content the user/agent
- *     authored or read.
- *   - `toolCall` — tool invocation arguments and tool results — the
- *     mechanical tool I/O that compaction can compress.
+ * `conversation` counts user and assistant text, assistant thinking, and user and tool-result images.
+ * `toolCall` counts tool invocation names, arguments, and result text.
  *
  * The result is persisted to `session_meta.{conversation_tokens,tool_call_tokens}`
  * so `/ctx-status` can render an accurate breakdown
  * bar that sums to the wire `inputTokens` (give or take provider
  * tokenizer drift).
  *
- * IMPORTANT: this walks the AFTER-tagging, AFTER-injection, AFTER-strip
- * Pi message array — i.e. exactly what the LLM sees. Sentinels for
- * dropped tags (`[dropped §N§]`) are tiny and tokenize to ~3 tokens
- * each, which correctly reflects what's on the wire.
  *
- * Stable message ids use a guarded cache: every token-relevant field must still
- * match exactly. This retains correctness when tagging, drops, or historian
- * publication changes an old message while avoiding repeated BPE work and
- * serialization of fields the counter ignores.
- * Synthetic injection messages are deliberately re-counted on every pass.
+ * The cache reuses a stable message ID only when every token-relevant field matches exactly.
+ * The cache avoids repeated BPE work and serialization of fields the counter ignores.
  *
- * Mirrors OpenCode's switch in `transform.ts:1028-1119` adapted to
- * Pi part shapes:
- *   - PiTextContent (user/assistant/toolResult) → conversation
- *   - PiThinkingContent (assistant) → conversation (incl. signature)
- *   - PiImageContent (user/toolResult) → conversation (visual tokens)
- *   - PiToolCall (assistant) → toolCall (name + JSON arguments)
- *   - PiToolResult content text → toolCall (the bulky result body)
+ * PiTextContent from user, assistant, or toolResult contributes to conversation.
+ * PiThinkingContent from an assistant contributes its text and signature to conversation.
+ * PiImageContent from user or toolResult contributes visual tokens to conversation.
+ * PiToolCall from an assistant contributes its name and JSON arguments to toolCall.
+ * PiToolResult content text contributes to toolCall.
  *
- * Tool definitions (the schemas Pi sends in the separate `tools` field
- * of the request) are NOT counted here. They're computed at status-
- * dialog render time from `pi.getAllTools()` — same approach as
- * OpenCode (residual at display).
+ * The counter excludes tool definitions sent in the request's separate `tools` field.
  */
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
@@ -80,13 +62,9 @@ interface MaybeMessage {
 }
 
 /**
- * Compute conversation + tool-call token totals for a Pi message array.
  *
- * Stable SessionEntry ids can reuse a per-message result when every field that
- * affects token accounting still matches. The fingerprint keeps exact text,
- * signatures, tool names, and canonical tool arguments while omitting fields the
- * counter never reads (including base64 image bytes, whose count is fixed).
- * Synthetic injection messages have no stable id and always run.
+ * The fingerprint includes exact text, signatures, tool names, and canonical tool arguments; it omits fields the counter never reads.
+ * Base64 image bytes are omitted because their token count is fixed.
  */
 export function tokenizePiMessages(
 	messages: unknown[],
@@ -102,9 +80,7 @@ export function tokenizePiMessages(
 		if (!raw || typeof raw !== "object") continue;
 		const cacheValidationStart = options?.onTiming ? performance.now() : 0;
 		const resolvedStableId = options?.stableId(raw);
-		// Cache equality is only meaningful when JSON.stringify observes the same
-		// fields the tokenizer reads. Pi's JSONL messages satisfy this shape; custom
-		// prototypes and toJSON hooks must take the uncached path.
+		// Messages with custom prototypes or `toJSON` hooks bypass the cache because canonical serialization may differ.
 		const stableId =
 			resolvedStableId !== undefined && isTokenCacheSafeMessage(raw)
 				? resolvedStableId
@@ -132,9 +108,6 @@ export function tokenizePiMessages(
 			const msg = raw as MaybeMessage;
 			const content = msg.content;
 
-			// User/Assistant: content is array of PiTextContent | PiImageContent
-			// | PiThinkingContent | PiToolCall (or a plain string for user
-			// messages — Pi allows that shape too).
 			if (msg.role === "user" || msg.role === "assistant") {
 				if (typeof content === "string") {
 					conversation += estimateTokens(content);
@@ -158,18 +131,10 @@ export function tokenizePiMessages(
 								conversation += estimateTokens(p.thinkingSignature);
 							break;
 						case "image":
-							// Pi image content is base64. Anthropic-style visual
-							// token estimate would need width/height, which Pi
-							// doesn't expose at this layer. Use the OpenCode
-							// fallback (1200 tokens) — over-estimates small
-							// thumbnails, under-estimates 4K screenshots, but is
-							// stable and matches the OpenCode fallback path.
+							// Pi images use 1200 tokens because Pi exposes no dimensions for a size-based estimate.
 							conversation += 1200;
 							break;
 						case "toolCall":
-							// Tool invocation: name + JSON-serialized arguments.
-							// Mirrors OpenCode's `tool_use` case where input is
-							// the args payload.
 							if (typeof p.name === "string")
 								toolCall += estimateTokens(p.name);
 							if (p.arguments !== undefined) {
@@ -185,9 +150,7 @@ export function tokenizePiMessages(
 				continue;
 			}
 
-			// ToolResult: top-level content is the bulky output body. This is
-			// the LARGER of the two halves of a tool tag (args ~58 bytes vs
-			// result ~4KB on a typical `read`), so it dominates the bucket.
+			// ToolResult content counts as tool-call tokens because it is the output body.
 			if (msg.role === "toolResult") {
 				if (typeof content === "string") {
 					toolCall += estimateTokens(content);

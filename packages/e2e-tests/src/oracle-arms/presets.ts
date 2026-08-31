@@ -15,16 +15,9 @@ export interface LiveModelOptions {
 }
 
 /**
- * Build the live-model portion of `SpawnOptions`.
+ * `RustTestHarness.restart()` drops `openCodeConfigExtra`.
  *
- * `openCodeConfigExtra.provider` is merged beside the generated mock provider.
- * `RustTestHarness.restart()` also drops `openCodeConfigExtra`, so callers must
- * not expect this recipe to survive a restart.
- *
- * The recipe pins `hostname` to loopback: the serve HTTP API is
- * unauthenticated, and this is the one spawn path that places a real
- * `ANTHROPIC_API_KEY` in the child env. Binding all interfaces here would let
- * anyone who can reach the port drive sessions against the live credential.
+ * `hostname` is `127.0.0.1` to restrict the server to loopback.
  */
 export function liveModelSpawnOptions({
     apiKey,

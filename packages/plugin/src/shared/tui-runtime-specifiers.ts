@@ -1,17 +1,11 @@
 /**
- * The module specifiers the compiled TUI is allowed to resolve through OpenCode's
- * process-wide OpenTUI runtime registry (`opentui:runtime-module:<encoded>`).
+ * The compiled TUI may resolve only these specifiers through OpenCode's process-wide OpenTUI registry.
+ * OpenCode exposes each specifier as `opentui:runtime-module:<encoded>` in its process-wide OpenTUI registry.
  *
- * Single source of truth, shared by `scripts/build-tui.ts` (which rewrites these
- * specifiers during the Solid transform) and
- * `src/tui/tui-compiled-runtime-imports.test.ts` (which verifies every emitted
- * specifier names a real export). Keeping one list means the guard test cannot
- * drift into skipping a specifier the build actually rewrites — a skipped
- * specifier is exactly the silent hole the test exists to close.
+ * `scripts/build-tui.ts` rewrites these specifiers, and `tui-compiled-runtime-imports.test.ts` validates every emitted specifier against a real export.
+ * `TUI_RUNTIME_SPECIFIERS` prevents the guard test from missing specifiers that `build-tui.ts` rewrites.
  *
- * Lives in `src/shared/` rather than `src/tui/` on purpose: `build-tui.ts` copies
- * every file under `src/tui/` into the shipped `src/tui-compiled/` bundle, and
- * this list is build/test tooling that the runtime bundle must not carry.
+ * `TUI_RUNTIME_SPECIFIERS` must remain in `src/shared/` because `build-tui.ts` copies `src/tui/` into `src/tui-compiled/`, which must exclude build and test tooling.
  */
 export const TUI_RUNTIME_SPECIFIERS = [
     "@opentui/core",
@@ -26,7 +20,7 @@ export const TUI_RUNTIME_SPECIFIERS = [
 
 export type TuiRuntimeSpecifier = (typeof TUI_RUNTIME_SPECIFIERS)[number];
 
-/** Virtual module id OpenCode registers for a runtime specifier. */
+/** OpenCode registers this virtual module ID for each runtime specifier. */
 export function runtimeModuleId(specifier: string): string {
     return `opentui:runtime-module:${encodeURIComponent(specifier)}`;
 }

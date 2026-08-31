@@ -1,10 +1,9 @@
 /**
  * Validates the installed non-GA release evidence that gates mc-host GA tags.
  *
- * `--check` requires complete qualified evidence. `--check-schema` validates the
- * schema against a contract-derived reference document, so it runs before any
- * evidence exists. `--write-template` refreshes the fail-closed repository
- * template from the current release artifacts.
+ * `--check` requires complete qualified evidence.
+ * `--check-schema` validates the schema against a contract-derived reference document before evidence exists.
+ * `--write-template` refreshes the fail-closed repository template from current release artifacts.
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -25,10 +24,7 @@ import {
 } from "./qualify-mc-host-production-inputs";
 
 const EVIDENCE_PATH = "tmp/mc-host-installed-release-evidence.json";
-// The qualifier owns this path and exports it; `build-mc-host-payload.ts`
-// already consumes it the same way. Restating the literal here let the writer
-// relocate the artifact while the GA verifier kept hashing a path nothing
-// writes, which fails the evidence gate for the wrong reason.
+// Use `U9_OUTPUT_PATHS.evidence` so moving the artifact cannot desynchronize its writer and GA verifier.
 const QUALIFICATION_PATH = U9_OUTPUT_PATHS.evidence;
 const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
@@ -54,11 +50,9 @@ interface TargetEvidence {
     process_crash_atomicity_verified: boolean;
     lifecycle_smoke_passed: boolean;
     /**
-     * Digest of the target's test report, recorded independently of the proof.
+     * `test_report_sha256` records the target test-report digest independently of the proof so their values can be compared.
      *
-     * Held here rather than read back out of the proof's own observations so
-     * that the comparison has two sides. `null` records that no report digest
-     * was captured, and the proof must then echo `null` too.
+     * `null` means no report digest was captured; the proof must also contain `null`.
      */
     test_report_sha256: string | null;
 }
@@ -92,15 +86,10 @@ export interface WorkflowSource {
 }
 
 /**
- * Returns the run id `runUrl` claims, or undefined when the URL is not an
- * immutable run URL under `source.repository`.
+ * Returns the run ID claimed by an immutable GitHub run URL under `source.repository`; otherwise returns `undefined`.
  *
- * The origin and repository prefix are part of the match: a bare trailing
- * `/actions/runs/<id>` would also accept a run id borrowed from a foreign
- * host or repository, and the api path this feeds is rebuilt under
- * `source.repository`, so the borrowed id would be silently requalified as
- * one of ours. The attempt is deliberately absent here -- it is signed into
- * the certificate, not carried by the human-facing run URL.
+ * Match the GitHub origin and `source.repository` to reject run IDs borrowed from another host or repository.
+ * `attempt` is signed into the certificate, not included in `runUrl`.
  */
 function claimedRunId(source: WorkflowSource): string | undefined {
     const prefix = `https://github.com/${source.repository}/actions/runs/`;
@@ -114,23 +103,17 @@ export function workflowRunApiPath(source: WorkflowSource): string | null {
 }
 
 /**
- * Returns every run attempt whose certificate binds this artifact to the
- * claimed workflow source, deduplicated and ordered by attempt number.
+ * Returns every matching attempt, deduplicated and ordered by attempt number.
  *
- * The attempt is required: a run-level conclusion reflects only the latest
- * attempt, so re-running a failed run would otherwise bless artifacts that
- * were signed by the attempt that failed.
+ * Require `attempt` because a run-level conclusion covers only its latest attempt.
+ * Without `attempt`, a successful rerun could bless artifacts signed by a failed attempt.
  *
- * Every matching attempt is returned rather than the first, because one digest
- * can legitimately carry more than one. A re-run leaves the proof bytes
- * unchanged -- their `run_url` deliberately omits the attempt -- so the same
- * subject digest is attested in the failed attempt and again in the successful
- * one. `gh attestation verify` emits one array entry per verified attestation
- * and documents no ordering, so returning a single entry would make
- * qualification depend on array order: the failed attempt could be chosen and
- * then rejected, or two artifacts could choose different attempts and appear
- * to disagree about their source. Callers intersect these sets across every
- * artifact and then require one shared attempt to have succeeded.
+ * A digest can have multiple verified attestations, so return every matching attempt.
+ * A rerun can attest the same digest in failed and successful attempts because `run_url` omits `attempt`.
+ * `gh attestation verify` emits one array entry per verified attestation and does not guarantee ordering.
+ * Return every matching attempt because `gh attestation verify` does not guarantee ordering.
+ * A failed attempt can be selected based on undocumented array order.
+ * Callers intersect the matching-attempt sets for every artifact.
  */
 function matchedAttestationAttempts(
     value: unknown,
@@ -184,9 +167,7 @@ function matchedAttestationAttempts(
                 );
             });
         const runInvocationUri = fields.runInvocationURI;
-        // Anchored on the full expected origin, repository, and claimed run so a
-        // certificate cannot satisfy this by carrying a matching trailing
-        // `/attempts/<n>` for a run that belongs to another repository.
+        // `invocationPrefix` includes the expected origin, repository, and run ID so another repository's `/attempts/<n>` suffix cannot match.
         const invocationPrefix = `https://github.com/${source.repository}/actions/runs/${runId}/attempts/`;
         const attempt =
             typeof runInvocationUri === "string" &&
@@ -209,8 +190,8 @@ function matchedAttestationAttempts(
 }
 
 /**
- * Runs `gh attestation verify` and returns the parsed bundle, or null when the
- * subprocess or its output is unusable. Callers treat null as "unattested".
+ * `gh attestation verify` returns the parsed bundle or `null` when its subprocess or output is unusable.
+ * `null` can also indicate unusable verification output.
  */
 function ghAttestationJson(
     rootDir: string,
@@ -243,16 +224,11 @@ function ghAttestationJson(
 }
 
 /**
- * Compares an observed workflow-run-attempt payload against the claimed source.
  *
- * The workflow path is compared without its ref suffix. GitHub's documented
- * example response for a run attempt reports `path` with a ref appended
- * (`.github/workflows/build.yml@main`) while observed responses for a directly
- * triggered workflow return the bare path, and a fail-closed gate that accepts
- * only one of those two forms could never pass against the other. Dropping the
- * ref costs nothing here: the ref is a mutable label, and the immutable binding
- * is `head_sha`, which is compared separately and exactly. `buildConfigURI` is
- * already normalized the same way when the certificate is checked.
+ * The workflow path comparison accepts both a bare path and a path suffixed with `@<ref>`.
+ * GitHub may report a run attempt's `path` as `.github/workflows/build.yml@main`.
+ * GitHub may return a bare workflow path for a directly triggered workflow.
+ * The ref is mutable; `head_sha` provides the separately checked immutable binding.
  */
 export function workflowRunAttemptMatchesSource(
     observed: Record<string, unknown>,
@@ -268,11 +244,8 @@ export function workflowRunAttemptMatchesSource(
 }
 
 /**
- * Confirms the attempt that signed the artifacts is the attempt that succeeded.
  *
- * `detail` separates a transport or permission failure (missing `gh`, no auth,
- * or a token without `actions: read`) from a genuine negative verdict, so a
- * blocked release is not misread as tampered evidence.
+ * `detail` distinguishes missing `gh`, authentication, or `actions: read` failures from negative verdicts so blocked releases are not reported as tampered evidence.
  */
 function verifyWorkflowRunAttempt(
     rootDir: string,
@@ -308,10 +281,8 @@ function verifyWorkflowRunAttempt(
 }
 
 /**
- * Verifies each distinct run attempt once.
  *
- * Every qualified proof is forced to share one workflow source and attempt, so
- * without this the gate would re-issue one identical `gh api` call per proof.
+ * Qualified proofs share one workflow source and attempt, so the gate issues one identical `gh api` call per attempt rather than per proof.
  */
 function cachedWorkflowRunCheck(
     rootDir: string,
@@ -360,8 +331,7 @@ export interface InstalledReleaseEvidence {
     };
     production_synapse_verified: boolean;
     /**
-     * Digest of the production semantic-Synapse report, recorded independently of
-     * the proof that cites it, so the proof cannot be its own witness.
+     * The independently recorded production semantic-Synapse report digest prevents a proof from witnessing itself.
      */
     production_synapse_report_sha256: string | null;
     proof_artifacts: ProofArtifactRef[];
@@ -445,7 +415,7 @@ function sha256File(rootDir: string, relative: string): string {
         .digest("hex");
 }
 
-/** Digest of a cited file, or null when it is absent or unreadable. */
+/** The digest operation returns null when the cited file is absent or unreadable. */
 function sha256FileOrNull(rootDir: string, relative: string): string | null {
     try {
         return sha256File(rootDir, relative);
@@ -463,13 +433,9 @@ function isSafeRelativePath(path: string): boolean {
 }
 
 /**
- * Proves a target proof is backed by real test report bytes that attest this
  * target.
  *
- * The report is mandatory: deriving the expected observations from the
- * observations themselves would let a proof mirror a null citation and clear
- * the gate while proving nothing. `seen` rejects one report satisfying more
- * than one target.
+ * The report is mandatory because deriving expected observations from observed observations would allow a proof with a null citation to pass.
  */
 function verifyTargetTestReport(
     rootDir: string,
@@ -535,11 +501,9 @@ function exactIdentitySet(
 }
 
 /**
- * Whether `names` lists every payload package before every parent package.
  *
- * Shared by construction and validation so the two cannot drift: the recorded
- * `publication.payloads_before_parents` boolean is only meaningful if the
- * verifier derives it from the same order the builder derived it from.
+ * `publication.payloads_before_parents` is meaningful only when the builder and verifier derive it from the same package order.
+ * The verifier must derive the boolean from `names` with the builder's ordering rule.
  * `exactIdentitySet` sorts, so nothing else in validation observes this order.
  */
 function payloadsBeforeParents(
@@ -762,9 +726,7 @@ export function validateInstalledReleaseEvidence(
         ["oidc_provenance_verified", "long_lived_token_used", "payloads_before_parents"],
         "publication",
     );
-    // The publication proof only echoes this boolean back, so without deriving
-    // it here a hand-authored file could list parents first, claim `true`, and
-    // pass the payload-first invariant after a parents-first release.
+    // `payloadsBeforeParents` must derive the boolean from `names`; otherwise a parents-first list could claim `true`.
     if (
         booleanField(publication, "payloads_before_parents", "publication") !==
         payloadsBeforeParents(
@@ -859,10 +821,6 @@ export function validateInstalledReleaseEvidence(
     if (qualified && (!allProofsPass || blockers.length !== 0)) {
         fail("qualified evidence contains a failed proof or blocker");
     }
-    // `null` is the fail-closed template's value, so it must not survive into
-    // qualified evidence: a proof echoing `null` back agrees with it, and the
-    // Linux semantic lane would be authorized without naming any report at all.
-    // The same holds for each target's lifecycle report.
     if (qualified) {
         if (synapseReport === null || isPlaceholderSha256(synapseReport)) {
             fail(
@@ -887,27 +845,17 @@ export function validateInstalledReleaseEvidence(
 }
 
 /**
- * Requires the artifacts this evidence cites to themselves be release-qualified.
+ * Evidence requires each cited artifact to be release-qualified.
  *
- * The digest comparison above only binds the evidence to whatever bytes are
- * committed; it says nothing about what those bytes claim. All three artifacts
- * are committed fail-closed between releases, so without parsing them an
- * evidence document could set `qualified: true`, carry passing proofs, and clear
- * the GA gate while citing a qualification run that recorded
- * `production_qualified: false`, payload entries that recorded
- * `qualified: false`, or a stop record that grants no usable stop authority.
+ * Parsing cited artifacts prevents `qualified: true` from overriding contradictory artifact contents.
+ * Parsing requires cited qualification runs to record `production_qualified: true` before the GA gate clears.
  *
- * Checking those booleans alone is not enough either: a skeletal file carrying
- * only the booleans would satisfy them while citing nothing. Each artifact is
- * therefore bound to this release — its schema, its contract digest, and its
- * identity set — so a stand-in has to reproduce the real citations to pass.
  *
- * Deliberately not re-implemented here: the input-lock byte citations and the
- * payload manifest/launcher digests. Those are what `release:qualify:check` and
- * `release:payload:check` validate in full, and duplicating their logic in a
- * third place would create exactly the drift this gate exists to catch. This
- * function's job is to stop *these* bytes from being a stand-in for the artifacts
- * those gates validate.
+ * `release:qualify:check` validates input-lock byte citations and payload manifest/launcher digests.
+ * `release:qualify:check` and `release:payload:check` validate input-lock citations and payload manifest and launcher digests.
+ * `release:qualify:check` and `release:payload:check` must remain the only qualification and payload validators to prevent divergent implementations.
+ * `release:qualify:check` and `release:payload:check` must remain the only qualification and payload validators to prevent divergent implementations.
+ * Evidence validation rejects evidence bytes that stand in for the qualification and payload artifacts.
  */
 function assertCitedArtifactsQualified(
     rootDir: string,
@@ -917,43 +865,19 @@ function assertCitedArtifactsQualified(
         rootDir: string,
     ) => { u8Digest: string; lockSha256: string },
 ): void {
-    // Delegate the qualification run to its own full consumer rather than
-    // re-deriving a weaker version of it here. `requireQualificationEvidence`
-    // checks the schema, the contract digest, the release identity, `test_only`,
-    // the artifact citations against real bytes, and — the part summary fields
-    // can never reach — it re-derives the verdict from the input-lock bytes,
-    // because the evidence's own `production_qualified` bit is self-describing
-    // and therefore not authority. That also stops the separately cited input
-    // lock from being opaque bytes to this gate.
     const { u8Digest, lockSha256 } = requireQualification(rootDir);
     const qualification = record(
         readJson(rootDir, QUALIFICATION_PATH),
         "cited qualification",
     );
-    // Retained after the delegation for the citation this gate specifically owns:
-    // the evidence's contract digest and the qualification run's must be the same
-    // one, not merely each current on its own.
     if (qualification.release_contract_sha256 !== expectedContractDigest) {
         fail("cited qualification was produced against a different release contract");
     }
 
-    // Same delegation for the payload index. Summary fields could not reach the
-    // input-lock digest citation, the per-target package identities, the platform
-    // floors, the size budgets, or the payload-manifest and bootstrap-launcher
-    // digests, so a stand-in index with the right booleans passed while carrying
-    // no usable bootstrap trust data. `validateTrustIndex` is the validator the
-    // payload builder already applies to this exact file, and it requires a
-    // qualified entry to carry real non-placeholder digests.
     //
-    // Note it also requires `publication.published === false`: the index is a
-    // build-time artifact and U6 performs no publication, so completed
-    // publication is recorded on the evidence's own `publication` block — which
-    // `allProofsPass` already gates — and must not be demanded of this file.
+    // `validateTrustIndex` requires `publication.published === false` for the build-time payload index.
     //
-    // `productionQualified` is `true` rather than re-derived: the qualification
-    // consumer above already re-derived the verdict from the lock bytes and
-    // rejects anything else, so reading the bit back here would only reintroduce
-    // a self-describing value as authority.
+    // `productionQualified: true` relies on `requireQualification` to derive the verdict from input-lock bytes.
     const lock = record(readJson(rootDir, INPUT_LOCK_PATH), "cited input lock");
     validateTrustIndex(readJson(rootDir, PAYLOAD_INDEX_PATH), {
         contract,
@@ -970,13 +894,6 @@ function assertCitedArtifactsQualified(
         fail("cited payload index was produced against a different release contract");
     }
 
-    // No proof kind covers stop provenance, so a digest match was previously the
-    // only thing standing between qualified evidence and a stop record granting
-    // unusable or unauthorized authority. `validateStopRecord` is the validator
-    // that adds this release's ancestry rules on top of the schema: genesis-only
-    // status, reservation exclusion, exact N-1 adjacency, and the
-    // predecessor-manifest hash. Reservation versions come from the gate file
-    // directly, which is the only thing beyond the contract that it needs.
     const gate = record(
         readJson(rootDir, REGISTRY_GATE_PATH),
         "cited registry gate",
@@ -990,9 +907,8 @@ function assertCitedArtifactsQualified(
                 : undefined,
         )
         .filter((version): version is string => typeof version === "string");
-    // `null` for the expected predecessor: this is the first payload-bearing
-    // release, so genesis is the only acceptable ancestry — the same stance
-    // `runCheck` takes. The next payload release must pass its real N-1 here.
+    // `null` is required because the first payload-bearing release may descend only from genesis.
+    // `runCheck` requires each subsequent payload release to use its actual N-1 predecessor.
     validateStopRecord(
         readJson(rootDir, STOP_PROVENANCE_PATH),
         { contract, reservationVersions },
@@ -1021,9 +937,9 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         ) => unknown;
         expectedHeadSha?: string;
         /**
-         * Seam for the production-input qualification consumer, defaulting to the
-         * real one. Tests that are not exercising qualification stub it; the
-         * `--check` path never does, so GA always runs the full validator.
+         * Tests stub `requireQualification`; production uses `requireQualificationEvidence` by default.
+         * Tests that do not exercise qualification stub `requireQualification`.
+         * `--check` uses `requireQualificationEvidence`, so GA runs the full validator.
          */
         requireQualification?: (
             rootDir: string,
@@ -1044,10 +960,10 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
     if (requireQualified && !/^[0-9a-f]{40}$/.test(expectedHeadSha)) {
         fail("cannot bind qualified evidence to the current release commit");
     }
-    // Every qualified proof must cite this signer workflow, so a checkout
-    // that does not carry it can never have produced (or reproduce) the
-    // attested evidence. Failing here names the gap directly instead of
-    // surfacing it later as an opaque per-proof attestation mismatch.
+    // Every qualified proof must cite `QUALIFICATION_WORKFLOW_PATH`.
+    // A checkout without `QUALIFICATION_WORKFLOW_PATH` cannot produce or reproduce the attested evidence.
+    // The validator checks for `QUALIFICATION_WORKFLOW_PATH` before per-proof verification to report the missing workflow directly.
+    // The validator checks for `QUALIFICATION_WORKFLOW_PATH` before per-proof verification to report the missing workflow directly.
     if (requireQualified && !existsSync(join(rootDir, QUALIFICATION_WORKFLOW_PATH))) {
         fail(
             `qualification workflow ${QUALIFICATION_WORKFLOW_PATH} does not exist in this checkout`,
@@ -1188,14 +1104,11 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                     ? {
                           cli_commands_passed: flow.cli_commands_passed,
                           managed_demand_passed: flow.managed_demand_passed,
-                          // Without this the flow proof is three booleans that
-                          // say nothing about *what* was exercised, so a run
-                          // against a source checkout, a staged tarball, or a
-                          // stale install passes identically to one against the
-                          // published artifact. The registry proof establishes
-                          // that a package with this integrity exists; naming it
-                          // here is what ties those bytes to the behavior. Target
-                          // proofs already carry `package_integrity` for the same
+                          // The flow proof must identify the artifact whose behavior it exercises.
+                          // A source checkout, staged tarball, and stale install would otherwise produce identical proofs.
+                          // The registry proof establishes that a package with the recorded integrity exists.
+                          // The proof must name the package integrity to bind the package bytes to observed behavior.
+                          // Target proofs already carry `package_integrity` to bind behavior to package bytes.
                           // reason.
                           package_integrity: evidence.registry_packages.find(
                               (entry) => entry.name === flow.package,
@@ -1213,12 +1126,9 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                         }
                       : proof.kind === "production_synapse"
                         ? {
-                              // The bare boolean said nothing about which bytes ran
-                              // the production semantic lane, so a source checkout,
-                              // staged payload, or stale install produced an
-                              // identical proof. The Linux payload's published
-                              // integrity and the semantic report digest are what
-                              // tie the result to the artifact GA ships.
+                              // The production semantic proof must identify the bytes that ran the semantic lane.
+                              // A source checkout, staged payload, and stale install would otherwise produce identical proofs.
+                              // The Linux payload integrity and semantic report digest bind the result to the selected artifact bytes.
                               package_integrity:
                                   evidence.registry_packages.find((entry) =>
                                       entry.name.endsWith("linux-x64-gnu"),
@@ -1250,10 +1160,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                 fail("qualified proof artifacts must share one workflow source");
             }
             qualifiedSource = workflowSource;
-            // Collect every attempt this artifact is attested in and narrow the
-            // shared set. The run check is deferred until the whole set is known,
-            // because a single artifact cannot tell which shared attempt is the
-            // one that succeeded.
+            // The validator defers the run check because one artifact cannot identify the shared attempt that succeeded.
             const attestationResult =
                 options.verifyAttestation !== undefined
                     ? options.verifyAttestation(proofPath, proof, workflowSource)
@@ -1281,9 +1188,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         }
         const installedEvidencePath = join(rootDir, EVIDENCE_PATH);
         const installedEvidenceBytes = readFileSync(installedEvidencePath);
-        // Truncated or hand-mangled bytes on disk are a failed attestation, not a
-        // crash: an unguarded parse would abort with a bare SyntaxError instead of
-        // the structured failure every other malformed-input path here reports.
+        // Malformed bytes must produce a structured validation failure instead of a `SyntaxError`.
         let installedEvidenceValue: unknown;
         try {
             installedEvidenceValue = JSON.parse(installedEvidenceBytes.toString("utf8"));
@@ -1318,10 +1223,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         if (sharedAttempts.length === 0) {
             fail("installed release evidence was attested by a different workflow run attempt");
         }
-        // One shared attempt must have concluded successfully. Candidates are
-        // tried in attempt order rather than trusting the attestation array's
-        // order, so a re-run that also attested the failed attempt still
-        // qualifies on the attempt that passed.
+        // At least one shared attempt must have concluded successfully.
         let verifiedAttempt: string | null = null;
         let lastDetail = "";
         for (const candidate of sharedAttempts) {
@@ -1360,11 +1262,7 @@ interface CitedArtifactDigests {
 }
 
 /**
- * Fail-closed evidence citing `digests`, with every proof recorded as unverified.
  *
- * The registry, target, and flow identity sets come from the release contract
- * rather than a literal here, because the validator requires them to be exactly
- * the contract's sets and a second hand-maintained copy would drift out of them.
  */
 function buildFailClosedEvidence(
     digests: CitedArtifactDigests,
@@ -1443,16 +1341,8 @@ function buildTemplate(rootDir: string): InstalledReleaseEvidence {
 }
 
 /**
- * The document the installed-release schema describes, derived from the release
  * contract alone.
  *
- * The schema gate precedes evidence production: a release run writes
- * `EVIDENCE_PATH`, and every artifact this schema cites is a digest of bytes a
- * later stage emits. Reading any of them here would make the gate report a
- * missing input rather than a schema defect. Every cited digest is therefore a
- * self-evident placeholder — it satisfies the digest shape the schema demands
- * while never resembling a real citation — and `qualified` stays false, so the
- * validator's placeholder ban on GA evidence still holds for real documents.
  */
 export function schemaReferenceEvidence(): InstalledReleaseEvidence {
     const placeholder = "0".repeat(64);
@@ -1482,11 +1372,6 @@ function main(): void {
         );
         process.exit(2);
     }
-    // The schema gate validates the reference document instead of the installed
-    // artifact, because it runs ahead of the stage that writes `EVIDENCE_PATH`
-    // and that path is not tracked between releases. Schema drift still fails
-    // here: the reference is built by this file's builder and checked by its
-    // validator, so the two disagreeing is a failure with nothing on disk.
     if (flag === "--check-schema") {
         validateInstalledReleaseEvidence(schemaReferenceEvidence());
         console.log("checked mc-host installed release evidence (schema only)");

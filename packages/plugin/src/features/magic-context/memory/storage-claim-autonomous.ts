@@ -1,10 +1,6 @@
 /**
- * Atomic autonomous-producer manifests (direct-claims U9; KTD3-KTD7).
  *
- * Model output never carries database authority by itself. The host binds each
- * parsed item to the exact prompt-time public locator, content digest, and
- * claim-local token, validates the complete batch before the first domain
- * write, then stages every item under one outer operation receipt.
+ * Model output has no database authority. The host binds each parsed item to its prompt-time public locator, content digest, and claim-local token; validates the complete batch before any domain write; and stages all items under one outer operation receipt.
  */
 
 import { type Database, isInTransaction } from "../../../shared/sqlite";
@@ -44,13 +40,13 @@ export interface AutonomousManifestBinding {
 
 export interface AutonomousManifestItem<T> {
     binding: AutonomousManifestBinding;
-    /** Other claims consumed by this item, such as merge sources. */
+    /** additionalBindings contains claims the item consumes, including merge sources. */
     additionalBindings?: readonly AutonomousManifestBinding[];
     value: T;
 }
 
 export interface AutonomousCreationManifestItem<T> {
-    /** Stable, canonical item identity included in the operation request digest. */
+    /** key is the stable canonical item identity in the operation request digest. */
     key: CanonicalJsonValue;
     value: T;
 }
@@ -138,8 +134,7 @@ function validateBindings(
         if (binding.contentDigest !== current.contentDigest) {
             return `manifest content digest is stale for ${binding.publicClaimId}`;
         }
-        // Full token comparison fences lifecycle, applicability, and policy
-        // heads in addition to the revision checked above.
+        // Full token comparison fences lifecycle, applicability, and policy heads, not only revision.
         const currentToken = computeProjectMemoryMutationToken(db, binding.publicClaimId);
         if (
             canonicalClaimMutationToken(binding.token) !== canonicalClaimMutationToken(currentToken)
@@ -205,7 +200,7 @@ function applyResult(operation: ClaimOperationRunResult): AutonomousManifestAppl
     };
 }
 
-/** Apply one fully parsed and host-bound manifest inside its lease transaction. */
+/** The lease transaction applies one fully parsed, host-bound manifest. */
 export function runAutonomousManifestInCurrentTransaction<T>(args: {
     db: Database;
     identity: AutonomousManifestIdentity;
@@ -258,7 +253,7 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
     return applyResult(operation);
 }
 
-/** Applies a creation manifest under one outer claim operation. */
+/* */
 export function runAutonomousCreationManifestInCurrentTransaction<T>(args: {
     db: Database;
     identity: AutonomousManifestIdentity;
@@ -341,7 +336,7 @@ function rejectionEnvelope(args: {
     };
 }
 
-/** Records a rejection result only within an active transaction. */
+/** An active transaction records the rejection result. */
 export function recordAutonomousManifestRejectionInCurrentTransaction(args: {
     db: Database;
     identity: AutonomousManifestIdentity;
@@ -364,7 +359,7 @@ export function recordAutonomousManifestRejectionInCurrentTransaction(args: {
     );
 }
 
-/** Persist a malformed/incomplete provider manifest as one replayable zero-effect result. */
+/** Processing a malformed or incomplete provider manifest persists one replayable, zero-effect result. */
 export function recordAutonomousManifestRejection(args: {
     db: Database;
     identity: AutonomousManifestIdentity;

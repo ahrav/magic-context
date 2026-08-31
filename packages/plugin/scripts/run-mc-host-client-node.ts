@@ -15,7 +15,7 @@ if (mode !== "smoke" && mode !== "synapse" && mode !== "all") {
     );
     process.exit(2);
 }
-// `synapse` requires a native ONNX Runtime library, so the default launcher runs only `smoke`. commentlint: allow(JUDGE)
+// `synapse` requires a native ONNX Runtime library, so the default launcher runs only `smoke`.
 const selected = mode === "all" ? (["smoke", "synapse"] as const) : ([mode] as const);
 
 const here = dirname(fileURLToPath(import.meta.url));

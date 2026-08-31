@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { publishJsonAtomically } from "../incident-pool/report";
+import { publishJsonAtomically } from "../atomic-publish";
 import {
     ARM_IDS,
     PRIMARY_ARM_IDS,
     PairedDeltaContractError,
+    r3PromptEvidence,
     REGRET_ARM_IDS,
     RUN_HEALTHS,
     validateCheckVector,
@@ -300,7 +301,7 @@ export function interventionFor(
         case "r2":
             return { kind: "gold-memory", value: scenario.interventions.r2 };
         case "r3":
-            return { kind: "gold-evidence", value: scenario.interventions.r3 };
+            return { kind: "gold-evidence", value: r3PromptEvidence(scenario) };
         default:
             return { kind: "none", value: null };
     }
@@ -571,7 +572,7 @@ function completedRecord(
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
         try {
-            validateCheckVector(scenario, coordinate.armId, observation.checks);
+            validateCheckVector(scenario, observation.checks);
             checks = observation.checks;
         } catch (error) {
             if (!(error instanceof PairedDeltaContractError)) throw error;
@@ -579,12 +580,7 @@ function completedRecord(
             runHealth = "malformed";
         }
     }
-    const applicableCritical = new Set(
-        scenario.checks
-            .filter(({ appliesToArms }) => appliesToArms.includes(coordinate.armId))
-            .map(({ id }) => id)
-            .filter((id) => scenario.criticalCheckIds.includes(id)),
-    );
+    const applicableCritical = new Set(scenario.criticalCheckIds);
     const checksPassed = checks.filter(({ passed }) => passed).length;
     const criticalPassed = checks.filter(
         ({ id, passed }) => passed && applicableCritical.has(id),
@@ -700,9 +696,7 @@ export function computeRegretRungs(
         canonicalFingerprint(interventionFor(scenario, record.armId)))) {
         return { refusedReason: "intervention-mismatch" };
     }
-    const ids = scenario.checks
-        .filter(({ appliesToArms }) => REGRET_ARM_IDS.every((arm) => appliesToArms.includes(arm)))
-        .map(({ id }) => id);
+    const ids = scenario.checks;
     const score = (armId: ArmId): number | null => {
         const record = records[armId];
         if (record?.cell.runHealth !== "completed") return null;

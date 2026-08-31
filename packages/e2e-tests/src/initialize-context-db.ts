@@ -11,19 +11,11 @@ export function initializeIsolatedContextDb(dataDir: string, releaseRoot?: Verif
     if (existsSync(path)) return;
     mkdirSync(dirname(path), { recursive: true });
     if (releaseRoot) {
-        // Copying straight to `path` publishes the destination before the bytes are
-        // complete, so a worker killed mid-copy leaves a truncated database that the
-        // existence check above then accepts on every retry, and each later paired attempt
-        // runs against the partial file instead of the authenticated template. Staging the
-        // copy beside the destination and renaming makes `path` appear only once the bytes
-        // are whole, since the rename is atomic within the directory.
+        // Stage and atomically rename the copy so an interrupted copy cannot leave a truncated `path`.
         const template = releaseRootPath(releaseRoot, "databaseTemplate");
         const staging = `${path}.staging-${randomBytes(8).toString("hex")}`;
         try {
             copyFileSync(template, staging, constants.COPYFILE_EXCL);
-            // A short copy is the failure this guards, and it is invisible without a size
-            // comparison: `copyFileSync` reports success for a destination the kernel
-            // truncated under disk pressure.
             if (statSync(staging).size !== statSync(template).size) {
                 throw new Error("initialize-context-db: template-copy-truncated");
             }

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { markAsUntransferable } from "node:worker_threads";
 
 export const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1";
-export const DESCRIPTOR_SCHEMA_VERSION = 2;
+export const DESCRIPTOR_SCHEMA_VERSION = 3;
 
 export interface NativeCapabilities {
     available: boolean;
@@ -41,8 +41,12 @@ export class NativeStartupError extends Error {
 export interface NativeDescriptor {
     profile: string;
     hostToPeerFd: number;
+    hostToPeerDataReadyFd: number;
+    hostToPeerCapacityReadyFd: number;
     hostToPeerGrant: string;
     peerToHostFd: number;
+    peerToHostDataReadyFd: number;
+    peerToHostCapacityReadyFd: number;
     peerToHostGrant: string;
 }
 
@@ -74,7 +78,8 @@ interface NativeAddon {
     workerLimit(): number;
     activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
-    connectSetup(options: NativeSetupOptions): number;
+    connectSetup(options: NativeSetupOptions): Promise<number>;
+    finishSetup(pending: number): Promise<number>;
     peerClosed(channel: number): boolean;
     createTestPair(): {
         first: number;
@@ -112,6 +117,8 @@ interface NativeAddon {
             segments: Uint8Array[],
         ) => void,
     ): boolean;
+    watch(channel: number, callback: () => void): void;
+    readinessHandled(): boolean;
     release(channel: number, token: number): void;
     close(channel: number): void;
     forceClose(channel: number): void;
@@ -122,16 +129,6 @@ let loadError: Error | undefined;
 let constructorCapability: NativeCapabilities | undefined;
 
 const PLATFORM_PACKAGES = {
-    "darwin-arm64": {
-        package: "@cortexkit/mc-host-darwin-arm64",
-        target: "darwin-arm64",
-        nativeTarget: "macos-aarch64",
-    },
-    "darwin-x64": {
-        package: "@cortexkit/mc-host-darwin-x64",
-        target: "darwin-x64",
-        nativeTarget: "macos-x86_64",
-    },
     "linux-x64": {
         package: "@cortexkit/mc-host-linux-x64-gnu",
         target: "linux-x64-gnu",
@@ -142,6 +139,10 @@ const PLATFORM_PACKAGES = {
 const ADDON_PAYLOAD_PATH = "payload/native/mc_shm_native.node";
 
 type PlatformPackage = (typeof PLATFORM_PACKAGES)[keyof typeof PLATFORM_PACKAGES];
+
+export function supportsNativePlatform(platform: string, arch: string): boolean {
+    return `${platform}-${arch}` in PLATFORM_PACKAGES;
+}
 
 function platformPackage(): PlatformPackage {
     const platform = PLATFORM_PACKAGES[`${process.platform}-${process.arch}` as keyof typeof PLATFORM_PACKAGES];
@@ -159,13 +160,15 @@ function packageAddonPath(platform: PlatformPackage): string {
     }
     const packageDir = dirname(packageJsonPath);
     const manifestPath = join(packageDir, "payload-manifest.json");
-    if (!existsSync(manifestPath)) {
-        throw new NativeStartupError("missing_manifest");
-    }
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    let manifest: {
         package?: { name?: string; target?: string };
         files?: { path?: string; sha256?: string }[];
     };
+    try {
+        manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    } catch {
+        throw new NativeStartupError("missing_manifest");
+    }
     if (
         manifest.package?.name !== platform.package ||
         manifest.package.target !== platform.target
@@ -245,6 +248,9 @@ export function probeCapabilities(): NativeCapabilities {
         transferPrevention: false,
         cleanupHooks: false,
     };
+    if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+        return { available: false, ...base, reason: "node_detachment_unavailable" };
+    }
     const native = addon();
     if (!native)
         return { available: false, ...base, reason: "addon_unavailable" };
@@ -256,14 +262,6 @@ export function probeCapabilities(): NativeCapabilities {
                 ...base,
                 napiVersion,
                 reason: "napi_8_unavailable",
-            };
-        }
-        if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
-            return {
-                available: false,
-                ...base,
-                napiVersion,
-                reason: "detachment_unavailable",
             };
         }
         const view = native.createExternalProbe(31);
@@ -442,10 +440,6 @@ export class NativeProducerReservation {
         beforePublish?: () => void,
     ): void {
         this.assertActive();
-        // Spent before the native call: commit_reservation detaches the
-        // producer token native-side before its later validation can throw,
-        // so a retry (or the abort() in an error path) would target an
-        // already-detached token and mask the original error.
         this.active = false;
         this.native.commitReservation(
             this.channel,
@@ -458,10 +452,6 @@ export class NativeProducerReservation {
 
     abort(): void {
         if (!this.active) return;
-        // Same spent-before-native rule as commit(): never leave a window
-        // where a throwing native call can be retried against a detached
-        // token. A pre-detach native failure leaves the reservation tracked
-        // in the channel registry, which close() aborts.
         this.active = false;
         this.native.abortReservation(this.channel, this.token);
     }
@@ -506,21 +496,33 @@ export class NativeReceiveLease {
 
     release(): void {
         if (this.released) throw new Error("receive lease is already released");
-        // Spent before the native call so a throwing release is never
-        // retried against a possibly-detached token. Cleanup of a
-        // live-but-failed lease is owned by channel close.
         this.released = true;
         this.native.release(this.channel, this.token);
     }
 
     [Symbol.dispose](): void {
-        // Disposal is idempotent; explicit double release() keeps its throw.
         if (this.released) return;
         this.release();
     }
 
     private assertActive(): void {
         if (this.released) throw new Error("receive lease is released");
+    }
+}
+
+const readinessHandlers = new Map<number, () => void>();
+
+function dispatchReadiness(): void {
+    try {
+        for (const handler of [...readinessHandlers.values()]) {
+            try {
+                handler();
+            } catch {
+                // One failed channel cannot starve readiness for other channels.
+            }
+        }
+    } finally {
+        if (loaded?.readinessHandled()) queueMicrotask(dispatchReadiness);
     }
 }
 
@@ -537,9 +539,10 @@ export class NativeChannel {
         return new NativeChannel(native, native.attach(descriptor));
     }
 
-    static connectSetup(options: NativeSetupOptions): NativeChannel {
+    static async connectSetup(options: NativeSetupOptions): Promise<NativeChannel> {
         const native = capableAddon();
-        return new NativeChannel(native, native.connectSetup(options));
+        const pending = await native.connectSetup(options);
+        return new NativeChannel(native, await native.finishSetup(pending));
     }
 
     static createTestPair(): NativeTestPair {
@@ -602,7 +605,18 @@ export class NativeChannel {
         );
     }
 
-    poll(deliver: (lease: NativeReceiveLease) => void): boolean {
+    startReadiness(handler: () => void): void {
+        this.assertOpen();
+        readinessHandlers.set(this.id, handler);
+        try {
+            this.native.watch(this.id, dispatchReadiness);
+        } catch (error) {
+            readinessHandlers.delete(this.id);
+            throw error;
+        }
+    }
+
+    drainOne(deliver: (lease: NativeReceiveLease) => void): boolean {
         this.assertOpen();
         return this.native.poll(this.id, (token, header, segments) => {
             deliver(
@@ -620,7 +634,7 @@ export class NativeChannel {
     /**
      * True once the host has dropped the setup socket that scopes this channel's
      * lifetime. A ring that has simply gone quiet is indistinguishable from a
-     * dead peer without this signal. commentlint: allow(JUDGE)
+     * dead peer without this signal.
      */
     peerClosed(): boolean {
         if (this.closed) return true;
@@ -629,12 +643,14 @@ export class NativeChannel {
 
     close(): void {
         if (this.closed) return;
+        readinessHandlers.delete(this.id);
         this.native.close(this.id);
         this.closed = true;
     }
 
     forceClose(): void {
         if (this.closed) return;
+        readinessHandlers.delete(this.id);
         this.native.forceClose(this.id);
         this.closed = true;
     }

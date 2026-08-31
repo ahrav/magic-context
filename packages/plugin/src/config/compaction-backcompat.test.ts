@@ -2,10 +2,6 @@ import { describe, expect, it } from "bun:test";
 import { isCompactionEnabled } from "./agent-disable";
 import { MagicContextConfigSchema } from "./schema/magic-context";
 
-// Back-compat acceptance for the compaction-off config gate (issue #266 S1).
-// The knob defaults at BOTH levels so `{}`, `{ compaction: {} }`, and a config
-// with no block all yield compaction.enabled === true — default-on behavior is
-// byte-identical to today (no behavior is gated yet in this slice; these are
 // schema-level assertions).
 
 describe("compaction config back-compat (issue #266 S1)", () => {
@@ -42,9 +38,6 @@ describe("compaction config back-compat (issue #266 S1)", () => {
     });
 
     it("absent block is byte-identical to default block for compaction (no behavior gated yet)", () => {
-        // Both resolve to the same { enabled: true } shape, so a config with no
-        // compaction block and one with `{ compaction: {} }` produce the same
-        // parsed compaction value.
         const absent = MagicContextConfigSchema.parse({ memory: { enabled: true } });
         const empty = MagicContextConfigSchema.parse({ compaction: {} });
         expect(absent.compaction).toEqual(empty.compaction);

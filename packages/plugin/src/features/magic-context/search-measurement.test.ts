@@ -77,7 +77,7 @@ describe("recordShadowMeasurement", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
         tempDirs.length = 0;
@@ -102,8 +102,8 @@ describe("recordShadowMeasurement", () => {
         _setTestProviderFactoryForProject(() => new FakeShadowProvider());
         registerProjectShadowEmbedding(db, "git:shadow-measure", synapseConfig, "/tmp/shadow");
 
-        // A closed database makes the terminal recordEmbeddingMeasurement write
-        // throw (the SQLITE_BUSY class of failure the guard must contain).
+        // A closed database makes the final `recordEmbeddingMeasurement` write throw.
+        // `recordShadowMeasurement` resolves instead of rejecting when `recordEmbeddingMeasurement` throws.
         const closedDb = new Database(":memory:");
         closedDb.close();
 
@@ -126,8 +126,7 @@ describe("recordShadowMeasurement", () => {
         };
         process.on("unhandledRejection", onUnhandledRejection);
         try {
-            // Mirrors unifiedSearch (search.ts): the measurement is void-floated
-            // after results are built, so any rejection would be unhandled.
+            // A rejection from a void-floated measurement is unhandled.
             void recordShadowMeasurement(makeMeasurementArgs(closedDb));
             await new Promise((resolve) => setTimeout(resolve, 50));
             expect(rejections).toHaveLength(0);
@@ -206,8 +205,6 @@ describe("recordShadowMeasurement", () => {
 
     it("records the resolved lane when the shadow query itself resolves a deferred one", async () => {
         const db = useTempDb();
-        // A deferred lane has no fingerprint yet, so the registration publishes
-        // the placeholder identity until the first embed resolves it.
         const deferredConfig = {
             provider: "synapse",
             model: "gte-modernbert-base-f16",
@@ -222,8 +219,6 @@ describe("recordShadowMeasurement", () => {
                 _signal?: AbortSignal,
                 _purpose?: EmbeddingPurpose,
             ): Promise<Float32Array> {
-                // The real Synapse provider announces its lane from inside the
-                // first embed; the registry then commits the resolved identity.
                 announceLane?.();
                 return new Float32Array([1, 2]);
             }
@@ -256,8 +251,6 @@ describe("recordShadowMeasurement", () => {
         const resolved = getShadowEmbeddingMeasurementCohort("git:shadow-measure");
         expect(resolved?.fingerprint).toBe("fp-resolved");
         expect(resolved?.modelId).not.toBe(placeholder?.modelId);
-        // The replayed search must query the lane that answered, not the
-        // placeholder model_id nothing is stored under.
         expect(overrides).toEqual([resolved?.modelId]);
 
         const rows = listEmbeddingMeasurements(db, "ses-shadow");

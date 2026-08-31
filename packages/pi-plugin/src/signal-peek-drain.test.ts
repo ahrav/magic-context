@@ -1,16 +1,8 @@
 /**
- * Regression: PEEK-then-drain-on-success pattern for the three
- * runtime signal sets (Oracle audit Round 8 finding #6).
  *
- * Before the fix, Pi eagerly drained the signal at the START of the
- * relevant phase — if the rebuild work threw, the signal was lost and
- * the next pass didn't retry. OpenCode peeks first, then drains AFTER
- * the work succeeds, so a mid-pipeline failure leaves the flag set for
+ * The handler drains each signal only after its rebuild succeeds; failures retain the signal for retry.
  * retry.
  *
- * These tests are source-pinning rather than runtime mocks because the
- * bug shape is structural — the difference between "delete-before-work"
- * and "delete-after-success" is what matters and that's stable across
  * runtime mocking.
  */
 
@@ -42,8 +34,6 @@ const CONTEXT_HANDLER_SRC = readFileSync(
 const INDEX_SRC = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
 
 function stripComments(src: string): string {
-	// Strip both /* ... */ and // ... single-line comments so source-pinning
-	// assertions match real code only.
 	let out = src.replace(/\/\*[\s\S]*?\*\//g, "");
 	out = out.replace(/^\s*\/\/.*$/gm, "");
 	out = out.replace(/(?<![:\w])\/\/.*$/gm, "");
@@ -59,7 +49,6 @@ describe("signal helpers: peek vs drain semantics", () => {
 			expect(hasSystemPromptRefresh("ses-peek-1")).toBe(true);
 			// drain
 			expect(clearSystemPromptRefresh("ses-peek-1")).toBe(true);
-			// post-drain peek must be false
 			expect(hasSystemPromptRefresh("ses-peek-1")).toBe(false);
 		} finally {
 			db.close();
@@ -110,7 +99,7 @@ describe("signal helpers: peek vs drain semantics", () => {
 			signalPiHistoryRefresh("ses-history");
 			signalPiSystemPromptRefresh("ses-history");
 			signalPiPendingMaterialization("ses-history");
-			// After clearing pendingMaterialization, the other two stay set.
+			// After consuming pendingMaterialization, historyRefresh and systemPromptRefresh remain set.
 			expect(consumePendingMaterialization("ses-history")).toBe(true);
 			expect(hasSystemPromptRefresh("ses-history")).toBe(true);
 		} finally {
@@ -142,37 +131,26 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 	const code = stripComments(CONTEXT_HANDLER_SRC);
 
 	test("runPipeline does NOT eager-delete historyRefreshSessions before work", () => {
-		// The eager-delete used to live in the outer pi.on("context") handler
-		// (around line 1052) before runPipeline. Confirm it's gone.
-		// Find the outer ctx-handler lifecycle area, before runPipeline call.
 		const before = code.split("await runPipeline(")[0];
 		expect(before).not.toContain("historyRefreshSessions.delete(sessionId)");
 	});
 
 	test("history drain happens AFTER injectM0M1Pi succeeds", () => {
-		// Find the injection block inside runPipeline. The drain must be:
-		//  1. Inside the try block (so it only runs on success)
-		//  2. After the injectM0M1Pi seam returns
-		//  3. Guarded by isCacheBusting
-		// Anchor on the LAST call site: the wire-injection seam. The pre-fold
-		// probe (fold-execution gate) also calls injectM0M1PiForRun earlier in
-		// runPipeline, and the drain contract applies to the wire injection only.
+		// The drain occurs only after `injectM0M1Pi` succeeds, so failures retain the signal for retry.
+		// The drain runs inside the `try` block so failures do not consume the signal.
+		// The drain applies only to the wire-injection `injectM0M1PiForRun` call.
+		// `injectM0M1Pi` does not consume the signal.
 		const idx = code.lastIndexOf("injectM0M1PiForRun(");
 		expect(idx).toBeGreaterThan(0);
-		// Look at the next ~600 chars after the injection call
 		const segment = code.slice(idx, idx + 2400);
-		// The drain must mention historyRefreshSessions.delete and isCacheBusting
 		expect(segment).toContain("historyRefreshSessions.delete(args.sessionId)");
 		expect(segment).toMatch(/if\s*\(\s*args\.isCacheBusting\s*\)/);
 	});
 
 	test("deferred publication drains only on a MID-TURN-AWARE can-consume-late gate", () => {
-		// canConsumeDeferredLate must be a mid-turn-aware gate computed
-		// INDEPENDENTLY (from the mid-turn-adjusted schedulerDecision + force
-		// threshold), NOT derived from shouldRunHeuristics. The old inverted form
-		// `baseShouldApplyPendingOps || shouldRunHeuristics` let a deferred publish
-		// drain mid-turn (shouldRunHeuristics read raw deferred-set membership),
-		// busting cache where OpenCode stayed deferred. It must mirror OpenCode's
+		// `canConsumeDeferredLate` uses the mid-turn-adjusted `schedulerDecision` and force threshold independently of `shouldRunHeuristics`.
+		// `shouldRunHeuristics` must not control deferred-publish consumption because it reads raw deferred-set membership.
+		// Deferred publishes remain queued mid-turn.
 		// canConsumeDeferredOnThisPass.
 		expect(code).not.toMatch(
 			/const\s+canConsumeDeferredLate\s*=\s*baseShouldApplyPendingOps\s*\|\|\s*shouldRunHeuristics/,
@@ -230,9 +208,6 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 	});
 
 	test("note nudges are wired after runPipeline", () => {
-		// The rolling/sticky reminders were removed in the ctx_reduce nudge
-		// redesign (replaced by Channel 1 tool-result append + Channel 2
-		// sendUserMessage). Note nudges still run after the pipeline completes.
 		const pipelineIdx = code.indexOf("const result = await runPipeline(");
 		const noteIdx = code.indexOf("applyNoteNudges(");
 		expect(pipelineIdx).toBeGreaterThan(0);
@@ -245,24 +220,20 @@ describe("source contract: peek-then-drain in runPipeline (pending materializati
 	const code = stripComments(CONTEXT_HANDLER_SRC);
 
 	test("gate uses hasPendingMaterialization, not consume", () => {
-		// The gate must not drain the signal at decision time. The drain
-		// happens AFTER applyPendingOperations succeeds.
-		// Match across formatter line wraps with a tolerant regex.
+		// The handler drains the signal only after `applyPendingOperations` succeeds.
+		// The handler drains the signal only after `applyPendingOperations` succeeds.
 		expect(code).toMatch(
 			/const\s+hasPendingMaterializeSignal\s*=\s*hasPendingMaterialization\(/,
 		);
-		// And confirm the variable is NOT directly assigned from the
-		// draining helper (regression guard for the pre-fix pattern).
+		// hasPendingMaterialization does not drain the signal.
 		expect(code).not.toMatch(
 			/const\s+hasPendingMaterializeSignal\s*=\s*consumePendingMaterialization\(/,
 		);
 	});
 
 	test("drain happens AFTER applyPendingOperations succeeds", () => {
-		// Find the gate body. After the applyPendingOperations call there
-		// must be a conditional consumePendingMaterialization drain
-		// guarded by hasPendingMaterializeSignal, all inside the same
-		// `if` block (so a throw from applyPendingOperations skips the drain).
+		// consumePendingMaterialization runs only after applyPendingOperations succeeds.
+		// A throw from `applyPendingOperations` skips the drain.
 		const idx = code.indexOf("applyPendingOperations(");
 		expect(idx).toBeGreaterThan(0);
 		const segment = code.slice(idx, idx + 800);
@@ -275,8 +246,6 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 	const code = stripComments(INDEX_SRC);
 
 	test("uses hasSystemPromptRefresh peek, not the old draining helper", () => {
-		// The old code called consumeSystemPromptRefresh(sessionId) at the
-		// start of the handler. After the fix it calls hasSystemPromptRefresh.
 		expect(code).toContain("hasSystemPromptRefresh(sessionId)");
 		expect(code).not.toContain("consumeSystemPromptRefresh(sessionId)");
 	});
@@ -290,19 +259,13 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 	});
 
 	test("clear is guarded by the captured isCacheBusting boolean", () => {
-		// Pattern: `if (isCacheBusting) { clearSystemPromptRefresh(...) }`
-		// The clear MUST be conditional on the captured variable, not a
-		// re-read of the set, so signals added later in the same pass
-		// (e.g. result.hashChanged path) survive to the next prompt.
+		// The handler clears the refresh signal only when captured isCacheBusting is true, preserving signals set during non-cache-busting passes.
 		const clearIdx = code.indexOf("clearSystemPromptRefresh(sessionId)");
 		const window = code.slice(Math.max(0, clearIdx - 200), clearIdx + 100);
 		expect(window).toMatch(/if\s*\(\s*isCacheBusting\s*\)/);
 	});
 
 	test("system-prompt injection supports global disable, skip signatures, and existing prompt dedup", () => {
-		// Council #4 (project-config bleed on /cd): these decisions use
-		// effectiveConfig — the config re-resolved from the CURRENT checkout's
-		// cwd on a project switch — not the launch-cwd boot `config`.
 		expect(code).toContain(
 			"effectiveConfig.system_prompt_injection?.enabled === false",
 		);

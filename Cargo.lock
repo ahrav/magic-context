@@ -1055,6 +1055,7 @@ dependencies = [
  "mc-store",
  "md5",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

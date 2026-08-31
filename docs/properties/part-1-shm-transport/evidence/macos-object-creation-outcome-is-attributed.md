@@ -53,6 +53,13 @@ uses only `mc_shm_transport::harness` (`:11`). `tests/shm_soak.rs` gates its rin
 work on `#[cfg(target_os = "linux")]` (`:252`, `:259`, `:267`, `:287`). So no
 macOS job reaches `Ring::create`.
 
+Update 2026-08-31: the CI paragraph above resolves against the pre-#131
+workflow. PR #131 (merge `5d638e3e8`) removed the macOS matrix leg entirely;
+`.github/workflows/ci.yml` at HEAD `bdf72f46a` contains only `ubuntu-latest`
+jobs. The same merge deleted the Darwin npm packages
+(`packages/mc-host-darwin-*`, removed in `55f47ac64`). See the dated
+investigation-log entry below for what remains of the macOS path at HEAD.
+
 The provider does not reach it either: `ShmProvider::preflight`
 (former `crates/mc-host/src/shm_provider.rs:276-278`) and `prepare` (former `:288-290`) both
 return early on `!cfg!(target_os = "linux")`, and
@@ -120,3 +127,34 @@ way to reach any of this; today that file is not in the macOS command.
   candidate is the strongest because its premise is arithmetic from source rather
   than a behavioural guess, but confirming it needs a macOS run. The claim that
   no macOS job reaches `Ring::create` is settled and does not depend on the cause.
+
+### Q: Is Darwin still a supported release surface? (added 2026-08-31)
+
+- Sources examined: `packages/` listing at HEAD `bdf72f46a` (no
+  `mc-host-darwin-*` directories remain); `.github/workflows/ci.yml` at HEAD
+  (every `runs-on` is `ubuntu-latest`);
+  `git log --diff-filter=D -- packages/mc-host-darwin-arm64/package.json`
+  (deleted in `55f47ac64`, merged via `5d638e3e8`, PR #131);
+  `crates/mc-shm-transport/src/backend/ring.rs:1-2`, `:311-312`, `:2109-2115`,
+  `:2176-2219`; `docs/mc-host-shm-transport.md:5`, `:83`.
+- Findings: the Darwin packages and macOS CI jobs are gone. `ring.rs:1-2` now
+  raises `compile_error!("mc-shm-transport ring backend supports Linux only")`
+  off Linux, `Mapping::create` calls `create_linux_memfd` unconditionally
+  (`:311-312`), and `create_macos_shm` (`:2176`) has no caller — the only
+  occurrence of its name in the crate is its definition. `099a314d5` also
+  rewrote its body: the name is now 10 random bytes, 28 characters against a
+  commented 31-byte Darwin limit (`:2177-2178`), which addresses this record's
+  strongest failure candidate, and `FD_CLOEXEC` is set via `fcntl` after
+  `shm_open` (`:2206`) because Darwin rejects `O_CLOEXEC` in `shm_open` flags.
+  The doc claim this record was anchored to (former
+  `docs/mc-host-shm-transport.md:121`, macOS `Ring::create` returns
+  `ObjectSetupFailed`) is gone; the doc now states Linux-x64 glibc support only
+  (`:5`, `:83`).
+- Missing evidence: any statement of intent for the surviving
+  `cfg(target_os = "macos")` code — dead residue, or a kept seed for a Darwin
+  return.
+- Conclusion: needs human input. Citation corrections: `create_macos_shm` is at
+  `ring.rs:2176-2219` at HEAD, not `:1748-1783`; the `ci.yml` matrix lines
+  cited above (`:132`, `:159-166`, `:169-176`) no longer exist; the
+  40-character-name analysis describes the pre-#131 body and is superseded by
+  the 28-character form.

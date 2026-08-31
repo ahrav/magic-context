@@ -23,22 +23,9 @@ export interface SeedGoldMemoriesOptions {
 }
 
 /**
- * Seed oracle rows through the production claim-aware write path.
  *
- * The database must already exist; opening a missing SQLite path would create a
- * schemaless file and turn a disabled-plugin baseline into misleading test data.
  *
- * Rows are seeded with the conservative `model_inference` trust class so the
- * maturity ladder — not the seeder — decides surface eligibility: an unverified
- * claim stays CANDIDATE and reaches explicit search only, and `verified` rows
- * become auto-injectable only after the real verification API records the
- * outcome against their exact current revision.
  *
- * Each row is its own claim operation, so a failure part-way through leaves the
- * earlier rows committed. A row whose normalized hash already has a live claim
- * in the same (project, category) slot resolves onto that claim and attaches its
- * provenance as independent evidence instead of creating a second claim, so the
- * returned array can name the same claim twice.
  */
 export function seedGoldMemories(
     options: SeedGoldMemoriesOptions,
@@ -96,8 +83,6 @@ export function seedGoldMemories(
             return claim;
         });
 
-        // Explicit search is the only surface that carries CANDIDATE claims, so
-        // reading it returns both verification modes with one request.
         const state = readProjectMemoryCurrentState(db, {
             publicClaimIds: [...new Set(seeded.map((claim) => claim.publicClaimId))],
             surface: "explicit_search",

@@ -1,27 +1,24 @@
 /**
- * Immutable baselines and the KTD17 regression policy (U6: R59-R62).
+ * Baselines are immutable.
  *
- * Quality identity and latency identity are separate (KTD3): a quality
- * baseline binds release + metric policy + behavior + profile fingerprints;
- * a latency baseline additionally binds one exact host fingerprint plus
- * exclusive-lock, canary, affinity, NUMA, power, and cache evidence. A
- * mismatch or drift makes latency non-comparable and can never yield a
- * latency pass; matching quality keys may still yield a quality-only
- * verdict, which cannot unblock a gate that requires latency.
+ * A quality baseline binds release, metric policy, behavior, and profile fingerprints.
+ * A latency baseline additionally binds an exact host fingerprint.
+ * A latency baseline also binds exclusive-lock, canary, affinity, NUMA, power, and cache evidence.
+ * A fingerprint mismatch or drift makes latency non-comparable and prevents a latency pass.
+ * Matching quality keys can still yield a quality-only verdict.
+ * A quality-only verdict cannot unblock a gate that requires latency.
  *
- * Latency policy input is raw request samples only: one p95 per run per
- * matrix cell through the versioned nearest-rank rule, then the median of
- * the three run-level p95 values. Pooled cross-run samples and averaged
- * worker/query percentiles are rejected as policy inputs, not silently
- * accepted (KTD15, R61).
+ * Each matrix cell uses one nearest-rank p95 from raw request samples per run.
+ * The latency baseline uses the median of the three run-level p95 values.
+ * Pooled cross-run samples and averaged worker/query percentiles are rejected as policy inputs.
  *
- * KTD10: the thresholds are repository policy, not statistical confidence.
- * The A/A check reports mechanical integrity of report parsing and policy
- * application; its spread is never interpreted as a noise floor.
+ * The thresholds are repository policy, not statistical confidence.
+ * The A/A check reports report-parsing and policy-application integrity.
+ * The A/A check never interprets its spread as a noise floor.
  *
- * KD4/R59: the TypeScript audit records absolute quality with
- * `quality_target: not_specified` and the 25 ms latency comparison for the
- * 100K/384 automatic cell; it never feeds the regression verdict.
+ * The TypeScript audit records absolute quality with `quality_target: not_specified`.
+ * The TypeScript audit compares latency against 25 ms for the 100K/384 automatic cell.
+ * The TypeScript audit's 100K/384 automatic cell never feeds the regression verdict.
  */
 
 import {
@@ -57,9 +54,8 @@ export const TS_AUDIT_SCHEMA_VERSION = "retrieval-benchmark-ts-audit/v1";
 export const REQUIRED_RUN_COUNT = 3;
 export const TS_AUDIT_LATENCY_THRESHOLD_MS = 25;
 
-/** Absorbs binary-float noise when metric losses land exactly on a policy
- *  boundary (0.80 - 0.78 is 2.0000000000000018 points in float64); one
- *  nano-point can never flip a genuine regression. */
+/** `LOSS_POINTS_EPSILON` absorbs float error at loss-policy boundaries without masking a genuine regression.
+ * */
 const LOSS_POINTS_EPSILON = 1e-9;
 
 export class RegressionError extends Error {
@@ -72,7 +68,6 @@ export class RegressionError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Strict versioned artifact schemas.
 // ---------------------------------------------------------------------------
 
 const fingerprintSchema = z.string().regex(/^[0-9a-f]{64}$/);
@@ -109,9 +104,8 @@ const qualityKeySchema = z.strictObject({
     metricPolicyVersion: z.literal(METRIC_POLICY_VERSION),
     timingPolicyVersion: z.literal(TIMING_POLICY_VERSION),
     profileFingerprint: fingerprintSchema,
-    /** Hash of the report's whole semantic config: harness version,
-     *  instrumentation schema versions, case set, fixtures, and every other
-     *  behavior-relevant knob. Any behavior-contract change moves it. */
+    /**
+     * */
     behaviorFingerprint: fingerprintSchema,
 });
 export type QualityKey = z.infer<typeof qualityKeySchema>;
@@ -133,9 +127,7 @@ const qualityRunSchema = z.strictObject({
     modes: z
         .array(modeValuesSchema)
         .min(1)
-        // Downstream lookups resolve a mode by find(); a duplicate entry in
-        // a hand-edited baseline would silently drop every entry after the
-        // first instead of failing loudly here.
+        // The loader rejects duplicate modes because `find()` would otherwise select only the first entry.
         .refine((modes) => new Set(modes.map((entry) => entry.mode)).size === modes.length, {
             message: "duplicate mode entries in one run",
         }),
@@ -207,11 +199,8 @@ export function parseRegressionPolicy(value: unknown): RegressionPolicy {
 export function parseQualityBaseline(value: unknown): QualityBaselineArtifact {
     const parsed = qualityBaselineSchema.safeParse(value);
     if (!parsed.success) throw new RegressionError(formatArtifactIssues("baseline", parsed.error));
-    // Cross-run mode consistency is a loader obligation, not just a builder
-    // one: evaluateRegression derives its mode set from the first run and
-    // asks every run for it, so a hand-edited but schema-valid artifact
-    // with diverging per-run mode sets must fail here with a clean
-    // diagnostic instead of crashing the evaluation.
+    // The loader enforces cross-run mode consistency because `evaluateRegression` derives modes from the first run.
+    // Diverging per-run mode sets must fail during parsing.
     const modeSet = (run: { modes: readonly { mode: string }[] }) =>
         [...run.modes.map((entry) => entry.mode)].sort().join(",");
     const first = parsed.data.runs[0];
@@ -235,8 +224,8 @@ export function parseHostEvidence(value: unknown): HostEvidence {
     return parsed.data;
 }
 
-/** Same promoter-serialization byte rule the release and profile loaders
- *  enforce: any byte the parsed view does not account for rejects. */
+/**
+ * The promoter serialization loader rejects bytes outside the parsed view, matching the release and profile loaders. */
 function readCanonicalArtifact(label: string, path: string): unknown {
     return readCanonicalJsonFile(
         path,
@@ -263,7 +252,6 @@ export function regressionPolicyFingerprint(policy: RegressionPolicy): string {
 }
 
 // ---------------------------------------------------------------------------
-// Report-derived identity and latency evidence.
 // ---------------------------------------------------------------------------
 
 export function qualityKeyFromReport(report: BenchmarkReport): QualityKey {
@@ -280,9 +268,8 @@ export function qualityKeyFromReport(report: BenchmarkReport): QualityKey {
     };
 }
 
-/** The runner records its host fingerprint as a `host:<sha256>` attempt
- *  diagnostic. Distinct fingerprints across attempts mean the checkpointed
- *  evidence mixes hosts, which is never usable latency identity. */
+/** The runner records its host fingerprint as a `host:<sha256>` attempt diagnostic.
+ * Checkpointed evidence with distinct host fingerprints across attempts is not usable as latency identity. */
 export function reportHostFingerprint(report: BenchmarkReport): string | null {
     const found = new Set<string>();
     for (const attempt of report.evidence.attempts) {
@@ -301,9 +288,8 @@ export type RunCellLatencyEvidence =
     | { kind: "averaged-worker-p95s"; p95sMs: readonly number[] }
     | { kind: "averaged-query-p95s"; p95sMs: readonly number[] };
 
-/** One run-level p95 per matrix cell from raw request samples only.
- *  Pre-pooled cross-run samples and averaged worker/query percentiles are
- *  rejected as policy inputs (R61, KTD10). */
+/**
+ * */
 export function runLevelP95(evidence: RunCellLatencyEvidence): number {
     if (evidence.kind !== "raw-request-samples") {
         throw new RegressionError([
@@ -317,7 +303,7 @@ export function medianOfThree(values: readonly [number, number, number]): number
     return [...values].sort((a, b) => a - b)[1];
 }
 
-/** Raw trace-disabled request samples per matrix cell (case) for one run. */
+/** reportCellSamples returns raw, trace-disabled request samples for each matrix cell in one run. */
 export function reportCellSamples(report: BenchmarkReport): Map<string, number[]> {
     const cells = new Map<string, number[]>();
     for (const caseEvidence of report.evidence.cases) {
@@ -347,7 +333,6 @@ function gateModeValues(report: BenchmarkReport): Map<QueryMode, BaselineModeVal
 }
 
 // ---------------------------------------------------------------------------
-// Baseline creation and atomic publication (KTD11).
 // ---------------------------------------------------------------------------
 
 function validateRunSet(
@@ -404,7 +389,7 @@ export function buildQualityBaseline(input: {
     policy: RegressionPolicy;
     reports: readonly BenchmarkReport[];
     claimEligibility: ClaimEligibility;
-    /** A/A mechanical mode only: the same artifact plays all three runs. */
+    /** A/A mechanical mode uses the same artifact for all three runs. */
     allowIdenticalRuns?: boolean;
 }): QualityBaselineArtifact {
     const allowIdenticalRuns = input.allowIdenticalRuns ?? false;
@@ -457,11 +442,8 @@ export function vacuousBaselineModes(artifact: QualityBaselineArtifact): QueryMo
         .map((mode) => mode.mode);
 }
 
-/** Core per-run host-evidence checks shared by baseline building and
- *  candidate evaluation: the exclusive run lock, canary stability, and the
- *  report's host matching its evidence. Reference comparisons stay with
- *  each caller because their referents differ (the first run's evidence
- *  for a new baseline; the stored baseline for candidates). */
+/**
+ * */
 function hostEvidenceRunIssues(
     label: string,
     index: number,
@@ -543,12 +525,11 @@ export function buildLatencyBaseline(input: {
 }
 
 /**
- * Atomic immutable publication (KTD11): refuse overwrite, stage the complete
- * artifact beside the destination, re-load the exact staged bytes through
- * the strict schema, and hard-link into place. link(2) fails with EEXIST
- * when the destination exists, so a concurrent publisher cannot replace an
- * already published baseline (rename(2) would). Any failure removes the
- * staging directory and leaves the destination directory byte-identical.
+ * The publisher atomically creates a baseline only when none exists.
+ * The publisher publishes only staged bytes accepted by the strict baseline schema.
+ * linkSync fails with EEXIST when the destination exists, so concurrent publishers cannot replace a published baseline.
+ * rename(2) would overwrite an already published baseline.
+ * Any failure after staging creation removes the staging directory.
  */
 export function publishBaseline(artifact: BaselineArtifact, outPath: string): { path: string } {
     if (existsSync(outPath)) {
@@ -576,13 +557,12 @@ export function publishBaseline(artifact: BaselineArtifact, outPath: string): { 
 }
 
 // ---------------------------------------------------------------------------
-// TS-only audit (KD4, R59, AE9).
 // ---------------------------------------------------------------------------
 
 export interface TsAudit {
     schemaVersion: typeof TS_AUDIT_SCHEMA_VERSION;
-    /** KD4: no absolute quality target exists; absolute metrics are
-     *  recorded without a verdict and never gate the roadmap. */
+    /** Absolute metrics are recorded without a verdict.
+     * Absolute metrics never gate evaluation. */
     quality_target: "not_specified";
     quality: Array<{
         runId: string;
@@ -605,12 +585,11 @@ export interface TsAudit {
 
 export function tsAudit(input: {
     reports: readonly BenchmarkReport[];
-    /** Cases realizing the 100K/384 automatic audit cell; the caller derives
-     *  them from the profile. Empty means the cell did not run here. */
+    /**
+     * Empty auditCaseIds means the cell did not run here. */
     auditCaseIds: readonly string[];
 }): TsAudit {
-    // Pooling raw samples from several cases would fold distinct matrix
-    // cells into one run-level p95 (R61), so more than one case rejects.
+    // tsAudit rejects more than one audit case because pooling cases merges distinct matrix cells into one run-level p95.
     if (input.auditCaseIds.length > 1) {
         throw new RegressionError([
             `audit: ${input.auditCaseIds.length} audit cases would pool raw samples across matrix cells into one run-level p95; supply at most one audit case id`,
@@ -663,7 +642,6 @@ export function tsAudit(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Regression evaluation (R60-R62, KTD17 values from the policy artifact).
 // ---------------------------------------------------------------------------
 
 export type RegressionVerdict =
@@ -723,7 +701,7 @@ export interface EvaluateRegressionInput {
     /** A gate that requires latency is never unblocked by quality-only. */
     latencyRequired?: boolean;
     auditCaseIds?: readonly string[];
-    /** A/A mechanical mode only. */
+    /** Only A/A mechanical mode runs the mechanical-consistency check. */
     allowIdenticalRuns?: boolean;
 }
 
@@ -917,9 +895,7 @@ export function evaluateRegression(input: EvaluateRegressionInput): RegressionRe
                 };
             }
             const candidateMedianP95Ms = medianOfThree(candidateRunP95sMs);
-            // Cross-multiplied percent comparison: the declared equality
-            // rule, so a median ratio of exactly 1.10 passes without a
-            // floating-point division deciding the boundary.
+            // Cross-multiplication lets a median ratio of exactly 1.10 satisfy the inclusive threshold without division rounding.
             const withinBound =
                 candidateMedianP95Ms * 100 <=
                 cell.medianP95Ms * input.policy.latency.maxMedianP95Percent;
@@ -956,7 +932,6 @@ export function evaluateRegression(input: EvaluateRegressionInput): RegressionRe
 }
 
 // ---------------------------------------------------------------------------
-// A/A mechanical-integrity check (KTD10).
 // ---------------------------------------------------------------------------
 
 export interface AaMechanicalResult {
@@ -965,14 +940,14 @@ export interface AaMechanicalResult {
     status: "ok" | "mechanical-failure";
     verdictUnderPolicy: RegressionVerdict;
     maxAbsAverageLossPoints: number;
-    /** Identical artifacts must parse to identical per-run values under
-     *  both labels; a float residue of the policy's mean arithmetic is
-     *  reported but is not a mechanical defect. */
+    /** Identical artifacts must yield identical per-run values when labeled baseline and candidate.
+     * The check reports float residue from policy mean arithmetic without treating it as a mechanical defect.
+     * */
     runValuesExact: boolean;
     maxAbsRunLossPoints: number;
     latencyCellsChecked: number;
-    /** Parsing and policy application over identical artifacts must be
-     *  exact; any spread is a harness defect, not a noise floor. */
+    /** Parsing and policy application over identical artifacts must be exact; any spread indicates a harness defect, not a noise floor.
+     * */
     interpretation: "mechanical integrity of report parsing and policy application over identical artifact/config fingerprints; not a statistical control and not a noise floor";
 }
 
@@ -994,11 +969,8 @@ export function aaMechanicalCheck(input: {
         allowIdenticalRuns: true,
     });
 
-    // Cross-check two INDEPENDENT computations of the same policy: the
-    // p95 recomputed here from raw samples against the p95 the runner
-    // recorded in case evidence at run time. Recomputing the same pure
-    // function twice over one array would be tautological and could never
-    // surface a defect in either pipeline.
+    // Runner-recorded p95 must agree with p95 recomputed from raw samples.
+    // Runner-recorded p95 must agree with p95 recomputed from raw samples.
     const recordedP95ByCase = new Map<string, number>();
     for (const caseEvidence of input.report.evidence.cases) {
         if (caseEvidence.latencySummary) {
@@ -1012,8 +984,6 @@ export function aaMechanicalCheck(input: {
         if (samplesMs.length === 0) continue;
         latencyCellsChecked += 1;
         const recordedP95 = recordedP95ByCase.get(caseId);
-        // The runner records a summary for every case with samples, so a
-        // missing or diverging recorded p95 is a mechanical defect.
         if (recordedP95 === undefined) {
             latencyExact = false;
             continue;

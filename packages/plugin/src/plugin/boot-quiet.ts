@@ -1,7 +1,4 @@
 /**
- * Background maintenance waits after the first plugin construction so a
- * sibling process can finish its startup reads and migrations before writers
- * begin. This is intentionally fixed rather than user-configurable.
  */
 export const BOOT_QUIET_MS = 120_000;
 
@@ -24,7 +21,7 @@ export function scheduleAfterBootQuiet(
     return timer;
 }
 
-/** Test seam for deterministic fake-timer coverage. */
+/* */
 export function setBootQuietPeriodForTests(startAtMs: number | null): void {
     bootQuietUntilMs = startAtMs === null ? 0 : startAtMs + BOOT_QUIET_MS;
 }

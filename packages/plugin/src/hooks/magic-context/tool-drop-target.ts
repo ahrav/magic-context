@@ -60,16 +60,7 @@ function setToolContent(part: unknown, content: string): void {
 }
 
 /**
- * Deep-copy a tool part so a clamp/drop can rewrite the copy without touching
- * the original object. The transform receives `args.messages` whose part
- * objects are the LIVE instances OpenCode still holds (it reads the same
- * objects back for the wire and, for a tool that is still executing, for the
- * execution itself). Rewriting one of those in place can corrupt a live run —
- * e.g. clamping a background task part's `input.prompt` while the child agent
- * is still spawning from it. Cloning first confines every byte change to the
- * wire copy that replaces the part in the message array. Parts are plain
- * JSON-serializable data, so structuredClone (with a JSON fallback for
- * runtimes/edge values that reject it) is sufficient.
+ * When cloning succeeds, replacing the array entry isolates clamp mutations from the original part.
  */
 function clonePart(part: unknown): unknown {
     if (part === null || typeof part !== "object") return part;
@@ -79,22 +70,13 @@ function clonePart(part: unknown): unknown {
         try {
             return JSON.parse(JSON.stringify(part));
         } catch {
-            // Non-serializable part: return it as-is rather than throw. The
-            // clamp then mutates the original, which is the pre-existing
-            // behavior; this branch is only reachable for exotic parts that
-            // cannot be cloned or serialized at all.
+            // If both cloning strategies fail, the subsequent clamp mutates the original part.
             return part;
         }
     }
 }
 
 /**
- * Apply a clamp to a throwaway clone of the occurrence's part and swap the
- * clone into the message's parts array, leaving the original part object
- * byte-identical. This is the mutation-safety guarantee: the wire (the array
- * OpenCode reads back) carries the clamped copy, while the live object OpenCode
- * may still execute from is never touched. The swap is by reference identity
- * (`indexOf`), so it is a no-op if the part is no longer in the array.
  */
 function clampCloneInPlace(occurrence: IndexedOccurrence, clamp: (part: unknown) => void): void {
     const clone = clonePart(occurrence.part);
@@ -107,14 +89,8 @@ function clampCloneInPlace(occurrence: IndexedOccurrence, clamp: (part: unknown)
 function truncateToolPart(part: unknown, tagId: number): void {
     if (!isRecord(part)) return;
 
-    // The skeleton keeps the tool_use call but replaces its OUTPUT with the
-    // one canonical drop placeholder `[dropped §N§]` (byte-identical to a
-    // full message/tool drop). Long input ARG values are separately clamped
-    // with `...[truncated]` — that's value-shortening, not a drop, so it keeps
-    // its own marker. Frozen by the dropMode column, so it replays identically.
     const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
 
-    // OpenCode format: { type: "tool", state: { input: {...}, output: "..." } }
     if (part.type === "tool" && isRecord(part.state)) {
         const state = part.state;
         state.output = sentinel;
@@ -129,13 +105,11 @@ function truncateToolPart(part: unknown, tagId: number): void {
         return;
     }
 
-    // Anthropic format: { type: "tool_result", content: "..." }
     if (part.type === "tool_result") {
         part.content = sentinel;
         return;
     }
 
-    // OpenCode invocation format: { type: "tool-invocation", args: {...} }
     if (part.type === "tool-invocation" && isRecord(part.args)) {
         const inputSize = estimateInputSize(part.args as Record<string, unknown>);
         if (inputSize > 500) {
@@ -144,7 +118,6 @@ function truncateToolPart(part: unknown, tagId: number): void {
         return;
     }
 
-    // Anthropic invocation format: { type: "tool_use", input: {...} }
     if (part.type === "tool_use" && isRecord(part.input)) {
         const inputSize = estimateInputSize(part.input as Record<string, unknown>);
         if (inputSize > 500) {
@@ -162,11 +135,7 @@ function estimateInputSize(input: Record<string, unknown>): number {
 }
 
 /**
- * Edit-marker variant of `truncateToolPart` for a superseded edit/write: keep
- * the tool_use call, output → `[dropped §N§]`, but preserve `filePath` verbatim
- * and clamp the diff to a region hint (instead of the 5-char generic clamp).
- * A SEPARATE path from `truncateToolPart`: it must never alter the existing
- * skeleton bytes. Deterministic + idempotent (see edit-marker.ts).
+ * Repeated calls with the same `tagId` leave the same marker.
  */
 function editMarkerToolPart(part: unknown, tagId: number): void {
     if (!isRecord(part)) return;
@@ -191,10 +160,6 @@ function editMarkerToolPart(part: unknown, tagId: number): void {
 }
 
 /**
- * Non-mutating read of a tool part's input object across the formats
- * `truncateToolPart` handles. Returns null when the part carries no input.
- * Used by supersession selection (read `ctx_note` action / edit `filePath`)
- * without touching the wire.
  */
 function readToolPartInput(part: unknown): Record<string, unknown> | null {
     if (!isRecord(part)) return null;
@@ -209,15 +174,10 @@ function readToolPartInput(part: unknown): Record<string, unknown> | null {
 const TRUNCATION_SENTINEL = "...[truncated]";
 
 /**
- * Slice a string without splitting a surrogate pair.
- * If the character at `maxLen - 1` is a high surrogate, back off by one
- * to avoid producing an orphaned surrogate that breaks JSON serialization.
  */
 function safeSlice(str: string, maxLen: number): string {
     if (str.length <= maxLen) return str;
-    // Check if we'd split a surrogate pair
     const lastCharCode = str.charCodeAt(maxLen - 1);
-    // High surrogate range: 0xD800–0xDBFF
     if (lastCharCode >= 0xd800 && lastCharCode <= 0xdbff) {
         return str.slice(0, maxLen - 1);
     }
@@ -228,7 +188,6 @@ function truncateInputValues(input: Record<string, unknown>): void {
     for (const key of Object.keys(input)) {
         const value = input[key];
         if (typeof value === "string") {
-            // Already truncated — skip to preserve idempotency
             if (
                 value.endsWith(TRUNCATION_SENTINEL) ||
                 value === "[object]" ||
@@ -264,22 +223,7 @@ function clearThinkingParts(thinkingParts: ThinkingLikePart[]): void {
 }
 
 /**
- * True when a tool part carries a COMPLETED result — i.e. the arc is closed and
- * OpenCode will not read its input again. This is the selection gate that keeps
- * open arcs (an invocation with no result yet) out of every drop/clamp selector.
  *
- * OpenCode's single-part `{ type: "tool" }` representation is classified as a
- * "result" observation by its TYPE even while the call is still pending/running
- * (no output written yet). The arc is closed in either of two arms: a completed
- * result (`state.output` is a string) OR an errored call (`state.status ===
- * "error"`, carrying `state.error`). OpenCode serializes an errored part as an
- * `output-error` block built from `state.error` and never reads its input again
- * (opencode message-v2.ts error arm), so it is just as safe to reclaim as a
- * completed one — excluding it would leak bulky inputs (e.g. a failed write with
- * a large content arg). Pending/running parts have neither an output nor an
- * error status and stay excluded. Anthropic's separate `tool_result` part only
- * exists after the call finished, so it always counts. Invocation-shaped parts
- * (`tool-invocation` / `tool_use`) never carry a result and are excluded here.
  */
 export function partHasCompletedResult(part: unknown): boolean {
     if (!isRecord(part)) return false;
@@ -344,19 +288,9 @@ export class ToolMutationBatch {
 }
 
 /**
- * Build a TagTarget for a single tool composite key
  * (`<ownerMsgId>\x00<callId>`).
  *
- * v3.3.1 Layer C: pre-fix this took a bare `callId`. Two assistant turns
- * reusing the same callId produced two TagTargets that both pointed at
- * the same `index.get(callId)` entry — last-write-wins on `targets.set`
- * silently merged them into one drop target, and a queued drop on the
- * older tag would mutate the newer turn's content. Composite keys
- * guarantee one TagTarget per (owner, callId) pair, so each turn's tag
- * gets its own independent drop scope.
  *
- * The `index` map is keyed by composite key as well — see
- * `tag-messages.ts` for the matching producer.
  */
 export function createToolDropTarget(
     compositeKey: string,
@@ -370,12 +304,6 @@ export function createToolDropTarget(
     truncate: () => ToolDropResult;
     editMarker: () => ToolDropResult;
     /**
-     * Non-mutating predicate: would drop()/truncate() actually remove bytes?
-     * False for an absent (compacted-away) or incomplete (invocation present,
-     * no result part) entry — both return early without reclaiming anything.
-     * The tiered emergency planner must filter on this, not on the mere
-     * presence of a drop() function: counting a no-reclaim tag as droppable
-     * makes the plan stop early and under-evict below the ceiling.
      */
     canDrop: () => boolean;
     readInput: () => Record<string, unknown> | null;
@@ -399,9 +327,6 @@ export function createToolDropTarget(
         if (!entry.hasResult) return "incomplete";
 
         for (const occurrence of entry.occurrences) {
-            // Truncate both result parts (output) and invocation parts
-            // (args/input). Clamp a CLONE and swap it into the wire so the live
-            // part object OpenCode may still execute from stays byte-identical.
             clampCloneInPlace(occurrence, (part) => truncateToolPart(part, tagId));
         }
         clearThinkingParts(thinkingParts);
@@ -414,8 +339,6 @@ export function createToolDropTarget(
         if (!entry.hasResult) return "incomplete";
 
         for (const occurrence of entry.occurrences) {
-            // Same mutation-safety guarantee as truncate(): clamp a clone, never
-            // the live part object.
             clampCloneInPlace(occurrence, (part) => editMarkerToolPart(part, tagId));
         }
         clearThinkingParts(thinkingParts);
@@ -453,11 +376,6 @@ export function createToolDropTarget(
         readInput: (): Record<string, unknown> | null => {
             const entry = index.get(compositeKey);
             if (!entry) return null;
-            // Prefer an invocation occurrence's input, but fall back to ANY
-            // occurrence carrying readable input: a COMPLETED OpenCode tool part
-            // is `{ type:"tool", state:{ input, output } }`, classified as a
-            // "result" occurrence, yet it still holds the call's input, which is
-            // where an edit/write's filePath lives once the call finished.
             for (const occurrence of entry.occurrences) {
                 if (occurrence.kind !== "invocation") continue;
                 const input = readToolPartInput(occurrence.part);

@@ -60,15 +60,9 @@ shm_run() {
   }
   shm_build
   "$SHM_BENCH" "${args[@]}" >"$evidence"
-  # Assert on fields the fixed-ring report actually emits. The previous guard
-  # required a "verdict" key the harness no longer writes, so every run failed
-  # after producing valid evidence.
-  grep -q '"campaign": "smoke"' "$evidence" || {
-    echo "shared-memory harness did not retain smoke campaign output" >&2
-    exit 1
-  }
-  grep -q '"state": "complete"' "$evidence" || {
-    echo "shared-memory harness did not retain complete measurement state" >&2
+  grep -Eq '"local_verdict"[[:space:]]*:[[:space:]]*"MECHANISM_SMOKE_ONLY"' "$evidence" &&
+    grep -Eq '"designated_host_verdict"[[:space:]]*:[[:space:]]*"BLOCKED"' "$evidence" || {
+    echo "shared-memory harness did not retain separate local/designated verdicts" >&2
     exit 1
   }
   cat "$evidence"
@@ -128,7 +122,7 @@ budget_collect() {
   return "$rc"
 }
 
-# Odd blocks run arms forward, even blocks reversed (matches
+# Even blocks reverse arm order to counter time-dependent drift.
 # evidence::counterbalanced_schedule).
 budget_block() {
   local block="$1"
@@ -148,8 +142,7 @@ budget_block() {
   done
   # Cross-NUMA paired arms: auto-selection either finds a pair or
   # finalizes a structured skip without failing the block. Their order
-  # reverses on even blocks exactly like the same-L3 arms, so
-  # time-dependent drift cancels for the cross-NUMA paired comparison
+  # Their order reverses on even blocks exactly like the same-L3 arms.
   # too.
   local cross=(atomic-floor ring-serial)
   if (((block - 1) % 2 == 1)); then

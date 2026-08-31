@@ -60,14 +60,7 @@ interface HistorianModelOverride {
 const HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 
 /**
- * Read reasoning only for the historian after the normal text extractor found no text.
- * Historian output still passes the compartment parser and validator before publication;
- * shared extractors remain text-only so fail-closed dreamer manifest parsers never accept
- * a model's private reasoning as normal task output.
  *
- * Exported so the historian eval lane's replay runner captures the same
- * artifact production validated (a reasoning-only payload must yield the same
- * text) instead of maintaining a second extractor.
  */
 export function extractLatestHistorianReasoning(messages: unknown): string | null {
     if (!Array.isArray(messages)) return null;
@@ -118,17 +111,15 @@ export async function runValidatedHistorianPass(args: {
     timeoutMs?: number;
     fallbackModelId?: string;
     /**
-     * Resolved historian fallback chain ("provider/modelID" entries). When the
-     * primary historian model fails (auth, model-not-found, transient network),
-     * each fallback is tried in order. Independent of `fallbackModelId` (which
-     * is a last-ditch single-model retry against the active session model).
+     * `runValidatedHistorianPass` tries `provider/modelID` fallback entries in order after the primary historian model fails.
+     * `fallbackModels` is independent of `fallbackModelId`, which retries the active session model.
      */
     fallbackModels?: readonly string[];
     callbacks?: HistorianProgressCallbacks;
     responseDumpObserver?: (dumpPath: string) => void;
-    /** When true, run a second editor pass after successful historian output
-     *  to clean low-signal U: lines and cross-compartment duplicates. If editor
-     *  validation fails, falls back to the draft (first-pass) result. */
+    /** When true, `twoPass` runs a second editor pass after successful historian output.
+     * The editor pass targets low-signal `U:` lines and cross-compartment duplicates.
+     * If editor validation fails, the pass returns the first-pass draft. */
     twoPass?: boolean;
     subagentKind?: SubagentKind;
     agentId?: string;
@@ -208,8 +199,8 @@ export async function runValidatedHistorianPass(args: {
                   draftInvocationId: repairRun.invocationId ?? null,
               })
             : { ...repairValidation, invocationId: repairRun.invocationId ?? null };
-        // Keep firstRun.dumpPath (initial failure) for debugging.
-        // Only cleanup the successful repair run's dump.
+        // Cleanup retains `firstRun.dumpPath` after an initial failure for debugging.
+        // Cleanup deletes only the successful repair run's dump.
         cleanupHistorianDump(args.parentSessionId, repairRun.dumpPath);
         return finalResult;
     }
@@ -223,19 +214,11 @@ export async function runValidatedHistorianPass(args: {
 }
 
 /**
- * Run the historian-editor agent on a validated historian draft. Returns the
- * editor's validated result if successful; falls back to the draft on any
- * failure (editor call, validation, or invalid structure). Editor can never
- * regress behavior — worst case we return the same validated draft.
+ * The editor returns its validated result on success and otherwise returns the draft.
+ * The editor never replaces a validated draft with an invalid result.
  *
- * Fallback-chain policy (Audit Finding #10 clarification): the editor pass
- * deliberately does NOT receive `fallbackModels`. If the configured editor
- * model fails (auth, model-not-found, transient network, or the editor's own
- * output fails validation), the function returns the already-validated draft
- * unchanged. Iterating through fallback models here would cost extra LLM
- * calls per chunk for no compression benefit — the draft is already known to
- * be valid and the editor pass is purely a polish step. Letting the editor
- * silently no-op back to the draft is the cheaper and safer behavior.
+ * The editor pass does not receive `fallbackModels`.
+ * If the editor model fails, the pass returns the validated draft.
  */
 async function runEditorPassOrFallback(args: {
     client: PluginContext["client"];
@@ -276,7 +259,7 @@ async function runEditorPassOrFallback(args: {
         shared.sessionLog(args.parentSessionId, "historian two-pass: editor call failed", {
             error: editorRun.error,
         });
-        // Editor failed → keep the validated draft; FK links to the draft run.
+        // On editor failure, the pass retains the validated draft.
         return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
     }
 
@@ -293,7 +276,7 @@ async function runEditorPassOrFallback(args: {
             "historian two-pass: editor validation failed, falling back to draft",
             { error: editorValidation.error },
         );
-        // Editor output was bad — keep editor dump for debugging.
+        // The pass retains the editor dump when editor validation fails.
         return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
     }
 
@@ -311,10 +294,10 @@ async function runHistorianPrompt(args: {
     timeoutMs?: number;
     dumpLabel?: string;
     modelOverride?: HistorianModelOverride;
-    /** Agent identifier to route the request to. Defaults to HISTORIAN_AGENT.
-     *  Use HISTORIAN_EDITOR_AGENT for the second pass in two-pass mode. */
+    /** `agentId` routes the request to the selected agent and defaults to `HISTORIAN_AGENT`.
+     * */
     agentId?: string;
-    /** Resolved historian fallback chain (forwarded to the prompt helper). */
+    /* */
     fallbackModels?: readonly string[];
     subagentKind?: SubagentKind;
     parentInvocationId?: number | null;
@@ -338,9 +321,8 @@ async function runHistorianPrompt(args: {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     let invocationRecorded = false;
-    // Keep FAILED historian child sessions for debugging (the model output, the
-    // exact prompt, and the error are all inspectable in the child session). Only
-    // delete on SUCCESS, where the result is already persisted as a compartment.
+    // The historian retains failed child sessions so their model output, exact prompt, and error remain inspectable.
+    // The cleanup deletes successful child sessions because their results are persisted as compartments.
     let outcomeOk = false;
 
     const recordInvocation = (params: {
@@ -403,11 +385,8 @@ async function runHistorianPrompt(args: {
                         path: { id: agentSessionId },
                         query: { directory: sessionDirectory },
                         body: {
-                            // Use the specified agent (HISTORIAN_AGENT by default, or
-                            // HISTORIAN_EDITOR_AGENT for two-pass editor pass) so OpenCode
-                            // loads the right system prompt. When modelOverride is set,
-                            // OpenCode uses the override model but still loads the agent's
-                            // registered system prompt.
+                            // `agentId` selects the registered agent whose system prompt OpenCode loads.
+                            // When `modelOverride` is set, OpenCode uses that model while retaining the selected agent's registered system prompt.
                             agent: agentId,
                             ...(modelOverride ? { model: modelOverride } : {}),
                             // synthetic: true keeps this big internal prompt out of the
@@ -420,8 +399,7 @@ async function runHistorianPrompt(args: {
                     },
                     {
                         timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
-                        // When modelOverride is set we're already in the last-ditch retry
-                        // path; iterating fallbacks again would be redundant.
+                        // `modelOverride` disables `fallbackModels` because the fallback candidates have already been tried.
                         fallbackModels: modelOverride ? undefined : fallbackModels,
                         callContext:
                             agentId === HISTORIAN_EDITOR_AGENT ? "historian:editor" : "historian",
@@ -492,9 +470,7 @@ async function runHistorianPrompt(args: {
             try {
                 responseDumpObserver?.(dumpPath);
             } catch (observerError: unknown) {
-                // The dump is already durably written and the model output is
-                // valid; an observer fault must not be reported as a historian
-                // failure, which would discard the result and force fallback.
+                // Observer failures after a valid dump must not discard the historian result or trigger fallback.
                 shared.sessionLog(
                     parentSessionId,
                     `historian response dump observer failed: ${describeError(observerError).brief}`,
@@ -515,11 +491,7 @@ async function runHistorianPrompt(args: {
             error: `Historian failed while processing this session: ${desc.brief}`,
         };
     } finally {
-        // Delete the child session ONLY on success. On failure, keep it so the
-        // failed model output / prompt / error can be inspected for debugging
-        // (the run is already recorded as failed in subagent_invocations +
-        // historian_runs; the live child session is the missing piece). A periodic
-        // sweep can GC old failed child sessions later if needed.
+        // The historian retains failed child sessions so their output, prompt, and error remain inspectable; it deletes successful sessions because their result is persisted as a compartment.
         if (agentSessionId && outcomeOk && !shouldKeepSubagents()) {
             await client.session.delete({ path: { id: agentSessionId } }).catch((e: unknown) => {
                 shared.sessionLog(
@@ -554,17 +526,10 @@ async function runFallbackHistorianPass(args: {
     dumpLabelBase: string;
     timeoutMs?: number;
     /**
-     * Configured historian fallback chain (e.g. `anthropic/claude-sonnet-4-6`),
-     * tried IN ORDER before the session-model last resort. Each candidate's
-     * output is validated — empty or unparseable output (e.g. a misconfigured
-     * primary that returns nothing, or a model that replies conversationally
-     * instead of emitting compartments) escalates to the next candidate rather
-     * than failing the whole pass.
+     * The fallback runner tries configured models in order before the session-model last resort; invalid, empty, or unparseable output advances to the next candidate.
      */
     fallbackModels?: readonly string[];
     /**
-     * The live session provider/model, used as the absolute last resort AFTER
-     * the configured chain is exhausted.
      */
     fallbackModelId?: string;
     callbacks?: HistorianProgressCallbacks;
@@ -573,14 +538,7 @@ async function runFallbackHistorianPass(args: {
     error: string;
     dumpPaths: Array<string | undefined>;
 }): Promise<ValidatedHistorianPassResult> {
-    // Ordered escalation that matches the intended fallback policy:
-    //   configured fallback_models (in order)  →  live session model (last resort)
-    // The primary model already ran (and was repaired) before we get here.
-    // Validation gates EVERY candidate, so a model that returns no usable
-    // compartments escalates to the next instead of ending the pass — this is
-    // exactly the path a misconfigured/empty-returning primary needs, since an
-    // empty-but-successful response never throws and so never triggers the
-    // throw-based chain inside the prompt call.
+    // Empty successful responses advance to the next candidate.
     const seen = new Set<string>();
     const chain: string[] = [];
     for (const candidate of [...(args.fallbackModels ?? []), args.fallbackModelId ?? ""]) {
@@ -632,13 +590,12 @@ async function runFallbackHistorianPass(args: {
             args.sequenceOffset,
         );
         if (fallbackValidation.ok) {
-            // Only cleanup the successful run's dump. Prior failed dumps
-            // (args.dumpPaths + earlier chain attempts) are kept for debugging.
+            // The function cleans up only the successful fallbackRun.dumpPath; failed-run dumps remain for debugging.
             cleanupHistorianDump(args.parentSessionId, fallbackRun.dumpPath);
             return { ...fallbackValidation, invocationId: fallbackRun.invocationId ?? null };
         }
         lastError = fallbackValidation.error ?? lastError;
-        // Keep the dump for debugging; escalate to the next candidate.
+        // A validation failure retains fallbackRun.dumpPath for debugging before the next candidate runs.
     }
 
     return { ok: false, error: lastError };
@@ -686,7 +643,6 @@ function dumpHistorianResponse(
     try {
         const dumpDir = historianResponseDumpDir(directory);
         mkdirSync(dumpDir, { recursive: true });
-        // Keep the transient dump dir out of the user's git status.
         ensureCortexKitArtifactGitignore(directory);
         const safeSessionId = sanitizeDumpName(sessionId);
         const safeLabel = sanitizeDumpName(label);

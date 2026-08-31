@@ -6,7 +6,7 @@ export function getOpenCodeDatabasePath(): string {
     return join(dataHome || join(homedir(), ".local", "share"), "opencode", "opencode.db");
 }
 
-/** Match Pi's platform-specific project-directory encoding for session folders. */
+/* */
 export function projectPathToPiSessionSlug(
     projectPath: string,
     platform: NodeJS.Platform = process.platform,

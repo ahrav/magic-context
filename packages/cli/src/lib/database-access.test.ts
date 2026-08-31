@@ -33,7 +33,7 @@ afterEach(() => {
 describe("CLI context database access", () => {
     it("rejects a database newer than the shared supported schema", () => {
         const path = join(tempDir(), "context.db");
-        // Derive from the live fence so a routine schema bump cannot stale this fixture.
+        // Using LATEST_SUPPORTED_VERSION keeps this fixture valid after schema-version bumps.
         const newerVersion = LATEST_SUPPORTED_VERSION + 1;
         createVersionedDatabase(path, newerVersion);
 

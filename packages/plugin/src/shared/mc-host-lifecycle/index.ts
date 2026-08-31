@@ -2,7 +2,7 @@
 // this barrel re-exports only the symbols production importers actually take
 // from it, so unused surface shows up as a compile error instead of hiding
 // behind a re-export line.
-export { type DaemonReason, type DaemonResultV1 } from "./contract";
+export type { DaemonReason, DaemonResultV1 } from "./contract";
 export { releaseContract } from "./generated-contract";
 export { createManagedLifecyclePolicy } from "./managed-policy";
 export type { NativeStartupEnvelope } from "./native-launcher";

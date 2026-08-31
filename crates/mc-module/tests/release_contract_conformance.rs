@@ -1,12 +1,3 @@
-//! Cross-artifact conformance: constants the Rust runtime hardcodes must
-//! equal the values the generated release artifacts publish, and the Rust
-//! canonical manifest encoder must reproduce the TypeScript-generated
-//! closure digests exactly. Each equality is load-bearing at runtime — a
-//! drifted fingerprint label mismatches every presented credential
-//! fingerprint, and a drifted canonical encoding makes every qualified
-//! closure digest unverifiable at spawn — so the drift must fail the build,
-//! not the deployment.
-
 use mc_host::broca::subprocess::{
     CREDENTIAL_FINGERPRINT_CANONICALIZATION, CREDENTIAL_FINGERPRINT_DOMAIN,
     CREDENTIAL_ROW_CAP_BYTES, CREDENTIAL_VALUE_CAP_BYTES,
@@ -55,11 +46,6 @@ fn provider_credential_matrix_matches_the_published_doc() {
     )
     .expect("provider credentials doc parses");
 
-    // Every published (harness, provider) row and alias must resolve through
-    // the runtime's canonicalization to exactly the published canonical
-    // name, and the published credential variable must match the runtime's
-    // row selection; a published row the runtime cannot serve (or the
-    // reverse) splits qualification from runtime behavior.
     let runtime_variable = |provider: &str| match provider {
         "anthropic" => "ANTHROPIC_API_KEY",
         "google" => "GEMINI_API_KEY",
@@ -112,8 +98,6 @@ fn provider_credential_matrix_matches_the_published_doc() {
             );
         }
     }
-    // The runtime accepts nothing beyond the published rows: unpublished
-    // names fail closed for both harnesses.
     for harness in ["opencode", "pi"] {
         assert!(
             mc_host::broca::subprocess::canonical_provider(harness, "bedrock").is_err(),
@@ -131,12 +115,7 @@ fn rust_canonical_encoding_reproduces_every_qualified_closure_digest() {
     for (name, digest, bytes) in mc_module::production_inputs::QUALIFIED_HARNESS_CLOSURES {
         let manifest: ClosureManifest =
             serde_json::from_str(bytes).expect("qualified closure manifest parses");
-        // `manifest_digest` validates the manifest, re-encodes it through the
-        // Rust canonical encoder (sorted keys, two-space pretty form), and
-        // hashes those bytes. Equality with the TypeScript-generated digest
-        // proves the two hand-written canonical encoders agree byte-for-byte
-        // on every shipped manifest; any encoder change that breaks the
-        // agreement fails here instead of surfacing at spawn as
+        // Digest equality enforces compatibility with the generated canonical digests.
         // `closure_incomplete`.
         assert_eq!(
             manifest_digest(&manifest).expect("manifest validates and digests"),

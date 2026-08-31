@@ -1,8 +1,6 @@
-# Test isolation for a bare `bun test` run from the monorepo ROOT (which
-# recursively discovers every package's *.test.ts). Without this, a root-CWD
-# `bun test` runs all suites with NO preload and a bare openDatabase() would hit
-# the user's REAL shared DB — exactly how a worktree at a newer LATEST migrated
-# the live DB (2026-06-01 v26 incident, recurred at v41). resolveDatabasePath()
-# also has a NODE_ENV=test backstop, but this keeps the redirect canonical.
+# A root-CWD `bun test` recursively discovers every package's `*.test.ts`.
+# Without this preload, root-CWD `bun test` runs discovered suites without the configured preload.
+# Without the preload, bare `openDatabase()` calls rely on `resolveDatabasePath()`.
+# `resolveDatabasePath()` redirects when `NODE_ENV=test`; the preload enables that redirect for root-CWD test runs.
 [test]
 preload = ["./packages/plugin/test-preload.ts"]

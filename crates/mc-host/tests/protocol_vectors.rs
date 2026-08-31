@@ -1,10 +1,9 @@
-//! Independent wire-vector conformance: literal proof and header bytes from
-//! `docs/mc-host-wire-protocol.md`, plus the framing dispositions a host must
-//! apply to a live connection.
+//! These tests compare protocol literals against independent wire vectors.
+//! These tests use vectors from `docs/mc-host-wire-protocol.md` and verify live-connection framing.
+//! The host must apply the specified framing dispositions to each live connection.
 //!
-//! Expected values here are committed literals decoded by the test oracle in
-//! `support::raw_client`. Nothing in this file asks the host to produce its own
-//! expected bytes (protocol §14.1).
+//! The test oracle in `support::raw_client` decodes committed expected literals.
+//! These tests do not ask the host to generate expected bytes (protocol §14.1).
 
 mod support;
 
@@ -20,8 +19,7 @@ use support::{TestHost, LINKED_MODULE_ID};
 const BUDGET: Duration = Duration::from_secs(5);
 const VECTOR_DAEMON_VER: &str = "mc-host/0.1.0";
 
-/// Key `00..1f`, client nonce `20..3f`, server nonce `40..5f`, daemon ID
-/// `60..6f` — the inputs the protocol's canonical proofs are computed over.
+/// `vector_inputs` uses the protocol's canonical proof inputs.
 fn vector_inputs() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     (
         (0x00u8..=0x1f).collect(),
@@ -69,7 +67,7 @@ fn committed_auth_proof_vectors_pin_the_construction() {
         "client proof construction drifted from the committed vector"
     );
 
-    // The two domains must not collapse into one value.
+    // Server and client domains must produce distinct proofs.
     assert_ne!(expected_server_proof, expected_client_auth);
 }
 
@@ -160,7 +158,7 @@ fn proof_folds_every_input() {
 
 #[test]
 fn committed_header_vectors_decode_to_their_documented_fields() {
-    // Control `route.open`: len 173, Interactive/Normal, channel 0, epoch 0,
+    // `route.open` uses control header values: length 173, Interactive/Normal, channel 0, and epoch 0.
     // correlation 1.
     let control = hex_to_bytes("ad0000000200020000000000000100000000000000");
     assert_eq!(control.len(), HEADER_LEN);
@@ -178,7 +176,7 @@ fn committed_header_vectors_decode_to_their_documented_fields() {
         "encoding must reproduce the committed control header"
     );
 
-    // Routed request: len 44, Background/Normal, channel 7, epoch 77,
+    // The routed request uses header values: length 44, Background/Normal, channel 7, and epoch 77.
     // correlation 2.
     let routed = hex_to_bytes("2c00000002000407004d0000000200000000000000");
     let decoded = raw_client::decode_header(&routed);
@@ -205,7 +203,7 @@ fn canonical_route_open_body_is_173_bytes() {
         173,
         "the documented control header declares 173 body bytes"
     );
-    // The literal must still be the shape the host accepts.
+    // The fixture literal must remain valid input to the host.
     let parsed: serde_json::Value = serde_json::from_str(canonical).expect("canonical JSON");
     assert_eq!(parsed["op"], "route.open");
     assert_eq!(parsed["target"]["module_id"], LINKED_MODULE_ID);
@@ -235,8 +233,7 @@ async fn every_valid_role_claim_gets_identical_admission() {
         let mut client = RawClient::connect_with_role(&host.info, role)
             .await
             .unwrap_or_else(|err| panic!("role {role:?} must authenticate identically: {err}"));
-        // Reporting metadata cannot buy privilege: the same operations work and
-        // nothing more becomes reachable.
+        // Reporting metadata cannot grant access beyond the operations available without it.
         let corr = client
             .control(&serde_json::json!({"op": "catalog.list"}))
             .await
@@ -259,8 +256,7 @@ async fn every_valid_role_claim_gets_identical_admission() {
 async fn auth_message_at_the_cap_is_valid_and_over_it_closes() {
     let host = TestHost::start().await;
 
-    // Exactly 4,096 bytes: valid. Padding whitespace inside the JSON keeps it
-    // parseable while reaching the cap.
+    // JSON whitespace padding produces a valid 4,096-byte body.
     let mut stream = raw_client::connect_unauthenticated(&host.info)
         .await
         .expect("connect");
@@ -268,7 +264,7 @@ async fn auth_message_at_the_cap_is_valid_and_over_it_closes() {
     let base = serde_json::json!({"client_nonce": nonce, "role": "client"});
     let mut body = serde_json::to_vec(&base).expect("hello");
     let pad = 4096 - body.len();
-    // Re-serialize with a padded role so the message reaches exactly the cap.
+    // Padding `role` makes the message exactly the size cap.
     let padded_role = format!("client{}", " ".repeat(pad));
     body = serde_json::to_vec(&serde_json::json!({
         "client_nonce": nonce,
@@ -277,12 +273,11 @@ async fn auth_message_at_the_cap_is_valid_and_over_it_closes() {
     .expect("padded hello");
     assert_eq!(body.len(), 4096, "fixture must sit exactly on the cap");
     write_len_prefixed(&mut stream, &body).await;
-    // The host answers, proving the message was accepted.
+    // The expected response proves that the request was accepted.
     let reply = read_len_prefixed(&mut stream).await.expect("server proof");
     assert!(reply["server_proof"].is_array());
     drop(stream);
 
-    // The valid JSON fixture detects hosts that parse before enforcing the
     // 4,096-byte limit.
     let mut stream = raw_client::connect_unauthenticated(&host.info)
         .await
@@ -320,7 +315,6 @@ async fn malformed_and_wrong_proof_handshakes_close_without_envelope_traffic() {
     write_len_prefixed(&mut stream, b"{not json").await;
     assert!(read_len_prefixed(&mut stream).await.is_none());
 
-    // Wrong nonce length.
     let mut stream = raw_client::connect_unauthenticated(&host.info)
         .await
         .expect("connect");
@@ -333,8 +327,7 @@ async fn malformed_and_wrong_proof_handshakes_close_without_envelope_traffic() {
     .await;
     assert!(read_len_prefixed(&mut stream).await.is_none());
 
-    // Valid hello, then a wrong client proof: the host must close and never
-    // read or write an envelope frame.
+    // After a valid `Hello` with an invalid client proof, the host must close without reading or writing an envelope frame.
     let mut stream = raw_client::connect_unauthenticated(&host.info)
         .await
         .expect("connect");
@@ -364,8 +357,7 @@ async fn malformed_and_wrong_proof_handshakes_close_without_envelope_traffic() {
     host.shutdown_gracefully().await;
 }
 
-/// Each structurally illegal frame retires the generation with no `Error`
-/// frame and no resynchronization (protocol §6.3, AE2, V13-V15, V17, V42).
+/// Each structurally illegal frame retires its generation without an `Error` frame or resynchronization (protocol §6.3, AE2, V13-V15, V17, V42).
 #[tokio::test]
 async fn structural_corruption_is_rejected_before_dispatch() {
     struct Case {
@@ -593,8 +585,8 @@ async fn control_body_at_the_profile_cap_is_read_and_over_it_is_rejected() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
 
-    // Exactly 65,536 bytes: admitted and parsed. Whitespace padding keeps it
-    // valid JSON, so the reply proves the body was fully read.
+    // JSON whitespace padding produces a valid, admitted 65,536-byte body.
+    // The reply to the whitespace-padded valid JSON proves the host read the full 65,536-byte body.
     let mut body =
         serde_json::to_vec(&serde_json::json!({"op": "catalog.list"})).expect("catalog body");
     let pad = 65_536 - body.len();
@@ -649,8 +641,6 @@ async fn control_body_at_the_profile_cap_is_read_and_over_it_is_rejected() {
 #[tokio::test]
 async fn a_maximum_size_frame_stays_interoperable() {
     let host = TestHost::start_with(|config| {
-        // 64 KiB of headroom absorbs the cached catalog's resident-byte
-        // subtraction while keeping the budgets at their interop floor.
         config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + 64 * 1024;
     })
     .await;
@@ -718,8 +708,6 @@ async fn read_len_prefixed(stream: &mut tokio::net::UnixStream) -> Option<serde_
     }
 }
 
-/// Pins the exact `host.shutdown` success bytes: a tagged compact object with
-/// only the `op` field, decoded here by the independent oracle.
 #[tokio::test]
 async fn host_shutdown_response_bytes_are_pinned() {
     let host = TestHost::start().await;
@@ -737,8 +725,7 @@ async fn host_shutdown_response_bytes_are_pinned() {
         }
     };
     assert_eq!(frame.ty, TY_RESPONSE);
-    // Interactive priority (bits 1-2 = 01) plus the last-frame bit (bit 3):
-    // the full flags byte is part of the pinned response.
+    // `FLAGS_INTERACTIVE | FLAGS_LAST` encodes interactive priority in bits 1–2 and the last-frame flag in bit 3.
     assert_eq!(frame.flags, FLAGS_INTERACTIVE | 0b0000_1000);
     assert_eq!(frame.channel, 0);
     assert_eq!(frame.epoch, 0);
@@ -746,9 +733,6 @@ async fn host_shutdown_response_bytes_are_pinned() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The three-target profile's catalog is a deterministic wire shape: exactly
-/// `magic-context`, `synapse`, `broca` in order with the pinned `subc_ops`
-/// (protocol §7.3, V40).
 #[tokio::test]
 async fn three_component_catalog_order_is_pinned() {
     let (mc, synapse, broca) = support::stub_trio();

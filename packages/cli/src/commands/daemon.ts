@@ -9,14 +9,13 @@ import { sanitizeDiagnosticText } from "../lib/redaction";
 
 const ACTIONS = new Set<LifecycleCommand>(["start", "stop", "restart", "status", "doctor"]);
 
-/** Display bound for peer-supplied version text, matching the shared
- *  diagnostic-string limit used by the mc-host client. */
+/**
+ * */
 const MAX_VERSION_TEXT_LEN = 128;
 
-/** C0 and C1 control characters (including ESC and newlines): peer-supplied
- *  version text must not be able to move the cursor, erase lines, or forge
- *  additional output lines in the terminal. */
-// biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing them is the point
+/** Replacing C0 and C1 controls prevents peer-supplied version text from moving the cursor, erasing lines, or forging terminal output.
+ * */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: the security boundary intentionally matches C0/C1 ranges
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 interface DaemonPolicy {
@@ -85,14 +84,8 @@ function redactResult(
     const sensitiveRoots = root.ok ? sensitiveRootsFor(root.root, env) : [];
     const redact = (value: string | null): string | null => {
         if (value === null) return null;
-        // Failures inside the redaction chain (e.g. os.userInfo() throwing for
-        // a UID with no passwd entry) must not reject the command: the v1
-        // output contract requires exactly one result object, so fall back to
-        // a placeholder instead of leaking or throwing.
         try {
-            // Replace every occurrence of each sensitive root, not just a
-            // leading prefix: version text is free-form and may embed a path
-            // mid-string (R35 requires no such path reaches output).
+            // Version text may embed a sensitive root mid-string, so redaction replaces every occurrence.
             let redacted = value;
             for (const sensitiveRoot of sensitiveRoots) {
                 redacted = redacted.split(sensitiveRoot).join("<data-root>");
@@ -129,27 +122,12 @@ export function renderDaemonHuman(result: DaemonResultV1): string {
         );
     }
     if (result.readiness !== null) {
-        for (const component of ["shared_memory", "storage", "synapse"] as const) {
+        for (const component of ["transport", "storage", "synapse"] as const) {
             const readiness = result.readiness[component];
             if (readiness !== undefined) {
                 lines.push(`Readiness ${component}: ${readiness.state} (${readiness.reason})`);
             }
         }
-    }
-    if (result.shared_memory !== null) {
-        const diagnostic = result.shared_memory;
-        lines.push(
-            `Shared memory: ${diagnostic.state}${diagnostic.error_class === null ? "" : ` (${diagnostic.error_class})`}`,
-        );
-        lines.push(
-            `Ring artifact: profile=${diagnostic.artifact.profile} wire=${diagnostic.artifact.wire_version} descriptor=${diagnostic.artifact.descriptor_schema}`,
-        );
-        lines.push(
-            `Ring accounting: active_bytes=${diagnostic.accounting?.active.arena_bytes ?? "unknown"} quarantined_bytes=${diagnostic.accounting?.quarantined.arena_bytes ?? "unknown"} bound_bytes=${diagnostic.bounds?.arena_bytes ?? "unknown"}`,
-        );
-        lines.push(
-            `Ring lifecycle: activations=${diagnostic.activation.completed} peer_deaths=${diagnostic.peer_death.observed} reclamations=${diagnostic.reclamation.completed} exhaustions=${diagnostic.exhaustion.observed}`,
-        );
     }
     for (const check of result.checks) {
         const remediation = check.remediation === null ? "" : ` remediation=${check.remediation}`;
@@ -185,8 +163,6 @@ export async function runDaemonCommand(
         return 1;
     }
 
-    // Redaction and rendering must not reject the command: an escaped throw
-    // would exit without any v1 object, violating the one-result contract.
     let rendered: string;
     let ok: boolean;
     try {

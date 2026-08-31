@@ -1,16 +1,14 @@
-/** Child-process exit primitive shared by the e2e runners. */
+/* */
 
 import type { ChildProcess } from "node:child_process";
 
 /**
- * Resolve true once `child` has exited, or false if it is still running after
+ * The returned promise resolves true when `child` exits and false when `timeoutMs` elapses first.
  * `timeoutMs`.
  *
- * A child that exited before this call resolves immediately: its `exit` event
- * already fired and never fires again, so `exitCode`/`signalCode` are the only
- * remaining record of it. Both settle paths detach their own resources — the
- * timeout removes the `exit` listener, the exit clears the timer — so a caller
- * that abandons the child after a false result leaves nothing attached to it.
+ * The returned promise resolves immediately when `child` exited before the call.
+ * After `child` exits, `exitCode` or `signalCode` records the exit because the `exit` event does not fire again.
+ * After a timeout, the function removes its `exit` listener before resolving false.
  */
 export function waitForChildExit(
     child: ChildProcess,

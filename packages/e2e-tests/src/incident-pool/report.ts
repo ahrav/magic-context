@@ -1,20 +1,17 @@
 /**
- * Versioned, catalog-bound incident pool report (U2, KTD8, KTD10, R8, R13).
+ * The report's `ledger_fingerprint` and `selected_set_digest` bind it to the catalog.
  *
- * Structural completeness (allowlisted facts, selected-set digest, expected
- * count, exactly one terminal result per selected variant, completion
- * marker, atomic publication) is separate from evaluation completeness
- * (every result completed and scored). The CLI exit policy lives here too:
- * only incompleteness matching a reviewed blocked_by dependency leaves the
- * incident command successful.
+ * Structural completeness requires allowlisted facts and a selected-set digest.
+ * Structural completeness requires an expected count and exactly one terminal result per selected variant.
+ * Publication completeness, including the completion marker and atomic publication, is separate from evaluation completeness.
+ * The incident command succeeds only when incompleteness matches a reviewed `blocked_by` dependency.
  *
- * Every field is a closed enum, static allowlisted id, or hex digest —
- * raw process output, stack traces, and fixture data cannot ride a report.
+ * Reports exclude raw process output, stack traces, and fixture data.
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { publishJsonAtomically } from "../atomic-publish";
 import { rowDigest } from "./history";
 import {
     ADJUDICATION_EVENT_ID_RE,
@@ -60,7 +57,7 @@ export const BASELINE_COMPARISONS = [
 ] as const;
 export type BaselineComparison = (typeof BASELINE_COMPARISONS)[number];
 
-/** Closed static reason vocabulary — never derived from process output. */
+/** `RESULT_REASON_CODES` is a closed static vocabulary and never derives from process output. */
 export const RESULT_REASON_CODES = [
     "deadline_exceeded",
     "exited_without_envelope",
@@ -112,9 +109,7 @@ export interface IncidentPoolReport {
 }
 
 // ---------------------------------------------------------------------------
-// Strict parsing helpers. contract.ts keeps its own copies private, so the
-// report/runner layer carries this small mirror rather than widening the U1
-// contract surface (see U2 report note).
+// `contract.ts` keeps equivalent helpers private, so this layer mirrors them instead of widening the contract surface.
 // ---------------------------------------------------------------------------
 
 export function fail(label: string, message: string): never {
@@ -164,9 +159,7 @@ export function asEnum<T extends string>(
 
 export function asId(value: unknown, re: RegExp, label: string): string {
     if (typeof value !== "string" || !re.test(value)) {
-        // Wording kept identical to `contract.ts`'s copy on purpose: the two
-        // validators are mirrors, and a diverging message is the first visible
-        // symptom of them drifting apart.
+        // The duplicate validators must retain matching error messages to expose drift.
         fail(label, `must be a static lowercase id matching ${re.source}`);
     }
     return value;
@@ -224,9 +217,7 @@ function asCount(value: unknown, label: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Result validation: the closed cross-field contract of the three orthogonal
-// dimensions (KTD8). Only a completed run with satisfied preconditions may
-// carry pass/assertion_fail or a scored comparison.
+// Only a completed run with satisfied preconditions may carry `pass` or `assertion_fail` or a scored comparison.
 // ---------------------------------------------------------------------------
 
 const UNHEALTHY_REASONS: Record<
@@ -493,7 +484,6 @@ export function parseCaseResult(
 }
 
 // ---------------------------------------------------------------------------
-// Report construction and structural completeness.
 // ---------------------------------------------------------------------------
 
 export function isEvaluationComplete(result: IncidentCaseResult): boolean {
@@ -514,9 +504,6 @@ export interface BuildReportInput {
 }
 
 /**
- * Build a structurally complete report or throw: rejects an empty selection,
- * duplicate results, missing selected results, and unexpected unselected
- * results (exactly-one-terminal-result bijection, KTD10).
  */
 export function buildIncidentReport(
     input: BuildReportInput,
@@ -556,12 +543,8 @@ export function buildIncidentReport(
             );
         }
     }
-    // `parseIncidentReport` recomputes this digest from the parsed results and
-    // rejects a mismatch, so accepting the caller's value unchecked here left
-    // publication as the only place the invariant was enforced. Today
-    // `runIncidentPool` passes the run snapshot's digest and it agrees by
-    // construction; a caller that derived it from the wrong row set would
-    // otherwise build a self-inconsistent report and only trip the reader.
+    // Construction validates the digest before publication to reject self-inconsistent reports.
+    // Construction validates the digest to reject digests derived from the wrong row set.
     const recomputedSelectedSetDigest = computeSelectedSetDigest(
         input.results.map((result) => [
             result.variant_id,
@@ -597,8 +580,8 @@ export function buildIncidentReport(
     };
 }
 
-/** Exact-key parse; recomputes counts and the evaluation-completeness flag
- *  so a tampered or truncated report cannot claim completeness. */
+/**
+ * Recomputed counts and evaluation completeness reject internally inconsistent or truncated reports that claim completeness. */
 export function parseIncidentReport(raw: unknown): IncidentPoolReport {
     const record = asRecord(raw, "report");
     requireExactKeys(
@@ -698,21 +681,8 @@ export function parseIncidentReport(raw: unknown): IncidentPoolReport {
     };
 }
 
-export function publishJsonAtomically(
-    value: unknown,
-    path: string,
-    options?: { mode?: number },
-): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temp = `${path}.tmp-${randomBytes(6).toString("hex")}`;
-    writeFileSync(temp, `${JSON.stringify(value, null, 4)}\n`, {
-        mode: options?.mode ?? 0o644,
-    });
-    renameSync(temp, path);
-}
-
-/** Atomic publication: write a temp file, then rename. An interrupted
- *  publication leaves no readable report at the target path. */
+/** The final rename prevents readers from observing a partially written report.
+ * An interrupted write cannot expose a partial report at `path`. */
 export function publishIncidentReport(
     report: IncidentPoolReport,
     path: string,
@@ -870,19 +840,19 @@ export function readScheduledIncidentReport(
 }
 
 // ---------------------------------------------------------------------------
-// CLI exit policy (KTD10): evaluation incompleteness is acceptable only when
-// every incomplete result matches a reviewed blocked_by dependency, and a
-// scored result must agree with its reviewed baseline.
+// CLI permits incomplete evaluation only when every incomplete result has a reviewed blocking dependency.
+// An excused incomplete result requires at least one `blocked_by` dependency that remains blocking.
+// Completed results with `regression` or `unexpected_failure` are baseline mismatches.
 // ---------------------------------------------------------------------------
 
 /**
- * A dependency excuses an unevaluated dependent only while that dependency
- * still exhibits the blocking condition: it is itself unevaluated in this run,
- * or it was evaluated and its defect still reproduces (`assertion_fail`). A
- * dependency that now passes — `expected_green` or the reviewed
- * `resolution_candidate` transition — blocks nothing, so its dependent must be
- * evaluated instead of being carried forward as blocked. Presence of the
- * dependency's id in the report is therefore necessary but not sufficient.
+ * An unevaluated dependent is excused only while its dependency remains blocking.
+ * A dependency remains blocking when it is unevaluated in the run.
+ * An evaluated dependency remains blocking only when its defect reproduces as `assertion_fail`.
+ * An evaluated dependency remains blocking only when its defect reproduces as `assertion_fail`.
+ * A dependent whose dependency no longer blocks must be evaluated.
+ * A `blocked_by` ID in the report does not prove that the dependency remains blocking.
+ * `regression` and `unexpected_failure` are scored baseline mismatches.
  */
 function dependencyStillBlocks(dependency: IncidentCaseResult): boolean {
     return (
@@ -915,12 +885,8 @@ export function unexpectedIncompleteResults(
 }
 
 /**
- * Scored results that contradict their reviewed baseline: a green-lane case
- * that failed (`regression`) or a known-red case whose failure shape no longer
- * matches what was adjudicated (`unexpected_failure`). Known-red cases run
- * only in the dedicated incident command, so without this the pool would
- * report a resurfaced defect and still exit 0. `expected_green`,
- * `expected_red`, and the reviewed `resolution_candidate` transition are not
+ * `unexpected_failure` is a scored baseline mismatch.
+ * `expected_red` and `resolution_candidate` are not mismatches.
  * mismatches.
  */
 export function scoredBaselineMismatches(

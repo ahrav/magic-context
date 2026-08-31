@@ -6,5 +6,6 @@ export const supersededOwner = defineScenario({
     title: "Prefer the current owner over a stale owner",
     evidence: "Ownership moved from RuntimeCore to StorageReliability; StorageReliability is authoritative.",
     answer: "StorageReliability",
+    answerMatch: "case-insensitive",
     locatorId: "mem-current-owner",
 });

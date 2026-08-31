@@ -1,6 +1,5 @@
-//! Shared harness for Synapse protocol tests: a deterministic embedding
-//! engine, a fake primary component, and a real-loopback composite host
-//! whose secondary is a `SynapseComponent`.
+//! The harness provides a deterministic embedding engine for Synapse protocol tests.
+//! The harness provides a fake primary component and a real-loopback composite host.
 
 #![allow(dead_code)]
 
@@ -38,8 +37,6 @@ pub fn test_lane() -> LaneInfo {
     }
 }
 
-/// Hash-derived unit vectors: deterministic, text-sensitive, and valid
-/// under the backend's finiteness and norm invariants.
 pub struct DeterministicEngine {
     pub dims: usize,
     pub delay: Mutex<Duration>,
@@ -126,7 +123,7 @@ impl EmbeddingEngine for DeterministicEngine {
     }
 }
 
-/// Minimal always-accepting primary so the composite can start.
+/// The primary accepts every request so the composite can start.
 pub struct EchoPrimary;
 
 impl CompositeComponent for EchoPrimary {
@@ -302,10 +299,9 @@ pub async fn open_synapse_route_rejection(client: &mut raw_client::RawClient) ->
             Err(code) if code == "module_reloading" && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // A transient reload code that never settled is a harness timeout,
-            // not the permanent rejection this returns. Falling through to the
-            // arm below would hand `module_reloading` back to the caller as if
-            // the route had been permanently refused for that reason.
+            // The harness treats `module_reloading` that never settles as a timeout, not a permanent rejection.
+            // The harness treats `module_reloading` that never settles as a timeout, not a permanent rejection.
+            // The harness treats `module_reloading` that never settles as a timeout, not a permanent rejection.
             Err(code) if code == "module_reloading" => {
                 panic!("synapse route still reloading at the rejection deadline")
             }
@@ -314,8 +310,6 @@ pub async fn open_synapse_route_rejection(client: &mut raw_client::RawClient) ->
     }
 }
 
-/// One `{method, params}` application call over an open synapse route,
-/// returning the terminal frame.
 pub async fn call(
     client: &mut raw_client::RawClient,
     channel: u16,
@@ -363,8 +357,7 @@ pub fn sha256_hex(text: &str) -> String {
     mc_host::synapse::protocol::sha256_hex(text.as_bytes())
 }
 
-/// Delegates to the production canonical-key algorithm, which is itself
-/// anchored by the committed JavaScript golden vectors.
+/// The harness delegates to the production canonical-key algorithm.
 pub fn request_key(lane: &LaneInfo, items: &[(String, String)]) -> String {
     let batch_items: Vec<mc_host::synapse::jobs::BatchItem> = items
         .iter()

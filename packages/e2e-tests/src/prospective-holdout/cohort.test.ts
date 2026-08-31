@@ -39,9 +39,6 @@ const custodyEvidence = {
 
 describe("cohort close", () => {
     it("rejects in-memory deletion evidence whose stores or instants are invalid", () => {
-        // A disposition built by hand rather than read from the store carries only
-        // TypeScript's word for its shape, and every timestamp test in the close is a
-        // Date.parse comparison an unparseable instant passes as NaN.
         const base = staticPrivacyRejection(
             `intake-${"e".repeat(32)}`,
             sanitizedIntakeFixture().submittedAt,
@@ -158,8 +155,6 @@ describe("cohort close", () => {
             evidence.deadline = "2026-09-12T00:00:00Z";
             evidence.completedAt = "2026-09-10T00:00:00Z";
         }
-        // Intake admits this evidence because every store sits inside its own
-        // deadline; only the close manifest compares completion against closedAt.
         const admitted = reviewSanitizedIntake(trailing, reviewOptions);
         expect(() => buildCohortClose({
             epochId: "epoch-test-release",
@@ -187,14 +182,7 @@ function pause(ms: number): void {
 }
 
 /**
- * Arranges for `lock` to be removed a moment from now by a separate process, and
- * returns once that process is running. A waiter blocks its own thread between
- * acquisition attempts, so nothing in this process could release the lock while
- * it waits: only another process can produce a release the waiter observes.
  *
- * The removal is sequenced behind a marker the caller's return writes, and the
- * caller waits for the poller to start, so the release lands after the waiter's
- * first attempt has already failed and well inside the acquire timeout.
  */
 function releaseFromCompetingProcess(root: string, lock: string): void {
     const polling = join(root, "holder-polling");
@@ -255,16 +243,12 @@ describe("cohort store lock", () => {
     it("takes the lock a live holder releases while a waiter is waiting", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
-            // A live holder inside its lease is never reclaimable, so the read can only
-            // succeed by retrying across the release the competing process performs.
+            // The store must retry after the competing process releases the lock.
             const lock = seedLock(root, { pid: process.pid, nonce: "live-holder", acquiredAt: Date.now() });
             releaseFromCompetingProcess(root, lock);
             const store = new ProspectiveIntakeStore(root);
             const started = Date.now();
             expect(store.readDecisions()).toEqual({ decisions: [], late: [] });
-            // An uncontended acquisition returns in about a millisecond, so the elapsed
-            // wait is what distinguishes a read that waited out the holder from one that
-            // found the lock already free and never entered the retry loop.
             expect(Date.now() - started).toBeGreaterThanOrEqual(100);
             expect(existsSync(lock)).toBe(false);
         } finally {
@@ -275,11 +259,8 @@ describe("cohort store lock", () => {
     it("keeps waiting when a failed claim leaves nothing at the lock path", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
-            // A symlink to a missing target holds still, for a whole acquisition, the
-            // state a release produces for an instant: `mkdirSync` refuses the path as
-            // taken while every existence check on it reports nothing there. Reading
-            // that absence as a failure is what would report busy for a free lock, so
-            // acquisition must instead retry until its deadline.
+            // `mkdirSync` treats a dangling symlink as taken, while existence checks treat it as absent.
+            // `mkdirSync` can fail with `EEXIST` while `existsSync(lock)` is false, so acquisition must retry until its deadline.
             symlinkSync(join(root, "no-such-holder"), join(root, ".lock"));
             const store = new ProspectiveIntakeStore(root);
             const started = Date.now();
@@ -299,8 +280,7 @@ describe("cohort store lock", () => {
             } catch (error) {
                 refused = error;
             }
-            // A missing parent directory is not a busy peer, and reporting it as one
-            // would hide the one fact that explains the failure.
+            // A missing parent must report `ENOENT`, not `cohort-store: busy`.
             expect((refused as { code?: string }).code).toBe("ENOENT");
             expect(refused).not.toBeInstanceOf(HoldoutContractError);
         } finally {
@@ -309,13 +289,10 @@ describe("cohort store lock", () => {
     });
 
     it("surfaces a refused permission on the store root rather than busy", () => {
-        // A process running as root creates the lock regardless of the mode, so the
-        // permission this asserts on does not exist there.
+        // Root bypasses permission checks.
         if (process.getuid?.() === 0) return;
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
-            // The store creates its own root, and a recursive create leaves an existing
-            // directory's mode alone, so a read-only root reaches the lock as EACCES.
             chmodSync(root, 0o500);
             const store = new ProspectiveIntakeStore(root);
             let refused: unknown;
@@ -342,9 +319,6 @@ describe("cohort store lock", () => {
             withRecoverableLock(lock, { busyCode: "cohort-store: busy" }, () => {
                 ran = true;
             });
-            // The takeover renames the abandoned lock aside before removing it, so a
-            // reclaim that leaves the sideline behind leaves an entry in the lock's
-            // parent that no later acquisition removes.
             expect(ran).toBe(true);
             expect(existsSync(lock)).toBe(false);
             expect(existsSync(lockSidelinePath(lock))).toBe(false);
@@ -356,15 +330,15 @@ describe("cohort store lock", () => {
     it("removes and claims nothing when the takeover of an abandoned lock loses its rename", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
-            // An abandoned lock with no owner record reaches the reclaim path without
-            // depending on a pid this test can prove dead.
+            // An abandoned lock with no owner record reaches the reclaim path without requiring a pid that the test can prove dead.
+            // The no-owner-record case does not require a pid that the test can prove dead.
             const lock = seedLock(root, null);
             const orphaned = new Date(Date.now() - 600_000);
             utimesSync(lock, orphaned, orphaned);
-            // Occupying the sideline is what makes this process's rename fail, which is
-            // the state a reclaimer that renamed first leaves for every other reclaimer
-            // of the same lock. The occupant is non-empty because a rename onto an empty
-            // directory replaces it and succeeds, which is the opposite of the loss
+            // A non-empty sideline makes this process's rename fail.
+            // A reclaimer that renames first leaves the sideline occupied for every other reclaimer of the same lock.
+            // The sideline must be non-empty because renaming onto an empty directory replaces it and succeeds.
+            // Renaming onto an empty directory succeeds by replacing it, so an empty occupant cannot model a lost takeover.
             // asserted here.
             const sideline = lockSidelinePath(lock);
             mkdirSync(sideline, { recursive: true });
@@ -374,15 +348,15 @@ describe("cohort store lock", () => {
             expect(() => withRecoverableLock(lock, { busyCode: "cohort-store: busy" }, () => {
                 ran = true;
             })).toThrow(/cohort-store: busy/);
-            // A lost takeover deletes nothing and claims nothing: the lock stands where it
-            // was, the sideline keeps its contents, and the guarded operation never runs.
-            // Under an unconditional remove the lock would be gone and the operation would
-            // have run, which is the concurrent entry two reclaimers must not produce.
+            // A lost takeover deletes nothing and claims nothing; the lock remains, the sideline retains its contents, and the guarded operation does not run.
+            // After a lost takeover, the sideline retains its contents and the guarded operation does not run.
+            // A lost takeover must not remove `lock`; removing it would allow two reclaimers to enter the guarded operation.
+            // Two reclaimers must not both enter the guarded operation.
             expect(ran).toBe(false);
             expect(existsSync(lock)).toBe(true);
             expect(existsSync(join(sideline, "occupied"))).toBe(true);
-            // Waiting is the remaining behaviour once the reclaim budget is spent, so the
-            // elapsed time separates this from an attempt that gave up without retrying.
+            // After the reclaim budget is spent, acquisition waits until its deadline.
+            // The elapsed time distinguishes waiting until the deadline from giving up without retrying.
             expect(Date.now() - started).toBeGreaterThanOrEqual(1_000);
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -396,18 +370,18 @@ describe("cohort store lock", () => {
         try {
             const stale = { pid, nonce: "abandoned-worker", acquiredAt: Date.now() - 600_000 };
             const lock = seedLock(root, stale);
-            // The verdict is reached while the stale holder is still the record on disk,
-            // which is the only state an acquisition can judge.
+            // The abandonment verdict is reached while the stale holder remains recorded on disk.
+            // An acquisition can judge only the holder record present on disk.
             const judged = lockAbandoned(lock);
             expect(judged).toEqual({ owner: stale });
-            // Another worker reclaims the lock and takes it in the gap between that
-            // verdict and the takeover, so the path now holds a live holder's lock.
+            // Another worker can reclaim and acquire the lock between the abandonment verdict and takeover, leaving a live holder's lock at the path.
+            // The takeover can encounter a live holder's lock after another worker acquires it.
             rmSync(lock, { recursive: true, force: true });
             const fresh = { pid: process.pid, nonce: "fresh-holder", acquiredAt: Date.now() };
             seedLock(root, fresh);
             takeOverLock(lock, judged!);
-            // The record no longer matches the one judged abandoned, so the takeover moves
-            // and removes nothing and the new holder keeps the lock it claimed.
+            // Because the record no longer matches the abandoned record, the takeover moves and removes nothing.
+            // The new holder keeps the lock it claimed because the takeover moves and removes nothing.
             expect(existsSync(lock)).toBe(true);
             expect(JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"))).toEqual(fresh);
             expect(existsSync(lockSidelinePath(lock))).toBe(false);

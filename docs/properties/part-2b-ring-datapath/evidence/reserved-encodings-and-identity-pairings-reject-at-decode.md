@@ -106,8 +106,8 @@ acceptance-with-masking — that would simply stop matching `Err(..)` and fail, 
 in fact they would catch it for these four inputs and only these four.
 
 **Reachability.** The three production `decode_header` call sites named in
-`catalog.md`'s group preamble: `ring_transport.rs:471`, `ring_transport.rs:701`,
-`client.rs:1908`. All six gates are unconditional statements in the function
+`catalog.md`'s group preamble: `ring_transport.rs:503`, `ring_transport.rs:730`,
+`client.rs:1978`. All six gates are unconditional statements in the function
 body, with no `cfg`, feature, or config branch between any call site and any
 gate. `wire.rs`'s only two `#[cfg]` attributes are `:541` and `:646`.
 

@@ -1,12 +1,6 @@
 /**
- * Vendor the historian SYSTEM prompt from the TS source of truth.
  *
- * The TS side generates historian-prompt.generated.ts from historian-prompt.source.md;
- * this script re-exports that exact string as a committed text asset so the Rust
- * producer sends byte-identical system-prompt bytes. Never edit the .txt by hand.
  *
- * Run:         bun crates/mc-module/gen/gen-historian-system-prompt.ts
- * Drift check: bun crates/mc-module/gen/gen-historian-system-prompt.ts --check
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

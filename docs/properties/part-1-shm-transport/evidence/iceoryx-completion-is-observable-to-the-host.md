@@ -1,5 +1,8 @@
 # iceoryx-completion-is-observable-to-the-host
 
+Record invalidated 2026-08-31: iceoryx2 backend removed in `0f336d3c`; absent at
+HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
+
 ## Citation refresh, 2026-08-30
 
 The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)

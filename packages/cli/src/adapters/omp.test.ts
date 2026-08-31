@@ -44,10 +44,5 @@ fi
         expect(adapter.isInstalled()).toBe(true);
         expect(adapter.hasPluginEntry()).toBe(true);
         expect(adapter.getInstalledPluginVersion()).toBe("0.33.0");
-        // Spawns a shell script through the adapter, so it inherits process-start
-        // latency from whatever else the machine is running. Bun's 5s default is
-        // not a considered ceiling for that: this body takes ~250ms idle and only
-        // exceeds 5s when the full suite saturates the box. Matches the explicit
-        // ceilings the other subprocess-spawning CLI tests already carry.
     }, 30_000);
 });

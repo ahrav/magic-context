@@ -700,3 +700,188 @@ fn a_terminal_candidate_is_not_replayed_under_a_live_run() {
         "a terminal candidate must not be treated as an idempotent replay"
     );
 }
+
+#[test]
+fn staging_metadata_retains_no_verifier_for_a_redacted_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut spec = shared_run_candidate("candidate-secret", 1);
+    spec.payload = format!("payload {SECRET}");
+    store.stage_candidate(spec).unwrap();
+
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let metadata: Vec<u8> = connection
+        .query_row("SELECT redaction_metadata FROM candidates", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&metadata).unwrap();
+    assert_eq!(entries.len(), 1, "one detection was recorded");
+    let mut keys = entries[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "detector_id",
+            "field",
+            "secret_type",
+            "source_utf8_length",
+            "source_utf8_offset"
+        ],
+        "R10 restricts detection metadata to detector id, secret type, offset, and length"
+    );
+
+    // A digest over the pre-redaction request would be an offline verifier,
+    // because every other component is stored beside it in plaintext.
+    let blob = String::from_utf8_lossy(&metadata).to_lowercase();
+    for forbidden in ["digest", "hash", "fingerprint"] {
+        assert!(
+            !blob.contains(forbidden),
+            "{forbidden} must not be retained"
+        );
+    }
+}
+
+#[test]
+fn a_secret_bearing_candidate_is_not_replayed_from_a_lossy_payload() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let secret_spec = |offset: i64| {
+        let mut spec = shared_run_candidate("candidate-secret", offset);
+        spec.payload = format!("payload {SECRET}");
+        spec
+    };
+    store.stage_candidate(secret_spec(1)).unwrap();
+    assert_eq!(
+        store.stage_candidate(secret_spec(2)).unwrap_err(),
+        KernelError::Conflict,
+        "a redacted payload cannot prove an unchanged retry"
+    );
+
+    // A detection-free candidate stays replayable, since its stored payload is exact.
+    let clean = shared_run_candidate("candidate-clean", 1);
+    let first = store.stage_candidate(clean.clone()).unwrap();
+    assert_eq!(store.stage_candidate(clean).unwrap(), first);
+}
+
+#[test]
+fn opening_a_store_strips_a_legacy_pre_redaction_digest() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut clean = shared_run_candidate("candidate-legacy", 1);
+    clean.payload = "no secret here".to_string();
+    let staged = store.stage_candidate(clean.clone()).unwrap();
+    drop(store);
+
+    // Recreate the parent build's `{request_digest, detections}` shape.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            r#"UPDATE candidates
+               SET redaction_metadata=CAST('{"request_digest":"deadbeefdeadbeef","detections":[]}' AS BLOB)"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(directory.path()).unwrap();
+    let metadata: Vec<u8> = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row("SELECT redaction_metadata FROM candidates", [], |row| {
+        row.get(0)
+    })
+    .unwrap();
+    let blob = String::from_utf8_lossy(&metadata);
+    assert!(
+        !blob.contains("request_digest") && !blob.contains("deadbeef"),
+        "opening must rewrite the legacy verifier, got {blob}"
+    );
+    assert_eq!(blob.trim(), "[]", "the detection array survives");
+
+    // The legacy blob must not cost a detection-free candidate its replay.
+    assert_eq!(
+        store.stage_candidate(clean).unwrap(),
+        staged,
+        "a detection-free candidate stays replayable after the rewrite"
+    );
+}
+
+#[test]
+fn a_changed_candidate_kind_is_not_an_idempotent_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut original = shared_run_candidate("candidate-kind", 1);
+    original.candidate_kind = "observation".to_string();
+    store.stage_candidate(original).unwrap();
+
+    let mut retyped = shared_run_candidate("candidate-kind", 2);
+    retyped.candidate_kind = "proposition".to_string();
+    assert_eq!(
+        store.stage_candidate(retyped).unwrap_err(),
+        KernelError::Conflict,
+        "a different candidate_kind is not the same request"
+    );
+    assert_eq!(
+        Connection::open_with_flags(
+            directory.path().join("core.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row("SELECT candidate_kind FROM candidates", [], |row| row
+            .get::<_, String>(0))
+        .unwrap(),
+        "observation"
+    );
+}
+
+#[test]
+fn the_legacy_rewrite_commits_in_batches_past_one_batch_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for index in 0..300 {
+        let mut spec = shared_run_candidate(&format!("candidate-{index}"), 1);
+        spec.payload = format!("clean-{index}");
+        store.stage_candidate(spec).unwrap();
+    }
+    drop(store);
+
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            r#"UPDATE candidates
+               SET redaction_metadata=CAST('{"request_digest":"deadbeefdeadbeef","detections":[]}' AS BLOB)"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let _store = KernelStore::open(directory.path()).unwrap();
+    let remaining: i64 = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM candidates
+         WHERE substr(CAST(redaction_metadata AS TEXT),1,1)='{'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "every legacy blob must be rewritten across batches, not just the first"
+    );
+}

@@ -1,10 +1,4 @@
 /**
- * User-facing spelling of the compaction-off config path, for log lines and
- * command output. Built from fragments so the accessor-exclusivity guard
- * (compaction-accessor-guard.test.ts) can keep rejecting literal
- * `compaction.enabled` reads elsewhere — messages import this constant instead
- * of inlining the path (the S5/S8 slices both re-derived it and tripped the
- * guard; one constant ends that class).
  */
 export const COMPACTION_ENABLED_PATH = `compaction${"."}enabled`;
 
@@ -21,12 +15,6 @@ export function isHistorianRunnable(config: { historian?: { disable?: boolean } 
 }
 
 /**
- * The ONLY non-schema reader of the `compaction.enabled` config path.
- * Resolves the compaction-off mode gate from a parsed Magic Context config.
- * Lives beside the other subsystem toggles (isDreamerRunnable /
- * isHistorianRunnable) and is IMPORTED — never re-derived — by every gate
- * site (pi-plugin, cli, plugin boot, session hooks). Returns true (compaction
- * ON / default behavior) when the block or field is absent.
  */
 export function isCompactionEnabled(config: {
     compaction?: { enabled?: boolean } | null;
@@ -68,7 +56,7 @@ function migrateLegacyEnabledForAgent(args: {
                 'Migrated "dreamer.enabled=false" → "dreamer.disable=true" in-memory (run doctor to persist). This now also disables manual /ctx-dream; for manual-only remove disable and set schedule="".',
             );
         }
-        // enabled=true is a no-op alias for the new default (disable=false); strip silently.
+        // `enabled=true` has no effect because only `disable=true` disables Dreamer; remove it without warning.
         args.patched.dreamer = agent;
         return;
     }
@@ -79,7 +67,7 @@ function migrateLegacyEnabledForAgent(args: {
             'Migrated "sidekick.enabled=false" → "sidekick.disable=true" in-memory (run doctor to persist).',
         );
     }
-    // enabled=true is a no-op alias for the new default; strip silently.
+    // `enabled=true` has no effect because only `disable=true` disables Sidekick; remove it without warning.
     args.patched.sidekick = agent;
 }
 

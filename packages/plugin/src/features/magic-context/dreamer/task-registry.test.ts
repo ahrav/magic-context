@@ -18,7 +18,6 @@ describe("dreamer task registry", () => {
             "promote-primers",
             "refresh-primers",
         ]);
-        // map-memories leads the canonical order (records the mappings verify gates on).
         expect(CANONICAL_DREAM_TASKS.indexOf("map-memories")).toBe(0);
         expect(CANONICAL_DREAM_TASKS.indexOf("compress-cues")).toBe(
             CANONICAL_DREAM_TASKS.indexOf("curate") + 1,

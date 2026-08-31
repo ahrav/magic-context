@@ -1,17 +1,14 @@
 /// <reference types="bun-types" />
 
 /**
- * Compaction-off mode end-to-end (issue #266 S3).
  *
- * Boots a real `opencode serve` with `compaction.enabled: false` and proves the
- * additive-only contract through the full stack — config → boot resolution →
- * transform gating → mode transition → m[0]/m[1] injection:
+ * Compaction-off preserves memory injection while disabling compaction mutations.
  *
  *   1. `<project-memory>` injects on EVERY main-agent pass (memory survives).
  *   2. The tagger writes ZERO rows and emits no §N§ prefixes.
  *   3. No compartments are ever created (historian never fires).
- *   4. No drops fire even deep past the execute threshold (all mutating gates
- *      are off), and `fail_closed_blocking: true` stays inert.
+ * No drops fire past the execute threshold because compaction-off disables all mutating gates.
+ * `fail_closed_blocking: true` remains inert when compaction is off.
  *   5. The per-session mode record commits to "off".
  */
 
@@ -30,11 +27,10 @@ beforeAll(async () => {
     h = await TestHarness.create({
         magicContextConfig: {
             compaction: { enabled: false },
-            // Deliberately armed: compaction-off must make it inert, and the
-            // prompts below must still succeed (no blocking, no cancellation).
+            // `fail_closed_blocking: true` must remain inert when compaction is off.
+            // Prompts must succeed without blocking or cancellation.
             fail_closed_blocking: true,
-            // Low execute threshold: in ON mode these turns would fire drops;
-            // in off mode nothing may fire.
+            // `execute_threshold_percentage` remains 5% so compaction-off gates must suppress drops.
             execute_threshold_percentage: 5,
         },
     });
@@ -88,7 +84,7 @@ describe("compaction-off mode (issue #266 S3)", () => {
                 },
             });
 
-            // Bootstrap so the plugin creates context.db.
+            // The bootstrap turn creates context.db.
             const bootstrapId = await h.createSession();
             await h.sendPrompt(bootstrapId, "bootstrap turn");
             await h.waitFor(() => h.hasContextDb(), {
@@ -96,7 +92,6 @@ describe("compaction-off mode (issue #266 S3)", () => {
                 label: "plugin initialized",
             });
 
-            // Seed a memory for the workdir project identity.
             const projectIdentity = computeDirIdentity(h.opencode.env.workdir);
             seedMemory(
                 h,
@@ -104,7 +99,6 @@ describe("compaction-off mode (issue #266 S3)", () => {
                 "off-mode seeded directive: always prefer bun over npm for running scripts",
             );
 
-            // Fresh session for the assertions.
             const sessionId = await h.createSession();
             h.mock.reset();
             h.mock.setDefault({
@@ -129,7 +123,7 @@ describe("compaction-off mode (issue #266 S3)", () => {
                 return {
                     text: `assistant turn ${mainCalls}`,
                     usage: {
-                        // Grow reported usage well past the 5% execute threshold.
+                        // Reported usage exceeds the 5% execute threshold.
                         input_tokens: 20_000 + mainCalls * 10_000,
                         output_tokens: 50,
                         cache_creation_input_tokens: 0,
@@ -138,7 +132,6 @@ describe("compaction-off mode (issue #266 S3)", () => {
                 };
             });
 
-            // Drive several turns with real content mass.
             for (let i = 1; i <= 3; i += 1) {
                 await h.sendPrompt(sessionId, `off-mode turn ${i} ${h.ballast(1_500)}`, {
                     timeoutMs: 60_000,
@@ -147,9 +140,7 @@ describe("compaction-off mode (issue #266 S3)", () => {
 
             expect(mainCalls).toBeGreaterThanOrEqual(3);
 
-            // Isolate the main-agent turn requests. OpenCode's title agent echoes
-            // the conversation text too, so exclude anything whose system prompt is
-            // the title generator; what remains are the real main-agent turns.
+            // The request filter excludes title-generator requests because OpenCode's title agent echoes conversation text; retained requests are main-agent turns.
             const requests = h.mock.requests();
             const mainRequests = requests.filter((req) => {
                 const bodyText = JSON.stringify(req.body);
@@ -161,16 +152,13 @@ describe("compaction-off mode (issue #266 S3)", () => {
             });
             expect(mainRequests.length).toBeGreaterThanOrEqual(3);
 
-            // Every main-agent turn carries the injected <project-memory>.
             for (const req of mainRequests) {
                 const bodyText = JSON.stringify(req.body);
                 expect(bodyText).toContain("<project-memory>");
                 expect(bodyText).toContain("off-mode seeded directive");
-                // No §N§ tag prefixes anywhere on the wire.
                 expect(bodyText).not.toMatch(/§\d+§/);
             }
 
-            // Zero tag rows, zero compartments, mode record committed to off.
             expect(h.countTags(sessionId)).toBe(0);
             expect(h.countCompartments(sessionId)).toBe(0);
             await h.waitFor(() => readModeRecord(h, sessionId) === "off", {
@@ -178,7 +166,6 @@ describe("compaction-off mode (issue #266 S3)", () => {
                 label: "mode record committed to off",
             });
 
-            // No pending ops queued (drops never ran).
             const pendingOps = h
                 .contextDb()
                 .prepare("SELECT COUNT(*) AS n FROM pending_ops WHERE session_id = ?")

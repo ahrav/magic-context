@@ -1,10 +1,8 @@
-//! Request dispatch, first-terminal-wins settlement, and route/generation
+//! This module dispatches requests and orchestrates first-terminal-wins settlement and route/generation closure.
 //! close orchestration.
 //!
-//! Logical settlement is distinct from socket-write outcome (plan KTD8): the
-//! settlement primitive records which terminal won; the writer only reports
-//! whether bytes made it out. Handler-task and byte permits live inside the
-//! task that owns their resources and release only when that resource is gone.
+//! Logical settlement is distinct from socket-write outcome:
+//! `Settlement` records which terminal won; the writer reports whether bytes were sent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,17 +23,16 @@ use crate::routing::{BindInstall, CloseDecision};
 use crate::runtime::HostShared;
 use crate::wire::{encode_owned_frame, pure_header_flags, response_flags, FrameId};
 
-/// First-terminal-wins arbiter for one correlation.
+/// `Settlement` arbitrates first-terminal-wins settlement for one correlation.
 ///
-/// `order` serializes every emission for the correlation, so a stream item can
-/// never be queued after the terminal and the won check is race-free. `won`
-/// flips exactly once, no matter which of handler completion, cancellation,
-/// route close, or teardown arrives first.
+/// `order` prevents stream items from being queued after a terminal.
+/// `order` makes the `won` check race-free.
+/// `won` flips exactly once when handler completion, cancellation, route close, or teardown arrives first.
 pub struct Settlement {
     won: AtomicBool,
     order: tokio::sync::Mutex<()>,
-    /// Set once any `StreamData` item reaches the writer. A streamed sequence
-    /// may terminate only with `StreamEnd` or `Error` (protocol §8.3), so a
+    /// `streamed` is set once any `StreamData` item reaches the writer.
+    /// A streamed response may terminate only with `StreamEnd` or `Error` (protocol §8.3).
     /// later unary `Response` from the handler is a contract violation.
     streamed: AtomicBool,
 }
@@ -58,7 +55,6 @@ impl Settlement {
     }
 }
 
-/// The terminal frames a request can settle with.
 pub enum Terminal {
     Response {
         body: OutputBuffer,
@@ -72,10 +68,7 @@ pub enum Terminal {
     StreamEnd,
 }
 
-/// Longest handler-authored diagnostic retained on a terminal. Diagnostics
-/// are held across the egress wait without a charge, so the cap — not the
-/// frame limit — is what bounds their retained cost per pending request.
-/// Anything larger is replaced immediately, dropping the oversized strings.
+/// `MAX_TERMINAL_CODE_LEN` and `MAX_TERMINAL_MESSAGE_LEN` bound diagnostics held across egress waits without budget charge.
 const MAX_TERMINAL_CODE_LEN: usize = 128;
 const MAX_TERMINAL_MESSAGE_LEN: usize = 4096;
 
@@ -94,10 +87,7 @@ fn bounded_terminal_error(code: String, message: String, retry_after_ms: Option<
     }
 }
 
-/// Serialized length of `s` inside a JSON string, without materializing it:
-/// `"` and `\` and the short control escapes emit two bytes, remaining
-/// control characters emit six (`\u00XX`), and everything else (including
-/// multi-byte UTF-8) passes through byte for byte.
+/// `escaped_json_len` returns the escaped UTF-8 byte length of `s` without materializing it.
 fn escaped_json_len(s: &str) -> usize {
     s.bytes()
         .map(|byte| match byte {
@@ -123,23 +113,13 @@ fn error_body_len(code: &str, message: &str, retry_after_ms: Option<u64>) -> usi
         }))
 }
 
-/// Builds an error terminal body under a pre-acquired egress reservation.
-/// Charges `bytes` of frame budget, or gives up and tears the generation down.
+/// The caller must acquire egress capacity before building an error terminal body.
+/// `charge_frame_or_cancel` charges `bytes` or cancels the generation.
 ///
-/// `None` means abandon the frame. Two ways to get there, and they are not the
-/// same event: a cancellation won the race, in which case the generation is
-/// already going away; or admission outlived the writer's deadline, which proves
-/// the writer is not draining, so the generation is cancelled here rather than
-/// left accumulating waiters behind a stalled socket.
+/// `None` means cancellation won or egress admission exceeded the writer deadline.
 ///
-/// `also_cancelled` is the request-scoped token where one exists (stream paths
-/// watch both it and the generation's).
+/// `also_cancelled` is the request-scoped cancellation token.
 ///
-/// Single-sourced because five call sites — unary responses, error terminals,
-/// stream reservations, direct stream sends, and the shutdown ack — each encoded
-/// this interaction by hand. A correctness fix applied to one and missed in
-/// another would leave those five paths with different cancellation semantics,
-/// which is exactly the kind of divergence nothing in the type system catches.
 async fn charge_frame_or_cancel(
     budget: &crate::wire::ByteBudget,
     generation: &GenerationCore,
@@ -167,13 +147,10 @@ async fn charge_frame_or_cancel(
     }
 }
 
-/// The encoded size is computed exactly from the escaped field lengths, so
-/// the charge exists BEFORE the body materializes — concurrent handler
+/// The budget charges bytes before `error_body_json_into` allocates the body.
 /// errors wait on the budget as bytes, not as retained encoded buffers.
-/// Returns the buffer with the admission deadline the budget wait ran under:
-/// serialization and queueing are contiguous, so the whole error emission is
-/// one bounded operation rather than two stacked frame deadlines. `Err`
-/// means the generation can no longer emit.
+/// `charged_error_body` returns the deadline used for budget admission.
+/// The returned deadline keeps serialization and queueing within one admission window.
 async fn charged_error_body(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
@@ -201,9 +178,8 @@ async fn charged_error_body(
         .await
         .ok_or(())?;
     let body = error_body_json_into(
-        // Header spare capacity up front: an exactly sized buffer would force
-        // `encode_owned_frame`'s reserve to reallocate, transiently retaining
-        // two near-maximum bodies against one charge.
+        // Without header capacity, `encode_owned_frame` reallocates the body buffer.
+        // Reallocation transiently retains two near-maximum bodies under one charge.
         Vec::with_capacity(body_len + HEADER_LEN),
         code,
         message,
@@ -221,9 +197,7 @@ async fn charged_error_body(
     ))
 }
 
-/// Serializes the error envelope directly into `buf` — no intermediate
-/// `serde_json::Value` — so the only allocation is the charged output buffer.
-/// Field order and escaping match `serde_json`, which `escaped_json_len`
+/// Writing directly to `buf` avoids allocating a `serde_json::Value`.
 /// models exactly.
 fn error_body_json_into(
     mut buf: Vec<u8>,
@@ -244,16 +218,9 @@ fn error_body_json_into(
     buf
 }
 
-/// Queues one frame on a generation's writer. Body-bearing frames charge their
-/// body plus wire header against the resident-byte budget; header-only frames
-/// are exempt. The byte-budget wait is bounded by generation retirement.
-/// `Err` means the generation can no longer emit; logical state must not
-/// depend on it.
+/// `Err` means the generation can no longer emit.
 ///
-/// A cancelled generation fails closed: retirement paths (structural
-/// corruption, connection teardown) cancel the token before settling admitted
-/// work, and the protocol requires those closes to stay silent rather than
-/// fabricate terminals (protocol §6.3).
+/// Structural-corruption and connection-teardown closes must remain silent rather than emit terminals.
 pub async fn emit_frame(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
@@ -305,13 +272,8 @@ async fn emit_frame_with_written(
         .map_err(|_| ())
 }
 
-/// Queues a handler body whose resident-byte reservation was acquired before
-/// allocation. The charge transfers directly to the writer with no second
-/// budget acquisition. `deadline` is the caller's admission window: handler
-/// outputs pass a fresh one at submission (a handler may validly compute
-/// longer than one window after reserving), while error emission passes the
-/// deadline its budget wait already ran under so the whole emission stays
-/// one bounded operation.
+/// The charge transfers directly to the writer without a second budget acquisition.
+/// `charged_error_body` reuses its admission deadline so error emission remains one bounded operation.
 async fn emit_reserved_frame(
     gen: &GenerationCore,
     ty: FrameType,
@@ -363,10 +325,7 @@ async fn emit_reserved_frame(
         .map_err(|_| ())
 }
 
-/// Emits one terminal `Error` for a correlation that has no settlement object
-/// (semantic rejection before dispatch: `unknown_channel`, `server_busy`,
-/// control rejections). The host proves no handler dispatch occurred for
-/// these codes (protocol §8.3).
+/// The host emits one terminal `Error` for a correlation with no settlement object.
 pub async fn emit_error_terminal(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
@@ -393,9 +352,9 @@ pub async fn emit_error_terminal(
     }
 }
 
-/// Settles a request with `terminal` if nothing settled it first. Returns
-/// whether this call won. Emission happens under the settlement's order lock
-/// so late stream items can never follow the terminal.
+/// The `settle` function settles a request with `terminal` only if no earlier call settled it.
+/// The `settle` function returns whether it won the settlement race.
+/// Holding `settlement.order` until terminal emission prevents late stream items from following the terminal.
 pub async fn settle(
     settlement: &Settlement,
     budget: &crate::wire::ByteBudget,
@@ -410,11 +369,7 @@ pub async fn settle(
     }
     let (ty, flags, body) = match terminal {
         Terminal::Response { body, binary } => {
-            // Authoritative streamed-state check, under the same order lock
-            // that serializes stream emission: a context escaped into a
-            // background task can queue StreamData after the caller's
-            // outside-the-lock check, and a Response following StreamData is
-            // a forbidden sequence (protocol §8.3).
+            // `settlement.order` serializes stream emission, so `has_streamed()` must be checked while holding it.
             if settlement.has_streamed() {
                 drop(body);
                 let Ok((error_body, deadline)) = charged_error_body(
@@ -500,7 +455,7 @@ pub async fn settle(
     true
 }
 
-/// Handler-facing ordered stream emitter for one request.
+/// `StreamSink` serializes stream-item emission for each request.
 #[derive(Clone)]
 pub struct StreamSink {
     pub(crate) settlement: Arc<Settlement>,
@@ -513,9 +468,7 @@ pub struct StreamSink {
 
 impl StreamSink {
     pub(crate) async fn reserve(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
-        // Terminal selection closes the stream (StreamClosed's contract): a
-        // context escaped into a background task must not keep reserving
-        // egress budget for buffers `send` can never emit.
+        // Terminal selection closes `StreamSink` so escaped contexts cannot reserve buffers that `send` cannot emit.
         if max_len > crate::wire::MAX_BODY_LEN as usize
             || self.cancel.is_cancelled()
             || self.settlement.won.load(Ordering::SeqCst)
@@ -605,11 +558,7 @@ impl StreamSink {
     }
 }
 
-/// Emits one no-dispatch rejection terminal off the connection reader while
-/// the per-generation bound allows, inline past it. The wait for contended
-/// egress can span a frame deadline; on the reader it would starve a queued
-/// Pong into a liveness false-kill, while unbounded spawning would let a
-/// client pipeline no-permit rejections into unbounded tasks.
+/// The connection reader emits one no-dispatch rejection terminal in a task while the per-generation bound permits it.
 pub async fn emit_rejection<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
@@ -627,37 +576,28 @@ pub async fn emit_rejection<H: McHostHandler>(
             }));
         }
         Err(_) => {
-            // Past the bound, awaiting inline would stall the generation's
-            // sole reader for a frame deadline and starve a queued Pong into
-            // a liveness false-kill. A peer with 32 no-dispatch rejections
-            // already stuck on contended egress is past its capacity grant:
-            // retire the generation instead (O(1), no reader stall). The
-            // unemitted terminals become outcome_unknown, which is the
-            // documented result of retirement (protocol §6.3).
+            // The connection reader retires the generation after 32 no-dispatch rejections are blocked on contended egress; awaiting inline can starve queued Pong processing for a frame deadline.
             gen.token.cancel();
             gen.writer.discard();
         }
     }
 }
 
-/// Serves one authenticated `host.shutdown` request against the host-owned
-/// commit latch (plan KTD4).
+/// The host serves one authenticated `host.shutdown` request against its commit latch.
 ///
-/// The owner enqueues the correlated success response carrying a
-/// [`crate::lifecycle::CommitOnAck`] hook: commit and host cancellation run
-/// inside the writer task at full-frame write completion, and every earlier
-/// failure — charge, encode, enqueue, writer retirement, partial write —
-/// drops the hook unrun, reopening ownership for a later requester.
-/// Contenders wait for the active attempt's outcome; only a committed
-/// attempt answers them without a second commit.
+/// The `CommitOnAck` hook commits and cancels the host after the writer completes the frame.
+/// The writer runs the hook only after writing the full frame.
+/// Charge, encoding, enqueue, writer-retirement, and partial-write failures leave the hook unrun.
+/// Charge, encoding, enqueue, writer-retirement, and partial-write failures drop the hook without running it, reopening ownership for a later requester.
+/// Contenders wait for the active attempt's outcome; only a committed attempt replies without a second commit.
+/// Contenders receive a reply without a second commit only after the active attempt commits.
 pub async fn handle_host_shutdown<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
     corr: u64,
 ) {
     loop {
-        // `notify_waiters` wakes only enabled or polled futures, so a reopen
-        // between the check and the first poll would otherwise be missed
+        // A reopen between `try_own` and the first poll must be handled because `notify_waiters` wakes only enabled or polled futures.
         // forever.
         let changed = shared.shutdown_latch.changed();
         tokio::pin!(changed);
@@ -703,8 +643,7 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
         }
     }
 
-    // Owner path. Constructed before any fallible step so every early return
-    // (or panic unwind) reopens the latch via Drop.
+    // `CommitOnAck` is constructed before fallible operations so Drop reopens the latch on early return or panic unwind.
     let commit = crate::lifecycle::CommitOnAck::new(
         Arc::clone(&shared.shutdown_latch),
         shared.shutdown.clone(),
@@ -726,9 +665,7 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
         FrameId::control(corr),
         body,
     ) else {
-        // Unreachable for the fixed-size shutdown body, but tear the
-        // generation down like every sibling failure branch rather than
-        // stranding the requester without a response or a cancellation.
+        // The generation is cancelled when encoding fails so the requester receives either a response or cancellation.
         gen.token.cancel();
         return;
     };
@@ -743,12 +680,8 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
                 written: Some(Box::new({
                     let shared = Arc::clone(shared);
                     move |_completed_at| {
-                        // The write acknowledgement IS the commit point, so
-                        // the admission fence must flip here, atomically with
-                        // it: `shutdown_sequence` stores these again only
-                        // after the accept loop observes cancellation, and a
-                        // dispatch that passed the flag checks before the
-                        // commit must find the registry already frozen.
+                        // The write acknowledgement is the commit point.
+                        // `shutdown_sequence` restores admission only after the accept loop observes cancellation.
                         shared.draining.store(true, Ordering::SeqCst);
                         shared.registry.freeze_admission();
                         commit.acknowledge();
@@ -758,13 +691,10 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
             deadline,
         )
         .await;
-    // Admission into the writer queue is not delivery: behind a slow reader,
-    // the committing response could otherwise sit queued for the whole
-    // per-frame stall budget of every earlier frame while the latch holds
-    // `ResponseInFlight` and healthy requesters can only wait. Hold the same
-    // absolute deadline through write completion: if the commit has not
-    // happened by then, retire the winning generation, which drops the
-    // acknowledgement hook unfired and reopens the latch for a successor.
+    // Earlier stalled frames can delay the committing response until the write deadline.
+    // The admission deadline covers write completion so stalled earlier frames cannot retain `ResponseInFlight` indefinitely.
+    // Write-deadline expiry before commit retires the generation.
+    // Retiring the generation drops `CommitOnAck` without committing and reopens the latch.
     let shutdown = shared.shutdown.clone();
     let gen_watch = Arc::clone(gen);
     tokio::spawn(async move {
@@ -779,10 +709,9 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
     });
 }
 
-/// Queues one §7.1-authoritative rejection terminal and reports (via
-/// `written_tx`) when its bytes fully reach the socket, so the caller can
-/// fence an otherwise-silent close around exactly this frame. The sender
-/// drops unfired if the emission fails at any stage.
+/// The sender reports through `written_tx` when the rejection frame fully reaches the socket.
+/// The caller can fence a silent close after `written_tx` reports the rejection frame.
+/// The sender drops the completion notification if emission fails.
 pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
@@ -820,11 +749,8 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
         .await;
 }
 
-/// Admits and dispatches one routed request frame (protocol §8.3, §9.1).
 ///
-/// Order matters: route lookup proves `unknown_channel` without consuming
-/// capacity; capacity rejections prove no dispatch; only then is the single
-/// handler task spawned.
+/// Route lookup proves `unknown_channel` without consuming capacity; capacity rejections prove no dispatch; only then is the single handler task spawned.
 pub async fn dispatch_request<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
@@ -837,10 +763,6 @@ pub async fn dispatch_request<H: McHostHandler>(
     };
     let corr = header.corr;
 
-    // `draining` is stored by the shutdown sequence, which starts only after
-    // the accept loop observes cancellation; a request pipelined behind a
-    // committed `host.shutdown` response can reach here first. The token
-    // check makes the admission fence coincide with the commit point.
     if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
         drop(frame);
         emit_rejection(
@@ -854,10 +776,8 @@ pub async fn dispatch_request<H: McHostHandler>(
         return;
     }
 
-    // Advisory liveness first so `unknown_channel` consumes no capacity;
-    // `register_dispatch` below is the authoritative recheck. The tracker
-    // wraps the dispatch future so route close can wait for it to STOP even
-    // if the waiting future is later dropped.
+    // `register_dispatch` rechecks admission before dispatch.
+    // The tracker wraps the dispatch future so route close can wait for it to stop even if the waiting future is dropped.
     let Some((route_tracker, class)) = shared.registry.route_tracker(route, gen.id) else {
         drop(frame);
         emit_rejection(
@@ -878,9 +798,7 @@ pub async fn dispatch_request<H: McHostHandler>(
         ),
     };
 
-    // Admission is synchronous with the read loop: acquiring permits inside
-    // the spawned task would let a client pipeline unbounded dispatch tasks
-    // ahead of the capacity gate.
+    // Admission acquires permits synchronously with the read loop to prevent clients from queueing unbounded dispatch tasks ahead of the capacity gate.
     let Ok(pending_permit) = pending_pool.clone().try_acquire_owned() else {
         drop(frame);
         emit_rejection(
@@ -906,10 +824,8 @@ pub async fn dispatch_request<H: McHostHandler>(
         return;
     };
 
-    // The pending entry is visible before the read loop can process any
-    // later frame, so a pipelined Cancel arriving right behind its Request
-    // always finds the correlation. The request token is a free-standing
-    // root: route close cancels entries explicitly when it collects them.
+    // The pending entry is visible before the read loop processes later frames, so a pipelined `Cancel` finds the correlation.
+    // `cancel` remains a free-standing root; route close cancels collected pending entries explicitly.
     let settlement = Settlement::new();
     let cancel = CancellationToken::new();
     let key: PendingKey = (route.channel, route.epoch, corr);
@@ -924,10 +840,8 @@ pub async fn dispatch_request<H: McHostHandler>(
     let (start_tx, start_rx) = oneshot::channel::<()>();
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
-    // The route's completion fence must cover the handler callback itself, not
-    // just this outer task: aborting the outer drops its AbortOnDropHandle,
-    // which only REQUESTS the callback's abort, so a route close could
-    // otherwise see the tracker empty while request code still runs.
+    // The route completion fence covers the handler callback because dropping the outer task only requests callback abort.
+    // Without the handler fence, route close could see the tracker empty while request code still runs.
     let handler_fence = route_tracker.clone();
     let outer = shared.spawn_tracked(route_tracker.track_future(async move {
         let _pending_permit = pending_permit;
@@ -970,8 +884,7 @@ pub async fn dispatch_request<H: McHostHandler>(
         };
         let ctx = RequestCtx {
             route,
-            // The charge travels inside the body: a handler that moves it
-            // into a background task keeps the ingress accounting with it.
+            // A handler that moves the body into a background task retains ingress accounting in that task.
             body: crate::handler::InputBuffer {
                 body,
                 _charge: body_charge,
@@ -983,14 +896,9 @@ pub async fn dispatch_request<H: McHostHandler>(
         };
         let handler = Arc::clone(&shared_task.handler);
         let inner = shared_task.spawn_tracked(handler_fence.track_future(async move {
-            // The task permit lives in the callback task, not the settling
-            // outer task: capacity frees when the handler finishes, so a
-            // slow client blocking terminal emission cannot occupy
-            // max_handler_tasks with already-finished handlers.
+            // The task permit belongs to the callback task so capacity frees when the handler finishes rather than when terminal emission settles.
             let _task_permit = task_permit;
-            // Construct under the sync guard, poll under the async guard:
-            // a panic in the callback's synchronous prologue must reach the
-            // redacting hook too.
+            // Construct the callback under the sync guard and poll it under the async guard so synchronous prologue panics reach the redacting hook.
             let callback = crate::panic_boundary::redact_sync(|| handler.handle(ctx));
             crate::panic_boundary::redact(callback).await
         }));
@@ -1018,9 +926,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             joined = &mut inner => {
                 let terminal = match joined {
                     Ok(RequestOutcome::Response { .. }) if settlement.has_streamed() => {
-                        // Streamed sequences terminate only with StreamEnd or
-                        // Error (protocol §8.3); a unary Response after
-                        // StreamData would corrupt the client's view.
+                        // After `StreamData`, protocol §8.3 permits only `StreamEnd` or `Error`; a unary `Response` would corrupt the client's stream state.
                         Terminal::Error {
                             code: CODE_INTERNAL_ERROR.to_owned(),
                             message: "handler returned a unary response after streaming"
@@ -1042,10 +948,6 @@ pub async fn dispatch_request<H: McHostHandler>(
                         message,
                         retry_after_ms,
                     }) => {
-                        // Normalized before the terminal is held across the
-                        // egress wait: the handler task permit is already
-                        // released, so oversized owned strings would otherwise
-                        // accumulate uncharged across up to
                         // max_pending_requests settlements.
                         bounded_terminal_error(code, message, retry_after_ms)
                     }
@@ -1073,13 +975,6 @@ pub async fn dispatch_request<H: McHostHandler>(
     {
         let _ = start_tx.send(());
     } else {
-        // No dispatch crossed the registry's live-route linearization point,
-        // so this rejection proves zero handler invocation; the spawned task
-        // observes the dropped start signal and removes the pending entry.
-        // Registration refuses for two distinct reasons that need different
-        // codes: frozen admission (the shutdown fence won the race after the
-        // advisory check above) is retryable-elsewhere `server_busy`, while
-        // a route that left Live is `unknown_channel`.
         drop(start_tx);
         let (code, message) =
             if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
@@ -1098,8 +993,6 @@ fn remove_pending(gen: &GenerationCore, key: PendingKey) {
     gen.pending.lock().expect("pending lock").remove(&key);
 }
 
-/// Handles a validated `route.open` after control parsing: reserve, bind,
-/// publish-or-cleanup, respond (protocol §8.2).
 pub async fn open_route<H: McHostHandler>(
     shared: Arc<HostShared<H>>,
     gen: Arc<GenerationCore>,
@@ -1107,8 +1000,6 @@ pub async fn open_route<H: McHostHandler>(
     target: crate::handler::RouteTarget,
     identity: crate::handler::RouteIdentity,
 ) {
-    // Same fence as routed dispatch: reject at the shutdown commit point,
-    // not only once the later shutdown sequence stores `draining`.
     if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
         emit_error_terminal(
             &shared.egress_budget,
@@ -1139,10 +1030,6 @@ pub async fn open_route<H: McHostHandler>(
     let handler = Arc::clone(&shared.handler);
     let bind_deadline = shared.timing.lifecycle_callback_deadline;
     let bind_watchdog = Arc::clone(&shared);
-    // Abort-exempt and self-bounded like route-gone: the forced shutdown
-    // path must not abort a bind callback mid-flight (the handler observed
-    // the handle, and route-gone must follow a completed or failed bind, not
-    // interleave with it).
     let bind_task = shared.spawn_lifecycle(async move {
         let callback =
             crate::panic_boundary::redact_sync(|| handler.bind(handle, target, identity));
@@ -1159,8 +1046,6 @@ pub async fn open_route<H: McHostHandler>(
     });
     let outcome = match shared.lifecycle_join("bind", bind_task).await {
         Ok(Some(outcome)) => outcome,
-        // The callback stopped (panic, abort) or self-bounded its own inner
-        // deadline, so the handle is inert and cleanup may proceed.
         Ok(None) | Err(crate::runtime::LifecycleFailure { stopped: true }) => {
             shared.registry.take_rejected_bind(handle);
             if run_route_gone(&shared, handle).await {
@@ -1168,9 +1053,6 @@ pub async fn open_route<H: McHostHandler>(
             }
             return;
         }
-        // Still executing: running route-gone or freeing the channel would
-        // overlap it for the same handle. The latch is already tripped, so
-        // the route stays claimed and the incarnation terminates.
         Err(crate::runtime::LifecycleFailure { stopped: false }) => return,
     };
 
@@ -1193,8 +1075,6 @@ pub async fn open_route<H: McHostHandler>(
                 }
             }
             BindInstall::CloseWins => {
-                // Close raced the bind and wins: never publish, still exactly
-                // one route-gone because the handler observed the handle
                 // (protocol AE8).
                 if run_route_gone(&shared, handle).await {
                     shared.registry.finalize_close(handle);
@@ -1202,10 +1082,6 @@ pub async fn open_route<H: McHostHandler>(
             }
         },
         crate::handler::BindOutcome::Reject { code, message } => {
-            // Normalized before the cleanup awaits below: these are
-            // handler-authored strings held across route-gone and the egress
-            // wait with no byte charge, so up to max_routes concurrent binds
-            // would otherwise retain arbitrary allocations. Same caps as
             // request-error terminals.
             let (code, message) =
                 if code.len() > MAX_TERMINAL_CODE_LEN || message.len() > MAX_TERMINAL_MESSAGE_LEN {
@@ -1238,17 +1114,7 @@ pub async fn open_route<H: McHostHandler>(
     }
 }
 
-/// Runs the route-gone callback exactly once per handle, gated by the
-/// registry's `gone_started` mark. Panic or timeout is host-fatal.
 ///
-/// The callback task is abort-exempt and self-bounded: the shutdown drain can
-/// drop this caller at its deadline and `abort_all` reaps ordinary tasks, but
-/// route-gone runs exactly once and must complete (or trip the fatal latch)
-/// before handler drop, so the spawned task enforces its own deadline.
-/// Returns whether the callback is no longer running: `false` means its
-/// deadline expired inside a non-yielding poll, so the caller must NOT
-/// finalize the route — finalizing frees the channel for reuse, and a later
-/// bind on the same channel would overlap the still-running callback.
 async fn run_route_gone<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
@@ -1277,10 +1143,6 @@ async fn run_route_gone<H: McHostHandler>(
     }
 }
 
-/// Phase A only, for host shutdown: settles a route's admitted work (emitting
-/// its terminals) without running route-gone, so connection Goodbyes can be
-/// queued between settlement and cleanup (protocol §12 steps 3-5). Returns
-/// whether this caller owns the route's phase B.
 pub async fn settle_route<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
@@ -1288,10 +1150,6 @@ pub async fn settle_route<H: McHostHandler>(
     settle_route_work(shared, handle, shared.registry.begin_close(handle)).await
 }
 
-/// Completes a supplied close decision whose registry transition already
-/// applied route ownership and generation fencing. Later frames on a route
-/// transitioned by that decision get `unknown_channel` immediately; callers
-/// run the returned drain off their own loop when cleanup latency must not
 /// stall them.
 pub(crate) async fn close_route_decision<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
@@ -1303,9 +1161,6 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
     }
 }
 
-/// Phase B of a route close: exactly-once route-gone, then finalize only if
-/// the callback stopped. Split from settlement so host shutdown can queue
-/// connection Goodbyes between the two (protocol §12 steps 3-5).
 pub(crate) async fn finish_route_close<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
@@ -1315,8 +1170,6 @@ pub(crate) async fn finish_route_close<H: McHostHandler>(
     }
 }
 
-/// Phase A of a route close: cancel admitted work, emit its terminals, and
-/// wait for dispatch tasks to stop. Returns whether the caller owns phase B.
 pub(crate) async fn settle_route_work<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
@@ -1341,28 +1194,22 @@ pub(crate) async fn settle_route_work<H: McHostHandler>(
                 })
                 .collect();
 
-            // Grace, then abort, then WAIT on the registry-owned tracker:
-            // route-gone must follow dispatch tasks actually stopping. The
-            // tracker (not this future) owns that ability, so a dropped
-            // drain leaves the forced path able to wait on the same signal.
+            // route-gone must follow dispatch tasks actually stopping.
             let deadline = Instant::now() + shared.timing.route_close_budget;
             tracker.close();
             if timeout_at(deadline, tracker.wait()).await.is_err() {
                 for abort in &aborts {
                     abort.abort();
                 }
-                // Abort only takes effect at an await point, so a future that
-                // never yields cannot be stopped by any mechanism; shutdown
-                // must still terminate. Surface the violated ordering instead
-                // of proceeding silently.
+                // A task observes abort only when it yields.
+                // A future that never yields prevents its task from observing abort.
+                // Shutdown must still terminate; trip the fatal latch when the task does not stop within the post-abort budget.
                 if timeout(shared.timing.route_close_budget, tracker.wait())
                     .await
                     .is_err()
                 {
-                    // Request code may still be executing, so route-gone must
-                    // NOT run: handler cleanup and channel finalization would
-                    // race it. The latch makes the incarnation fatal instead,
-                    // and this route stays claimed — inert, because the host
+                    // If `tracker.wait()` times out, request code may still execute; do not run route-gone.
+                    // Running route-gone while request code executes races handler cleanup and channel finalization.
                     // is terminating.
                     shared.fatal.trip(
                         &shared.shutdown,
@@ -1371,7 +1218,6 @@ pub(crate) async fn settle_route_work<H: McHostHandler>(
                     return false;
                 }
             }
-            // Aborted tasks never removed their own pending entries.
             {
                 let mut pending = gen.pending.lock().expect("pending lock");
                 for key in keys {
@@ -1383,14 +1229,6 @@ pub(crate) async fn settle_route_work<H: McHostHandler>(
     }
 }
 
-/// Retires a generation: cancels its token (stopping reads, settling admitted
-/// work as cancelled) and closes every route it owned (protocol §12). `begun`
-/// carries decisions the caller marked before waiting for in-flight binds; a
-/// second sweep after the token cancel catches routes reserved in the window
-/// between that marking pass and here. Routes close concurrently — bounded by
-/// `max_routes` — because serial closes would multiply a slow route-gone
-/// callback by the route count, retaining the connection permit and global
-/// channels for the whole product.
 pub async fn close_generation<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
@@ -1413,11 +1251,6 @@ pub async fn close_generation<H: McHostHandler>(
         .remove(&gen.id);
 }
 
-/// Forced-path cleanup after the shutdown deadline: aborts every remaining
-/// route task and still runs exactly-once route-gone before handler drop
-/// (protocol §12 forced shutdown). Route drains run concurrently — bounded by
-/// `max_routes` — because a serial sweep would multiply each route-gone
-/// callback's deadline by the route count while `run` holds the instance lock.
 pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
     let mut drains = tokio::task::JoinSet::new();
     for (handle, aborts, tracker) in shared.registry.force_drain() {
@@ -1426,17 +1259,12 @@ pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>
             for abort in &aborts {
                 abort.abort();
             }
-            // Wait for the route's dispatch tasks to STOP before route-gone,
-            // even when a graceful close owner already claimed (and lost)
-            // their handles: the tracker lives in the registry, so abort_all
-            // plus this wait still proves no request code is running.
             tracker.close();
             if timeout(shared.timing.lifecycle_callback_deadline, tracker.wait())
                 .await
                 .is_err()
             {
-                // Same rule as the graceful path: never run route-gone beside
-                // still-executing request code. Fatal, and no finalize.
+                // Do not finalize while request code may still execute.
                 shared.fatal.trip(
                     &shared.shutdown,
                     "dispatch task did not stop before route-gone".to_owned(),
@@ -1484,8 +1312,6 @@ pub async fn send_connection_goodbye(gen: Arc<GenerationCore>, deadline: tokio::
     }
 }
 
-/// Cancels one pending request if it exists; stale or settled targets are
-/// idempotent no-ops (protocol §9.2).
 pub fn handle_cancel(gen: &GenerationCore, key: PendingKey) {
     let pending = gen.pending.lock().expect("pending lock");
     if let Some(entry) = pending.get(&key) {

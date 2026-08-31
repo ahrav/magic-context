@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-context/search";
 import {
     PairedDeltaContractError,
     PAIRED_DELTA_MANIFEST_SCHEMA,
@@ -15,31 +16,27 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         scenarioId: "var-demo-one",
         familyId: "fam-demo",
         title: "Recall the buried identifier",
-        checks: [
-            {
-                id: "check-shared",
-                appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-            },
-        ],
+        expectedAnswer: "alpha-17",
+        answerMatch: "exact",
+        checks: ["check-shared"],
         criticalCheckIds: ["check-shared"],
         turnScript: [
             { id: "turn-evidence", role: "user", content: "Remember ID alpha-17." },
+            { id: "turn-burial", role: "user", content: "Continue after the ballast." },
             { id: "turn-probe", role: "user", content: "Write the remembered ID." },
         ],
         interventions: {
             r1: {
-                insertAfterTurnId: "turn-evidence",
-                query: "alpha-17",
+                insertAfterTurnId: "turn-burial",
                 locatorIds: ["mem-alpha"],
             },
             r2: {
                 memories: [{ claim: "The ID is alpha-17.", evidence: "Remember ID alpha-17." }],
             },
-            r3: { evidence: "The required ID is alpha-17." },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-evidence",
-            minimumBallastBytes: 1024,
+            minimumBallastBytes: 32_768,
         },
         modelContextLimit: 4096,
         restartArms: [],
@@ -63,37 +60,322 @@ describe("paired-delta scenario contract", () => {
             PairedDeltaContractError,
         );
         expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [
-                    { id: "check-shared", appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] },
-                    { id: "check-shared", appliesToArms: ["mc-on"] },
-                ],
-            })),
+            parseScenarioDeclaration(scenario({ checks: ["check-shared", "check-shared"] })),
         ).toThrow(/checks: duplicate/);
     });
 
-    it("rejects unknown arms and critical checks outside the declaration", () => {
+    it("rejects malformed check ids and critical checks outside the declaration", () => {
         expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [{ id: "check-shared", appliesToArms: ["mc-on", "future-arm" as never] }],
-            })),
-        ).toThrow(/enum-invalid/);
+            parseScenarioDeclaration(scenario({ checks: ["Check Shared" as never] })),
+        ).toThrow(/checks\[0\]: id-invalid/);
         expect(() =>
             parseScenarioDeclaration(scenario({ criticalCheckIds: ["check-missing"] })),
         ).toThrow(/criticalCheckIds: unknown-check/);
     });
 
-    it("requires primary and regret-ladder check intersections", () => {
+    it("applies the declared casing policy when checking supplied gold", () => {
+        const base = scenario();
+        const miscased = (): Partial<ScenarioDeclaration> => ({
+            turnScript: [
+                { id: "turn-evidence", role: "user", content: "Remember ID ALPHA-17." },
+                ...base.turnScript.slice(1),
+            ],
+        });
+        /** Under `exact` the verifier rejects a differently-cased answer, so miscased evidence is not gold. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({ answerMatch: "exact", ...miscased() })),
+        ).toThrow(/evidenceTurnId: answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({ answerMatch: "case-insensitive", ...miscased() })),
+        ).not.toThrow();
+    });
+
+    it("rejects an answer revealed only by the composed search prompt", () => {
+        /** Present in neither the fixed prefix nor a claim id alone, but in their join. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({ expectedAnswer: "evidence: mcm" })),
+        ).toThrow(/expectedAnswer: revealed-by-search-prompt/);
+    });
+
+    it("rejects an aggregate claim payload past the render bound", () => {
+        const base = scenario();
+        const chunk = (n: number): string => `alpha-17 part ${n} ${"x".repeat(400)}`;
         expect(() =>
             parseScenarioDeclaration(scenario({
-                checks: [{ id: "check-shared", appliesToArms: ["mc-on", "r1", "r2", "r3"] }],
+                interventions: {
+                    ...base.interventions,
+                    r1: { ...base.interventions.r1, locatorIds: ["mem-a", "mem-b", "mem-c"] },
+                    r2: {
+                        memories: [0, 1, 2].map((n) => ({
+                            claim: chunk(n),
+                            evidence: "Remember ID alpha-17.",
+                        })),
+                    },
+                },
             })),
-        ).toThrow(/checks: primary-intersection-empty/);
+        ).toThrow(/r2\.memories: payload-exceeds-render-bound/);
+    });
+
+    it("rejects an answer that collides with the claim-id prefix", () => {
+        for (const expectedAnswer of ["mcm", "mcm_", "cm"]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({ expectedAnswer })),
+            ).toThrow(/expectedAnswer: collides-with-claim-id-prefix/);
+        }
+    });
+
+    it("treats an internal decimal point as part of a numeric value", () => {
+        const base = scenario();
+        const withEvidence = (content: string): Partial<ScenarioDeclaration> => ({
+            expectedAnswer: "47",
+            answerMatch: "case-insensitive",
+            turnScript: [
+                { id: "turn-evidence", role: "user", content },
+                ...base.turnScript.slice(1),
+            ],
+            interventions: {
+                ...base.interventions,
+                r2: { memories: [{ claim: content, evidence: content }] },
+            },
+        });
+        expect(() =>
+            parseScenarioDeclaration(scenario(withEvidence("The ratio is 47.5 exactly."))),
+        ).toThrow(/answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario(withEvidence("The target is 47."))),
+        ).not.toThrow();
+    });
+
+    it("rejects a claim that cannot render intact or is ill-formed", () => {
+        const base = scenario();
+        const withClaim = (claim: string): Partial<ScenarioDeclaration> => ({
+            interventions: {
+                ...base.interventions,
+                r2: { memories: [{ claim, evidence: "Remember ID alpha-17." }] },
+            },
+        });
+        /** Past MAX_RENDER_FIELD_BYTES: R1 would receive a truncated claim while R3 gets it whole. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario(withClaim(`alpha-17 ${"filler ".repeat(200)}`))),
+        ).toThrow(/claim: exceeds-render-bound/);
+        /** A lone surrogate freezes but can never be seeded. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario(withClaim("alpha-17 \ud800"))),
+        ).toThrow(/claim: unicode-ill-formed/);
+    });
+
+    it("detects an answer leak across canonically equivalent spellings", () => {
+        const base = scenario();
+        /** Composed gold, decomposed in a post-insertion turn: identical to a reader. commentlint: allow(JUDGE) */
         expect(() =>
             parseScenarioDeclaration(scenario({
-                checks: [{ id: "check-shared", appliesToArms: ["mc-on", "mc-off", "compaction"] }],
+                expectedAnswer: "caf\u00e9",
+                answerMatch: "case-insensitive",
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "The venue is caf\u00e9." },
+                    base.turnScript[1]!,
+                    { id: "turn-probe", role: "user", content: "Write cafe\u0301 to the file." },
+                ],
+                interventions: {
+                    ...base.interventions,
+                    r2: { memories: [{ claim: "The venue is caf\u00e9.", evidence: "e" }] },
+                },
             })),
-        ).toThrow(/checks: ladder-intersection-empty/);
+        ).toThrow(/turnScript: post-insertion-answer-leak/);
+    });
+
+    it("rejects a path answer satisfied only by a longer path", () => {
+        const base = scenario();
+        const withPath = (content: string): Partial<ScenarioDeclaration> => ({
+            expectedAnswer: "db/migrations/x.sql",
+            turnScript: [
+                { id: "turn-evidence", role: "user", content },
+                ...base.turnScript.slice(1),
+            ],
+            interventions: {
+                ...base.interventions,
+                r2: { memories: [{ claim: content, evidence: content }] },
+            },
+        });
+        for (const longer of [
+            "at /srv/db/migrations/x.sql now",
+            "at old/db/migrations/x.sql/backup",
+            "at C:\\srv\\db/migrations/x.sql now",
+        ]) {
+            expect(() => parseScenarioDeclaration(scenario(withPath(longer))))
+                .toThrow(/answer-absent/);
+        }
+        expect(() => parseScenarioDeclaration(scenario(withPath("write db/migrations/x.sql."))))
+            .not.toThrow();
+    });
+
+    it("requires the gold answer as a complete value, not a substring", () => {
+        const base = scenario();
+        /** `alpha-17` inside `alpha-170` must not count as gold. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "Remember ID alpha-170." },
+                    ...base.turnScript.slice(1),
+                ],
+            })),
+        ).toThrow(/evidenceTurnId: answer-absent/);
+        /** A trailing sentence period is not a value character, so it still matches. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "The ID is alpha-17." },
+                    ...base.turnScript.slice(1),
+                ],
+            })),
+        ).not.toThrow();
+    });
+
+    it("requires the gold answer wherever an arm must derive it", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r2: { memories: [{ claim: "Unrelated note.", evidence: "Remember ID alpha-17." }] },
+                },
+            })),
+        ).toThrow(/r2\.memories: answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "Consult the memo." },
+                    ...base.turnScript.slice(1),
+                ],
+            })),
+        ).toThrow(/evidenceTurnId: answer-absent/);
+    });
+
+    it("requires the evidence turn to precede the R1 insertion point", () => {
+        const base = scenario();
+        /** Answer-free turns so the ordering rule is what fires, not the post-insertion leak scan. commentlint: allow(JUDGE) */
+        const turnScript: ScenarioDeclaration["turnScript"] = [
+            { id: "turn-lead", role: "user", content: "Start the task." },
+            { id: "turn-evidence", role: "user", content: "Consult the memo." },
+            { id: "turn-probe", role: "user", content: "Write the remembered ID." },
+        ];
+        for (const insertAfterTurnId of ["turn-lead", "turn-evidence"]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({
+                    turnScript,
+                    interventions: {
+                        ...base.interventions,
+                        r1: { ...base.interventions.r1, insertAfterTurnId },
+                    },
+                })),
+            ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
+        }
+    });
+
+    it("rejects a padded expected answer the verifier could never match", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({ expectedAnswer: "alpha-17 " })),
+        ).toThrow(/expectedAnswer: not-trimmed/);
+    });
+
+    it("rejects an answer leak in any turn at or after the R1 insertion point", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    ...base.turnScript.slice(0, 2),
+                    { id: "turn-probe", role: "user", content: "Write ALPHA-17 to the file." },
+                ],
+            })),
+        ).toThrow(/turnScript: post-insertion-answer-leak/);
+    });
+
+    it("requires a user probe turn after the R1 insertion point", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: { ...base.interventions.r1, insertAfterTurnId: "turn-probe" },
+                },
+            })),
+        ).toThrow(/insertAfterTurnId: no-following-probe/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    ...base.turnScript.slice(0, 2),
+                    { id: "turn-probe", role: "assistant", content: "Understood." },
+                ],
+            })),
+        ).toThrow(/insertAfterTurnId: no-following-probe/);
+    });
+
+    it("rejects duplicate R2 gold claims", () => {
+        const base = scenario();
+        for (const second of ["The ID is alpha-17.", "the id is   ALPHA-17.  "]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({
+                    interventions: {
+                        ...base.interventions,
+                        r1: { ...base.interventions.r1, locatorIds: ["mem-alpha", "mem-beta"] },
+                        r2: {
+                            memories: [
+                                { claim: "The ID is alpha-17.", evidence: "First sighting." },
+                                { claim: second, evidence: "Second sighting." },
+                            ],
+                        },
+                    },
+                })),
+            ).toThrow(/r2\.memories: duplicate/);
+        }
+    });
+
+    it("requires one declared gold memory per R1 locator handle", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: {
+                        ...base.interventions.r1,
+                        locatorIds: ["mem-alpha", "mem-beta"],
+                    },
+                },
+            })),
+        ).toThrow(/r1\.locatorIds: memory-cardinality-mismatch/);
+    });
+
+    it("bounds R1 locator sets to the scripted-search limit", () => {
+        const base = scenario();
+        const withLocators = (count: number): Partial<ScenarioDeclaration> => ({
+            interventions: {
+                ...base.interventions,
+                r1: {
+                    ...base.interventions.r1,
+                    locatorIds: Array.from({ length: count }, (_, i) => `mem-handle${i}`),
+                },
+                r2: {
+                    memories: Array.from({ length: count }, (_, i) => ({
+                        claim: `Gold claim ${i} names alpha-17.`,
+                        evidence: `Gold evidence ${i}.`,
+                    })),
+                },
+            },
+        });
+        expect(() =>
+            parseScenarioDeclaration(scenario(withLocators(ID_SHAPED_QUERY_MAX_TOKENS + 1))),
+        ).toThrow(/r1\.locatorIds: exceeds-search-limit/);
+        expect(() =>
+            parseScenarioDeclaration(scenario(withLocators(ID_SHAPED_QUERY_MAX_TOKENS))),
+        ).not.toThrow();
+    });
+
+    it("rejects an R2 declaration with no gold memory", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: { ...scenario().interventions, r2: { memories: [] } },
+            })),
+        ).toThrow(/r2\.memories: empty/);
     });
 
     it("requires an absence precondition and rejects non-MC restart declarations", () => {
@@ -105,17 +387,53 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/restartArms: unsupported-arm/);
     });
 
+    it("rejects an R1 locator handle that leaks the expected answer", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...scenario().interventions,
+                    r1: { ...scenario().interventions.r1, locatorIds: ["mem-alpha-17"] },
+                },
+            })),
+        ).toThrow(/r1\.locatorIds: contains-answer/);
+    });
+
+    it("rejects ballast below the token-denominated context window", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                absencePrecondition: {
+                    evidenceTurnId: "turn-evidence",
+                    minimumBallastBytes: 1024,
+                },
+            })),
+        ).toThrow(/absencePrecondition: ballast-below-context/);
+    });
+
     it("requires verifier output to match the arm's declared checks", () => {
         const declaration = parseScenarioDeclaration(scenario());
         expect(() =>
-            validateCheckVector(declaration, "mc-on", [{ id: "check-other", passed: true }]),
+            validateCheckVector(declaration, [{ id: "check-other", passed: true }]),
         ).toThrow(/declaration-mismatch/);
         expect(() =>
-            validateCheckVector(declaration, "mc-on", [
+            validateCheckVector(declaration, [
                 { id: "check-shared", passed: true },
                 { id: "check-shared", passed: true },
             ]),
         ).toThrow(/duplicate/);
+    });
+
+    it("rejects a verifier vector that is not an array of check results", () => {
+        const declaration = parseScenarioDeclaration(scenario());
+        for (const vector of [null, undefined, "check-shared", { id: "check-shared" }]) {
+            expect(() =>
+                validateCheckVector(declaration, vector as never),
+            ).toThrow(PairedDeltaContractError);
+        }
+        expect(() =>
+            validateCheckVector(declaration, [
+                { id: "check-shared", passed: "yes" as never },
+            ]),
+        ).toThrow(/checkVector\[0\]\.passed: boolean-required/);
     });
 });
 
@@ -145,6 +463,69 @@ describe("paired-delta armed cell contract", () => {
         expect(() => parseArmedCellResult({ ...completed, criticalPassed: 2 })).toThrow(
             /critical: passed-exceeds-total/,
         );
+    });
+
+    it("rejects critical counts that exceed the overall counts they subset", () => {
+        expect(() =>
+            parseArmedCellResult({ ...completed, criticalTotal: 4, criticalPassed: 1 }),
+        ).toThrow(/critical: total-exceeds-checks/);
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                checksPassed: 0,
+                criticalPassed: 1,
+                criticalTotal: 1,
+            }),
+        ).toThrow(/critical: passed-exceeds-checks/);
+    });
+
+    it("rejects reason codes incompatible with the reported health", () => {
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                runHealth: "timeout",
+                reasonCode: "runner-crash",
+            }),
+        ).toThrow(/reasonCode: health-incompatible/);
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                runHealth: "crash",
+                reasonCode: "deadline-exceeded",
+            }),
+        ).toThrow(/reasonCode: health-incompatible/);
+        for (const health of ["timeout", "crash", "malformed", "unavailable"] as const) {
+            expect(() =>
+                parseArmedCellResult({
+                    ...completed,
+                    runHealth: health,
+                    reasonCode: "harness-failure",
+                }),
+            ).not.toThrow();
+        }
+    });
+
+    it("rejects a completed cell with an empty score denominator", () => {
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                checksPassed: 0,
+                checksTotal: 0,
+                criticalPassed: 0,
+                criticalTotal: 0,
+            }),
+        ).toThrow(/checks: completed-requires-checks/);
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                checksPassed: 0,
+                checksTotal: 0,
+                criticalPassed: 0,
+                criticalTotal: 0,
+                runHealth: "timeout",
+                reasonCode: "deadline-exceeded",
+            }),
+        ).not.toThrow();
     });
 });
 
@@ -189,5 +570,21 @@ describe("paired-delta manifest contract", () => {
                 scenarios: [{ ...entry, runModes: ["nightly"] }],
             }),
         ).toThrow(/enum-invalid/);
+        expect(() =>
+            parsePairedDeltaManifest({
+                schema: PAIRED_DELTA_MANIFEST_SCHEMA,
+                scenarios: [{ ...entry, runModes: [] }],
+            }),
+        ).toThrow(/runModes: empty/);
+        expect(() =>
+            parsePairedDeltaManifest({ schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios: [] }),
+        ).toThrow(/manifest\.scenarios: empty/);
+        /** Release-only entries leave calibration and weekly with no measurements. commentlint: allow(JUDGE) */
+        expect(() =>
+            parsePairedDeltaManifest({
+                schema: PAIRED_DELTA_MANIFEST_SCHEMA,
+                scenarios: [{ ...entry, runModes: ["release"] }],
+            }),
+        ).toThrow(/manifest\.scenarios: run-mode-uncovered/);
     });
 });

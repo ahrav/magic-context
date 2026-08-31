@@ -1,9 +1,20 @@
 # every-shm-header-consumer-applies-its-role-gate
 
+> Refresh note, 2026-08-31: PR #131 (merge `5d638e3e8`) rewrote the client
+> transport stack this record examines. `tcp-frame-channel.ts`,
+> `transport-provider.ts`, and `shm-transport-provider.ts` were deleted
+> (`907746f7b`, ring transport made mandatory), and `shm-frame-channel.ts` now
+> imports `headerViolation` (`:19`) and calls it at `:348` before dispatch. The
+> role-gate comparison below therefore describes the pre-#131 client and needs
+> mechanism-level re-derivation, not just citation refresh. Host-side citations
+> were re-verified at HEAD; client-side citations below are left as pre-rewrite
+> evidence. The role-invalid-publish exercise formerly at
+> `shm_failure_modes.rs:195-241` is also absent from the rewritten test file.
+
 ## Discovery trigger
 
 The transport hands the same 21 header bytes to more than one consumer, and it
-validates only five of them (`crates/mc-shm-transport/src/descriptor.rs:289-297`).
+validates only five of them (`crates/mc-shm-transport/src/descriptor.rs:265-273`).
 That makes the role gate a per-consumer obligation rather than a property of the
 transport. Checking the consumers against each other found the Rust host applies
 its gate and the TypeScript peer, over shared memory only, does not — while the
@@ -19,9 +30,9 @@ close the generation rather than extend this profile implicitly."
 role-invalid on a consumer connection.
 
 Consumer one, the host. `receive_one` calls `validate_inbound_header`
-(`crates/mc-host/src/ring_transport.rs:473`), which restricts the type to
+(`crates/mc-host/src/ring_transport.rs:505`), which restricts the type to
 `Request`, `Cancel`, `Pong`, `Goodbye` and returns `ReadClose::Corrupt` otherwise
-(`frame_channel.rs:69-74`). `Corrupt` is outside the clean set
+(`frame_channel.rs:61-66`). `Corrupt` is outside the clean set
 (the `clean` classification formerly at `shm_provider.rs:498`, deleted by
 `ed487e11`), so the generation closes and the custody record
 goes to `recovery.report_suspect` (`:364-371`). This arm is exercised end to end
@@ -38,8 +49,8 @@ Consumer two, the peer. `ShmFrameChannel.poll`
 cap, reserved flag bits, reserved priority, reserved admission class, `Sheddable`
 placement, both channel/epoch rules, and pure-header-with-body. It does not
 contain a role rule. The role rule lives in `headerViolation`
-(`frame-channel.ts:512-557`), which starts with `isLegalHostToConsumerType`
-(`:515`, set defined at `protocol.ts:297-305`, exported at `:320-322`) and adds
+(`frame-channel.ts:497-542` at HEAD), which starts with `isLegalHostToConsumerType`
+(`:500`, set defined at `protocol.ts:291-299`, exported at `:313-315`) and adds
 the identity rules — `corr === 0n` on a terminal or stream frame, `StreamEnd`
 with a body, `Ping` outside `0/0/nonzero`, `Goodbye` with a nonzero correlation.
 `headerViolation` has exactly three call sites: `tcp-frame-channel.ts:860`,
@@ -60,8 +71,8 @@ passes the range check at `:165`, reaches `dispatch`, and is silently released.
 which is a deliberate profile decision, not the role gate.
 
 Consumer three, the Rust test peer. `TestShmPeer::recv`
-(`ring_transport.rs:676-687`, whose body now sits in `try_recv_with`) calls
-`decode_header` at `:701` and no role gate. It
+(`ring_transport.rs:702-721`, whose body now sits in `try_recv_with`) calls
+`decode_header` at `:730` and no role gate. It
 is test-only surface, but it is a third reader of `ValidatedFrame::wire_header()`
 and it demonstrates that the transport's lease API invites decode-only use.
 

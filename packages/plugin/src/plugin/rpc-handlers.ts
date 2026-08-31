@@ -1,6 +1,4 @@
 /**
- * Server-side RPC handlers. Queries the server's own SQLite DB
- * and returns typed responses for TUI consumption.
  */
 import { isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
@@ -67,11 +65,8 @@ import {
 } from "../shared/tail-hygiene-status";
 import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 
-// Per-process incremental work-metrics state, keyed by session. The RPC server
-// is long-lived, so the carry survives across polls and each poll folds only
-// assistant rows newer than its watermark (≈0 when idle). Lost on restart —
-// the next poll cold-starts from the persisted session_meta value's session by
-// re-folding once, which is the acceptable one-time cost design A accepts.
+// Each poll processes only assistant rows newer than its watermark because the long-lived RPC server retains each session's carry across polls.
+// A restart discards the in-memory carry; the next poll cold-starts from persisted session metadata.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
 const RUST_STATUS_CACHE_TTL_MS = 2_000;
 export interface RustSessionStatus {
@@ -91,9 +86,7 @@ export interface RustSessionStatus {
 const rustStatusCache = new Map<string, { status: RustSessionStatus; cachedAt: number }>();
 
 /**
- * Lazily compute work-metrics for the sidebar. Returns the persisted fallback
- * (instant warm-start value) when OpenCode's DB is absent or the read fails,
- * and write-throughs the fresh value to session_meta on success.
+ * When OpenCode's DB is unavailable or unreadable, the sidebar returns the persisted fallback.
  */
 function resolveSidebarWorkMetrics(
     db: Database,
@@ -110,11 +103,11 @@ function resolveSidebarWorkMetrics(
             computeOpenCodeWorkMetricsIncremental(openCodeDb, sessionId, carry),
         );
         workMetricsCarryBySession.set(sessionId, nextCarry);
-        // Write-through so the value warm-starts the sidebar after a restart.
+        // The handler writes the fresh value through so the sidebar can warm-start after a restart.
         try {
             setSessionWorkMetrics(db, sessionId, metrics.newWorkTokens, metrics.totalInputTokens);
         } catch {
-            // Non-fatal: the in-memory value is still returned below.
+            // A failed persistence write does not prevent returning the in-memory value.
         }
         return metrics;
     } catch {
@@ -192,18 +185,14 @@ function resolveConfigValue<T>(
     return defaultValue;
 }
 
-// Exported for test access. Production code reaches this via the
-// "sidebar-snapshot" RPC handler registered below.
 export function buildSidebarSnapshot(
     db: Database,
     sessionId: string,
     directory: string,
     liveSessionState?: LiveSessionState,
     injectionBudgetTokens?: number,
-    // Optional config so the sidebar can show the effective execute threshold
-    // alongside `usagePercentage` (e.g. "47.5% / 65%"). Resolved per-model from
-    // `liveSessionState.liveModelBySession`. When omitted (e.g. legacy test
-    // callers), the snapshot falls back to the runtime default of 65%.
+    // The optional execute-threshold config lets the sidebar display the effective threshold with usagePercentage.
+    // If the execute-threshold config is omitted, the snapshot uses the 65% runtime default.
     config?: Record<string, unknown>,
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
@@ -235,9 +224,8 @@ export function buildSidebarSnapshot(
             moduleContextLimit > 0
                 ? (moduleInputTokens / moduleContextLimit) * 100
                 : usagePercentage;
-        // Work-metrics are computed lazily + incrementally HERE (the only
-        // consumer), not in the transform hot path. The persisted session_meta
-        // columns are a warm-start fallback used on cold start / DB-absent.
+        // The sidebar computes work metrics lazily and incrementally to keep computation off the transform hot path.
+        // Persisted session_meta columns provide a warm-start fallback on cold start or when the DB is absent.
         const persistedNewWork = meta ? Number(meta.new_work_tokens ?? 0) : 0;
         const persistedTotalInput = meta ? Number(meta.total_input_tokens ?? 0) : 0;
         const { newWorkTokens, totalInputTokens } = resolveSidebarWorkMetrics(
@@ -247,13 +235,11 @@ export function buildSidebarSnapshot(
             persistedTotalInput,
         );
         const systemPromptTokens = meta ? Number(meta.system_prompt_tokens ?? 0) : 0;
-        // messagesBlockTokens = token estimate of text/reasoning/image parts
-        // in output.messages[] after transform, persisted by transform.ts.
-        // Includes injected compartments/facts/memories (they're in message[0]).
+        // messagesBlockTokens estimates tokens in text, reasoning, and image parts of transformed output.messages[].
+        // messagesBlockTokens includes injected compartments, facts, and memories in output.messages[0].
         const messagesBlockTokens = meta ? Number(meta.conversation_tokens ?? 0) : 0;
-        // toolCallTokensRaw = token estimate of tool_use/tool_result/tool/
-        // tool-invocation parts in output.messages[], persisted by transform.
-        // These are tool call I/O inside conversation (not tool schemas).
+        // toolCallTokensRaw estimates tokens in tool_use, tool_result, and tool-invocation parts of output.messages[].
+        // toolCallTokensRaw excludes tool schemas; it counts only conversation tool-call I/O.
         const toolCallTokensRaw = meta ? Number(meta.tool_call_tokens ?? 0) : 0;
         const compartmentInProgress = meta ? Boolean(meta.compartment_in_progress) : false;
         const cacheTtl = meta ? String(meta.cache_ttl ?? "5m") : "5m";
@@ -303,9 +289,7 @@ export function buildSidebarSnapshot(
                 )
                 .get(sessionId);
             sessionNoteCount = noteRow?.count ?? 0;
-        } catch {
-            // notes table may not exist
-        }
+        } catch {}
 
         let readySmartNoteCount = 0;
         if (projectIdentity) {
@@ -321,11 +305,6 @@ export function buildSidebarSnapshot(
             }
         }
 
-        // Token estimates via real Claude tokenizer (ai-tokenizer). The m[0]
-        // per-block attribution (docs / user-profile / project-memory /
-        // session-history) is computed by the SHARED helper so the OpenCode
-        // sidebar and the Pi /ctx-status dialog can never diverge on what the
-        // categories are or how they're measured.
         const m0Bytes = meta?.cached_m0_bytes;
         const m0Text =
             m0Bytes instanceof Uint8Array
@@ -355,14 +334,11 @@ export function buildSidebarSnapshot(
             try {
                 dreamerBacklog = getDreamTaskBacklogs(db, projectIdentity, CANONICAL_DREAM_TASKS);
             } catch {
-                // A pre-Dreamer-V2 database may not have all task tables yet.
+                // Pre-Dreamer-V2 databases may not have all task tables.
             }
         }
         if (projectIdentity) {
             try {
-                // Dreamer V2 retired the V1 dream_state['last_dream_at'] field;
-                // the live "last successful run" is MAX(last_run_at) across the
-                // project's task_schedule_state rows (issue #194).
                 lastDreamerRunAt = getMostRecentTaskRunAt(db, projectIdentity);
             } catch {
                 // task_schedule_state may not exist on a pre-V2 DB
@@ -371,32 +347,19 @@ export function buildSidebarSnapshot(
 
         // Display-layer attribution.
         //
-        // Local raw counts come from ai-tokenizer. Per-model calibration in
-        // tokenizer-calibration.ts captures the empirically-measured drift
-        // between local raw counts and the API's actual token counts (varies
-        // significantly across providers and model generations). We:
-        //   1. scale stable buckets (system, tool defs) by per-model ratios,
-        //   2. compute the dynamic remainder as inputTokens - calibrated_stable,
-        //   3. proportionally distribute the remainder to dynamic buckets so
-        //      they sum to exactly inputTokens. Overhead becomes 0.
+        // tokenizer-calibration.ts captures empirically measured per-model tokenizer drift.
+        // Tokenizer drift between local raw counts and API token counts varies significantly across providers and model generations.
+        // Dynamic buckets receive the remainder proportionally so they sum to exactly inputTokens and overhead is 0.
         //
-        // messagesBlockTokens persisted by transform.ts includes the injected
-        // <session-history> block (compartments + facts + memories live in
-        // message[0]). Subtract those so "conversationLocal" reflects real
-        // user/assistant dialog only.
+        // messagesBlockTokens includes the injected <session-history> block in output.messages[0].
+        // The handler subtracts injected session-history tokens so conversationLocal excludes compartments, facts, and memories.
         const injectedInMessages =
             compartmentTokens + factTokens + memoryTokens + docsTokens + profileTokens;
         const conversationLocal = Math.max(0, messagesBlockTokens - injectedInMessages);
         const toolCallsLocal = Math.max(0, toolCallTokensRaw);
 
-        // Measured tool schema cost. Resolved via the live-session-state latch
-        // (session → agent/model). When the in-memory map is empty (post-restart,
-        // before this session's first chat.message has fired in this process)
-        // fall back to OpenCode's SQLite DB to recover provider/model/agent
-        // from the last assistant message, mirroring the model-recovery path
-        // already in place for hook.ts. Populate the cache so subsequent reads
-        // hit memory directly. This eliminates the "Tool Defs shows 0 until
-        // next chat.message" cold-start gap.
+        // When the cache lacks a model or agent, the handler recovers missing values from OpenCode's SQLite database.
+        // Caching recovered values prevents Tool Defs from showing 0 until the next chat.message.
         let measuredToolDefTokens = 0;
         let activeProviderID: string | undefined;
         let activeModelID: string | undefined;
@@ -437,12 +400,7 @@ export function buildSidebarSnapshot(
                     })
                   : 0;
 
-        // Resolve the effective execute-threshold percentage for this
-        // session's active model so the sidebar header can show
-        // "47.5% / 65%" alongside the absolute "475K / 1.0M". Falls back
-        // to 65% (the runtime default) when no live model is known yet
-        // or when no config was passed in. Mirrors the resolution flow
-        // used by `buildStatusDetail` so the dialog and sidebar agree.
+        // The sidebar uses the configured default threshold when no live model is known.
         let executeThreshold = 65;
         let executeThresholdClamped = false;
         if (config) {
@@ -466,10 +424,8 @@ export function buildSidebarSnapshot(
             executeThresholdClamped = thresholdDetail.clamped === true;
         }
 
-        // Native compaction watches the model's full window, not Magic Context's
-        // output-reserved budget or execute threshold. Resolve the same catalog
-        // chokepoint without reservation so this display metric cannot inherit a
-        // budget denominator; every scheduling consumer keeps `contextLimit`.
+        // Native compaction uses the model's full context window rather than Magic Context's reserved limit.
+        // nativeContextUsagePercentage uses the unreserved context limit because native compaction watches the model's full window.
         const nativeContextLimit =
             activeProviderID && activeModelID
                 ? resolveContextLimit(activeProviderID, activeModelID, {
@@ -558,10 +514,7 @@ export function buildSidebarSnapshot(
                 };
             })(),
         };
-        // Defensive sticky cache: if `inputTokens` briefly drops to 0 mid-turn
-        // (intermittent — possibly streaming events with empty token shape, or
-        // first-pass reset firing on existing-session messages), serve the
-        // last good breakdown instead of letting the bar flicker.
+        // The breakdown retains its last nonzero value when inputTokens is 0 to prevent bar flicker.
         return applyStickySnapshotCache(sessionId, fresh);
     } catch (err) {
         log("[rpc] sidebar-snapshot error:", err);
@@ -569,7 +522,7 @@ export function buildSidebarSnapshot(
     }
 }
 
-/** Convert snapshot-build failures into a transport-failure envelope. A genuine
+/** Snapshot-build failures return a transport-failure envelope.
  * zero snapshot remains a successful value so deleted sessions stay deleted. */
 export function buildSidebarSnapshotRpcResponse(
     db: Database,
@@ -646,22 +599,14 @@ export function buildStatusDetail(
         toastDurationMs: 5000,
         mural: undefined,
         loggerDiagnostics: getLoggerDiagnostics(),
-        // Safe defaults; the live context.db value is filled in the try block below.
         storage_versions: {
-            // null = the probe FAILED (read threw); 0 = probe succeeded on a fresh DB
-            // with no migrations table; N = max applied upstream-lane migration
-            // (version < 10000). Distinct values so a
-            // reader never has to guess whether a falsy version means broken or empty
-            // (fleet Q1 discrimination — SUBC status-surface contract).
+            // null means the probe read failed; 0 means the migrations table is absent; a positive value is the highest applied upstream-lane migration.
             context_db_schema_version: null as number | null,
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
         },
     };
 
     try {
-        // Storage-version probe: live upstream migration lane vs this binary's fence. Fills the
-        // safe default from above; getPersistedSchemaVersion itself returns 0 when
-        // the migrations table is absent.
         detail.storage_versions = {
             context_db_schema_version: getPersistedSchemaVersion(db),
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
@@ -706,14 +651,9 @@ export function buildStatusDetail(
                 .get(sessionId);
             detail.droppedTags = droppedRow?.count ?? 0;
             detail.totalTags = detail.activeTags + detail.droppedTags;
-        } catch {
-            // tags table might have different schema
-        }
+        } catch {}
 
-        // Pending ops. The dialog only displays pendingOpsCount (computed
-        // elsewhere); this array is unused by the UI, so cap it — without a LIMIT a
-        // large pending queue serializes thousands of {tag_id, operation} rows over
-        // RPC on every status poll for nothing.
+        // Because the dialog displays only pendingOpsCount, status polls limit pendingOps to 100 rows and avoid serializing unused rows.
         try {
             const ops = db
                 .prepare<[string], { tag_id: number; operation: string }>(
@@ -722,7 +662,7 @@ export function buildStatusDetail(
                 .all(sessionId);
             detail.pendingOps = ops.map((o) => ({ tagId: o.tag_id, operation: o.operation }));
         } catch {
-            // pending_ops may not exist
+            // Return an empty pending-op list when pending_ops is absent.
         }
 
         const modelSlash = modelKey?.indexOf("/") ?? -1;
@@ -734,7 +674,6 @@ export function buildStatusDetail(
             );
         }
 
-        // Derived context limit needed for tokens-based threshold resolution.
         const contextLimitForTokens =
             base.contextLimit > 0
                 ? base.contextLimit
@@ -742,7 +681,6 @@ export function buildStatusDetail(
                   ? Math.round(base.inputTokens / (base.usagePercentage / 100))
                   : 0;
 
-        // Config values (resolve per-model)
         if (config) {
             const pctCfg = config.execute_threshold_percentage as
                 | number
@@ -751,9 +689,7 @@ export function buildStatusDetail(
             const tokensCfg = config.execute_threshold_tokens as
                 | { default?: number; [k: string]: number | undefined }
                 | undefined;
-            // Use the detail resolver so we can surface mode + absolute tokens
-            // consistently with /ctx-status. Avoids the "progressive lookup drift"
-            // where RPC and status-text disagreed on whether tokens mode was active.
+            // The RPC uses resolveExecuteThresholdDetail to return the threshold mode and absolute-token threshold.
             const thresholdDetail = resolveExecuteThresholdDetail(pctCfg ?? 65, modelKey, 65, {
                 tokensConfig: tokensCfg,
                 contextLimit: contextLimitForTokens || undefined,
@@ -791,12 +727,9 @@ export function buildStatusDetail(
         }
         detail.cacheTtlMs = safeParseTtl(detail.cacheTtl);
         if (detail.cacheTtlMs === Number.POSITIVE_INFINITY) {
-            // Infinity does not survive JSON-RPC (JSON.stringify emits null), and
-            // 0 would be indistinguishable from a fresh/expired lane to a consumer
-            // that never learned the cacheNeverExpires convention. -1 is the
-            // never-expires sentinel: the VALUES discriminate on their own
-            // (-1 never / 0 expired-or-unset / N live), and the flag stays as a
-            // convenience for consumers that prefer it.
+            // JSON.stringify emits null for Infinity, so use -1 as the never-expires sentinel.
+            // cacheTtlMs uses -1 because 0 represents an expired or unset cache.
+            // cacheTtlMs uses -1 for a non-expiring cache.
             detail.cacheNeverExpires = true;
             detail.cacheTtlMs = -1;
         }
@@ -825,9 +758,7 @@ export function buildStatusDetail(
                 detail.compressionBudget = budget;
                 detail.compressionUsage = `${((histTokens / budget) * 100).toFixed(0)}%`;
             }
-        } catch {
-            // history-token derivation failure
-        }
+        } catch {}
     } catch (err) {
         log("[rpc] status-detail error:", err);
     }
@@ -861,7 +792,6 @@ function buildEmbedDetail(
 }
 
 /**
- * Register all RPC handlers on the server.
  */
 export function registerRpcHandlers(
     rpcServer: MagicContextRpcServer,
@@ -874,12 +804,9 @@ export function registerRpcHandlers(
     },
 ): void {
     const { directory, config, liveSessionState, rustModeModuleClient } = args;
-    // Resolve mode once at the RPC boundary. The TUI receives this data and
-    // never reads the config itself.
     const compactionEnabled = isCompactionEnabled(config);
 
-    // Read config as raw object for per-model resolution
-    // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
+    // RPC results serialize to JSON, so handler-map values use the JSON-object envelope.
     const rawConfig = config as unknown as Record<string, unknown>;
     const getNotificationParams = (sessionId: string) =>
         getLiveNotificationParams(
@@ -923,7 +850,6 @@ export function registerRpcHandlers(
             config.transform_mode === "rust"
                 ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
                 : undefined;
-        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return buildStatusDetail(
             db,
             sessionId,
@@ -943,7 +869,6 @@ export function registerRpcHandlers(
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
         try {
-            // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
             return buildEmbedDetail(db, sessionId, dir, liveSessionState) as unknown as Record<
                 string,
                 unknown
@@ -970,15 +895,7 @@ export function registerRpcHandlers(
         }
     });
 
-    // ── Recomp / session-upgrade: delegate to the shared orchestrator ───────
-    // The RPC dialog paths ("/ctx-recomp" + "Run upgrade now") run through the
-    // SAME runManagedRecomp/runManagedUpgrade as the /ctx-* command paths, so
-    // they get identical model fallback, live progress, terminal state, and
-    // clean messaging. Dogfood 2026-05-30: the old RPC upgrade handler lacked
-    // model fallback (failed when the primary historian model returned empty,
-    // while /ctx-session-upgrade succeeded via fallback) and the command path
-    // lacked progress (left the sidebar stuck on a stale "failed"). One runner
-    // closes both gaps permanently.
+    // Both RPC dialog paths use the shared runners, so they share model fallback, progress, terminal state, and messaging.
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
@@ -1020,8 +937,7 @@ export function registerRpcHandlers(
         );
         log(`[rpc] recomp requested for session ${sessionId}`);
         const ctx = await buildManagedCtx(db);
-        // Fire-and-forget; outcome is force-persisted so a multi-minute recomp's
-        // result stays visible in scrollback instead of a 5s toast.
+        // Force-persist fire-and-forget recomp outcomes so multi-minute results remain visible in scrollback instead of a 5s toast.
         void runManagedRecomp(ctx, sessionId)
             .then((message) => {
                 void sendIgnoredMessage(
@@ -1036,8 +952,7 @@ export function registerRpcHandlers(
         return { ok: true };
     });
 
-    // TUI-triggered `/ctx-session-upgrade`: full recomp + once-per-project memory
-    // migration. Fired from the upgrade dialog's "Run upgrade now" action.
+    // `/ctx-session-upgrade` performs a full recomp and updates memory once per project.
     rpcServer.handle("upgrade", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
@@ -1064,11 +979,8 @@ export function registerRpcHandlers(
         return { ok: true };
     });
 
-    // The user made an explicit choice on the upgrade dialog (Confirm or Cancel).
-    // Set the durable stamp so the FRESH reminder won't re-show. We deliberately
-    // do NOT stamp when the dialog is merely displayed — a display that the user
-    // closed/ctrl-c'd before acting must re-show on the next process (dogfood
-    // 2026-05-30). Resume prompts are staging-driven and unaffected by this stamp.
+    // Stamp only Confirm or Cancel so a dismissed dialog reappears in the next process.
+    // A dialog closed or ctrl-c'd before action must reappear in the next process.
     rpcServer.handle("dismiss-upgrade-reminder", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
@@ -1095,24 +1007,10 @@ export function registerRpcHandlers(
         return { toastDurationMs: resolved };
     });
 
-    // Server→TUI notification delivery is no longer an HTTP poll. The TUI holds a
-    // persistent WebSocket (rpc-server `/ws`); the server pushes each queued
-    // notification over it and replays the unacked backlog on the hello. See
-    // rpc-server.ts + rpc-notifications.ts.
-
-    // Startup announcement — called by the TUI plugin once per session to decide
-    // whether to show the "What's new" dialog. We deliberately read state via
-    // the file in getMagicContextStorageDir() (not an SQLite table) so that
-    // both OpenCode and Pi share one source of truth and a dismissal in either
-    // harness suppresses the dialog in the other for the same announcement.
     rpcServer.handle("get-announcement", async () => {
-        // shouldShowAnnouncement already covers the empty-version / empty-features
-        // case as "nothing to show", so this is the single gate.
         if (!shouldShowAnnouncement()) {
-            // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
             return { show: false } as unknown as Record<string, unknown>;
         }
-        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return {
             show: true,
             version: ANNOUNCEMENT_VERSION,
@@ -1125,7 +1023,6 @@ export function registerRpcHandlers(
         if (ANNOUNCEMENT_VERSION) {
             markAnnouncementSeen(ANNOUNCEMENT_VERSION);
         }
-        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return { ok: true } as unknown as Record<string, unknown>;
     });
 }

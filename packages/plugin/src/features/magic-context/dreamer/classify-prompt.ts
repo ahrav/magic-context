@@ -1,14 +1,11 @@
 /**
- * classify-memories prompt + manifest parser (non-agentic single-shot transform).
+ * The module performs a non-agentic single-shot classification transform.
  *
- * classify scores each memory's importance (1-100), scope, and shareability from
- * the memory TEXT alone (no code inspection). The reworked task is a PURE
- * transform: the host renders one prompt, the zero-tool dreamer-classifier agent
- * emits ONE XML manifest, and the host batch-applies revision-bound claim
- * attributes under one operation receipt. No per-claim tool calls.
+ * The classifier derives importance, scope, and shareability from memory text only; it does not inspect code.
+ * The host renders one prompt for the zero-tool classifier agent.
+ * The agent emits one XML manifest, and the host batch-applies revision-bound claim attributes under one operation receipt.
+ * The host makes no per-claim tool calls.
  *
- * Importance/scope/shareability GUIDANCE is the harness-validated text (DS4F:
- * 229 importances assigned, correct discrimination, 4/4 private controls held).
  */
 
 import {
@@ -30,9 +27,8 @@ export interface ClassifyPromptMemory {
     shareable: number | boolean;
 }
 
-/** A few already-classified memories shown as scoring ANCHORS in Stage 3 (large
- *  pools), so the model calibrates the new/changed memories against the existing
- *  distribution instead of re-scoring in a vacuum. */
+/** In large pools, anchors calibrate new and changed memories against the existing score distribution.
+ * */
 export interface ClassifyAnchorMemory {
     publicClaimId: string;
     category: string;
@@ -100,9 +96,7 @@ ${list}
 }
 
 /**
- * Build the classify prompt for a batch. `anchors` (optional) are existing
- * classified memories shown for distribution calibration in large pools; they
- * are NOT scored and must NOT appear in the manifest.
+ * Anchors calibrate new and changed memories against the existing score distribution in large pools.
  */
 export function buildClassifyPrompt(args: {
     projectPath: string;
@@ -138,9 +132,8 @@ function classifyBody(text: string): string {
     }
 }
 
-/** Parse the agent's complete `<classify>` manifest. A missing root close tag is
- *  treated as truncation and rejects the whole batch. A well-formed root with
- *  no `<memory>` entries is a format miss, not success. */
+/**
+ * The parser treats zero `<memory>` entries as a format error. */
 export function parseClassifyManifest(text: string): ParsedClassification[] {
     const out: ParsedClassification[] = [];
     const body = classifyBody(text);
@@ -184,8 +177,8 @@ export function parseClassifyManifest(text: string): ParsedClassification[] {
     return out;
 }
 
-/** Retry-time contract: non-empty parse + exact id coverage. Apply still
- *  re-asserts coverage as the final belt. */
+/**
+ * */
 export function validateClassifyManifest(
     text: string,
     expectedIds: ReadonlySet<string>,

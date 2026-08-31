@@ -96,11 +96,8 @@ describe("primer clustering", () => {
 });
 
 // ---------------------------------------------------------------------------
-// U6 — incremental centroid maintenance (R39).
 //
-// The reference below is the recomputing implementation this unit replaced. It
-// exists only here, so production keeps one centroid path while the tests still
-// prove numerical, membership, and complexity parity.
+// The test-only reference implementation provides an independent clustering oracle.
 // ---------------------------------------------------------------------------
 
 function referenceAverageVectors(vectors: Float32Array[]): Float32Array | null {
@@ -146,7 +143,7 @@ function referenceRecompute(cluster: ReferenceCluster): void {
     }
 }
 
-/** Recomputing equivalent of `buildPrimerClusters`, used for differential checks. */
+/** The reference implementation supports differential checks against `buildPrimerClusters`. */
 function referenceBuildClusters(args: {
     candidates: PrimerCandidate[];
     activePrimers: Primer[];
@@ -265,7 +262,7 @@ describe("primer centroid accumulation (R39)", () => {
     });
 
     it("makes the same assignment for threshold-adjacent adversarial vectors", () => {
-        // Cosines land within a few 1e-3 of the 0.85 threshold in both directions.
+        // The test cosines straddle the 0.85 threshold by less than 0.003.
         const adversarial = [
             candidate({ id: 1, questionEmbedding: new Float32Array([1, 0]) }),
             candidate({
@@ -388,8 +385,7 @@ describe("primer centroid accumulation (R39)", () => {
             referenceBuildClusters({ candidates: rows, activePrimers: [] }),
         );
 
-        // Recomputation rescans the whole cluster on every insert (triangular);
-        // accumulation touches each accepted vector a bounded number of times.
+        // Each insertion rescans the cluster, making recomputation quadratic.
         expect(incremental).toBeLessThan(recomputing);
         expect(incremental).toBeLessThan(many.length * 5);
     });
