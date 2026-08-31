@@ -31,10 +31,10 @@ compiling without a warning.
 
 | Variant | Producers |
 | --- | --- |
-| `CleanEof` | `ring_transport.rs:359` (closed inbound channel) |
-| `Corrupt` | `frame_channel.rs:60`, `:67`, `:73`; `ring_transport.rs:467`, `:472`, `:477`, `:507`, `:521`, `:524` |
-| `Cancelled` | `ring_transport.rs:396`, `:483`, `:493`, `:513`, `:532` |
-| `Overloaded` | `ring_transport.rs:499` |
+| `CleanEof` | `ring_transport.rs:354` (closed inbound channel) |
+| `Corrupt` | `frame_channel.rs:60`, `:67`, `:73` (not re-swept post-#131); `ring_transport.rs:499`, `:504`, `:509`, `:536`, `:545`, `:548` |
+| `Cancelled` | `ring_transport.rs:402`, `:515`, `:525`, `:539`, `:556` |
+| `Overloaded` | `ring_transport.rs:531` |
 | `Io` | **none** |
 | `RejectedDrainFailed` | **none** |
 
@@ -79,7 +79,7 @@ fences exactly that authoritative frame (protocol §7.1)". The transport has no
 realignment.
 
 **Why the ring has no realignment to fail.** `receive_one`'s oversize channel-0
-rejection is `ring_transport.rs:474-485`:
+rejection is `ring_transport.rs:506-517`:
 
 ```
 if header.ty == FrameType::Request && header.channel == 0 && header.len > MAX_CONTROL_BODY_LEN {
@@ -173,7 +173,7 @@ and was written against deleted code.
   `ReadExit` match including the dead `PeerKeepQueue` arm),
   `connection.rs:356-370` (the `ReadExit` enum and its doc comment, which
   describes `PeerKeepQueue` as "the one exception"),
-  `ring_transport.rs:474-485` (the ring's rejection path),
+  `ring_transport.rs:506-517` (the ring's rejection path),
   `docs/mc-host-wire-protocol.md:321` (the guarantee),
   `docs/mc-host-shm-transport.md:7` ("There is no runtime transport
   selector, alternate shared-memory backend, compatibility reader, or degraded
@@ -200,15 +200,15 @@ and was written against deleted code.
 ### Q: Does the ring path satisfy `docs/mc-host-wire-protocol.md:321` or merely evade it?
 
 - Sources examined: `docs/mc-host-wire-protocol.md:321` in full;
-  `ring_transport.rs:474-485`; `connection.rs:408-420` (the
+  `ring_transport.rs:506-517`; `connection.rs:408-420` (the
   `InboundEvent::Rejected` handler and its watermark check at `:415-417`);
   `wire.rs:374` (`MAX_CONTROL_BODY_LEN = 65_536`).
 - Findings: the doc's clauses split cleanly. "A channel-0 header declaring `len`
-  greater than 65,536 already proves the violation" — satisfied at `:474`. "the
+  greater than 65,536 already proves the violation" — satisfied at `:506`. "the
   host MAY emit that terminal as soon as header validation completes" —
-  satisfied, `validate_inbound_header` runs at `:473` and the rejection follows
-  at `:474`. "MUST NOT buffer the oversize body" — satisfied, the lease is
-  released at `:475-477` before any body byte is read, and no ingress charge is
+  satisfied, `validate_inbound_header` runs at `:505` and the rejection follows
+  at `:506`. "MUST NOT buffer the oversize body" — satisfied, the lease is
+  released at `:507-509` before any body byte is read, and no ingress charge is
   taken. "drains and discards the declared bytes under the frame's absolute
   deadline to preserve stream alignment" — inapplicable, there is no stream. "The
   early terminal is authoritative for its correlation even if the declared body

@@ -33,12 +33,17 @@ one job:
 
 `cargo check` compiles. It runs nothing, and it does not build test targets.
 
-Every other Rust invocation in `ci.yml` names a different crate: `ci.yml:131`
-(`cargo nextest run -p mc-host --test client`), `ci.yml:168` (`cargo test -p
-mc-module --test lifecycle_cli`), `ci.yml:173-174` (`-p mc-shm-native -p
-mc-shm-transport`, then `-p mc-host --test client --test lifecycle`),
-`ci.yml:180-183` (the macOS equivalents), and `ci.yml:186` (`cargo test -p
-mc-host --doc`). There is no `--workspace` test run and no `--all-targets` test
+At authoring, every other Rust invocation in `ci.yml` named a different crate:
+`cargo nextest run -p mc-host --test client`, `cargo test -p mc-module --test
+lifecycle_cli`, the `-p mc-shm-native -p mc-shm-transport` and `-p mc-host
+--test client --test lifecycle` pair, their macOS equivalents, and `cargo test
+-p mc-host --doc`. PR #131 (merge `5d638e3e8`) removed every macOS job, so no
+macOS equivalents exist at HEAD, and the surviving Linux invocations have
+shifted lines (the client/lifecycle pair is now `ci.yml:167-169`, the doc run
+`ci.yml:175`). The same rewrite also added runs this inventory predates, for
+example `cargo test -p mc-store` at `ci.yml:232` (job `mc-host-lifecycle`), so
+the executed-in-CI column below is stale for `mc-store`; re-audit rather than
+trust it. There is no `--workspace` test run and no `--all-targets` test
 run anywhere in any workflow.
 
 So:

@@ -1340,10 +1340,10 @@ Open questions: None.
 
 Type: reachability
 Reachability: test-only — the subject is the integration-test binaries and the
-CI workflow that names them; `--test client --test lifecycle` now runs on Linux
-(`.github/workflows/ci.yml:178-179`) and macOS (`:187`). This is build
-configuration, not a runtime path. The record's own `ci.yml:156` and `:164`
-citations no longer resolve to those steps.
+CI workflow that names them; `--test client --test lifecycle` runs on Linux
+(`.github/workflows/ci.yml:168-169`, job `shm-source-build`). After PR #131
+(merge `5d638e3e8`) `ci.yml` contains only `ubuntu-latest` jobs, so no macOS
+run exists. This is build configuration, not a runtime path.
 Status: active
 Exercised: no — this is the finding.
 Guarantee: The executed proof of shutdown ordering, lock-release ordering, latch
@@ -1353,24 +1353,24 @@ Check: `reachable` — the lifecycle, activation, and roundtrip integration bina
 are named in a workflow and execute on at least one platform.
 Fault/timing angle: none; a configuration fact.
 Required faults and enabling state: none.
-Confidence: high — verified directly. Of `mc-host`'s 26 integration binaries, CI
-names four: the library tests, two shared-memory suites, one negotiation suite, a
-macOS soak, one filtered macOS library test, and doc tests. `tests/lifecycle.rs`,
+Confidence: high — verified directly at authoring time, when of `mc-host`'s 26
+integration binaries CI named four: the library tests, two shared-memory
+suites, one negotiation suite, a macOS soak, one filtered macOS library test,
+and doc tests. The macOS steps were removed with every other macOS job by
+PR #131 (merge `5d638e3e8`), which left `ci.yml` Linux-only. `tests/lifecycle.rs`,
 `tests/activation.rs`, and `tests/host_roundtrip.rs` appear in no workflow. The
 only `--test lifecycle` match in the workflows is a different crate's
 `lifecycle_cli`.
 Existing check: none — this record *is* the check.
 Impact: 36 tests and 1872 lines, including the regression tests for ten repaired
-lifecycle defects, execute only when a developer runs the local script. Separately,
-no in-crate lifecycle or generation test executes on macOS: the macOS library step
-names exactly one filter, and a prior commit records that the library test target
-did not even compile on macOS on main. **Gap closed by the ring-transport
-refactor, observed 2026-08-30.** `ed487e11 refactor(host): make ring transport
-mandatory` rewrote the CI workflow: `.github/workflows/ci.yml:156` adds `--test
-lifecycle` to the Linux `mc-host` run and `:164` adds `--test client --test
-lifecycle` to the macOS run, so the lifecycle binary now executes on both
-platforms. The record is retained because the gap was real and its closure is the
-evidence. Two residual gaps are narrower than the original finding:
+lifecycle defects, execute only when a developer runs the local script. **Gap
+closed by the ring-transport refactor, observed 2026-08-30.** `ed487e11
+refactor(host): make ring transport mandatory` rewrote the CI workflow to add
+`--test lifecycle` to the Linux `mc-host` run and `--test client --test
+lifecycle` to a then-existing macOS run. PR #131 (merge `5d638e3e8`) later
+removed every macOS job, so at HEAD the lifecycle binary executes on Linux
+only (`ci.yml:168-169`). The record is retained because the gap was real and
+its closure is the evidence. Two residual gaps are narrower than the original finding:
 `tests/activation.rs` and `tests/host_roundtrip.rs` remain unnamed, and the
 `--test lifecycle` in the `mc-module` step at `:149` is still the unrelated
 `lifecycle_cli` binary, not this one.
@@ -1964,8 +1964,10 @@ probed generation; both are `explicit-config-only`, because `LivenessPolicy`
 defaults to `None` (`config.rs:296`) and nothing in this crate opts in. The next
 two are canonical manifest evolution, the golden vector that pins the bytes and
 the digest, and the declaration-order change that must not orphan a retained
-generation. The last two are the platform pair: an atomic directory exchange that
-macOS compiles and never runs, and a portable rename fallback that cannot deliver
+generation. The last two are the platform pair: an atomic directory exchange
+whose macOS arm is dead text with no CI executor now that `ci.yml` is
+Linux-only after PR #131 (merge `5d638e3e8`), and a portable rename fallback
+that cannot deliver
 the guarantee its caller documents. The lens pass proposed folding the first two
 into Group B and the last four into Group F; they are kept together here because
 the index and the deferred-candidate list already treat the gap-closure set as
@@ -2228,7 +2230,10 @@ Type: safety
 Reachability: default-production
 Status: active
 Exercised: not yet — the Linux arm has one test through `promote_temp`
-(`generation.rs:1689`), and the macOS arm has never executed under observation.
+(`same_digest_corrupt_target_is_repaired_only_by_validated_exchange`,
+`generation.rs:1526`, re-located at HEAD), and the macOS arm has never executed
+under observation; after PR #131 (merge `5d638e3e8`) `ci.yml` has no macOS job,
+so no CI executor for that arm exists.
 Guarantee: Wherever the digest-target exchange runs, the two names are swapped
 atomically inside one directory, or an error is returned and neither name is
 left unoccupied; on a platform without the primitive it fails closed.
@@ -2259,16 +2264,16 @@ the missing element is executing it on macOS. On the stub platforms the check
 is a compile-and-call assertion.
 Confidence: high —
 [evidence](evidence/the-atomic-directory-exchange-is-atomic-on-every-supported-platform.md).
-Both cfg arms, the call site, and the whole macOS CI job were read at HEAD; the
-claim that no macOS lifecycle or generation test executes is derived from the
-four mc-host steps in that job rather than asserted.
-Existing check: partial, Linux only. `generation.rs:1689`
+Both cfg arms and the call site were read at the authoring pass's HEAD, along
+with the whole macOS CI job as it then existed. PR #131 (merge `5d638e3e8`)
+since deleted that job with every other macOS job, so the claim that no macOS
+lifecycle or generation test executes now holds trivially: `ci.yml` at HEAD
+contains only `ubuntu-latest` jobs.
+Existing check: partial, Linux only. `generation.rs:1526` (re-located at HEAD)
 `same_digest_corrupt_target_is_repaired_only_by_validated_exchange` drives the
-branch. CI's macOS job (`.github/workflows/ci.yml:126-184`) runs only
-`cargo build -p mc-host` (`:156`), `--test shm_soak` (`:178`), one filtered
-`--lib shm_provider` test (`:179-181`), and `--doc` (`:182-183`). No
-`generation` or `lifecycle` test body runs on macOS; the step comment at
-`:171-174` says the job proves omission, not parity. Status unaudited.
+branch. The macOS CI job this entry previously described was removed by
+PR #131 (merge `5d638e3e8`); no `generation` or `lifecycle` test body runs on
+macOS because nothing runs on macOS. Status unaudited.
 Impact: the exchange is the store's only repair primitive for a corrupt
 occupant, and it is immediately followed by a deletion. If macOS `RENAME_SWAP`
 behaves differently on APFS than `RENAME_EXCHANGE` on ext4, the failure mode is
@@ -2276,9 +2281,11 @@ deleting a retained generation, on a platform whose lifecycle code the suite
 never runs.
 Open questions:
 - Is macOS a supported deployment target for the lifecycle store, or only a
-  development platform? The cfg arm and the CI build say it is supported enough
-  to compile; the test selection says it is not exercised. That decision sets
-  whether this record is a real gap or a documentation fix. (needs human input)
+  development platform? The cfg arm still carries the macOS path in source,
+  but after PR #131 (merge `5d638e3e8`) no CI job builds or runs it. That
+  decision sets whether this record is a real gap or a documentation fix.
+  (needs human input)
+- Is Darwin still a supported release surface? (needs human input)
 
 ### an-occupied-rename-target-is-never-replaced-on-the-portable-path
 
@@ -2349,7 +2356,9 @@ The lens passes produced roughly 90 candidates; the 55 above are the strongest.
 Groups I, J, and K closed the five gaps the portfolio evaluation queued: the
 mandatory setup-state transitions, the shared frame-read mechanics and the
 budget-free oversize drain, normal configured liveness, canonical manifest
-evolution, and the Darwin store behaviour. The candidates still deferred to a
+evolution, and the Darwin store behaviour (whose macOS arms now have no CI
+executor: `ci.yml` is Linux-only after PR #131, merge `5d638e3e8`). The
+candidates still deferred to a
 follow-up pass, with their lens evidence retained:
 
 - Grant records: activation replay across generations, the grant binding compared

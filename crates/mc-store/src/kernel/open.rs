@@ -107,11 +107,15 @@ impl std::error::Error for KernelError {}
 
 pub struct KernelStore {
     writer: Mutex<Connection>,
+    pub(super) purge_intent_log: Mutex<File>,
     pub(super) readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     // Distinct from mutex poisoning, which `PoisonError::into_inner` recovers: this
     // records that an unrecoverable restore left the family unusable.
     poisoned: AtomicBool,
+    pub(super) cas_failed: AtomicBool,
+    pub(super) artifact_cap: u64,
+    pub(super) artifacts_path: PathBuf,
     lease_epoch: u64,
     pub(super) db_path: PathBuf,
     _lease: Box<dyn LeaseHandle>,
@@ -130,17 +134,18 @@ impl KernelStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, KernelError> {
         let identity =
             probe_sqlite_engine_identity_off_path().map_err(|_| KernelError::EngineUnsupported)?;
-        Self::open_with_engine_identity(root, &identity)
+        Self::open_with_engine_identity_and_cap(root, &identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
-    fn open_with_engine_identity(
+    fn open_with_engine_identity_and_cap(
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
+        artifact_cap: u64,
     ) -> Result<Self, KernelError> {
         if !evaluate_sqlite_runtime_gate(identity).is_empty() {
             return Err(KernelError::EngineUnsupported);
         }
-        Self::open_supported(root)
+        Self::open_supported(root, artifact_cap)
     }
 
     #[cfg(feature = "test-support")]
@@ -148,16 +153,27 @@ impl KernelStore {
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
     ) -> Result<Self, KernelError> {
-        Self::open_with_engine_identity(root, identity)
+        Self::open_with_engine_identity_and_cap(root, identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
-    fn open_supported(root: impl AsRef<Path>) -> Result<Self, KernelError> {
+    #[cfg(feature = "test-support")]
+    pub fn open_with_artifact_cap_for_test(
+        root: impl AsRef<Path>,
+        artifact_cap: u64,
+    ) -> Result<Self, KernelError> {
+        let identity =
+            probe_sqlite_engine_identity_off_path().map_err(|_| KernelError::EngineUnsupported)?;
+        Self::open_with_engine_identity_and_cap(root, &identity, artifact_cap)
+    }
+
+    fn open_supported(root: impl AsRef<Path>, artifact_cap: u64) -> Result<Self, KernelError> {
         let root = prepare_root(root.as_ref())?;
         let db_path = root.join("core.sqlite");
         let lease_store = FileLeaseStore::new(root.join("leases"));
         let lease_key = LeaseKey::new("magic-context-kernel", "sqlite", "core");
         let lease = lease_store.acquire(&lease_key).map_err(map_lease_error)?;
         let lease_epoch = lease.epoch();
+        let artifacts_path = super::cas::prepare_layout(&root)?;
 
         if entry_exists(&restore_marker_path(&db_path))? {
             super::backup::resume_restore(&db_path)?;
@@ -199,12 +215,20 @@ impl KernelStore {
         harden_family(&db_path)?;
         let readers = open_read_pool(&db_path)?;
         harden_family(&db_path)?;
+        let root_directory = File::open(&root).map_err(|_| KernelError::Io)?;
+        let purge_intent_log =
+            super::durable_fs::open_or_create_append_file(&root_directory, "purge-intent.jsonl")
+                .map_err(|_| KernelError::Io)?;
 
         let store = Self {
             writer: Mutex::new(writer),
+            purge_intent_log: Mutex::new(purge_intent_log),
             readers,
             next_reader: AtomicUsize::new(0),
             poisoned: AtomicBool::new(false),
+            cas_failed: AtomicBool::new(false),
+            artifact_cap,
+            artifacts_path,
             lease_epoch,
             db_path,
             _lease: lease,
@@ -212,6 +236,7 @@ impl KernelStore {
         // Reclaiming an expired lease keeps every row; deleting aged runs is left to an
         // explicit call, so opening a store is not a destructive act.
         store.abandon_expired_staging_runs(crate::current_time_ms())?;
+        store.run_artifact_recovery(crate::current_time_ms())?;
         Ok(store)
     }
 
@@ -623,7 +648,9 @@ pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
 
 pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
     let epoch = i64::try_from(epoch).map_err(|_| KernelError::IdentityMismatch)?;
-    let tx = conn.transaction().map_err(|_| KernelError::Io)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| KernelError::Io)?;
     if tx
         .execute(
             "UPDATE writer_fence SET writer_epoch=?1 WHERE id=0",
