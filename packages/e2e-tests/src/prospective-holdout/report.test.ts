@@ -3,6 +3,7 @@ import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmar
 import type { PairedCaseFact, PairStatus } from "./comparison";
 import {
     buildProspectiveReport,
+    completeFamilyCount,
     parseProspectiveReport,
     releasePromotionAllowed,
     validateProspectiveReportEvidence,
@@ -101,6 +102,17 @@ function report(
 }
 
 describe("prospective report", () => {
+    it("counts only families whose every coordinate completed", () => {
+        expect(completeFamilyCount([
+            coordinatePair(7, "complete"),
+            coordinatePair(11, "complete"),
+        ])).toBe(1);
+        expect(completeFamilyCount([
+            coordinatePair(7, "complete"),
+            coordinatePair(11, "incomplete"),
+        ])).toBe(0);
+    });
+
     it("delegates estimator and scorecard ownership and recomputes exact fingerprint", () => {
         const built = report();
         expect(built.body.decision).toBe("hold");

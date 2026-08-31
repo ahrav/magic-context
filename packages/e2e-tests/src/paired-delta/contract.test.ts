@@ -6,6 +6,7 @@ import {
     parsePairedDeltaManifest,
     parseScenarioDeclaration,
     validateCheckVector,
+    type PairedDeltaManifest,
     type ScenarioDeclaration,
 } from "./contract";
 
@@ -149,7 +150,7 @@ describe("paired-delta armed cell contract", () => {
 
 describe("paired-delta manifest contract", () => {
     it("round-trips frozen entries for multiple families and run modes", () => {
-        const raw = {
+        const raw: PairedDeltaManifest = {
             schema: PAIRED_DELTA_MANIFEST_SCHEMA,
             scenarios: [
                 {
@@ -165,7 +166,7 @@ describe("paired-delta manifest contract", () => {
                     runModes: ["release"],
                 },
             ],
-        } as const;
+        };
         expect(parsePairedDeltaManifest(raw)).toEqual(raw);
     });
 
