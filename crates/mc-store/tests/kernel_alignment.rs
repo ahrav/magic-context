@@ -1,11 +1,11 @@
 #![cfg(feature = "test-support")]
 
 use mc_store::kernel::{
-    AlignmentProjectionSpec, ArtifactDeletionIdentity, ArtifactDeletionKind,
-    ArtifactDeletionRequest, ArtifactIngestRequest, CommitIntent, DecisionEventPayload,
-    DecisionEventSpec, DecisionPayload, DecisionSpec, DomainSpec, KernelErrorKind, KernelStore,
-    ObservationDependencySpec, ObservationPayload, ObservationSpec, ProviderEgress,
-    RepositoryProvenance, Sensitivity,
+    AlignmentProjectionSpec, ArtifactDeletionFault, ArtifactDeletionIdentity, ArtifactDeletionKind,
+    ArtifactDeletionRequest, ArtifactErrorKind, ArtifactIngestRequest, CommitIntent,
+    DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec, DomainSpec,
+    KernelErrorKind, KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec,
+    ProviderEgress, RepositoryProvenance, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -301,12 +301,139 @@ fn deletion_replay_repairs_projection() {
     assert!(expected.is_empty());
     assert_eq!(store.alignment_as_of(3).unwrap().rows, before_deletion.rows);
     assert!(store.alignment_as_of(4).unwrap().rows.is_empty());
+    let current_slice = store.slice_as_of(4).unwrap();
+    assert_eq!(current_slice.decisions[0].decision_id, "decision-1");
+    assert_eq!(
+        current_slice.decisions[0].evidence_id.as_deref(),
+        Some("evidence")
+    );
     store.replace_alignment_projection(&[]).unwrap();
     assert!(projection_rows(root.path()).is_empty());
 
     let replay = store.delete_artifact(request).unwrap();
     assert!(replay.already_applied);
     assert_eq!(projection_rows(root.path()), expected);
+}
+
+#[test]
+fn deleted_predecessor_evidence_still_resolves_eligible_successor() {
+    let (_root, store) = open_store();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(ArtifactIngestRequest {
+            intent: intent("evidence"),
+            payload: b"evidence".to_vec(),
+            evidence_id: "evidence".to_string(),
+            object_id: "evidence-object".to_string(),
+            object_kind: "evidence".to_string(),
+            domain_id: "domain".to_string(),
+            source_kind: "repository".to_string(),
+            source_id: "source".to_string(),
+            source_revision: 1,
+            media_type: "text/plain".to_string(),
+            retention_class: "canonical".to_string(),
+            retain_until: None,
+            asserted_sensitivity: Sensitivity::Normal,
+            provider_egress: ProviderEgress::RemoteAllowed,
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+        })
+        .unwrap();
+    seed_pair(&store, Some("evidence"));
+    store
+        .commit(intent("correct"), |envelope| {
+            envelope.correct_decision("decision-object-1", decision(2, None))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("delete-evidence"),
+            identity: ArtifactDeletionIdentity::Digest(handle.digest),
+            kind: ArtifactDeletionKind::Delete,
+            operator_id: None,
+            target_locator: None,
+            reason: None,
+            deleted_at: 42,
+        })
+        .unwrap();
+
+    let current = store.alignment_as_of(5).unwrap();
+    assert_eq!(current.rows.len(), 1);
+    assert_eq!(current.rows[0].decision_id, "decision-2");
+}
+
+#[test]
+fn purge_replay_rebuild_failure_preserves_pending_artifact() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(ArtifactIngestRequest {
+            intent: intent("evidence"),
+            payload: b"evidence".to_vec(),
+            evidence_id: "evidence".to_string(),
+            object_id: "evidence-object".to_string(),
+            object_kind: "evidence".to_string(),
+            domain_id: "domain".to_string(),
+            source_kind: "repository".to_string(),
+            source_id: "source".to_string(),
+            source_revision: 1,
+            media_type: "text/plain".to_string(),
+            retention_class: "canonical".to_string(),
+            retain_until: None,
+            asserted_sensitivity: Sensitivity::Normal,
+            provider_egress: ProviderEgress::RemoteAllowed,
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+        })
+        .unwrap();
+    seed_pair(&store, None);
+    let request = ArtifactDeletionRequest {
+        intent: intent("purge-evidence"),
+        identity: ArtifactDeletionIdentity::Digest(handle.digest.clone()),
+        kind: ArtifactDeletionKind::Purge,
+        operator_id: Some("operator".to_string()),
+        target_locator: Some("fixture".to_string()),
+        reason: Some("proof".to_string()),
+        deleted_at: 42,
+    };
+    let error = store
+        .delete_artifact_with_fault_for_test(request.clone(), ArtifactDeletionFault::AfterCommit)
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::PurgeUnlinkPending);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = store.delete_artifact(request).unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::ReferenceCommit);
+    let object_path = root
+        .path()
+        .join("artifacts/objects")
+        .join(&handle.digest[..2])
+        .join(&handle.digest[2..]);
+    assert!(object_path.exists());
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let pending: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_pending_unlinks
+             WHERE artifact_digest=?1",
+            [&handle.digest],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1);
 }
 
 #[test]

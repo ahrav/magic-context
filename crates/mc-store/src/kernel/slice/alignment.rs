@@ -46,6 +46,7 @@ struct DecisionHistory {
     decision_id: String,
     invalidated_commit_seq: Option<i64>,
     superseded_by: Option<String>,
+    evidence_eligible: bool,
 }
 
 #[derive(Debug)]
@@ -135,17 +136,15 @@ fn load_alignment_input(
             .prepare(
                 "SELECT decision_id,object_id,
                         CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
-                        CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END
+                        CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END,
+                        evidence_id IS NULL OR EXISTS(
+                            SELECT 1 FROM evidence_meta e
+                            WHERE e.evidence_id=d.evidence_id
+                              AND e.created_commit_seq<=?1
+                              AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
+                        )
                  FROM decisions d
                  WHERE created_commit_seq<=?1
-                   AND (
-                       evidence_id IS NULL OR EXISTS(
-                           SELECT 1 FROM evidence_meta e
-                           WHERE e.evidence_id=d.evidence_id
-                             AND e.created_commit_seq<=?1
-                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
-                       )
-                   )
                  ORDER BY object_id",
             )
             .map_err(|_| KernelError::Io)?;
@@ -157,6 +156,7 @@ fn load_alignment_input(
                         decision_id: row.get(0)?,
                         invalidated_commit_seq: row.get(2)?,
                         superseded_by: row.get(3)?,
+                        evidence_eligible: row.get(4)?,
                     },
                 ))
             })
@@ -293,7 +293,7 @@ fn resolve_decision<'a>(
             return Ok(None);
         };
         if decision.invalidated_commit_seq.is_none() {
-            return Ok(Some(decision));
+            return Ok(decision.evidence_eligible.then_some(decision));
         }
         let Some(successor) = decision.superseded_by.as_deref() else {
             return Ok(None);
