@@ -194,6 +194,8 @@ impl KernelStore {
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         let state = load_artifact_state(&writer, &request.identity)?;
+        // Idempotent replays bypass `commit_with_writer`, so check receipt conflicts here.
+        receipt_conflict_free(&writer, &request.intent)?;
 
         if request.kind == ArtifactDeletionKind::Purge && state.tombstoned {
             crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
@@ -238,7 +240,6 @@ impl KernelStore {
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
             line.push(b'\n');
-            receipt_conflict_free(&writer, &request.intent)?;
             let mut log = self
                 .purge_intent_log
                 .lock()

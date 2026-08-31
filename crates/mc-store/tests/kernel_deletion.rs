@@ -1125,6 +1125,42 @@ fn a_barrier_records_acknowledgement_before_its_consumer_is_removed() {
 }
 
 #[test]
+fn a_conflicting_operation_key_is_rejected_on_the_idempotent_deletion_short_circuit() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "short-circuit", b"short-circuit");
+    let request = delete_request(
+        "short-circuit",
+        &handle.digest,
+        ArtifactDeletionKind::Delete,
+    );
+    assert!(
+        !store
+            .delete_artifact(request.clone())
+            .unwrap()
+            .already_applied
+    );
+
+    // The artifact now has no live references, so a replay takes the idempotent
+    // short-circuit rather than reaching `commit_with_writer`.
+    let mut replay = request.clone();
+    assert!(
+        store
+            .delete_artifact(replay.clone())
+            .unwrap()
+            .already_applied
+    );
+
+    replay.intent.request_digest = format!("{:x}", Sha256::digest(b"a different request"));
+    assert_eq!(
+        store.delete_artifact(replay).unwrap_err().kind(),
+        ArtifactErrorKind::ReferenceCommit,
+        "a reused operation key with a different digest was accepted as an idempotent replay"
+    );
+}
+
+#[test]
 fn a_conflicting_operation_key_leaves_no_durable_purge_record() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();

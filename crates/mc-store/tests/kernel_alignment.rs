@@ -305,8 +305,16 @@ fn deletion_replay_repairs_projection() {
         current_slice.decisions[0].evidence_id.as_deref(),
         Some("evidence")
     );
-    store.replace_alignment_projection(&[]).unwrap();
-    assert!(projection_rows(root.path()).is_empty());
+    store
+        .replace_alignment_projection(&[AlignmentProjectionSpec {
+            decision_id: "decision-1".to_string(),
+            observation_id: "observation-1".to_string(),
+            alignment_kind: "stale".to_string(),
+            alignment_payload: Some("{}".to_string()),
+            built_through_commit_seq: 2,
+        }])
+        .unwrap();
+    assert!(!projection_rows(root.path()).is_empty());
 
     let replay = store.delete_artifact(request).unwrap();
     assert!(replay.already_applied);
