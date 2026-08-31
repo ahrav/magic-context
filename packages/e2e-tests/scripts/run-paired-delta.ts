@@ -76,8 +76,11 @@ function smokeRepoCommit(recordsPath: string): string {
     const git = at(root);
     const commit = git(["rev-parse", "HEAD"]).trim();
     /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
-    const relative = relativeTo(root, recordsPath);
-    const scope = relative === null ? ["."] : [".", `:(exclude)${relative}`];
+    /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. commentlint: allow(JUDGE) */
+    const owned = [recordsPath, `${recordsPath}.lock`]
+        .map((path) => relativeTo(root, path))
+        .filter((path): path is string => path !== null);
+    const scope = [".", ...owned.map((path) => `:(exclude)${path}`)];
     const status = git([
         "status",
         "--porcelain",

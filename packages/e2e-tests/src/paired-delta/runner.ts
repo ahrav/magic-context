@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import {
@@ -327,16 +327,23 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
 /** Two runners over one records path each cache the pre-run array and publish a private snapshot, so the later rename erases the other's record after both paid calls happened — and the erased spend is then repeated on resume. The lock is taken before the first read, because by the time a write conflicts the money is already gone. commentlint: allow(JUDGE) */
 export class RolloutStoreBusyError extends Error {}
 
+/** The pid file cannot separate two stores inside one process, which race exactly as two processes do, so live owners are tracked here as well. Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. commentlint: allow(JUDGE) */
+const ownedRecordPaths = new Set<string>();
+
 
 export class FileRolloutStore implements RolloutStore {
     private records: RolloutRecord[] | null = null;
     private indexByCoordinate = new Map<string, number>();
     private readonly lockPath: string;
+    private readonly claim: string;
+    private readonly readOnly: boolean;
     private lockHeld = false;
     private readonly releaseOnExit = () => this.release();
 
-    constructor(private readonly path: string) {
+    constructor(private readonly path: string, options?: { readOnly?: boolean }) {
         this.lockPath = `${path}.lock`;
+        this.claim = resolve(path);
+        this.readOnly = options?.readOnly === true;
     }
 
     list(): RolloutRecord[] {
@@ -348,6 +355,7 @@ export class FileRolloutStore implements RolloutStore {
     release(): void {
         if (!this.lockHeld) return;
         this.lockHeld = false;
+        ownedRecordPaths.delete(this.claim);
         process.off("exit", this.releaseOnExit);
         try {
             rmSync(this.lockPath, { force: true });
@@ -357,7 +365,13 @@ export class FileRolloutStore implements RolloutStore {
     }
 
     private acquire(): void {
-        if (this.lockHeld) return;
+        /** A read-only store observes the file without claiming it, so a report or an assertion can read records the owning run is still writing. commentlint: allow(JUDGE) */
+        if (this.readOnly || this.lockHeld) return;
+        if (ownedRecordPaths.has(this.claim)) {
+            throw new RolloutStoreBusyError(
+                `rollout store ${this.path} is already owned in this process`,
+            );
+        }
         /** The records path's directory is created by the first publish, so the lock cannot assume it exists. commentlint: allow(JUDGE) */
         mkdirSync(dirname(this.lockPath), { recursive: true });
         try {
@@ -385,10 +399,14 @@ export class FileRolloutStore implements RolloutStore {
             writeFileSync(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
         }
         this.lockHeld = true;
+        ownedRecordPaths.add(this.claim);
         process.on("exit", this.releaseOnExit);
     }
 
     put(record: RolloutRecord): void {
+        if (this.readOnly) {
+            throw new Error(`rollout store ${this.path} was opened read-only`);
+        }
         this.acquire();
         const records = this.load();
         const key = coordinateKey(record);
@@ -528,6 +546,10 @@ export async function runPairedDelta(
     /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. commentlint: allow(JUDGE) */
     const lateDisposals: Promise<boolean>[] = [];
     const selectedScenarioIds = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
+    /** The loop visits every declaration while the coordinate map is keyed by id, so a repeated id would pay for a coordinate the store already holds completed evidence for and then fail to record it. commentlint: allow(JUDGE) */
+    if (selectedScenarioIds.size !== options.scenarios.length) {
+        throw new Error("scenarios contain a duplicate scenarioId");
+    }
     const inMatrix = (record: RolloutRecord): boolean =>
         record.poolManifestFingerprint === options.poolManifestFingerprint &&
         selectedScenarioIds.has(record.scenarioId) &&
@@ -794,7 +816,14 @@ function completedRecord(
     const declarationMatches = observation.baseScriptFingerprint === expectedFingerprint &&
         observedInterventionFingerprint !== null &&
         observedInterventionFingerprint === interventionFingerprint(expectedIntervention);
-    const usage = finiteUsage(observation.usage);
+    const observedUsage = finiteUsage(observation.usage);
+    /** The counters can be individually safe and still price beyond the float range once multiplied, so the computed cost is what has to be finite. commentlint: allow(JUDGE) */
+    const observedCostUsd = observedUsage === null
+        ? null
+        : tokenCostUsd(observedUsage, options.pricesPerMillionTokens);
+    const usage = observedCostUsd === null || !Number.isFinite(observedCostUsd)
+        ? null
+        : observedUsage;
     /** Every field copied onto the record crosses the adapter boundary, and one value `JSON.stringify` refuses makes the whole record unwritable — which loses the paid coordinate instead of recording it as malformed. commentlint: allow(JUDGE) */
     const echoesAreStrings = (observation.echoedProviderId === null ||
         typeof observation.echoedProviderId === "string") &&
@@ -874,9 +903,9 @@ function completedRecord(
         checks,
         usage: usage ?? ZERO_USAGE,
         /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. commentlint: allow(JUDGE) */
-        costUsd: usage === null
+        costUsd: usage === null || observedCostUsd === null
             ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
-            : tokenCostUsd(usage, options.pricesPerMillionTokens),
+            : observedCostUsd,
         priorAttemptsCostUsd,
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
@@ -983,7 +1012,8 @@ const ZERO_USAGE: TokenUsage = { input: 0, output: 0, cacheCreation: 0, cacheRea
 /** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. commentlint: allow(JUDGE) */
 function finiteUsage(usage: TokenUsage): TokenUsage | null {
     const counters = [usage?.input, usage?.output, usage?.cacheCreation, usage?.cacheRead];
-    if (counters.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+    /** Safe integers rather than merely finite ones: a counter near `Number.MAX_VALUE` prices to `Infinity`, which JSON writes as `null` and the next resume rejects as `cost-invalid`. commentlint: allow(JUDGE) */
+    if (counters.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) {
         return null;
     }
     return {

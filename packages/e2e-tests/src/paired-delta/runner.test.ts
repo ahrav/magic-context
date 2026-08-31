@@ -606,7 +606,7 @@ describe("paired-delta runner", () => {
             });
             // The store had to be able to write it, or the paid coordinate is
             // repeated on the next resume.
-            expect(new FileRolloutStore(path).list().filter(({ armId }) => armId === "mc-off"))
+            expect(new FileRolloutStore(path, { readOnly: true }).list().filter(({ armId }) => armId === "mc-off"))
                 .toHaveLength(1);
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -722,7 +722,7 @@ describe("paired-delta runner", () => {
             expect(malformed?.turns).toBe(0);
             expect(malformed?.echoedModelId).toBeNull();
             store.release();
-            expect(new FileRolloutStore(path).list().filter(({ armId }) => armId === "mc-off"))
+            expect(new FileRolloutStore(path, { readOnly: true }).list().filter(({ armId }) => armId === "mc-off"))
                 .toHaveLength(1);
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -748,6 +748,38 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("refuses a second owning store for one path in this process", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-owner-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = new FileRolloutStore(path);
+            owner.list();
+
+            // The pid file cannot tell these apart, and two cached snapshots
+            // erase each other's paid records exactly as two processes would.
+            expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
+            // Inspecting the file is not ownership.
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).not.toThrow();
+
+            owner.release();
+            expect(() => new FileRolloutStore(path).list()).not.toThrow();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses to write through a read-only store", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-readonly-"));
+        try {
+            const path = join(root, "records.json");
+            const reader = new FileRolloutStore(path, { readOnly: true });
+
+            expect(() => reader.put({} as unknown as RolloutRecord)).toThrow(/read-only/);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("reclaims a lock whose owner is gone", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-stale-lock-"));
         try {
@@ -760,6 +792,39 @@ describe("paired-delta runner", () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+
+    it("refuses a usage counter that cannot be priced safely", async () => {
+        for (const input of [Number.MAX_VALUE, Number.MAX_SAFE_INTEGER + 2, 1.5]) {
+            const result = await runPairedDelta(
+                options(),
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") value.usage = { ...value.usage, input };
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            // `Number.MAX_VALUE` is finite, so a finiteness test alone would
+            // price it and serialize the result as `null`.
+            expect(malformed?.cell.reasonCode).toBe("invalid-result");
+            expect(malformed?.costSource).toBe("estimated");
+            expect(Number.isFinite(malformed?.costUsd)).toBe(true);
+            expect(Number.isFinite(result.spentUsd)).toBe(true);
+        }
+    });
+
+    it("refuses a duplicate scenario id before running anything", async () => {
+        const events: string[] = [];
+
+        await expect(
+            runPairedDelta(
+                { ...options(), scenarios: [scenario, scenario] },
+                dependencies(undefined, events),
+            ),
+        ).rejects.toThrow(/duplicate scenarioId/);
+        expect(events).toHaveLength(0);
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {
@@ -1139,7 +1204,7 @@ describe("file rollout store", () => {
             const store = new FileRolloutStore(path);
             store.put(record);
 
-            expect(new FileRolloutStore(path).list()).toEqual([record]);
+            expect(new FileRolloutStore(path, { readOnly: true }).list()).toEqual([record]);
             expect(() => store.put({ ...record })).toThrow(
                 /refusing to replace completed rollout/,
             );
@@ -1156,13 +1221,13 @@ describe("file rollout store", () => {
             if (!record) throw new Error("missing fixture record");
 
             writeFileSync(path, JSON.stringify([{ ...record, costUsd: "free" }]));
-            expect(() => new FileRolloutStore(path).list()).toThrow(/cost-invalid/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/cost-invalid/);
 
             writeFileSync(path, JSON.stringify([{ ...record, costUsd: -1 }]));
-            expect(() => new FileRolloutStore(path).list()).toThrow(/cost-invalid/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/cost-invalid/);
 
             writeFileSync(path, JSON.stringify([{ ...record, schema: "other/v1" }]));
-            expect(() => new FileRolloutStore(path).list()).toThrow(/schema-mismatch/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/schema-mismatch/);
 
             writeFileSync(
                 path,
@@ -1171,16 +1236,16 @@ describe("file rollout store", () => {
                     cell: { ...record.cell, runHealth: "sideways" },
                 }]),
             );
-            expect(() => new FileRolloutStore(path).list()).toThrow(/run-health-invalid/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/run-health-invalid/);
 
             writeFileSync(path, JSON.stringify([{ ...record, priorAttemptsCostUsd: -1 }]));
-            expect(() => new FileRolloutStore(path).list())
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
                 .toThrow(/prior-attempts-cost-invalid/);
 
             // `put` protects completed evidence by coordinate index, which a
             // duplicate would silently point away from.
             writeFileSync(path, JSON.stringify([record, record]));
-            expect(() => new FileRolloutStore(path).list()).toThrow(/duplicate-coordinate/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/duplicate-coordinate/);
 
             // A completed cell suppresses its live rollout, so an impossible one
             // must not be accepted as evidence.
@@ -1195,14 +1260,14 @@ describe("file rollout store", () => {
                     path,
                     JSON.stringify([{ ...record, cell: { ...record.cell, ...cell } }]),
                 );
-                expect(() => new FileRolloutStore(path).list()).toThrow(/cell-invalid/);
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/cell-invalid/);
             }
 
             writeFileSync(
                 path,
                 JSON.stringify([{ ...record, cell: { ...record.cell, reasonCode: "made-up" } }]),
             );
-            expect(() => new FileRolloutStore(path).list()).toThrow(/reason-code-invalid/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/reason-code-invalid/);
 
             for (const checks of [
                 "none",
@@ -1210,7 +1275,7 @@ describe("file rollout store", () => {
                 [{ id: "check-ladder", passed: true }, { id: "check-ladder", passed: true }],
             ]) {
                 writeFileSync(path, JSON.stringify([{ ...record, checks }]));
-                expect(() => new FileRolloutStore(path).list()).toThrow(/checks-invalid/);
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/checks-invalid/);
             }
 
             for (const patch of [
@@ -1220,7 +1285,7 @@ describe("file rollout store", () => {
                 { checks: [] as typeof record.checks },
             ]) {
                 writeFileSync(path, JSON.stringify([{ ...record, ...patch }]));
-                expect(() => new FileRolloutStore(path).list())
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list())
                     .toThrow(/completed-cell-invalid|cell-invalid/);
             }
         } finally {
