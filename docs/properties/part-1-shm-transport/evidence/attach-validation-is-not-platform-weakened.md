@@ -60,6 +60,20 @@ and the host-side `attach_ring` deleted with `shm_provider.rs` in `ed487e11`), a
 error on non-Linux (`packages/mc-shm-native/src/lib.rs:552-560`). macOS thus gets
 size immutability by unreachability, not by sealing.
 
+Update 2026-08-31: PR #131 (merge `5d638e3e8`) changed the reachability ground
+again. It deleted the Darwin npm packages (`packages/mc-host-darwin-*`, removed
+in `55f47ac64`), removed the macOS CI jobs (`.github/workflows/ci.yml` at HEAD
+`bdf72f46a` has only `ubuntu-latest` jobs), and added
+`compile_error!("mc-shm-transport ring backend supports Linux only")` at
+`ring.rs:1-2`, so no macOS build of the crate exists at HEAD. Separately,
+`6352f873f` had re-added the Darwin type carve-out that `b5dc778e` deleted: at
+HEAD `validate_object` checks `S_IFREG` only on Linux (`ring.rs:2109-2110`) and
+sets `type_valid = true` under `cfg(target_os = "macos")` (`ring.rs:2114-2115`).
+The seal call sites are ungated at HEAD (`ring.rs:336` attach-side,
+`ring.rs:769-770` create-side) while `validate_seals` (`:2127`) and
+`seal_object` (`:2165`) keep their Linux cfg; that compiles only because the
+whole crate is Linux-only. See the dated investigation-log entry below.
+
 ## Failure scenario
 
 `Ring::attach` (`:593-611`) is `pub` and compiled on macOS, so the weakening is
@@ -125,3 +139,26 @@ attributable to the missing checks and not to the test setup.
   from cfg attributes. Its current impact is nil because attach is unreachable on
   macOS; the property exists so that adding a Darwin descriptor path is forced to
   supply a substitute for seals rather than inheriting an attach that has none.
+
+### Q: Is Darwin still a supported release surface? (added 2026-08-31)
+
+- Sources examined: `packages/` listing at HEAD `bdf72f46a`;
+  `.github/workflows/ci.yml` at HEAD (every `runs-on` is `ubuntu-latest`);
+  `git log --diff-filter=D -- packages/mc-host-darwin-arm64/package.json`
+  (`55f47ac64`, merged via `5d638e3e8`, PR #131);
+  `ring.rs:1-2`, `:311-312`, `:334-336`, `:769-770`, `:2109-2115`, `:2127`,
+  `:2165`; `git log -S 'let type_valid = true'` (`b5dc778e1` removed,
+  `6352f873f` re-added); `docs/mc-host-shm-transport.md:5`, `:83`.
+- Findings: the record's earlier "resolved by deletion" note on the Darwin
+  `st_mode` premise was wrong at HEAD — the carve-out is back in `#[cfg]` form
+  (`ring.rs:2114-2115`), so the unverified premise returns with any Darwin
+  build. The weakening cannot currently be live: the crate compile-errors off
+  Linux, no macOS CI job or Darwin package remains, and the docs now state
+  Linux-x64 glibc support only (`docs/mc-host-shm-transport.md:5`, `:83`).
+- Missing evidence: intent for the surviving `cfg(target_os = "macos")`
+  carve-out and `create_macos_shm`.
+- Conclusion: needs human input. Citation corrections: `validate_object` is at
+  `ring.rs:2100-2125` at HEAD, `validate_seals` at `:2127-2137`, `seal_object`
+  at `:2165-2174`, the attach-side calls at `:335-336`, the create-side pair at
+  `:769-770`; the pre-#131 line numbers in the trail above resolve against
+  `e447c927`.

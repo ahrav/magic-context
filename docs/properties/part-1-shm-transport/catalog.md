@@ -1976,64 +1976,92 @@ other.
 ### macos-object-creation-outcome-is-attributed
 
 Type: reachability
-Reachability: default-production — `Mapping::create` takes its macOS arm at
-`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
-created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
-with a darwin distribution package in tree
-(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
-coverage, not reachability.
+Reachability: default-production — label retained from the pre-#131 catalog
+and no longer supported at HEAD; the class is unresolved pending the Darwin
+question below. The evidence the label rested on is gone: PR #131 (merge
+`5d638e3e8`) deleted the Darwin npm packages (`packages/mc-host-darwin-*`,
+removed in `55f47ac64`) and left `.github/workflows/ci.yml` with only
+`ubuntu-latest` jobs. What remains at HEAD is weaker than a coverage gap:
+`create_macos_shm` (`crates/mc-shm-transport/src/backend/ring.rs:2176`) still
+exists under `cfg(target_os = "macos")`, but `Mapping::create`
+(`ring.rs:311-312`) calls `create_linux_memfd` unconditionally, so the function
+has no caller, and `ring.rs:1-2` raises `compile_error!("mc-shm-transport ring
+backend supports Linux only")` on any non-Linux target, so the crate cannot
+compile where the cfg matches.
 Status: active
-Exercised: not yet — no macOS CI job reaches `Ring::create`, so
-`create_macos_shm` has never executed under observation and the documented
-failure has no attributed step or errno.
+Exercised: not yet — `create_macos_shm` has never executed under observation,
+and at HEAD it cannot: it has no call site, no macOS CI job exists, and the
+crate refuses to compile off Linux (`ring.rs:1-2`).
 Guarantee: On macOS the ring object-creation path is executed, and its outcome is
 attributed to a named step and error code rather than recorded as a bare variant.
 Check: `reachable` — assert `create_macos_shm` is entered on a macOS host and its
 result is recorded with the failing step and `errno` distinguished. This is
 code-location and environment coverage: the location exists and is never
 executed.
-Fault/timing angle: none. The blocker is environmental — a macOS host that
-actually runs the file.
-Required faults and enabling state: none. A macOS runner executing
-`tests/ring.rs` suffices.
+Fault/timing angle: none. The blocker was environmental — a macOS host that
+actually runs the file — and is now also structural: no call site, and a
+compile error off Linux.
+Required faults and enabling state: a restored call site for `create_macos_shm`
+and removal of the `ring.rs:1-2` compile error, then a macOS runner executing
+`tests/ring.rs`.
 Confidence: medium — [evidence](evidence/macos-object-creation-outcome-is-attributed.md).
-`create_macos_shm` (`ring.rs:1748-1783`) has three `ObjectSetupFailed` exits and
-`validate_object` returns a different variant, so the documented error originates
-inside the create function. The shm name is 40 characters, computed by
-replicating the fold at `:1750-1759` rather than assumed. Medium because nothing
-could be executed on macOS and Darwin's `PSHMNAMLEN` is external to the
-repository and unverified.
+The original analysis resolves against the pre-#131 tree: three
+`ObjectSetupFailed` exits in `create_macos_shm` (then `ring.rs:1748-1783`),
+`validate_object` returning a different variant, and a 40-character shm name
+computed by replicating the fold. Re-verified at HEAD `bdf72f46a`: `099a314d5`
+rewrote the function (now `ring.rs:2176-2219`); the name is built from 10
+random bytes, 28 characters against a commented 31-byte Darwin limit
+(`ring.rs:2177-2178`), which addresses the name-length candidate, an
+`FD_CLOEXEC` `fcntl` step follows `shm_open` (`ring.rs:2206`), and the function
+now has five `ObjectSetupFailed` exits and no caller. Medium because nothing
+was ever executed on macOS, and the doc claim this record attributes is gone:
+`docs/mc-host-shm-transport.md` now states Linux-x64 glibc support only (`:5`,
+`:83`) and records no macOS `ObjectSetupFailed` status.
 Existing check: none, and the former partial one is gone.
 `platform_preflight_is_side_effect_free` (former `shm_provider.rs:827-848`)
 asserted `StaticallyOmitted` on non-Linux, but that was a `cfg!` decision and
 never called `Ring::create`. `ed487e11` made the ring mandatory and removed
 `preflight` and `PreflightEligibility` entirely, so no check now records a
 platform decision on this path at all.
-Impact: `docs/mc-host-shm-transport.md:121` presents the macOS omission as
-resting on an observed runtime failure that no check observes. If the cause is
-the 40-character name, fixing it silently activates the whole untested macOS path
-at once: creation without seals, attach without a type check, and a mapping whose
-descriptor was dropped.
+Impact: the documented macOS failure status this record was anchored to
+(former `docs/mc-host-shm-transport.md:121`) is gone from HEAD docs, which now
+declare Linux-x64 glibc the only supported production platform (`:5`, `:83`).
+If the Darwin surface returns, the concern stands unchanged: fixing whatever
+failed silently activates the whole untested macOS path at once — creation
+without seals, and an attach whose type predicate is a constant `true` on
+Darwin (`ring.rs:2114-2115`).
 Open questions:
 
-- Which step fails, and with which errno? Needs one macOS run. (needs human
-  input)
+- Which step fails, and with which errno? The pre-#131 doc claim of a macOS
+  `ObjectSetupFailed` is no longer in the tree, and `099a314d5` changed the
+  strongest candidate (name length). Needs one macOS run with a restored call
+  site. (needs human input)
 - Is the macOS ring intended to become functional, or is `ObjectSetupFailed` the
   permanent state? If permanent, the dependent records below become invalidated
   rather than latent. (needs human input)
+- Is Darwin still a supported release surface? PR #131 (merge `5d638e3e8`)
+  deleted the Darwin npm packages and the macOS CI jobs while the
+  `cfg(target_os = "macos")` code path remains at `ring.rs:2176`, uncalled and
+  behind the `ring.rs:1-2` compile error, and `docs/mc-host-shm-transport.md:5`
+  states Linux-x64 glibc only. If not, this record and its two dependents
+  should be invalidated. (needs human input)
 
 ### attach-validation-is-not-platform-weakened
 
 Type: safety
-Reachability: default-production — `Mapping::create` takes its macOS arm at
-`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
-created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
-with a darwin distribution package in tree
-(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
-coverage, not reachability.
+Reachability: default-production — label retained from the pre-#131 catalog
+and no longer supported at HEAD; the class is unresolved pending the Darwin
+question below. PR #131 (merge `5d638e3e8`) deleted the Darwin npm packages
+(`packages/mc-host-darwin-*`, removed in `55f47ac64`), left
+`.github/workflows/ci.yml` with only `ubuntu-latest` jobs, and added
+`compile_error!` at `crates/mc-shm-transport/src/backend/ring.rs:1-2` for any
+non-Linux target, so no macOS binary of this crate can exist at HEAD. The
+platform-conditional validation text is still in the tree
+(`ring.rs:2109-2115`), which is what keeps this record active.
 Status: active
-Exercised: not yet — needs a macOS execution of `Mapping::attach`; CI still runs
-no macOS job that constructs a `Ring`.
+Exercised: not yet — needs a macOS execution of `Mapping::attach`, which at
+HEAD is impossible: no macOS CI job exists and the crate refuses to compile off
+Linux (`ring.rs:1-2`).
 Guarantee: On every platform where attach is reachable, an admitted descriptor's
 object type is established and its size is immutable for the mapping's lifetime.
 Check: `always` — at every attach, the descriptor is refused unless its object
@@ -2051,74 +2079,96 @@ plus `SCM_RIGHTS` is now one — plus a retained second descriptor used to
 `ftruncate` after validation.
 Confidence: high — [evidence](evidence/attach-validation-is-not-platform-weakened.md).
 The refactor changed this record's premise in both directions, verified from `cfg`
-attributes at `e447c927`. Closed: `validate_object` no longer weakens the
-object-type clause off Linux. `b5dc778e` deleted the `cfg!(target_os = "linux")`
-carve-out that set `type_valid = true` on Darwin, and the check is now the
-unconditional `stat.st_mode & S_IFMT == S_IFREG` at `ring.rs:1688`, so the type
-half of this guarantee holds on both platforms by construction. Still open, and
-now reachable: shrink immunity remains Linux-only. `validate_seals`
-(`:1700-1709`) and `seal_object` (`:1738-1746`) are both still Linux-gated, as are
-the attach-side call (`:242-243`) and the create-side pair (`:578-582`). Opened:
+attributes at `e447c927`. Correction at HEAD `bdf72f46a`: the type-check closure
+did not hold. `b5dc778e` deleted the `cfg!(target_os = "linux")` carve-out that
+set `type_valid = true` on Darwin, but `6352f873f` re-added it in `#[cfg]`
+form — `validate_object` at HEAD checks `S_IFREG` only on Linux
+(`ring.rs:2109-2110`) and sets `type_valid = true` under
+`cfg(target_os = "macos")` (`ring.rs:2114-2115`). The weakening is dead text
+rather than a live path only because `ring.rs:1-2` refuses to compile the crate
+off Linux. The shrink half is now vacuously uniform: `validate_seals`
+(`ring.rs:2127-2137`) and `seal_object` (`ring.rs:2165-2174`) keep their
+`#[cfg(target_os = "linux")]`, but their call sites are ungated at HEAD — the
+attach-side call (`ring.rs:336`) and the create-side pair (`ring.rs:769-770`) —
+which compiles only because the whole crate is Linux-only, so every attach that
+can be built runs the seal check. Opened:
 the vacuity argument is gone. `d8bde128` removed the macOS `drop(fd)` and the
 `#[cfg(target_os = "linux")]` on `Mapping`'s `fd` field, so macOS now retains the
 descriptor (`ring.rs:207-211`), and it removed the Linux gates from `raw_fd`
 (`:624`), `attachment` (`:629`), and `set_inheritable` (`:645`); `RingAttachment`
 (`:503`) is ungated and gained `into_parts` (`:521`), which hands out the raw
-`OwnedFd`. A macOS host therefore has an in-tree descriptor source today, and
-`Ring::attach` on macOS is unreachable only because no macOS job runs this code.
+`OwnedFd`. Those observations resolve against `e447c927`; at HEAD the
+descriptor-source question is moot for macOS, because `ring.rs:1-2` prevents
+any macOS build of the crate.
 Existing check: `artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected`
 (`tests/ring.rs:380`) covers the Linux seal path only and is itself Linux-gated,
 with no macOS counterpart. Status unaudited as evidence for the shrink check.
 Impact: `docs/mc-host-shm-transport.md:117` rests the trusted-peer boundary on
-owner-only attachment. On macOS that boundary is now uid plus exact size plus mode
-bits plus the regular-file check, with no shrink immunity, and the compensating
-property is no longer that attach is structurally unreachable — only that no CI
-job executes it. A descriptor whose size is reduced after `fstat` is mapped
+owner-only attachment. On a macOS build that boundary would be uid plus exact
+size plus mode bits with a constant-true type predicate and no shrink immunity;
+at HEAD the compensating property is that no such build exists — the crate
+compile-errors off Linux (`ring.rs:1-2`) and no macOS CI job or Darwin package
+remains. A descriptor whose size is reduced after `fstat` would be mapped
 `MAP_SHARED | PROT_READ | PROT_WRITE` at its validated length.
 Open questions:
 
-- The former question about the Darwin `st_mode` premise is resolved by deletion:
-  `b5dc778e` removed the carve-out and took the `S_IFREG` branch on both
-  platforms, so whatever the Darwin premise was, the code no longer relies on it.
+- The former note that `b5dc778e` resolved the Darwin `st_mode` premise by
+  deletion is corrected: `6352f873f` re-added the carve-out in `#[cfg]` form
+  (`ring.rs:2114-2115`), so the unverified premise returns with any Darwin
+  build. (needs human input)
 - If a macOS descriptor-passing path is wired to the now-ungated `attachment()`,
   what substitutes for `F_SEAL_SHRINK`? Darwin has no seals. (needs human input)
+- Is Darwin still a supported release surface? PR #131 (merge `5d638e3e8`)
+  deleted the Darwin npm packages and the macOS CI jobs while the
+  `cfg(target_os = "macos")` validation carve-out remains at
+  `ring.rs:2114-2115`, behind the `ring.rs:1-2` compile error. If not, this
+  record's weakening can never be live and the record should be invalidated
+  with that reason. (needs human input)
 
 ### macos-object-creation-leaks-no-shm-name
 
 Type: safety
-Reachability: default-production — `Mapping::create` takes its macOS arm at
-`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
-created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
-with a darwin distribution package in tree
-(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
-coverage, not reachability.
+Reachability: default-production — label retained from the pre-#131 catalog
+and no longer supported at HEAD; the class is unresolved pending the Darwin
+question below. PR #131 (merge `5d638e3e8`) deleted the Darwin npm packages
+(`packages/mc-host-darwin-*`, removed in `55f47ac64`) and left
+`.github/workflows/ci.yml` with only `ubuntu-latest` jobs. At HEAD
+`create_macos_shm` (`crates/mc-shm-transport/src/backend/ring.rs:2176`) has no
+caller — `Mapping::create` (`ring.rs:311-312`) calls `create_linux_memfd`
+unconditionally — and `ring.rs:1-2` compile-errors on any non-Linux target, so
+the leak path is dead text unless a Darwin surface returns.
 Status: active
 Exercised: not yet — needs a failpoint on `shm_unlink`, or a crash between open
-and unlink, on macOS, plus an oracle over the Darwin shm namespace.
+and unlink, on macOS, plus an oracle over the Darwin shm namespace; at HEAD
+additionally blocked by the missing call site and the `ring.rs:1-2` compile
+error.
 Guarantee: A failed or interrupted macOS object creation leaves no name in the
 Darwin shared-memory namespace.
 Check: `always` — after any `create_macos_shm` invocation that does not return
 `Ok`, the generated name is absent from the shm namespace. The forbidden state is
 residue after an operation with a defined completion point, and there is no
 dedicated detector, so `unreachable` does not apply.
-Fault/timing angle: a one-statement error window at `ring.rs:1774`, between a
-successful `shm_open` and a successful `shm_unlink`. No concurrency needed. The
-crash variant is wider, spanning `OwnedFd::from_raw_fd` at `:1772`.
+Fault/timing angle: a one-statement error window at `ring.rs:2209`, between a
+successful `shm_open` (`ring.rs:2191`) and a successful `shm_unlink`. No
+concurrency needed. The crash variant is wider, spanning `OwnedFd::from_raw_fd`
+at `:2201` and the `FD_CLOEXEC` `fcntl` at `:2206`.
 Required faults and enabling state: an `shm_unlink` failure after a successful
 `O_EXCL` `shm_open`, or a process kill in that window. Both require macOS and a
 seam into `create_macos_shm`.
 Confidence: medium — [evidence](evidence/macos-object-creation-leaks-no-shm-name.md).
-Verified from the `a5568707` diff and HEAD that the step order is `shm_open`
-(`:1761-1767`), `shm_unlink` (`:1774`), `ftruncate` (`:1779`), so the pre-fix
-`ftruncate` leak window is closed and the `shm_unlink` exit is now the one
-returning with the name present and no retained handle. `shm_unlink` appears
-exactly once in the crate. Medium because whether Darwin names survive the last
+Verified from the `a5568707` diff that the unlink moved ahead of the truncate,
+and re-verified at HEAD `bdf72f46a` after `099a314d5` rewrote the body (now
+`ring.rs:2176-2219`): the order is `shm_open` (`:2191`), `FD_CLOEXEC` `fcntl`
+(`:2206`), `shm_unlink` (`:2209`), `ftruncate` (`:2215`), so the pre-fix
+`ftruncate` leak window stays closed and the combined `cloexec < 0 || unlinked
+!= 0` exit (`:2210-2212`) is the one returning with the name present and no
+retained handle. `shm_unlink` is called exactly once in the crate. Medium
+because whether Darwin names survive the last
 descriptor close, and whether `shm_unlink` can fail after `O_EXCL` success, are
-external facts that could not be tested. Re-checked at `e447c927`:
-`create_macos_shm` is byte-identical to its form at `9c1eb4d1` and only moved
-five lines up, so the refactor did not touch this record's premise. The macOS
-descriptor-lifetime change in `d8bde128` applies to `Mapping` after a successful
-return; on every early-return path inside `create_macos_shm` the local `OwnedFd`
+external facts that could not be tested. The former note that
+`create_macos_shm` was byte-identical to its `9c1eb4d1` form no longer holds:
+`099a314d5` shortened the name to 28 characters and added the `fcntl` step, but
+on every early-return path the local `OwnedFd`
 still drops, so "no retained handle" continues to describe the leak path.
 Existing check: none. `RuntimeDir` has the analogous cleanup — `Drop` plus unwind
 on two early returns — and the shm object has no equivalent.
@@ -2136,6 +2186,11 @@ Open questions:
   input)
 - Should `create_macos_shm` own an unwind matching `RuntimeDir`, or should the
   name never be unlinked before `ftruncate`? (needs human input)
+- Is Darwin still a supported release surface? PR #131 (merge `5d638e3e8`)
+  deleted the Darwin npm packages and the macOS CI jobs while
+  `create_macos_shm` remains at `ring.rs:2176`, uncalled and behind the
+  `ring.rs:1-2` compile error. If not, the leak window can never open and this
+  record should be invalidated rather than left latent. (needs human input)
 
 ### layout-region-offsets-are-real-page-aligned
 
@@ -2188,15 +2243,18 @@ Open questions:
 ### page-size-dependent-setup-runs-on-a-non-4096-page-host
 
 Type: reachability
-Reachability: default-production — `Mapping::create` takes its macOS arm at
-`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
-created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
-with a darwin distribution package in tree
-(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
-coverage, not reachability.
+Reachability: default-production — the ring transport is the only application
+transport and every accepted connection prepares a duplex ring:
+`crates/mc-host/src/connection.rs:117` calls `ring.prepare`, which constructs
+the pair via `DuplexRing::create` (`crates/mc-host/src/ring_transport.rs:248`).
+The former support this preamble cited — a Darwin distribution package in tree —
+is gone: PR #131 (merge `5d638e3e8`) deleted `packages/mc-host-darwin-*`
+(`55f47ac64`) and left `.github/workflows/ci.yml` with only `ubuntu-latest`
+jobs. The gap this record names is coverage, not reachability.
 Status: active
 Exercised: not yet — the only page-size assertion in the tree is a pure-function
-unit test, and it runs only on a 4096-page x86-64 runner.
+unit test, and it runs only on a 4096-page x86-64 runner; since PR #131 removed
+the macOS CI leg, CI provisions no non-4096-page host at all.
 Guarantee: The full setup path that depends on page size — layout, `ftruncate`,
 `mmap`, both prefault walks, `mincore`, and the `PrefaultFailed` gate — executes
 on a host whose kernel page size is not 4096.
@@ -2212,27 +2270,35 @@ Confidence: high — [evidence](evidence/page-size-dependent-setup-runs-on-a-non
 The `a5568707` diff touched only `verify_prefaulted`, adding `system_page_size`
 and `residency_vector_len`, and left `Layout::new` plus both prefault walks on
 4096 — including `arena.rs:229`, a bare literal that does not reference the
-constant. CI was read directly: Linux runs all targets while macOS runs
-`--test contract --test fuzz_corpus`, which excludes both `ring.rs` and the lib
-target. The `mincore` mismatch the fix repaired reproduces exactly in arithmetic:
+constant. CI was read directly at the time; re-read at HEAD `bdf72f46a` after
+PR #131 (merge `5d638e3e8`), `.github/workflows/ci.yml` has only
+`ubuntu-latest` jobs — the macOS leg that ran
+`--test contract --test fuzz_corpus` is gone, so nothing in CI runs any of this
+crate off Linux. The `mincore` mismatch the fix repaired reproduces exactly in
+arithmetic:
 16386 entries sized against 4097 written, leaving 12289 zero.
 Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1785-1795`),
-a pure-function assertion with no mapping. On macOS it does not run at all, since
-`--test` excludes the lib target.
+a pure-function assertion with no mapping. The macOS CI leg that excluded it via
+`--test` selection was removed with PR #131; no macOS job remains.
 Impact: the configuration in which the previous defect lived has never been
 executed end to end, so the residual defects in
 `layout-region-offsets-are-real-page-aligned` are invisible to CI, as is any
-future change reintroducing a 4096 assumption into the residency path.
-`macos-latest` maps to Apple Silicon with a 16384-byte page, so CI already
-provisions a 16 KiB host every run, and it is precisely the host on which no
-`Ring` is constructed.
+future change reintroducing a 4096 assumption into the residency path. PR #131
+removed the macOS job, so CI provisions no 16 KiB host at all; closing the gap
+now requires an aarch64 Linux large-page job or an injectable page size rather
+than a returning macOS runner.
 Open questions:
 
 - Add an aarch64 Linux job with a large-page kernel, or make the page size
   injectable so the path can be driven on any host? (needs human input)
-- The claim that `macos-latest` provisions arm64 with a 16384-byte page is
-  external to this repository; the workflow pins only the label. Worth
-  confirming, though if the label resolved to x86-64 the gap is wider.
+- The former question about `macos-latest` provisioning a 16384-byte page is
+  moot: PR #131 removed the macOS job, so CI has no 16 KiB host of any
+  provenance.
+- Is Darwin still a supported release surface? PR #131 (merge `5d638e3e8`)
+  deleted the Darwin npm packages and the macOS CI jobs while the
+  `cfg(target_os = "macos")` code path remains (`ring.rs:2176`, uncalled,
+  behind the `ring.rs:1-2` compile error). If not, non-4096-page coverage must
+  come from Linux, not from a restored macOS runner. (needs human input)
 
 ---
 

@@ -56,6 +56,13 @@ fuzz_corpus`; `--test` selects integration targets, so the lib target is exclude
 and even that pure test does not run on macOS. Neither step runs `tests/ring.rs`
 on macOS, and `tests/contract.rs` and `tests/fuzz_corpus.rs` construct no `Ring`.
 
+Update 2026-08-31: the CI paragraph above resolves against the pre-#131
+workflow. PR #131 (merge `5d638e3e8`) removed the macOS matrix leg entirely and
+deleted the Darwin npm packages (`packages/mc-host-darwin-*`, removed in
+`55f47ac64`); `.github/workflows/ci.yml` at HEAD `bdf72f46a` has only
+`ubuntu-latest` jobs, so CI provisions no non-4096-page host of any kind. See
+the dated investigation-log entry below.
+
 ## Failure scenario
 
 The only in-tree evidence that any page-size code is correct is a pure-function
@@ -128,3 +135,27 @@ executed and its own probe passed. It must not assert a page-size violation.
 - Conclusion: resolved with answer. Three page-size sources, one of them reading
   the kernel, and no end-to-end execution on a host where they differ. The
   half-fix is confirmed from the diff rather than inferred from the current state.
+
+### Q: Does any non-4096-page host remain after PR #131, and is Darwin still a supported release surface? (added 2026-08-31)
+
+- Sources examined: `.github/workflows/ci.yml` at HEAD `bdf72f46a` (every
+  `runs-on` is `ubuntu-latest`); `packages/` listing at HEAD;
+  `git log --diff-filter=D -- packages/mc-host-darwin-arm64/package.json`
+  (`55f47ac64`, merged via `5d638e3e8`, PR #131);
+  `crates/mc-shm-transport/src/backend/ring.rs:1-2`, `:311-312`, `:2176`;
+  `docs/mc-host-shm-transport.md:5`, `:83`.
+- Findings: PR #131 removed the macOS matrix leg, so CI provisions no 16 KiB
+  host at all; the former open question about `macos-latest`'s page size is
+  moot. The crate now compile-errors off Linux (`ring.rs:1-2`) and
+  `create_macos_shm` (`:2176`) has no caller, so the arm in "What a test must
+  construct" that adds `--test ring` to the macOS command no longer has a
+  command to add to and would require restoring both the CI leg and the code
+  path. The remaining constructions are unchanged: an aarch64 Linux large-page
+  job, or an injectable page size.
+- Missing evidence: whether Darwin is intended to return as a release surface;
+  the packages and CI jobs are deleted while the `cfg(target_os = "macos")`
+  code remains.
+- Conclusion: needs human input on the Darwin surface; resolved with answer on
+  coverage — at HEAD no CI host has a non-4096 page. Citation corrections: the
+  `ci.yml` matrix and macOS step lines cited above (`:132`, `:159-166`,
+  `:168-175`) no longer exist at HEAD.
