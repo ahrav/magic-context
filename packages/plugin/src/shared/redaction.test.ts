@@ -3,9 +3,19 @@
 import { describe, expect, test } from "bun:test";
 
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
-import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
+import {
+    hasShareabilitySensitiveText,
+    redactSecretText,
+    SECRET_QUALIFIERS,
+    SECRET_WORDS,
+} from "./redaction";
 
 describe("redaction vocabulary fixture", () => {
+    test("matches the cross-runtime label vocabulary", () => {
+        expect(SECRET_WORDS).toEqual(vocabulary.label_words);
+        expect([...SECRET_QUALIFIERS]).toEqual(vocabulary.label_qualifiers);
+    });
+
     test("matches the cross-runtime redacted output", () => {
         for (const fixture of vocabulary.cases) {
             expect(redactSecretText(fixture.input)).toBe(fixture.expected_redacted);
