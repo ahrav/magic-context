@@ -1132,28 +1132,28 @@ pub fn watch(channel_id: u32, callback: Function<(), ()>) -> Result<()> {
 }
 
 #[napi]
-pub fn readiness_handled() {
+pub fn readiness_handled() -> bool {
     REGISTRY.with(|registry| {
-        if let Ok(registry) = registry.try_borrow() {
-            if let Some(reactor) = registry.reactor.as_ref() {
-                let mut kick = false;
-                for (channel_id, channel) in &registry.channels {
-                    if !reactor.is_registered(*channel_id) {
-                        continue;
-                    }
-                    kick |= channel.from_host.complete_data_wait().is_err();
-                    match channel.from_host.arm_data_wait() {
-                        Ok(true) => {}
-                        Ok(false) | Err(_) => kick = true,
-                    }
-                }
-                reactor.handled();
-                if kick {
-                    reactor.kick();
-                }
+        let Ok(registry) = registry.try_borrow() else {
+            return false;
+        };
+        let Some(reactor) = registry.reactor.as_ref() else {
+            return false;
+        };
+        let mut redispatch = false;
+        for (channel_id, channel) in &registry.channels {
+            if !reactor.is_registered(*channel_id) {
+                continue;
+            }
+            redispatch |= channel.from_host.complete_data_wait().is_err();
+            match channel.from_host.arm_data_wait() {
+                Ok(true) => {}
+                Ok(false) | Err(_) => redispatch = true,
             }
         }
-    });
+        reactor.handled();
+        redispatch
+    })
 }
 
 #[napi]

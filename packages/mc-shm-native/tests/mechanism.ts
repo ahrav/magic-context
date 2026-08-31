@@ -80,7 +80,7 @@ interface RawAttachAddon {
         deliver: (token: number, header: Uint8Array, segments: Uint8Array[]) => void,
     ): boolean;
     watch(channel: number, callback: () => void): void;
-    readinessHandled(): void;
+    readinessHandled(): boolean;
     release(channel: number, token: number): void;
     close(channel: number): void;
 }
@@ -232,7 +232,7 @@ describe("raw N-API descriptor boundary", () => {
                 () => {},
             );
         };
-        addon.watch(pair.second, () => {
+        const onReady = (): void => {
             try {
                 callbacks += 1;
                 addon.poll(pair.second, (token, _header, segments) => {
@@ -246,9 +246,10 @@ describe("raw N-API descriptor boundary", () => {
                     complete();
                 }
             } finally {
-                addon.readinessHandled();
+                if (addon.readinessHandled()) queueMicrotask(onReady);
             }
-        });
+        };
+        addon.watch(pair.second, onReady);
 
         let timeout: ReturnType<typeof setTimeout>;
         try {

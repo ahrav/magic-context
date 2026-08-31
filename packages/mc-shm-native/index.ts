@@ -118,7 +118,7 @@ interface NativeAddon {
         ) => void,
     ): boolean;
     watch(channel: number, callback: () => void): void;
-    readinessHandled(): void;
+    readinessHandled(): boolean;
     release(channel: number, token: number): void;
     close(channel: number): void;
     forceClose(channel: number): void;
@@ -534,7 +534,7 @@ function dispatchReadiness(): void {
             }
         }
     } finally {
-        loaded?.readinessHandled();
+        if (loaded?.readinessHandled()) queueMicrotask(dispatchReadiness);
     }
 }
 
