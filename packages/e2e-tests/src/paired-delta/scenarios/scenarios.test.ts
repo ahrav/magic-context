@@ -56,12 +56,18 @@ describe("paired-delta authored scenarios", () => {
         });
 
         it(`${scenario.scenarioId} applies its declared answer-casing policy`, async () => {
+            const answer = scenario.expectedAnswer;
+            const swapped = answer.toUpperCase() === answer
+                ? answer.toLowerCase()
+                : answer.toUpperCase();
+            /** An all-digit answer cannot be case-swapped, so asserting a policy against it would pass under either mode. Assert the vacuity instead, so this branch is taken only for genuinely caseless answers and a future answer that gains letters lands in the real check below. commentlint: allow(JUDGE) */
+            if (swapped === answer) {
+                expect(answer).not.toMatch(/\p{L}/u);
+                return;
+            }
             const root = mkdtempSync(join(tmpdir(), "paired-delta-scenario-"));
             try {
                 mkdirSync(join(root, "result"), { recursive: true });
-                const swapped = scenario.expectedAnswer.toUpperCase() === scenario.expectedAnswer
-                    ? scenario.expectedAnswer.toLowerCase()
-                    : scenario.expectedAnswer.toUpperCase();
                 writeFileSync(join(root, "result", "answer.txt"), swapped);
                 const checks = await scenario.verifier({ armId: "mc-on", workspacePath: root });
                 const passed = checks.find(({ id }) => id === "check-answer")?.passed;
