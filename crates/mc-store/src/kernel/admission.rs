@@ -3,7 +3,7 @@ use super::{KernelError, Sensitivity};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "37964fc530e83c8be0ded92cc43bff768a5790f3a34bd2675647ce7328bd07d2";
+    "63aa7b552fe115e4ecf82d09cdab925fd22d2682dee74345b112bfcfa5b5b244";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -215,7 +215,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     let relaxes_disposition = requested_disposition.is_some_and(|requested| {
         disposition_restrictiveness(requested) < disposition_restrictiveness(current_disposition)
     });
-    let requires_approval = (raises_support
+    let requires_approval = (event_can_raise_support(input.event)
         && (!auto_admit_event(input.event)
             || requested.rank() > admission_ceiling(input.event, ceiling).rank()))
         || relaxes_disposition;
@@ -271,7 +271,8 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     } else {
         requested_outcome
     };
-    let no_op = state_unchanged && input.prior.is_some_and(|prior| prior.outcome == outcome);
+    let no_op =
+        state_unchanged && !denied && input.prior.is_some_and(|prior| prior.outcome == outcome);
 
     let visibility = visibility_row(effective, disposition);
 
@@ -641,8 +642,10 @@ mod tests {
         assert_eq!(denied.historical_maturity, Maturity::Verified);
         assert_eq!(denied.effective_maturity.get(), Maturity::Verified);
 
-        // A repeated denial is still an unchanged decision.
-        let replayed = evaluate_admission(EvaluationInputs {
+        // A denial is an attempt, so it is never folded into an unchanged replay.
+        // `PriorDecision` carries no event identity, so a second denial reaching the
+        // same state is otherwise indistinguishable from the first.
+        let repeated = evaluate_admission(EvaluationInputs {
             source_class: prior.source_class,
             taint_class: prior.taint_class,
             prior: Some(PriorDecision {
@@ -656,8 +659,59 @@ mod tests {
             has_evidence: true,
         })
         .unwrap();
-        assert_eq!(replayed.outcome, Outcome::Deny);
-        assert!(replayed.no_op);
+        assert_eq!(repeated.outcome, Outcome::Deny);
+        assert!(!repeated.no_op);
+    }
+
+    #[test]
+    fn an_authority_event_requires_approval_even_at_an_unchanged_rung() {
+        let base = EvaluationInputs {
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            prior: None,
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: Some(Sensitivity::Normal),
+            approval_valid: false,
+            event: EventKind::Other,
+            has_evidence: true,
+        };
+        let settled = PriorDecision {
+            historical_maturity: Maturity::Approved,
+            effective_maturity: Maturity::Approved,
+            disposition: Disposition::Active,
+            outcome: Outcome::Promote,
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            sensitivity: Sensitivity::Normal,
+        };
+        for (prior, event) in [
+            (settled, EventKind::Approve),
+            (
+                PriorDecision {
+                    historical_maturity: Maturity::Enforced,
+                    effective_maturity: Maturity::Enforced,
+                    ..settled
+                },
+                EventKind::Enforce,
+            ),
+        ] {
+            let unauthorized = EvaluationInputs {
+                prior: Some(prior),
+                event,
+                ..base
+            };
+            let result = evaluate_admission(unauthorized).unwrap();
+            assert_eq!(result.outcome, Outcome::Deny, "{event:?}");
+            assert!(!result.no_op, "{event:?}");
+
+            let authorized = evaluate_admission(EvaluationInputs {
+                approval_valid: true,
+                ..unauthorized
+            })
+            .unwrap();
+            assert_eq!(authorized.outcome, prior.outcome, "{event:?}");
+            assert!(authorized.no_op, "{event:?}");
+        }
     }
 
     #[test]
