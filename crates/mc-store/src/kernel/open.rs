@@ -134,13 +134,6 @@ impl KernelStore {
         Self::open_with_engine_identity_and_cap(root, &identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
-    fn open_with_engine_identity(
-        root: impl AsRef<Path>,
-        identity: &SqliteEngineIdentity,
-    ) -> Result<Self, KernelError> {
-        Self::open_with_engine_identity_and_cap(root, identity, super::cas::DEFAULT_ARTIFACT_CAP)
-    }
-
     fn open_with_engine_identity_and_cap(
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
@@ -157,7 +150,7 @@ impl KernelStore {
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
     ) -> Result<Self, KernelError> {
-        Self::open_with_engine_identity(root, identity)
+        Self::open_with_engine_identity_and_cap(root, identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
     #[cfg(feature = "test-support")]
