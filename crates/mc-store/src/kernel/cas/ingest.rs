@@ -635,8 +635,10 @@ fn insert_reference(
         kind: "insert",
         replaced_object_id: None,
         redactions: vec![
-            ("evidence_id".to_string(), evidence_id.clone()),
             ("object_id".to_string(), object_id),
+            ("object_kind".to_string(), object_kind),
+            ("domain_id".to_string(), domain_id),
+            ("source_kind".to_string(), source_kind),
             ("source_id".to_string(), source_id),
         ],
         audit: None,

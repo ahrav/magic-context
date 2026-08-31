@@ -771,3 +771,84 @@ fn symlinked_object_is_not_admitted_as_a_verified_reference() {
     assert_eq!(reservation_count(root.path()), 0);
     assert_eq!(staged_entries(root.path()), 0);
 }
+
+#[test]
+fn hard_linked_object_is_not_admitted_as_a_verified_reference() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"hard link bait".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&payload));
+
+    let outside = root.path().join("outside-alias");
+    fs::write(&outside, &payload).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let shard = root.path().join("artifacts/objects").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::hard_link(&outside, shard.join(&digest[2..])).unwrap();
+
+    let error = store
+        .ingest_artifact(request("hardlink", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let references: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_meta WHERE artifact_digest=?1",
+            [&digest],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(references, 0);
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn oversized_replaced_object_is_rejected_without_reading_it_whole() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("oversize", b"small payload".to_vec()))
+        .unwrap();
+
+    let path = artifact_path(root.path(), &handle.digest);
+    fs::write(&path, vec![b'z'; 64 * MIB + 1]).unwrap();
+    let error = store.read_artifact(&handle).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::CorruptObject);
+}
+
+#[test]
+fn change_payload_redactions_cover_every_emitted_object_field() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut tainted = request("ledger", b"ledger payload".to_vec());
+    tainted.object_kind = format!("evidence key={SECRET}");
+    tainted.source_kind = format!("repository token={SECRET}");
+    let handle = store.ingest_artifact(tainted).unwrap();
+    assert!(!handle.digest.is_empty());
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT field_name FROM durable_text_redactions
+             WHERE owner_kind='outbox' ORDER BY field_name",
+        )
+        .unwrap();
+    let fields = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect::<Vec<_>>();
+    for expected in ["object_kind", "source_kind"] {
+        assert!(
+            fields.iter().any(|field| field == expected),
+            "outbox redaction ledger is missing {expected}: {fields:?}"
+        );
+    }
+}

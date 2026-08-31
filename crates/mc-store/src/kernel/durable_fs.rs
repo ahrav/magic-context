@@ -217,10 +217,14 @@ pub(super) fn open_regular_nofollow(directory: &File, name: &str) -> Result<File
     .map_err(classify_errno)?;
     let file = File::from(descriptor);
     let metadata = file.metadata().map_err(classify_io)?;
-    if !metadata.file_type().is_file() {
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o177 != 0o000
+    {
         return Err(classify_io(io::Error::new(
             io::ErrorKind::InvalidData,
-            "artifact object must be a regular file",
+            "object is not an exclusively owned regular file",
         )));
     }
     Ok(file)

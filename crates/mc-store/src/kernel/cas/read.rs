@@ -1,11 +1,12 @@
 use std::fs;
+use std::io::Read;
 
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::{
     is_artifact_digest, ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind,
-    ArtifactHandle, EligibilityDeniedReason, ProviderEgress,
+    ArtifactHandle, EligibilityDeniedReason, ProviderEgress, MAX_PAYLOAD_BYTES,
 };
 use crate::kernel::{KernelStore, Sensitivity};
 
@@ -48,9 +49,35 @@ impl KernelStore {
             return Err(ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable));
         }
         let path = self.artifact_object_path(&handle.digest);
-        let bytes = fs::read(path).map_err(|_| {
+        let metadata = fs::symlink_metadata(&path).map_err(|_| {
             ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
         })?;
+        if !metadata.file_type().is_file() {
+            return Err(ArtifactError::for_digest(
+                ArtifactErrorKind::CorruptObject,
+                &handle.digest,
+            ));
+        }
+        let object = fs::File::open(&path).map_err(|_| {
+            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
+        })?;
+        let mut bytes = Vec::new();
+        object
+            .take(
+                u64::try_from(MAX_PAYLOAD_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut bytes)
+            .map_err(|_| {
+                ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
+            })?;
+        if bytes.len() > MAX_PAYLOAD_BYTES {
+            return Err(ArtifactError::for_digest(
+                ArtifactErrorKind::CorruptObject,
+                &handle.digest,
+            ));
+        }
         if format!("{:x}", Sha256::digest(&bytes)) != handle.digest {
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::CorruptObject,
