@@ -51,21 +51,37 @@ function semanticInput(declaration: ScenarioDeclaration): unknown {
     return { contract: "paired-delta-scenario/v1", ...serializable };
 }
 
-/** Covers every file whose contents the lane's validation reads: `semanticInput` drops the verifier function, so without this a change to a parsing primitive, to `CHARS_PER_TOKEN`, or to the scoring rules would alter what each frozen scenario accepts while both fingerprints stayed identical. Deliberately coarse — a whole file, not the one constant consumed from it — because over-triggering a refreeze costs one command while under-triggering hides a semantic change. Stops at direct reads; it is not a transitive import closure. commentlint: allow(JUDGE) */
+/** Every file a validation rule reads a value from, wherever it lives: `semanticInput` drops the verifier function, so without these a change to a parsing primitive, to `CHARS_PER_TOKEN`, to the search-token bound, or to the claim normalizer would alter what each frozen scenario accepts while both fingerprints stayed identical. Deliberately coarse — a whole file, not the one value consumed from it — because over-triggering a refreeze costs one command while under-triggering hides a semantic change. A direct-read list, not a transitive import closure: resolving the closure would make the digest depend on most of the repository and refreeze the pool on unrelated edits. commentlint: allow(JUDGE) */
+const SHARED_VALIDATION_FILES = [
+    "src/contract-primitives.ts",
+    "src/ballast.ts",
+    "src/paired-delta/contract.ts",
+    "src/paired-delta/scenarios/support.ts",
+    "../plugin/src/features/magic-context/search-bounds.ts",
+    "../plugin/src/features/magic-context/memory/normalize-hash.ts",
+] as const;
+
+/** Read once per root rather than once per scenario: the shared files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. commentlint: allow(JUDGE) */
+function sharedValidationBytes(root: string): ReadonlyArray<readonly [string, Buffer]> {
+    const cached = sharedBytesByRoot.get(root);
+    if (cached !== undefined) return cached;
+    const bytes = SHARED_VALIDATION_FILES.map((path) =>
+        [path, readFileSync(resolve(root, path))] as const);
+    sharedBytesByRoot.set(root, bytes);
+    return bytes;
+}
+const sharedBytesByRoot = new Map<string, ReadonlyArray<readonly [string, Buffer]>>();
+
 function verifierBundleDigest(root: string, implementationFile: string): string {
     const hash = createHash("sha256");
-    for (const path of [
-        "src/contract-primitives.ts",
-        "src/ballast.ts",
-        "src/paired-delta/contract.ts",
-        "src/paired-delta/scenarios/support.ts",
-        implementationFile,
-    ]) {
-        const bytes = readFileSync(resolve(root, path));
+    for (const [path, bytes] of sharedValidationBytes(root)) {
         hash.update(path);
         hash.update("\0");
         hash.update(bytes);
     }
+    hash.update(implementationFile);
+    hash.update("\0");
+    hash.update(readFileSync(resolve(root, implementationFile)));
     return hash.digest("hex");
 }
 
