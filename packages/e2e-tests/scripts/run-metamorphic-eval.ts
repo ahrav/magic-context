@@ -2,7 +2,6 @@
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { stagingPathFor, writeJsonAtomically } from "./atomic-json-write";
 
 import { parseScenario, type HistorianEvalScenario } from "../src/historian-eval/contract";
 import {
@@ -153,11 +152,28 @@ export function selectInputs(
     return { scenarios, transforms };
 }
 
-/** Kept as a named re-export: the metamorphic tests and stale-artifact cleanup both refer to it by this name. commentlint: allow(JUDGE) */
-export const stagingReportPath = stagingPathFor;
+export function stagingReportPath(destination: string): string {
+    return `${destination}.tmp`;
+}
 
 function writeReportFile(destination: string, report: MetamorphicReport): void {
-    writeJsonAtomically(destination, report, "report");
+    mkdirSync(dirname(destination), { recursive: true });
+    const staging = stagingReportPath(destination);
+    /** lstat, not existsSync: writeFileSync would follow a symlink here and overwrite its target, then renameSync would publish the link. commentlint: allow(JUDGE) */
+    const occupant = lstatSync(staging, { throwIfNoEntry: false });
+    if (occupant !== undefined) {
+        if (!occupant.isFile() && !occupant.isSymbolicLink()) {
+            throw new Error(`report staging path is not a regular file: ${staging}`);
+        }
+        rmSync(staging, { force: true });
+    }
+    try {
+        writeFileSync(staging, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+        renameSync(staging, destination);
+    } catch (error) {
+        rmSync(staging, { force: true });
+        throw error;
+    }
 }
 
 export function partialReportPath(destination: string): string {
