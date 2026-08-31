@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
@@ -64,7 +64,7 @@ pub(super) fn classify_io(source: io::Error) -> StorageError {
     }
 }
 
-fn classify_errno(source: rustix::io::Errno) -> StorageError {
+pub(super) fn classify_errno(source: rustix::io::Errno) -> StorageError {
     classify_io(io::Error::from(source))
 }
 
@@ -170,6 +170,58 @@ pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, Stor
     .map_err(classify_errno)?;
     rfs::fchmod(&descriptor, Mode::from_raw_mode(0o600)).map_err(classify_errno)?;
     Ok(File::from(descriptor))
+}
+
+pub(super) fn open_or_create_append_file(
+    directory: &File,
+    name: &str,
+) -> Result<File, StorageError> {
+    match create_new_file(directory, name) {
+        Ok(file) => {
+            sync_directory(directory)?;
+            drop(file);
+            open_or_create_append_file(directory, name)
+        }
+        Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
+            validate_name(name)?;
+            let descriptor = rfs::openat(
+                directory,
+                name,
+                OFlags::APPEND | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(classify_errno)?;
+            let file = File::from(descriptor);
+            let metadata = file.metadata().map_err(classify_io)?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o777 != 0o600
+            {
+                return Err(classify_io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "append file is not an exclusive owner-only regular file",
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A partial prior append can leave the file without its trailing newline, so a record is separated from that remnant before new bytes are written.
+pub(super) fn append_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), StorageError> {
+    let length = file.metadata().map_err(classify_io)?.len();
+    if length > 0 {
+        let mut last = [0_u8; 1];
+        file.read_exact_at(&mut last, length - 1)
+            .map_err(classify_io)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n").map_err(classify_io)?;
+        }
+    }
+    file.write_all(bytes).map_err(classify_io)?;
+    sync_file(file)
 }
 
 pub(super) fn open_regular_nofollow(directory: &File, name: &str) -> Result<File, StorageError> {

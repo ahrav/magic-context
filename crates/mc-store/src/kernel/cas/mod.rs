@@ -1,3 +1,5 @@
+mod deletion;
+pub(super) mod gc;
 mod ingest;
 mod read;
 
@@ -112,10 +114,13 @@ pub enum ArtifactErrorKind {
     CorruptObject,
     ReferenceUnavailable,
     ReferenceCommit,
+    ReclaimInProgress,
     UnredactableSecret,
     DetectionLimit,
     TextFieldTooLong,
     InvalidInput,
+    PurgeIntent,
+    PurgeUnlinkPending,
 }
 
 pub struct ArtifactError {
@@ -140,6 +145,16 @@ impl ArtifactError {
 
     pub fn digest(&self) -> Option<&str> {
         self.digest.as_deref()
+    }
+
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self.kind,
+            ArtifactErrorKind::Capacity
+                | ArtifactErrorKind::StorageExhausted
+                | ArtifactErrorKind::ReclaimInProgress
+                | ArtifactErrorKind::PurgeUnlinkPending
+        )
     }
 
     pub(super) fn new(kind: ArtifactErrorKind) -> Self {
@@ -209,6 +224,9 @@ impl fmt::Display for ArtifactError {
             ArtifactErrorKind::ReferenceCommit => {
                 formatter.write_str("artifact canonical reference commit failed")
             }
+            ArtifactErrorKind::ReclaimInProgress => {
+                formatter.write_str("artifact reclamation is in progress; retry ingestion")
+            }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
             ArtifactErrorKind::TextFieldTooLong => write!(
@@ -220,9 +238,25 @@ impl fmt::Display for ArtifactError {
                 "artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets"
             ),
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
+            ArtifactErrorKind::PurgeIntent => {
+                formatter.write_str("artifact purge intent could not be made durable")
+            }
+            ArtifactErrorKind::PurgeUnlinkPending => {
+                formatter.write_str("artifact purge committed with durable unlink pending")
+            }
         }
     }
 }
+
+#[cfg(feature = "test-support")]
+pub use deletion::ArtifactDeletionFault;
+pub use deletion::{
+    ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
+    ArtifactDeletionResult, BarrierConsumerStatus, DeletionBarrierStatus,
+};
+#[cfg(feature = "test-support")]
+pub use gc::ArtifactGcFault;
+pub use gc::ArtifactGcResult;
 
 impl fmt::Debug for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -255,6 +289,10 @@ impl KernelStore {
     /// A same-UID process can replace `artifacts` or `objects` with a symlink
     /// after the store is open, so neither is trusted as a path component.
     pub(super) fn open_objects_directory(&self) -> Result<File, StorageError> {
+        self.open_artifacts_subdirectory("objects")
+    }
+
+    pub(super) fn open_artifacts_subdirectory(&self, name: &str) -> Result<File, StorageError> {
         let Some(store_root) = self.artifacts_path.parent() else {
             return Err(classify_io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -263,7 +301,7 @@ impl KernelStore {
         };
         let root = File::open(store_root).map_err(classify_io)?;
         let artifacts = open_secure_directory(&root, "artifacts")?;
-        open_secure_directory(&artifacts, "objects")
+        open_secure_directory(&artifacts, name)
     }
 
     pub(super) fn cas_is_failed(&self) -> bool {
@@ -272,6 +310,25 @@ impl KernelStore {
 
     pub(super) fn latch_cas_failure(&self) {
         self.cas_failed.store(true, Ordering::Release);
+    }
+
+    pub(super) fn map_cas_storage_error(
+        &self,
+        error: StorageError,
+        non_capacity_kind: ArtifactErrorKind,
+    ) -> ArtifactError {
+        match error {
+            StorageError::Exhausted(_) => ArtifactError::new(ArtifactErrorKind::StorageExhausted),
+            StorageError::Other(_) => {
+                self.latch_cas_failure();
+                ArtifactError::new(non_capacity_kind)
+            }
+        }
+    }
+
+    pub(super) fn fail_cas_storage(&self, kind: ArtifactErrorKind) -> ArtifactError {
+        self.latch_cas_failure();
+        ArtifactError::new(kind)
     }
 }
 

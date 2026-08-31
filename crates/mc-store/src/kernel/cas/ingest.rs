@@ -15,7 +15,7 @@ use super::{
 };
 use crate::current_time_ms;
 use crate::kernel::durable_fs::{
-    classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
+    classify_errno, create_new_file, durable_unlink, open_or_create_secure_directory,
     open_regular_nofollow, publish_noreplace_between_locked, sync_directory,
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
@@ -191,7 +191,7 @@ impl KernelStore {
         &self,
         request: ArtifactIngestRequest,
     ) -> Result<ArtifactHandle, ArtifactError> {
-        self.ingest_artifact_inner(request, false, false)
+        self.ingest_artifact_inner(request, false, false, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -204,7 +204,17 @@ impl KernelStore {
             request,
             fault == ArtifactIngestFault::AfterDirectorySync,
             fault == ArtifactIngestFault::AfterEvents,
+            None,
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn ingest_artifact_with_temp_hook_for_test(
+        &self,
+        request: ArtifactIngestRequest,
+        mut hook: impl FnMut(&str),
+    ) -> Result<ArtifactHandle, ArtifactError> {
+        self.ingest_artifact_inner(request, false, false, Some(&mut hook))
     }
 
     fn ingest_artifact_inner(
@@ -212,6 +222,7 @@ impl KernelStore {
         request: ArtifactIngestRequest,
         fault_after_directory_sync: bool,
         fault_after_events: bool,
+        temp_written_hook: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ArtifactHandle, ArtifactError> {
         if self.cas_is_failed() {
             return Err(ArtifactError::new(ArtifactErrorKind::IngestionFailClosed));
@@ -223,34 +234,43 @@ impl KernelStore {
         let store_root = self
             .artifacts_path
             .parent()
-            .ok_or_else(|| self.fail_storage(ArtifactErrorKind::IngestionFailClosed))?;
+            .ok_or_else(|| self.fail_cas_storage(ArtifactErrorKind::IngestionFailClosed))?;
         let root = File::open(store_root)
-            .map_err(|_| self.fail_storage(ArtifactErrorKind::IngestionFailClosed))?;
-        let artifacts = open_or_create_secure_directory(&root, "artifacts")
-            .map_err(|error| self.map_storage_error(error))?;
-        let tmp = open_or_create_secure_directory(&artifacts, "tmp")
-            .map_err(|error| self.map_storage_error(error))?;
-        let objects = open_or_create_secure_directory(&artifacts, "objects")
-            .map_err(|error| self.map_storage_error(error))?;
-        let temp_name = temp_name("artifact");
-        let mut temp =
-            create_new_file(&tmp, &temp_name).map_err(|error| self.map_storage_error(error))?;
+            .map_err(|_| self.fail_cas_storage(ArtifactErrorKind::IngestionFailClosed))?;
+        let artifacts = open_or_create_secure_directory(&root, "artifacts").map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
+        let tmp = open_or_create_secure_directory(&artifacts, "tmp").map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
+        let objects = open_or_create_secure_directory(&artifacts, "objects").map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
+        let temp_name = temp_name(&format!("artifact-{}", prepared.digest));
+        let mut temp = create_new_file(&tmp, &temp_name).map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
         let mut staged = StagedObject {
             directory: &tmp,
             name: &temp_name,
             consumed: false,
         };
         if let Err(error) = write_and_sync(&mut temp, &prepared.bytes) {
-            return Err(self.map_storage_error(error));
+            return Err(self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed));
         }
         drop(temp);
+        if let Some(hook) = temp_written_hook {
+            hook(&temp_name);
+        }
 
         let mut writer = self
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         self.check_budget(&objects, &prepared.digest, byte_length)?;
-        let shard = open_or_create_secure_directory(&objects, &prepared.digest[..2])
-            .map_err(|error| self.map_storage_error(error))?;
+        let shard =
+            open_or_create_secure_directory(&objects, &prepared.digest[..2]).map_err(|error| {
+                self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+            })?;
         let now = current_time_ms();
         let reservation_id = format!(
             "{}-{}",
@@ -263,6 +283,16 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         check_fence(&reservation, self.lease_epoch())
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        // A digest under active reclamation must not be re-admitted.
+        if artifact_is_reclaiming(&reservation, &prepared.digest)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
+        {
+            drop(reservation);
+            return Err(ArtifactError::for_digest(
+                ArtifactErrorKind::ReclaimInProgress,
+                &prepared.digest,
+            ));
+        }
         if artifact_is_blocked(&reservation, &prepared.digest)
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
         {
@@ -304,7 +334,8 @@ impl KernelStore {
             // `verify_object` rejects.
             Ok(PublishOutcome::PublishedTempRetained) => {
                 if let Err(error) = durable_unlink(&tmp, &temp_name) {
-                    let mapped = self.map_storage_error(error);
+                    let mapped =
+                        self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
                     self.cleanup_failed_reference(
                         &mut writer,
                         &reservation_id,
@@ -318,7 +349,8 @@ impl KernelStore {
             }
             Ok(PublishOutcome::AlreadyExists) => {
                 if let Err(error) = durable_unlink(&tmp, &temp_name) {
-                    let mapped = self.map_storage_error(error);
+                    let mapped =
+                        self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
                     self.release_reservation(&mut writer, &reservation_id);
                     return Err(mapped);
                 }
@@ -326,14 +358,15 @@ impl KernelStore {
                 false
             }
             Err(error) => {
-                let mapped = self.map_storage_error(error);
+                let mapped =
+                    self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
                 self.cleanup_failed_reference(&mut writer, &reservation_id, &prepared.digest, true);
                 return Err(mapped);
             }
         };
 
         if let Err(error) = sync_publish_directories_with(&tmp, &shard, sync_directory) {
-            let mapped = self.map_storage_error(error);
+            let mapped = self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
             self.cleanup_failed_reference(
                 &mut writer,
                 &reservation_id,
@@ -451,25 +484,15 @@ impl KernelStore {
         digest: &str,
         byte_length: u64,
     ) -> Result<(), ArtifactError> {
-        let usage = regular_file_bytes(objects).map_err(|error| self.map_storage_error(error))?;
+        let usage = regular_file_bytes(objects).map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
         let already_present = object_is_present(objects, digest);
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
         if projected > self.artifact_cap {
             return Err(ArtifactError::capacity(usage, self.artifact_cap));
         }
         Ok(())
-    }
-
-    fn map_storage_error(&self, error: StorageError) -> ArtifactError {
-        match error {
-            StorageError::Exhausted(_) => ArtifactError::new(ArtifactErrorKind::StorageExhausted),
-            StorageError::Other(_) => self.fail_storage(ArtifactErrorKind::IngestionFailClosed),
-        }
-    }
-
-    fn fail_storage(&self, kind: ArtifactErrorKind) -> ArtifactError {
-        self.latch_cas_failure();
-        ArtifactError::new(kind)
     }
 
     fn merge_replayed_classification(
@@ -786,6 +809,20 @@ fn artifact_is_blocked(
         .map_err(|_| KernelError::Io)
 }
 
+fn artifact_is_reclaiming(
+    connection: &rusqlite::Transaction<'_>,
+    digest: &str,
+) -> Result<bool, KernelError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_ingestion_reservations
+                           WHERE artifact_digest=?1 AND state='Reclaiming')",
+            [digest],
+            |row| row.get(0),
+        )
+        .map_err(|_| KernelError::Io)
+}
+
 fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactError> {
     let object = open_regular_nofollow(shard, name)
         .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
@@ -806,10 +843,6 @@ fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactE
     Ok(())
 }
 
-fn storage_errno(source: rustix::io::Errno) -> StorageError {
-    classify_io(std::io::Error::from(source))
-}
-
 fn stat_bytes(stat: &rfs::Stat) -> u64 {
     u64::try_from(stat.st_size).unwrap_or(0)
 }
@@ -826,18 +859,23 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
         rfs::Mode::empty(),
     )
     .map(File::from)
-    .map_err(storage_errno)
+    .map_err(classify_errno)
 }
 
-fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
+pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
-    for entry in rfs::Dir::read_from(objects).map_err(storage_errno)? {
-        let entry = entry.map_err(storage_errno)?;
+    for entry in rfs::Dir::read_from(objects).map_err(classify_errno)? {
+        let entry = entry.map_err(classify_errno)?;
         let name = entry.file_name();
         if is_dot_entry(name) {
             continue;
         }
-        let stat = rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW).map_err(storage_errno)?;
+        // Reclamation can unlink an entry between the directory read and this stat.
+        let stat = match rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(classify_errno(error)),
+        };
         let kind = rfs::FileType::from_raw_mode(stat.st_mode);
         if kind.is_file() {
             bytes = bytes.saturating_add(stat_bytes(&stat));
@@ -846,15 +884,24 @@ fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
         if !kind.is_dir() {
             continue;
         }
-        let shard = open_shard_nofollow(objects, name)?;
-        for shard_entry in rfs::Dir::read_from(&shard).map_err(storage_errno)? {
-            let shard_entry = shard_entry.map_err(storage_errno)?;
+        let shard = match open_shard_nofollow(objects, name) {
+            Ok(shard) => shard,
+            Err(StorageError::Other(source)) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        for shard_entry in rfs::Dir::read_from(&shard).map_err(classify_errno)? {
+            let shard_entry = shard_entry.map_err(classify_errno)?;
             let shard_name = shard_entry.file_name();
             if is_dot_entry(shard_name) {
                 continue;
             }
-            let shard_stat = rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(storage_errno)?;
+            let shard_stat = match rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(shard_stat) => shard_stat,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(error) => return Err(classify_errno(error)),
+            };
             if rfs::FileType::from_raw_mode(shard_stat.st_mode).is_file() {
                 bytes = bytes.saturating_add(stat_bytes(&shard_stat));
             }

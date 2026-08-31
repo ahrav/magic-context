@@ -12,6 +12,14 @@ pub struct OutboxPruneResult {
     pub deleted: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerAbandonment {
+    pub operator_id: String,
+    pub reason: String,
+    pub abandoned_at: i64,
+    pub barrier_id: Option<String>,
+}
+
 impl Envelope<'_> {
     /// `consumer_id` is the primary key of `outbox_consumers`, so it is stored verbatim through [`identity`], which rejects an id carrying a secret rather than collapsing distinct ids onto one row.
     ///
@@ -62,7 +70,13 @@ impl Envelope<'_> {
             "checkpoint_commit_seq": checkpoint,
             "recorded_at": recorded_at,
         });
-        self.push_control_change(consumer_id.clone(), "consumer_register", audit, Vec::new());
+        self.push_control_change(
+            consumer_id.clone(),
+            "outbox_consumer",
+            "consumer_register",
+            audit,
+            Vec::new(),
+        );
         Ok(checkpoint)
     }
 
@@ -92,6 +106,8 @@ impl Envelope<'_> {
         if checkpoint < self.pre_operation_tip()? {
             return Err(KernelError::ConsumerPending);
         }
+        // A missing `outbox_consumers` row counts as checkpoint -1.
+        complete_satisfied_barriers(self.tx, recorded_at)?;
         self.tx
             .execute(
                 "DELETE FROM outbox_consumers WHERE consumer_id=?1",
@@ -105,6 +121,7 @@ impl Envelope<'_> {
         });
         self.push_control_change(
             consumer_id.clone(),
+            "outbox_consumer",
             "consumer_deregister",
             audit,
             Vec::new(),
@@ -119,6 +136,137 @@ impl Envelope<'_> {
     pub fn abandon_outbox_consumer(
         &mut self,
         consumer_id: &str,
+        abandonment: ConsumerAbandonment,
+    ) -> Result<(), KernelError> {
+        if let Some(error) = self.already_poisoned() {
+            return Err(error);
+        }
+        let outcome = self.abandon_outbox_consumer_inner(consumer_id, &abandonment);
+        self.poison(outcome)
+    }
+
+    fn abandon_outbox_consumer_inner(
+        &mut self,
+        consumer_id: &str,
+        abandonment: &ConsumerAbandonment,
+    ) -> Result<(), KernelError> {
+        if abandonment.operator_id.trim().is_empty() || abandonment.reason.trim().is_empty() {
+            return Err(KernelError::InvalidInput);
+        }
+        let (consumer_id, checkpoint) =
+            self.consumer_checkpoint(consumer_id, abandonment.abandoned_at)?;
+        let operator_id = redact(&abandonment.operator_id);
+        let reason = redact(&abandonment.reason);
+        // A secret-bearing barrier id is rejected because a redacted id would not
+        // match its barrier row.
+        let barrier_id = abandonment
+            .barrier_id
+            .as_deref()
+            .map(barrier_identity)
+            .transpose()?;
+        if let Some(barrier_id) = &barrier_id {
+            let recorded: bool = self
+                .tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM deletion_backfill_barrier_consumers
+                         WHERE barrier_id=?1 AND consumer_id=?2
+                     )",
+                    params![barrier_id, consumer_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_sqlite)?;
+            if !recorded {
+                return Err(KernelError::NotFound);
+            }
+        }
+        let abandonment_id = format!(
+            "{}-{}",
+            self.commit_seq,
+            crate::kernel::durable_fs::next_unique_id()
+        );
+        // Deleting `outbox_consumers` removes the consumer checkpoint. Record one
+        // abandonment per blocked barrier so each can still satisfy its
+        // `required_checkpoint_commit_seq`.
+        let recorded = self
+            .tx
+            .execute(
+                "INSERT INTO consumer_abandonments(
+                     abandonment_id,consumer_id,barrier_id,operator_id,
+                     last_checkpoint_commit_seq,reason,abandoned_at,commit_seq
+                 )
+                 SELECT ?1 || '-' || CAST(bc.rowid AS TEXT),?2,bc.barrier_id,?3,?4,?5,?6,?7
+                 FROM deletion_backfill_barrier_consumers bc
+                 JOIN deletion_backfill_barriers b USING(barrier_id)
+                 WHERE bc.consumer_id=?2
+                   AND (b.completed_at IS NULL OR b.barrier_id=?8)",
+                params![
+                    abandonment_id,
+                    consumer_id,
+                    operator_id.text,
+                    checkpoint,
+                    reason.text,
+                    abandonment.abandoned_at,
+                    self.commit_seq,
+                    barrier_id.as_deref(),
+                ],
+            )
+            .map_err(map_sqlite)?;
+        if recorded == 0 {
+            self.tx
+                .execute(
+                    "INSERT INTO consumer_abandonments(
+                         abandonment_id,consumer_id,barrier_id,operator_id,
+                         last_checkpoint_commit_seq,reason,abandoned_at,commit_seq
+                     ) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",
+                    params![
+                        abandonment_id,
+                        consumer_id,
+                        operator_id.text,
+                        checkpoint,
+                        reason.text,
+                        abandonment.abandoned_at,
+                        self.commit_seq,
+                    ],
+                )
+                .map_err(map_sqlite)?;
+        }
+        self.tx
+            .execute(
+                "DELETE FROM outbox_consumers WHERE consumer_id=?1",
+                [consumer_id.as_str()],
+            )
+            .map_err(map_sqlite)?;
+        complete_satisfied_barriers(self.tx, abandonment.abandoned_at)?;
+        let audit = serde_json::json!({
+            "consumer_id": consumer_id.clone(),
+            "checkpoint_commit_seq": checkpoint,
+            "operator_id": operator_id.text.clone(),
+            "reason": reason.text.clone(),
+            "abandoned_at": abandonment.abandoned_at,
+            "barrier_id": barrier_id.clone(),
+        });
+        self.push_control_change(
+            consumer_id.clone(),
+            "outbox_consumer",
+            "consumer_abandon",
+            audit,
+            vec![
+                ("operator_id".to_string(), operator_id),
+                ("reason".to_string(), reason),
+            ],
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// - Returns [`KernelError::InvalidInput`] when `abandoned_at` is negative, or when `barrier_id`, `operator_id`, or `reason` is empty.
+    /// - Returns [`KernelError::Conflict`] when the barrier still has recorded consumers.
+    /// - Returns [`KernelError::NotFound`] when no incomplete barrier has the id.
+    pub fn abandon_deletion_barrier(
+        &mut self,
+        barrier_id: &str,
         operator_id: &str,
         reason: &str,
         abandoned_at: i64,
@@ -127,57 +275,56 @@ impl Envelope<'_> {
             return Err(error);
         }
         let outcome =
-            self.abandon_outbox_consumer_inner(consumer_id, operator_id, reason, abandoned_at);
+            self.abandon_deletion_barrier_inner(barrier_id, operator_id, reason, abandoned_at);
         self.poison(outcome)
     }
 
-    fn abandon_outbox_consumer_inner(
+    fn abandon_deletion_barrier_inner(
         &mut self,
-        consumer_id: &str,
+        barrier_id: &str,
         operator_id: &str,
         reason: &str,
         abandoned_at: i64,
     ) -> Result<(), KernelError> {
-        if operator_id.trim().is_empty() || reason.trim().is_empty() {
+        if operator_id.trim().is_empty() || reason.trim().is_empty() || abandoned_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let (consumer_id, checkpoint) = self.consumer_checkpoint(consumer_id, abandoned_at)?;
+        let barrier_id = barrier_identity(barrier_id)?;
         let operator_id = redact(operator_id);
         let reason = redact(reason);
-        let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id);
-        self.tx
-            .execute(
-                "INSERT INTO consumer_abandonments(
-                     abandonment_id,consumer_id,operator_id,last_checkpoint_commit_seq,
-                     reason,abandoned_at,commit_seq
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    abandonment_id,
-                    consumer_id,
-                    operator_id.text,
-                    checkpoint,
-                    reason.text,
-                    abandoned_at,
-                    self.commit_seq,
-                ],
+        let consumer_count: i64 = self
+            .tx
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_backfill_barrier_consumers WHERE barrier_id=?1",
+                [&barrier_id],
+                |row| row.get(0),
             )
             .map_err(map_sqlite)?;
-        self.tx
+        if consumer_count != 0 {
+            return Err(KernelError::Conflict);
+        }
+        if self
+            .tx
             .execute(
-                "DELETE FROM outbox_consumers WHERE consumer_id=?1",
-                [consumer_id.as_str()],
+                "UPDATE deletion_backfill_barriers SET completed_at=?1
+                 WHERE barrier_id=?2 AND completed_at IS NULL",
+                params![abandoned_at, barrier_id],
             )
-            .map_err(map_sqlite)?;
+            .map_err(map_sqlite)?
+            != 1
+        {
+            return Err(KernelError::NotFound);
+        }
         let audit = serde_json::json!({
-            "consumer_id": consumer_id.clone(),
-            "checkpoint_commit_seq": checkpoint,
+            "barrier_id": barrier_id.clone(),
             "operator_id": operator_id.text.clone(),
             "reason": reason.text.clone(),
             "abandoned_at": abandoned_at,
         });
         self.push_control_change(
-            consumer_id.clone(),
-            "consumer_abandon",
+            barrier_id,
+            "deletion_backfill_barrier",
+            "deletion_barrier_abandon",
             audit,
             vec![
                 ("operator_id".to_string(), operator_id),
@@ -222,6 +369,7 @@ impl Envelope<'_> {
     fn push_control_change(
         &mut self,
         object_id: String,
+        object_kind: &'static str,
         kind: &'static str,
         audit: serde_json::Value,
         redactions: Vec<(String, RedactedField)>,
@@ -230,7 +378,7 @@ impl Envelope<'_> {
             object: ObjectRow {
                 source_id: object_id.clone(),
                 object_id,
-                object_kind: "outbox_consumer".to_string(),
+                object_kind: object_kind.to_string(),
                 domain_id: "kernel-control".to_string(),
                 source_kind: "kernel-control".to_string(),
                 source_revision: 0,
@@ -332,6 +480,7 @@ impl KernelStore {
             params![checkpoint_commit_seq, updated_at, consumer_id],
         )
         .map_err(map_sqlite)?;
+        complete_satisfied_barriers(&tx, updated_at)?;
         tx.commit().map_err(map_sqlite)
     }
 
@@ -372,6 +521,52 @@ fn consumer_identity(consumer_id: &str) -> Result<String, KernelError> {
         return Err(KernelError::InvalidInput);
     }
     identity(consumer_id)
+}
+
+fn barrier_identity(barrier_id: &str) -> Result<String, KernelError> {
+    if barrier_id.trim().is_empty() {
+        return Err(KernelError::InvalidInput);
+    }
+    identity(barrier_id)
+}
+
+/// A consumer whose acknowledgement is already persisted stays satisfied even if
+/// its checkpoint later regresses or its row is deleted.
+fn complete_satisfied_barriers(tx: &Transaction<'_>, completed_at: i64) -> Result<(), KernelError> {
+    tx.execute(
+        "UPDATE deletion_backfill_barrier_consumers AS bc SET acknowledged_at=?1
+         WHERE bc.acknowledged_at IS NULL
+           AND EXISTS(
+               SELECT 1 FROM outbox_consumers c
+               WHERE c.consumer_id=bc.consumer_id
+                 AND c.checkpoint_commit_seq>=bc.required_checkpoint_commit_seq
+           )",
+        params![completed_at],
+    )
+    .map_err(map_sqlite)?;
+    tx.execute(
+        "UPDATE deletion_backfill_barriers AS b SET completed_at=?1
+         WHERE b.completed_at IS NULL
+           AND EXISTS(
+               SELECT 1 FROM deletion_backfill_barrier_consumers bc
+               WHERE bc.barrier_id=b.barrier_id
+           )
+           AND NOT EXISTS(
+               SELECT 1 FROM deletion_backfill_barrier_consumers bc
+               LEFT JOIN outbox_consumers c USING(consumer_id)
+               WHERE bc.barrier_id=b.barrier_id
+                 AND bc.acknowledged_at IS NULL
+                 AND COALESCE(c.checkpoint_commit_seq,-1)<bc.required_checkpoint_commit_seq
+                 AND NOT EXISTS(
+                     SELECT 1 FROM consumer_abandonments a
+                     WHERE a.barrier_id=bc.barrier_id AND a.consumer_id=bc.consumer_id
+                       AND a.commit_seq>=bc.required_checkpoint_commit_seq
+                 )
+           )",
+        params![completed_at],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
 }
 
 fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {
