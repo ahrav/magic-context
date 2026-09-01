@@ -4,10 +4,10 @@ mod applicability_fixtures;
 mod git_fixtures;
 
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use applicability_fixtures::{candidate, checkout, reachable_anchor};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion};
 use git_fixtures::{
     commit_snapshot, commit_tree, init_repo, materialize, set_head, write_tree,
     write_worktree_file, FixtureRepo,
@@ -319,4 +319,55 @@ criterion_group! {
     config = configure();
     targets = algebra_benches, ancestry_benches, snapshot_benches, batch_benches
 }
-criterion_main!(benches);
+
+fn profile_kernel(kernel: &str) {
+    let until = Instant::now() + Duration::from_secs(10);
+    match kernel {
+        "ancestry-far" => {
+            let history = linear_history(10_000);
+            let snapshot = checkout(&history.fixture, *history.commits.last().unwrap());
+            let ancestor = history.commits[0].to_string();
+            let tip = history.commits.last().unwrap().to_string();
+            while Instant::now() < until {
+                let budget = EvalBudget::unbounded();
+                black_box(
+                    ResolutionLadder::new(&snapshot, &budget).is_ancestor_or_equal(&ancestor, &tip),
+                );
+            }
+        }
+        "batch-warm-512" => {
+            let (_dir, fixture, base, tip) = applicability_fixture();
+            let snapshot = checkout(&fixture, tip);
+            let candidates = candidates(&fixture, base, 512, true);
+            let engine = ApplicabilityEngine::new();
+            let query = QueryContext::default();
+            let scope = ScopeMatchContext::new();
+            let _ = engine.evaluate_batch(
+                &snapshot,
+                &query,
+                &scope,
+                &candidates,
+                &EvalBudget::unbounded(),
+            );
+            while Instant::now() < until {
+                black_box(engine.evaluate_batch(
+                    &snapshot,
+                    &query,
+                    &scope,
+                    &candidates,
+                    &EvalBudget::unbounded(),
+                ));
+            }
+        }
+        other => panic!("unknown MC_SCOPE_PROFILE kernel {other}"),
+    }
+}
+
+fn main() {
+    if let Ok(kernel) = std::env::var("MC_SCOPE_PROFILE") {
+        profile_kernel(&kernel);
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
