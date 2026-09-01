@@ -6,7 +6,8 @@ mod applicability_fixtures;
 #[path = "support/git_fixtures.rs"]
 mod git_fixtures;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::Ordering;
 
 use applicability_fixtures::checkout;
 use git_fixtures::{commit_snapshot, init_repo};
@@ -14,7 +15,8 @@ use mc_store::kernel::applicability::{
     capture_anchor_representation, compute_patch_id, EvalBudget, GitConditionOutcome,
     ResolutionLadder,
 };
-use mc_store::kernel::{AnchorCapture, GitCondition};
+use mc_store::kernel::{AnchorCapture, GitCondition, GraphOracle};
+use proptest::prelude::*;
 
 fn captures_for(
     repo: &gix::Repository,
@@ -35,6 +37,112 @@ fn reachable_from(oid: gix::ObjectId, captures: BTreeMap<String, AnchorCapture>)
         oid: oid.to_string(),
         captures,
     }
+}
+
+fn reference_reachable(parents: &[Vec<usize>], ancestor: usize, descendant: usize) -> Option<bool> {
+    if ancestor == descendant {
+        return Some(true);
+    }
+    if ancestor >= parents.len() || descendant >= parents.len() {
+        return None;
+    }
+    let mut pending = VecDeque::from([descendant]);
+    let mut seen = vec![false; parents.len()];
+    while let Some(commit) = pending.pop_front() {
+        if seen[commit] {
+            continue;
+        }
+        seen[commit] = true;
+        for &parent in &parents[commit] {
+            if parent == ancestor {
+                return Some(true);
+            }
+            pending.push_back(parent);
+        }
+    }
+    Some(false)
+}
+
+fn query_oid(commits: &[gix::ObjectId], index: usize) -> String {
+    commits
+        .get(index)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{:02x}", 0x80 + index % 0x7f).repeat(20))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 48,
+        rng_algorithm: prop::test_runner::RngAlgorithm::ChaCha,
+        rng_seed: prop::test_runner::RngSeed::Fixed(0xA11CE57),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn ancestry_matches_parent_graph_bfs(
+        shape in prop::collection::vec((any::<u16>(), any::<u16>(), any::<bool>(), any::<bool>()), 1..18),
+        ancestor_raw in any::<u16>(),
+        descendant_raw in any::<u16>(),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = init_repo(dir.path());
+        let mut commits = Vec::with_capacity(shape.len());
+        let mut parents = Vec::with_capacity(shape.len());
+        for (index, (first, second, is_root, has_second)) in shape.into_iter().enumerate() {
+            let mut parent_indexes = Vec::new();
+            if index > 0 && !is_root {
+                parent_indexes.push(usize::from(first) % index);
+                let second = usize::from(second) % index;
+                if has_second && second != parent_indexes[0] {
+                    parent_indexes.push(second);
+                }
+            }
+            let parent_oids: Vec<gix::ObjectId> = parent_indexes
+                .iter()
+                .map(|parent| commits[*parent])
+                .collect();
+            let commit = commit_snapshot(
+                &fixture.repo,
+                &format!("node-{index}"),
+                &parent_oids,
+                &[("graph.txt", &format!("node {index}\n"))],
+                &format!("node {index}"),
+                i64::try_from(index + 1).unwrap(),
+            );
+            parents.push(parent_indexes);
+            commits.push(commit);
+        }
+
+        let snapshot = checkout(&fixture, *commits.last().unwrap());
+        let budget = EvalBudget::unbounded();
+        let ladder = ResolutionLadder::new(&snapshot, &budget);
+        let query_span = commits.len() + 2;
+        let ancestor = usize::from(ancestor_raw) % query_span;
+        let descendant = usize::from(descendant_raw) % query_span;
+        prop_assert_eq!(
+            ladder.is_ancestor_or_equal(
+                &query_oid(&commits, ancestor),
+                &query_oid(&commits, descendant),
+            ),
+            reference_reachable(&parents, ancestor, descendant),
+        );
+    }
+}
+
+#[test]
+fn exhausted_budget_makes_uncached_ancestry_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let root = commit_snapshot(&fixture.repo, "main", &[], &[("f", "0")], "root", 1);
+    let tip = commit_snapshot(&fixture.repo, "main", &[root], &[("f", "1")], "tip", 2);
+    let snapshot = checkout(&fixture, tip);
+    let budget = EvalBudget::unbounded();
+    budget.interrupt_flag().store(true, Ordering::Relaxed);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.is_ancestor_or_equal(&root.to_string(), &tip.to_string()),
+        None
+    );
 }
 
 #[test]
