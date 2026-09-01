@@ -77,13 +77,12 @@ jobs:
       - name: Build harness plugin
         run: bun run --cwd packages/plugin build
 
+      # Reruns share `github.run_id`; omitting `restore-keys` prevents fresh runs from reusing completed rollouts.
       - name: Restore mode rollout records
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
           key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}
-          restore-keys: |
-            paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-
 
       - name: Restore calibration evidence
         if: env.PAIRED_DELTA_MODE != 'calibration'
@@ -115,8 +114,9 @@ jobs:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
           key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}
 
+      # Weekly and release dispatches now fail closed on an invalid record, so caching one would block every later run.
       - name: Save calibration evidence
-        if: always() && env.PAIRED_DELTA_MODE == 'calibration' && hashFiles('packages/e2e-tests/artifacts/paired-delta-calibration.json') != ''
+        if: success() && env.PAIRED_DELTA_MODE == 'calibration' && hashFiles('packages/e2e-tests/artifacts/paired-delta-calibration.json') != ''
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json

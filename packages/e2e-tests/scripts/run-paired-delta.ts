@@ -217,6 +217,7 @@ function armOptions(
             [providerId]: {
                 api: "@ai-sdk/anthropic",
                 name: "Pinned Anthropic",
+                npm: "@ai-sdk/anthropic",
                 env: ["ANTHROPIC_API_KEY"],
                 models: {
                     [modelId]: {
@@ -271,6 +272,7 @@ function authoredEvidenceAbsentFromMemory(
     harness: TestHarness,
     scenario: ScenarioDeclaration,
 ): boolean {
+    // Missing context database cannot prove evidence absent from memory.
     if (!harness.hasContextDb()) return false;
     try {
         const evidence = scenario.turnScript.find(
@@ -313,6 +315,10 @@ export function createLiveDependencies(input: {
             return {
                 async prepare() {
                     if (coordinate.armId !== "r1" && coordinate.armId !== "r2") return;
+                    // `seedGoldMemories` requires `context.db` to exist; the plugin creates it after the server reports ready.
+                    await harness.waitFor(() => harness.hasContextDb(), {
+                        label: "context.db created",
+                    });
                     const rows: GoldMemoryRow[] = scenario.interventions.r2.memories.map(
                         ({ claim, evidence }) => ({
                             category: "PROJECT_RULES",
@@ -329,19 +335,22 @@ export function createLiveDependencies(input: {
                 async run(): Promise<RolloutObservation> {
                     const sessionId = await harness.createSession();
                     const responses: PromptResult[] = [];
-                    const assistantText: string[] = [];
                     let ballastBytes = 0;
+                    let ballastTokens = 0;
                     for (const turn of scenario.turnScript) {
                         if (turn.role !== "user") {
                             throw new Error("live paired-delta supports authored user turns only");
                         }
                         let content = turn.content;
                         if (turn.id === "turn-burial") {
-                            const ballast = ballastProse(
+                            // The authored floor is bytes and the window is tokens, so the burial turn carries whichever demand is larger once converted.
+                            ballastTokens = Math.max(
                                 Math.ceil(
                                     scenario.absencePrecondition.minimumBallastBytes / 4,
                                 ),
+                                scenario.modelContextLimit + 1,
                             );
+                            const ballast = ballastProse(ballastTokens);
                             ballastBytes = Buffer.byteLength(ballast);
                             content = `${content}\n\n${ballast}`;
                         }
@@ -362,7 +371,7 @@ export function createLiveDependencies(input: {
                                 modelID: input.modelId,
                             },
                         ));
-                        if (response.error !== undefined) {
+                        if (response.error != null) {
                             const tolerated = coordinate.armId === "mc-off" &&
                                 detectOverflow(response.error).isOverflow;
                             if (!tolerated) {
@@ -372,7 +381,6 @@ export function createLiveDependencies(input: {
                             }
                         }
                         responses.push(response);
-                        assistantText.push(response.text);
                         if (
                             coordinate.armId === "r1" &&
                             turn.id === scenario.interventions.r1.insertAfterTurnId
@@ -401,7 +409,7 @@ export function createLiveDependencies(input: {
                         evidenceIndex >= 0 &&
                         evidenceIndex < burialIndex &&
                         ballastBytes >= scenario.absencePrecondition.minimumBallastBytes &&
-                        ballastBytes > scenario.modelContextLimit;
+                        ballastTokens > scenario.modelContextLimit;
                     const absencePreconditionHeld =
                         structuralAbsence &&
                         (
@@ -420,11 +428,15 @@ export function createLiveDependencies(input: {
                         (
                             coordinate.armId !== "compaction" ||
                             !harness.hasContextDb()
+                        ) &&
+                        (
+                            coordinate.armId !== "mc-on" ||
+                            harness.hasContextDb()
                         );
                     return {
                         checks,
-                        claimedDone: assistantText.some((text) =>
-                            /\b(?:done|completed|finished)\b/i.test(text)),
+                        // The probe turn is the last authored turn, and an earlier turn can acknowledge the authored rule without producing the answer.
+                        claimedDone: /\b(?:done|completed|finished)\b/i.test(last.text),
                         absencePreconditionHeld,
                         armIdentityMatches,
                         echoedProviderId: last.providerId,
@@ -806,8 +818,8 @@ async function runLive(args: CliArgs): Promise<void> {
             runStatus: result.status,
             poolManifestFingerprint: manifestFingerprint,
             pinnedSnapshotId: model.modelId,
+            targetMinimumDetectableDelta: policy.targetMinimumDetectableDelta,
             decisions: {
-                poolSize: 20,
                 familyCount: policy.minimumAnalyzableFamilyCount,
                 replicateCount: policy.replicateCount,
                 cadence: "weekly-and-release",
@@ -815,7 +827,14 @@ async function runLive(args: CliArgs): Promise<void> {
         });
         publishCalibrationRecord(calibration, args.calibrationRecordPath);
         noiseFloors = calibrationNoiseFloors(calibration);
-    } else if (existsSync(args.calibrationRecordPath)) {
+    } else {
+        // A missing calibration record aborts dispatch to prevent publishing an uncalibrated report.
+        if (!existsSync(args.calibrationRecordPath)) {
+            throw new Error(
+                `paired-delta ${args.mode} mode requires a calibration record at ` +
+                args.calibrationRecordPath,
+            );
+        }
         const calibration = readCalibrationRecord(args.calibrationRecordPath);
         // A record from another manifest, another model snapshot, or a
         // partial calibration run must not lend its noise floors to this
@@ -856,6 +875,8 @@ async function runLive(args: CliArgs): Promise<void> {
         analyzableFamilyCount: analysis.analyzableFamilyCount,
         evidenceSufficient: analysis.evidenceSufficient,
     }, null, 2));
+    // Reports and cache output are published above; a cap- or deadline-terminated dispatch still has to fail its monitoring step.
+    if (result.status !== "completed") process.exitCode = 1;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {

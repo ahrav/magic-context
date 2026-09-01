@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../incident-pool/report";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
-import type { ArmId, ReasonCode } from "./contract";
+import { PRIMARY_ARM_IDS, type ArmId, type ReasonCode } from "./contract";
 import type { EndpointEstimate, FamilyDeltaAnalysis, FamilyNoiseFloor } from "./estimator";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
@@ -85,6 +85,65 @@ export interface PairedDeltaCalibrationRecord {
     familyNoise: CalibrationFamilyNoise[];
     decisions: CalibrationDecision;
     recordFingerprint: string;
+}
+
+/** SIZING_QUANTILE_SUM_SQUARED is (z(0.975) + z(0.80))^2 for a two-sided alpha=0.05 test with 80% power. */
+const SIZING_QUANTILE_SUM_SQUARED = (1.959964 + 0.841621) ** 2;
+
+/**
+ * Size the pool using the highest family variance so all families meet the target minimum detectable delta.
+ *
+ * Each family receives at least one pool member, even when worstVariance is zero.
+ */
+function derivePoolSize(
+    familyNoise: readonly CalibrationFamilyNoise[],
+    targetMinimumDetectableDelta: number,
+    familyCount: number,
+): number {
+    if (
+        !Number.isFinite(targetMinimumDetectableDelta) ||
+        targetMinimumDetectableDelta <= 0
+    ) {
+        throw new Error("paired-delta-calibration: target-delta-invalid");
+    }
+    if (!Number.isSafeInteger(familyCount) || familyCount < 1) {
+        throw new Error("paired-delta-calibration: family-count-invalid");
+    }
+    const worstVariance = familyNoise.reduce(
+        (worst, { variance }) => Math.max(worst, variance),
+        0,
+    );
+    const perFamily = Math.max(
+        1,
+        Math.ceil(
+            (SIZING_QUANTILE_SUM_SQUARED * worstVariance) /
+            targetMinimumDetectableDelta ** 2,
+        ),
+    );
+    return perFamily * familyCount;
+}
+
+/**
+ * A top-level run status of `completed` means the runner avoided its cost and deadline exits, while individual cells can still be excluded for provider, identity, or precondition reasons.
+ * Measuring the noise floor over the population the delta estimator analyses stops a run with widespread exclusions from claiming a floor the analysis never sees.
+ */
+function completePrimaryCoordinates(
+    records: readonly RolloutRecord[],
+): Set<string> {
+    const healthy = new Map<string, Set<ArmId>>();
+    for (const record of records) {
+        if (!(PRIMARY_ARM_IDS as readonly ArmId[]).includes(record.armId)) continue;
+        if (record.cell.runHealth !== "completed") continue;
+        const key = `${record.scenarioId}:${record.replicateIndex}`;
+        const arms = healthy.get(key) ?? new Set<ArmId>();
+        arms.add(record.armId);
+        healthy.set(key, arms);
+    }
+    return new Set(
+        [...healthy]
+            .filter(([, arms]) => PRIMARY_ARM_IDS.every((armId) => arms.has(armId)))
+            .map(([key]) => key),
+    );
 }
 
 function requireHex64(value: string, label: string): void {
@@ -190,9 +249,11 @@ export function buildCalibrationRecord(input: {
     runStatus: PairedDeltaRunResult["status"];
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
-    decisions: CalibrationDecision;
+    targetMinimumDetectableDelta: number;
+    decisions: Omit<CalibrationDecision, "poolSize">;
 }): PairedDeltaCalibrationRecord {
     requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
+    const analysable = completePrimaryCoordinates(input.records);
     const byFamily = new Map<string, number[]>();
     for (const familyId of new Set(input.scenarioFamilies.values())) {
         byFamily.set(familyId, []);
@@ -206,6 +267,7 @@ export function buildCalibrationRecord(input: {
         if (record.cell.checksTotal === 0) {
             throw new Error(`paired-delta-calibration: empty-check-vector-${record.scenarioId}`);
         }
+        if (!analysable.has(`${record.scenarioId}:${record.replicateIndex}`)) continue;
         byFamily.get(familyId)!.push(
             record.cell.checksPassed / record.cell.checksTotal,
         );
@@ -233,17 +295,26 @@ export function buildCalibrationRecord(input: {
         poolManifestFingerprint: input.poolManifestFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
-        // Pool sizing requires a completed run with a measurement for every
-        // family.
+        // A single completed coordinate per family reports zero variance, so
+        // sizing also requires the replicate depth the run was configured for.
         validForPoolSizing: input.runStatus === "completed" &&
-            familyNoise.length === byFamily.size,
+            familyNoise.length === byFamily.size &&
+            familyNoise.every(({ replicateCount }) =>
+                replicateCount >= input.decisions.replicateCount),
         measuredCostUsd: input.records.reduce((sum, record) => sum + record.costUsd, 0),
         measuredWallClockMs: input.records.reduce(
             (sum, record) => sum + record.wallClockMs,
             0,
         ),
         familyNoise,
-        decisions: input.decisions,
+        decisions: {
+            ...input.decisions,
+            poolSize: derivePoolSize(
+                familyNoise,
+                input.targetMinimumDetectableDelta,
+                input.decisions.familyCount,
+            ),
+        },
     };
     return { ...body, recordFingerprint: canonicalFingerprint(body) };
 }
