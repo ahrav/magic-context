@@ -112,6 +112,11 @@ function storedRecord(armId: ArmId): RolloutRecord {
     };
 }
 
+/** Mode bits do not restrain root, so a test that stages a filesystem failure with them would exercise the success path instead. Windows has no `getuid`. commentlint: allow(JUDGE) */
+function skipWhenPermissionsDoNotApply(): boolean {
+    return process.getuid?.() === 0;
+}
+
 function dropRecord(store: MemoryStore, armId: ArmId): void {
     const index = store.records.findIndex((record) => record.armId === armId);
     if (index < 0) throw new Error(`missing ${armId} record`);
@@ -1879,6 +1884,7 @@ describe("paired-delta runner", () => {
     });
 
     it("keeps the claim when removing the lock directory fails", () => {
+        if (skipWhenPermissionsDoNotApply()) return;
         const root = mkdtempSync(join(tmpdir(), "paired-delta-release-throws-"));
         try {
             const path = join(root, "records.json");
@@ -1904,6 +1910,7 @@ describe("paired-delta runner", () => {
     });
 
     it("keeps a claim releasable when the owner record cannot be read", () => {
+        if (skipWhenPermissionsDoNotApply()) return;
         const root = mkdtempSync(join(tmpdir(), "paired-delta-unreadable-owner-"));
         try {
             const path = join(root, "records.json");
@@ -1924,6 +1931,7 @@ describe("paired-delta runner", () => {
     });
 
     it("retries removing the lock directory after a failure clears", () => {
+        if (skipWhenPermissionsDoNotApply()) return;
         const root = mkdtempSync(join(tmpdir(), "paired-delta-release-retry-"));
         try {
             const path = join(root, "records.json");
