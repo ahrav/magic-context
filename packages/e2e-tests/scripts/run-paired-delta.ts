@@ -475,6 +475,17 @@ async function runSmoke(args: CliArgs): Promise<void> {
 }
 
 
+function scenarioIdsForMode(
+    manifest: ReturnType<typeof parsePairedDeltaManifest>,
+    mode: LiveMode,
+): Set<string> {
+    return new Set(
+        manifest.scenarios
+            .filter(({ runModes }) => runModes.includes(mode))
+            .map(({ scenarioId }) => scenarioId),
+    );
+}
+
 function lanePolicy(): PairedDeltaPolicy {
     const document = parsePolicyOwnerDocument(policyJson, "magic-context-x4l.14");
     if (document.status !== "ready" || document.policy === null) {
@@ -584,42 +595,110 @@ function armOptions(
     return mergeHarnessOptions(live, arm, scenario.modelContextLimit);
 }
 
+interface SessionUsage {
+    usage: RolloutObservation["usage"];
+    offPinRoute: { providerId: string; modelId: string } | null;
+}
+
+const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
+
+function addUsage(
+    left: RolloutObservation["usage"],
+    right: RolloutObservation["usage"],
+): RolloutObservation["usage"] {
+    return {
+        input: left.input + right.input,
+        output: left.output + right.output,
+        cacheCreation: left.cacheCreation + right.cacheCreation,
+        cacheRead: left.cacheRead + right.cacheRead,
+    };
+}
+
+interface LedgerMessage {
+    providerID?: unknown;
+    modelID?: unknown;
+    tokens?: {
+        input?: unknown;
+        output?: unknown;
+        cache?: { write?: unknown; read?: unknown };
+    };
+}
+
+function ledgerEntries(payload: unknown): LedgerMessage[] {
+    const rows = (payload as { data?: unknown } | null)?.data;
+    if (!Array.isArray(rows)) return [];
+    return rows
+        .map((row) => (row as { info?: LedgerMessage } | null)?.info)
+        .filter((info): info is LedgerMessage =>
+            info !== null && info !== undefined && typeof info.providerID === "string");
+}
+
 /**
- * Compaction runs the historian in a child session, whose `session.prompt` calls never appear among the parent's responses.
- * Leaving them out understated `usage`, `costUsd`, and the admission check that the cost cap runs before the next arm, so a dispatch could exceed its declared budget while the report claimed otherwise.
+ * Total the model calls OpenCode itself recorded for a session and its children, rather than only the prompts this runner issued.
+ *
+ * Native compaction on the `compaction` arm and the historian on the plugin arms both call a model
+ * without appearing among the authored responses, so a reducer over those responses understated
+ * `usage`, and therefore `costUsd`, `spentUsd`, and the reserve the cap checks before the next arm.
+ * Reading OpenCode's own ledger also removes any dependence on the plugin recording its own
+ * accounting, which it does on a best-effort path.
+ *
+ * Only calls on the pinned route are billed: the R1 oracle's scripted `ctx_search` turn is
+ * mock-served, and pricing it as live spend would overstate the cap. An off-pin route is reported
+ * so the runner's identity comparison excludes the cell.
  */
-function childSessionUsage(
+async function sessionUsage(
     harness: TestHarness,
     sessionId: string,
-): RolloutObservation["usage"] {
-    const zero = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
-    if (!harness.hasContextDb()) return zero;
-    let row: {
-        input: number;
-        output: number;
-        cacheCreation: number;
-        cacheRead: number;
-    } | null;
-    try {
-        row = harness.contextDb().prepare(
-            `SELECT COALESCE(SUM(input_tokens), 0) AS input,
-                    COALESCE(SUM(output_tokens), 0) AS output,
-                    COALESCE(SUM(cache_write_tokens), 0) AS cacheCreation,
-                    COALESCE(SUM(cache_read_tokens), 0) AS cacheRead
-             FROM subagent_invocations WHERE session_id = ?`,
-        ).get(sessionId) as typeof row;
-    } catch (error) {
-        /** Silently treating this as zero is the defect being closed, so an unreadable ledger fails the rollout instead. */
-        throw new Error(
-            `live paired-delta cannot read child-session usage: ${(error as Error).message}`,
-        );
+    pinned: { providerId: string; modelId: string },
+): Promise<SessionUsage> {
+    let usage = ZERO_USAGE;
+    let offPinRoute: SessionUsage["offPinRoute"] = null;
+    const pending = [sessionId];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+        const id = pending.pop()!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        for (const info of ledgerEntries(await harness.client.session.messages({
+            path: { id },
+        }))) {
+            const route = {
+                providerId: info.providerID as string,
+                modelId: typeof info.modelID === "string" ? info.modelID : "",
+            };
+            const tokens = info.tokens;
+            if (
+                typeof tokens?.input !== "number" ||
+                typeof tokens.output !== "number" ||
+                typeof tokens.cache?.write !== "number" ||
+                typeof tokens.cache.read !== "number"
+            ) {
+                continue;
+            }
+            if (route.providerId !== pinned.providerId || route.modelId !== pinned.modelId) {
+                /** The mock provider serves the R1 oracle turn by design, so it is not an identity failure. */
+                if (route.providerId !== "mock-anthropic" && offPinRoute === null) {
+                    offPinRoute = route;
+                }
+                continue;
+            }
+            usage = addUsage(usage, {
+                input: tokens.input,
+                output: tokens.output,
+                cacheCreation: tokens.cache.write,
+                cacheRead: tokens.cache.read,
+            });
+        }
+        const children = (await harness.client.session.children({ path: { id } }))
+            .data;
+        if (Array.isArray(children)) {
+            for (const child of children) {
+                const childId = (child as { id?: unknown } | null)?.id;
+                if (typeof childId === "string") pending.push(childId);
+            }
+        }
     }
-    return {
-        input: row?.input ?? 0,
-        output: row?.output ?? 0,
-        cacheCreation: row?.cacheCreation ?? 0,
-        cacheRead: row?.cacheRead ?? 0,
-    };
+    return { usage, offPinRoute };
 }
 
 function configMatchesArm(
@@ -782,12 +861,18 @@ export function createLiveDependencies(input: {
                     }
                     const last = responses.at(-1);
                     if (!last) throw new Error("scenario produced no live prompts");
+                    const ledger = await sessionUsage(harness, sessionId, {
+                        providerId: input.providerId,
+                        modelId: input.modelId,
+                    });
                     /**
                      * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
                      * A rollout whose earlier turns were served by a fallback provider or snapshot produced its outcome, and its persisted memory, partly off the pin.
                      */
                     const offPin = responses.find(({ providerId, modelId }) =>
-                        providerId !== input.providerId || modelId !== input.modelId) ?? last;
+                        providerId !== input.providerId || modelId !== input.modelId) ??
+                        ledger.offPinRoute ??
+                        last;
                     const resolvedLocatorIds = locatorIds();
                     const checks = await scenario.verifier({
                         armId: coordinate.armId,
@@ -852,16 +937,7 @@ export function createLiveDependencies(input: {
                         armIdentityMatches,
                         echoedProviderId: offPin.providerId,
                         echoedModelId: offPin.modelId,
-                        usage: responses.reduce(
-                            (sum, response) => ({
-                                input: sum.input + response.usage.input,
-                                output: sum.output + response.usage.output,
-                                cacheCreation:
-                                    sum.cacheCreation + response.usage.cacheCreation,
-                                cacheRead: sum.cacheRead + response.usage.cacheRead,
-                            }),
-                            childSessionUsage(harness, sessionId),
-                        ),
+                        usage: ledger.usage,
                         turns: scenario.turnScript.length +
                             (scriptedTurnText === undefined ? 0 : 1),
                         baseScriptFingerprint: expectedFingerprint,
@@ -1114,6 +1190,20 @@ async function runLive(args: CliArgs): Promise<void> {
             );
         }
         const calibration = readCalibrationRecord(args.calibrationRecordPath);
+        /**
+         * The calibrated size is a decision, and a cohort below it cannot support the preregistered
+         * detectable delta, so the dispatch refuses before spending rather than publishing an
+         * underpowered directional verdict. Widening the cohort means re-authoring the frozen pool
+         * or the policy's replicate count, neither of which the runner may do at dispatch time.
+         */
+        const cohort = scenarioIdsForMode(manifest, mode).size * policy.replicateCount;
+        if (cohort < calibration.decisions.poolSize) {
+            throw new Error(
+                `paired-delta ${mode} cohort of ${cohort} coordinates is below the calibrated ` +
+                `${calibration.decisions.poolSize}; re-author the pool or the replicate count, ` +
+                "or re-calibrate",
+            );
+        }
         if (
             calibration.poolManifestFingerprint !== manifestFingerprint ||
             calibration.pinnedSnapshotId !== model.modelId ||
@@ -1126,11 +1216,7 @@ async function runLive(args: CliArgs): Promise<void> {
         noiseFloors = calibrationNoiseFloors(calibration);
     }
     const registry = buildPairedDeltaRegistry();
-    const selectedIds = new Set(
-        manifest.scenarios
-            .filter(({ runModes }) => runModes.includes(mode))
-            .map(({ scenarioId }) => scenarioId),
-    );
+    const selectedIds = scenarioIdsForMode(manifest, mode);
     const scenarios = [...registry.values()]
         .map(({ declaration }) => declaration)
         .filter(({ scenarioId }) => selectedIds.has(scenarioId));
