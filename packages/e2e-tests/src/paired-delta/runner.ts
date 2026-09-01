@@ -653,6 +653,25 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
+        /** The contract's own validator rather than a local subset, so a custom store cannot drift from it: it rules out the combinations a matching arm and matching counts still admit — a reason code paired with a health it cannot carry, or a completed cell carrying one at all — which a resume would otherwise return as evidence and fold into the exclusion counts. commentlint: allow(JUDGE) */
+        try {
+            parseArmedCellResult(record.cell);
+        } catch (error) {
+            options.store.release?.();
+            if (!(error instanceof PairedDeltaContractError)) throw error;
+            throw new Error(
+                `records file cell is invalid at ${coordinateKey(record)} ` +
+                    `(${error.diagnostics.join(",")}); point at a fresh records path`,
+            );
+        }
+        /** A record counted as neither observed nor estimated disappears from the run's provenance totals while still suppressing its rollout. commentlint: allow(JUDGE) */
+        if (record.costSource !== "observed" && record.costSource !== "estimated") {
+            options.store.release?.();
+            throw new Error(
+                `records file cost source ${String(record.costSource)} is not recognized at ` +
+                    `${coordinateKey(record)}; point at a fresh records path`,
+            );
+        }
         /** `finiteUsage` admits a live observation only at non-negative safe integers, because a counter near `Number.MAX_VALUE` prices to `Infinity` and a fractional token or turn count is not a measurement any harness can produce. A persisted record has to clear the same bar or a resume reports counts the live path would have refused. commentlint: allow(JUDGE) */
         for (const [label, value] of [
             ["turns", record.turns],
@@ -1305,6 +1324,7 @@ async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<bool
     const grace = new Promise<"unreclaimed">((resolve) => {
         timer = setTimeout(() => resolve("unreclaimed"), LATE_DISPOSAL_GRACE_MS);
     });
+    const startedAt = Date.now();
     try {
         const outcome = await Promise.race([
             creation.then(
@@ -1316,6 +1336,8 @@ async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<bool
             ),
             grace,
         ]);
+        /** Cleanup that holds the event loop keeps the grace macrotask from firing and then wins the race as a microtask, so elapsed time decides the outcome here for the same reason it does in `settleDisposal`. commentlint: allow(JUDGE) */
+        if (Date.now() - startedAt >= LATE_DISPOSAL_GRACE_MS) return false;
         return outcome === "reclaimed";
     } catch {
         return false;
@@ -1367,13 +1389,21 @@ async function withRolloutDeadline<T>(
             );
         }
         pending.then(stamp, stamp);
-        const settled = await Promise.race([pending, expiry]);
+        /** The race is captured as an outcome rather than awaited directly, because a rejection that settles late would otherwise be rethrown before the elapsed check ran: a `ProviderUnavailableError` arriving past the deadline would then be recorded as a provider failure, and a final arm could leave the run reporting `completed`. commentlint: allow(JUDGE) */
+        const outcome = await Promise.race([
+            pending.then(
+                (value) => ({ ok: true as const, value }),
+                (error: unknown) => ({ ok: false as const, error }),
+            ),
+            expiry,
+        ]);
         if ((settledAt ?? Date.now()) - startedAt >= remainingMs) {
             throw new RolloutDeadlineError(
                 `rollout still in flight after the ${remainingMs}ms deadline budget`,
             );
         }
-        return settled;
+        if (!outcome.ok) throw outcome.error;
+        return outcome.value;
     } finally {
         clearTimeout(timer);
         // On timeout the losing promise settles later with no consumer;

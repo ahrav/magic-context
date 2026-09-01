@@ -442,6 +442,33 @@ describe("paired-delta runner", () => {
         });
     });
 
+    it("attributes a late rejection to the deadline rather than its own error", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run(): Promise<RolloutObservation> {
+                            await new Promise((resolve) => setTimeout(resolve, 1));
+                            const until = Date.now() + 60;
+                            while (Date.now() < until) { /* spin */ }
+                            throw new ProviderUnavailableError("late provider failure");
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        // The rejection settles past the budget, so the deadline is the cause of record.
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
     it("refuses evidence whose async continuation blocked past the deadline", async () => {
         const result = await runPairedDelta(
             { ...options(), deadlineEpochMs: Date.now() + 25 },
@@ -1375,6 +1402,31 @@ describe("paired-delta runner", () => {
 
         await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
             /cell arm mc-off does not match coordinate/,
+        );
+    });
+
+    it("refuses an impossible cell from a store that does not validate", async () => {
+        // Matching arm and counts still admit a reason code the health cannot carry.
+        const record = storedRecord("mc-on");
+        const store = new MemoryStore([{
+            ...record,
+            cell: { ...record.cell, runHealth: "completed", reasonCode: "provider-unavailable" },
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /records file cell is invalid at/,
+        );
+    });
+
+    it("refuses an unrecognized cost source from a store that does not validate", async () => {
+        // Neither observed nor estimated: the record would vanish from the provenance totals.
+        const store = new MemoryStore([{
+            ...storedRecord("mc-on"),
+            costSource: "free" as unknown as RolloutRecord["costSource"],
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /cost source free is not recognized/,
         );
     });
 
