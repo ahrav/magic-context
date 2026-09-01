@@ -338,14 +338,33 @@ impl<'s> ResolutionLadder<'s> {
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
         // The walk follows all parents: a rewrite reachable only through a
         // merge's non-first parent is still a fallback candidate.
-        let walk = repo.rev_walk([head]).all().ok()?;
+        //
+        // A walk that cannot start, or that stops advancing partway, wanted a commentlint: allow(JUDGE)
+        // commit the database does not hold. That is the availability case, commentlint: allow(JUDGE)
+        // not budget exhaustion: without recording it, the caller reports the commentlint: allow(JUDGE)
+        // same `Uncertain` a deadline produces while both transience commentlint: allow(JUDGE)
+        // predicates read false, so the verdict is retained and a fetch commentlint: allow(JUDGE)
+        // supplying the missing commit cannot dislodge it until eviction. commentlint: allow(JUDGE)
+        let walk = match repo.rev_walk([head]).all() {
+            Ok(walk) => walk,
+            Err(_) => {
+                self.note_unreadable_object();
+                return None;
+            }
+        };
         let mut commits = Vec::new();
         let mut walk = walk.into_iter();
         for info in walk.by_ref().take(CANDIDATE_WINDOW) {
             if self.budget.is_exhausted() {
                 return None;
             }
-            commits.push(info.ok()?.id);
+            match info {
+                Ok(info) => commits.push(info.id),
+                Err(_) => {
+                    self.note_unreadable_object();
+                    return None;
+                }
+            }
         }
         let window = CandidateWindow {
             truncated: commits.len() == CANDIDATE_WINDOW && walk.next().is_some(),

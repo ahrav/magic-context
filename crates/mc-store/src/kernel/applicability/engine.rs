@@ -21,7 +21,7 @@ use super::super::scope::{
 };
 use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
-use super::checkout::{CheckoutSnapshot, EvalBudget};
+use super::checkout::{CheckoutSnapshot, DirtyEntry, EvalBudget, PathEncoding};
 use super::checks::{check_observation, run_cheap_check, CheckCache, CheckOutcome};
 use super::payloads::{
     CheckSpec, ObjectApplicabilitySpec, PayloadDecode, OBSERVATION_KIND_CURRENT,
@@ -744,7 +744,7 @@ fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Opti
         }
         let dirty_path = entry.path.as_str();
         for affected in affected_paths {
-            if paths_overlap(dirty_path, affected) {
+            if entry_overlaps(entry, affected) {
                 return Some(dirty_path.to_string());
             }
         }
@@ -799,13 +799,36 @@ fn paths_overlap(dirty: &str, declared: &str) -> bool {
     };
     let dirty = dirty.trim_end_matches('/');
     let declared = declared.as_ref();
-    dirty == declared
-        || dirty
-            .strip_prefix(declared)
-            .is_some_and(|rest| rest.starts_with('/'))
-        || declared
-            .strip_prefix(dirty)
-            .is_some_and(|rest| rest.starts_with('/'))
+    dirty == declared || is_under(dirty, declared) || is_under(declared, dirty)
+}
+
+fn is_under(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a dirty entry bears on a declared affected path.
+///
+/// A `LossyWithDigest` entry's recorded string is a rendering of bytes that commentlint: allow(JUDGE)
+/// are not valid UTF-8, never the path itself, so a declared path — always commentlint: allow(JUDGE)
+/// valid UTF-8 — cannot be that file, nor live inside it. Only the remaining commentlint: allow(JUDGE)
+/// direction is real: the rendering preserves valid leading bytes verbatim commentlint: allow(JUDGE)
+/// and appends the digest to the final component alone, so a declared commentlint: allow(JUDGE)
+/// ancestor directory still matches by prefix. Comparing the rendering commentlint: allow(JUDGE)
+/// itself would let a file deliberately named like some byte path's commentlint: allow(JUDGE)
+/// rendering plus digest stand in for that path, and the snapshot records commentlint: allow(JUDGE)
+/// `path_encoding` precisely to keep those twins apart. commentlint: allow(JUDGE)
+fn entry_overlaps(entry: &DirtyEntry, declared: &str) -> bool {
+    match entry.path_encoding {
+        PathEncoding::Utf8 => paths_overlap(&entry.path, declared),
+        PathEncoding::LossyWithDigest => {
+            // An unreadable declaration is no evidence the entry is unrelated.
+            let Some(declared) = canonical_declared_path(declared) else {
+                return true;
+            };
+            is_under(entry.path.as_str(), declared.as_ref())
+        }
+    }
 }
 
 /// Digest over every non-snapshot input that can change the verdict, so a
@@ -904,7 +927,7 @@ fn scoped_dirty_fingerprint(
         let relevant = spec
             .affected_paths
             .iter()
-            .any(|affected| paths_overlap(&entry.path, affected));
+            .any(|affected| entry_overlaps(entry, affected));
         if relevant {
             let hash = hash.get_or_insert_with(Sha256::new);
             hash_bytes(hash, entry.path.as_bytes());

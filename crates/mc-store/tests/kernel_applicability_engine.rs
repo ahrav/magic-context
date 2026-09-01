@@ -11,7 +11,8 @@ use git_fixtures::{
 };
 use mc_store::kernel::applicability::{
     capture_anchor_representation, snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine,
-    ApplicabilityState, CheckSpec, CheckoutSnapshot, EvalBudget, ObjectApplicabilitySpec,
+    ApplicabilityState, BatchEvaluation, CheckSpec, CheckoutSnapshot, EvalBudget,
+    ObjectApplicabilitySpec,
 };
 use mc_store::kernel::{
     encode_anchor_captures, AnchorRowSpec, Dimension, QueryContext, ScopeMatchContext,
@@ -46,6 +47,19 @@ fn candidate(object_id: &str) -> ApplicabilityCandidate {
         object_revision: 1,
         ..ApplicabilityCandidate::default()
     }
+}
+
+fn engine_batch(
+    snapshot: &CheckoutSnapshot,
+    candidate: &ApplicabilityCandidate,
+) -> BatchEvaluation {
+    ApplicabilityEngine::new().evaluate_batch(
+        snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(candidate),
+        &EvalBudget::unbounded(),
+    )
 }
 
 fn seeded_repo(dir: &std::path::Path) -> (FixtureRepo, gix::ObjectId, gix::ObjectId) {
@@ -2117,4 +2131,159 @@ fn every_candidate_sharing_an_absent_object_declines_to_cache() {
         assert_eq!(object.state, ApplicabilityState::Uncertain);
         assert!(!object.append_pending);
     }
+}
+
+/// The snapshot records a non-UTF-8 path as its lossy rendering plus a digest
+/// of the raw bytes, and a repository can hold a valid UTF-8 file named
+/// exactly that string. Comparing the rendering alone lets a dirty instance of
+/// the byte path stand in for the declared UTF-8 twin, so an unrelated file
+/// would gate the object.
+#[cfg(unix)]
+#[test]
+fn a_dirty_byte_path_does_not_gate_its_utf8_twin() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+
+    let raw = b"src/\xff";
+    let lossy_twin = format!(
+        "{}#x{:x}",
+        String::from_utf8_lossy(raw),
+        <sha2::Sha256 as sha2::Digest>::digest(raw)
+    );
+    std::fs::write(workdir.join(std::ffi::OsStr::from_bytes(raw)), "bytes\n").unwrap();
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    // Guards the premise: the byte file must be the recorded dirty entry, and
+    // it must be recorded under the twin's spelling.
+    let recorded: Vec<&str> = snapshot
+        .dirty_entries()
+        .iter()
+        .filter(|entry| entry.is_uncommitted_change())
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(recorded, [lossy_twin.as_str()]);
+
+    let declared = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec![lossy_twin], vec![]).encode()),
+        ..candidate("object-utf8-twin")
+    };
+    let batch = engine_batch(&snapshot, &declared);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::Current,
+        "a dirty non-UTF-8 file was treated as the declared UTF-8 path"
+    );
+}
+
+/// The rendering preserves valid leading bytes verbatim and appends the digest
+/// to the final component alone, so a declared ancestor directory of a
+/// byte-named file still overlaps it.
+#[cfg(unix)]
+#[test]
+fn a_declared_directory_still_gates_a_byte_named_file_inside_it() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+
+    std::fs::write(
+        workdir.join(std::ffi::OsStr::from_bytes(b"src/\xff")),
+        "bytes\n",
+    )
+    .unwrap();
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let declared = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec!["src".to_string()], vec![]).encode()),
+        ..candidate("object-declares-dir")
+    };
+    let batch = engine_batch(&snapshot, &declared);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain,
+        "an uncommitted byte-named file under a declared directory stopped gating it"
+    );
+}
+
+/// The fallback rungs scan a window of commits reachable from HEAD. A walk
+/// that cannot advance wanted a commit the database does not hold, which a
+/// fetch can supply without moving HEAD, the worktree, or the repository
+/// state — so the uncertainty it produces must not be retained under a key
+/// none of those inputs distinguish.
+#[test]
+fn window_walk_uncertainty_from_an_absent_commit_is_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    // Present in the database, unreachable from HEAD: the state that sends
+    // resolution to the patch-ID and tree rungs over the candidate window.
+    let rewritten = commit_snapshot(
+        &fixture.repo,
+        "side",
+        &[tip],
+        &[
+            (
+                "src/lib.rs",
+                "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+            ),
+            ("config.toml", "flag = true\n"),
+        ],
+        "rewritten",
+        3,
+    );
+    let anchored = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-rewritten", rewritten)),
+        ..candidate("object-window-walk")
+    };
+    let snapshot = checkout(&fixture, tip);
+
+    // Break the walk one step past HEAD.
+    let hex = base.to_string();
+    let loose = fixture
+        .repo
+        .git_dir()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    let saved = std::fs::read(&loose).expect("base commit is a loose object");
+    std::fs::remove_file(&loose).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    for round in 0..2 {
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            std::slice::from_ref(&anchored),
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+        assert_eq!(
+            batch.stats.object_cache_hits, 0,
+            "round {round} served a verdict resting on an unwalkable history"
+        );
+        assert_eq!(batch.stats.anchor_cache_hits, 0);
+        assert!(!batch.objects[0].append_pending);
+    }
+
+    // Restoring the commit is what a fetch does; the verdict must be free to
+    // change without waiting for eviction.
+    std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+    std::fs::write(&loose, saved).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&anchored),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_ne!(batch.objects[0].state, ApplicabilityState::Uncertain);
 }
