@@ -124,6 +124,8 @@ const CREDENTIAL_TAIL_WORDS = [
     "password",
     "passwd",
     "passphrase",
+    /** The abbreviation is as common as the word in config, and neither the tail rule nor any vendor value shape would otherwise recognize `dbPwd`. commentlint: allow(JUDGE) */
+    "pwd",
     "credential",
     "cookie",
     "authorization",
@@ -172,6 +174,16 @@ const TOKEN_COUNTING_QUALIFIERS = [
 
 /** `key` names a position in a data structure as often as a credential, and these qualifiers only ever mean the former. Kept closed and structural: anything not named here is treated as a credential, because a refused spawn is visible and a written credential is not. */
 /** Words that name a credential when glued directly to `key`. Listed positively because the suffix alone carries no signal: an unrecognized glued word is left alone rather than treated as a secret, and a bare `key` remains a credential on its own. commentlint: allow(JUDGE) */
+/** Key kinds that have a publishable half, so `public` qualifying them names something safe to write. A key kind with no public half — an API key, an access key — is a credential however it is qualified. commentlint: allow(JUDGE) */
+const PUBLISHABLE_KEY_PREFIXES: readonly string[] = [
+    "signing",
+    "ssh",
+    "encryption",
+    "cert",
+    "host",
+    "verification",
+];
+
 const CREDENTIAL_KEY_PREFIXES: readonly string[] = [
     "api",
     "access",
@@ -263,14 +275,20 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         // singular entry.
         compact.endsWith(word) || compact.endsWith(`${word}s`);
     if (endsWith("key")) {
-        /** The glued credential tail is checked before the qualifier, because acronym casing puts the whole compound in one segment: `primaryAPIKey` splits as `primary`/`apikey`, so the qualifier rule would read `primary` as structural and return before the compound was ever considered. An API key is a credential whatever qualifies it. commentlint: allow(JUDGE) */
+        /** A published keypair half is not a secret and cannot be routed through `extraEnv`, so `public` still exempts the fields that name one — `publicSigningKey`, `publicSshKey`. It does not exempt every compound: an API key is a credential whatever qualifies it, so `publicAPIKey` stays refused. The two are told apart by which word precedes `key`, because only some key kinds have a publishable half. commentlint: allow(JUDGE) */
+        const publishedHalf =
+            allSegments.includes("public") &&
+            PUBLISHABLE_KEY_PREFIXES.some((word) => compact.endsWith(`${word}key`));
+        /** The glued credential tail is checked before the qualifier, because acronym casing puts the whole compound in one segment: `primaryAPIKey` splits as `primary`/`apikey`, so the qualifier rule would read `primary` as structural and return before the compound was ever considered. commentlint: allow(JUDGE) */
         if (
+            !publishedHalf &&
             CREDENTIAL_KEY_PREFIXES.some(
                 (word) => compact.endsWith(`${word}key`) || compact.endsWith(`${word}keys`),
             )
         ) {
             return true;
         }
+        if (publishedHalf) return false;
         if (qualifier !== undefined) return !STRUCTURAL_KEY_QUALIFIERS.includes(qualifier);
         // A glued name has no segment to read, so the whole word decides. `monkey` and
         // `turkey` end in these letters without naming a key at all, so a glued credential

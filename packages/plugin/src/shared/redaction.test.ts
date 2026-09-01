@@ -176,6 +176,10 @@ describe("isCredentialBearingConfigKey", () => {
             "connectionString",
             "storageConnectionString",
             "databaseUrl",
+            // The abbreviation is as common as the word.
+            "dbPwd",
+            "databasePwd",
+            "PWD",
             // An enumerator can sit outside the descriptor as easily as inside it.
             "apiKeyValue2",
             "passwordValue2",
@@ -223,6 +227,10 @@ describe("isCredentialBearingConfigKey", () => {
             // Plural counts keep their exemption.
             "cachedTokens",
             "cacheTokens",
+            // A published keypair half is not a secret, and cannot be routed through extraEnv.
+            "publicSigningKey",
+            "publicSshKey",
+            "publicVerificationKey",
             // A separated enumerator must not become the qualifier.
             "public_key_value_2",
             "primary_key_id_2",

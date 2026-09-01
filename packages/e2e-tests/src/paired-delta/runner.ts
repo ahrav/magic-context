@@ -1257,6 +1257,11 @@ function completedRecord(
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
         try {
+            /** The container is established as an array before it is mapped: `null` or an object would raise a `TypeError` here, which escapes as a non-contract error and loses the paid rollout, where `validateCheckVector` turns the same input into the `invalid-result` this path is built to record. commentlint: allow(JUDGE) */
+            if (!Array.isArray(observation.checks)) {
+                validateCheckVector(scenario, []);
+                throw new PairedDeltaContractError(["checks-not-an-array"]);
+            }
             /** Snapshotted before validation, not after: a spread re-reads the adapter's object, so an accessor could answer one value to `validateCheckVector` and another to the copy — recording an outcome the validator never saw — or throw on the second read and lose the paid rollout. The named fields are copied rather than spread so nothing else the adapter attached rides along into the record. commentlint: allow(JUDGE) */
             const snapshot = observation.checks.map(({ id, passed }) => ({ id, passed }));
             validateCheckVector(scenario, snapshot);

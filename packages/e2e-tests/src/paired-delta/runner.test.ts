@@ -1527,6 +1527,22 @@ describe("paired-delta runner", () => {
         expect(released).toBe(1);
     });
 
+    it("records a malformed check container as an invalid result", async () => {
+        // Mapping a null container raises a TypeError, which escapes as a non-contract error
+        // and loses the paid rollout instead of recording it.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                return { ...base, checks: null as unknown as typeof base.checks };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        expect(result.records[0]?.cell.reasonCode).toBe("invalid-result");
+    });
+
     it("records the check value the validator actually read", async () => {
         // An accessor can answer differently on a second read, so the value that was
         // validated must be the value that is stored.
