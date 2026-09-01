@@ -190,6 +190,46 @@ function relativeTo(root: string, target: string): string | null {
 }
 
 /** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change run report success without executing the changed code. commentlint: allow(JUDGE) */
+/**
+ * Digest the declared calibration scope from the worktree, so the binding changes when the running
+ * system does and not when an unrelated commit lands.
+ *
+ * Tracked contents come from each path's git tree or blob object, which is content-addressed, and
+ * uncommitted changes inside the scope are hashed on top so a dirty checkout is distinguished.
+ */
+function scopeDigest(): string {
+    const root = worktreeRoot();
+    const git = gitAt(root);
+    const parts: Uint8Array[] = [];
+    for (const path of CALIBRATION_SCOPE) {
+        parts.push(Buffer.from(`${path}\0`, "utf8"));
+        /** `rev-parse HEAD:<path>` names the tree or blob object, so unrelated commits do not move it. */
+        const object = Bun.spawnSync(["git", "rev-parse", `HEAD:${path}`], { cwd: root });
+        if (object.exitCode !== 0) {
+            throw new Error(`paired-delta calibration scope path is not tracked: ${path}`);
+        }
+        parts.push(Buffer.from(object.stdout.toString().trim(), "utf8"));
+        parts.push(Buffer.from(git(["status", "--porcelain", "--untracked-files=all", "--", path]), "utf8"));
+        parts.push(Buffer.from(git(["diff", "--binary", "HEAD", "--", path]), "utf8"));
+    }
+    return Bun.hash(Buffer.concat(parts)).toString(16);
+}
+
+function worktreeRoot(): string {
+    const started = resolve(import.meta.dir, "..");
+    return gitAt(started)(["rev-parse", "--show-toplevel"]).trim();
+}
+
+function gitAt(cwd: string): (args: string[]) => string {
+    return (args: string[]): string => {
+        const run = Bun.spawnSync(["git", ...args], { cwd });
+        if (run.exitCode !== 0) {
+            throw new Error(`paired-delta cannot read the worktree: git ${args.join(" ")}`);
+        }
+        return run.stdout.toString();
+    };
+}
+
 function recordsRepoCommit(ownedPaths: readonly string[]): string {
     const started = resolve(import.meta.dir, "..");
     const at = (cwd: string) => (args: string[]): string => {
@@ -487,8 +527,30 @@ function scenarioIdsForMode(
     );
 }
 
-function lanePolicy(): PairedDeltaPolicy {
-    const document = parsePolicyOwnerDocument(policyJson, "magic-context-x4l.14");
+const POLICY_OWNER = "magic-context-x4l.14";
+
+/**
+ * Paths whose contents decide whether calibration evidence still describes the running system.
+ *
+ * Binding calibration to the commit broke the schedule: any later commit on the default branch, an
+ * unrelated documentation change included, invalidated the record and left weekly and release
+ * refusing until someone re-dispatched calibration at that exact revision. A declared scope keeps
+ * the binding meaningful — a plugin, harness, oracle, or lane change still invalidates it — without
+ * tying it to commits that cannot affect the measurement. The workflow's cache key hashes the same
+ * globs, so a scope change misses the cache rather than restoring a record the runner will reject.
+ */
+const CALIBRATION_SCOPE = [
+    "packages/plugin/src",
+    "packages/e2e-tests/src/paired-delta",
+    "packages/e2e-tests/src/oracle-arms",
+    "packages/e2e-tests/src/opencode-runner",
+    "packages/e2e-tests/src/harness.ts",
+    "packages/e2e-tests/src/ballast.ts",
+    "packages/e2e-tests/scripts/run-paired-delta.ts",
+    "packages/e2e-tests/pools",
+] as const;
+
+function lanePolicy(document: ReturnType<typeof parsePolicyOwnerDocument>): PairedDeltaPolicy {
     if (document.status !== "ready" || document.policy === null) {
         throw new Error("paired-delta policy is not ready");
     }
@@ -1187,11 +1249,11 @@ async function runLive(args: CliArgs): Promise<void> {
     if (!apiKey) {
         throw new Error("live paired-delta mode requires PAIRED_DELTA_ANTHROPIC_API_KEY");
     }
-    const policyDocument = parsePolicyOwnerDocument(policyJson, "magic-context-x4l.14");
+    const policyDocument = parsePolicyOwnerDocument(policyJson, POLICY_OWNER);
     if (policyDocument.policyFingerprint === null) {
         throw new Error("paired-delta policy is not ready");
     }
-    const policy = lanePolicy();
+    const policy = lanePolicy(policyDocument);
     const manifest = parsePairedDeltaManifest(manifestJson);
     const manifestFingerprint = canonicalFingerprint(manifest);
     if (manifestFingerprint !== policy.poolManifestFingerprint) {
@@ -1227,7 +1289,7 @@ async function runLive(args: CliArgs): Promise<void> {
      * Calibration evidence is validated before the first provider call rather than after the experiment.
      * A weekly or release dispatch with a missing or unbound record would otherwise spend its whole budget and then discard the result.
      */
-    const implementationCommit = recordsRepoCommit([args.recordsPath, args.reportPath, args.calibrationRecordPath]);
+    const implementationDigest = scopeDigest();
     let noiseFloors: FamilyNoiseFloor[] = [];
     if (mode !== "calibration") {
         if (!existsSync(args.calibrationRecordPath)) {
@@ -1242,7 +1304,7 @@ async function runLive(args: CliArgs): Promise<void> {
             calibration.poolManifestFingerprint !== manifestFingerprint ||
             calibration.pinnedSnapshotId !== model.modelId ||
             calibration.policyFingerprint !== policyDocument.policyFingerprint ||
-            calibration.implementationCommit !== implementationCommit ||
+            calibration.implementationDigest !== implementationDigest ||
             !calibration.validForPoolSizing
         ) {
             throw new Error("paired-delta calibration record does not bind this run");
@@ -1290,7 +1352,11 @@ async function runLive(args: CliArgs): Promise<void> {
         {
             scenarios,
             poolManifestFingerprint: manifestFingerprint,
-            repoCommit: implementationCommit,
+            repoCommit: recordsRepoCommit([
+                args.recordsPath,
+                args.reportPath,
+                args.calibrationRecordPath,
+            ]),
             pinnedProviderId: model.providerId,
             pinnedSnapshotId: model.modelId,
             replicateCount: policy.replicateCount,
@@ -1323,7 +1389,7 @@ async function runLive(args: CliArgs): Promise<void> {
             poolManifestFingerprint: manifestFingerprint,
             pinnedSnapshotId: model.modelId,
             policyFingerprint: policyDocument.policyFingerprint,
-            implementationCommit,
+            implementationDigest,
             targetMinimumDetectableDelta: policy.targetMinimumDetectableDelta,
             decisions: {
                 familyCount: policy.minimumAnalyzableFamilyCount,
@@ -1351,7 +1417,7 @@ async function runLive(args: CliArgs): Promise<void> {
         poolManifestFingerprint: manifestFingerprint,
         pinnedSnapshotId: model.modelId,
         policyDocument: policyJson,
-        implementationCommit,
+        implementationDigest,
         pairs: LIVE_LANE_PAIRS,
         analysis,
         exclusions: flattenExclusions(result),

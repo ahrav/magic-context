@@ -49,8 +49,8 @@ export interface PairedDeltaReportBody {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
-    /** The manifest digest excludes the plugin and live runner, so a standalone artifact identifies its implementation here. */
-    implementationCommit: string;
+    /** The manifest digest excludes the plugin, harness, and live runner, so a standalone artifact identifies its implementation here. */
+    implementationDigest: string;
     analysis: FamilyDeltaAnalysis;
     exclusions: ExclusionCount[];
     secondaryMetrics: SecondaryMetrics;
@@ -150,7 +150,7 @@ export function buildPairedDeltaReport(input: {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyDocument: unknown;
-    implementationCommit: string;
+    implementationDigest: string;
     pairs: readonly PairedCaseFact[];
     analysis: FamilyDeltaAnalysis;
     exclusions: readonly ExclusionCount[];
@@ -168,8 +168,8 @@ export function buildPairedDeltaReport(input: {
     if (input.pinnedSnapshotId.trim().length === 0) {
         throw new Error("paired-delta-report: pinned-snapshot-id-invalid");
     }
-    if (input.implementationCommit.trim().length === 0) {
-        throw new Error("paired-delta-report: implementation-commit-invalid");
+    if (input.implementationDigest.trim().length === 0) {
+        throw new Error("paired-delta-report: implementation-digest-invalid");
     }
     if (
         input.analysis.poolManifestFingerprint !== input.poolManifestFingerprint ||
@@ -222,7 +222,7 @@ export function buildPairedDeltaReport(input: {
         poolManifestFingerprint: input.poolManifestFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         policyFingerprint: policy.policyFingerprint,
-        implementationCommit: input.implementationCommit,
+        implementationDigest: input.implementationDigest,
         analysis: input.analysis,
         exclusions,
         secondaryMetrics: {
@@ -277,8 +277,8 @@ export interface PairedDeltaCalibrationRecord {
     poolManifestFingerprint: string;
     /** Noise measured under one policy does not transfer to another: replicate depth and the family minimum both change what the floor means. */
     policyFingerprint: string;
-    /** The manifest digest covers the pool's own files and deliberately excludes the plugin and live runner, so the evaluated implementation is bound here instead. */
-    implementationCommit: string;
+    /** A digest of the declared calibration scope, because the manifest digest covers the pool's own files and deliberately excludes the plugin, harness, and live runner. */
+    implementationDigest: string;
     pinnedSnapshotId: string;
     runStatus: PairedDeltaRunResult["status"];
     validForPoolSizing: boolean;
@@ -400,14 +400,14 @@ export function buildCalibrationRecord(input: {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
-    implementationCommit: string;
+    implementationDigest: string;
     targetMinimumDetectableDelta: number;
     decisions: Omit<CalibrationDecision, "poolSize">;
 }): PairedDeltaCalibrationRecord {
     requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
     requireHex64(input.policyFingerprint, "policy-fingerprint");
-    if (input.implementationCommit.trim().length === 0) {
-        throw new Error("paired-delta-calibration: implementation-commit-invalid");
+    if (input.implementationDigest.trim().length === 0) {
+        throw new Error("paired-delta-calibration: implementation-digest-invalid");
     }
     const analysable = completePrimaryCoordinates(input.records);
     const deltasByCoordinate = coordinateDeltas(input.records, analysable);
@@ -473,7 +473,7 @@ export function buildCalibrationRecord(input: {
         schema: PAIRED_DELTA_CALIBRATION_SCHEMA,
         poolManifestFingerprint: input.poolManifestFingerprint,
         policyFingerprint: input.policyFingerprint,
-        implementationCommit: input.implementationCommit,
+        implementationDigest: input.implementationDigest,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
         validForPoolSizing: input.runStatus === "completed" &&
@@ -537,13 +537,18 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     if (
         typeof record.pinnedSnapshotId !== "string" ||
         typeof record.policyFingerprint !== "string" ||
-        typeof record.implementationCommit !== "string" ||
-        record.implementationCommit.trim().length === 0 ||
+        typeof record.implementationDigest !== "string" ||
+        record.implementationDigest.trim().length === 0 ||
         typeof record.validForPoolSizing !== "boolean" ||
         !Array.isArray(record.familyNoise) ||
         record.familyNoise.some((noise) =>
             typeof noise.familyId !== "string" ||
             !Number.isFinite(noise.spread) ||
+            /** `familyFloorValue` divides by these, and a non-finite floor silently labels every family outside it, which disables the gate rather than failing. */
+            !Number.isSafeInteger(noise.observationCount) ||
+            noise.observationCount < 0 ||
+            !Number.isFinite(noise.variance) ||
+            noise.variance < 0 ||
             !Number.isFinite(noise.interval?.lower) ||
             !Number.isFinite(noise.interval?.upper))
     ) {
@@ -563,7 +568,12 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
  */
 function familyFloorValue(noise: CalibrationFamilyNoise): number {
     if (noise.observationCount < 2 || !(noise.variance > 0)) return 0;
-    return 1.959964 * Math.sqrt(noise.variance / noise.observationCount);
+    const value = 1.959964 * Math.sqrt(noise.variance / noise.observationCount);
+    /** A non-finite floor would compare false against every point estimate, disabling the gate silently. */
+    if (!Number.isFinite(value)) {
+        throw new Error(`paired-delta-calibration: floor-invalid-${noise.familyId}`);
+    }
+    return value;
 }
 
 /**

@@ -90,15 +90,19 @@ jobs:
           restore-keys: |
             paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-
 
-      # The commit joins the manifest and policy in the key because the manifest digest deliberately excludes the plugin and live runner: without it, a code change restores noise measured against the previous implementation. The runner rejects a mismatch, and keying it here avoids restoring a record only to fail closed on it.
+      # Keyed on the same calibration scope the runner digests, not on the commit: a commit-scoped
+      # key invalidated every record on the next push to the default branch and left this lane
+      # refusing until calibration was re-dispatched. `CALIBRATION_SCOPE` in run-paired-delta.ts
+      # is the matching declaration; the two are independent hashes of the same path set, so a
+      # scope change misses the cache rather than restoring a record the runner will reject.
       - name: Restore calibration evidence
         if: env.PAIRED_DELTA_MODE != 'calibration'
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.sha }}-${{ github.run_id }}
+          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/e2e-tests/src/paired-delta/**', 'packages/e2e-tests/src/oracle-arms/**', 'packages/e2e-tests/src/opencode-runner/**', 'packages/e2e-tests/src/harness.ts', 'packages/e2e-tests/src/ballast.ts', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**') }}-${{ github.run_id }}
           restore-keys: |
-            paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.sha }}-
+            paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/e2e-tests/src/paired-delta/**', 'packages/e2e-tests/src/oracle-arms/**', 'packages/e2e-tests/src/opencode-runner/**', 'packages/e2e-tests/src/harness.ts', 'packages/e2e-tests/src/ballast.ts', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**') }}-
 
       - name: Run live paired-delta lane
         timeout-minutes: 300
@@ -129,7 +133,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/e2e-tests/src/paired-delta/**', 'packages/e2e-tests/src/oracle-arms/**', 'packages/e2e-tests/src/opencode-runner/**', 'packages/e2e-tests/src/harness.ts', 'packages/e2e-tests/src/ballast.ts', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # `upload-artifact@v4` artifacts are immutable, so the attempt is part of the name: a rerun uploading under the prior attempt's name conflicts instead of replacing it.
       - name: Archive reports and rollout records
