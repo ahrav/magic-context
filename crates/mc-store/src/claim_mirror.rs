@@ -332,7 +332,7 @@ fn prepare_integrity_json(
             RedactionErrorKind::SecretDetected,
         ));
     }
-    write.record_observed_scan(field_id, detections);
+    write.record_observed_scan(field_id, detections, "reject");
     Ok(())
 }
 

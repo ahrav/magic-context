@@ -1327,6 +1327,12 @@ CREATE TABLE mc_claim_mirror_receipts (
     Migration {
         version: 58,
         statements: r#"
+-- Migration 57 shipped these two indexes with column lists identical to the
+-- implicit indexes of their tables' UNIQUE and PRIMARY KEY constraints, so
+-- every write maintained two copies of the same B-tree.
+DROP INDEX IF EXISTS idx_mc_tags_session_block;
+DROP INDEX IF EXISTS idx_shadow_user_profile_project;
+
 CREATE TABLE mc_scan_batches (
             scan_batch_id TEXT PRIMARY KEY CHECK (length(scan_batch_id) = 32),
             owner_kind TEXT NOT NULL,
@@ -1348,9 +1354,6 @@ CREATE TABLE mc_scan_domain_owners (
             owner_key TEXT NOT NULL CHECK (length(owner_key) = 64),
             UNIQUE (owner_scope_id, owner_kind, owner_key)
         );
-
-CREATE INDEX idx_mc_scan_domain_owners_scope
-            ON mc_scan_domain_owners(owner_scope_id, owner_kind, owner_key);
 
 CREATE TABLE mc_field_scans (
             scan_id TEXT PRIMARY KEY CHECK (length(scan_id) = 32),
@@ -1391,7 +1394,11 @@ CREATE TABLE mc_scan_detections (
                 AND label_id NOT GLOB '*[^abcdefghijklmnopqrstuvwxyz0-9_]*'
             ),
             span_kind TEXT NOT NULL CHECK (span_kind = 'value'),
-            action TEXT NOT NULL CHECK (action IN ('substitute', 'reject')),
+            -- 'substitute': the span was replaced before storage.
+            -- 'preserve': an existing identity was stored verbatim; rejecting it
+            --             retroactively would orphan rows already keyed by it.
+            -- 'reject': reserved; rejected writes roll back with their receipts.
+            action TEXT NOT NULL CHECK (action IN ('substitute', 'preserve', 'reject')),
             PRIMARY KEY (scan_id, detection_ordinal)
         ) WITHOUT ROWID;
     "#,
@@ -2912,6 +2919,9 @@ pub struct NoteInput<'a> {
 struct PreparedFieldScan {
     field_id: &'static str,
     redaction: Redaction,
+    /// Disposition of each detected span, persisted verbatim into
+    /// `mc_scan_detections.action`.
+    detection_action: &'static str,
     owners: Vec<PreparedDomainOwner>,
 }
 
@@ -3081,13 +3091,19 @@ impl PreparedWrite {
     ///
     /// Lets a caller that prepared its text through a JSON-aware path attach the audit
     /// receipt without running the scanner over the same bytes a second time.
-    fn record_observed_scan(&mut self, field_id: &'static str, detections: Vec<Detection>) {
+    fn record_observed_scan(
+        &mut self,
+        field_id: &'static str,
+        detections: Vec<Detection>,
+        detection_action: &'static str,
+    ) {
         self.scans.push(PreparedFieldScan {
             field_id,
             redaction: Redaction {
                 text: String::new(),
                 detections,
             },
+            detection_action,
             owners: self.domain_owners.clone(),
         });
     }
@@ -3164,9 +3180,15 @@ impl PreparedWrite {
                 input.to_owned()
             }
         };
+        let detection_action = match policy {
+            PreparedFieldPolicy::Content => "substitute",
+            PreparedFieldPolicy::NewIdentity => "reject",
+            PreparedFieldPolicy::ExistingIdentity => "preserve",
+        };
         self.scans.push(PreparedFieldScan {
             field_id,
             redaction,
+            detection_action,
             owners: self.domain_owners.clone(),
         });
         Ok(output)
@@ -3229,47 +3251,78 @@ impl ActiveWriteTransaction<'_> {
             )));
         }
         let mut domain_owner_ids = Vec::with_capacity(prepared.domain_owners.len());
-        for owner in &prepared.domain_owners {
-            let private_scope_key = active_scan_private_key(owner.scope_kind, &owner.scope_key);
-            let private_owner_key = active_scan_private_key(prepared.owner_kind, &owner.owner_key);
-            let proposed_scope_id = opaque_sqlite_id(self.tx)?;
-            self.tx.execute(
+        {
+            let mut insert_scope = self.tx.prepare_cached(
                 "INSERT OR IGNORE INTO mc_scan_owner_scopes(
                      owner_scope_id,scope_kind,scope_key
                  ) VALUES (?1,?2,?3)",
-                params![proposed_scope_id, owner.scope_kind, private_scope_key],
             )?;
-            let owner_scope_id: String = self.tx.query_row(
+            let mut select_scope = self.tx.prepare_cached(
                 "SELECT owner_scope_id FROM mc_scan_owner_scopes
                   WHERE scope_kind = ?1 AND scope_key = ?2",
-                params![owner.scope_kind, private_scope_key],
-                |row| row.get(0),
             )?;
-            let proposed_owner_id = opaque_sqlite_id(self.tx)?;
-            self.tx.execute(
+            let mut insert_owner = self.tx.prepare_cached(
                 "INSERT OR IGNORE INTO mc_scan_domain_owners(
                      domain_owner_id,owner_scope_id,owner_kind,owner_key
                  ) VALUES (?1,?2,?3,?4)",
-                params![
+            )?;
+            let mut select_owner = self.tx.prepare_cached(
+                "SELECT domain_owner_id FROM mc_scan_domain_owners
+                  WHERE owner_scope_id = ?1 AND owner_kind = ?2 AND owner_key = ?3",
+            )?;
+            for owner in &prepared.domain_owners {
+                let private_scope_key = active_scan_private_key(owner.scope_kind, &owner.scope_key);
+                let private_owner_key =
+                    active_scan_private_key(prepared.owner_kind, &owner.owner_key);
+                let proposed_scope_id = opaque_sqlite_id(self.tx)?;
+                insert_scope.execute(params![
+                    proposed_scope_id,
+                    owner.scope_kind,
+                    private_scope_key
+                ])?;
+                let owner_scope_id: String = select_scope
+                    .query_row(params![owner.scope_kind, private_scope_key], |row| {
+                        row.get(0)
+                    })?;
+                let proposed_owner_id = opaque_sqlite_id(self.tx)?;
+                insert_owner.execute(params![
                     proposed_owner_id,
                     owner_scope_id,
                     prepared.owner_kind,
                     private_owner_key
-                ],
-            )?;
-            let domain_owner_id = self.tx.query_row(
-                "SELECT domain_owner_id FROM mc_scan_domain_owners
-                  WHERE owner_scope_id = ?1 AND owner_kind = ?2 AND owner_key = ?3",
-                params![owner_scope_id, prepared.owner_kind, private_owner_key],
-                |row| row.get::<_, String>(0),
-            )?;
-            domain_owner_ids.push((owner.clone(), domain_owner_id));
+                ])?;
+                let domain_owner_id = select_owner.query_row(
+                    params![owner_scope_id, prepared.owner_kind, private_owner_key],
+                    |row| row.get::<_, String>(0),
+                )?;
+                domain_owner_ids.push((owner.clone(), domain_owner_id));
+            }
         }
         let batch_id = opaque_sqlite_id(self.tx)?;
-        self.tx.execute(
-            "INSERT INTO mc_scan_batches(scan_batch_id,owner_kind,created_at_ms)
-             VALUES (?1,?2,?3)",
-            params![batch_id, prepared.owner_kind, current_time_ms()],
+        self.tx
+            .prepare_cached(
+                "INSERT INTO mc_scan_batches(scan_batch_id,owner_kind,created_at_ms)
+                 VALUES (?1,?2,?3)",
+            )?
+            .execute(params![batch_id, prepared.owner_kind, current_time_ms()])?;
+        // The detector build is constant across one audit batch.
+        let semantic_digest = detector_semantic_digest().map(hex_digest);
+        let revision = detector_revision();
+        let mut insert_scan = self.tx.prepare_cached(
+            "INSERT INTO mc_field_scans(
+                 scan_id,scan_batch_id,detector_id,detector_revision,
+                 semantic_digest,finding_count
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        let mut insert_copy = self.tx.prepare_cached(
+            "INSERT INTO mc_scan_owner_copies(
+                 owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
+             ) VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        let mut insert_detection = self.tx.prepare_cached(
+            "INSERT INTO mc_scan_detections(
+                 scan_id,detection_ordinal,exactness,label_id,span_kind,action
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
         for field in &prepared.scans {
             if field.owners.is_empty() {
@@ -3281,21 +3334,14 @@ impl ActiveWriteTransaction<'_> {
                 )));
             }
             let scan_id = opaque_sqlite_id(self.tx)?;
-            let semantic_digest = detector_semantic_digest().map(hex_digest);
-            self.tx.execute(
-                "INSERT INTO mc_field_scans(
-                     scan_id,scan_batch_id,detector_id,detector_revision,
-                     semantic_digest,finding_count
-                 ) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    scan_id,
-                    batch_id,
-                    DETECTOR_ID,
-                    detector_revision(),
-                    semantic_digest,
-                    i64::try_from(field.redaction.detections.len()).unwrap_or(i64::MAX),
-                ],
-            )?;
+            insert_scan.execute(params![
+                scan_id,
+                batch_id,
+                DETECTOR_ID,
+                revision,
+                semantic_digest,
+                i64::try_from(field.redaction.detections.len()).unwrap_or(i64::MAX),
+            ])?;
             for owner in &field.owners {
                 let domain_owner_id = domain_owner_ids
                     .iter()
@@ -3305,35 +3351,25 @@ impl ActiveWriteTransaction<'_> {
                             "scan field references an unregistered durable owner".to_string(),
                         )))
                     })?;
-                self.tx.execute(
-                    "INSERT INTO mc_scan_owner_copies(
-                         owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
-                     ) VALUES (?1,?2,?3,?4,?5)",
-                    params![
-                        opaque_sqlite_id(self.tx)?,
-                        scan_id,
-                        domain_owner_id,
-                        prepared.owner_kind,
-                        field.field_id,
-                    ],
-                )?;
+                insert_copy.execute(params![
+                    opaque_sqlite_id(self.tx)?,
+                    scan_id,
+                    domain_owner_id,
+                    prepared.owner_kind,
+                    field.field_id,
+                ])?;
             }
             // The detector build is recorded once per field scan, so a
             // detection row carries only what varies within one scan.
             for (ordinal, detection) in field.redaction.detections.iter().enumerate() {
-                self.tx.execute(
-                    "INSERT INTO mc_scan_detections(
-                         scan_id,detection_ordinal,exactness,label_id,span_kind,action
-                     ) VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![
-                        scan_id,
-                        i64::try_from(ordinal).unwrap_or(i64::MAX),
-                        "exact",
-                        detection.secret_type,
-                        "value",
-                        "substitute",
-                    ],
-                )?;
+                insert_detection.execute(params![
+                    scan_id,
+                    i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    "exact",
+                    detection.secret_type,
+                    "value",
+                    field.detection_action,
+                ])?;
             }
         }
         for link in &prepared.existing_scan_links {
@@ -3345,20 +3381,17 @@ impl ActiveWriteTransaction<'_> {
                         "existing scan link references an unregistered durable owner".to_string(),
                     )))
                 })?;
+            // The id expression sits inside the SELECT so it evaluates per row;
+            // a bound parameter evaluates once for the whole statement.
             self.tx.execute(
                 "INSERT INTO mc_scan_owner_copies(
                      owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
                  )
-                 SELECT ?1,scan_id,?2,?3,field_id
+                 SELECT lower(hex(randomblob(16))),scan_id,?1,?2,field_id
                    FROM mc_scan_owner_copies
-                  WHERE scan_id=?4
+                  WHERE scan_id=?3
                   GROUP BY scan_id,field_id",
-                params![
-                    opaque_sqlite_id(self.tx)?,
-                    domain_owner_id,
-                    prepared.owner_kind,
-                    link.scan_id,
-                ],
+                params![domain_owner_id, prepared.owner_kind, link.scan_id],
             )?;
         }
         Ok(())
@@ -3366,7 +3399,8 @@ impl ActiveWriteTransaction<'_> {
 }
 
 fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
-    tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+    tx.prepare_cached("SELECT lower(hex(randomblob(16)))")?
+        .query_row([], |row| row.get(0))
 }
 
 /// Deletes the audit rows that lost their last owner, restricted to `scan_ids`.
@@ -3986,13 +4020,19 @@ fn prepare_json_content_collecting(
         if let Some(key) = key.filter(|key| identity_json_field(key) || integrity_json_field(key)) {
             // `api_key` passes `identity_json_field` and matches no `integrity_json_field`
             // marker, so the length-only path would store a credential unscanned.
-            if identity_json_field(key)
+            let preserved_identity = identity_json_field(key)
                 && !integrity_json_field(key)
                 && qualified_secret_key_label(key).is_none()
-                && !policy.reject_protected()
-            {
+                && !policy.reject_protected();
+            if preserved_identity {
                 ensure_durable_text_bound(key)?;
-                validate_existing_value(value)?;
+                // A nested object supplies its own field names, and those names carry the
+                // policy for their values. Exempting the whole subtree stores the secret in
+                // `{"id":{"message":"password=.."}}` verbatim. An array inherits this key,
+                // so it keeps the preserving policy through the structural walk below.
+                if !value.is_object() {
+                    return validate_existing_value(value);
+                }
             } else if contains_nonempty_text(value) {
                 let encoded = canonical_json_encode(value)
                     .map_err(|error| McStoreError::Serde(error.to_string()))?;
@@ -4005,8 +4045,10 @@ fn prepare_json_content_collecting(
                     return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
                 }
                 detections.extend(redaction.detections);
+                return Ok(());
+            } else {
+                return Ok(());
             }
-            return Ok(());
         }
         match value {
             Value::String(text) => {
@@ -6819,10 +6861,11 @@ impl McStore {
                 // The receipt reuses the detections from the preparation above; scanning
                 // `response_text` again would run the scanner over the whole payload twice on
                 // every command.
-                coordinated
-                    .prepared
-                    .borrow_mut()
-                    .record_observed_scan("response_json", response_detections);
+                coordinated.prepared.borrow_mut().record_observed_scan(
+                    "response_json",
+                    response_detections,
+                    "substitute",
+                );
                 if let Some(command_id) = command_id {
                     let created_at_ms = current_time_ms();
                     tx.execute(
@@ -17200,6 +17243,58 @@ mod tests {
         }
     }
 
+    /// A name can satisfy `identity_json_field` and still name a credential, and an
+    /// identity-named field can hold a nested object rather than a scalar. Both reach the
+    /// preserving policy, so neither may exempt its value from scanning.
+    #[test]
+    fn preserved_json_identities_do_not_exempt_credential_names_or_nested_values() {
+        // `api_key` and `private_key` end in `_key`, so they satisfy `identity_json_field`,
+        // and no `integrity_json_field` marker matches them.
+        for field in ["api_key", "private_key", "access_key"] {
+            let input = format!(r#"{{"{field}":"password=protected-secret"}}"#);
+            let error = prepare_json_content_preserving_identities(&input).unwrap_err();
+            assert!(
+                matches!(error, McStoreError::Redaction(_)),
+                "{field} must not reach durable storage unscanned"
+            );
+            assert!(!error.to_string().contains("protected-secret"));
+        }
+
+        // `apiKey` ends in `Key`, not `_key`, so it is no identity field and never reached
+        // the preserving policy. Substitution rather than rejection is its contract.
+        let substituted =
+            prepare_json_content_preserving_identities(r#"{"apiKey":"password=protected-secret"}"#)
+                .unwrap();
+        assert_eq!(substituted, r#"{"apiKey":"<REDACTED:api_key>"}"#);
+        assert!(!substituted.contains("protected-secret"));
+
+        // A structural identity keeps its bytes, which is the behaviour the credential
+        // names above are distinguished from.
+        for field in ["block_id", "target_key", "revision_locator"] {
+            let input = format!(r#"{{"{field}":"password=legacy-id"}}"#);
+            let preserved = prepare_json_content_preserving_identities(&input).unwrap();
+            assert_eq!(preserved, format!(r#"{{"{field}":"password=legacy-id"}}"#));
+        }
+
+        // The nested field name `message` carries no identity policy, so its value is
+        // scanned even though the enclosing `id` is preserved.
+        let nested = prepare_json_content_preserving_identities(
+            r#"{"id":{"message":"password=nested-secret"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            nested,
+            r#"{"id":{"message":"password=<REDACTED:password>"}}"#
+        );
+        assert!(!nested.contains("nested-secret"));
+
+        // An array under an identity name inherits that name, so its elements stay verbatim.
+        let inherited =
+            prepare_json_content_preserving_identities(r#"{"block_ids":["password=legacy-id"]}"#)
+                .unwrap();
+        assert_eq!(inherited, r#"{"block_ids":["password=legacy-id"]}"#);
+    }
+
     /// A "nothing happened" commit: every optional effect empty. Tests
     /// override only the fields they exercise via struct update.
     fn base_commit<'a>(
@@ -19477,6 +19572,52 @@ mod tests {
         let _first = McStore::open(&d).unwrap();
         // Second live handle on the same database must be rejected (single-writer).
         assert!(McStore::open(&d).is_err());
+    }
+
+    /// A preserved existing identity stores its value verbatim and records a
+    /// `preserve` audit action, never a `substitute` one.
+    #[test]
+    fn detection_receipts_record_preserve_for_existing_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let secret = "x_auth_token=hunter-two";
+
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", "ses_actions", "receipt_probe");
+        let kept = write.existing_identity("unit_key", secret).unwrap();
+        assert_eq!(kept, secret, "an existing identity is stored verbatim");
+        let substituted = write.content("content", secret).unwrap();
+        assert_ne!(
+            substituted, secret,
+            "content preparation substitutes the detected span"
+        );
+        write
+            .execute(&store.inner, |_| Ok(WriteDisposition::Applied(())))
+            .unwrap();
+
+        let actions: Vec<(String, String)> = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT copies.field_id, det.action
+                       FROM mc_scan_detections det
+                       JOIN mc_scan_owner_copies copies USING(scan_id)
+                      ORDER BY copies.field_id",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                ("content".to_string(), "substitute".to_string()),
+                ("unit_key".to_string(), "preserve".to_string()),
+            ],
+            "each detection receipt must carry the disposition its field actually took"
+        );
     }
 
     fn import_compartment(
