@@ -232,8 +232,13 @@ impl ApplicabilityEngine {
                 objects[index].append_pending = false;
                 continue;
             }
-            // Nothing recorded means nothing to clear.
-            if object.state == ApplicabilityState::Current && block.is_none() {
+            // Nothing blocked means nothing to clear: no record, a record that
+            // already reads current, or a history whose records were all
+            // invalidated. Appending a clear over any of those writes durably to
+            // lift a block that is not there.
+            if object.state == ApplicabilityState::Current
+                && !block.is_some_and(|block| block.blocked)
+            {
                 continue;
             }
             let outcome = commit_read_repair(store, self, &snapshot, object, &intent, budget)?;

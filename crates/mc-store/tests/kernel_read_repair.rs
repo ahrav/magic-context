@@ -2304,3 +2304,151 @@ fn same_commit_observations_reduce_in_insertion_order() {
     );
     assert!(block.blocked);
 }
+
+/// A history whose records were all invalidated blocks nothing, so a current
+/// verdict over it has nothing to clear and must not write durably.
+#[test]
+fn a_fully_invalidated_history_needs_no_clearing_append() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+
+    // Record a block, then retire it, leaving an invalidated-only history.
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let stale_object = text(
+        store_dir.path(),
+        &format!(
+            "SELECT object_id FROM observations
+             WHERE observation_kind='{OBSERVATION_KIND_STALE}'"
+        ),
+    );
+    store
+        .commit(intent("retire-stale", 'e'), |envelope| {
+            envelope.retire_observation(&stale_object)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert!(
+        store
+            .applicability_block_state(
+                TARGET_OBJECT,
+                snapshot.identity(),
+                store.known_as_of(0).unwrap().tip
+            )
+            .unwrap()
+            .is_none_or(|block| !block.blocked),
+        "a retired record blocks nothing"
+    );
+
+    // The object now passes. There is no block to lift, so nothing commits.
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    let before = store.known_as_of(0).unwrap().tip;
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert_eq!(report.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(
+        report.appends().count(),
+        0,
+        "no clearing append for a history that blocks nothing, got {:?}",
+        report.appends().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        store.known_as_of(0).unwrap().tip,
+        before,
+        "nothing was committed"
+    );
+}
+
+/// A row older than the newest kind change can carry a newer invalidation, and
+/// the generation has to include it or a replacement repair reuses a retired
+/// identity. The verdict settles at the kind change, so the scan has to keep
+/// walking past it to see that invalidation.
+#[test]
+fn an_invalidation_older_than_the_kind_change_still_moves_the_generation() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+    let evaluate = || {
+        ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &EvalBudget::unbounded(),
+            )
+            .unwrap()
+    };
+
+    // Two failing snapshots, then a passing one. Newest-first that is
+    // current, stale, stale: the first stale row is the kind-change boundary and
+    // the second is older than it.
+    evaluate();
+    let oldest_stale = text(
+        store_dir.path(),
+        &format!(
+            "SELECT object_id FROM observations
+             WHERE observation_kind='{OBSERVATION_KIND_STALE}'"
+        ),
+    );
+    git_fixtures::write_worktree_file(&fixture.repo, "src/unrelated.rs", "pub fn u() {}\n");
+    evaluate();
+    assert_eq!(
+        count(
+            store_dir.path(),
+            &format!(
+                "SELECT COUNT(*) FROM observations
+                 WHERE observation_kind='{OBSERVATION_KIND_STALE}'"
+            )
+        ),
+        2,
+        "two failing snapshots recorded two stale rows"
+    );
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    evaluate();
+
+    // The oldest row is retired, at a commit newer than everything above it.
+    store
+        .commit(intent("retire-older", 'f'), |envelope| {
+            envelope.retire_observation(&oldest_stale)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let retired_at = store.known_as_of(0).unwrap().tip;
+
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let block = store
+        .applicability_block_state(TARGET_OBJECT, snapshot.identity(), retired_at)
+        .unwrap()
+        .expect("the clearing record still reduces");
+    assert_eq!(
+        block.observation_kind, OBSERVATION_KIND_CURRENT,
+        "the verdict still settles on the newest record"
+    );
+    assert_eq!(
+        block.invalidated_commit_seq, retired_at,
+        "the invalidation behind the kind change reaches the generation"
+    );
+    assert!(
+        block.generation_for(OBSERVATION_KIND_STALE) >= retired_at,
+        "a stale repair derives an identity past the retirement"
+    );
+}

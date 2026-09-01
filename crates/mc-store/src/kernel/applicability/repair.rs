@@ -661,7 +661,13 @@ fn reduce_with_reader(
 /// Rows sharing a commit sequence order by their change-event ordinal, which is
 /// insertion order. Ordering them by identifier would let one commit that writes
 /// both a clearing and a stale observation for the same target resolve to
-/// whichever identifier sorts higher rather than to the one written last. Rows decode as the scan streams them. Collecting the chunk first
+/// whichever identifier sorts higher rather than to the one written last.
+///
+/// The verdict settles at an object's newest kind change, but the scan walks the
+/// rest of that object's applicability history, because an older row can carry a
+/// newer invalidation. The budget poll and the progress handler bound that walk,
+/// and the dedup identity keeps the history proportional to distinct failing
+/// checkout states rather than to evaluation count. Rows decode as the scan streams them. Collecting the chunk first
 /// would materialize every historical payload for every identifier before a
 /// single one is inspected.
 fn reduce_chunk(
@@ -720,12 +726,6 @@ fn reduce_chunk(
             return Err(KernelError::Deadline);
         }
         let object_id: String = row.get(0).map_err(scan_error)?;
-        if matches!(
-            pending.get(&object_id),
-            Some(Reduction::Done(_) | Reduction::Unreadable)
-        ) {
-            continue;
-        }
         let kind: String = row.get(1).map_err(|_| KernelError::Io)?;
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
@@ -755,12 +755,23 @@ fn reduce_chunk(
             }
         }
         // An invalidated row is out of the reduction but still moves the
-        // generation, so a replacement repair cannot reuse its identity.
+        // generation, so a replacement repair cannot reuse its identity. Folded
+        // before the settled check below: a row older than the newest kind
+        // change can carry a newer invalidation than that change, and skipping
+        // it would understate the generation.
         if let Some(invalidated) = invalidated {
             invalidations
-                .entry(object_id.clone())
+                .entry(object_id)
                 .and_modify(|newest| *newest = (*newest).max(invalidated))
                 .or_insert(invalidated);
+            continue;
+        }
+        // The verdict stops at the newest kind change; the scan continues so
+        // older invalidations still reach the generation.
+        if matches!(
+            pending.get(&object_id),
+            Some(Reduction::Done(_) | Reduction::Unreadable)
+        ) {
             continue;
         }
         let entry = pending.entry(object_id).or_insert(Reduction::Latest);
