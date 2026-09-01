@@ -77,12 +77,14 @@ jobs:
       - name: Build harness plugin
         run: bun run --cwd packages/plugin build
 
-      # Reruns share `github.run_id`; omitting `restore-keys` prevents fresh runs from reusing completed rollouts.
+      # Reruns share `github.run_id`; the prefix restore keeps progress accumulating across attempts of one dispatch while a fresh run cannot reuse it.
       - name: Restore mode rollout records
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
-          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-
 
       - name: Restore calibration evidence
         if: env.PAIRED_DELTA_MODE != 'calibration'
@@ -107,12 +109,13 @@ jobs:
           if [[ -f "$RECORDS" ]]; then ARGS+=("--resume"); fi
           bun packages/e2e-tests/scripts/run-paired-delta.ts "${ARGS[@]}"
 
-      - name: Save rollout records for the next dispatch
+      # Cache entries are immutable, so the attempt is part of the key: a rerun writes its own accumulated progress instead of failing to replace the first attempt's checkpoint.
+      - name: Save rollout records for the next attempt
         if: always() && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE)) != ''
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
-          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Weekly and release dispatches now fail closed on an invalid record, so caching one would block every later run.
       - name: Save calibration evidence

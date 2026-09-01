@@ -641,36 +641,58 @@ export function createLiveDependencies(input: {
             baseScriptFingerprint: expectedFingerprint,
             intervention,
         }) {
-            const harness = await TestHarness.create(
-                armOptions(
-                    input.apiKey,
-                    input.providerId,
-                    input.modelId,
-                    scenario,
-                    coordinate.armId,
-                ),
+            const harnessOptions = armOptions(
+                input.apiKey,
+                input.providerId,
+                input.modelId,
+                scenario,
+                coordinate.armId,
             );
+            let harness = await TestHarness.create(harnessOptions);
             let seeded: ReturnType<typeof seedGoldMemories> = [];
             let scriptedTurnText: string | undefined;
+            /** R2 supplies the gold as memory and R3 supplies the same content in the prompt, so the seeded row carries the declared claim alone; a second labelled copy of the evidence would make `R3 - R2` measure duplicated content as well as representation. */
+            const seedOracleMemories = async (): Promise<typeof seeded> => {
+                /** `seedGoldMemories` requires `context.db` to exist; the plugin creates it after the server reports ready. */
+                await harness.waitFor(() => harness.hasContextDb(), {
+                    label: "context.db created",
+                });
+                const rows: GoldMemoryRow[] = scenario.interventions.r2.memories.map(
+                    ({ claim }) => ({ category: "PROJECT_RULES", content: claim }),
+                );
+                return seedGoldMemories({
+                    workdir: harness.opencode.env.workdir,
+                    dbPath: harness.contextDbPath(),
+                    rows,
+                    verification: coordinate.armId === "r1" ? "candidate" : "verified",
+                });
+            };
+            const locatorIds = (): string[] =>
+                seeded.map(({ publicClaimId }) => publicClaimId);
             return {
                 async prepare() {
                     if (coordinate.armId !== "r1" && coordinate.armId !== "r2") return;
-                    /** `seedGoldMemories` requires `context.db` to exist; the plugin creates it after the server reports ready. */
-                    await harness.waitFor(() => harness.hasContextDb(), {
-                        label: "context.db created",
-                    });
-                    const rows: GoldMemoryRow[] = scenario.interventions.r2.memories.map(
-                        ({ claim, evidence }) => ({
-                            category: "PROJECT_RULES",
-                            content: `${claim}\nEvidence: ${evidence}`,
-                        }),
-                    );
-                    seeded = seedGoldMemories({
-                        workdir: harness.opencode.env.workdir,
-                        dbPath: harness.contextDbPath(),
-                        rows,
-                        verification: coordinate.armId === "r1" ? "candidate" : "verified",
-                    });
+                    seeded = await seedOracleMemories();
+                    if (coordinate.armId !== "r1") return;
+                    /**
+                     * A resolved id that contains the answer would reveal the gold in the model-visible query, and `seedGoldMemories` resolves a repeated row onto the same claim, so a new id needs a new database.
+                     * Reseeding rather than excluding keeps the sample: exclusion is input-dependent and removes R1 observations only for scenarios with short answers, biasing the retrieval rung.
+                     */
+                    for (
+                        let attempt = 1;
+                        r1QueryLeaksAnswer(scenario, locatorIds());
+                        attempt++
+                    ) {
+                        if (attempt > R1_RESEED_ATTEMPTS) {
+                            throw new Error(
+                                `paired-delta r1 locator ids revealed the answer for ` +
+                                `${scenario.scenarioId} across ${R1_RESEED_ATTEMPTS} reseeds`,
+                            );
+                        }
+                        await harness.dispose();
+                        harness = await TestHarness.create(harnessOptions);
+                        seeded = await seedOracleMemories();
+                    }
                 },
                 async run(): Promise<RolloutObservation> {
                     const sessionId = await harness.createSession();
@@ -734,7 +756,7 @@ export function createLiveDependencies(input: {
                     }
                     const last = responses.at(-1);
                     if (!last) throw new Error("scenario produced no live prompts");
-                    const resolvedLocatorIds = seeded.map(({ publicClaimId }) => publicClaimId);
+                    const resolvedLocatorIds = locatorIds();
                     const checks = await scenario.verifier({
                         armId: coordinate.armId,
                         workspacePath: harness.opencode.env.workdir,
@@ -759,8 +781,8 @@ export function createLiveDependencies(input: {
                             authoredEvidenceAbsentFromMemory(harness, scenario)
                         );
                     /**
-                     * The R1 gates are folded into arm identity because an undelivered or answer-revealing search turn leaves an arm that is not R1, and the observation carries no separate validity channel.
-                     * A leaking locator set is excluded rather than reseeded, which biases against short numeric answers; reseeding needs a fresh database, so it belongs with the runner that owns harness creation.
+                     * An undelivered search turn leaves an arm that is not R1, and the observation carries no separate validity channel, so the gate folds into arm identity.
+                     * `prepare` reseeds until the locator query is non-leaking, so the leak test here only catches a reseed loop that stopped honoring its own contract.
                      */
                     const r1Valid = coordinate.armId !== "r1" ||
                         (
@@ -911,6 +933,12 @@ function buildAnalysis(
 
 const BOOTSTRAP_SEED = 20260831;
 
+/** Bound on R1 database reseeds. Each attempt draws fresh 32-hex ids, so exhausting the bound is a contract failure rather than bad luck, and it is reported as one. */
+const R1_RESEED_ATTEMPTS = 8;
+
+/** A calibration run that completes without producing sizing-valid evidence exits with its own code, so the workflow does not cache a record every later dispatch rejects. */
+const INVALID_CALIBRATION_EXIT = 5;
+
 /** The live lane derives its deltas from rollout records, so it publishes no prospective paired-case facts. */
 const LIVE_LANE_PAIRS = [] as const;
 
@@ -986,6 +1014,13 @@ async function runLive(args: CliArgs): Promise<void> {
     if (manifestFingerprint !== policy.poolManifestFingerprint) {
         throw new Error("paired-delta policy does not bind the current pool manifest");
     }
+    /** The report binds the whole policy fingerprint, so executing one entry of a longer matrix would publish coverage the run never had. */
+    if (policy.modelMatrix.length !== 1) {
+        throw new Error(
+            `paired-delta live lane executes exactly one model; the policy declares ` +
+            `${policy.modelMatrix.length}`,
+        );
+    }
     const model = policy.modelMatrix[0];
     if (!model || !/-\d{8}$/.test(model.modelId)) {
         throw new Error("paired-delta policy requires a dated model snapshot");
@@ -1059,6 +1094,7 @@ async function runLive(args: CliArgs): Promise<void> {
     const scenarioFamilies = new Map(
         scenarios.map(({ scenarioId, familyId }) => [scenarioId, familyId]),
     );
+    let calibrationValidForSizing = true;
     if (mode === "calibration") {
         const calibration = buildCalibrationRecord({
             records: result.records,
@@ -1075,6 +1111,7 @@ async function runLive(args: CliArgs): Promise<void> {
         });
         publishCalibrationRecord(calibration, args.calibrationRecordPath);
         noiseFloors = calibrationNoiseFloors(calibration);
+        calibrationValidForSizing = calibration.validForPoolSizing;
     }
     const analysis = buildAnalysis(
         result,
@@ -1110,7 +1147,20 @@ async function runLive(args: CliArgs): Promise<void> {
         spentUsd: result.spentUsd,
         analyzableFamilyCount: analysis.analyzableFamilyCount,
         evidenceSufficient: analysis.evidenceSufficient,
+        validForPoolSizing: mode === "calibration" ? calibrationValidForSizing : null,
     }, null, 2));
+    /** A non-completed status outranks the calibration verdict, because the caller keyed on `harness-unreclaimed` must not lose it. */
+    if (result.status !== "completed") {
+        process.exitCode = EXIT_CODES[result.status];
+        return;
+    }
+    if (!calibrationValidForSizing) {
+        console.error(
+            "paired-delta calibration completed without evidence valid for pool sizing",
+        );
+        process.exitCode = INVALID_CALIBRATION_EXIT;
+        return;
+    }
     process.exitCode = EXIT_CODES[result.status];
 }
 
