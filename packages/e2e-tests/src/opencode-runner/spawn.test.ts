@@ -347,6 +347,21 @@ describe("opencode child lifecycle", () => {
                 }
             }).toThrow(/Anthropic-style key as a property name/);
 
+            // A composite key satisfies both key rules; whichever wins must not name it.
+            expect(() => {
+                try {
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        openCodeConfigExtra: {
+                            headers: { "sk-ant-abcdefghijklmnopqrstuv-apiKey": true },
+                        },
+                    });
+                } catch (error) {
+                    expect(String(error)).not.toContain("sk-ant-abcdefghijklmnopqrstuv");
+                    throw error;
+                }
+            }).toThrow(/Anthropic-style key as a property name/);
+
             // A deep-merged live provider's baseURL is a config value like any other, and a
             // signed URL's signature passes every whole-value rule.
             expect(() =>
@@ -674,7 +689,7 @@ describe("opencode child lifecycle", () => {
         }
     });
 
-    it("stops the Rust fixture when config serialization fails before spawn", async () => {
+    it("never provisions the Rust fixture when config serialization fails", async () => {
         const root = mkdtempSync(join(tmpdir(), "opencode-spawn-rollback-"));
         const env: IsolatedEnv = {
             configDir: join(root, "config"),
@@ -687,6 +702,7 @@ describe("opencode child lifecycle", () => {
         writeFileSync(fixtureState, "running");
 
         let stopCalls = 0;
+        let provisionCalls = 0;
         const mcHost = {
             connectionFile: join(env.dataDir, "mc-host-connection.json"),
             async stop(): Promise<void> {
@@ -707,14 +723,19 @@ describe("opencode child lifecycle", () => {
                         port: 1,
                         openCodeConfigExtra: cyclic,
                     },
-                    async () => ({ env, connectionFile: mcHost.connectionFile, mcHost }),
+                    async () => {
+                        provisionCalls += 1;
+                        return { env, connectionFile: mcHost.connectionFile, mcHost };
+                    },
                 )
                 .catch((failure: unknown) => failure);
 
             expect(String(error)).toContain("cyclic structures");
-            expect(stopCalls).toBe(1);
-            expect(existsSync(fixtureState)).toBe(false);
-            expect(existsSync(dirname(env.dataDir))).toBe(false);
+            // The config is canonicalized before provisioning, so there is no fixture to
+            // stop: a rejected spawn does not create resources it then has to tear down.
+            expect(provisionCalls).toBe(0);
+            expect(stopCalls).toBe(0);
+            expect(existsSync(fixtureState)).toBe(true);
         } finally {
             if (previousMode === undefined) delete process.env.MC_E2E_MODE;
             else process.env.MC_E2E_MODE = previousMode;

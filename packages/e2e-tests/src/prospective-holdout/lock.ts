@@ -48,9 +48,9 @@ function holderAlive(pid: number): boolean {
 /** Distinguishes "this path holds no parseable claim" from "this path could not be read at all". Release has to tell them apart: an unreadable record may still be this process's own claim, and treating a transient `EIO` or `EACCES` as a foreign owner let release report success over a directory it had not removed. commentlint: allow(JUDGE) */
 class LockOwnerUnreadableError extends Error {}
 
-function readLockOwner(lock: string): LockOwner | null {
+function parseLockOwner(text: string): LockOwner | null {
     try {
-        const value = JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8")) as unknown;
+        const value = JSON.parse(text) as unknown;
         if (typeof value !== "object" || value === null) return null;
         const { pid, nonce, acquiredAt } = value as Record<string, unknown>;
         // Nonpositive PIDs address process groups rather than individual processes.
@@ -63,19 +63,28 @@ function readLockOwner(lock: string): LockOwner | null {
     }
 }
 
+function readLockOwner(lock: string): LockOwner | null {
+    try {
+        return parseLockOwner(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"));
+    } catch {
+        return null;
+    }
+}
+
 /** `readLockOwner` reports "no parseable claim" for both an absent record and an unreadable one, which is the right answer for judging abandonment or contention — neither can act on a record it cannot read. Release is the exception: it deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and a malformed one stay `null`; anything else raises. commentlint: allow(JUDGE) */
 function readLockOwnerForRelease(lock: string): LockOwner | null {
+    let text: string;
     try {
-        readFileSync(join(lock, LOCK_OWNER_FILE));
+        text = readFileSync(join(lock, LOCK_OWNER_FILE), "utf8");
     } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT" && code !== "ENOTDIR") {
-            throw new LockOwnerUnreadableError(
-                `lock owner record at ${lock} could not be read (${String(code)})`,
-            );
-        }
+        if (code === "ENOENT" || code === "ENOTDIR") return null;
+        throw new LockOwnerUnreadableError(
+            `lock owner record at ${lock} could not be read (${String(code)})`,
+        );
     }
-    return readLockOwner(lock);
+    /** The checked bytes are parsed here rather than re-read through `readLockOwner`: a second read can fail where the first succeeded, and that helper answers `null` for a failure, which release would take as proof the claim is foreign. commentlint: allow(JUDGE) */
+    return parseLockOwner(text);
 }
 
 /**
@@ -249,6 +258,8 @@ function releaseLock(lock: string): void {
     sweepSidelines();
     if (readLockOwnerForRelease(lock)?.nonce === LOCK_NONCE) {
         rmSync(lock, { recursive: true, force: true });
+        /** The same check-then-delete gap as above, so it gets the same treatment: a reclaimer moving this record between the check and the removal leaves it at a sideline, and only a sweep behind the delete finds it there. Each pass narrows the interleaving; none closes it, because reclamation cannot be made atomic against a concurrent reclaimer. commentlint: allow(JUDGE) */
+        sweepSidelines();
     }
 }
 

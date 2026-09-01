@@ -378,13 +378,7 @@ function assertConfigHasNoCredentials(
                 }
                 /** No `continue`: an unrecognized name falls through to the rules below, where the credential-bearing-key rule is what refuses it. Only a name the sensitive-key rule recognizes is an approved channel. commentlint: allow(JUDGE) */
             }
-            if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
-                throw new Error(
-                    `config contains credential-shaped key: ${childPath}; ` +
-                        "pass credentials through extraEnv",
-                );
-            }
-            /** A property name can be the credential rather than describe one — `{ "sk-ant-…": true }` reaches the file through the key, where the semantic-word rule finds nothing and the value rules never look. The path is omitted from this diagnostic because it contains the key, and reporting it would put the secret in the log the guard exists to keep it out of. commentlint: allow(JUDGE) */
+            /** A property name can be the credential rather than describe one — `{ "sk-ant-…": true }` reaches the file through the key, where the semantic-word rule finds nothing and the value rules never look. Checked before the semantic rule because a composite key can satisfy both — `sk-ant-…-apiKey` is a credential *and* ends in a credential word — and that rule interpolates the path, which contains the key. Whichever diagnostic wins must be the one that does not name it. commentlint: allow(JUDGE) */
             if (!Array.isArray(current)) {
                 const keyFormat = credentialValueFormat(key) ?? urlCredentialFinding(key);
                 if (keyFormat !== null) {
@@ -393,6 +387,12 @@ function assertConfigHasNoCredentials(
                             "pass credentials through extraEnv",
                     );
                 }
+            }
+            if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
+                throw new Error(
+                    `config contains credential-shaped key: ${childPath}; ` +
+                        "pass credentials through extraEnv",
+                );
             }
             if (typeof child === "string") {
                 /** A config value can be a URL as easily as the harness's own can, and a deep-merged live provider's `baseURL` is exactly that: a signed URL's signature is recognized by parameter name, which no value rule reads. Run first for the same reason as above — it names the component. commentlint: allow(JUDGE) */
@@ -606,6 +606,13 @@ async function spawnOpencodeWithProvision(
 ): Promise<SpawnedOpencode> {
     const hostname = opts.hostname ?? "0.0.0.0";
     assertSecretsBoundToLoopback(opts, hostname);
+    /** Canonicalized and scanned before provisioning, for the same reason the loopback gate runs first: a rejected spawn must not have created a hermetic Rust stack to tear down. `canonicalizeSpawnConfigs` snapshots `extraEnv` ahead of any `toJSON()` and returns that snapshot, so the map the scan read is the map the child is given — re-reading `opts.extraEnv` later would forward whatever a hook left behind, and a hook that replaces the map is never seen by the scan at all. A hook serializes config; it does not get a say in the child's environment. commentlint: allow(JUDGE) */
+    const canonicalOpts: SpawnOptions = canonicalizeSpawnConfigs(opts);
+    /** The gate reads both maps merged. A hook cannot reach the child, but adding a sensitive name is still an attempt worth refusing rather than silently dropping, and this gate is the one that reads the hostname. commentlint: allow(JUDGE) */
+    assertSecretsBoundToLoopback({
+        ...canonicalOpts,
+        extraEnv: { ...(canonicalOpts.extraEnv ?? {}), ...(opts.extraEnv ?? {}) },
+    }, hostname);
 
     // `MC_E2E_MODE` is evaluated at this shared spawn path so Rust suites share provisioning behavior.
     const rustMode = process.env.MC_E2E_MODE === "rust";
@@ -636,14 +643,6 @@ async function spawnOpencodeWithProvision(
     let stdoutBuf = "";
     let stderrBuf = "";
     try {
-        /** Canonicalized once here so the database decision below and `writeConfigs` cannot read different representations of the same config. commentlint: allow(JUDGE) */
-        /** `canonicalizeSpawnConfigs` snapshots `extraEnv` before running any `toJSON()`, and returns that snapshot, so the map the credential scan read is the map the child is given. Re-reading `opts.extraEnv` for the child instead would forward whatever a hook left behind, and a hook that replaces the map rather than mutating it is never seen by the scan at all — so its placeholder targets go unread. A hook serializes config; it does not get a say in the child's environment. commentlint: allow(JUDGE) */
-        const canonicalOpts: SpawnOptions = canonicalizeSpawnConfigs(opts);
-        /** The gate reads both maps merged. A hook cannot reach the child, but adding a sensitive name is still an attempt worth refusing rather than silently dropping, and this gate is the one that reads the hostname. commentlint: allow(JUDGE) */
-        assertSecretsBoundToLoopback({
-            ...canonicalOpts,
-            extraEnv: { ...(canonicalOpts.extraEnv ?? {}), ...(opts.extraEnv ?? {}) },
-        }, hostname);
         const resolvedOpts: SpawnOptions = resources
             ? {
                   ...canonicalOpts,

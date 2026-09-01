@@ -108,15 +108,21 @@ function smokeRepoCommit(recordsPath: string): string {
     /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. commentlint: allow(JUDGE) */
     /** `publishJsonAtomically` writes through `${path}.tmp-<hex>` before renaming, so a run killed mid-write leaves one behind; the lock is a directory the next run reclaims. Both are runner-owned output, and hashing either would reject every stored coordinate. commentlint: allow(JUDGE) */
     /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
-    const owned = [
-        recordsPath,
-        `${recordsPath}.lock`,
-        `${recordsPath}.lock.reclaimed-*`,
-        `${recordsPath}.tmp-*`,
-    ]
-        .map((path) => relativeTo(root, path))
+    const relative = (path: string): string | null => relativeTo(root, path);
+    /** The exact paths are excluded as literals because they come from `--records`: a value carrying pathspec metacharacters — `artifacts/run[1].json` — would otherwise exclude unrelated matching paths, dropping their changes from the status, the diff, and the untracked hash, so a resume could reuse records produced against different working code. commentlint: allow(JUDGE) */
+    const exact = [recordsPath, `${recordsPath}.lock`]
+        .map(relative)
+        .filter((path): path is string => path !== null)
+        .map((path) => `:(exclude,literal)${path}`);
+    /** The suffix families need pattern meaning, so they cannot be literal; the caller-supplied prefix is escaped instead, leaving only the trailing `*` as a wildcard. commentlint: allow(JUDGE) */
+    const escapeGlob = (path: string): string => path.replace(/[\\[\]*?]/g, "\\$&");
+    const globbed = [".lock.reclaimed-", ".tmp-"]
+        .map((suffix) => {
+            const prefix = relative(`${recordsPath}${suffix}`);
+            return prefix === null ? null : `:(exclude)${escapeGlob(prefix)}*`;
+        })
         .filter((path): path is string => path !== null);
-    const scope = [".", ...owned.map((path) => `:(exclude)${path}`)];
+    const scope = [".", ...exact, ...globbed];
     const status = git([
         "status",
         "--porcelain",
