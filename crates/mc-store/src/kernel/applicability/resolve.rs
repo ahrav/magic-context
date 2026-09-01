@@ -2,7 +2,7 @@
 //! patch identity, and the exact-OID → ancestry → patch-ID → tree-hash
 //! fallback ladder with stop-on-ambiguity.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -59,6 +59,13 @@ pub struct ResolutionLadder<'s> {
     window: RefCell<Option<CandidateWindow>>,
     /// A candidate's patch identity depends only on its commit.
     patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
+    graph_operations: Cell<u64>,
+    /// Whether any resolution needed an object the database did not hold.
+    saw_unreadable_object: Cell<bool>,
+    /// Sticky once movement is seen. Only that direction is memoized: a commentlint: allow(JUDGE)
+    /// boundary that matched before one walk says nothing about the boundary a commentlint: allow(JUDGE)
+    /// later walk ran under. commentlint: allow(JUDGE)
+    repository_state_moved: Cell<bool>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -70,7 +77,79 @@ impl<'s> ResolutionLadder<'s> {
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
             patch_id_cache: RefCell::new(HashMap::new()),
+            graph_operations: Cell::new(0),
+            saw_unreadable_object: Cell::new(false),
+            repository_state_moved: Cell::new(false),
         }
+    }
+
+    /// Object-database operations performed so far: ancestry walks,
+    /// candidate-window builds, and patch-ID computations. The zero-IO
+    /// cache-hit proof asserts this stays flat on hits.
+    pub fn graph_operations(&self) -> u64 {
+        self.graph_operations.get()
+    }
+
+    pub fn budget_was_exhausted(&self) -> bool {
+        self.budget.is_exhausted()
+    }
+
+    /// Whether any resolution this request performed needed an object the
+    /// database did not hold.
+    ///
+    /// Object availability is deliberately outside the snapshot generation, commentlint: allow(JUDGE)
+    /// because a fetch can supply a missing commit without moving HEAD, the commentlint: allow(JUDGE)
+    /// worktree, sparse configuration, or the shallow file. An outcome that commentlint: allow(JUDGE)
+    /// rests on an absent object is therefore transient exactly as a commentlint: allow(JUDGE)
+    /// budget-driven one is, and is not retained. commentlint: allow(JUDGE)
+    ///
+    /// This is a request-wide predicate rather than a per-evaluation delta on commentlint: allow(JUDGE)
+    /// purpose. The ancestry, window, and patch-ID memos serve later commentlint: allow(JUDGE)
+    /// candidates from the first candidate's work, so a delta would credit the commentlint: allow(JUDGE)
+    /// absent object only to whichever candidate happened to read it first and commentlint: allow(JUDGE)
+    /// let every other candidate retain the same uncertainty. An incomplete commentlint: allow(JUDGE)
+    /// object database is a property of the request, not of one lookup. commentlint: allow(JUDGE)
+    pub fn saw_unreadable_object(&self) -> bool {
+        self.saw_unreadable_object.get()
+    }
+
+    fn note_unreadable_object(&self) {
+        self.saw_unreadable_object.set(true);
+    }
+
+    /// Whether sparse or shallow state moved out from under the graph work this
+    /// request performed.
+    ///
+    /// Unlike an absent object, this invalidates every outcome rather than only commentlint: allow(JUDGE)
+    /// an uncertain one: a walk that ran under a deepened boundary can report commentlint: allow(JUDGE)
+    /// `Holds` where the boundary the key names would truncate it, and commentlint: allow(JUDGE)
+    /// re-truncating to that same boundary makes the key match again. Callers commentlint: allow(JUDGE)
+    /// therefore ask before retaining any graph-derived verdict. Only commentlint: allow(JUDGE)
+    /// movement is memoized, so an unchanged boundary is re-read on every commentlint: allow(JUDGE)
+    /// call: a match established before one walk says nothing about the commentlint: allow(JUDGE)
+    /// boundary a later walk ran under. commentlint: allow(JUDGE)
+    pub fn repository_state_moved(&self) -> bool {
+        if self.repository_state_moved.get() {
+            return true;
+        }
+        let moved = !self.snapshot.repository_state_still_current(self.budget);
+        if moved {
+            self.repository_state_moved.set(true);
+        }
+        moved
+    }
+
+    /// Whether movement was already seen, without re-reading.
+    ///
+    /// A verdict that reused this request's graph work — through the anchor commentlint: allow(JUDGE)
+    /// memo or the anchor cache — inherits whatever the walk behind it ran commentlint: allow(JUDGE)
+    /// under, and performs no graph operations of its own to reveal it. commentlint: allow(JUDGE)
+    pub fn repository_state_movement_seen(&self) -> bool {
+        self.repository_state_moved.get()
+    }
+
+    fn count_graph_operation(&self) {
+        self.graph_operations.set(self.graph_operations.get() + 1);
     }
 
     /// Evaluates a git anchor condition via independent ancestry tests —
@@ -130,6 +209,11 @@ impl<'s> ResolutionLadder<'s> {
         };
         let anchor = ObjectId::from_hex(oid_hex.as_bytes()).ok();
         let anchor_present = anchor.is_some_and(|oid| repo.find_commit(oid).is_ok());
+        // A parsed OID the database does not hold is the availability case: a
+        // fetch can supply it later without moving anything the key covers.
+        if anchor.is_some() && !anchor_present {
+            self.note_unreadable_object();
+        }
         // An undecided ancestry test still permits a positive fallback match. commentlint: allow(JUDGE)
         // Every window candidate is reachable from HEAD, so a match proves commentlint: allow(JUDGE)
         // reachability; it only bars the negative conclusion below. commentlint: allow(JUDGE)
@@ -257,6 +341,8 @@ impl<'s> ResolutionLadder<'s> {
             if self.budget.is_exhausted() {
                 return WindowMatch::Budget;
             }
+            // `matches` performs graph operations not counted internally.
+            self.count_graph_operation();
             match matches(candidate) {
                 Ok(true) => {
                     if found.replace(candidate).is_some() {
@@ -265,7 +351,10 @@ impl<'s> ResolutionLadder<'s> {
                 }
                 Ok(false) => {}
                 Err(ResolveObstacle::BudgetExhausted) => return WindowMatch::Budget,
-                Err(ResolveObstacle::UnreadableObject) => return WindowMatch::Unreadable,
+                Err(ResolveObstacle::UnreadableObject) => {
+                    self.note_unreadable_object();
+                    return WindowMatch::Unreadable;
+                }
             }
         }
         match found {
@@ -280,21 +369,58 @@ impl<'s> ResolutionLadder<'s> {
         if let Some(window) = self.window.borrow().as_ref() {
             return Some(window.clone());
         }
+        self.count_graph_operation();
         let repo = self.snapshot.repo();
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
         // The walk follows all parents: a rewrite reachable only through a
         // merge's non-first parent is still a fallback candidate.
-        let walk = repo.rev_walk([head]).all().ok()?;
+        //
+        // A walk that cannot start, or that stops advancing partway, wanted a commentlint: allow(JUDGE)
+        // commit the database does not hold. That is the availability case, commentlint: allow(JUDGE)
+        // not budget exhaustion: without recording it, the caller reports the commentlint: allow(JUDGE)
+        // same `Uncertain` a deadline produces while both transience commentlint: allow(JUDGE)
+        // predicates read false, so the verdict is retained and a fetch commentlint: allow(JUDGE)
+        // supplying the missing commit cannot dislodge it until eviction. commentlint: allow(JUDGE)
+        let walk = match repo.rev_walk([head]).all() {
+            Ok(walk) => walk,
+            Err(_) => {
+                self.note_unreadable_object();
+                return None;
+            }
+        };
         let mut commits = Vec::new();
         let mut walk = walk.into_iter();
         for info in walk.by_ref().take(CANDIDATE_WINDOW) {
             if self.budget.is_exhausted() {
                 return None;
             }
-            commits.push(info.ok()?.id);
+            match info {
+                Ok(info) => commits.push(info.id),
+                Err(_) => {
+                    self.note_unreadable_object();
+                    return None;
+                }
+            }
+        }
+        // `is_some` cannot separate a real next commit from a walk that failed commentlint: allow(JUDGE)
+        // to reach one. Scanned commits stay candidates either way, since each commentlint: allow(JUDGE)
+        // is reachable from HEAD and a positive match resolves regardless of commentlint: allow(JUDGE)
+        // what lies beyond the window; truncation withholds only the negative commentlint: allow(JUDGE)
+        // conclusion, while the absent object keeps the uncertainty a miss commentlint: allow(JUDGE)
+        // produces out of both caches. commentlint: allow(JUDGE)
+        let mut truncated = false;
+        if commits.len() == CANDIDATE_WINDOW {
+            match walk.next() {
+                Some(Ok(_)) => truncated = true,
+                Some(Err(_)) => {
+                    self.note_unreadable_object();
+                    truncated = true;
+                }
+                None => {}
+            }
         }
         let window = CandidateWindow {
-            truncated: commits.len() == CANDIDATE_WINDOW && walk.next().is_some(),
+            truncated,
             commits: commits.into(),
         };
         *self.window.borrow_mut() = Some(window.clone());
@@ -305,6 +431,7 @@ impl<'s> ResolutionLadder<'s> {
         if let Some(cached) = self.patch_id_cache.borrow().get(&candidate) {
             return Ok(cached.clone());
         }
+        self.count_graph_operation();
         let patch_id = compute_patch_id(self.snapshot.repo(), candidate, self.budget)?;
         self.patch_id_cache
             .borrow_mut()
@@ -398,11 +525,21 @@ impl<'s> ResolutionLadder<'s> {
     /// boundary, which is indistinguishable from disjoint history, so a commentlint: allow(JUDGE)
     /// negative result there stays unknown. commentlint: allow(JUDGE)
     fn test_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+        self.count_graph_operation();
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
+            self.note_unreadable_object();
             return None;
         }
-        let bases = repo.merge_bases_many(ancestor, &[descendant]).ok()?;
+        // Both endpoints exist, so a failure here is a missing object further
+        // in: an intermediate parent a later fetch can supply.
+        let bases = match repo.merge_bases_many(ancestor, &[descendant]) {
+            Ok(bases) => bases,
+            Err(_) => {
+                self.note_unreadable_object();
+                return None;
+            }
+        };
         // Do not return a graph result after the budget expires.
         if self.budget.is_exhausted() {
             return None;

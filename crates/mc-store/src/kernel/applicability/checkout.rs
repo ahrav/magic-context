@@ -31,33 +31,64 @@ const HASH_CHUNK_BYTES: usize = 64 * 1024;
 /// `readlinkat`. commentlint: allow(JUDGE)
 ///
 /// `workdir` is trusted; its resolved directory is the containment root.
-fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> Option<(OwnedFd, OsString)> {
+enum ParentDir {
+    Opened(OwnedFd, OsString),
+    /// An ancestor does not exist, so nothing beneath it exists either. Read commentlint: allow(JUDGE)
+    /// repair needs that separated from a walk that failed: absence is a commentlint: allow(JUDGE)
+    /// definite answer about the checked path, whereas a refused or unreadable commentlint: allow(JUDGE)
+    /// ancestor hides whatever is really there. commentlint: allow(JUDGE)
+    AncestorAbsent,
+    Unresolvable,
+}
+
+impl ParentDir {
+    /// For callers that owe the same answer however the walk stopped.
+    fn opened(self) -> Option<(OwnedFd, OsString)> {
+        match self {
+            Self::Opened(dir, name) => Some((dir, name)),
+            Self::AncestorAbsent | Self::Unresolvable => None,
+        }
+    }
+}
+
+fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> ParentDir {
     let mut names = Vec::new();
     for component in rela_path.components() {
         match component {
             Component::Normal(name) => names.push(name),
             Component::CurDir => {}
             // Absolute roots, prefixes, and `..` leave the worktree.
-            _ => return None,
+            _ => return ParentDir::Unresolvable,
         }
     }
-    let (final_name, ancestors) = names.split_last()?;
-    let mut dir = rfs::open(
+    let Some((final_name, ancestors)) = names.split_last() else {
+        return ParentDir::Unresolvable;
+    };
+    let Ok(mut dir) = rfs::open(
         workdir,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         rfs::Mode::empty(),
-    )
-    .ok()?;
+    ) else {
+        return ParentDir::Unresolvable;
+    };
     for ancestor in ancestors {
-        dir = rfs::openat(
+        match rfs::openat(
             &dir,
             *ancestor,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             rfs::Mode::empty(),
-        )
-        .ok()?;
+        ) {
+            Ok(next) => dir = next,
+            // Only absence is definite. `O_PATH` with `NOFOLLOW` opens a commentlint: allow(JUDGE)
+            // symlinked ancestor rather than refusing it, so `O_DIRECTORY` commentlint: allow(JUDGE)
+            // rejects that link as `ENOTDIR` — indistinguishable here from a commentlint: allow(JUDGE)
+            // plain non-directory, and the link hides whatever it points at. commentlint: allow(JUDGE)
+            // Both stay unresolvable. commentlint: allow(JUDGE)
+            Err(rustix::io::Errno::NOENT) => return ParentDir::AncestorAbsent,
+            Err(_) => return ParentDir::Unresolvable,
+        }
     }
-    Some((dir, (*final_name).to_os_string()))
+    ParentDir::Opened(dir, (*final_name).to_os_string())
 }
 
 /// A path can be replaced after a stat; validate the opened descriptor
@@ -283,6 +314,11 @@ impl<'a> ScanCtx<'a> {
 pub struct DirtyEntry {
     pub path: String,
     pub path_encoding: PathEncoding,
+    /// The path exactly as the repository holds it. `path` is a rendering for commentlint: allow(JUDGE)
+    /// display and fingerprinting and is lossy for bytes that are not valid commentlint: allow(JUDGE)
+    /// UTF-8, so only these bytes identify the file; a rendering cannot say commentlint: allow(JUDGE)
+    /// where loss occurred, which leaves even its prefixes ambiguous. commentlint: allow(JUDGE)
+    pub raw_path: Vec<u8>,
     pub status: &'static str,
     pub content_hash: String,
 }
@@ -296,6 +332,20 @@ pub enum PathEncoding {
     LossyWithDigest,
 }
 
+impl DirtyEntry {
+    /// Whether this entry records an uncommitted change, as opposed to an index
+    /// bookkeeping flag the status walk does not inspect.
+    ///
+    /// `skip_worktree` and `assume_valid` entries are keyed straight from the commentlint: allow(JUDGE)
+    /// index so a fingerprint covers state the walk skips. Git reports both commentlint: allow(JUDGE)
+    /// clean, and a sparse checkout marks every unmaterialized path commentlint: allow(JUDGE)
+    /// `skip_worktree`, so treating them as dirty would gate every object commentlint: allow(JUDGE)
+    /// declaring such a path forever. commentlint: allow(JUDGE)
+    pub fn is_uncommitted_change(&self) -> bool {
+        !matches!(self.status, "skip_worktree" | "assume_valid")
+    }
+}
+
 impl PathEncoding {
     fn as_bytes(self) -> &'static [u8] {
         match self {
@@ -305,14 +355,16 @@ impl PathEncoding {
     }
 }
 
-/// Frozen view of one checkout, taken once per request: identity, HEAD, and
-/// the dirty state. Cache keys derive from `identity`, `head`, and
-/// `dirty_fingerprint`; the open repository handle serves the request's
-/// object-database work and is never cached.
+/// Frozen view of one checkout, taken once per request: identity, HEAD,
+/// repository state, and the dirty state. Cache keys derive from `identity`,
+/// `head`, `repository_state`, and the dirty entries an object declares; the
+/// open repository handle serves the request's object-database work and is
+/// never cached.
 pub struct CheckoutSnapshot {
     repo: gix::Repository,
     identity: String,
     head: String,
+    repository_state: String,
     dirty_fingerprint: String,
     dirty_entries: Vec<DirtyEntry>,
     shallow: bool,
@@ -331,6 +383,20 @@ impl CheckoutSnapshot {
         &self.head
     }
 
+    /// `repository_state` digests sparse-checkout configuration and shallow boundary. commentlint: allow(JUDGE)
+    ///
+    /// Unshallowing or a sparse-pattern edit moves neither HEAD nor the commentlint: allow(JUDGE)
+    /// worktree, so a cache key for a verdict that read history reach or path commentlint: allow(JUDGE)
+    /// materialization has to carry this generation. commentlint: allow(JUDGE)
+    ///
+    /// Object availability is deliberately outside it: a fetch can supply a commentlint: allow(JUDGE)
+    /// missing object without moving HEAD, the worktree, sparse configuration, commentlint: allow(JUDGE)
+    /// or the shallow file, so a verdict that rested on an absent object must commentlint: allow(JUDGE)
+    /// not be retained against this generation at all. commentlint: allow(JUDGE)
+    pub fn repository_state(&self) -> &str {
+        &self.repository_state
+    }
+
     /// Whether the repository was shallow when this snapshot was taken.
     ///
     /// A shallow boundary truncates every graph walk, so a negative ancestry commentlint: allow(JUDGE)
@@ -339,6 +405,23 @@ impl CheckoutSnapshot {
     /// fingerprint was fixed. commentlint: allow(JUDGE)
     pub fn is_shallow(&self) -> bool {
         self.shallow
+    }
+
+    /// Whether sparse configuration and the shallow boundary still match the commentlint: allow(JUDGE)
+    /// state this snapshot's cache keys record. commentlint: allow(JUDGE)
+    ///
+    /// The keys record that state once, while a graph walk reads the live commentlint: allow(JUDGE)
+    /// repository later. A concurrent fetch between the two makes a walk commentlint: allow(JUDGE)
+    /// answer for a boundary the key does not name, and a boundary that moves commentlint: allow(JUDGE)
+    /// away and back leaves that answer reachable under the original key. commentlint: allow(JUDGE)
+    /// State that cannot be re-read counts as moved: an unverifiable boundary commentlint: allow(JUDGE)
+    /// is no basis for retaining a verdict derived from one. commentlint: allow(JUDGE)
+    pub(super) fn repository_state_still_current(&self, budget: &EvalBudget) -> bool {
+        let ctx = ScanCtx::root(budget);
+        match repository_state(&self.repo, &ctx) {
+            Ok((state, _)) => hex_digest(&state) == self.repository_state,
+            Err(_) => false,
+        }
     }
 
     /// Digest over the sorted set of (path, status, content hash) for
@@ -375,6 +458,92 @@ impl CheckoutSnapshot {
     /// re-check it, or use no-follow access such as `symlink_metadata`. commentlint: allow(JUDGE)
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
         contained_path(self.repo.workdir()?, Path::new(rela_path))
+    }
+}
+
+/// Shape of one worktree entry, established without following a symlink at any
+/// level — ancestor or final.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WorktreeEntry {
+    RegularFile,
+    Absent,
+    Symlink,
+    Directory,
+    /// Present as something no reader can consume: FIFO, socket, device.
+    Other,
+    /// The declared spelling leaves the worktree, or its ancestors could not be
+    /// walked beneath it.
+    Unresolvable(String),
+}
+
+impl CheckoutSnapshot {
+    /// Inspects `rela_path` beneath the worktree without traversing a symlink.
+    ///
+    /// `worktree_path` validates containment against a pathname, which a commentlint: allow(JUDGE)
+    /// concurrent checkout can invalidate by replacing an ancestor directory commentlint: allow(JUDGE)
+    /// with a symlink before the caller looks. Resolving through commentlint: allow(JUDGE)
+    /// `open_parent_beneath` pins every ancestor's inode instead, so no rung of commentlint: allow(JUDGE)
+    /// the path can be swapped out from under this stat. commentlint: allow(JUDGE)
+    pub(super) fn worktree_entry(&self, rela_path: &str) -> WorktreeEntry {
+        let Some(workdir) = self.repo.workdir() else {
+            return WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} has no worktree to resolve against"
+            ));
+        };
+        // A malformed spelling and an ancestor that cannot be walked both stop
+        // `open_parent_beneath`, and read repair needs them distinguished.
+        if !Path::new(rela_path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} is not a plain relative path inside the checkout"
+            ));
+        }
+        let (dir, name) = match open_parent_beneath(workdir, Path::new(rela_path)) {
+            ParentDir::Opened(dir, name) => (dir, name),
+            // Nothing exists beneath a missing ancestor, so the checked path is
+            // definitely absent rather than unexamined.
+            ParentDir::AncestorAbsent => return WorktreeEntry::Absent,
+            ParentDir::Unresolvable => {
+                return WorktreeEntry::Unresolvable(format!(
+                    "path {rela_path} does not resolve beneath this checkout's worktree"
+                ));
+            }
+        };
+        match rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                let kind = rfs::FileType::from_raw_mode(stat.st_mode);
+                if kind.is_file() {
+                    WorktreeEntry::RegularFile
+                } else if kind.is_symlink() {
+                    WorktreeEntry::Symlink
+                } else if kind.is_dir() {
+                    WorktreeEntry::Directory
+                } else {
+                    WorktreeEntry::Other
+                }
+            }
+            Err(rustix::io::Errno::NOENT) => WorktreeEntry::Absent,
+            Err(error) => WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} could not be inspected: {error}"
+            )),
+        }
+    }
+
+    /// Opens `rela_path` beneath the worktree as a regular file, following no
+    /// symlink at any level. `Ok(None)` means no regular file is there.
+    pub(super) fn open_worktree_regular(
+        &self,
+        rela_path: &str,
+    ) -> Result<Option<std::fs::File>, rustix::io::Errno> {
+        let Some(workdir) = self.repo.workdir() else {
+            return Ok(None);
+        };
+        let Some((dir, name)) = open_parent_beneath(workdir, Path::new(rela_path)).opened() else {
+            return Ok(None);
+        };
+        open_regular_no_follow_at(&dir, name.as_os_str())
     }
 }
 
@@ -443,6 +612,7 @@ pub fn snapshot_checkout(
         repo,
         identity,
         head,
+        repository_state: hex_digest(&repository_state),
         dirty_fingerprint,
         dirty_entries,
         shallow,
@@ -527,7 +697,7 @@ fn scan_dirty_entries(
             continue;
         };
         let rela_path = entry.path(&index);
-        let (path, path_encoding) = encode_path(rela_path);
+        let (path, path_encoding, raw_path) = encode_path(rela_path);
         // A chmod moves the git entry mode while the bytes stay equal, so
         // the mode tag participates alongside the content hash. The index commentlint: allow(JUDGE)
         // blob id separates two absent-file states whose staged content commentlint: allow(JUDGE)
@@ -541,6 +711,7 @@ fn scan_dirty_entries(
             ),
             path,
             path_encoding,
+            raw_path,
             status,
         });
     }
@@ -559,17 +730,19 @@ fn index_worktree_entry(
         Item::Modification {
             rela_path, status, ..
         } => {
-            let (path, path_encoding) = encode_path(rela_path.as_ref());
+            let (path, path_encoding, raw_path) = encode_path(rela_path.as_ref());
             let entry = match status {
                 EntryStatus::Conflict { .. } => Some(DirtyEntry {
                     content_hash: conflict_content_hash(repo, rela_path.as_ref(), ctx)?,
                     path,
                     path_encoding,
+                    raw_path,
                     status: "conflicted",
                 }),
                 EntryStatus::Change(Change::Removed) => Some(DirtyEntry {
                     path,
                     path_encoding,
+                    raw_path,
                     status: "removed",
                     content_hash: "absent".to_string(),
                 }),
@@ -586,6 +759,7 @@ fn index_worktree_entry(
                     ),
                     path,
                     path_encoding,
+                    raw_path,
                     status: "modified",
                 }),
                 EntryStatus::IntentToAdd => Some(DirtyEntry {
@@ -596,6 +770,7 @@ fn index_worktree_entry(
                     ),
                     path,
                     path_encoding,
+                    raw_path,
                     status: "intent_to_add",
                 }),
                 // A racy stat with unchanged content is not dirty.
@@ -607,13 +782,14 @@ fn index_worktree_entry(
             if !matches!(entry.status, gix::dir::entry::Status::Untracked) {
                 return Ok(None);
             }
-            let (path, path_encoding) = encode_path(entry.rela_path.as_ref());
+            let (path, path_encoding, raw_path) = encode_path(entry.rela_path.as_ref());
             if entry.disk_kind.is_some_and(|kind| kind.is_dir()) {
                 // `UntrackedFiles::Files` emits contained files individually,
                 // so directory entries have no content to hash.
                 return Ok(Some(DirtyEntry {
                     path,
                     path_encoding,
+                    raw_path,
                     status: "untracked",
                     content_hash: "directory".to_string(),
                 }));
@@ -622,6 +798,7 @@ fn index_worktree_entry(
                 content_hash: worktree_content_hash(repo, entry.rela_path.as_ref(), ctx)?,
                 path,
                 path_encoding,
+                raw_path,
                 status: "untracked",
             }))
         }
@@ -632,9 +809,10 @@ fn index_worktree_entry(
 
 /// The digest suffix distinguishes non-UTF-8 paths that share a lossy
 /// string.
-fn encode_path(rela_path: &BStr) -> (String, PathEncoding) {
+fn encode_path(rela_path: &BStr) -> (String, PathEncoding, Vec<u8>) {
+    let raw = rela_path.as_bytes().to_vec();
     match rela_path.to_str() {
-        Ok(utf8) => (utf8.to_owned(), PathEncoding::Utf8),
+        Ok(utf8) => (utf8.to_owned(), PathEncoding::Utf8, raw),
         Err(_) => (
             format!(
                 "{}#x{:x}",
@@ -642,6 +820,7 @@ fn encode_path(rela_path: &BStr) -> (String, PathEncoding) {
                 Sha256::digest(rela_path.as_bytes())
             ),
             PathEncoding::LossyWithDigest,
+            raw,
         ),
     }
 }
@@ -681,10 +860,11 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
             format!("{}:{:o}", id.as_ref(), entry_mode.bits()),
         ),
     };
-    let (path, path_encoding) = encode_path(location.as_ref());
+    let (path, path_encoding, raw_path) = encode_path(location.as_ref());
     DirtyEntry {
         path,
         path_encoding,
+        raw_path,
         status,
         content_hash: id,
     }
@@ -708,7 +888,7 @@ fn worktree_content_hash(
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return Ok("unreadable".to_string());
     };
-    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path).opened() else {
         return Ok("out-of-worktree".to_string());
     };
     // Inspection failures use `unreadable`, distinct from content hashes.
@@ -811,6 +991,16 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(joined)
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> String {
@@ -929,7 +1119,7 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return "absent";
     };
-    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path).opened() else {
         return "absent";
     };
     let Ok(stat) = rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) else {
@@ -1107,8 +1297,11 @@ mod tests {
         std::fs::write(outside.join("inside"), b"escaped").unwrap();
 
         // Resolve while `real` is a genuine directory, as any check would.
-        let (dir_fd, name) =
-            open_parent_beneath(&workdir, Path::new("real/inside")).expect("a real ancestor opens");
+        let ParentDir::Opened(dir_fd, name) =
+            open_parent_beneath(&workdir, Path::new("real/inside"))
+        else {
+            panic!("a real ancestor opens");
+        };
         assert_eq!(name, OsStr::new("inside"));
 
         // The window a path-based open leaves: swap the validated ancestor.
@@ -1132,10 +1325,18 @@ mod tests {
             "the swap really does redirect the pathname"
         );
 
-        // A symlinked ancestor present up front is refused outright.
-        assert!(open_parent_beneath(&workdir, Path::new("real/inside")).is_none());
-        assert!(open_parent_beneath(&workdir, Path::new("../outside/inside")).is_none());
-        assert!(open_parent_beneath(&workdir, Path::new("")).is_none());
+        // A symlinked ancestor present up front is refused outright, and
+        // `Unresolvable` rather than `AncestorAbsent`: the link hides whatever
+        // it points at, so nothing about the checked path is settled.
+        for spelling in ["real/inside", "../outside/inside", ""] {
+            assert!(
+                matches!(
+                    open_parent_beneath(&workdir, Path::new(spelling)),
+                    ParentDir::Unresolvable
+                ),
+                "spelling {spelling:?} must stay unresolvable"
+            );
+        }
     }
 
     /// Resolving a known child needs search permission, not read permission,
@@ -1164,7 +1365,9 @@ mod tests {
         )
         .unwrap();
 
-        let (dir_fd, name) = resolved.expect("an execute-only ancestor is traversable");
+        let ParentDir::Opened(dir_fd, name) = resolved else {
+            panic!("an execute-only ancestor is traversable");
+        };
         assert!(open_regular_no_follow_at(&dir_fd, name.as_os_str())
             .expect("the file is not a scan failure")
             .is_some());
