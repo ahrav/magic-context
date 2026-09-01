@@ -94,17 +94,18 @@ impl<'s> ResolutionLadder<'s> {
                 let start = self.resolve_commit(start_oid, captures.get(start_oid));
                 let end = self.resolve_commit(end_oid, captures.get(end_oid));
                 match (start, end) {
+                    // Reaching the end exits the validity window, which is commentlint: allow(JUDGE)
+                    // exactly what `historical` records, so this side is commentlint: allow(JUDGE)
+                    // tested first: a start the ladder could not place must commentlint: allow(JUDGE)
+                    // not downgrade an end that is demonstrably reached. commentlint: allow(JUDGE)
+                    // `WallClockInterval` orders its bounds the same way. commentlint: allow(JUDGE)
+                    (_, CommitResolution::Reachable) => {
+                        GitConditionOutcome::DoesNotHold { historical: true }
+                    }
                     // An unreachable start falsifies the half-open window
                     // whatever the end resolves to: false dominates unknown.
                     (CommitResolution::NotReachable, _) => {
                         GitConditionOutcome::DoesNotHold { historical: false }
-                    }
-                    // A reached end closes the window whatever the start commentlint: allow(JUDGE)
-                    // resolves to, so false dominates unknown on this side commentlint: allow(JUDGE)
-                    // too, and the end having been reached is what commentlint: allow(JUDGE)
-                    // `historical` records. commentlint: allow(JUDGE)
-                    (_, CommitResolution::Reachable) => {
-                        GitConditionOutcome::DoesNotHold { historical: true }
                     }
                     (CommitResolution::Uncertain, _) | (_, CommitResolution::Uncertain) => {
                         GitConditionOutcome::Uncertain
@@ -183,7 +184,17 @@ impl<'s> ResolutionLadder<'s> {
         let stored_patch_id = capture
             .patch_id
             .as_ref()
-            .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM);
+            .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM)
+            // A current-tag value this build cannot have produced is commentlint: allow(JUDGE)
+            // uninterpretable fallback data, exactly like a malformed commentlint: allow(JUDGE)
+            // `tree_oid`: no candidate can ever equal it, so treating it as commentlint: allow(JUDGE)
+            // readable would turn a corrupt capture into an ordinary miss commentlint: allow(JUDGE)
+            // and let the scan conclude `NotReachable`. commentlint: allow(JUDGE)
+            .filter(|patch| {
+                let well_formed = is_sha256_hex(&patch.value);
+                patch_unreadable |= !well_formed;
+                well_formed
+            });
         if let Some(stored) = stored_patch_id {
             match self.match_candidates(|candidate| {
                 if !self.commit_touches_paths(candidate, &capture.changed_paths)? {
@@ -470,6 +481,14 @@ pub fn compute_patch_id(
     // the gate sits at the exit rather than ahead of the aggregation. commentlint: allow(JUDGE)
     budget_gate(budget)?;
     Ok(Some(format!("{:x}", combined.finalize())))
+}
+
+/// The exact rendering [`compute_patch_id`] emits: 64 lowercase hex digits.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Tree changes do not identify blobs; excluding them prevents blob lookup

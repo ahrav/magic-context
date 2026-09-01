@@ -646,6 +646,67 @@ fn unreachable_start_dominates_an_uncertain_end() {
 }
 
 #[test]
+fn a_reached_end_is_historical_even_when_the_start_is_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    // The ODB contains an `other` commit unreachable from `HEAD`; empty
+    // captures leave no fallback rung.
+    let start = commit_snapshot(repo, "other", &[], &[("f.txt", "one\n")], "start", 1);
+    let end = commit_snapshot(repo, "main", &[], &[("g.txt", "g\n")], "end", 2);
+    let head = commit_snapshot(repo, "main", &[end], &[("h.txt", "h\n")], "head", 3);
+
+    let condition = GitCondition::ReachableBetween {
+        start_oid: start.to_string(),
+        end_oid: end.to_string(),
+        captures: BTreeMap::new(),
+    };
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, head);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    // Reaching the end exits the validity window, which is what `historical`
+    // records; an unplaceable start must not downgrade that to a plain miss.
+    assert_eq!(
+        ladder.evaluate(&condition),
+        GitConditionOutcome::DoesNotHold { historical: true }
+    );
+}
+
+#[test]
+fn a_malformed_current_algorithm_patch_id_is_uncertain_not_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("f.txt", "one\n"), ("g.txt", "change\n")],
+        "anchored",
+        2,
+    );
+    let mut captures = captures_for(repo, &[anchored]);
+    let capture = captures.get_mut(&anchored.to_string()).unwrap();
+    let patch_id = capture.patch_id.as_mut().expect("capture has a patch id");
+    // The capture's patch ID is corrupt, not an older algorithm's output.
+    patch_id.value = "not-a-sha256-digest".to_string();
+    assert_eq!(patch_id.algorithm, PATCH_ID_ALGORITHM);
+
+    let advanced = commit_snapshot(repo, "main", &[base], &[("f.txt", "two\n")], "advance", 3);
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, advanced);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    // Treating a corrupt patch ID as readable would produce a patch-rung miss
+    // and incorrectly report the anchor as moved.
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Uncertain,
+        "a corrupt fallback is not evidence the anchor moved"
+    );
+}
+
+#[test]
 fn opposite_mode_transitions_have_distinct_patch_ids() {
     use gix::objs::tree::EntryKind;
 

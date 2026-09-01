@@ -9,9 +9,46 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use gix::bstr::{BStr, ByteSlice};
+use rustix::fs::{self as rfs, OFlags};
 use sha2::{Digest, Sha256};
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A path can be replaced after `symlink_metadata`; validate the opened
+/// descriptor instead. A swapped-in symlink would move the read outside the commentlint: allow(JUDGE)
+/// checkout, and a FIFO would block the request without reaching another commentlint: allow(JUDGE)
+/// budget poll, so `NOFOLLOW` and `NONBLOCK` refuse both at open time and commentlint: allow(JUDGE)
+/// the descriptor's own mode settles what was reached. commentlint: allow(JUDGE)
+///
+/// `Ok(None)` means no regular file is there — it vanished, or it is a
+/// symlink, FIFO, directory, or device. `Err` keeps genuine failures commentlint: allow(JUDGE)
+/// distinguishable, since those hide content that still governs the commentlint: allow(JUDGE)
+/// checkout. commentlint: allow(JUDGE)
+fn open_regular_no_follow(path: &Path) -> Result<Option<std::fs::File>, rustix::io::Errno> {
+    let file = match rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        rfs::Mode::empty(),
+    ) {
+        Ok(file) => std::fs::File::from(file),
+        // NOENT is a vanished path; LOOP answers NOFOLLOW on a symlink, commentlint: allow(JUDGE)
+        // NXIO answers NONBLOCK on a reader-less FIFO, and ISDIR answers a commentlint: allow(JUDGE)
+        // directory. All four report the absence of a regular file here commentlint: allow(JUDGE)
+        // rather than a failure to scan one. commentlint: allow(JUDGE)
+        Err(
+            rustix::io::Errno::NOENT
+            | rustix::io::Errno::LOOP
+            | rustix::io::Errno::NXIO
+            | rustix::io::Errno::ISDIR,
+        ) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let stat = rfs::fstat(&file)?;
+    if !rfs::FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
 
 /// Worker-thread ceiling for the status scan. Spawn and coordination cost commentlint: allow(JUDGE)
 /// grows with core count while the stat-bound scan does not, so an uncapped commentlint: allow(JUDGE)
@@ -617,7 +654,7 @@ fn worktree_content_hash(
         }
         return Ok("not-a-regular-file".to_string());
     }
-    let Ok(mut file) = std::fs::File::open(&path) else {
+    let Ok(Some(mut file)) = open_regular_no_follow(&path) else {
         return Ok("unreadable".to_string());
     };
     let mut hash = Sha256::new();
@@ -780,21 +817,15 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
 /// neither the working set nor the digest. Anything other than a regular file commentlint: allow(JUDGE)
 /// counts as absent, since opening a FIFO can block indefinitely. commentlint: allow(JUDGE)
 fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), SnapshotError> {
-    let is_regular = std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false);
-    if !is_regular {
-        hash.update(b"absent\0");
-        return Ok(());
-    }
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        // A file removed between the stat and the open is genuinely gone; any commentlint: allow(JUDGE)
-        // other failure hides content that still governs the checkout. commentlint: allow(JUDGE)
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    // The open is the sole authority on what is there: a stat first would commentlint: allow(JUDGE)
+    // leave a window for the path to be swapped before the read. commentlint: allow(JUDGE)
+    let mut file = match open_regular_no_follow(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
             hash.update(b"absent\0");
             return Ok(());
         }
+        // Any other failure hides content that still governs the checkout. commentlint: allow(JUDGE)
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     hash.update(b"present\0");
@@ -831,4 +862,56 @@ fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32
     hash.update(b"shallow\0");
     fold_file(&mut hash, &repo.shallow_file(), ctx)?;
     Ok(hash.finalize().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The descriptor, not the pathname, decides what a hash reads. Every
+    /// case here is what a racing swap would substitute after a stat.
+    #[test]
+    fn open_regular_no_follow_admits_only_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let regular = root.join("regular");
+        std::fs::write(&regular, b"payload").unwrap();
+        assert!(
+            open_regular_no_follow(&regular)
+                .expect("a regular file is not a scan failure")
+                .is_some(),
+            "a regular file stays readable"
+        );
+
+        assert!(open_regular_no_follow(&root.join("missing"))
+            .expect("a vanished path is not a scan failure")
+            .is_none());
+
+        assert!(open_regular_no_follow(root)
+            .expect("a directory is not a scan failure")
+            .is_none());
+
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&regular, &link).unwrap();
+            assert!(
+                open_regular_no_follow(&link)
+                    .expect("a symlink is not a scan failure")
+                    .is_none(),
+                "following the link would read whatever it points at"
+            );
+
+            let fifo = root.join("fifo");
+            rfs::mkfifoat(rfs::CWD, &fifo, rfs::Mode::RUSR | rfs::Mode::WUSR)
+                .expect("mkfifo succeeds in a temp dir");
+            assert!(
+                open_regular_no_follow(&fifo)
+                    .expect("a FIFO is not a scan failure")
+                    .is_none(),
+                "a blocking open would run past the budget"
+            );
+        }
+    }
 }
