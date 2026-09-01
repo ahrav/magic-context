@@ -177,6 +177,22 @@ fn ancestry_benches(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new(*shape, "memo-hit"), |b| {
             b.iter(|| ladder.is_ancestor_or_equal(black_box(&ancestor), black_box(&tip)));
         });
+        if *shape == "linear-10k" {
+            let ancestors: Vec<String> = [0, 2_500, 5_000, 7_500]
+                .map(|index| history.commits[index].to_string())
+                .into();
+            group.bench_function(BenchmarkId::new(*shape, "distinct-4"), |b| {
+                b.iter(|| {
+                    let budget = EvalBudget::unbounded();
+                    let ladder = ResolutionLadder::new(&snapshot, &budget);
+                    for ancestor in &ancestors {
+                        black_box(
+                            ladder.is_ancestor_or_equal(black_box(ancestor), black_box(&tip)),
+                        );
+                    }
+                });
+            });
+        }
     }
     group.finish();
 }
