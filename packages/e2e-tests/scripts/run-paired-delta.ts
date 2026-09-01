@@ -261,17 +261,9 @@ function gitAt(cwd: string): (args: string[]) => string {
 }
 
 function recordsRepoCommit(ownedPaths: readonly string[]): string {
-    const started = resolve(import.meta.dir, "..");
-    const at = (cwd: string) => (args: string[]): string => {
-        const run = Bun.spawnSync(["git", ...args], { cwd });
-        if (run.exitCode !== 0) {
-            throw new Error(`cannot resolve the smoke records binding: git ${args.join(" ")}`);
-        }
-        return run.stdout.toString();
-    };
     /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. commentlint: allow(JUDGE) */
-    const root = at(started)(["rev-parse", "--show-toplevel"]).trim();
-    const git = at(root);
+    const root = worktreeRoot();
+    const git = gitAt(root);
     const commit = git(["rev-parse", "HEAD"]).trim();
     /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
     /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. commentlint: allow(JUDGE) */
@@ -571,11 +563,17 @@ const POLICY_OWNER = "magic-context-x4l.14";
  */
 const CALIBRATION_SCOPE = [
     "packages/plugin/src",
-    "packages/e2e-tests/src/paired-delta",
-    "packages/e2e-tests/src/oracle-arms",
-    "packages/e2e-tests/src/opencode-runner",
-    "packages/e2e-tests/src/harness.ts",
-    "packages/e2e-tests/src/ballast.ts",
+    /** `canonicalFingerprint` lives here, and every fingerprint in the record and report is its output. */
+    "packages/plugin/scripts/retrieval-benchmark",
+    /**
+     * The whole e2e source tree rather than the lane's own directories. A transitive-import audit of
+     * this script reaches 322 modules, including `prospective-holdout`, `atomic-publish`,
+     * `code-unit-order`, `contract-primitives`, `test-db`, `mock-provider`, and the harness
+     * primitives, so an enumerated list of directories was already incomplete and would drift again
+     * with the next import. Over-triggering costs one re-calibration; under-triggering publishes
+     * noise measured against different code.
+     */
+    "packages/e2e-tests/src",
     "packages/e2e-tests/scripts/run-paired-delta.ts",
     "packages/e2e-tests/pools",
     /** Pins the OpenCode version and its digest, and native compaction, prompt routing, and the session ledger are all part of the measured behaviour. */
