@@ -41,5 +41,9 @@ tempfile = "3"
 criterion = "=0.8.2"
 
 [[bench]]
+name = "anchor_resolution"
+harness = false
+
+[[bench]]
 name = "scope_algebra"
 harness = false

@@ -103,7 +103,7 @@ impl Envelope<'_> {
                     object.sensitivity.as_str(),
                 ],
             )
-            .map_err(map_write_error)?;
+            .map_err(super::map_sqlite)?;
         for (name, field) in [
             ("object_id", &spec.object_id),
             ("domain_id", &spec.domain_id),
@@ -132,7 +132,7 @@ impl Envelope<'_> {
                     spec.sensitivity.as_str(),
                 ],
             )
-            .map_err(map_write_error)?;
+            .map_err(super::map_sqlite)?;
         insert_scope_terms(self.tx, &spec.scope_id.text, &spec.terms)?;
         let redactions = spec.text_fields();
         for (name, field) in &redactions {
@@ -324,22 +324,9 @@ fn insert_scope_terms(
                 term.payload.as_ref().map(|value| value.text.as_bytes()),
             ],
         )
-        .map_err(map_write_error)?;
+        .map_err(super::map_sqlite)?;
     }
     Ok(())
-}
-
-fn map_write_error(error: rusqlite::Error) -> KernelError {
-    match error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::ConstraintViolation,
-                ..
-            },
-            _,
-        ) => KernelError::Conflict,
-        _ => KernelError::Io,
-    }
 }
 
 // ---------------------------------------------------------------------------

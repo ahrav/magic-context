@@ -54,18 +54,26 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Clone> TwoGenerationCache<
             return Some((stored_key.clone(), value.clone()));
         }
         if let Some((stored_key, value)) = self.previous.remove_entry(key) {
-            self.insert(stored_key.clone(), value.clone());
+            if self.current.len() < self.cap {
+                self.current.insert(stored_key.clone(), value.clone());
+            } else {
+                self.previous.insert(stored_key.clone(), value.clone());
+            }
             return Some((stored_key, value));
         }
         None
     }
 
-    pub(super) fn insert(&mut self, key: K, value: V) {
-        if self.current.len() >= self.cap && !self.current.contains_key(&key) {
+    pub(super) fn insert(&mut self, key: K, value: V) -> Option<HashMap<K, V, S>> {
+        let evicted = if self.current.len() >= self.cap && !self.current.contains_key(&key) {
             let current = HashMap::with_hasher(self.current.hasher().clone());
-            self.previous = std::mem::replace(&mut self.current, current);
-        }
+            let previous = std::mem::replace(&mut self.current, current);
+            Some(std::mem::replace(&mut self.previous, previous))
+        } else {
+            None
+        };
         self.current.insert(key, value);
+        evicted
     }
 
     /// Mutates a cached value in place wherever it currently lives.
@@ -93,28 +101,29 @@ mod tests {
     #[test]
     fn rotation_preserves_one_generation_and_hits_promote() {
         let mut cache = TwoGenerationCache::new(2);
-        cache.insert("a", 1);
-        cache.insert("b", 2);
+        drop(cache.insert("a", 1));
+        drop(cache.insert("b", 2));
         // Third distinct insert rotates: {a, b} becomes the previous
         // generation.
-        cache.insert("c", 3);
+        drop(cache.insert("c", 3));
         // A previous-generation hit promotes the entry back into current.
         assert_eq!(cache.get(&"a"), Some(1));
         // Updates reach values still parked in the previous generation.
         cache.update(&"b", |value| *value = 20);
         assert_eq!(cache.get(&"b"), Some(20));
-        // Two more distinct inserts push the oldest generation out entirely.
-        cache.insert("d", 4);
-        cache.insert("e", 5);
+        // Three more distinct inserts push the oldest generation out entirely.
+        drop(cache.insert("d", 4));
+        drop(cache.insert("e", 5));
+        drop(cache.insert("f", 6));
         assert_eq!(cache.get(&"c"), None);
     }
 
     #[test]
     fn reinserting_an_existing_key_does_not_rotate() {
         let mut cache = TwoGenerationCache::new(2);
-        cache.insert("a", 1);
-        cache.insert("b", 2);
-        cache.insert("a", 10);
+        drop(cache.insert("a", 1));
+        drop(cache.insert("b", 2));
+        drop(cache.insert("a", 10));
         assert_eq!(cache.get(&"a"), Some(10));
         assert_eq!(cache.get(&"b"), Some(2));
     }

@@ -127,7 +127,7 @@ pub struct FailedCheck {
 /// Opaque handle read repair passes back to confirm a durable append for a
 /// cached classification (KTD6 append-confirmed flag).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClassificationToken(Arc<ObjectCacheKey>);
+pub struct ClassificationToken(Option<Arc<ObjectCacheKey>>);
 
 /// Per-object verdict with evidence. `append_pending` marks a non-current
 /// classification whose durable observation has not been confirmed yet;
@@ -504,6 +504,30 @@ impl ApplicabilityEngine {
             .expect("cache lock")
             .reserve(candidates.len());
         for candidate in candidates {
+            if candidate.lifecycle_invalidated {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::terminal(
+                        ApplicabilityState::LifecycleInvalidated,
+                        "object lifecycle-invalidated before applicability evaluation",
+                    ),
+                    false,
+                ));
+                continue;
+            }
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted before this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
             let payload_decode = match candidate.payload.as_deref() {
                 Some(payload) => payload_memo
                     .get_or_insert_with(payload, || ObjectApplicabilitySpec::decode(Some(payload))),
@@ -565,22 +589,10 @@ impl ApplicabilityEngine {
                 check_observations,
                 scoped_dirty_fingerprint,
             );
-            if candidate.lifecycle_invalidated {
-                objects.push(finished(
-                    candidate,
-                    ClassificationToken(Arc::new(key)),
-                    Classification::terminal(
-                        ApplicabilityState::LifecycleInvalidated,
-                        "object lifecycle-invalidated before applicability evaluation",
-                    ),
-                    false,
-                ));
-                continue;
-            }
             if budget.is_exhausted() {
                 objects.push(finished(
                     candidate,
-                    ClassificationToken(Arc::new(key)),
+                    ClassificationToken(None),
                     Classification::uncacheable(
                         ApplicabilityState::Uncertain,
                         "evaluation budget exhausted before this object",
@@ -625,14 +637,14 @@ impl ApplicabilityEngine {
                     append_pending: state.blocks_auto_injection()
                         && !cached.query_local
                         && !cached.append_confirmed,
-                    token: ClassificationToken(key),
+                    token: ClassificationToken(Some(key)),
                     append: None,
                 });
                 continue;
             }
             stats.object_cache_misses += 1;
             let key = Arc::new(key);
-            let token = ClassificationToken(Arc::clone(&key));
+            let token = ClassificationToken(Some(Arc::clone(&key)));
             let scope_context = resolved_scope_context
                 .get_or_init(|| scope_context.clone().with_head_commit(snapshot.head()));
             let graph_ops_before = ladder.graph_operations();
@@ -645,31 +657,67 @@ impl ApplicabilityEngine {
                 candidate,
                 payload_decode,
             );
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted while classifying this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
             let boundary_moved = if ladder.graph_operations() > graph_ops_before {
                 ladder.repository_state_moved()
             } else {
                 ladder.repository_state_movement_seen()
             };
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted while validating this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
             let cacheable = classification.cacheable
                 && !boundary_moved
                 && !(classification.state == ApplicabilityState::Uncertain
-                    && ladder.saw_unreadable_object())
-                && !budget.is_exhausted();
+                    && ladder.saw_unreadable_object());
             if cacheable {
-                self.object_cache.lock().expect("cache lock").insert(
-                    key,
-                    CachedClassification {
-                        details: (classification.state != ApplicabilityState::Current).then(|| {
-                            Box::new(CachedClassificationDetails {
-                                state: classification.state,
-                                evidence: classification.evidence.as_str().into(),
-                                failed_check: classification.failed_check.clone().map(Box::new),
-                            })
-                        }),
-                        query_local: classification.query_local,
-                        append_confirmed: false,
-                    },
-                );
+                let evicted = {
+                    let mut cache = self.object_cache.lock().expect("cache lock");
+                    let mut append_confirmed = false;
+                    cache.update(key.as_ref(), |cached| {
+                        append_confirmed = cached.append_confirmed;
+                    });
+                    cache.insert(
+                        key,
+                        CachedClassification {
+                            details: (classification.state != ApplicabilityState::Current
+                                || classification.evidence != CURRENT_EVIDENCE)
+                                .then(|| {
+                                    Box::new(CachedClassificationDetails {
+                                        state: classification.state,
+                                        evidence: classification.evidence.as_str().into(),
+                                        failed_check: classification
+                                            .failed_check
+                                            .clone()
+                                            .map(Box::new),
+                                    })
+                                }),
+                            query_local: classification.query_local,
+                            append_confirmed,
+                        },
+                    )
+                };
+                drop(evicted);
             }
             let append_pending = cacheable && !classification.query_local;
             objects.push(finished(candidate, token, classification, append_pending));
@@ -684,10 +732,13 @@ impl ApplicabilityEngine {
     /// later cache hits stop retrying it.
     #[must_use]
     pub fn confirm_durable_append(&self, token: &ClassificationToken) -> bool {
+        let Some(key) = token.0.as_deref() else {
+            return false;
+        };
         self.object_cache
             .lock()
             .expect("cache lock")
-            .update(token.0.as_ref(), |cached| cached.append_confirmed = true)
+            .update(key, |cached| cached.append_confirmed = true)
     }
 
     #[expect(clippy::too_many_arguments, reason = "internal classify pipeline")]
@@ -903,10 +954,12 @@ impl ApplicabilityEngine {
                         && (outcome != GitConditionOutcome::Uncertain
                             || (!ladder.budget_was_exhausted() && !ladder.saw_unreadable_object()))
                     {
-                        self.anchor_cache
+                        let evicted = self
+                            .anchor_cache
                             .lock()
                             .expect("cache lock")
                             .insert(key.clone(), outcome);
+                        drop(evicted);
                     }
                     (outcome, !boundary_moved)
                 }
@@ -980,20 +1033,7 @@ impl ObjectApplicability {
             evidence,
             failed_check: None,
             append_pending: false,
-            token: ClassificationToken(Arc::new(ObjectCacheKey {
-                hash: 0,
-                snapshot: SnapshotCacheKey::Owned(SnapshotCacheValues {
-                    hash: 0,
-                    checkout_identity: String::new(),
-                    head: String::new(),
-                    repository_state: String::new(),
-                }),
-                object_id: candidate.object_id.as_str().into(),
-                object_revision: candidate.object_revision,
-                inputs_digest: [0; 32],
-                check_observations: [0; 32],
-                scoped_dirty_fingerprint: [0; 32],
-            })),
+            token: ClassificationToken(None),
             append: None,
         }
     }
