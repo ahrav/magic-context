@@ -1964,18 +1964,22 @@ fn a_query_local_exclusion_claims_no_durable_append() {
         }]),
         ..candidate("object-scoped")
     };
-    let batch = engine.evaluate_batch(
-        &snapshot,
-        &QueryContext::default(),
-        &ScopeMatchContext::new().with_value(Dimension::Project, "this-project"),
-        &[scoped],
-        &EvalBudget::unbounded(),
-    );
-    assert_eq!(batch.objects[0].state, ApplicabilityState::OutOfScope);
-    assert!(
-        !batch.objects[0].append_pending,
-        "a per-query exclusion asked read repair to record an object-wide one"
-    );
+    // Twice: the second request hits the object cache, which recomputes
+    // `append_pending` from the cached entry rather than the classification.
+    for round in 0..2 {
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new().with_value(Dimension::Project, "this-project"),
+            std::slice::from_ref(&scoped),
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(batch.objects[0].state, ApplicabilityState::OutOfScope);
+        assert!(
+            !batch.objects[0].append_pending,
+            "round {round}: a per-query exclusion asked read repair to record an object-wide one"
+        );
+    }
 
     // A checkout-derived block still records: the dirty tree is the same for
     // every query against this checkout.

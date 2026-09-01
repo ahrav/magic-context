@@ -176,6 +176,9 @@ struct CachedClassification {
     state: ApplicabilityState,
     evidence: String,
     failed_check: Option<FailedCheck>,
+    /// Carried so a hit reaches the same append decision as the miss that
+    /// produced it; the key recurs on every repeat of the same query.
+    query_local: bool,
     append_confirmed: bool,
 }
 
@@ -308,6 +311,7 @@ impl ApplicabilityEngine {
                     evidence: cached.evidence,
                     failed_check: cached.failed_check,
                     append_pending: cached.state.blocks_auto_injection()
+                        && !cached.query_local
                         && !cached.append_confirmed,
                     token,
                 });
@@ -351,6 +355,7 @@ impl ApplicabilityEngine {
                         state: classification.state,
                         evidence: classification.evidence.clone(),
                         failed_check: classification.failed_check.clone(),
+                        query_local: classification.query_local,
                         append_confirmed,
                     },
                 );
