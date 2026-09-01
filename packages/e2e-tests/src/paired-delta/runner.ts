@@ -965,7 +965,7 @@ export async function runPairedDelta(
                 }
                 const wallClockMs = Math.max(0, dependencies.now() - startedAt);
                 const record = observation
-                    ? completedRecord(
+                    ? completedRecord({
                         options,
                         coordinate,
                         scenario,
@@ -973,26 +973,26 @@ export async function runPairedDelta(
                         fingerprint,
                         intervention,
                         wallClockMs,
-                        disposed,
+                        harnessDisposed: disposed,
                         reserveUsd,
                         priorAttemptsCostUsd,
                         priorMaxAttemptCostUsd,
                         disposalFailed,
-                    )
-                    : failedRecord(
+                    })
+                    : failedRecord({
                         options,
                         coordinate,
                         scenario,
                         fingerprint,
                         intervention,
                         wallClockMs,
-                        disposed,
+                        harnessDisposed: disposed,
                         failure,
                         reserveUsd,
                         priorAttemptsCostUsd,
                         priorMaxAttemptCostUsd,
                         disposalFailed,
-                    );
+                    });
                 options.store.put(record);
                 records.push(record);
                 coordinateResult.cells[armId] = record;
@@ -1130,20 +1130,38 @@ function contractAdmits(reasonCode: ReasonCode, runHealth: RunHealth): boolean {
     }
 }
 
+/** One named bundle rather than a positional tail: these functions carried three adjacent numbers and two adjacent booleans, so `priorAttemptsCostUsd` and `priorMaxAttemptCostUsd` could be transposed at a call site with nothing to catch it — and a silent swap there corrupts the cost ledger the caps are checked against. commentlint: allow(JUDGE) */
+interface RecordInputs {
+    options: RunPairedDeltaOptions;
+    coordinate: RolloutCoordinate;
+    scenario: ScenarioDeclaration;
+    fingerprint: string;
+    intervention: InterventionDescriptor;
+    wallClockMs: number;
+    harnessDisposed: boolean;
+    reserveUsd: number;
+    priorAttemptsCostUsd: number;
+    priorMaxAttemptCostUsd: number;
+    disposalFailed: boolean;
+}
+
 function completedRecord(
-    options: RunPairedDeltaOptions,
-    coordinate: RolloutCoordinate,
-    scenario: ScenarioDeclaration,
-    observation: RolloutObservation,
-    expectedFingerprint: string,
-    expectedIntervention: InterventionDescriptor,
-    wallClockMs: number,
-    harnessDisposed: boolean,
-    reserveUsd: number,
-    priorAttemptsCostUsd: number,
-    priorMaxAttemptCostUsd: number,
-    disposalFailed: boolean,
+    inputs: RecordInputs & { observation: RolloutObservation },
 ): RolloutRecord {
+    const {
+        options,
+        coordinate,
+        scenario,
+        observation,
+        fingerprint: expectedFingerprint,
+        intervention: expectedIntervention,
+        wallClockMs,
+        harnessDisposed,
+        reserveUsd,
+        priorAttemptsCostUsd,
+        priorMaxAttemptCostUsd,
+        disposalFailed,
+    } = inputs;
     const identityMatches =
         observation.echoedProviderId === options.pinnedProviderId &&
         observation.echoedModelId === options.pinnedSnapshotId;
@@ -1250,20 +1268,21 @@ function completedRecord(
     };
 }
 
-function failedRecord(
-    options: RunPairedDeltaOptions,
-    coordinate: RolloutCoordinate,
-    scenario: ScenarioDeclaration,
-    fingerprint: string,
-    intervention: InterventionDescriptor,
-    wallClockMs: number,
-    harnessDisposed: boolean,
-    failure: unknown,
-    reserveUsd: number,
-    priorAttemptsCostUsd: number,
-    priorMaxAttemptCostUsd: number,
-    disposalFailed: boolean,
-): RolloutRecord {
+function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecord {
+    const {
+        options,
+        coordinate,
+        scenario,
+        fingerprint,
+        intervention,
+        wallClockMs,
+        harnessDisposed,
+        failure,
+        reserveUsd,
+        priorAttemptsCostUsd,
+        priorMaxAttemptCostUsd,
+        disposalFailed,
+    } = inputs;
     /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
     const providerUnavailable = !disposalFailed && failure instanceof ProviderUnavailableError;
     const deadlineExceeded = !disposalFailed && failure instanceof RolloutDeadlineError;
