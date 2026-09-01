@@ -317,8 +317,6 @@ fn three_child_composite(
 }
 
 /// A 96-slot declaration must leave at least one general slot in each pool:
-/// startup fails when either limit is at most the reservation and starts
-/// when both are one above it (R13, plan KTD2).
 #[tokio::test]
 async fn reservations_must_leave_one_general_slot_in_each_pool() {
     for (pending, tasks) in [(96, 200), (200, 96), (96, 96)] {
@@ -339,7 +337,6 @@ async fn reservations_must_leave_one_general_slot_in_each_pool() {
         config.limits.max_handler_tasks = 97;
     })
     .await;
-    // One general slot exists in each pool: an ordinary request dispatches.
     let mut client = host.client().await;
     let (channel, epoch) = client
         .route_open_target(
@@ -369,8 +366,7 @@ async fn reservations_must_leave_one_general_slot_in_each_pool() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A reserved-class module must reserve permits, and a general-class module
-/// must not: both mismatches are impossible accounting and fail startup.
+/// A reserved-class module must reserve permits, and a general-class module must not.
 #[tokio::test]
 async fn class_and_reservation_mismatches_fail_startup() {
     let mismatches = [
@@ -399,11 +395,7 @@ async fn class_and_reservation_mismatches_fail_startup() {
     }
 }
 
-/// A module's declared bound on concurrently parked general handler tasks
-/// (for example Synapse's running query plus its FIFO waiters) must leave at
-/// least one free general task slot, or one module's waiting traffic could
-/// starve every other route: the exact-fit bound fails startup and one
-/// below it starts.
+/// Each module must leave one general task slot free so its parked tasks cannot starve other routes.
 #[tokio::test]
 async fn parked_general_task_bound_must_leave_one_free_slot() {
     let declaration = |hold: usize| ResourceDeclaration {
@@ -429,10 +421,7 @@ async fn parked_general_task_bound_must_leave_one_free_slot() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A 64 MiB retained declaration raises the resident floor: one byte below
-/// the handler-dependent floor fails startup, the exact floor starts and
-/// still admits one maximum-size ingress body, so ingress, scratch, egress,
-/// catalog, and declared retention exactly sum to the configured cap.
+/// The configured cap must cover ingress, scratch, egress, catalog, and declared retention.
 #[tokio::test]
 async fn retained_declaration_raises_the_resident_floor_exactly() {
     const RETAINED: u64 = 64 * 1024 * 1024;
@@ -446,9 +435,8 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
         .await
     };
 
-    // The floor is MIN_RESIDENT_BYTES + retained + the serialized catalog's
-    // resident length, which only the runtime knows; bisect the boundary.
-    // `lo` always fails (the catalog is nonempty) and `hi` must pass.
+    // The resident floor is MIN_RESIDENT_BYTES plus retained bytes and the serialized catalog's resident length.
+    // A resident cap one byte below the floor fails because the catalog is nonempty; the exact floor passes.
     let mut lo = mc_host::config::MIN_RESIDENT_BYTES + RETAINED;
     let mut hi = lo + 64 * 1024;
     assert!(
@@ -477,8 +465,6 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
         "one byte below the handler-dependent floor must be rejected"
     );
 
-    // At the exact floor the ingress pool is exactly one maximum body: a
-    // 64 MiB frame is still interoperable (protocol V12/V28).
     let host = match try_resident(floor).await {
         Ok(host) => host,
         Err(err) => panic!("the exact floor must be accepted: {err}"),
@@ -518,15 +504,12 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The default resident cap is the no-retention ingress floor, and a composite
-/// that links components with real retention must size the ceiling itself.
+/// The default resident cap is the no-retention ingress floor.
+/// Composites must include linked components' retained-memory declarations in the resident cap.
 ///
-/// The default used to pre-add Broca's declaration, which only worked because
-/// Broca lives inside this crate: a default cannot name the declaration of an
-/// external component such as `mc_module::McHandler`, so every composite that
-/// linked one silently under-sized its ceiling. The knowledge of which
-/// components are linked lives at the composition site, so the number does too —
-/// and startup refuses an under-sized composite rather than over-offering
+/// The default resident cap excludes external components' declarations.
+/// Composites that link external components must include their declarations in the resident cap.
+/// The composition site must calculate the resident cap because it knows the linked components.
 /// ingress.
 #[tokio::test]
 async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
@@ -543,8 +526,7 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         "the default is the no-retention floor plus one maximum ingress body"
     );
 
-    // Defaults alone cannot hold a declaring component: startup must refuse it
-    // rather than hand ingress bytes the component is already holding.
+    // Startup rejects the composite rather than allocating retained bytes to ingress.
     let refused = CompositeTestHost::try_start(
         three_child_composite(broca_declaration(RETAINED)),
         |config| {
@@ -557,11 +539,8 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         "a declaration the ceiling cannot cover must fail startup"
     );
 
-    // Startup also charges the serialized catalog: the full body, the empty
-    // body, and each per-module body plus its id. Measure that charge from
-    // the wire — `catalog.list` serves exactly the cached resident bodies —
-    // so the sizing rule below is asserted with the computed value instead
-    // of hand-tuned slack. The probe composite declares no retention; the
+    // Startup charges the full catalog body, the empty catalog body, and each per-module body plus its ID.
+    // Computing the charge from `catalog.list` responses avoids a fixed slack allowance.
     // catalog depends only on the manifests, which are identical.
     let catalog_charge = {
         async fn fetch_body(
@@ -598,9 +577,7 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         charge
     };
 
-    // The sizing rule itself: the handler-dependent floor is exactly the
-    // interop floor plus the declaration plus the measured catalog charge.
-    // One byte below it fails startup; the exact floor starts.
+    // The handler-dependent floor equals the interop floor, declaration, and measured catalog charge.
     let floor = mc_host::config::MIN_RESIDENT_BYTES + RETAINED + catalog_charge;
     let refused = CompositeTestHost::try_start(
         three_child_composite(broca_declaration(RETAINED)),
@@ -629,9 +606,7 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A zero-reservation handler keeps single-pool behavior: the tightest
-/// interoperable limits still serve a request because nothing was carved out
-/// of the general pools.
+/// A zero-reservation handler uses only the general pools, so the tightest interoperable limits still admit a request.
 #[tokio::test]
 async fn zero_reservation_handlers_keep_single_pool_admission() {
     let (mc, synapse, broca) = support::stub_trio();

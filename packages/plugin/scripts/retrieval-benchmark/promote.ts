@@ -1,12 +1,12 @@
 /**
- * DB-free promotion of a reviewed draft into an immutable release directory.
+ * The promoter creates an immutable release directory from a reviewed draft without a database.
  *
- * The promoter validates operator-supplied artifacts and approvals against
- * the exact release tuple, re-loads the full release through the strict
- * consumer path in an owner-only review directory outside every VCS tree,
- * and only then stages the validated bytes next to the destination and
- * atomically renames them into place. It has no API for creating approvals
- * and never modifies an existing release.
+ * The promoter validates operator-supplied artifacts and approvals against the exact release tuple.
+ * The promoter re-loads the full release through the strict consumer path.
+ * The promoter uses an owner-only review directory outside every VCS tree.
+ * The promoter stages validated bytes next to the destination only after every validation gate passes.
+ * The promoter atomically renames staged bytes into place and cannot create approvals.
+ * The promoter never modifies an existing release.
  */
 
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -47,14 +47,14 @@ export interface PromotionInput {
     corpus: unknown;
     judgments: unknown;
     syntheticProfiles: unknown;
-    /** Operator-supplied, exactly one per kind. The promoter never creates
-     *  or repairs these. */
+    /** Operators supply exactly one approval of each kind; the promoter cannot create approvals.
+     * The promoter does not repair supplied approvals. */
     approvals: readonly unknown[];
-    /** Operator deny list (project codenames, customer names) applied by the
-     *  privacy gate during both validating re-loads. Optional because the
+    /** The privacy gate applies forbiddenTokens to project codenames and customer names during both validating reloads.
+     * forbiddenTokens is optional because the tokens are sensitive.
      *  tokens are themselves sensitive and never ship with the release. */
     forbiddenTokens?: readonly string[];
-    /** Word-bounded operator deny list (usernames). */
+    /** The privacy gate matches forbiddenIdentifiers as whole words. */
     forbiddenIdentifiers?: readonly string[];
     releasesRoot: string;
     releaseVersion: string;
@@ -107,10 +107,9 @@ function checkApprovals(
 }
 
 /**
- * Assemble the manifest for validated artifacts. The manifest is a
- * deterministic envelope over the release tuple and its approvals; its own
- * fingerprint is computed by consumers over the manifest document, which
- * carries no self-reference.
+ * The manifest deterministically binds validated artifacts to the release tuple and approvals.
+ * Consumers fingerprint the manifest document itself.
+ * The manifest contains no fingerprint of itself.
  */
 export function buildManifest(
     input: Omit<PromotionInput, "releasesRoot">,
@@ -129,23 +128,18 @@ export function buildManifest(
 }
 
 /**
- * Validate and atomically install a new immutable release directory.
- * Rejection, write failure, or process interruption leaves the releases root
- * without a partial version directory and any prior release byte-identical.
- * (Process-level atomicity only: no fsync, so a power loss can leave a
- * renamed directory with truncated files — loadReviewedRelease then fails
- * loudly on a fingerprint mismatch.)
+ * A failed promotion leaves every prior release byte-identical.
+ * The promoter provides process-level atomicity only because it does not fsync staged files or directories.
+ * Power loss can leave a renamed directory with truncated files.
  *
- * Unvetted bytes never touch the releases root: the full consumer-path
- * re-load (fingerprints, approvals, privacy, partitions) runs against an
- * owner-only review directory outside every VCS tree, and only content that
- * passed every gate is staged next to the destination for the atomic rename.
+ * Unvetted bytes never enter releasesRoot.
+ * The promoter re-loads fingerprints, approvals, privacy checks, and partitions before staging release bytes.
+ * The consumer-path reload runs in an owner-only review directory outside every VCS tree.
  */
 export function promoteRelease(input: PromotionInput): { releaseDir: string } {
-    // The privacy gate runs before any parser or validator: schema and
-    // release diagnostics interpolate regex-bounded artifact ids, so an
-    // identifying id in an invalid draft would otherwise reach exception
-    // messages (and CI or terminal logs) before the deny lists ever ran.
+    // The privacy gate runs before parsers and validators because their diagnostics can expose artifact IDs.
+    // Schema and release diagnostics interpolate regex-bounded artifact IDs.
+    // An identifying artifact ID in an invalid draft could otherwise reach exception messages before deny-list checks run.
     const violations = scanForSensitiveContent(
         {
             corpus: input.corpus,
@@ -182,9 +176,7 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         ] as Array<[string, unknown]>
     ).map(([name, value]) => [name, `${JSON.stringify(value, null, 2)}\n`]);
 
-    // Consumer-path re-load happens in an owner-only directory outside any
-    // worktree, so a crash mid-promotion cannot leave privacy-unvetted bytes
-    // where a `git add` could commit them.
+    // The review directory is outside every VCS tree, so a crash cannot leave unreviewed bytes in an existing work tree.
     const reviewDir = mkdtempSync(
         join(realpathSync.native(tmpdir()), "magic-context-benchmark-promote-"),
     );
@@ -206,16 +198,14 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     rmSync(reviewDir, { recursive: true, force: true });
 
     mkdirSync(input.releasesRoot, { recursive: true });
-    // Unique staging directory per attempt: concurrent promotions of the same
-    // version cannot swap each other's contents between the validating
-    // re-load below and the rename. Only gate-passing bytes reach this point.
+    // A unique staging directory prevents concurrent promotions of the same version from exchanging contents.
+    // Only bytes that passed the review-directory validation are written to `staging`.
     const staging = mkdtempSync(join(input.releasesRoot, ".staging-"));
     try {
         for (const [name, content] of files) {
             writeFileSync(join(staging, name), content, { flag: "wx" });
         }
-        // Re-load the exact directory being renamed into place, so tampering
-        // with staged bytes between write and rename is still caught.
+        // Reloading `staging` detects tampering after its files are written and before the atomic rename.
         loadReviewedRelease(staging, {
             forbiddenTokens: input.forbiddenTokens,
             forbiddenIdentifiers: input.forbiddenIdentifiers,

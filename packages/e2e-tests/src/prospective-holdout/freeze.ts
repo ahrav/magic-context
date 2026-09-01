@@ -119,59 +119,32 @@ export function validateFreezePolicies(freeze: ReleaseFreezeManifest, policies: 
 }
 
 /**
- * Name `mkdtempSync` gives a staging directory: the fixed prefix this module passes as
- * the template plus the six random characters `XXXXXX` becomes. No artifact name begins
- * with a dot, and the fixed length refuses a longer name that merely starts the same
- * way, so the pattern cannot match an artifact. Readers of an artifact parent recognise
- * staging directories by this pattern, so it lives with the code that produces them.
  */
 export const STAGING_ENTRY_RE = /^\.staging-[A-Za-z0-9]{6}$/;
 
 /**
- * How long a staging directory must sit untouched before a publish treats it as
- * orphaned rather than as another publisher's work in progress.
+ * A publish treats a staging directory as orphaned only after it remains untouched for 60,000 ms.
  *
- * `mkdtempSync` picks the name at random and nothing records who created it, so there
- * is no owner to interrogate the way a lock's record names its holder, and no lease is
- * published either. Age is the only evidence available. A publisher holds a staging
- * directory across one write, one canonical re-read and one rename, with no wait in
- * between, so a live one was touched a few filesystem operations ago; a minute is
- * orders of magnitude beyond that window.
  */
 const STAGING_ORPHAN_AGE_MS = 60_000;
 
 /**
- * Removes staging directories in `parent` that no publisher can still be holding.
  *
- * A publisher killed between `mkdtempSync` and `renameSync` leaves its staging
- * directory beside the artifacts. An identical retry publishes through the
- * accept-existing path without touching that leftover, while the epoch artifact-set
- * check reads it as an entry no artifact owns, so the retry documented as the recovery
- * cannot finish it. Sweeping on the way into every publish, including that retry, is
- * what completes the recovery without an operator deleting files by hand.
  *
- * With only age as evidence, the threshold is what protects a live publisher. Removing
- * a live directory costs that publisher its `renameSync` and nothing else: the rename
- * is the only step that installs a destination, and it moves a directory whose manifest
- * has already been written and re-read, so a removal cannot leave partial bytes behind
- * at the destination.
  */
 function reclaimOrphanedStaging(parent: string): void {
     let entries: string[];
     try {
         entries = readdirSync(parent);
     } catch {
-        // An unreadable parent holds no orphan this publish can act on, and the publish
-        // below reports whatever is actually wrong with the path.
+        // Allow `mkdirSync(parent, { recursive: true })` to create a missing parent.
         return;
     }
     for (const entry of entries) {
         if (!STAGING_ENTRY_RE.test(entry)) continue;
         const path = join(parent, entry);
         const stat = lstatSync(path, { throwIfNoEntry: false });
-        // A publish only ever creates a directory under this name. Anything else is not
-        // a staging directory this reclaim owns, and a symlink would move the removal
-        // outside the parent.
+        // Skip symlinks because this publisher never creates staging directories as symlinks.
         if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) continue;
         if (Date.now() - stat.mtimeMs <= STAGING_ORPHAN_AGE_MS) continue;
         rmSync(path, { recursive: true, force: true });
@@ -189,9 +162,7 @@ function writeArtifactAtomically(value: unknown, destination: string): void {
         }
         return true;
     };
-    // The sweep runs ahead of the accept-existing return because a killed publisher's
-    // destination may already hold the artifact, and the identical retry is then the
-    // only run that reaches this parent again.
+    // A matching retry returns from `acceptExisting`; reclaim orphaned staging before that return.
     reclaimOrphanedStaging(parent);
     if (acceptExisting()) return;
     mkdirSync(parent, { recursive: true });
@@ -242,19 +213,14 @@ export function loadFreeze(
 type TrustedFreeze = { manifest: ReleaseFreezeManifest; manifestFingerprint: string };
 
 /**
- * The complete set of close-versus-freeze binding invariants, enforced
- * identically by every entry point.
+ * All entry points use this function to enforce the same close-versus-freeze invariants.
  *
- * Repository validation reads an installed close through `loadClose` and never
- * calls `publishClose`, so an invariant checked only while publishing is not
- * enforced at all against a close artifact written directly into a repository.
- * Holding the comparisons in one body is what keeps the two paths from admitting
+ * `loadClose` must enforce these invariants because repository validation can load artifacts written without `publishClose`.
+ * `publishClose` and `loadClose` call this function to prevent them from accepting different manifests.
  * different manifests.
  *
- * `linkMismatch` is the only sanctioned difference between callers: the publish
- * path names the diverging link field for the operator authoring the manifest,
- * while the load path reports a single code for either field. The cutoff code is
- * shared because both paths reject the same condition for the same reason.
+ * `linkMismatch` lets publish callers report the mismatched link field.
+ * `publishClose` and `loadClose` use the same cutoff code because both reject closes before the intake window closes.
  */
 function assertCloseBoundToFreeze(
     manifest: CohortCloseManifest,
@@ -267,18 +233,11 @@ function assertCloseBoundToFreeze(
     if (manifest.body.freezeManifestFingerprint !== trustedFreeze.manifestFingerprint) {
         throw new HoldoutContractError([linkMismatch.freezeManifestFingerprint]);
     }
-    // The frozen intake window bounds admission: a close stamped before that
-    // window ends discards reports the epoch is still obliged to admit.
+    // A close must not be stamped before `intakeWindow.closesAt`, or it can discard reports still required for admission.
     if (Date.parse(manifest.body.closedAt) < Date.parse(trustedFreeze.manifest.body.intakeWindow.closesAt)) {
         throw new HoldoutContractError(["close.closedAt: before-cutoff"]);
     }
-    // Each manifest's own parse keeps its two approvers distinct, which is independence
-    // within one attestation and says nothing across the pair. The freeze's approvers attest
-    // the release identities the epoch will compare; the close's attest the raw-intake and
-    // admission boundary those releases are measured over. One actor holding a seat in both
-    // sets attests that boundary already knowing which builds it decides between, which is
-    // the separation the two sets exist to create. Both manifests are in scope only here, so
-    // this is the only place the pair can be compared.
+    // Per-manifest approver distinctness does not prevent an actor from approving both manifests.
     const freezeApprovers = new Set(trustedFreeze.manifest.approvals.map((approval) => approval.approver));
     if (manifest.approvals.some((approval) => freezeApprovers.has(approval.approver))) {
         throw new HoldoutContractError(["close.approvals: freeze-independence-required"]);
@@ -314,7 +273,7 @@ export function loadClose(
         throw new HoldoutContractError(["close.manifest: untrusted"]);
     }
     const manifest = parseCloseManifest(raw);
-    // One code covers either link field on this path.
+    // `loadClose` uses one error code for either link-field mismatch.
     const linkInvalid = "close: freeze-link-invalid";
     assertCloseBoundToFreeze(manifest, trustedFreeze, {
         epochId: linkInvalid,

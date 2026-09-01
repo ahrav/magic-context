@@ -1,21 +1,14 @@
 /**
- * Memory lifecycle and search incident cases (U4): A5, A10/A41, A32, A44, A54.
  *
- * Each case is a DRIVER that performs real `ctx_memory` / `ctx_search` /
- * `ctx_note` tool loops in the case-owned workspace (returning a serializable
- * observation or throwing an infrastructure error), a strict NORMALIZER, a
- * reproduction PRECONDITION, and a PURE VERIFIER mapping the normalized
- * observation to static check IDs (KTD2, R6, R9, R10).
+ * Each case runs real `ctx_memory`, `ctx_search`, and `ctx_note` loops in its workspace.
+ * Each driver returns a serializable observation or throws an infrastructure error.
+ * Each pure verifier maps normalized observations to KTD2, R6, R9, or R10.
  *
  * Verdict semantics:
  *   - A5, A10/A41, A54 are accepted behavior (baseline green).
- *   - A32 and A44 are known defects (baseline red): their verifiers assert
- *     the NORMATIVE behavior, which the current product fails with the
- *     reviewed failed-check IDs and observation signatures.
+ * A32 and A44 verifiers assert normative behavior and fail at baseline.
  *
- * Observations carry only stable booleans/counters/enums — never raw memory
- * bodies, prompts, or process output (R13) — so red observation signatures
- * stay deterministic across runs.
+ * Observations exclude raw memory bodies, prompts, and process output to keep red signatures deterministic.
  */
 
 import { extractM0, extractM1, mainAgentRequests } from "../../cache-analysis";
@@ -50,9 +43,8 @@ import {
 
 const MODEL_LIMIT = 100_000;
 
-/** Harness options shared by the memory/search cases: deterministic memory
- *  behavior, no background agents, no auto-search, embeddings off unless a
- *  case opts in. */
+/**
+ * */
 function memoryHarnessOptions(
     overrides: Record<string, unknown> = {},
 ): TestHarnessOptions {
@@ -86,9 +78,8 @@ function unmet(): PreconditionOutcome {
 
 type FieldKind = "boolean" | "number" | "string";
 
-/** Strict exact-key observation parse: unknown fields, missing fields, and
- *  wrong primitive types all reject, so a malformed observation can never
- *  satisfy a verifier. */
+/** Malformed observations cannot satisfy a verifier: unknown or missing fields and wrong primitive types reject.
+ * */
 function parseObservation<T>(
     raw: unknown,
     kind: string,
@@ -121,7 +112,7 @@ function parseObservation<T>(
     return raw as T;
 }
 
-/** `true` when every scripted tool result parsed as a validated execution
+/** Returns `true` only when every scripted tool result is a validated execution.
  *  (a tool-level "Error: ..." reply means the arguments never validated). */
 function argsValidated(results: readonly string[]): boolean {
     return results.every((text) => !text.includes("Error:"));
@@ -148,7 +139,7 @@ function lastMainBody(h: TestHarness): Record<string, unknown> {
     return body;
 }
 
-/** Resolve the rendered memory id for `content` from an m[0] block. */
+/* */
 function memoryIdIn(m0: string, content: string): number {
     const escaped = content.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const match = m0.match(
@@ -161,10 +152,8 @@ function memoryIdIn(m0: string, content: string): number {
 }
 
 /**
- * Promote the claim carrying `content` to VERIFIED through the real
- * verification API. An agent `ctx_memory` write lands CANDIDATE and is hidden
- * from every automatic surface, so a case that asserts on injected bytes has to
- * clear the maturity gate first. Returns the promoted claim's public ID.
+ * Promotes the claim containing `content` to VERIFIED through the verification API.
+ * `ctx_memory` writes remain CANDIDATE and are excluded from automatic surfaces until verification.
  */
 function verifyMemoryByContent(h: TestHarness, content: string): string {
     return promoteMemoryToVerified(h.contextDbPath(), content);
@@ -207,10 +196,7 @@ interface FactRowState {
 }
 
 /**
- * The dedup fixtures expect a two-row state, and SQLite leaves the order of an
- * unordered query unspecified — so `rows[0]` would let the in-process read and
- * the fresh-process observer read pick different rows between runs. Ordering by
- * id makes both reads name the same (original) row.
+ * Order dedup queries by `id` because SQLite does not order unordered results.
  */
 function factRowStateSql(): string {
     return `SELECT m.id AS id, m.status AS status,
@@ -243,14 +229,14 @@ function readFactRowState(
     });
 }
 
-/** The plugin's memory-identity normalization, mirrored here rather than
- *  imported (normalize-hash.ts): lowercase, collapse whitespace, trim. */
+/** This normalization matches `normalize-hash.ts`: lowercase, collapse whitespace, and trim.
+ * */
 function normalizeMemoryText(content: string): string {
     return content.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-/** Compute the plugin-normalized memory hash without importing half the
- *  plugin: lowercase, collapse whitespace, trim, md5 (normalize-hash.ts). */
+/**
+ * */
 function normalizedMemoryHash(content: string): string {
     const hasher = new Bun.CryptoHasher("md5");
     hasher.update(normalizeMemoryText(content));
@@ -258,18 +244,15 @@ function normalizedMemoryHash(content: string): string {
 }
 
 /**
- * The product surfaces these cases actually exercise: the two tools they call
- * plus the memory storage, projection, and hashing modules behind them. Without
- * these the bundle digest only covered harness code, so a behavior change in
- * the code under test left the digest — and every selected-set digest derived
- * from it — unchanged. Deeper transitive dependencies stay out deliberately;
- * these are the modules whose behavior the checks assert.
+ * The bundle digest includes the tools and memory modules exercised by the memory-search cases.
+ * Changes to listed product files would otherwise leave the bundle digest unchanged.
+ * The bundle excludes deeper transitive dependencies because the checks do not assert their behavior.
  */
 const MEMORY_SEARCH_PRODUCT_FILES = [
-    // Every one of these cases gates scoring on a tool being PUBLISHED, and
-    // inclusion plus allowed-action wiring is decided in the registry, not in the
-    // tool modules. A change to those gates turns a case from scored to
-    // precondition_unmet with both digests unchanged.
+    // Each memory-search case requires a PUBLISHED tool before scoring.
+    // The registry determines tool inclusion and allowed-action wiring.
+    // Changes to publication gates can change a case from scored to precondition_unmet.
+    // Such changes leave the implementation and selected-set digests unchanged.
     "packages/plugin/src/plugin/tool-registry.ts",
     "packages/plugin/src/tools/ctx-memory/index.ts",
     "packages/plugin/src/tools/ctx-memory/tools.ts",
@@ -285,18 +268,11 @@ const MEMORY_SEARCH_PRODUCT_FILES = [
     "packages/plugin/src/features/magic-context/memory/storage-memory-projection.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-fts.ts",
     "packages/plugin/src/features/magic-context/memory/normalize-hash.ts",
-    // ctx-search/tools.ts only assembles arguments and packs results: candidate
-    // retrieval, semantic and FTS fusion, source boosts, and the cross-source
-    // ordering A44 judges all live in the unified search implementation, so a
-    // change there flips delivery and ranking with both digests unchanged.
+    // Changes to search.ts can change result delivery and ranking without changing either digest.
     "packages/plugin/src/features/magic-context/search.ts",
-    // Recall is only observable through the injected compartment blocks: this
-    // module decides which memories reach m[0], renders the m[1] memory-update
-    // delta, and performs the hard fold. A5 and A54 read ordinary-turn m[0]
-    // recall through it, and A10's three checks (effective-context
-    // reconciliation, hard-fold convergence, no dual authority) are driven
-    // almost entirely by its output, so a change here flips those verdicts
-    // while the implementation and selected-set digests stay constant.
+    // A5 and A54 observe ordinary-turn recall through inject-compartments.ts output.
+    // A10 consumes inject-compartments.ts output for effective-context reconciliation, hard-fold convergence, and authority checks.
+    // Changes to inject-compartments.ts can change these test verdicts without changing either digest.
     "packages/plugin/src/hooks/magic-context/inject-compartments.ts",
 ];
 
@@ -310,26 +286,16 @@ const IMPLEMENTATION_FILES = [
 
 const A32_IMPLEMENTATION_FILES = [
     ...IMPLEMENTATION_FILES,
-    // Project-memory claim writes, revisions, and verification events all run
-    // through this module's operation envelope, so it owns the write-side
-    // behavior A32 measures.
+    // storage-claim-operations.ts handles project-memory claim writes, revisions, and verification events.
+    // A32 measures this module's write-side behavior.
     "packages/plugin/src/features/magic-context/memory/storage-claim-operations.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-embeddings.ts",
-    // `search.ts` delegates the behavior A32 measures — missing/stale selection,
-    // re-embedding, and guarded persistence — to the backfill path, which in turn
-    // runs the provider and derives the persisted model identity. Without these,
-    // a change that flips stale-vector replacement or semantic recall leaves both
     // digests unchanged.
     "packages/plugin/src/features/magic-context/memory/embedding-backfill.ts",
     "packages/plugin/src/features/magic-context/memory/embedding.ts",
     "packages/plugin/src/features/magic-context/memory/embedding-identity.ts",
 ];
 
-// A54 drives the note path, which the shared memory/search bundle does not
-// cover: its precondition gates on `noteToolPublished` (so tool registration is
-// load-bearing), `noteCreateAcknowledged`, and `noteDurablePending` — the last
-// read straight off `notes.status`. Without these files, editing note creation
-// or note persistence could flip the A54 verdict while `implementation_digest`
 // stayed constant.
 const A54_IMPLEMENTATION_FILES = [
     ...IMPLEMENTATION_FILES,
@@ -341,7 +307,6 @@ const A54_IMPLEMENTATION_FILES = [
 ];
 
 // ---------------------------------------------------------------------------
-// A5 — archived re-observation (accepted behavior, green)
 // ---------------------------------------------------------------------------
 
 export const ARCHIVED_REOBSERVATION_FIXTURE = {
@@ -449,8 +414,8 @@ export function verifyArchivedReobservation(
     ];
 }
 
-/** Read the fact row from a NEW process after the writer (opencode) exited,
- *  proving the case-owned durable state outlives the writer. */
+/** A new process verifies that case-owned durable state outlives the exited opencode writer.
+ * */
 function observerProcessFactState(
     dbPath: string,
     normalizedHash: string,
@@ -458,9 +423,7 @@ function observerProcessFactState(
     const script = [
         'const { Database } = require("bun:sqlite");',
         `const db = new Database(${JSON.stringify(dbPath)}, { readonly: true });`,
-        // The child cannot import `openTestDb`, so it sets the same pragma
-        // inline: without it this read races the writer and fails as
-        // SQLITE_BUSY instead of waiting for the lock.
+        // The child sets `busy_timeout=5000` inline because it cannot import `openTestDb`; without the timeout, this read can fail with `SQLITE_BUSY` instead of waiting for the writer's lock.
         'db.exec("PRAGMA busy_timeout=5000");',
         `const rows = db.prepare(${JSON.stringify(factRowStateSql())}).all(${JSON.stringify(normalizedHash)});`,
         "console.log(JSON.stringify(rows));",
@@ -520,7 +483,6 @@ export async function driveArchivedReobservation(
             prompt: "archive the reconciliation queue rule",
         });
 
-        // Re-observe the SAME normalized fact with different raw bytes.
         const reobserve = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
@@ -567,7 +529,6 @@ export async function driveArchivedReobservation(
         const durable = readFactRowState(h, hash);
         const dbPath = `${h.opencode.env.dataDir}/cortexkit/magic-context/context.db`;
 
-        // Writer exits; a fresh observer process reads the same durable state.
         await h.opencode.kill();
         const observed = observerProcessFactState(dbPath, hash);
         const observerReadConsistent =
@@ -607,16 +568,10 @@ export async function driveArchivedReobservation(
             recurrenceCount: durable.seenCount,
             observerReadConsistent,
             searchAcknowledged: search.resultText.length > 0,
-            // Either path is agent-visible recall of an archived fact: the
-            // injected m[0] block AND the explicit ctx_search response both
-            // reach the model, so checking only m[0] would score a search
-            // that still returns the archived row as "no recall".
+            // Both the injected `m[0]` block and the explicit `ctx_search` response reach the model, so an archived fact in either path counts as recall.
             //
-            // Compare on the product's identity normalization, not raw bytes:
-            // this case deliberately re-observes the fact as uppercase with
-            // padding, so a case-sensitive match would score an exposed
-            // archived fact as "no recall" whenever the surfaced copy carries
-            // the re-observed bytes instead of the original ones.
+            // Compare normalized identities because re-observation uses uppercase text with padding.
+            // `agentVisibleFactRecall` counts a matching `ctx_search` result even when `m[0]` lacks the archived fact.
             agentVisibleFactRecall:
                 normalizeMemoryText(ordinaryM0).includes(
                     normalizeMemoryText(fixture.fact),
@@ -634,7 +589,6 @@ export async function driveArchivedReobservation(
 }
 
 // ---------------------------------------------------------------------------
-// A10/A41 — supersede reconciliation (accepted behavior, green)
 // ---------------------------------------------------------------------------
 
 export const SUPERSEDE_RECONCILIATION_FIXTURE = {
@@ -706,8 +660,7 @@ export function verifySupersedeReconciliation(
 ): VerifierCheck[] {
     const obs = normalizeSupersedeReconciliation(observation as JsonValue);
     return [
-        // AE6: stale cached m0 bytes PLUS the m1 correction are judged as one
-        // effective context; stale m0 without the correction fails.
+        // `check-a10-effective-context-reconciled` evaluates stale `m[0]` with its `m[1]` correction as one context; stale `m[0]` alone fails.
         check(
             "check-a10-effective-context-reconciled",
             obs.m0ShowsRevisedAfterUpdate ||
@@ -719,7 +672,7 @@ export function verifySupersedeReconciliation(
             "check-a10-hard-fold-convergence",
             obs.freshFoldShowsRevised && !obs.freshFoldShowsOriginal,
         ),
-        // Old and new content must never read as simultaneously authoritative.
+        // Archived and re-observed content must not appear simultaneously authoritative.
         check(
             "check-a10-no-dual-authority",
             !obs.m1PresentsOriginalAsCurrent &&
@@ -749,7 +702,6 @@ export async function driveSupersedeReconciliation(
         }
         verifyMemoryByContent(h, fixture.original);
 
-        // Materialize m[0] WITH the original rule (execute pass).
         h.mock.reset();
         h.mock.setDefault({ text: "warm", usage: DEFER_USAGE });
         await h.sendPrompt(sessionId, "A10 warmup turn");
@@ -761,8 +713,8 @@ export async function driveSupersedeReconciliation(
         const baselineShowsOriginal = baselineM0.includes(fixture.original);
         const memoryId = memoryIdIn(baselineM0, fixture.original);
 
-        // The in-session non-additive mutation through the REAL tool. Its
-        // responses carry execute-marking usage so the next pass reconciles.
+        // The test uses the non-additive tool mutation because execute-marking usage triggers next-pass reconciliation.
+        // The mutation response carries execute-marking usage so the next pass reconciles.
         const epochBeforeUpdate = memoryProjectEpoch(h, memoryId);
         const update = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
@@ -787,8 +739,7 @@ export async function driveSupersedeReconciliation(
         const m0After = extractM0(reconcileBody) ?? "";
         const m1After = extractM1(reconcileBody) ?? "";
 
-        // Legitimate hard fold: a fresh session materializes m[0] from the
-        // durable store and must converge on the revised value only.
+        // A fresh session materializes m[0] from durable storage and must converge on the revised value only.
         const readerSessionId = await h.createSession();
         h.mock.reset();
         h.mock.setDefault({ text: "reader warm", usage: DEFER_USAGE });
@@ -815,12 +766,6 @@ export async function driveSupersedeReconciliation(
                 m0After === baselineM0 &&
                 m0After.includes(fixture.original) &&
                 !m0After.includes(fixture.revised),
-            // Either the same-session m[0] or the fresh-session fold may carry
-            // the revised value: with the current accepted behavior the
-            // in-session m[0] carries neither value and no m[1] delta is
-            // emitted, so the fresh fold is the only observable evidence that
-            // the supersede reconciled. Narrowing this to m0After alone turns
-            // the adjudicated green baseline red.
             m0ShowsRevisedAfterUpdate:
                 (m0After.includes(fixture.revised) &&
                     !m0After.includes(fixture.original)) ||
@@ -840,7 +785,6 @@ export async function driveSupersedeReconciliation(
 }
 
 // ---------------------------------------------------------------------------
-// A32 — embedding freshness (known defect, red)
 // ---------------------------------------------------------------------------
 
 export const EMBEDDING_FRESHNESS_FIXTURE = {
@@ -926,10 +870,6 @@ export function preconditionEmbeddingFreshness(
         obs.argsValidated &&
         obs.workspaceScoped &&
         obs.namespaceUnique;
-    // KTD7 non-vacuity: isolation proven, a real vector was persisted for the
-    // OLD content, the in-place edit kept the row, the persisted vector
-    // survived the edit unchanged, and a fresh embed of the new content WOULD
-    // differ (so the stale condition is meaningful).
     const setupOk =
         obs.schemaSentinel &&
         obs.emptyStateAtStart &&
@@ -939,8 +879,7 @@ export function preconditionEmbeddingFreshness(
         obs.editKeptRowId &&
         obs.staleVectorPersistedAfterEdit &&
         obs.freshVectorWouldDiffer;
-    // The reproduction REQUIRES the semantic lane: any lexical overlap (or a
-    // non-semantic match) means FTS could bypass the stale-vector condition.
+    // A non-semantic FTS match could bypass the stale-vector condition.
     const semanticLaneOk =
         !obs.lexicalOverlapStaleQuery &&
         !obs.lexicalOverlapFreshQuery &&
@@ -956,14 +895,10 @@ export function verifyEmbeddingFreshness(
 ): VerifierCheck[] {
     const obs = normalizeEmbeddingFreshness(observation as JsonValue);
     return [
-        // Normative: semantic recall must reflect the CURRENT content — the
-        // fresh query finds the memory and the stale query no longer does.
         check(
             "check-a32-fresh-semantic-recall",
             obs.freshQueryReturnsMemory && !obs.staleQueryReturnsMemory,
         ),
-        // Normative: the persisted vector must be replaced after the content
-        // edit (observed as a real re-embed plus a changed stored vector).
         check(
             "check-a32-stale-vector-replaced",
             obs.vectorReplacedBySearchTime && obs.passageReembedObserved,
@@ -988,8 +923,7 @@ export async function driveEmbeddingFreshness(
     const fixture = EMBEDDING_FRESHNESS_FIXTURE;
     const embedMock = new MockProvider();
     const { baseURL: embeddingEndpoint } = await embedMock.start();
-    // The harness boot is inside the try so a failure there still stops the
-    // embedding mock; leaving it running leaks a bound port for the whole run.
+    // The harness stops the embedding mock to release its bound port.
     let harness: TestHarness | null = null;
     try {
         const h = await createCaseHarness(
@@ -1005,7 +939,6 @@ export async function driveEmbeddingFreshness(
             }),
         );
         harness = h;
-        // KTD7 preconditions BEFORE any seeding or out-of-band SQL.
         const sentinel = readContextDb(h, (db) => {
             const tables = db
                 .prepare(
@@ -1049,7 +982,7 @@ export async function driveEmbeddingFreshness(
         const memoryId = Number(idMatch[1]);
         verifyMemoryByContent(h, fixture.oldContent);
 
-        // Wait for the proactive embed to persist the seed vector.
+        // The test waits until the proactive embed persists the seed vector.
         const readStoredVector = (): {
             vector: Float32Array;
             modelId: string;
@@ -1097,9 +1030,7 @@ export async function driveEmbeddingFreshness(
             const before = db
                 .prepare("SELECT COUNT(*) AS n FROM memories")
                 .get() as { n: number };
-            // The edit rewrites content and dedup identity in place without
-            // touching the stored vector, which is what leaves the embedding
-            // stale for the searches below.
+            // The unchanged stored vector remains stale for subsequent searches.
             db.prepare(
                 "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
             ).run(
@@ -1150,11 +1081,8 @@ export async function driveEmbeddingFreshness(
                     input.includes(fixture.freshQuery),
                 ),
         );
-        // Matching the input text alone accepts a re-embedding issued in QUERY
-        // mode. The deterministic mock returns the same vector either way, so
-        // the final-vector comparison below would also pass while a real
-        // provider produced a vector from the wrong space. Require the
-        // configured passage mode and model.
+        // Matching input text alone accepts a QUERY-mode re-embedding.
+        // The deterministic mock returns the same vector in either mode.
         const passageReembedObserved = embeds.some(
             (request) =>
                 request.inputType === "passage" &&
@@ -1164,17 +1092,12 @@ export async function driveEmbeddingFreshness(
                 ),
         );
         const finalVector = readStoredVector();
-        // "Different from the stale vector" is not "correct": any corrupted
-        // replacement satisfies it. The passage-request check proves only that
-        // an embedding was REQUESTED, not that the returned vector was
-        // persisted, and a single-row search can satisfy the fresh/stale query
-        // assertions with a merely favorable wrong vector. Compare against the
-        // deterministic embedding of the edited content, and tie the persisted
-        // identity to the CONFIGURED model rather than only to the seed row —
-        // agreement between two rows written under the same wrong identity is
-        // not provenance. Containment rather than equality because the stored
-        // identity may be composite; the point is that an unrelated model
-        // cannot satisfy it.
+        // A vector different from the stale vector may still come from QUERY-mode re-embedding.
+        // The passage-request check proves only that an embedding was requested.
+        // Persisted-vector equality verifies that the edited-content embedding was written.
+        // `finalVector.modelId` must include `fixture.embeddingModel`; matching `seeded.modelId` alone does not establish model provenance.
+        // Two rows can share the same wrong `modelId`, so their agreement does not establish provenance.
+        // The check uses containment because stored model IDs can be composite.
         const vectorReplacedBySearchTime =
             finalVector !== null &&
             vectorsRoughlyEqual(finalVector.vector, newVector) &&
@@ -1222,11 +1145,9 @@ export async function driveEmbeddingFreshness(
                 staleSearch.resultText.includes("[memory]"),
             staleQueryMatchSemantic:
                 staleSearch.resultText.includes("match=semantic"),
-            // A bare `[memory]` header is satisfied by ANY memory result, so an
-            // unrelated or fabricated hit passed while the edited row itself
-            // stayed unrecalled — and the vector assertions never couple a
-            // result to `memoryId`. Require the fresh lane to name the edited
-            // row and carry its new content.
+            // The check requires fresh results to include `id=${memoryId}` and `fixture.newContent`; `[memory]` alone does not identify the edited row.
+            // The vector assertions do not link a search result to `memoryId`.
+            // The row ID excludes unrelated `[memory]` results; `fixture.newContent` confirms the edit.
             freshQueryReturnsMemory:
                 freshSearch.resultText.includes("[memory]") &&
                 freshSearch.resultText.includes(`id=${memoryId}`) &&
@@ -1241,7 +1162,6 @@ export async function driveEmbeddingFreshness(
 }
 
 // ---------------------------------------------------------------------------
-// A44 — cross-source rank remap (known defect, red)
 // ---------------------------------------------------------------------------
 
 export const CROSS_SOURCE_RANK_FIXTURE = {
@@ -1303,7 +1223,7 @@ export function preconditionCrossSourceRank(
         obs.argsValidated &&
         obs.workspaceScoped &&
         obs.namespaceUnique;
-    // Non-vacuity: BOTH candidates must be eligible and delivered — a
+    // Both candidates must be eligible and delivered; otherwise the ordering cannot be scored.
     // single-candidate ordering is vacuously correct and must never score.
     const bothEligible =
         obs.compartmentCoversProbe &&
@@ -1320,8 +1240,7 @@ export function verifyCrossSourceRank(
 ): VerifierCheck[] {
     const obs = normalizeCrossSourceRank(observation as JsonValue);
     return [
-        // Normative: the known-better single-source memory hit outranks the
-        // common-literal probe message in the rendered ctx_search ordering.
+        // The known-better single-source memory hit must outrank the common-literal probe message in rendered `ctx_search` order.
         check(
             "check-a44-known-better-memory-outranks",
             obs.memoryOutranksMessage,
@@ -1384,8 +1303,7 @@ export async function driveCrossSourceRank(
         });
         const sessionId = await h.createSession();
 
-        // The known-better memory lives in the reader session while the common
-        // message candidate remains eligible from the separate writer session.
+        // The known-better memory is eligible in the reader session, and the common message candidate is eligible in the writer session.
         const write = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
@@ -1450,12 +1368,9 @@ export async function driveCrossSourceRank(
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),
             namespaceUnique: caseNamespaceIsUnique(context),
             compartmentCoversProbe: probeState().covered,
-            // Delivery stays durable-derived. Deriving it from the rendered
-            // response is the honest reading, but the response currently
-            // carries NO message-lane entry, so the switch reports
-            // precondition_unmet and abandons the adjudicated red baseline —
-            // the reproduction is vacuous until the message lane is really
-            // delivered, which needs a setup fix plus re-adjudication.
+            // Delivery is derived from durable state, not rendered output.
+            // The precondition returns `precondition_unmet` when no message-lane entry is delivered.
+            // TODO: Deliver a message-lane candidate before scoring cross-source rank ordering.
             memoryDelivered: durableCandidates.memory,
             messageDelivered: durableCandidates.message,
             memoryContentMatchesQuery:
@@ -1475,7 +1390,6 @@ export async function driveCrossSourceRank(
 }
 
 // ---------------------------------------------------------------------------
-// A54 — pending smart-note recall (accepted behavior, green)
 // ---------------------------------------------------------------------------
 
 export const PENDING_NOTE_RECALL_FIXTURE = {
@@ -1572,8 +1486,6 @@ export async function drivePendingNoteRecall(
     context: CaseDriverContext,
 ): Promise<PendingNoteRecallObservation> {
     const fixture = PENDING_NOTE_RECALL_FIXTURE;
-    // Smart notes require an enabled dreamer; nightly evaluation never fires
-    // inside the short case window, so the note stays pending throughout.
     const h = await createCaseHarness(
         context,
         memoryHarnessOptions({ dreamer: { disable: false } }),
@@ -1608,8 +1520,7 @@ export async function drivePendingNoteRecall(
             return row?.status === "pending";
         });
 
-        // An ORDINARY turn in a fresh session: the pending note must not be
-        // surfaced anywhere on the provider-visible wire.
+        // An ordinary turn in a fresh session must not surface a pending note on the provider-visible wire.
         const readerSessionId = await h.createSession();
         h.mock.reset();
         h.mock.setDefault({ text: "ordinary reply", usage: DEFER_USAGE });
@@ -1671,7 +1582,7 @@ export async function drivePendingNoteRecall(
 // Registry entries
 // ---------------------------------------------------------------------------
 
-/** The registered U4 cases; `builtinIncidentCaseRegistry` installs these. */
+/* */
 export function auditMemorySearchIncidentCases(): RegisteredIncidentCase[] {
     return [
         {

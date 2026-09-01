@@ -1,4 +1,3 @@
-//! Pure assembly for the historian's per-run user prompt.
 //!
 //! The builders in this module take already-loaded rows and strings. They do not read the
 //! store, call the clock, or inspect provider state; callers own those integration choices.
@@ -11,7 +10,7 @@ use serde::Deserialize;
 
 /// Permanent seed floor — every historian run receives this many calibration examples.
 pub const SEED_FLOOR: usize = 4;
-/// Number of this-session compartments shown for continuity and local calibration.
+/// The prompt shows six this-session compartments for continuity and local calibration.
 pub const SESSION_REF_WINDOW: usize = 6;
 
 const SEED_BANDS: [(i32, i32); 5] = [(85, 100), (60, 84), (30, 59), (10, 29), (1, 9)];
@@ -29,7 +28,6 @@ pub struct ReferenceSeed {
     pub block: String,
 }
 
-/// Stored-form compartment fields needed to render the historian's reference block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReferenceCompartment {
     pub start_message: i64,
@@ -63,9 +61,9 @@ impl From<&StoredCompartment> for ReferenceCompartment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceBlocks {
-    /// `<compartment_examples_from_other_projects>` — present for the normal 4-seed floor.
+    /// `seed_examples` contains `<compartment_examples_from_other_projects>` when the four-example seed floor applies.
     pub seed_examples: String,
-    /// `<session_references>` — empty for a young session with no prior compartments.
+    /// `session_references` is empty when the session has no prior compartments.
     pub session_references: String,
 }
 
@@ -107,7 +105,7 @@ pub fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// FNV-1a over JavaScript UTF-16 code units, matching the prompt reference exactly.
+/// The hash applies FNV-1a to JavaScript UTF-16 code units to match the prompt reference exactly.
 ///
 /// The same session chunk can be retried after a transient failure; a stable hash keeps
 /// the calibration examples unchanged so the historian rerun sees the same prompt bytes.
@@ -194,7 +192,6 @@ fn select_seed_indices(
     picks
 }
 
-/// Select deterministic cross-project calibration examples for a historian run.
 pub fn select_seeds(session_id: &str, chunk_start: i64, count: usize) -> Vec<ReferenceSeed> {
     let corpus = reference_seeds();
     select_seed_indices(corpus, session_id, chunk_start, count)
@@ -301,7 +298,7 @@ pub fn build_reference_blocks_from_stored(
     build_reference_blocks(session_id, chunk_start, &refs)
 }
 
-/// Render the same claim-native project-memory block used by the host.
+/// Project memory uses the host's claim-native block format.
 pub fn render_historian_claim_block(claims: &[MirroredClaimMemory]) -> String {
     render_claim_memory_block(claims, "project-memory")
 }

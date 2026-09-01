@@ -1,36 +1,21 @@
 #!/usr/bin/env bun
 /**
- * analyze-cache-busts.ts — walk a session's anthropic-auth request dumps in
- * order and locate exactly WHERE the Anthropic prompt cache busts.
+ * The script locates Anthropic prompt-cache busts in a session's request dumps.
  *
- * The opencode-anthropic-auth plugin dumps every outbound request body to a
- * temp dir (`<tmpdir>/opencode-anthropic-auth-dumps/*.body.json`) alongside a
- * `.meta.json`. This tool reconstructs the wire-order segment list for each
- * request (system blocks, then every message), hashes each segment, and finds
- * the FIRST segment whose content changed vs the previous same-session request.
- * Anthropic serves a cache hit only up to the longest matching prefix that ends
- * at a `cache_control` breakpoint, so the first-diverging segment is the bust
- * origin and the last breakpoint at-or-before it is the effective cached prefix.
+ * The plugin writes each outbound request body to `<tmpdir>/opencode-anthropic-auth-dumps/*.body.json`.
+ * The plugin stores a `.meta.json` file beside each request body dump.
+ * Anthropic caches only the longest matching prefix ending at a `cache_control` breakpoint.
+ * The first diverging segment identifies the cache-bust origin.
  *
- * Normalization (so we measure REAL content drift, not provider noise):
- *   - The `cch=<nonce>` in the `x-anthropic-billing-header` system block is a
- *     per-request nonce Anthropic ignores for cache-keying → normalized out.
- *   - `cache_control` markers move every turn (they sit on the last/second-last
- *     message) → stripped before hashing, since marker movement is not content.
- *   - `§N§` tag prefixes ARE on-wire content the model sees → kept (a changed
- *     tag number is a genuine bust we want to catch).
+ * Anthropic ignores the per-request `cch=<nonce>` billing-header value when cache-keying.
+ * `cache_control` markers move between the last and second-last message each turn.
+ * The tool strips `cache_control` before hashing because marker movement does not change content.
+ * The tool preserves `§N§` tag prefixes because they are on-wire model input.
+ * A changed `§N§` tag number is a genuine cache bust.
  *
  * Usage:
- *   bun scripts/analyze-cache-busts.ts <sessionIdPrefix> [options]
  * Options:
- *   --dir <path>     dump dir (default: <tmpdir>/opencode-anthropic-auth-dumps)
- *   --since <ISO>    only requests created at/after this time
- *   --until <ISO>    only requests created at/before this time
- *   --limit <N>      only the last N requests in range
- *   --show-diff      print before/after snippet of the first-diverging segment
- *   --all-busts      list every diverging segment, not just the first
- *   --all-rows       also print STABLE/SAME rows (default: only BUST rows, so a
- *                    real prefix bust is never buried under ordinary tail growth)
+ * `--all-rows` includes STABLE and SAME rows.
  */
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
@@ -89,7 +74,7 @@ function parseArgs(argv: string[]): {
     };
 }
 
-/** Recursively strip `cache_control` fields — marker movement is not content. */
+/** stripCacheControl removes `cache_control` fields because marker movement does not change content. */
 function stripCacheControl(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(stripCacheControl);
     if (value && typeof value === "object") {
@@ -115,7 +100,7 @@ function messageHasBreakpoint(msg: Json): boolean {
     return hasCacheControl(msg);
 }
 
-/** Normalize the per-request billing nonce so it isn't seen as a content change. */
+/** normalizeSystemText replaces the per-request billing nonce so it does not change the hash. */
 function normalizeSystemText(text: string): string {
     return text.replace(/cch=[^;]*;/g, "cch=<NONCE>;");
 }
@@ -164,8 +149,7 @@ function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
             continue;
         }
         const session = String(meta.session ?? "");
-        // The dump truncates session ids with an ellipsis ("ses_31366057…"); match
-        // on the visible head so a full id or a head fragment both work.
+        // Dumped session IDs contain an ellipsis; matching their visible head accepts both full IDs and head fragments.
         const head = session.replace(/[….]+$/, "");
         if (!session.startsWith(opts.sessionPrefix) && !opts.sessionPrefix.startsWith(head)) {
             continue;
@@ -199,7 +183,7 @@ function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
     return snaps;
 }
 
-/** First wire-order segment index where prev/cur diverge (added/removed/changed). */
+/** The divergence index is the first wire-order segment where the previous and current requests differ, including additions and removals. */
 function firstDivergence(prev: Segment[], cur: Segment[]): number {
     const n = Math.min(prev.length, cur.length);
     for (let i = 0; i < n; i += 1) {
@@ -208,7 +192,7 @@ function firstDivergence(prev: Segment[], cur: Segment[]): number {
     return prev.length === cur.length ? -1 : n;
 }
 
-/** Effective cached prefix = bytes up to the last breakpoint strictly before divergence. */
+/* */
 function cachedPrefixBytes(segs: Segment[], divergeIdx: number): { bytes: number; at: string } {
     let bytes = 0;
     let lastBreakpointBytes = 0;
@@ -216,7 +200,7 @@ function cachedPrefixBytes(segs: Segment[], divergeIdx: number): { bytes: number
     const limit = divergeIdx < 0 ? segs.length : divergeIdx;
     for (let i = 0; i < segs.length; i += 1) {
         if (i < limit && segs[i].breakpoint) {
-            // breakpoint content is unchanged up to here
+            // The effective cached prefix contains bytes through the last breakpoint before divergence.
             lastBreakpointBytes = bytes + segs[i].bytes;
             lastBreakpointId = segs[i].id;
         }
@@ -226,8 +210,6 @@ function cachedPrefixBytes(segs: Segment[], divergeIdx: number): { bytes: number
 }
 
 function fmtTime(iso: string): string {
-    // Dumps are UTC; the dashboard renders local time (UTC+2), so include the date
-    // here to keep multi-day dump sets unambiguous when correlating views.
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
     const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -268,10 +250,8 @@ function main(): void {
         "-------------------|------|---------|-------------------------|-----------------------------|------------------------",
     );
 
-    // By default only BUST rows are printed so a genuine prefix bust is never
-    // buried under ordinary tail-growth (STABLE) or no-op (SAME) rows. STABLE =
-    // divergence is past prev's last breakpoint (pure tail addition, still a
-    // cache hit). --all-rows restores the full per-request table.
+    // Default output omits STABLE and SAME rows so BUST rows remain visible.
+    // STABLE means the divergence is a pure tail addition after the previous request's last breakpoint.
     let bustCount = 0;
     for (let k = 0; k < snaps.length; k += 1) {
         const cur = snaps[k];
@@ -294,9 +274,6 @@ function main(): void {
             continue;
         }
         const seg = cur.segments[idx] ?? prev.segments[idx];
-        // The reusable cache was written at PREV's breakpoints. OpenCode moves the
-        // tail breakpoint forward every request, so judging against CUR's final
-        // breakpoint mislabels ordinary tail growth as a bust.
         const prevLastBreakpoint = lastBreakpointIndex(prev.segments);
         const verdict = idx > prevLastBreakpoint ? "STABLE" : "BUST";
         if (verdict === "BUST") bustCount += 1;

@@ -6,5 +6,6 @@ export const exactPath = defineScenario({
     title: "Recall an exact migration path",
     evidence: "The generated migration must be written at db/migrations/20260831_add_lease_epoch.sql.",
     answer: "db/migrations/20260831_add_lease_epoch.sql",
+    answerMatch: "exact",
     locatorId: "mem-exact-path",
 });

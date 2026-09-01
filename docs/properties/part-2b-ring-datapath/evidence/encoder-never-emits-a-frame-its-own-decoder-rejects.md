@@ -58,9 +58,11 @@ two production encoders share one gate for small bodies.
    `decode_header` rejects `channel != 0 && epoch == 0` at `:352` with
    `ZeroEpochOnRoutedChannel`.
 
-All four are reachable from outside the crate: `pub mod wire` at `lib.rs:39`
+All four are reachable from outside the crate: `pub mod wire` at `lib.rs:36`
+(post-#131 it carries `#[doc(hidden)]` at `:35`, which hides it from rustdoc
+but not from linkage)
 exposes both encoders, `Flags` and `FrameId::routed`, and `pub mod handler` at
-`lib.rs:17` exposes `RouteHandle` with both fields `pub` (`handler.rs:36-40`).
+`lib.rs:14` exposes `RouteHandle` with both fields `pub` (`handler.rs:36-40`).
 
 **Why the in-tree host paths are safe today, by construction rather than
 enforcement.** `Flags::new` (`:146-156`) builds from `bool`, `Priority` and
@@ -184,7 +186,7 @@ Three dependencies are worth naming:
   of "passes inbound validation" in the guarantee. That function is Part 2b's and
   applies the caps, the pure-header triple and the role subset that
   `decode_header` does not. The check below should call both, in the order
-  `ring_transport.rs:471-473` calls them.
+  `ring_transport.rs:503-505` calls them.
 
 ## What a test must construct
 
@@ -227,7 +229,7 @@ it under `R0`.
   `force_last_epoch`), `:511-528`
   (`reserved_channels_are_nonzero_distinct_and_start_at_epoch_one`), `:715-718`
   and `:750-753` (test-constructed handles), `handler.rs:36-40` (`RouteHandle`),
-  `lib.rs:17` (`pub mod handler`), `wire.rs:525-531` (`FrameId::routed`).
+  `lib.rs:14` (`pub mod handler`), `wire.rs:525-531` (`FrameId::routed`).
 - Findings: the registry cannot mint one. Channel 0 is skipped at `:123`; epoch
   starts from `last_epoch: 0` at `:125` and is minted as `last_epoch + 1` at
   `:129-130`, so it is at least 1; `force_last_epoch` (`:458-468`) only moves the
@@ -255,7 +257,7 @@ it under `R0`.
 - Sources examined: `wire.rs:142` (`Flags(pub u8)`), `:146-156` (`Flags::new`),
   `:86-88` (`is_pure_header`), `:525-531` (`FrameId::routed`), `:571-602` and
   `:608-633` (the two production encoders), `:636-644` (the two host flag
-  helpers), `lib.rs:17` and `:39` (both modules public),
+  helpers), `lib.rs:14` and `:36` (both modules public),
   `handler.rs:36-40` (`RouteHandle`'s public fields).
 - Findings: both routes are viable and they differ in blast radius. Validation in
   the encoders is local, costs a branch per emission on a path that already
@@ -269,9 +271,10 @@ it under `R0`.
   the cleanest end state and the largest change.
 - Missing evidence: whether `wire` and `handler` are intended as stable public
   API or are public only because the module tree needed them. `pub mod
-  ring_transport` next to them carries `#[doc(hidden)]` at `lib.rs:20` and these
-  two do not, which is weak evidence that they are intended to be public, but it
-  is not decisive and no crate-level API-stability document was found.
+  ring_transport` next to them carries `#[doc(hidden)]` at `lib.rs:17` and these
+  two did not when this was written; post-#131 `wire` carries `#[doc(hidden)]`
+  too (`lib.rs:35`), which weakens that evidence for `wire` specifically. No
+  crate-level API-stability document was found.
 - Conclusion: needs human input. The choice turns on the public-API question,
   which is not answerable from the tree.
 

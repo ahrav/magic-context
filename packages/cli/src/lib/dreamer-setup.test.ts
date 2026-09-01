@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { runDreamerSetup } from "./dreamer-setup";
 import type { PromptIO, PromptLog, PromptSpinner, SelectOption } from "./prompts";
 
-/** Minimal scripted PromptIO: confirms/selects/texts are FIFO queues. */
+/* */
 class MockPrompts implements PromptIO {
     private confirms: boolean[];
     private selects: string[];
@@ -73,7 +73,6 @@ describe("runDreamerSetup", () => {
     });
 
     it("declining defaults runs the per-task loop and writes every task's schedule", async () => {
-        // useRecommendedSchedules = NO, then one preset select per task (all "Nightly").
         const prompts = new MockPrompts({
             confirms: [false],
             autos: ["x/y"],
@@ -104,7 +103,7 @@ describe("runDreamerSetup", () => {
     });
 
     it("Custom preset drops to validated raw-cron text entry", async () => {
-        // First task picks Custom → text entry; rest pick Nightly.
+        // The first task consumes texts[0]; the remaining task prompts select `cron:0 3 * * *`.
         const prompts = new MockPrompts({
             confirms: [false],
             autos: ["x/y"],

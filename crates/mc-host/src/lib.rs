@@ -1,10 +1,7 @@
 //! Host runtime for the wire contract in `docs/mc-host-wire-protocol.md`.
 
-// `deny` rather than `forbid`: the Broca subprocess spawner carries the one
-// permitted `unsafe` block in this crate — a `pre_exec` hook that arms
-// `PR_SET_PDEATHSIG` so harness children cannot outlive a crashed host.
-// Every other module remains unsafe-free; new `unsafe` requires its own
-// scoped `allow` and a safety justification.
+// `deny(unsafe_code)` permits Broca's scoped `allow` for its `pre_exec` hook.
+// `PR_SET_PDEATHSIG` terminates harness children when the host dies.
 #![deny(unsafe_code)]
 
 pub mod auth;
@@ -79,9 +76,7 @@ pub use runtime::{run, run_with_publish_hook, HostError};
 /// The version-2 body cap. Published so a consumer preparing an output can
 /// gate on the same value frame admission enforces, rather than restating it.
 pub use wire::MAX_FRAME_BODY_LEN;
-/// Launch-identity environment variable names. Published so module-side code
-/// reads the same names the host injects at spawn, rather than restating the
-/// protocol vocabulary as string literals.
+/// `SUBC_LAUNCH_NONCE_ENV` and `SUBC_MODULE_ID_ENV` let module-side code use the names injected at spawn.
 pub use wire::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
 pub use tokio_util::sync::CancellationToken;

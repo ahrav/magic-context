@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { getVisibleRevisionLocators } from "../../../plugin/src/hooks/magic-context/inject-compartments";
@@ -87,8 +86,7 @@ describe("scriptedCtxSearchTurn", () => {
                 .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
                 .get(visibleSession) as { memory_block_ids: string } | null;
             expect(row).not.toBeNull();
-            // Injection records the revision locator of every rendered claim, and
-            // that locator set is what `ctx_search` hard-filters against.
+            // `ctx_search` hard-filters against revision locators recorded for rendered claims.
             const visibleLocators = getVisibleRevisionLocators(db, visibleSession);
             expect(visibleLocators).not.toBeNull();
             expect([...(visibleLocators ?? [])]).toContain(injected.revisionLocator);

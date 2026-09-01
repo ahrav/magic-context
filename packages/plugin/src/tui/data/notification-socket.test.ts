@@ -77,7 +77,6 @@ function startLegacyServer(
         fetch(req, bunServer) {
             const url = new URL(req.url);
             if (url.pathname === "/health") {
-                // Frozen v0.32 response: pid only, with no instance_id.
                 return Response.json({ ok: true, pid: process.pid });
             }
             if (
@@ -107,7 +106,6 @@ function startLegacyServer(
                             ws.send(JSON.stringify({ type: "notification", notification }));
                         }
                     }
-                    // Frozen v0.32 acknowledgement: protocol epoch fields did not exist.
                     ws.send(JSON.stringify({ type: "hello-ack" }));
                 } else if (msg.type === "ack" && typeof msg.cursor === "number") {
                     ackCursors.push(msg.cursor);
@@ -253,8 +251,6 @@ describe("notification socket", () => {
 
         first.stop();
         await waitFor(() => !isTuiConnected("ses_R"), "old websocket sink removed");
-        // A process restart recreates module state as well as the RPC server. The
-        // client state intentionally survives so reused ids exercise epoch reset.
         __resetNotificationStateForTests();
         pushNotification("queued-after-restart", { action: "show-status-dialog" }, "ses_R");
         const second = await startServer(dataHome, directory);

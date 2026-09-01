@@ -1,29 +1,12 @@
 /**
- * Bounded LRU map keyed by session id.
  *
- * Rationale: magic-context maintains several module-scope Maps that track
- * per-session state (prepared injection cache, per-message token cache, etc.).
- * These are cleared on the `session.deleted` event, but sessions that are
- * never explicitly deleted — because OpenCode crashed, the user force-quit,
- * the session was archived rather than deleted, or the session simply outlived
- * the plugin process's interest in it — leak entries for the lifetime of the
  * plugin process.
  *
- * In long-running OpenCode instances with thousands of sessions over time,
- * an unbounded `Map<sessionId, LargeObject>` can retain tens of megabytes
- * indefinitely. A session-scoped LRU with a generous cap (e.g. 100) covers
- * any realistic working-set of active sessions a user actually cares about,
- * while evicting cold session ids that will either never return or be
- * rebuilt from durable SQLite state on their next transform pass.
  *
  * Implementation notes:
- * - Built on `Map` which preserves insertion order. On every `set`/`get`
- *   touch we delete+reinsert to move the key to the tail (most-recent).
+ * `Map` preserves insertion order.
+ * `get` refreshes keys whose stored value is not `undefined`; `set` refreshes existing keys by deleting and reinserting them.
  * - Eviction drops the oldest entry (first in iteration order).
- * - The cached value type is generic — callers decide what per-session state
- *   to store. For injection/token state, all three properties of the cached
- *   object are safe to throw away: they are either recomputable from the
- *   messages array on the next pass, or reloadable from SQLite.
  */
 export class BoundedSessionMap<V> {
     private readonly maxEntries: number;
@@ -39,15 +22,14 @@ export class BoundedSessionMap<V> {
     get(sessionId: string): V | undefined {
         const value = this.store.get(sessionId);
         if (value === undefined) return undefined;
-        // Touch: move to most-recent position.
+        // Deleting and reinserting `sessionId` refreshes its recency when its stored value is not `undefined`.
         this.store.delete(sessionId);
         this.store.set(sessionId, value);
         return value;
     }
 
     /**
-     * Peek without touching recency — useful for `has`-style checks that
-     * should not rearrange LRU order. Use sparingly; `get` is the normal
+     * `peek` reads `sessionId` without changing its LRU recency.
      * access path.
      */
     peek(sessionId: string): V | undefined {
@@ -63,7 +45,7 @@ export class BoundedSessionMap<V> {
             // Refresh recency.
             this.store.delete(sessionId);
         } else if (this.store.size >= this.maxEntries) {
-            // Evict oldest entry. Map iteration is insertion-ordered.
+            // `set` evicts the least recently used entry when adding a new key to a full `store`; `Map` iterates in insertion order.
             const oldest = this.store.keys().next().value;
             if (oldest !== undefined) this.store.delete(oldest);
         }

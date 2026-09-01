@@ -9,9 +9,6 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 		const db = createTestDb();
 		try {
 			// A user message reduced to only [dropped §N§] must NOT be removed:
-			// user messages anchor turn boundaries (parity with OpenCode's
-			// strip-content "Never neutralize user-role messages"). Only the
-			// assistant placeholder is stripped.
 			const messages = [
 				userMessage("keep", 1),
 				assistantMessage("[dropped §2§]", 2),
@@ -26,8 +23,6 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 				isCacheBusting: true,
 			});
 
-			// Only the assistant placeholder (#2) is removed; the all-[dropped]
-			// USER message (#3) is preserved.
 			expect(result).toEqual({ removed: 1, discovered: 1 });
 			expect(messages.map((m) => (m as { role: string }).role)).toEqual([
 				"user",
@@ -129,7 +124,6 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 	it("prunes below-boundary ids from the persisted set on cache-busting passes", () => {
 		const db = createTestDb();
 		try {
-			// Pass 1: discover two placeholders under real carried ids.
 			const phA = assistantMessage("[dropped §2§]", 2);
 			const phB = assistantMessage("[dropped §3§]", 3);
 			const pass1 = [userMessage("keep", 1), phA, phB];
@@ -147,9 +141,7 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 			});
 			expect(getStrippedPlaceholderIds(db, "ses-prune").size).toBe(2);
 
-			// Pass 2 (cache-busting): entry-A has fallen below the compaction
-			// boundary (no longer in the window); only entry-B remains present.
-			// The persisted set must prune entry-A.
+			// Cache-busting passes prune persisted IDs absent from the current window.
 			const phB2 = assistantMessage("[dropped §3§]", 3);
 			const pass2 = [userMessage("keep", 1), phB2];
 			const map2 = new Map<object, string>([
@@ -192,8 +184,8 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 				getStrippedPlaceholderIds(db, "ses-defer-noprune").has("entry-A"),
 			).toBe(true);
 
-			// Defer pass where entry-A is absent — must NOT prune (defer passes
-			// never mutate persisted replay state).
+			// Defer passes do not mutate persisted replay state.
+			// Defer passes do not mutate persisted replay state.
 			const pass2 = [userMessage("keep", 1)];
 			const map2 = new Map<object, string>([
 				[pass2[0] as object, "entry-keep"],
@@ -216,7 +208,6 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 	it("uses the carried-id map by object-ref and survives an index shift", () => {
 		const db = createTestDb();
 		try {
-			// Pass 1: discover under a real entry id carried by object-ref.
 			const placeholder = assistantMessage("[dropped §9§]", 2);
 			const pass1 = [userMessage("keep", 1), placeholder];
 			const map1 = new Map<object, string>([
@@ -231,15 +222,13 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 				stableIdByRef: map1,
 			});
 			expect(r1).toEqual({ removed: 1, discovered: 1 });
-			// Persisted under the REAL id, not pi-msg-*.
+			// The stripper persists the stable entry ID instead of a `pi-msg-*` ID.
 			expect(getStrippedPlaceholderIds(db, "ses-carry").has("entry-PH")).toBe(
 				true,
 			);
 
-			// Pass 2 (defer): the SAME placeholder object now sits at a DIFFERENT
-			// index (prefix grew), and a synthetic m[0] prepend (NOT in the map) is
-			// at the head. Removal must still strip the placeholder by object-ref
-			// and SKIP the unmapped synthetic prepend.
+			// Removal uses object identity, so index shifts do not affect mapped placeholders.
+			// Removal uses object identity to strip mapped placeholder messages and skip unmapped prepended messages.
 			const syntheticPrepend = userMessage("<session-history>…", 0);
 			const pass2 = [
 				syntheticPrepend,
@@ -251,7 +240,6 @@ describe("stripPiDroppedPlaceholderMessages", () => {
 				[pass2[1] as object, "entry-newer"],
 				[pass2[2] as object, "entry-keep"],
 				[placeholder as object, "entry-PH"],
-				// syntheticPrepend deliberately absent → skip-on-miss.
 			]);
 			const r2 = stripPiDroppedPlaceholderMessages({
 				db,

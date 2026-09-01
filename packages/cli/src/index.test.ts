@@ -7,11 +7,9 @@ import { type CliDispatchDependencies, dispatchCli, usageText } from "./dispatch
 import { PromptCancelledError } from "./lib/prompts";
 
 const builtCliRoot = mkdtempSync(join(tmpdir(), "magic-context-cli-built-"));
-// A per-run home keeps concurrent runs on a shared host from racing on one
-// fixed path while still pointing the CLI away from the real home directory.
+// A per-run home prevents concurrent shared-host runs from racing on a fixed path and keeps the CLI out of the real home directory.
 const entrypointHome = mkdtempSync(join(tmpdir(), "magic-context-cli-entrypoint-"));
-// An absolute data root so lifecycle resolution stops at XDG_DATA_HOME instead
-// of reaching the NODE_ENV=test backstop, which warns once on stderr.
+// An absolute data root stops lifecycle resolution at XDG_DATA_HOME, avoiding the NODE_ENV=test fallback's one-time stderr warning.
 const entrypointDataRoot = join(entrypointHome, ".local", "share");
 
 afterAll(() => {
@@ -87,9 +85,7 @@ describe("import-safe CLI dispatch", () => {
 
     test("a cancelled prompt exits 0 rather than escaping as an error", async () => {
         const h = dependencies();
-        // The command rejects the way a cancelled clack prompt does. Without
-        // `return await` in dispatchCli the rejection settles dispatchCli's own
-        // promise, bypassing its isPromptCancelledError branch entirely.
+        // `return await` lets `dispatchCli` catch `PromptCancelledError` rejections and return 0.
         h.deps.runDaemon = async () => {
             throw new PromptCancelledError("Cancelled.");
         };
@@ -131,8 +127,7 @@ describe("import-safe CLI dispatch", () => {
             cmd: [
                 process.execPath,
                 "-e",
-                // A bin path that cannot be realpath-resolved (removed or
-                // unreadable) must not look the same as "imported as a module".
+                // A bin path that cannot be realpath-resolved must not be treated as a module import.
                 `process.argv[1] = ${JSON.stringify(missingEntry)}; await import("./src/index.ts")`,
             ],
             cwd: cliRoot,

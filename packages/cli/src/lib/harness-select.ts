@@ -1,11 +1,6 @@
 /**
- * Harness selection logic for the unified Magic Context CLI.
  *
- * Resolves which adapter(s) a command should target based on:
- *   1. `--harness opencode|pi|omp` flag (hard override, no prompts)
- *   2. Auto-detect installed harnesses, prompting only when ambiguous
  *
- * Mirrors AFT's selection model — battle-tested cross-harness UX.
  */
 import { getAdapter, getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter, HarnessKind } from "../adapters/types";
@@ -28,22 +23,15 @@ function parseHarnessFlag(argv: string[]): HarnessFlagResult {
 }
 
 export interface ResolveOptions {
-    /** Allow the user to select multiple harnesses at once. Setup defaults to single. */
+    /* */
     allowMulti: boolean;
-    /** Verb used in prompts ("setup" / "diagnose"). */
+    /* */
     verb: string;
 }
 
 /**
- * Resolve which adapter(s) to act on for the given command invocation.
  *
  * Decision tree:
- *   - `--harness opencode|pi|omp` → return that single adapter (hard override)
- *   - 0 installed → prompt user to pick one (gives install hints)
- *   - 1 installed → use it silently
- *   - 2+ installed:
- *       - allowMulti=true → multiselect
- *       - allowMulti=false → single-select
  */
 export async function resolveAdaptersForCommand(
     argv: string[],

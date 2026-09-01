@@ -916,7 +916,7 @@ const moveAcceptedDecision: Transform = {
             // in `reorder-independent-turns`, so only moves of two or more
             // positions are candidates; otherwise both transforms can emit
             // identical derivative transcripts that get scored twice.
-            // commentlint: allow(JUDGE)
+            //
             Array.from(
                 {
                     length: Math.max(
@@ -1065,7 +1065,7 @@ const duplicateRejectedProposal: Transform = {
 // The separator class `[_./-]` must remain disjoint from `[A-Za-z0-9]`: if a
 // segment can also contain separators, a long `-` run after a letter
 // backtracks exponentially when the trailing `\b` fails.
-// commentlint: allow(JUDGE)
+//
 const SYMBOL_RE =
     /`([^`]+)`|\b(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})\b/g;
 

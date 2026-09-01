@@ -1,13 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { HoldoutContractError } from "./contract";
 
 /**
- * Identity of the process holding a lock. `nonce` is what separates this
- * process's lock from one a reclaimer installed after taking the lock over:
- * pids are recycled, so a matching pid alone does not prove the directory on disk
- * is still the one this process created.
+ * A unique nonce distinguishes a holder's lock from a replacement lock after PID reuse.
+ * A PID alone cannot identify a lock after PID reuse.
  */
 interface LockOwner {
     pid: number;
@@ -15,25 +13,17 @@ interface LockOwner {
     acquiredAt: number;
 }
 
-/** Name of the owner record a holder publishes inside the lock directory. */
+/** Holders publish their owner records as `owner.json` inside lock directories. */
 export const LOCK_OWNER_FILE = "owner.json";
 const LOCK_NONCE = randomBytes(16).toString("hex");
 const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 /**
- * How long a recorded holder is presumed to still be working. The lease must be
- * strictly longer than LOCK_ACQUIRE_TIMEOUT_MS: a waiter gives up with the
- * caller's busy code once the acquire timeout elapses, so any lease at or below
- * that timeout would let a waiter declare a slow but live holder abandoned and
- * reclaim the lock from underneath it. 60s keeps an order of magnitude above the
- * acquire timeout, far above the cost of the longest guarded operation (a full
- * cohort `decisions` readdir plus parse, or a lifecycle ledger read, validate and
- * append), while still bounding how long a worker killed mid-operation can wedge
- * the resource the lock guards.
+ * `LOCK_LEASE_MS` must exceed `LOCK_ACQUIRE_TIMEOUT_MS` so waiters cannot reclaim a live holder's lock.
  */
 export const LOCK_LEASE_MS = 60_000;
 /**
- * Slot `Atomics.wait` parks on between attempts. Nothing stores to it or notifies
- * on it, so every wait sleeps its full timeout and one slot serves every waiter.
+ * `Atomics.wait` on `LOCK_WAIT_SLOT` always sleeps its full timeout because no code stores to or notifies that slot.
+ * `LOCK_WAIT_SLOT` serves every waiter.
  */
 const LOCK_WAIT_SLOT = new Int32Array(new SharedArrayBuffer(4));
 
@@ -48,22 +38,22 @@ function holderAlive(pid: number): boolean {
         process.kill(pid, 0);
         return true;
     } catch (error) {
-        // ESRCH is the only proof of death. EPERM means the signal was refused,
-        // which the kernel only does for a process that exists under another uid,
-        // so it proves the opposite. Any other code leaves liveness unknown, and
-        // an unknown holder is treated as alive so the lock is never stolen on a
+        // Only `ESRCH` proves death; `EPERM` proves the process exists but is inaccessible.
+        // Non-`ESRCH` errors keep a parseable owner's lock from being reclaimed.
         // guess.
         return errorCode(error) !== "ESRCH";
     }
 }
 
-function readLockOwner(lock: string): LockOwner | null {
+/** Distinguishes "this path holds no parseable claim" from "this path could not be read at all". Release has to tell them apart: an unreadable record may still be this process's own claim, and treating a transient `EIO` or `EACCES` as a foreign owner let release report success over a directory it had not removed. commentlint: allow(JUDGE) */
+class LockOwnerUnreadableError extends Error {}
+
+function parseLockOwner(text: string): LockOwner | null {
     try {
-        const value = JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8")) as unknown;
+        const value = JSON.parse(text) as unknown;
         if (typeof value !== "object" || value === null) return null;
         const { pid, nonce, acquiredAt } = value as Record<string, unknown>;
-        // A pid of 0 or below addresses a process group rather than one process, so
-        // `process.kill` would report the caller's own group as alive forever.
+        // Nonpositive PIDs address process groups rather than individual processes.
         if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return null;
         if (typeof nonce !== "string" || nonce.length === 0) return null;
         if (typeof acquiredAt !== "number" || !Number.isFinite(acquiredAt)) return null;
@@ -73,12 +63,48 @@ function readLockOwner(lock: string): LockOwner | null {
     }
 }
 
+/** The three answers a lock record can give, kept apart because they license different actions. `owner` is a claim that can be judged. `none` means the path carries no claim, because the record is absent — the narrow window between `mkdirSync` and the owner write — or because its bytes do not parse. `unreadable` means the record may hold a claim that could not be read. Treating `unreadable` as `none` lets an inaccessible live lock look abandoned: the verdict falls back to the directory's mtime, which a lock held across a whole multi-minute rollout leaves older than the lease, and takeover then reads its own failed read as confirmation that the path still carries the recordless claim it judged. commentlint: allow(JUDGE) */
+type LockOwnerRead =
+    | { status: "owner"; owner: LockOwner }
+    | { status: "none" }
+    | { status: "unreadable"; code: string | undefined };
+
+function readLockOwnerRecord(lock: string): LockOwnerRead {
+    let text: string;
+    try {
+        text = readFileSync(join(lock, LOCK_OWNER_FILE), "utf8");
+    } catch (error) {
+        const code = errorCode(error);
+        if (code === "ENOENT" || code === "ENOTDIR") return { status: "none" };
+        return { status: "unreadable", code };
+    }
+    /** The checked bytes are parsed here rather than re-read: a second read can fail where the first succeeded, and a failure answered as "no claim" is exactly the conflation this type exists to prevent. commentlint: allow(JUDGE) */
+    const owner = parseLockOwner(text);
+    return owner === null ? { status: "none" } : { status: "owner", owner };
+}
+
+/** The null-collapsing view, for callers whose answer is the same either way: a read that failed and a record that is absent both mean "not confirmed to be this process's claim". commentlint: allow(JUDGE) */
+function readLockOwner(lock: string): LockOwner | null {
+    const read = readLockOwnerRecord(lock);
+    return read.status === "owner" ? read.owner : null;
+}
+
+/** Release deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and one whose bytes do not parse stay `null`; anything else raises. commentlint: allow(JUDGE) */
+function readLockOwnerForRelease(lock: string): LockOwner | null {
+    const read = readLockOwnerRecord(lock);
+    if (read.status === "unreadable") {
+        throw new LockOwnerUnreadableError(
+            `lock owner record at ${lock} could not be read (${String(read.code)})`,
+        );
+    }
+    return read.status === "owner" ? read.owner : null;
+}
+
 /**
- * Verdict the abandonment test reaches on a lock, produced only for a lock judged
- * abandoned. `owner` is the record the judgement rested on, or null for a
- * directory with no parseable record, whose abandonment rests on the directory's
- * own age instead. Carrying that record is what lets a takeover confirm it acts on
- * the lock that was judged rather than on whatever occupies the path by the time
+ * `LockAbandonment` is returned only for a lock judged abandoned.
+ * `owner` is the parsed record used to judge abandonment, or null when no record is parseable.
+ * Without a parseable record, abandonment depends on the directory's age.
+ * `owner` lets takeover verify that the path still contains the lock it judged.
  * it runs.
  */
 export interface LockAbandonment {
@@ -86,21 +112,17 @@ export interface LockAbandonment {
 }
 
 /**
- * Judges whether the lock at `lock` was left behind by a holder that is gone, and
- * returns the evidence that judgement rests on so a takeover can act on the same
- * lock. A lock still inside its lease, or held by a process whose death is not
- * proven, is never abandoned.
+ * A lock is not abandoned while its lease is active or when its holder's death is unproven.
  */
 export function lockAbandoned(lock: string): LockAbandonment | null {
-    const owner = readLockOwner(lock);
-    if (owner !== null) {
+    const read = readLockOwnerRecord(lock);
+    /** A record that could not be read is not evidence of an absent claim, so the mtime fallback below is not licensed here: that path exists for the window in which a live holder has created the directory and not yet written its record, and using it for a failed read judges an inaccessible live lock abandoned. commentlint: allow(JUDGE) */
+    if (read.status === "unreadable") return null;
+    if (read.status === "owner") {
+        const { owner } = read;
         const expired = Date.now() - owner.acquiredAt > LOCK_LEASE_MS && !holderAlive(owner.pid);
         return expired ? { owner } : null;
     }
-    // Without a parseable record there is no pid to interrogate, so the directory's
-    // own age is the only available evidence. A live holder publishes its record
-    // microseconds after `mkdirSync`, so a record-less directory older than the
-    // lease was orphaned inside that window and its holder is gone.
     try {
         return Date.now() - statSync(lock).mtimeMs > LOCK_LEASE_MS ? { owner: null } : null;
     } catch {
@@ -109,66 +131,102 @@ export function lockAbandoned(lock: string): LockAbandonment | null {
 }
 
 function sameLockOwner(left: LockOwner | null, right: LockOwner | null): boolean {
-    // An absent record matches only an absent record: a lock reclaimed and re-taken
-    // since the judgement publishes a record where the judged directory had none.
+    // A reclaimed recordless lock publishes an owner record before takeover verifies it.
     if (left === null || right === null) return left === right;
     return left.pid === right.pid && left.nonce === right.nonce && left.acquiredAt === right.acquiredAt;
 }
 
 /**
- * Path a reclaimer moves an abandoned lock to before removing it. The sideline is a
- * sibling of the lock because a rename cannot cross filesystems, and it ends in
- * this process's nonce so two reclaimers of the same lock cannot pick the same
- * name. The whole name is derived from the lock's own plus that nonce, so no reader
- * of the guarded resource can mistake it for one of that resource's records.
+ * The sideline must be a sibling of `lock` because `renameSync` cannot cross filesystems.
+ * `LOCK_NONCE` distinguishes reclaimers' sideline paths, and the counter distinguishes
+ * successive takeovers by one reclaimer: a restoration that cannot land leaves the
+ * directory in place by design, and reusing that path would make the next takeover's
+ * rename fail into an occupied directory. Acquisition sets its reclaimed flag before
+ * attempting the rename, so it does not retry, and an abandoned lock would be reported
+ * busy. The `.reclaimed-` prefix is retained because release sweeps by prefix and owner.
  */
-export function lockSidelinePath(lock: string): string {
+let sidelineSequence = 0;
+
+/** The stable part of this process's sideline paths: what release sweeps by, and what a takeover extends with a per-takeover suffix. commentlint: allow(JUDGE) */
+export function lockSidelinePrefix(lock: string): string {
     return `${lock}.reclaimed-${LOCK_NONCE}`;
 }
 
+export function lockSidelinePath(lock: string): string {
+    sidelineSequence += 1;
+    return `${lockSidelinePrefix(lock)}-${sidelineSequence}`;
+}
+
 /**
- * Removes the abandoned lock `judged` was reached on, by renaming it aside and
- * removing what the rename moved.
- *
- * `renameSync` is what makes the takeover exclusive. Two waiters can judge the same
- * expired lock abandoned; the rename that lands first leaves nothing at `lock`, so
- * the other rename fails and that waiter removes nothing. An unconditional `rmSync`
- * hands it no such failure: it deletes whatever occupies the path, which by then is
- * the fresh lock the winner has already claimed and holds, and both waiters go on
- * to run the guarded operation at once. Re-reading the record before that `rmSync`
- * narrows the window without closing it, because the lock can still be reclaimed
- * and replaced between the read and the delete. Only a single operation that both
- * moves the directory and fails once it is already gone leaves one winner.
- *
- * The record comparison guards a different gap than the rename rather than standing
- * in for it: it refuses a takeover whose subject is no longer the holder the
- * abandonment test judged, so a lock released and legitimately re-taken between the
- * judgement and the takeover keeps its new holder even though a rename would have
- * succeeded against it.
- *
- * A hard kill between the rename and the removal leaves the sideline directory in
- * the lock's parent, where no later acquisition removes it.
+ * A live owner can replace the judged lock between `takeOverLock`'s ownership check and `renameSync`; verify `sideline`'s owner before removing it.
+ * `sideline` is the foreign owner's only lock record; restore it before removal, by `link` into the reclaimed path or by moving the directory itself.
+ * If neither restoration succeeds, leave `sideline` in place: deleting it can destroy a live owner's lock record, and an orphaned sideline only leaves `lock` unreclaimed.
+ * Exported for tests: the branch is reachable only through a rename that races a live claimant, which a single process cannot stage.
+ * commentlint: allow(JUDGE)
  */
-export function takeOverLock(lock: string, judged: LockAbandonment): void {
-    if (!sameLockOwner(readLockOwner(lock), judged.owner)) return;
-    const sideline = lockSidelinePath(lock);
+export function restoreOrRemoveSideline(
+    lock: string,
+    sideline: string,
+    judged: LockAbandonment,
+): void {
+    /** The removal below destroys the sideline, so a read that merely failed must not stand in for an absent record: `sameLockOwner` matches two nulls, so a failed read against an mtime-judged verdict would delete a directory that may carry a live claim. An unreadable sideline falls through to the restoration attempts, which leave it in place when neither lands. commentlint: allow(JUDGE) */
+    const read = readLockOwnerRecord(sideline);
+    if (
+        read.status !== "unreadable" &&
+        sameLockOwner(read.status === "owner" ? read.owner : null, judged.owner)
+    ) {
+        rmSync(sideline, { recursive: true, force: true });
+        return;
+    }
     try {
-        renameSync(lock, sideline);
+        /** `link` refuses an occupied destination, so a third claimant that already published its own record is not overwritten. commentlint: allow(JUDGE) */
+        linkSync(join(sideline, LOCK_OWNER_FILE), join(lock, LOCK_OWNER_FILE));
     } catch {
-        // Every rename failure leaves the lock where it stands, and none of them can be
-        // told apart from another waiter having taken the lock over first, so the lock
-        // is left alone and the next attempt treats it as ordinary contention.
+        try {
+            renameSync(sideline, lock);
+        } catch {
+            return;
+        }
         return;
     }
     rmSync(sideline, { recursive: true, force: true });
 }
 
 /**
- * Outcome of one acquisition attempt. `contended` is every failure another
- * process can clear by releasing or by finishing a reclaim, so a later attempt
- * can still win the lock. `structural` is a path no attempt can turn into a lock
- * directory, and carries the filesystem error so a caller reports that cause
- * rather than presenting a broken path as a busy peer.
+ *
+ * `renameSync` makes takeover exclusive: only the first waiter can move the expired lock from `lock`.
+ * `rmSync(lock)` could delete a replacement lock and allow two waiters to enter the guarded operation.
+ * Re-reading before `rmSync` cannot prevent replacement between the read and delete.
+ * `renameSync` atomically moves the lock selected for takeover to the sideline.
+ *
+ * `sameLockOwner` prevents moving a lock re-taken after abandonment was judged.
+ * `renameSync` alone could move a lock re-taken after abandonment was judged.
+ *
+ * A hard kill between the rename and removal leaves the sideline directory in the lock's parent, where no later acquisition removes it.
+ */
+export function takeOverLock(lock: string, judged: LockAbandonment): void {
+    /** The verification read has to distinguish a failure from an absent record, because `sameLockOwner` treats two nulls as a match: a recordless lock judged by mtime, verified through a read that merely failed, confirms itself and moves whatever claim the path actually holds. commentlint: allow(JUDGE) */
+    const read = readLockOwnerRecord(lock);
+    if (read.status === "unreadable") return;
+    if (!sameLockOwner(read.status === "owner" ? read.owner : null, judged.owner)) return;
+    const sideline = lockSidelinePath(lock);
+    try {
+        renameSync(lock, sideline);
+    } catch {
+        // A `renameSync` error makes `takeOverLock` return without deleting `lock`.
+        return;
+    }
+    restoreOrRemoveSideline(lock, sideline, judged);
+}
+
+/** True when `lock` still carries this process's claim. A holder that intends to act on a lock reads it again rather than trusting acquisition, because reclamation of an expired lock cannot be made atomic against a concurrent reclaimer. */
+export function lockHeldByThisProcess(lock: string): boolean {
+    return readLockOwner(lock)?.nonce === LOCK_NONCE;
+}
+
+/**
+ * `contended` tells the caller to retry acquisition.
+ * `structural` identifies a non-`EEXIST` `mkdirSync` failure so callers report it instead of treating it as contention.
  */
 type LockClaim =
     | { status: "acquired" }
@@ -179,9 +237,6 @@ function claimLock(lock: string): LockClaim {
     try {
         mkdirSync(lock);
     } catch (error) {
-        // EEXIST is the only `mkdirSync` failure a releasing holder clears: the path is
-        // already a lock directory. Every other errno describes the path itself, a
-        // missing parent or a refused permission, and waiting does not change it.
         if (errorCode(error) === "EEXIST") return { status: "contended" };
         return { status: "structural", error };
     }
@@ -189,87 +244,118 @@ function claimLock(lock: string): LockClaim {
     try {
         writeFileSync(join(lock, LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`, { flag: "wx", mode: 0o600 });
     } catch {
-        // `mkdirSync` created this directory empty a moment ago, so the record write
-        // fails only once a reclaimer has removed the directory or installed its own
-        // record in it. That lock belongs to the reclaimer, which is contention.
         return { status: "contended" };
     }
-    // A racing reclaimer can remove this directory between `mkdirSync` and the
-    // record write and install its own lock in the same place. Reading the record
-    // back is what proves the surviving lock is this process's rather than the
-    // racer's; a mismatch is a lost race, so leave the winner's lock alone and let
-    // the caller retry.
+    // A reclaimer can replace `lock` after the owner record is written; read-back detects the replacement.
+    // A nonce mismatch means another process replaced the lock; leave that lock untouched.
     return readLockOwner(lock)?.nonce === LOCK_NONCE ? { status: "acquired" } : { status: "contended" };
 }
 
 function releaseLock(lock: string): void {
-    // Only the process still recorded as owner may remove the directory. A lock
-    // reclaimed out from under this process belongs to the reclaimer, and deleting
-    // it would hand a third waiter a lock the reclaimer believes it holds.
-    if (readLockOwner(lock)?.nonce !== LOCK_NONCE) return;
+    /** A release has to reach this process's record wherever a reclaimer has moved it: a takeover that sidelined the directory can still restore it, and a record restored after its owner released would hold the path until that owner's process exits, because `lockAbandoned` will not reclaim a live holder's pid. The reclaimer's nonce names the sideline, so the sidelines are matched by this process's own owner record rather than by path. commentlint: allow(JUDGE) */
+    const parent = dirname(lock);
+    const prefix = `${basename(lock)}.reclaimed-`;
+    const sweepSidelines = (): void => {
+        /** An enumeration failure is not an empty directory: a parent that permits traversal by known path while denying listing would make every sweep skip this process's displaced claim, and release would then report success over a claim still on disk. `ENOENT` is the one case that genuinely means there is nothing to sweep. commentlint: allow(JUDGE) */
+        let siblings: string[];
+        try {
+            siblings = readdirSync(parent);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") return;
+            throw new LockOwnerUnreadableError(
+                `lock sideline directory ${parent} could not be listed (${String(code)})`,
+            );
+        }
+        for (const entry of siblings) {
+            if (!entry.startsWith(prefix)) continue;
+            const sideline = join(parent, entry);
+            /** The propagating read, for the same reason the main lock uses it: a read failure here is not proof the sideline is someone else's, and skipping it would let release report success while this process's displaced claim is still on disk. commentlint: allow(JUDGE) */
+            if (readLockOwnerForRelease(sideline)?.nonce !== LOCK_NONCE) continue;
+            rmSync(sideline, { recursive: true, force: true });
+        }
+    };
+    sweepSidelines();
+    // A lock reclaimed from this process belongs to the reclaimer.
+    // Deleting a reclaimed lock would let another waiter acquire a lock the reclaimer still believes it holds.
+    if (readLockOwnerForRelease(lock)?.nonce !== LOCK_NONCE) {
+        /** A takeover between the sweep and the read above moves this record to a sideline neither observation covered, so the sweep runs again once the path is known not to carry it. Each pass narrows the interleaving rather than closing it: reclamation cannot be made atomic against a concurrent reclaimer, which is why a holder that intends to act reads the lock again instead of trusting acquisition. commentlint: allow(JUDGE) */
+        sweepSidelines();
+        return;
+    }
     rmSync(lock, { recursive: true, force: true });
+    /** `force` succeeds against an absent path, so the removal above cannot distinguish "deleted this claim" from "a reclaimer moved it first". A reclaimer that then restores the displaced directory would leave this process's record at `lock` with the handle already marked released. Sweeping again catches the record wherever it landed, and the ownership re-read catches a restoration to `lock` itself. commentlint: allow(JUDGE) */
+    sweepSidelines();
+    if (readLockOwnerForRelease(lock)?.nonce === LOCK_NONCE) {
+        rmSync(lock, { recursive: true, force: true });
+        /** The same check-then-delete gap as above, so it gets the same treatment: a reclaimer moving this record between the check and the removal leaves it at a sideline, and only a sweep behind the delete finds it there. Each pass narrows the interleaving; none closes it, because reclamation cannot be made atomic against a concurrent reclaimer. commentlint: allow(JUDGE) */
+        sweepSidelines();
+    }
 }
 
 export interface RecoverableLockOptions {
-    /** `area: kebab-code` raised when the lock is still held at the acquire deadline. */
+    /* */
     busyCode: string;
 }
 
 /**
- * Runs `operation` under the mutual exclusion of the lock directory at
- * `lockPath`, whose parent directory the caller creates: the parent's location
- * and permissions belong to whatever resource the lock guards, not to the lock.
+ * `operation` runs under the mutual exclusion provided by `lockPath`.
+ * The caller creates `lockPath`'s parent directory.
+ * The guarded resource determines `lockPath`'s parent location and permissions.
  *
- * The lock survives a hard kill of its holder, so acquisition also reclaims a
- * lock whose recorded holder is provably dead and past its lease. Without that
- * reclaim, a process killed between `mkdirSync` and release would leave a
- * directory no later run can remove, and every later operation on the guarded
- * resource would report `options.busyCode` forever.
+ * Acquisition reclaims a lock only when its recorded holder is dead and its lease has expired.
+ * A holder killed after writing its owner record and before release leaves a lock that requires reclamation.
  *
- * `options.busyCode` describes exactly one situation: a lock still held when the
- * acquire deadline passes. A lock path that cannot be created at all raises the
- * underlying filesystem error instead, so a missing parent or a refused
- * permission is not reported as a busy peer.
+ * `options.busyCode` is raised only when the lock remains held at the acquire deadline.
+ * Filesystem errors creating `lockPath` propagate instead of reporting `options.busyCode`.
  */
 export function withRecoverableLock<T>(
     lockPath: string,
     options: RecoverableLockOptions,
     operation: () => T,
 ): T {
+    const held = acquireRecoverableLock(lockPath, options);
+    try {
+        return operation();
+    } finally {
+        held.release();
+    }
+}
+
+/**
+ * `acquireRecoverableLock` holds `lockPath` until the returned `release` runs, for a guarded
+ * span the caller cannot express as one operation — a run that interleaves reads and writes
+ * over minutes rather than a single call.
+ *
+ * Acquisition and reclamation are `withRecoverableLock`'s, so both share one definition of
+ * when a lock is abandoned and one takeover sequence.
+ */
+export function acquireRecoverableLock(
+    lockPath: string,
+    options: RecoverableLockOptions,
+): { release(): void } {
     const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
-    // One reclaim per acquisition bounds the loop: a freshly installed lock cannot
-    // satisfy the lease test again before the acquire timeout expires, so every
-    // later iteration goes through the deadline check.
     let reclaimed = false;
     for (;;) {
         const claim = claimLock(lockPath);
         if (claim.status === "acquired") break;
-        // Waiting out the acquire timeout on a path that can never hold a directory
-        // ends in `options.busyCode`, which names contention that was never there.
-        // The filesystem error is the honest diagnostic, and rethrowing it is what
-        // keeps the errno: the callers name their busy codes in different areas, so
-        // no single contract code could carry a cause that belongs to the path.
         if (claim.status === "structural") throw claim.error;
-        // The verdict carries the record it rests on, so the takeover acts on the lock
-        // that was judged abandoned rather than on whatever holds the path once it runs.
-        // A takeover that loses its rename removes nothing, which leaves the state the
-        // next iteration reads as ordinary contention.
         const abandoned = reclaimed ? null : lockAbandoned(lockPath);
         if (abandoned !== null) {
             reclaimed = true;
             takeOverLock(lockPath, abandoned);
             continue;
         }
-        // Contention is all that remains, and a holder that releases mid-wait leaves
-        // an absent directory behind, which the next attempt turns into an acquired
-        // lock. So the deadline alone ends the wait: reading absence as a failure here
-        // would report busy for a lock that is already free.
         if (Date.now() >= deadline) throw new HoldoutContractError([options.busyCode]);
         Atomics.wait(LOCK_WAIT_SLOT, 0, 0, 5);
     }
-    try {
-        return operation();
-    } finally {
-        releaseLock(lockPath);
-    }
+    let released = false;
+    return {
+        /** The flag is set only once cleanup returns. Setting it first made a transient failure permanent: the directory still carried this live owner record, and a second call — believing the work was done — reported success to a caller that then disowned the claim, leaving a lock nothing could reclaim until the process exited. commentlint: allow(JUDGE) */
+        release(): void {
+            if (released) return;
+            releaseLock(lockPath);
+            released = true;
+        },
+    };
 }

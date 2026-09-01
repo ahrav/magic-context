@@ -1,6 +1,5 @@
-//! Perf-harness host process, separate from the load generator so
-//! strace/perf attribute host cost only. See docs/perf/mc-host-baseline.md
-//! for the harness contract, including the request-body mode layout the load
+//! The separate host process lets strace and perf attribute costs only to the host.
+//! The harness contract defines the request-body mode layout that the load generator encodes.
 //! generator encodes.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -12,16 +11,12 @@ use mc_host::{
     ManifestSnapshot, McHostHandler, RequestCtx, RequestOutcome, RouteHandle, RouteIdentity,
 };
 
-// The fixture-echo contract (manifest, bind, echo semantics) has exactly one
-// definition, shared with the ipc-budget tests, so the `compact-json-v1`
-// workload identity always names the same server behavior.
 #[path = "../tests/support/echo_host.rs"]
 mod echo_host;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Relaxed counters perform two fetch_add operations per allocation.
 struct CountingAlloc;
 
 unsafe impl GlobalAlloc for CountingAlloc {
@@ -38,9 +33,6 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
-/// Shared echo handler plus the perf-only mode-byte sleep branch: a request
-/// body starting with byte 1 carries a little-endian u32 sleep duration in
-/// milliseconds, applied before the delegated echo.
 struct EchoHandler {
     inner: echo_host::EchoHandler,
 }

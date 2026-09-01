@@ -1,13 +1,10 @@
 /**
- * Historian structural eval lane — invalid-state mutation battery (R13/KTD5).
  *
- * Admission gate for the frozen release: for every scenario, crafted wrong
- * historian outputs must score red AT THE EXPECTED STAGE, per mutation
- * class. The battery fails on stage mismatch, not only on a PASS — a
- * semantic mutation dying in validation would silently stop exercising the
- * scorer, so semantic-class fixtures are required to be valid per
- * `validateHistorianOutput` by construction (asserted per scenario, so a
- * validator change surfaces as a battery error instead of a silent stage
+ * Each mutation must fail at its expected stage.
+ * The battery fails on a stage mismatch, not only on a PASS.
+ * A semantic mutation rejected by validation never reaches the scorer.
+ * Semantic-class fixtures must pass `validateHistorianOutput` so they exercise the scorer.
+ * A validator change causes a battery error instead of silently moving a mutation to another stage.
  * migration).
  */
 
@@ -27,7 +24,7 @@ import { compareProbeAnswer, scoreRawOutput, type FailReason } from "./scorer";
 
 export const MUTATION_EVIDENCE_SCHEMA = "historian-eval-mutation-evidence/v1";
 
-/** The deliberately wrong answer every probe mutation sends. */
+/* */
 const WRONG_PROBE_ANSWER = "historian-eval-mutation-wrong-answer";
 
 export const MUTATION_CLASSES = [
@@ -46,7 +43,7 @@ export type ExpectedMutationOutcome =
     | { stage: "validation-rejected" }
     | { stage: "probe-comparison"; outcome: "fail" };
 
-/** Expected stage and verdict per class (plan U6 step 1). */
+/* */
 export const EXPECTED_OUTCOMES: Record<MutationClass, ExpectedMutationOutcome> = {
     "speculation-promoted": { stage: "scored", failReason: "false-authoritative" },
     "rejected-proposal-active": { stage: "scored", failReason: "false-authoritative" },
@@ -59,7 +56,7 @@ export const EXPECTED_OUTCOMES: Record<MutationClass, ExpectedMutationOutcome> =
 
 export interface MutationResult {
     mutationClass: MutationClass | "baseline-fixture" | "battery-coverage";
-    /** Absent when the class does not apply to this scenario (recorded as skipped). */
+    /** `applicable` is false when the class does not apply to the scenario; the result is recorded as skipped. */
     applicable: boolean;
     green: boolean;
     detail: string;
@@ -78,7 +75,7 @@ export interface MutationEvidenceArtifact {
     green: boolean;
 }
 
-/** Gold-satisfying synthetic facts: one per expected claim. */
+/* */
 function goldSatisfyingFacts(scenario: HistorianEvalScenario): MockHistorianFact[] {
     return scenario.gold.expectedClaims.map((claim) => ({
         category: claim.category,
@@ -87,13 +84,10 @@ function goldSatisfyingFacts(scenario: HistorianEvalScenario): MockHistorianFact
 }
 
 /**
- * Baseline compartments: `gold.compartments.minCount` contiguous,
- * non-overlapping segments covering the authored transcript. A fixed single
- * compartment would trip the scorer's `compartment-count` structural finding
- * for every scenario declaring a minimum above one, so `assertBaselineValidates`
- * would report a baseline FAIL — and promotion would reject the scenario —
- * before any mutation ran. The count is clamped to the message count because a
- * segment must cover at least one message.
+ * Baseline compartments form `gold.compartments.minCount` contiguous, non-overlapping segments over the authored transcript.
+ * A single compartment triggers `compartment-count` when `gold.compartments.minCount` exceeds one.
+ * A baseline failure prevents scenario promotion before mutations run.
+ * The count is clamped to the message count because each segment covers at least one message.
  */
 export function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
     const messageCount = scenario.transcript.turns.length * 2;
@@ -116,17 +110,12 @@ export function baselineCompartments(scenario: HistorianEvalScenario): MockHisto
 }
 
 /**
- * Chunk the battery scores against: the authored transcript plus trailing
- * lookahead. The scorer's default synthetic chunk ends exactly at the authored
- * end, which no real run ever does — the runner always appends post-epilogue
- * padding — and that difference is load-bearing. Production treats a last
- * compartment within `HISTORIAN_BOUNDARY_HEALING_SLACK` of the chunk end as
- * provisional: it discards that compartment AND skips fact promotion for the
- * whole pass. Scored against a chunk ending at the authored end, therefore, any
- * multi-compartment output loses every fact and reports recall 0 for a purely
- * structural reason, which is what made scenarios declaring a compartment
- * minimum above one unpromotable. The authored span stays explicit so
- * `compartment-count` still measures only compartments over authored content.
+ * The battery scores chunks against the authored transcript plus trailing lookahead.
+ * The scorer's default synthetic chunk ends at the authored end.
+ * The runner marks a post-epilogue compartment within `HISTORIAN_BOUNDARY_HEALING_SLACK` of the chunk end as provisional.
+ * The runner discards a provisional compartment and skips fact promotion for the pass.
+ * A `gold.compartments.minCount` above one is unpromotable.
+ * `compartment-count` measures only compartments over authored content.
  */
 export function batteryScoringOptions(scenario: HistorianEvalScenario): {
     chunkStartOrdinal: number;
@@ -148,12 +137,8 @@ function baselineOutput(scenario: HistorianEvalScenario, facts: MockHistorianFac
 }
 
 /**
- * Perturb the matched span of one gold predicate: flip the first digit, or
- * split the longest word when no digit exists (a substring matcher shrugs
- * off surrounding negation, so the value itself must change). Either way
- * the predicate must stop matching — asserted by the caller, since a
- * perturbation the matcher still accepts means the matcher no longer
- * discriminates (the near-miss class exists to prove matchers stay sharp).
+ * The mutation changes only part of the predicate because `predicateMatches` accepts substrings.
+ * A matching perturbation indicates that the matcher does not distinguish near misses.
  */
 export function perturbPredicateValue(value: string): string {
     const digit = /[1-9]/.exec(value);
@@ -173,10 +158,7 @@ export function perturbPredicateValue(value: string): string {
 }
 
 /**
- * Score one crafted output against the class's EXPECTED stage and verdict
- * from `EXPECTED_OUTCOMES` — the single policy table the battery consults.
- * A class landing at a DIFFERENT stage is red even when that stage is a
- * rejection: stage migration silently stops exercising the scorer.
+ * A class that reaches a different stage fails, even if that stage rejects.
  */
 export function checkMutationOutcome(
     mutationClass: Exclude<MutationClass, "probe-wrong-answer">,
@@ -228,11 +210,9 @@ function runFalseAuthoritativeClass(
     if (forbidden.length === 0) {
         return { mutationClass, applicable: false, green: true, detail: "no expected-absent predicate in class families" };
     }
-    // Every declared hard negative in the class, not just the first. A scenario
-    // may declare several in one family, and mutating only one leaves the rest
-    // unexercised: a detector that catches the first while accepting a later one
-    // would still emit green admission evidence, so the release would ship a
-    // false-authoritative check nothing ever demonstrated.
+    // Mutating only the first hard negative could leave later negatives untested.
+    // A scenario may declare several hard negatives in one family, so the battery mutates each one.
+    // Mutating only one hard negative could miss a detector that accepts later negatives.
     const gold = goldSatisfyingFacts(scenario);
     const checks = forbidden.map((fact, index) => ({
         index,
@@ -260,14 +240,8 @@ function runFalseAuthoritativeClass(
 }
 
 /**
- * Aggregate one mutation applied across every variant it has, requiring all of
- * them to be caught.
  *
- * Mutating a single variant leaves the rest unexercised: a scorer regression that
- * stops enforcing the second expected claim, or one specific wrong-category
- * pairing, still trips on the variant that IS mutated, so admission evidence stays
- * green while the release ships enforcement nothing demonstrated. The count is
- * recorded in the detail so a regression back to one variant is visible in the
+ * Mutating every variant catches variant-specific regressions.
  * published artifact.
  */
 function aggregateChecks(
@@ -296,17 +270,9 @@ function aggregateChecks(
 }
 
 function runWrongCategory(scenario: HistorianEvalScenario): MutationResult {
-    // Every claim against every OTHER category, not one representative pairing.
-    // Picking the first non-matching category sent every non-PROJECT_RULES claim
-    // to PROJECT_RULES and PROJECT_RULES claims to ARCHITECTURE, so category
-    // enforcement was demonstrated for one pairing per claim: a scorer that
-    // wrongly accepted NAMING for a CONFIG_VALUES expectation was never tested.
+    // Testing every non-matching category catches pair-specific validation gaps.
     //
-    // Categories come from the production taxonomy, never hardcoded names:
-    // `promoteSessionFactsDurable` silently DROPS facts whose category is outside
-    // `V2_MEMORY_CATEGORIES`, so a drifted literal would land at the same
-    // scored/recall outcome as dropped-gold-fact and this class would silently
-    // stop testing miscategorization.
+    // `promoteSessionFactsDurable` drops categories outside `V2_MEMORY_CATEGORIES`; use that taxonomy to test miscategorization rather than dropped facts.
     const checks = scenario.gold.expectedClaims.flatMap((target, index) =>
         V2_MEMORY_CATEGORIES.filter((category) => category !== target.category).map((wrongCategory) => {
             const facts = goldSatisfyingFacts(scenario);
@@ -357,34 +323,16 @@ function runStructuralOverlap(scenario: HistorianEvalScenario): MutationResult {
 
 function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
     if (scenario.probes.length === 0) {
-        // A probe-less scenario would freeze with this class never
-        // exercised; the freeze lint forbids it and the battery fails red
-        // as defense in depth.
+        // A scenario without probes leaves `probe-wrong-answer` unexercised.
         return { mutationClass: "probe-wrong-answer", applicable: false, green: false, detail: "scenario has no probes; probe class cannot be exercised" };
     }
-    // No injected claims: the gold claim was never promoted, so a miss is a
-    // probe FAIL, not a trimmed ERROR (KTD6). The expected outcome comes
-    // from the policy table so this class stays table-driven like the rest
-    // of the battery.
     const expected = EXPECTED_OUTCOMES["probe-wrong-answer"];
     if (expected.stage !== "probe-comparison") {
         throw new Error(`probe-wrong-answer policy entry must stay at probe-comparison, got ${expected.stage}`);
     }
-    // EVERY probe, not just the first: `compareProbeAnswer` branches on
-    // `answerType`, and the corpus places `claim-id` probes after an `exact`
-    // or `multiple-choice` one. Mutating only `probes[0]` would leave the
-    // claim-id comparison path unexercised, so a regression accepting a wrong
-    // claim identifier would still pass the admission gate.
+    // The mutation loop processes every probe so `claim-id` comparisons are exercised.
     const failures = scenario.probes.flatMap((probe) => {
-        // A MEASURABLE exchange: the probe's backing claim is present in the
-        // injected set and its locator is recorded, so the availability gate
-        // above the comparison passes and the wrong answer is judged on its
-        // merits. An empty injected set made every claim-id probe fail for want
-        // of any candidate id at all, so a regression accepting an id from the
-        // wrong injected claim — or one absent from the recorded locators — left
-        // this class green while real probes could pass a leaked or unavailable
-        // identifier. The claim's content carries the probe's answer, which the
-        // freeze lint now guarantees for every non-claim-id probe.
+        // The injected backing claim and its recorded locator satisfy probe availability checks.
         const backingId = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
         const backing = scenario.gold.expectedClaims.find((claim) => claim.id === backingId);
         const injectedClaims: InjectedClaimRecord[] =
@@ -405,8 +353,6 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
             reAsked: false,
             injectedRevisionLocators: injectedClaims.map((item) => item.revisionLocator),
             payloadText: null,
-            // Synthetic exchange: there is no captured request, the answer came
-            // straight from the marker reply, and nothing was re-asked.
             finalRequestPayloadText: null,
             responseText: `<answer>${WRONG_PROBE_ANSWER}</answer>`,
             discardedResponseTexts: [],
@@ -428,7 +374,7 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
     };
 }
 
-/** Construction invariant: semantic-class fixtures must be validator-clean. */
+/* */
 function assertBaselineValidates(scenario: HistorianEvalScenario): MutationResult | null {
     const result = scoreRawOutput(
         baselineOutput(scenario, goldSatisfyingFacts(scenario)),
@@ -477,9 +423,7 @@ export function runScenarioMutationBattery(scenario: HistorianEvalScenario): Sce
                   runStructuralOverlap(scenario),
                   runProbeWrongAnswer(scenario),
               ];
-    // A scenario must trip at least one false-authoritative class: every
-    // scenario declares at least one hard-negative family, so both classes
-    // being inapplicable means the family/absent mapping drifted.
+    // Each scenario must exercise at least one false-authoritative class.
     const falseAuthoritative = results.filter(
         (result) =>
             result.mutationClass === "speculation-promoted" || result.mutationClass === "rejected-proposal-active",
@@ -512,10 +456,7 @@ export function runMutationBattery(scenarios: readonly HistorianEvalScenario[]):
 const RESULT_LABELS: readonly string[] = [...MUTATION_CLASSES, "baseline-fixture", "battery-coverage"];
 
 /**
- * The two false-authoritative classes are the only ones a green run may skip
- * (a scenario need not declare an expected-absent predicate in both class
- * family sets). Every other class is unconditionally applied, so a green
- * artifact marking one `applicable: false` was not produced by the battery.
+ * Only false-authoritative classes may be inapplicable in a green run.
  */
 const ALWAYS_APPLICABLE_CLASSES: readonly MutationClass[] = MUTATION_CLASSES.filter(
     (mutationClass) =>
@@ -527,13 +468,8 @@ function evidenceFail(code: string): never {
 }
 
 /**
- * Strict, fail-closed evidence parser: an artifact claiming green must be
- * internally consistent (aggregate flags derived from per-result flags,
- * every result labeled with a known class) AND carry the exact result set
- * a green battery run emits — one result per mutation class with at least
- * one applicable false-authoritative class — so a hand-written
- * `{green: true}` shell (or a single-result stub) cannot slip a scenario
- * past the admission gate.
+ * A green artifact contains one result per mutation class and at least one applicable false-authoritative result.
+ * Full result coverage rejects `{green: true}` shells and single-result stubs.
  */
 export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) evidenceFail("schema-invalid");
@@ -541,12 +477,7 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
     if (root.schema !== MUTATION_EVIDENCE_SCHEMA) evidenceFail("schema-invalid");
     if (Object.keys(root).sort().join(",") !== "green,scenarios,schema") evidenceFail("fields-invalid");
     if (!Array.isArray(root.scenarios) || typeof root.green !== "boolean") evidenceFail("fields-invalid");
-    // One entry per scenario, keyed BOTH ways. `checkMutationEvidence` indexes
-    // entries by `scenarioFingerprint` into a Map, where a later duplicate wins,
-    // so a red entry followed by a green one for the same scenario reports green
-    // to the admission gate. The aggregate flags stay self-consistent under that
-    // forgery — they are derived from every entry, including the masked red one —
-    // so uniqueness is the only place it can be caught.
+    // Artifact validation rejects duplicate `scenarioId` and `scenarioFingerprint` values.
     const seenIds = new Set<string>();
     const seenFingerprints = new Set<string>();
     const scenarios = root.scenarios.map((entryRaw, index) => {
@@ -589,11 +520,6 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
         if (entry.green !== results.every((result) => result.green)) {
             evidenceFail(`scenarios[${index}].green: inconsistent-with-results`);
         }
-        // Green class coverage: a green battery run always emits exactly one
-        // result per mutation class (the baseline-fixture and
-        // battery-coverage rows only appear on red runs), and at least one
-        // false-authoritative class applied. Anything else claiming green is
-        // a forged or truncated artifact.
         if (entry.green === true) {
             const labels = results.map((result) => result.mutationClass);
             const missing = MUTATION_CLASSES.filter((mutationClass) => !labels.includes(mutationClass));
@@ -609,9 +535,6 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
             if (!falseAuthoritativeApplied) {
                 evidenceFail(`scenarios[${index}]: green-without-applicable-false-authoritative-class`);
             }
-            // Coverage alone still admits an artifact that lists every class
-            // but marks the unconditional ones skipped, which would claim
-            // green while demonstrating only the false-authoritative pair.
             const skipped = ALWAYS_APPLICABLE_CLASSES.filter(
                 (mutationClass) =>
                     !results.some((result) => result.mutationClass === mutationClass && result.applicable),

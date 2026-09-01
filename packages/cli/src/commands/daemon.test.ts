@@ -21,7 +21,6 @@ function result(
         remediation: null,
         effects: command === "restart" ? { stop_committed: true, start_committed: true } : null,
         readiness: null,
-        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",
@@ -161,7 +160,6 @@ describe("daemon command contract", () => {
         expect(h.stderr).toEqual([]);
         expect(h.stdout).toHaveLength(1);
         const rendered = h.stdout[0] ?? "";
-        // Human mode renders text, never the JSON object.
         expect(() => JSON.parse(rendered)).toThrow();
         expect(rendered).toContain("Daemon status: wedged (native_probe_unavailable)");
         expect(rendered).toContain("Remediation: run_daemon_restart");
@@ -235,68 +233,6 @@ describe("daemon command contract", () => {
         expect(rendered).toContain("start_committed=false");
     });
 
-    test("doctor renders fixed-ring identity, bounds, accounting, and lifecycle counts", () => {
-        const rendered = renderDaemonHuman(
-            result("doctor", {
-                readiness: {
-                    shared_memory: { state: "ready", reason: "healthy" },
-                },
-                shared_memory: {
-                    state: "terminal",
-                    error_class: "peer_death",
-                    artifact: {
-                        profile: "mc-host-test-ring-v1",
-                        wire_version: 2,
-                        descriptor_schema: 2,
-                    },
-                    bounds: {
-                        descriptors: 16,
-                        arena_bytes: 134_217_728,
-                        leases: 16,
-                        mappings: 2,
-                        file_descriptors: 2,
-                        workers: 1,
-                        client_instances: 1,
-                        pinned_workers: 0,
-                    },
-                    accounting: {
-                        active: {
-                            descriptors: 16,
-                            arena_bytes: 134_217_728,
-                            leases: 16,
-                            mappings: 2,
-                            file_descriptors: 2,
-                            workers: 1,
-                            client_instances: 1,
-                            pinned_workers: 0,
-                        },
-                        quarantined: {
-                            descriptors: 7,
-                            arena_bytes: 8_388_608,
-                            leases: 6,
-                            mappings: 5,
-                            file_descriptors: 4,
-                            workers: 3,
-                            client_instances: 2,
-                            pinned_workers: 1,
-                        },
-                    },
-                    activation: { completed: 37 },
-                    peer_death: { observed: 31 },
-                    reclamation: { completed: 29 },
-                    exhaustion: { observed: 23 },
-                },
-            }),
-        );
-
-        expect(rendered).toContain("Shared memory: terminal (peer_death)");
-        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=2");
-        expect(rendered).toContain("active_bytes=134217728");
-        expect(rendered).toContain("quarantined_bytes=8388608");
-        expect(rendered).toContain("activations=37");
-        expect(rendered).toContain("peer_deaths=31 reclamations=29 exhaustions=23");
-    });
-
     test("redacts lifecycle roots and secret-shaped native version text", async () => {
         const root = "/private/home/alice/data";
         const h = harness((command) =>
@@ -355,9 +291,7 @@ describe("daemon command contract", () => {
             result(command, {
                 versions: {
                     release: "0.38.0",
-                    // A non-string value makes the redaction chain throw for
-                    // this entry; the command must substitute a placeholder
-                    // and still emit one complete v1 object.
+                    // A non-string version value must produce a placeholder without aborting the v1 response.
                     proof: 10n as unknown as string,
                     daemon: "mc-host/0.1.0",
                     magic_context: null,
@@ -380,8 +314,7 @@ describe("daemon command contract", () => {
     test("rendering failures produce bounded stderr without a partial v1 object", async () => {
         const h = harness((command) =>
             result(command, {
-                // A BigInt outside the redacted versions block makes
-                // JSON.stringify throw, exercising the guarded render region.
+                // A BigInt outside `versions` prevents JSON rendering.
                 checks: [10n] as unknown as DaemonResultV1["checks"],
             }),
         );

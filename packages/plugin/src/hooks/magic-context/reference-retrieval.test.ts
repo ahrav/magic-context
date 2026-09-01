@@ -38,7 +38,6 @@ describe("reference seed corpus", () => {
         const imps = REFERENCE_SEEDS.map((s) => s.importance);
         expect(Math.min(...imps)).toBeLessThanOrEqual(9);
         expect(Math.max(...imps)).toBeGreaterThanOrEqual(85);
-        // every block is a real compartment unit
         for (const s of REFERENCE_SEEDS) {
             expect(s.block.startsWith("<compartment")).toBe(true);
             expect(s.block).toContain("</compartment>");
@@ -58,7 +57,6 @@ describe("selectSeeds", () => {
     });
 
     it("rotates: different chunkStart yields a different combination (usually)", () => {
-        // Across many chunk starts we should see more than one distinct combo.
         const combos = new Set<string>();
         for (let chunk = 1; chunk <= 30; chunk++) {
             combos.add(
@@ -72,7 +70,6 @@ describe("selectSeeds", () => {
     });
 
     it("spans the importance range every run (not 4 clustered scores)", () => {
-        // Each pick comes from a distinct band, so the spread (max-min) is wide.
         for (let chunk = 1; chunk <= 20; chunk++) {
             const imps = selectSeeds("ses_x", chunk).map((s) => s.importance);
             const spread = Math.max(...imps) - Math.min(...imps);
@@ -94,8 +91,6 @@ describe("selectSeeds", () => {
         const b = selectSeeds("ses_zzzz", 1)
             .map((s) => s.importance)
             .join(",");
-        // not asserting inequality strictly (hash collisions possible), but the
-        // mechanism must consider sessionId — verify by sampling several.
         const distinct = new Set<string>();
         for (const sid of ["s1", "s2", "s3", "s4", "s5", "s6"]) {
             distinct.add(
@@ -139,7 +134,6 @@ describe("renderSessionReferencesBlock", () => {
             }),
         );
         const block = renderSessionReferencesBlock(comps);
-        // last 6 → sequences 4..9 present, 0..3 absent
         expect(block).toContain("tier1-9");
         expect(block).toContain("tier1-4");
         expect(block).not.toContain("tier1-3");
@@ -230,11 +224,6 @@ describe("buildReferenceBlocks", () => {
 });
 
 describe("seed corpus matches the historian's required event fields", () => {
-    // The seeds are runtime examples: `selectSeeds` puts them in front of the
-    // historian to calibrate output shape. A seed that omits a field the prompt
-    // marks required teaches the model to omit it too, and for
-    // `reason_for_change` the consequence is silent — `mappedPayload` skips such
-    // an event and receipts it, so the anti-memory is never created and never
     // retried.
     const REQUIRED_TRAJECTORY_FIELDS = [
         "summary",
@@ -264,9 +253,6 @@ describe("seed corpus matches the historian's required event fields", () => {
     });
 
     it("keeps the rejection reason distinct from the evidence quote", () => {
-        // `evidence` proves the pivot happened; `reason_for_change` must say why
-        // the old strategy was wrong. A seed that repeats one as the other
-        // demonstrates exactly the conflation the harvest refuses to persist.
         const conflated = trajectoryBlocks.flatMap((block, index) => {
             const field = (tag: string) =>
                 block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))?.[1]?.trim();

@@ -1,7 +1,7 @@
-//! Broca session client used by historian writer.
+//! This module provides the Broca session client for the historian writer.
 //!
-//! Transport, authentication, correlation, liveness, and route epochs remain owned by
-//! [`mc_host::Client`]. This module interprets only Broca request and stream payloads.
+//! `mc_host::Client` owns transport, authentication, correlation, liveness, and route epochs.
+//! This module interprets only Broca request and stream payloads.
 
 use std::{
     collections::BTreeMap,
@@ -351,13 +351,9 @@ impl HistorianProducerError {
         }
     }
 
-    /// The send classification, when this failure carries one.
     ///
-    /// `None` means the failure describes something other than a send attempt —
-    /// a transport or client error — so a consumer must not read it as "not
-    /// sent". Public alongside `code`, `classification`, and the other
-    /// accessors: whether a request may have reached the host is exactly what a
-    /// caller needs before deciding to retry.
+    /// `None` denotes a transport or client error rather than a send attempt; callers must not treat it as `NotSent`.
+    /// `None` denotes a transport or client error rather than a send attempt; callers must not treat it as `NotSent`.
     pub fn send_outcome(&self) -> Option<HistorianSendOutcome> {
         match self {
             Self::Call(failure) => Some(failure.outcome),
@@ -756,12 +752,12 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
-        // Nothing here observes the token until the request itself, and
-        // `ensure_command_route` sits in front of it carrying `open_route`'s own
-        // 30-second retry budget. Without this gate a handler that is already
-        // shutting down waits through route admission and can bind a route for a
-        // firing that was cancelled before it started. `NotSent` is exact: no
-        // frame has been queued on any route yet.
+        // The handler checks the cancellation token before `ensure_command_route` because its awaits do not observe the token.
+        // The handler checks the cancellation token before `ensure_command_route` because its awaits do not observe the token.
+        // Without a pre-route cancellation check, a cancelled handler can wait through route admission and bind a route.
+        // A handler cancelled before its request starts can otherwise bind a route after route admission completes.
+        // `NotSent` means no frame has been queued on any route.
+        // `NotSent` means no frame has been queued on any route.
         if self.stop_requested() {
             return Err(HistorianProducerError::Call(
                 HistorianCallFailure::untagged(
@@ -919,13 +915,12 @@ impl HistorianProducer {
         Ok(serde_json::from_slice(&response)?)
     }
 
-    /// Replays the frozen request on a fresh generation after an ambiguous send.
     ///
-    /// `ambiguous` is the failure that justified the replay. Every abort inside
-    /// this function returns it unchanged: the frozen request may already have
-    /// reached the host, so reporting the cancellation itself — a `NotSent`
-    /// classification — would tell the caller a possibly-delivered request is
-    /// safe to send again.
+    /// The recovery path returns `ambiguous` unchanged on every abort because the frozen request may already have reached the host.
+    /// The recovery path returns `ambiguous` unchanged on every abort because the frozen request may already have reached the host.
+    /// Reporting cancellation as `NotSent` would permit retrying a request that may already have reached the host.
+    /// Reporting cancellation as `NotSent` would permit retrying a request that may already have reached the host.
+    /// Reporting cancellation as `NotSent` would permit retrying a request that may already have reached the host.
     async fn replay_frozen_once(
         &mut self,
         frozen_daemon: [u8; 16],
@@ -933,26 +928,22 @@ impl HistorianProducer {
         frozen: &[u8],
         ambiguous: HistorianProducerError,
     ) -> Result<Value, HistorianProducerError> {
-        // Release the ambiguous generation before dialing the replay
-        // connection. Both hold a host connection permit, so overlapping them
-        // cannot recover at a `max_connections` of 1: the host drops the newly
-        // authenticated socket for capacity, `reconnect` fails, and the old
-        // permit is never freed because the cleanup sits past the failure.
-        // The daemon comparison survives the reorder because `frozen_daemon` is
-        // already captured — it does not come from the old connection.
+        // The recovery path releases the ambiguous generation before reconnecting because both connections consume a host permit.
+        // The old and replay connections both consume a host connection permit.
+        // At `max_connections == 1`, reconnecting before release causes the host to drop the new authenticated socket.
+        // At `max_connections == 1`, reconnecting before release causes the host to drop the new authenticated socket.
+        // The recovery path releases the old generation before reconnecting so failed reconnects cannot prevent its cleanup.
         if let Err(error) = self.close_routes_and_connection().await {
             eprintln!("mc-module: historian replay cleanup failed: {error}");
         }
         self.command_route = None;
         self.subscribe_route = None;
 
-        // The caller's gate is one check, and the setup below spans three
-        // separately budgeted awaits — cleanup, a fresh dial with authentication
-        // and negotiation, and a route open. None of them observe the token, so
-        // only the final request would notice a cancellation that arrived just
-        // after the gate; a stopping handler would first spend every one of those
-        // budgets and bind a host-side route. Rechecking between stages aborts at
-        // a boundary where nothing is half-done.
+        // The recovery path checks cancellation before setup because cleanup, reconnect, and route opening do not observe the token.
+        // The recovery path checks cancellation before setup because cleanup, reconnect, and route opening do not observe the token.
+        // Cleanup, reconnect, and route opening do not observe the cancellation token.
+        // Cancellation during setup is observed by the `stop_requested` checks after cleanup and reconnect.
+        // The recovery path rechecks `stop_requested` after cleanup and reconnect to avoid opening a route after cancellation.
         if self.stop_requested() {
             return Err(ambiguous);
         }
@@ -964,14 +955,10 @@ impl HistorianProducer {
         {
             Ok(reconnected) => reconnected,
             Err(error) => {
-                // The replacement connection is the replay's own machinery, not
-                // the thing the caller asked about. Surfacing the dial failure
-                // replaces an `OutcomeUnknown` send with a transport error that
-                // carries no send classification at all — `send_outcome()` is
-                // `None` for `Client` — so a consumer can no longer tell that the
-                // frozen request may already have committed. Keep the ambiguity
-                // and log the dial failure as context, exactly as the cleanup
-                // failure above does.
+                // Reconnect failures must preserve the original send's unknown outcome.
+                // Reconnect failures must not replace the original send's `OutcomeUnknown` result.
+                // `Client` errors have no `send_outcome()` classification.
+                // The recovery path returns `ambiguous` because the frozen request may already have committed.
                 eprintln!("mc-module: historian replay reconnect failed: {error}");
                 return Err(ambiguous);
             }
@@ -986,18 +973,14 @@ impl HistorianProducer {
                 identity_changed,
             });
         }
-        // `send_frozen_once` opens the command route before it sends, and
-        // `open_route` carries its own 30-second budget. This is the last gate
-        // that can prevent binding a route for a run nobody is waiting for.
+        // The `stop_requested` check after reconnect is the last check before `send_frozen_once` can open a route.
         if self.stop_requested() {
             return Err(ambiguous);
         }
         let sent = self.send_frozen_once(frozen).await;
-        // A cancellation landing anywhere inside the replay's own send leaves the
-        // ORIGINAL send's outcome unresolved, and the replay's local failure —
-        // `cancelled`/`NotSent` from the route-open race, say — describes only the
-        // replay. Reporting it would tell the caller a possibly-committed request
-        // is safe to send again.
+        // If `stop_requested` follows a replay send error, return `ambiguous`: the replay error does not classify the original send.
+        // A replay `cancelled` or `NotSent` error classifies only the replay.
+        // Reporting a replay-local failure would mark a possibly committed request as safe to retry.
         if sent.is_err() && self.stop_requested() {
             return Err(ambiguous);
         }
@@ -1046,18 +1029,7 @@ impl HistorianProducer {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                // `Client::open_route` carries its own 30-second budget and
-                // retries retryable terminals without observing this token, so
-                // abandoning the await is the only way a stopping handler does
-                // not wait for it.
                 //
-                // Walking away is safe only because of the cleanup below. The
-                // host may bind the route after we stop listening, and we can
-                // never name it, so closing the connection is what settles it:
-                // its connection `Goodbye` obliges the host to settle every
-                // route on this generation (§11.2), including the one we
-                // abandoned. Without that this would strand a route and a
-                // channel permit on every cancelled open.
                 if let Err(error) = self.connection.close().await {
                     eprintln!("mc-module: historian cancelled route-open cleanup failed: {error}");
                 }
@@ -1088,16 +1060,7 @@ impl HistorianProducer {
         Ok(serde_json::from_slice(&response)?)
     }
 
-    /// Bounds the whole attempt, not just the drain.
     ///
-    /// Opening the subscription route is itself a request carrying the client's
-    /// own 30-second route-open timeout, so a per-request bound alone lets one
-    /// attempt overshoot the margin reserved for cleanup and leaves an outer
-    /// cancel to land during `session.delete`. Expiry must also stay
-    /// distinguishable: the firing, reattach, and classify paths grant their
-    /// recovery re-drain only on `TimedOut`, and a per-request deadline
-    /// surfaces as a `Call` failure instead, so a run that would finish inside
-    /// the recovery window gets cancelled and discarded.
     async fn subscribe_from_start(
         &mut self,
         run_id: &str,
@@ -1169,19 +1132,7 @@ impl HistorianProducer {
         }
     }
 
-    /// Whether the caller has asked this producer to stop.
     ///
-    /// Replay exists for an ambiguous *transport* loss: the request may have
-    /// been dispatched, so resending on a fresh generation is how the run gets
-    /// established. A caller cancellation produces the same `OutcomeUnknown`
-    /// classification for the same reason — the bytes may already be gone — but
-    /// the correct response is the opposite. Replaying there dials a new
-    /// connection and re-sends `session.send` after the caller explicitly said
-    /// stop, which starts a billable run if the original never went out, and
-    /// during handler shutdown makes a cancelled task perform connection setup
-    /// instead of draining. The token is the authority on that, not the error
-    /// code: it is what the caller actually signalled. The deadline and
-    /// transport-loss replays are unaffected because neither cancels it.
     fn stop_requested(&self) -> bool {
         self.config
             .cancellation
@@ -1338,10 +1289,6 @@ fn unit_text(unit: &Value) -> Option<String> {
 }
 
 fn is_terminal_unit(unit: &Value) -> bool {
-    // Every error unit is terminal. Deferring to `is_error_unit` keeps the two
-    // sets from drifting: a spelling recognized as an error but not as a
-    // terminal would skip terminal handling entirely and surface as
-    // `UnexpectedStreamEnd`, discarding the run's typed classification.
     if is_error_unit(unit) {
         return true;
     }
@@ -1501,14 +1448,10 @@ mod tests {
             _target: RouteTarget,
             identity: RouteIdentity,
         ) -> Result<RouteHandle, HistorianProducerError> {
-            // Lets a test place a cancellation inside the route open itself,
-            // which is the window `Client::open_route`'s own budget does not
             // observe.
             let cancel = self.state.lock().unwrap().cancel_on_open_route.take();
             if let Some(cancel) = cancel {
                 cancel.cancel();
-                // Yield so the racing `select!` observes the token before this
-                // open resolves; otherwise the ordering under test never occurs.
                 tokio::task::yield_now().await;
             }
             let mut state = self.state.lock().unwrap();
@@ -1563,8 +1506,6 @@ mod tests {
                 state.close_calls += 1;
                 state.cancel_on_close.take()
             };
-            // Lets a test place a cancellation exactly inside the replay's
-            // cleanup — after the caller's pre-replay gate, before any dial.
             if let Some(cancel) = cancel {
                 cancel.cancel();
             }
@@ -1581,8 +1522,6 @@ mod tests {
         }
     }
 
-    /// A subscription that never yields an item and never ends, so only the
-    /// attempt's own bound can end the wait.
     struct StallingStream;
 
     #[async_trait]
@@ -1613,8 +1552,6 @@ mod tests {
             identity: &SemanticIdentity,
         ) -> Result<Reconnected, HistorianProducerError> {
             self.reconnect_calls.fetch_add(1, Ordering::SeqCst);
-            // An exhausted queue stands in for a dial that cannot be completed —
-            // a transient daemon outage during replay setup.
             let Some((connection, override_identity)) = self.reconnects.lock().unwrap().pop_front()
             else {
                 return Err(HistorianProducerError::Client(HistorianClientFailure {
@@ -1637,8 +1574,6 @@ mod tests {
         ))
     }
 
-    /// The shape the managed client reports when the caller's token fires after
-    /// the writer may already have claimed the request.
     fn cancelled_unknown() -> HistorianProducerError {
         HistorianProducerError::Call(HistorianCallFailure::untagged(
             HistorianSendOutcome::OutcomeUnknown,
@@ -1826,13 +1761,6 @@ mod tests {
 
     #[tokio::test]
     async fn caller_cancellation_prevents_replay_but_transport_loss_still_replays() {
-        // A cancellation and an ambiguous transport loss can both end a firing,
-        // but they need opposite handling. Replaying a cancellation dials a new
-        // connection and re-sends `session.send` after the caller said stop,
-        // starting a run if the original never went out, and during handler
-        // shutdown makes a cancelled task do connection setup instead of
-        // draining. The token is the authority, so the transport replay below
-        // must survive the gate while the cancelled firing never reaches it.
         async fn start_with_token(
             token: Option<CancellationToken>,
         ) -> (
@@ -1865,10 +1793,6 @@ mod tests {
             (connector, first_state, second_state, result)
         }
 
-        // Already cancelled before the firing starts: nothing is sent at all, so
-        // no route is opened and no replay is considered. `NotSent` is the exact
-        // classification here — unlike a cancellation that lands mid-send, this
-        // one is provably before any frame was queued.
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let (connector, first_state, replay_state, result) =
@@ -1897,7 +1821,6 @@ mod tests {
             "a cancelled caller must not have its request resent"
         );
 
-        // Live token: the intentional transport-loss replay is unaffected.
         for token in [None, Some(CancellationToken::new())] {
             let (connector, _first_state, replay_state, result) = start_with_token(token).await;
             assert_eq!(result.expect("transport loss replays").run_id, "replayed");
@@ -1908,12 +1831,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancellation_during_replay_setup_stops_before_dialing() {
-        // The caller's gate is one check, and the replay's setup then spans a
-        // cleanup, a fresh dial with authentication and negotiation, and a route
-        // open — none of which observe the token. A cancellation arriving in that
-        // span must stop the setup, not run to the final request: otherwise a
-        // stopping handler spends every one of those budgets and binds a
-        // host-side route for a run nobody will await.
         let cancelled = CancellationToken::new();
         let first = connection(9, [Err(cancelled_unknown())]);
         first.state.lock().unwrap().cancel_on_close = Some(cancelled.clone());
@@ -1956,15 +1873,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_replay_reconnect_keeps_the_send_ambiguous() {
-        // The replay exists because the first `session.send` may already have
-        // committed. If the replacement dial fails — a transient daemon outage —
-        // reporting that transport error discards the only evidence of that
-        // ambiguity: `Client` carries no send classification at all, so a
-        // consumer can no longer tell the request might be live.
         let first = connection(9, [Err(cancelled_unknown())]);
         let connector = Arc::new(FakeConnector {
             initial: first,
-            // No reconnect available: the dial fails.
             reconnects: Mutex::new(VecDeque::new()),
             reconnect_calls: AtomicU64::new(0),
         });
@@ -1999,15 +1910,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancellation_during_route_open_abandons_it_and_closes_the_connection() {
-        // `Client::open_route` carries its own 30-second budget and does not
-        // observe the token, so a cancellation landing after the start gate must
-        // abandon the open rather than wait for it. Abandoning is only sound
-        // because the connection is closed: the host may bind the route after we
-        // stop listening, and its connection `Goodbye` is what settles a route we
-        // can never name.
         let cancelled = CancellationToken::new();
         let first = connection(9, [Ok(br#"{"run_id":"unreachable"}"#.to_vec())]);
-        // Cancel while the route open is in flight.
         first.state.lock().unwrap().cancel_on_open_route = Some(cancelled.clone());
         let state = Arc::clone(&first.state);
         let connector = Arc::new(FakeConnector {
@@ -2171,10 +2075,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_attempt_that_outlives_its_budget_reports_timed_out() {
-        // `TimedOut` is not interchangeable with a `Call` failure carrying
-        // `deadline_expired`: only the former earns the recovery re-drain, so a
-        // stalled attempt must keep reporting the variant its callers match on.
-        // A stalled subscription can never win the race, so a short real budget
         // is deterministic.
         let connection = connection(1, [Ok(br#"{"run_id":"run"}"#.to_vec())]);
         connection.state.lock().unwrap().stall_stream = true;
@@ -2186,10 +2086,6 @@ mod tests {
             producer.await_output_with_timeout("run", Duration::from_millis(20)),
         )
         .await
-        // The fake connection does not honor `RequestOptions`, so nothing but
-        // the attempt's own bound can end this wait. Without that bound the call
-        // never returns, and this outer guard turns the regression into a
-        // failure instead of a hung suite.
         .expect("the attempt's own bound must end the wait")
         .expect_err("a stalled subscription cannot complete");
         assert!(
@@ -2225,9 +2121,6 @@ mod tests {
 
     #[tokio::test]
     async fn every_error_spelling_terminates_the_drain_with_its_classification() {
-        // Each spelling `is_error_unit` accepts must also end the drain. A
-        // spelling that is an error but not a terminal falls through to stream
-        // end, and the typed classification the retry ladder needs is lost.
         for kind in ["error", "run_error"] {
             let mut stream = stream_of([
                 json!({"type": "run_started", "run_id": "r1"}),

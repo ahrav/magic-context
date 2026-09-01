@@ -52,6 +52,16 @@ descriptor that drops with it.
 No CI job executes any of this. The macOS step (`.github/workflows/ci.yml:169-176`)
 runs `--test contract --test fuzz_corpus`, neither of which constructs a `Ring`.
 
+Update 2026-08-31: the CI sentence above resolves against the pre-#131
+workflow. PR #131 (merge `5d638e3e8`) removed the macOS matrix leg entirely and
+deleted the Darwin npm packages (`packages/mc-host-darwin-*`, removed in
+`55f47ac64`); `.github/workflows/ci.yml` at HEAD `bdf72f46a` has only
+`ubuntu-latest` jobs. The same PR (`099a314d5`) removed the call site:
+`Mapping::create` (`ring.rs:311-312`) now calls `create_linux_memfd`
+unconditionally, `create_macos_shm` moved to `ring.rs:2176-2219` with no
+caller, and `ring.rs:1-2` compile-errors off Linux. See the dated
+investigation-log entry below.
+
 ## Failure scenario
 
 `shm_unlink` returns nonzero on a name the process just created successfully with
@@ -120,3 +130,30 @@ window.
 - Conclusion: resolved with answer on the code question, unresolved on the
   platform question. The asymmetry between the two error exits is verified from the
   diff and from HEAD. Whether the remaining exit is reachable needs a macOS run.
+
+### Q: Is Darwin still a supported release surface, and does the leak window survive the #131 rewrite? (added 2026-08-31)
+
+- Sources examined: `ring.rs:2176-2219` at HEAD `bdf72f46a` (`getrandom`
+  `:2180`, `shm_open` `:2191`, `OwnedFd::from_raw_fd` `:2201`, `FD_CLOEXEC`
+  `fcntl` `:2206`, `shm_unlink` `:2209`, combined failure check `:2210-2212`,
+  `ftruncate` `:2215`); every `shm_unlink` occurrence in the crate (one call
+  site, `:2209`); `packages/` listing at HEAD; `.github/workflows/ci.yml` at
+  HEAD; `git log --diff-filter=D` on the Darwin package manifests
+  (`55f47ac64`, merged via `5d638e3e8`); `docs/mc-host-shm-transport.md:5`,
+  `:83`.
+- Findings: `099a314d5` rewrote the body — the record's earlier "byte-identical
+  to `9c1eb4d1`" note no longer holds. The name is now 10 random bytes,
+  28 characters, and `FD_CLOEXEC` is set by `fcntl` after `shm_open` because
+  Darwin rejects `O_CLOEXEC` in `shm_open` flags. The leak window survives in
+  kind: a failed `shm_unlink` still returns `ObjectSetupFailed` from the
+  combined check at `:2210-2212` with the name present and the only descriptor
+  dropping. But the path is dead text at HEAD: `create_macos_shm` has no
+  caller, the Darwin packages and macOS CI jobs are deleted, and `ring.rs:1-2`
+  compile-errors on non-Linux targets. `docs/mc-host-shm-transport.md:5`
+  states Linux-x64 glibc support only.
+- Missing evidence: intent for the surviving `cfg(target_os = "macos")`
+  function.
+- Conclusion: needs human input. Citation corrections: the function is at
+  `ring.rs:2176-2219`, not `:1748-1783`; the window statement is `:2209`, not
+  `:1774`/`:1779`; the crash variant spans `:2201-2209`; the cited `ci.yml`
+  macOS step lines no longer exist.

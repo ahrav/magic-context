@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-/** FM-OC-3: a parked session self-heals when a killed external module returns. */
+/* */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";

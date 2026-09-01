@@ -264,7 +264,7 @@ and the doctest at `handler.rs:213-219` asserts that constructing
 `RequestOutcome::Response { body: Vec::<u8>::new(), binary: false }` must fail
 to compile. This is the sharpest disagreement in the sub-part because the two
 sides are not merely unsynchronised, they are mechanically opposed: the document
-describes a construction, and a check that **runs in CI** (`ci.yml:190`) fails
+describes a construction, and a check that **runs in CI** (`ci.yml:175`) fails
 the build if that construction ever becomes possible. The mechanism the code
 enforces is absent from the document — `OutputBuffer`, `reserve_output`, and
 `output_from_writer` appear nowhere in `docs/mc-host-wire-protocol.md`, grepped,
@@ -301,11 +301,13 @@ CI-executed check on any record in this catalog.** "Zero executed by CI" is true
 of the 121 tests in the five source files and six subject binaries. It is not true
 of this sub-part's *record coverage*, because one record is asserted exactly by a
 test in a binary CI does name.
-`tests/lifecycle.rs:576-657` `shutdown_refuses_new_routes_and_new_routed_work`
+`tests/lifecycle.rs:570-651` `shutdown_refuses_new_routes_and_new_routed_work`
 drives a `route.open` and a routed request into one draining host and asserts
 `target_unavailable` and `server_busy` respectively, which is
 [req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes](#req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes)
-in full; `lifecycle` runs at `ci.yml:178-179` on Linux and `:187` on macOS. The
+in full; `lifecycle` runs at `ci.yml:168-169` on Linux. The former macOS run of
+the same pair was removed with every other macOS job by PR #131 (merge
+`5d638e3e8`); `ci.yml` at HEAD contains only `ubuntu-latest` jobs. The
 binary was excluded from the six because its *subject* is the host lifecycle
 rather than the request path, which is a defensible scope call and is exactly how
 the check went uncredited. Counting by binary subject rather than by assertion is
@@ -313,7 +315,7 @@ what produced the error.
 
 The four doctests are the exception and they matter. All four are
 `compile_fail`, all four are in `handler.rs`, and all four execute because
-`handler.rs` is `pub mod` (`lib.rs:17`) and `ci.yml:190` runs
+`handler.rs` is `pub mod` (`lib.rs:17`) and `ci.yml:175` runs
 `cargo test -p mc-host --doc` under the step name "Rust lease non-escape",
 printed and confirmed.
 
@@ -656,6 +658,7 @@ three exits there is no frame at all, so that remedy never triggers and the
 client burns its full 30-second route deadline. Repeated bind panics therefore
 cost one route deadline each.
 Open questions:
+
 - Is the `CloseWins` silent exit reachable on a generation that stays live
   afterwards, or does every producer of that decision also retire the
   generation? `settle_route` is called from host shutdown, so the host is at
@@ -712,6 +715,7 @@ unbounded growth. The consequence is a stale `PendingEntry` holding a
 generation, which makes `handle_cancel` for that key a live no-op against an
 already-dead task.
 Open questions:
+
 - Does the forced path always drop the `GenerationCore` immediately afterwards?
   `close_generation` removes the connection at `dispatch.rs:1409-1413`, but
   `force_close_all_routes` does not call it. (unresolved, needs sub-part 2f)
@@ -780,6 +784,7 @@ answered. Protocol §10.1 makes an unobserved terminal `outcome_unknown` on the
 client side; the host has no matching classification, so the two ends cannot be
 reconciled after a close.
 Open questions:
+
 - Should routed terminals carry a `written` hook for metering, given the hook
   is a boxed closure per frame? (needs human input)
 
@@ -820,6 +825,7 @@ nothing was answered. Combined with Part 2d's finding that a clean host close
 and a transport failure share one code, the client cannot attribute the loss,
 and any effect the handler already applied is invisible to it.
 Open questions:
+
 - Does any production handler use `output_from_writer` with a computed
   `exact_len` that could disagree with its serializer? That is `mc-module`'s
   side of the boundary. (unresolved, needs an `mc-module` audit)
@@ -877,6 +883,7 @@ at publication with `ProducerError::Underfill` rather than at this gate, which i
 territory. The gap here is specifically the owned path, where declared and written
 are the same field and zero is legal.
 Open questions:
+
 - Is a zero-length `Response` a defect or a supported outcome?
   `handler.rs:220-235` does not state the intent, and
   `OutputBuffer::is_empty()` (`:368-370`) exists as public API, which weakly
@@ -940,6 +947,7 @@ Impact: All four pools are host-global, so one connection can hold every general
 permit. Per-connection fairness is not provided at this layer; if it is
 required, it is required somewhere else and nothing here supplies it.
 Open questions:
+
 - Is per-connection handler-capacity fairness owned anywhere? `connection_permits`
   bounds connection count but not per-connection dispatch share. (unresolved,
   needs sub-part 2f's `runtime.rs` and `config.rs` pass)
@@ -994,6 +1002,7 @@ Impact: Handler-task capacity is reclaimed only by handler cooperation, client
 timeout can hold all 256 general task permits, at which point every other
 route's traffic gets `server_busy` while the host reports itself healthy.
 Open questions:
+
 - Should the host own a request deadline at all, given protocol §11's rule that
   each operation owns exactly one absolute deadline and it assigns the request
   deadline to the client? Adding one would create the multiplied timer §11
@@ -1055,10 +1064,10 @@ no, which the routed and control chains do differently at every level.
 Type: safety
 Reachability: default-production
 Status: active
-Exercised: yes — `tests/lifecycle.rs:576`
+Exercised: yes — `tests/lifecycle.rs:570` (re-located at HEAD)
 `shutdown_refuses_new_routes_and_new_routed_work` asserts both codes against one
-draining host, and `lifecycle` is CI-executed on Linux (`ci.yml:178-179`) and
-macOS (`:187`)
+draining host, and `lifecycle` is CI-executed on Linux (`ci.yml:168-169`);
+`ci.yml` has no macOS jobs after PR #131 (merge `5d638e3e8`)
 Guarantee: The shutdown admission fence is one condition evaluated at two call
 sites, and the two sites answer with different error codes carrying different
 client retry rules.
@@ -1077,16 +1086,17 @@ external shutdown signal, with a client pipelining both a routed request and a
 Confidence: high — [evidence](evidence/req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes.md).
 Both call sites read; protocol §10.2's two retry rows compared.
 Existing check: **corrected during disposition from "none".**
-`tests/lifecycle.rs:576-657` `shutdown_refuses_new_routes_and_new_routed_work`
+`tests/lifecycle.rs:570-651` `shutdown_refuses_new_routes_and_new_routed_work`
 asserts this property exactly and in the record's own shape: it holds a drain open
-with a parked handler (`:590-606`), spawns the shutdown (`:611`), waits for the
-publication to be unlinked (`:614-621`), then sends a `route.open` and asserts
-`open_error.error_code() == "target_unavailable"` (`:626-638`) and sends a routed
+with a parked handler (`:584-600`), spawns the shutdown (`:605`), waits for the
+publication to be unlinked (`:608-615`), then sends a `route.open` and asserts
+`open_error.error_code() == "target_unavailable"` (`:620-632`) and sends a routed
 request on the still-live route and asserts
-`request_error.error_code() == "server_busy"` (`:640-657`). Both codes, one
+`request_error.error_code() == "server_busy"` (`:634-651`). Both codes, one
 draining host, one test. Status `unaudited`. **In CI**, unlike every other check
-this catalog cites: `ci.yml:178-179` runs `--test client --test lifecycle` on
-Linux and `:187` runs the same pair on macOS.
+this catalog cites: `ci.yml:168-169` runs `--test client --test lifecycle` on
+Linux. The former macOS run of the same pair was removed by PR #131 (merge
+`5d638e3e8`), which left `ci.yml` Linux-only.
 Impact: Protocol §10.2 tells a client to retry `target_unavailable` "with new
 correlation under bounded route deadline" and `server_busy` "with backoff". A
 draining host therefore invites un-backed-off `route.open` retries from exactly
@@ -1094,6 +1104,7 @@ the clients it is trying to shed, while backing off their routed traffic. The
 divergence is not merely unchecked, it is **pinned by a CI-executed test**, so it
 is current intended behaviour unless someone changes both the code and that test.
 Open questions:
+
 - Which code does the protocol intend for a `route.open` during shutdown? §12
   step 1 names `server_busy` for routed requests and is silent on `route.open`;
   §8.3 reserves `target_unavailable` for route admission failures such as
@@ -1136,6 +1147,7 @@ requests, so malformed control traffic degrades application throughput on every
 connection, while a capacity-rejection flood is contained per generation. The
 two attack surfaces have different blast radii for the same client behaviour.
 Open questions:
+
 - Protocol §8.3 says a control request is "one consumer request against the
   global unsettled bound", which the semantic path honours. Is charging
   malformed traffic to the *global* pool rather than a per-generation one the
@@ -1186,8 +1198,8 @@ hypothesis** about which oracle subsumes which, offered to order the work, not a
 verified claim. None has been tested. **Corrected during disposition: one record
 is CI-tested, though no dominance statement is.** The four `compile_fail` doctests
 bear on the handler API surface rather than on any record here, but
-`tests/lifecycle.rs:576-657` asserts the divergent-codes record exactly and runs
-at `ci.yml:178-179` and `:187`. That record appears in the fourth cluster below,
+`tests/lifecycle.rs:570-651` asserts the divergent-codes record exactly and runs
+at `ci.yml:168-169` on Linux. That record appears in the fourth cluster below,
 and its presence there is the only place a hypothesis could be checked against
 something CI executes today.
 
@@ -1388,6 +1400,7 @@ Impact: a bind path that never yields `route_gone` leaks one map entry per
 connection for the host's lifetime, and the leaked entry keeps routing a reused
 handle to a stale child.
 Open questions:
+
 - Does the host guarantee `route_gone` after a panicking `bind`, or only after
   `Reject` and close? The comment claims all three; the runtime side is outside
   this lens. **Resolved at carry time, and the answer is yes.** The runtime side

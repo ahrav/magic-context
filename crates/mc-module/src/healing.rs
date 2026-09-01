@@ -1,4 +1,3 @@
-//! Serializer healing profiles and the module residuals they leave behind.
 //!
 //! The serializer profile is the operational key for provider-specific cleanup that
 //! happens before a request reaches the provider. The module only performs residual
@@ -9,10 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SerializerProfile {
     OwnedLlmRunner,
-    /// The owned leg renamed (llm-runner -> broca). Identical serializer semantics
-    /// to OwnedLlmRunner; a separate variant so the wire string keeps driving the
-    /// render_config identity (the rename is a designed one-time HARD per session).
-    /// OwnedLlmRunner is deleted once the fleet cut lands and nothing sends it.
+    /// OwnedBroca has identical serializer semantics to OwnedLlmRunner but retains a distinct wire ID.
     OwnedBroca,
     ClaudeCodeAnthropic,
     OpencodeAiSdk,
@@ -117,7 +113,6 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
     }
 }
 
-/// The profile-default tail-reclaim capability.
 ///
 /// Every shipping profile is a full-array consumer: the provider request is rebuilt from
 /// the transformed array each pass, so prefix and tail rewrites both round-trip and the
@@ -130,8 +125,7 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
 /// current content, and any tail mutation a fence skips simply reapplies on the next
 /// healthy pass. Prefix folding remains available regardless of the tail setting.
 pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
-    // Single exhaustive arm: all shipping profiles reclaim the tail. The match stays
-    // exhaustive (not a wildcard) so a future profile forces an explicit decision here.
+    // The match is exhaustive so each future profile requires an explicit decision.
     match profile {
         SerializerProfile::ClaudeCodeAnthropic
         | SerializerProfile::OwnedLlmRunner
@@ -173,8 +167,7 @@ mod tests {
 
     #[test]
     fn owned_broca_is_semantically_identical_to_owned_llmrunner() {
-        // The broca rename must not change ANY profile-derived behavior — only the
-        // wire string (which drives the designed one-time render_config HARD).
+        // OwnedBroca must have the same coverage as OwnedLlmRunner.
         assert_eq!(
             coverage(SerializerProfile::OwnedBroca),
             coverage(SerializerProfile::OwnedLlmRunner)
@@ -196,10 +189,6 @@ mod tests {
 
     #[test]
     fn tail_reclaim_is_full_array_for_every_shipping_profile() {
-        // U0 retired the Claude Code byte-splice, so every shipping profile is now a
-        // full-array consumer with tail reclaim enabled. Claude Code flips from its
-        // historical false default to true; owned-broca is unchanged (it was already
-        // full-array and is semantically identical to owned-llmrunner).
         for profile in SerializerProfile::all() {
             assert!(tail_reclaim(*profile), "{profile:?} must reclaim the tail");
         }

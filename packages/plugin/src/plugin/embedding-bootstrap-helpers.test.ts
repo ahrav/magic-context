@@ -20,11 +20,6 @@ function makeDetailed(embedding: EmbeddingConfig): Detailed {
 
 describe("isConfigLoadUntrusted — literal config tokens", () => {
     it("treats a literal {env:} token in an embedding field as untrusted", () => {
-        // A project config can leave {env:}/{file:} tokens literal (no expansion
-        // for security). If one lands in an embedding field the registry would
-        // hash a bogus identity, clear the untrusted latch, and GC could reap the
-        // real model's vectors — so the load must be untrusted regardless of how
-        // the (generic, key-path-less) substitution warning was worded.
         const detailed = makeDetailed({
             provider: "openai-compatible",
             model: "qwen/qwen3-embedding-8b",

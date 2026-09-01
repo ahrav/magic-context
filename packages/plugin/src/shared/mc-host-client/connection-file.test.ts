@@ -181,29 +181,27 @@ describe("direct-file snapshot", () => {
     });
 
     test("classifies a missing file as not_found discovery churn", async () => {
-        // A raw ENOENT here would escape the ConnectionFileError retry
-        // allowlist and permanently stop a recovery episode whose daemon
-        // was mid-republication (unlink before the fresh file lands).
+        // ENOENT must map to a retryable `ConnectionFileError` so recovery continues during republication.
+        // The retry allowlist must include ENOENT so recovery does not stop during republication.
+        // The daemon can unlink its published file before the replacement lands.
         await expectFailure(freshPath("absent.json"), "not_found");
     });
 
     test("classifies a permanent stat failure as stat_failed, not churn", async () => {
         const filePath = freshPath("not-a-dir.json");
         await writePrivateFile(filePath, JSON.stringify(validJson()));
-        // A regular file used as a path component is a permanent
-        // configuration error (ENOTDIR), not republication churn: it must
-        // stop a recovery episode instead of retrying to its deadline.
+        // A regular-file path component produces permanent ENOTDIR, not retryable republication churn.
+        // ENOTDIR must stop recovery instead of retrying until the deadline.
         await expectFailure(path.join(filePath, "child.json"), "stat_failed");
     });
 
     test("classifies a permanent open failure as open_failed, not churn", async () => {
-        // Root opens an unreadable file anyway; the errno split under test
-        // is unreachable there.
+        // When `process.getuid?.() === 0`, root can open mode-000 files, so this test cannot exercise EACCES.
         if (process.getuid?.() === 0) return;
         const filePath = freshPath("unreadable.json");
         await writeFile(filePath, JSON.stringify(validJson()), { mode: 0o000 });
-        // The pre-open lstat succeeds; open(2) fails with EACCES, which is
-        // permanent evidence outside the retryable churn classes.
+        // The pre-open `lstat` succeeds, then `open(2)` fails with EACCES.
+        // EACCES is permanent evidence outside the retryable churn classes.
         await expectFailure(filePath, "open_failed");
     });
 
@@ -213,10 +211,10 @@ describe("direct-file snapshot", () => {
         const afterOpen = async (): Promise<void> => {
             await rm(filePath, { force: true });
         };
-        // First attempt: the post-read stat reports the removal as
-        // `replaced_during_read`; the one-restart rule retries, and the
-        // restart's initial stat reports the still-absent file as
-        // `not_found`. Both are retryable churn codes for callers.
+        // After removal, the post-read `stat` reports `replaced_during_read`.
+        // The one-restart rule retries `replaced_during_read`.
+        // The restart's initial `stat` reports `not_found` while the file remains absent.
+        // `replaced_during_read` and `not_found` are retryable churn codes.
         await expectFailure(filePath, "not_found", { afterOpen });
     });
 

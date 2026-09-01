@@ -1,15 +1,14 @@
 /**
  * RustTestHarness drives OpenCode through U5's directly composed mc-host fixture.
  *
- * Fixture and OpenCode share one isolated data root. Fixture starts before
- * OpenCode so plugin discovery reaches a published, authenticated host.
+ * Fixture and OpenCode share an isolated data root; the fixture starts before OpenCode.
+ * The fixture starts before OpenCode so plugin discovery reaches a published, authenticated host.
  * OpenCode restarts preserve database and module-store state.
  *
- * Assertion surface: wire captures come from the model mock's full request
- * bodies (the same source the TS lane asserts on). Rust transform decisions are
- * ALSO surfaced from the plugin diagnostic log (redirected per-suite via
- * MAGIC_CONTEXT_LOG_PATH) as a secondary signal — `readRustPasses()` parses the
- * `rust pass: decision=… served_from=… applied=…` lines the Rust transform emits.
+ * Wire assertions use the model mock's full request bodies.
+ * The TS lane asserts against the same full request bodies.
+ * Rust transform decisions are also surfaced through the per-suite diagnostic log at `MAGIC_CONTEXT_LOG_PATH`.
+ * The Rust transform emits `rust pass: decision=… served_from=… applied=…` lines.
  */
 
 import { Database } from "bun:sqlite";
@@ -42,10 +41,9 @@ export interface RustTestHarnessOptions extends SharedHarnessOptions {
     /** magic-context USER-tier config overrides (thresholds, memory, etc.). */
     magicContextConfig?: Record<string, unknown>;
     /**
-     * Start opencode in TS mode instead of Rust mode. Direct host still
-     * runs (so a later `restart({ rust: true })` can flip to Rust against the
-     * same data dir) but the plugin transforms in TS on this boot. Used by the
-     * cold-start-drop-seed scenario to build TS-mode state, then restart in Rust.
+     * Starts OpenCode in TS mode instead of Rust mode.
+     * The direct host continues running, so `restart({ rust: true })` can switch modes against the same data directory.
+     * The plugin transforms in TS on this boot.
      * Default: false (boot straight into Rust mode).
      */
     startInTsMode?: boolean;
@@ -127,7 +125,7 @@ export class RustTestHarness {
         this.releaseRoot = args.releaseRoot;
     }
 
-    /** Preflight current repository and Cargo. */
+    /* */
     static detectPrereqs(): RustModePrereqs {
         return detectRustModePrereqs();
     }
@@ -169,9 +167,9 @@ export class RustTestHarness {
                 rustMode: !options.startInTsMode,
             });
         } catch (error) {
-            // Independent steps: a failing teardown neither skips the ones
-            // after it — the mock's HTTP listener outlives this scope
-            // otherwise — nor replaces the spawn failure being reported.
+            // Teardown steps run independently: a failure does not skip later steps.
+            // The mock HTTP listener must outlive this scope.
+            // A teardown failure does not replace the reported spawn failure.
             try {
                 await mcHost.stop();
             } catch {
@@ -186,7 +184,6 @@ export class RustTestHarness {
         }
 
         const sdk = await import("@opencode-ai/sdk");
-        // SAFETY: SdkClient is bounded subset of createOpencodeClient used by this harness.
         const client = sdk.createOpencodeClient({
             baseUrl: opencode.url,
         }) as unknown as SdkClient;
@@ -236,10 +233,10 @@ export class RustTestHarness {
     }
 
     /**
-     * Restart `opencode serve` against the SAME data dir (opencode.db, context.db,
-     * module store, and the running direct host all persist). Optionally flip the
-     * project transform_mode (ts↔rust) — the cold-start-drop-seed scenario builds
-     * TS-mode state then restarts in Rust to prove drop-tag state seeds correctly.
+     * Restarts `opencode serve` against the same data directory.
+     * The databases, module store, and direct host persist across restarts.
+     * Optionally switches `transform_mode` between `ts` and `rust`.
+     * The cold-start-drop-seed scenario builds TS-mode state before restarting in Rust.
      */
     async restart(
         opts: {
@@ -275,7 +272,7 @@ export class RustTestHarness {
         }) as unknown as SdkClient;
     }
 
-    /** Create a session bound to the isolated workdir. Throws on failure. */
+    /* */
     async createSession(): Promise<string> {
         const maxAttempts = 5;
         for (let i = 1; i <= maxAttempts; i++) {
@@ -295,19 +292,13 @@ export class RustTestHarness {
     }
 
     /**
-     * Generate ~`tokens` tokens of varied prose ballast. Delegates to the
-     * shared generator (see ballast.ts): the protected-tail boundary measures
-     * true-raw content, so pressure turns must carry real mass, and varied
-     * prose tokenizes at a stable rate.
+     * `ballastProse()` generates approximately `tokens` tokens of varied prose.
      */
     ballast(tokens: number): string {
         return ballastProse(tokens);
     }
 
     /**
-     * Append persisted messages through OpenCode's production database shape. This keeps
-     * large-session transport tests fast while the next prompt still traverses the real
-     * OpenCode → plugin → direct host → McHandler path.
      */
     appendSyntheticHistory(
         sessionId: string,
@@ -347,9 +338,9 @@ export class RustTestHarness {
             const insertPart = db.prepare(
                 "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
             );
-            // OpenCode orders message IDs generated from descending timestamps. Place the
-            // fixture immediately before the live seed messages so a later prompt remains
-            // newest while both OpenCode and the raw ordinal reader agree on history order.
+            // OpenCode orders generated message IDs by descending timestamp.
+            // The fixture precedes the live seed messages so a later prompt remains newest.
+            // This ordering keeps OpenCode and the raw ordinal reader consistent.
             const firstTimestamp = Math.max(1, row.latest - options.count - 1);
             const descendingId = (
                 prefix: "msg" | "prt",
@@ -446,10 +437,6 @@ export class RustTestHarness {
     }
 
     /**
-     * Remove a message from the session the way session.revert does — the
-     * message.removed event path the ordinal resolver must self-heal from. Reverts
-     * TO the given message (dropping it and everything after), then unshares so the
-     * revert is applied as a real removal opencode persists to its DB.
      */
     async revertMessage(sessionId: string, messageId: string): Promise<void> {
         await this.clientInstance.session.revert({
@@ -458,7 +445,7 @@ export class RustTestHarness {
         });
     }
 
-    /** Fetch the session's messages via the SDK (for choosing a mid-session id to remove). */
+    /* */
     async listMessages(
         sessionId: string,
     ): Promise<Array<{ info?: { id?: string; role?: string } }>> {
@@ -471,9 +458,8 @@ export class RustTestHarness {
             : [];
     }
 
-    // ── wire captures (from the fake provider) ────────────────────────────────
 
-    /** Full captured provider request bodies for the main agent (Magic Context system prompt present). */
+    /* */
     mainRequests() {
         return this.mock
             .requests()
@@ -484,7 +470,7 @@ export class RustTestHarness {
             );
     }
 
-    /** The messages array of the most recent main-agent request. */
+    /* */
     lastMainMessages(): Array<{ role?: string; content?: unknown }> {
         const req = this.mainRequests().at(-1);
         const messages = req?.body.messages;
@@ -494,9 +480,6 @@ export class RustTestHarness {
     }
 
     /**
-     * Byte size of the full serialized messages array of the most recent
-     * main-agent request, with `cache_control` stripped (it is provider cache
-     * bookkeeping that varies pass to pass and is not part of the logical wire).
      */
     lastMainWireBytes(): number {
         const req = this.mainRequests().at(-1);
@@ -504,19 +487,15 @@ export class RustTestHarness {
         return Buffer.byteLength(stableSerialize(req.body.messages ?? []));
     }
 
-    /** Stable serialization of the most recent main-agent messages array (cache_control stripped). */
+    /* */
     lastMainWireSerialized(): string {
         const req = this.mainRequests().at(-1);
         return stableSerialize(req?.body.messages ?? []);
     }
 
-    // ── plugin-log rust-pass decisions (secondary signal) ─────────────────────
 
     /**
-     * Wait until at least `minCount` rust-pass lines are visible, then return
-     * them. The plugin logger buffers and flushes every ~500ms, so a read
-     * immediately after a prompt returns can miss the just-emitted pass. Polling
-     * removes that race without a fixed sleep (the no-sleeps-as-sync rule).
+     * Polling avoids the race without a fixed sleep.
      */
     async waitForRustPasses(
         minCount: number,
@@ -531,13 +510,13 @@ export class RustTestHarness {
         );
     }
 
-    /** Read the subprocess diagnostic log for assertions about the active lineage. */
+    /* */
     diagnosticLog(): string {
         if (!existsSync(this.logPath)) return "";
         return readFileSync(this.logPath, "utf8");
     }
 
-    /** Parse every `rust pass:` diagnostic line the Rust transform emitted so far. */
+    /* */
     readRustPasses(): RustPassLine[] {
         if (!existsSync(this.logPath)) return [];
         const lines = readFileSync(this.logPath, "utf8").split("\n");
@@ -576,7 +555,7 @@ export class RustTestHarness {
         return parsed;
     }
 
-    /** Poll until `predicate` returns truthy or `timeoutMs` elapses. */
+    /* */
     async waitFor<T>(
         predicate: () => T | null | undefined | false,
         opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
@@ -594,7 +573,6 @@ export class RustTestHarness {
         );
     }
 
-    // ── context.db access (plugin state) ──────────────────────────────────────
 
     private contextDbPath(): string {
         return join(storageSubtreePath(this.env.dataDir), "context.db");
@@ -670,17 +648,12 @@ export class RustTestHarness {
     }
 
     /**
-     * Override one session's cache TTL for a deterministic cache-busting probe.
-     * The regular config path only refreshes this value on a new session; tests
-     * that preserve a warm module session need to change it without recreating
-     * the queued module-side drop.
      */
     setSessionCacheTtl(sessionId: string, cacheTtl: string): void {
         if (this.contextDbCached) {
             try {
                 this.contextDbCached.close();
             } catch {
-                // Best-effort close: a failure must not prevent reopening the database below.
             }
             this.contextDbCached = null;
         }
@@ -702,7 +675,7 @@ export class RustTestHarness {
         }
     }
 
-    /** All mock requests received in this suite. */
+    /* */
     requests() {
         return this.mock.requests();
     }
@@ -716,7 +689,6 @@ export class RustTestHarness {
             }
             this.contextDbCached = null;
         }
-        // OpenCode owns client connections, so stop it before fixture.
         try {
             await this.opencodeInstance.kill();
         } catch {
@@ -732,7 +704,6 @@ export class RustTestHarness {
         } catch {
             // ignore
         }
-        // Reclaim the per-suite temp tree (best-effort).
         try {
             rmSync(join(this.env.dataDir, ".."), {
                 recursive: true,
@@ -744,7 +715,7 @@ export class RustTestHarness {
     }
 }
 
-/** Extract `key=value` (value = up to the next space) from a rust-pass log body. */
+/* */
 function field(body: string, key: string): string {
     const match = body.match(new RegExp(`(?:^|\\s)${key}=([^\\s]+)`));
     return match ? match[1]! : "";
@@ -755,7 +726,7 @@ function stageField(body: string, key: string): string {
     return match ? match[1]! : "";
 }
 
-/** Serialize a value with every `cache_control` key stripped, for byte-identity checks. */
+/* */
 export function stableSerialize(value: unknown): string {
     return JSON.stringify(stripCacheControl(value)) ?? "";
 }

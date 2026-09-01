@@ -264,7 +264,6 @@ function fakeContext(
 	usagePercentage: number,
 ): ExtensionContext {
 	const byId = new Map(branchEntries.map((entry) => [entry.id, entry]));
-	// SAFETY: The partial ExtensionContext includes every member that registerPiContextHandler reads.
 	return {
 		cwd,
 		hasUI: false,

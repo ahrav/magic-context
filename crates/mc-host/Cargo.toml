@@ -7,7 +7,6 @@ publish = false
 description = "Directly linked host for Magic Context, Synapse, and Broca components."
 
 [lints.clippy]
-# Shared integration helpers are intentionally compiled into independent test targets.
 duplicate_mod = "allow"
 
 [dependencies]
@@ -20,7 +19,7 @@ fastembed = { version = "=6.0.0", default-features = false, features = ["ort-loa
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }
 tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-rustix = { version = "1.1.4", features = ["fs", "net", "process", "thread"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "thread"] }
 getrandom = "0.2"
 libc = "0.2"
 mc-shm-transport = { path = "../mc-shm-transport", default-features = false }
@@ -28,8 +27,6 @@ mc-shm-transport = { path = "../mc-shm-transport", default-features = false }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "signal"] }
-# `stdio` only serves the broca_subprocess fixture that replaces its own
-# stdin; feature unification keeps production builds on fs+process alone.
 rustix = { version = "1.1.4", features = ["stdio"] }
 criterion = "=0.8.2"
 hdrhistogram = "=7.6.0"

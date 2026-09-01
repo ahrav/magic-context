@@ -1,32 +1,25 @@
-//! Subprocess tests for the production `ck-mc-host` executable (plan U2).
 //!
-//! Every test gets an isolated data root through `XDG_DATA_HOME` and drives
-//! the real binary end to end: strict argument parsing, side-effect-free
-//! metadata commands, read-only probes, and the dev-mode staged
-//! start/stop/restart transactions with their exact KTD12 result shapes.
+//! Dev-mode lifecycle tests require exact KTD12 result shapes.
 
 #![cfg(unix)]
 
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-// Two independent Linux dependencies bind the lifecycle proofs below.
 //
-// A published daemon requires Broca, whose crash-ownership records and sweeps
-// prove process identity through `/proc`, so Broca refuses to initialize
-// anywhere else and no spawned daemon can publish there.
+// Published daemons require Broca.
+// Broca verifies process identity through `/proc` before initializing.
+// Broca cannot initialize outside environments that provide `/proc`, so spawned daemons cannot publish there.
 //
-// Separately, every lifecycle path walk opens each component with
-// `O_NOFOLLOW`, and each isolated data root here lives under the per-user
-// temporary directory. On macOS that directory resolves through `/var`, a
-// symlink to `private/var`, so the walk refuses the root itself: the
-// read-only probe reports the refusal as `wedged`/`wedged` and the
-// coordination-lock openers report it as `wedged`/`internal_error`, in place
-// of whatever state the root's contents describe.
+// Lifecycle path walks open every component with `O_NOFOLLOW`.
+// Each isolated data root lives under the per-user temporary directory.
+// On macOS, the per-user temporary directory resolves through `/var`.
+// Because `/var` is a symlink to `private/var`, `O_NOFOLLOW` rejects the root itself.
+// The read-only probe reports the root-symlink refusal as `wedged`/`wedged`.
+// Coordination-lock openers report the root-symlink refusal as `wedged`/`internal_error`.
+// The root-symlink refusal overrides the state described by the root contents.
 //
-// Every item carrying this gate serves a proof that needs a published daemon
-// or an observed lifecycle state. The argument-parsing and version-metadata
-// proofs resolve no data root and stay portable.
+// Linux-gated tests require a published daemon or an observed lifecycle state; argument-parsing and version-metadata tests resolve no data root and remain portable.
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
@@ -42,9 +35,9 @@ use mc_module::{
 use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ck-mc-host");
-/// Debug-build daemons on loaded CI hosts can exceed the 3s production
-/// spawn/publication/auth phase cap; the knob only widens phase caps and the
-/// 60s aggregate still binds.
+/// Debug-build daemons on loaded CI hosts can exceed the 3s spawn/publication/auth phase cap.
+/// `CK_MC_HOST_TEST_PHASE_CAP_MS` widens only phase caps.
+/// The 60s aggregate cap still applies.
 const PHASE_CAP_MS: &str = "30000";
 
 struct CliOutput {
@@ -143,7 +136,6 @@ fn effects(value: &Value) -> (bool, bool) {
     )
 }
 
-/// Writes a tiny dev payload: one executable, one data file, one nested file.
 #[cfg(target_os = "linux")]
 fn write_payload(dir: &Path) {
     std::fs::create_dir_all(dir.join("bin")).expect("payload bin dir");
@@ -181,7 +173,7 @@ fn try_flock_exclusive(path: &Path) -> bool {
     locked
 }
 
-/// Best-effort stop on drop so a failed assertion cannot leak a daemon.
+/// `InstanceGuard` attempts to stop its daemon on drop so failed assertions do not leak it.
 #[cfg(target_os = "linux")]
 struct DaemonJanitor {
     root: PathBuf,
@@ -373,7 +365,7 @@ fn stop_reports_wedged_when_lifetime_fence_is_held_without_a_runtime_dir() {
     let value = out.json();
     assert_result(&value, "stop", false, "wedged", "wedged");
     assert_eq!(value["remediation"], "inspect_daemon_process");
-    // Never unlink or signal: the quarantined lock file must survive.
+    // Cleanup must not unlink or signal; the quarantined lock file must survive.
     assert!(lock_path.exists());
 }
 
@@ -402,15 +394,12 @@ fn dev_payload_without_explicit_test_self_exec_fails_closed() {
     );
 }
 
-/// A quarantined record with both fences free is classified identically by
+/// `probe_lifecycle`, `start`, `restart`, and `stop` must return `unsupported_state_schema` for a quarantined record with both fences free.
 /// every command.
 ///
-/// `probe_lifecycle` reports this shape as `stopped` (no fence is held), so a
-/// command that only checked the `wedged` shape would treat it as cleanly
-/// startable: `start`/`restart` would spawn a child that `InstanceGuard`
-/// refuses, then report `startup_timeout`, and `stop` would report a clean
-/// `already_stopped`. All four must surface `unsupported_state_schema`, and
-/// none may touch the preserved bytes.
+/// A command that checks only the `wedged` shape would treat the quarantined record as startable.
+/// `start` and `restart` would spawn a child that `InstanceGuard` refuses, then report `startup_timeout`.
+/// `probe_lifecycle`, `start`, `restart`, and `stop` must not modify the preserved bytes.
 #[cfg(target_os = "linux")]
 #[test]
 fn quarantined_record_is_classified_alike_by_every_command() {
@@ -445,7 +434,6 @@ fn quarantined_record_is_classified_alike_by_every_command() {
                 "restart must not commit a stop over a quarantined record"
             );
         }
-        // The quarantined bytes survive every command byte for byte.
         assert_eq!(
             std::fs::read(&record).expect("record still present"),
             original,
@@ -454,12 +442,9 @@ fn quarantined_record_is_classified_alike_by_every_command() {
     }
 }
 
-/// `restart` proves the successor is resolvable before committing its stop.
 ///
-/// The stop is irreversible, so a successor condition that was already true
-/// on disk must never be discovered after the daemon is down: that yields
-/// `stop_committed:true`, `start_committed:false`, and an outage with no
-/// takeover. The running daemon must still be serving afterwards.
+/// `restart` resolves the successor before stopping; otherwise it can commit `stop` without committing `start` and leave no takeover.
+/// `restart` leaves the running daemon serving when successor resolution fails.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_preflights_the_successor_before_committing_the_stop() {
@@ -478,8 +463,7 @@ async fn restart_preflights_the_successor_before_committing_the_stop() {
     assert_eq!(out.code, 0, "start failed: {} {}", out.stdout, out.stderr);
     assert_result(&out.json(), "start", true, "running", "started");
 
-    // Restart toward a payload that cannot resolve. The failure is detected
-    // before the stop, so neither effect bit is set.
+    // The invalid successor is detected before `restart` commits `stop` or `start`.
     let out = run(
         &data,
         &[
@@ -534,8 +518,7 @@ async fn full_dev_mode_lifecycle_roundtrip() {
         active: false,
     };
 
-    // start: stages the dev payload, spawns the detached daemon, and
-    // completes at authenticated transport.
+    // `start` stages the development payload, spawns the detached daemon, and completes after authenticated transport is ready.
     let out = run(&data, &["start", "--payload-dir", payload_arg]);
     janitor.active = true;
     assert_eq!(out.code, 0, "start failed: {} {}", out.stdout, out.stderr);
@@ -547,7 +530,6 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert_eq!(value["versions"]["proof"], "current");
     assert_eq!(value["versions"]["daemon"], "mc-host/0.1.0");
 
-    // The publication authenticates with the real client.
     let publication = mc_host::runtime_dir_path(Some(&data))
         .expect("runtime dir")
         .join(mc_host::CONNECTION_FILE_NAME);
@@ -586,19 +568,17 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert_result(&value, "start", true, "running", "already_running");
     assert_eq!(value["versions"]["daemon"], "mc-host/0.1.0");
 
-    // status: running and healthy. The contracted verb; `probe` above covers
-    // the historical spelling of the same command.
     let out = run(&data, &["status"]);
     assert_eq!(out.code, 0);
     assert_result(&out.json(), "status", true, "running", "healthy");
 
-    // Second start: compatible incarnation already running, no respawn.
+    // A second `start` reuses the compatible running incarnation without respawning it.
     let out = run(&data, &["start", "--payload-dir", payload_arg]);
     assert_eq!(out.code, 0);
     let value = out.json();
     assert_result(&value, "start", true, "running", "already_running");
 
-    // restart of a running daemon: one transaction, both effects true.
+    // `restart` atomically commits stopping the running daemon and starting its successor.
     let out = run(&data, &["restart", "--payload-dir", payload_arg]);
     assert_eq!(out.code, 0, "restart failed: {} {}", out.stdout, out.stderr);
     let value = out.json();
@@ -612,7 +592,6 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert_result(&value, "stop", true, "stopped", "stopped");
     janitor.active = false;
 
-    // Both fences are acquirable and the publication is gone.
     assert!(!publication.exists(), "publication removed at teardown");
     let coordination = coordination_dir(&data);
     assert!(try_flock_exclusive(&coordination.join("transaction.lock")));
@@ -623,13 +602,12 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert!(probe.instance_lock_free);
     assert!(probe.lifetime_lock_free);
 
-    // stop again: no lock-held incarnation, nothing unlinked or signaled.
+    // A second `stop` finds no lock-held incarnation and neither unlinks nor signals anything.
     let out = run(&data, &["stop"]);
     assert_eq!(out.code, 0);
     assert_result(&out.json(), "stop", true, "stopped", "already_stopped");
 
-    // restart from stopped: no --payload-dir needed, the promoted current
-    // generation revalidates; stop bit stays false.
+    // A restart from stopped revalidates the promoted current generation without `--payload-dir`; its stop effect remains false.
     let out = run(&data, &["restart"]);
     janitor.active = true;
     assert_eq!(out.code, 0, "restart failed: {} {}", out.stdout, out.stderr);
@@ -643,8 +621,7 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert_result(&out.json(), "stop", true, "stopped", "stopped");
     janitor.active = false;
 
-    // Poll briefly for daemon-side teardown stragglers, then verify the
-    // daemon log stayed owner-only.
+    // `stop` completes daemon teardown before returning.
     let log = coordination_dir(&data).join("daemon.log");
     assert!(log.exists(), "detached daemon logged to the owner-only log");
     let mode = std::fs::metadata(&log)
@@ -904,10 +881,7 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         "already-stopped cleanup must remove stale active selection"
     );
 
-    // A schema-1 selection citing a digest outside the qualified closure set —
-    // the residue an upgrade that rotates the qualified inputs leaves behind —
-    // is stale state this binary owns, not tampering: stop must clear it
-    // rather than wedge on the very file it exists to remove.
+    // A schema-1 selection that cites a digest outside the qualified closure is stale state owned by this binary; `stop` clears it instead of treating it as tampering.
     std::fs::write(
         &selection,
         format!("{{\"schema\":1,\"opencode\":\"{}\"}}", "f".repeat(64)).as_bytes(),
@@ -929,11 +903,10 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         "stop must clear a stale selection citing an unqualified closure"
     );
 
-    // Selector cleanup is best-effort stale-state removal, so a cleanup fault
-    // cannot unmake a stop that already holds. The residue is stale bookkeeping
-    // the next start rewrites; failing the command would send callers into
-    // recovery for a host that is exactly where they asked it to be. Only an
-    // unsupported schema still fails, and `unknown_stop` above pins that.
+    // After the stop transaction commits, selector-cleanup failures do not fail `stop`.
+    // Selector-cleanup residue is stale bookkeeping.
+    // A later `start` rewrites stale selector state; failing `stop` would force recovery for a host that is already stopped.
+    // An unsupported selector schema causes `stop` to fail.
     std::fs::write(&selection, b"{\"schema\":1}").expect("cleanup-fault fixture");
     std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))
         .expect("cleanup-fault mode");
@@ -957,9 +930,8 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
     );
     std::fs::remove_file(&selection).expect("cleanup-fault fixture removal");
 
-    // The same rule once the stop transaction has committed: the incarnation
-    // was signalled, acknowledged, and observed stopped before cleanup ran, so
-    // the command reports the stop it performed and the probe agrees.
+    // After the stop transaction commits, selector-cleanup failures do not fail `stop`.
+    // `stop` signals, acknowledges, and observes the incarnation stopped before selector cleanup runs.
     let cleanup_fault_start = run_with_envelope(&data, &["start"], Some(&merged_envelope));
     assert_eq!(
         cleanup_fault_start.code, 0,

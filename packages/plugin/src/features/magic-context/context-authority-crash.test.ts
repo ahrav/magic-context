@@ -1,5 +1,3 @@
-/// <reference types="bun-types" />
-
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -66,7 +64,7 @@ interface DurableModuleState {
 interface AttemptOptions {
     cut?: CrashCut;
     failContext?: boolean;
-    /** Reject inside `commitContext` the way a caller-input defect does. */
+    /** `failContextWithInputError` rejects inside `commitContext` as a caller-input defect. */
     failContextWithInputError?: boolean;
     request?: Record<string, unknown>;
     binding?: ClaimIntentBinding;
@@ -544,8 +542,8 @@ describe("U5 claim intent crash recovery", () => {
     test("binding change resolves a context-committed intent instead of stranding it", async () => {
         const operationKey = "binding-change-after-context-commit";
         const f = fixture(operationKey);
-        // Crash inside settlement: the context write and its context-committed
-        // acknowledgement are durable, but the final acknowledgement never runs.
+        // A settlement crash leaves the context write and context-committed acknowledgement durable but prevents the final acknowledgement.
+        // A settlement crash leaves the context write and context-committed acknowledgement durable but prevents the final acknowledgement.
         await expect(
             runAttempt({
                 db: f.db,
@@ -560,9 +558,9 @@ describe("U5 claim intent crash recovery", () => {
             "context-committed",
         );
 
-        // The authority binding moves before the retry. The intent cannot be
-        // terminally rejected because its context effects are already durable, so
-        // it must be acknowledged under the binding that staged it.
+        // Durable context effects require acknowledgement under the staged binding after the authority binding changes.
+        // Durable context effects require acknowledgement under the staged binding after the authority binding changes.
+        // Durable context effects require acknowledgement under the staged binding after the authority binding changes.
         await expect(
             runAttempt({
                 db: f.db,
@@ -576,8 +574,8 @@ describe("U5 claim intent crash recovery", () => {
             }),
         ).rejects.toThrow("obsolete context incarnation or authority");
 
-        // An unresolved intent counts against claim-store rebuild and mirror reset,
-        // so leaving it in context-committed would block both permanently.
+        // An unresolved intent blocks claim-store rebuild and mirror reset.
+        // An unresolved intent blocks claim-store rebuild and mirror reset.
         expect(f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }))?.state).toBe(
             "acknowledged",
         );
@@ -598,8 +596,8 @@ describe("U5 claim intent crash recovery", () => {
             }),
         ).rejects.toThrow("create requires non-empty content and category");
 
-        // The same stable tool-call ID reproduces the rejection on every retry, so a
-        // row left staged would never resolve and would block claim-store rebuilds.
+        // A stable tool-call ID repeats the rejection, leaving a staged row unresolved and blocking claim-store rebuilds.
+        // A stable tool-call ID repeats the rejection, leaving a staged row unresolved and blocking claim-store rebuilds.
         expect(f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }))?.state).toBe(
             "terminal-rejected",
         );

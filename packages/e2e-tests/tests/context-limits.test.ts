@@ -4,19 +4,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 
 /**
- * Context-limit resolution from custom provider config.
  *
- * The plugin's scheduler and thresholds rely on knowing the true context
- * window size for the active model. When a provider is defined in
- * opencode.json with an explicit limit.context, the plugin MUST honor that
- * limit rather than falling back to a default (which historically was
- * 128K for unknown models).
  *
- * This test sets the mock model's context limit to 50_000 tokens, then
- * has the mock return a response worth ~20K tokens. The plugin should
- * record ~40% usage in session_meta (20_000 / 50_000). If the plugin
- * ignored the custom limit and fell back to 128K or 200K, we'd see ~15%
- * or ~10% instead.
  */
 
 let h: TestHarness;
@@ -50,10 +39,6 @@ describe("context-limit resolution", () => {
         const sessionId = await h.createSession();
         await h.sendPrompt(sessionId, "probe turn for context-limit resolution.");
 
-        // Mock Anthropic uses a shared context window: resolveLimit reserves
-        // min(8,192, 25% of 50,000) = 8,192 output tokens, leaving 41,808
-        // usable input tokens. The exact pressure is 20,000 / 41,808 * 100.
-        // Give the event handler a moment to persist last_context_percentage.
         await Bun.sleep(300);
 
         const row = h
@@ -66,8 +51,6 @@ describe("context-limit resolution", () => {
             `[TEST] last_context_percentage = ${pct} (expected 47.83773440489858 for 20K/41,808)`,
         );
 
-        // Keep the exact value: a broad range would hide changes to the
-        // shared-window output reservation arithmetic.
         expect(pct).toBe(47.83773440489858);
     }, 60_000);
 });

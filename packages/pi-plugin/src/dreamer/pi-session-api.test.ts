@@ -8,13 +8,6 @@ import {
 } from "./pi-session-api";
 
 /**
- * These tests exercise the DEFAULT resolution path against the actually
- * installed pi-coding-agent package. The Pi session-listing API drifted once
- * (`SessionManager.listSessions` never existed publicly) and the providers'
- * dependency-injected unit tests could not catch it — every test supplied its
- * own listSessions stub, so the broken default lookup only failed at runtime
- * inside the dreamer. This is the missing coverage: if pi-coding-agent renames
- * or removes the session APIs again, this fails in CI instead of silently
  * degrading retrospective/refresh-primers.
  */
 describe("loadDefaultPiSessionApi", () => {

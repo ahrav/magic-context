@@ -1,13 +1,24 @@
 import { readFileSync } from "node:fs";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { publishJsonAtomically } from "../incident-pool/report";
+import { publishJsonAtomically } from "../atomic-publish";
+import { compareCodeUnits } from "../code-unit-order";
+import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
-import { PRIMARY_ARM_IDS, type ArmId, type ReasonCode } from "./contract";
-import type { EndpointEstimate, FamilyDeltaAnalysis, FamilyNoiseFloor } from "./estimator";
+import { pairedFactsFingerprint } from "../prospective-holdout/report";
+import { ARM_IDS, PRIMARY_ARM_IDS, REASON_CODES, type ArmId, type ReasonCode } from "./contract";
+import type {
+    EndpointEstimate,
+    FamilyDeltaAnalysis,
+    FamilyNoiseFloor,
+    RawRegretRecord,
+} from "./estimator";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
 export const PAIRED_DELTA_REPORT_SCHEMA = "paired-delta-report/v1";
 export const PAIRED_DELTA_CALIBRATION_SCHEMA = "paired-delta-calibration/v1";
+
+const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
+const REASON_CODE_SET: ReadonlySet<string> = new Set(REASON_CODES);
 
 export interface ExclusionCount {
     armId: ArmId;
@@ -59,6 +70,179 @@ export interface PairedDeltaReport {
     reportFingerprint: string;
 }
 
+function requireHex64(value: string, label: string): void {
+    if (!/^[0-9a-f]{64}$/.test(value)) {
+        throw new Error(`paired-delta-report: ${label}-invalid`);
+    }
+}
+
+function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
+    for (const [armId, value] of Object.entries(metrics)) {
+        if (!ARM_ID_SET.has(armId)) {
+            throw new Error(`paired-delta-report: metric-arm-invalid-${armId}`);
+        }
+        if (value === undefined || !Number.isFinite(value) || value < 0) {
+            throw new Error("paired-delta-report: metric-invalid");
+        }
+    }
+    return Object.fromEntries(
+        Object.entries(metrics).sort(([left], [right]) => compareCodeUnits(left, right)),
+    );
+}
+
+// A `:`-joined key is ambiguous because both identifiers are free-form and may contain `:`; JSON array encoding keeps distinct pairs distinct.
+function ladderRowKey(coordinateId: string, familyId: string): string {
+    return JSON.stringify([coordinateId, familyId]);
+}
+
+// The ladder is a pivot of the analyzed records, so published regret values cannot contradict the analysis.
+function rawRegretLadder(records: readonly RawRegretRecord[]): RawRegretLadder[] {
+    const rows = new Map<string, RawRegretLadder>();
+    for (const record of records) {
+        const key = ladderRowKey(record.coordinateId, record.familyId);
+        const row = rows.get(key) ?? {
+            coordinateId: record.coordinateId,
+            familyId: record.familyId,
+            retrieval: null,
+            formation: null,
+            representation: null,
+            label: "raw-non-inferential" as const,
+        };
+        row[record.endpoint] = record.delta;
+        rows.set(key, row);
+    }
+    // `coordinateId` alone repeats across families, so the sort key carries both identifiers.
+    return [...rows]
+        .sort(([left], [right]) => compareCodeUnits(left, right))
+        .map(([, row]) => row);
+}
+
+// A report is policy-bound only when its family minimum equals the minimum the ready policy declares.
+function requirePolicyBoundEstimatorSettings(
+    policyPayload: unknown,
+    analysis: FamilyDeltaAnalysis,
+): void {
+    const payload = policyPayload as {
+        minimumAnalyzableFamilyCount?: unknown;
+        targetMinimumDetectableDelta?: unknown;
+    } | null;
+    const declared = payload?.minimumAnalyzableFamilyCount;
+    if (!Number.isSafeInteger(declared) || (declared as number) < 1) {
+        throw new Error("paired-delta-report: policy-minimum-family-count-missing");
+    }
+    if (declared !== analysis.minimumAnalyzableFamilyCount) {
+        throw new Error("paired-delta-report: policy-minimum-family-count-mismatch");
+    }
+    // The declared delta sizes the cohort during calibration rather than filtering an observed estimate, so this checks its shape and leaves resolution to the interval rule.
+    const detectableDelta = payload?.targetMinimumDetectableDelta;
+    if (typeof detectableDelta !== "number" || !Number.isFinite(detectableDelta) ||
+        detectableDelta <= 0) {
+        throw new Error("paired-delta-report: policy-detectable-delta-invalid");
+    }
+}
+
+export function buildPairedDeltaReport(input: {
+    poolManifestFingerprint: string;
+    pinnedSnapshotId: string;
+    policyDocument: unknown;
+    pairs: readonly PairedCaseFact[];
+    analysis: FamilyDeltaAnalysis;
+    exclusions: readonly ExclusionCount[];
+    secondaryMetrics: SecondaryMetrics;
+    runSummary: PairedDeltaReportBody["runSummary"];
+}): PairedDeltaReport {
+    const policy = parsePolicyOwnerDocument(
+        input.policyDocument,
+        "magic-context-x4l.14",
+    );
+    if (policy.status !== "ready" || policy.policyFingerprint === null) {
+        throw new Error("paired-delta-report: policy-not-ready");
+    }
+    requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
+    if (input.pinnedSnapshotId.trim().length === 0) {
+        throw new Error("paired-delta-report: pinned-snapshot-id-invalid");
+    }
+    if (
+        input.analysis.poolManifestFingerprint !== input.poolManifestFingerprint ||
+        input.analysis.pinnedSnapshotId !== input.pinnedSnapshotId ||
+        input.analysis.policyFingerprint !== policy.policyFingerprint
+    ) {
+        throw new Error("paired-delta-report: analysis-lane-binding-mismatch");
+    }
+    // The estimator adapter proves this against the pairs it analyzes; the report path proves it too rather than trusting the stamped value.
+    if (pairedFactsFingerprint(input.pairs) !== input.analysis.pairedFactsFingerprint) {
+        throw new Error("paired-delta-report: analysis-paired-facts-mismatch");
+    }
+    requirePolicyBoundEstimatorSettings(policy.policy, input.analysis);
+    const exclusions = [...input.exclusions].sort((left, right) => compareCodeUnits(
+        `${left.armId}:${left.reasonCode}`,
+        `${right.armId}:${right.reasonCode}`,
+    ));
+    for (const { armId, reasonCode } of exclusions) {
+        if (!ARM_ID_SET.has(armId)) {
+            throw new Error(`paired-delta-report: exclusion-arm-invalid-${armId}`);
+        }
+        if (!REASON_CODE_SET.has(reasonCode)) {
+            throw new Error(`paired-delta-report: exclusion-reason-code-invalid-${reasonCode}`);
+        }
+    }
+    if (exclusions.some(({ count }) => !Number.isSafeInteger(count) || count < 1)) {
+        throw new Error("paired-delta-report: exclusion-count-invalid");
+    }
+    if (new Set(exclusions.map(({ armId, reasonCode }) => `${armId}:${reasonCode}`)).size !==
+        exclusions.length) {
+        throw new Error("paired-delta-report: duplicate-exclusion");
+    }
+    if (Object.values(input.secondaryMetrics.invalidSuccessRateByArm)
+        .some((rate) => rate !== undefined && rate > 1)) {
+        throw new Error("paired-delta-report: invalid-success-rate-invalid");
+    }
+    if (
+        !Number.isFinite(input.runSummary.spentUsd) ||
+        input.runSummary.spentUsd < 0 ||
+        !Number.isSafeInteger(input.runSummary.observedCostRollouts) ||
+        input.runSummary.observedCostRollouts < 0 ||
+        !Number.isSafeInteger(input.runSummary.estimatedCostRollouts) ||
+        input.runSummary.estimatedCostRollouts < 0
+    ) {
+        throw new Error("paired-delta-report: run-summary-invalid");
+    }
+    const body: PairedDeltaReportBody = {
+        poolManifestFingerprint: input.poolManifestFingerprint,
+        pinnedSnapshotId: input.pinnedSnapshotId,
+        policyFingerprint: policy.policyFingerprint,
+        analysis: input.analysis,
+        exclusions,
+        secondaryMetrics: {
+            invalidSuccessRateByArm: sortedMetrics(input.secondaryMetrics.invalidSuccessRateByArm),
+            tokensByArm: sortedMetrics(input.secondaryMetrics.tokensByArm),
+            wallClockMsByArm: sortedMetrics(input.secondaryMetrics.wallClockMsByArm),
+            turnsByArm: sortedMetrics(input.secondaryMetrics.turnsByArm),
+        },
+        regret: {
+            live: input.analysis.liveRegret,
+            providerMixed: input.analysis.providerMixedRegret,
+            raw: rawRegretLadder(input.analysis.rawRegretRecords),
+        },
+        runSummary: input.runSummary,
+    };
+    return {
+        schema: PAIRED_DELTA_REPORT_SCHEMA,
+        body,
+        reportFingerprint: canonicalFingerprint(body),
+    };
+}
+
+export function publishPairedDeltaReport(report: PairedDeltaReport, path: string): void {
+    if (report.schema !== PAIRED_DELTA_REPORT_SCHEMA) {
+        throw new Error("paired-delta-report: schema-invalid");
+    }
+    if (canonicalFingerprint(report.body) !== report.reportFingerprint) {
+        throw new Error("paired-delta-report: fingerprint-mismatch");
+    }
+    publishJsonAtomically(report, path);
+}
+
 export interface CalibrationDecision {
     poolSize: number;
     familyCount: number;
@@ -68,7 +252,8 @@ export interface CalibrationDecision {
 
 export interface CalibrationFamilyNoise {
     familyId: string;
-    replicateCount: number;
+    /** Paired deltas contributing to the family, which is two per analysable coordinate rather than a replicate depth. */
+    observationCount: number;
     spread: number;
     variance: number;
     interval: { lower: number; upper: number };
@@ -81,6 +266,7 @@ export interface PairedDeltaCalibrationRecord {
     runStatus: PairedDeltaRunResult["status"];
     validForPoolSizing: boolean;
     measuredCostUsd: number;
+    estimatedReserveUsd: number;
     measuredWallClockMs: number;
     familyNoise: CalibrationFamilyNoise[];
     decisions: CalibrationDecision;
@@ -134,7 +320,7 @@ function completePrimaryCoordinates(
     for (const record of records) {
         if (!(PRIMARY_ARM_IDS as readonly ArmId[]).includes(record.armId)) continue;
         if (record.cell.runHealth !== "completed") continue;
-        const key = `${record.scenarioId}:${record.replicateIndex}`;
+        const key = coordinateKey(record);
         const arms = healthy.get(key) ?? new Set<ArmId>();
         arms.add(record.armId);
         healthy.set(key, arms);
@@ -146,101 +332,43 @@ function completePrimaryCoordinates(
     );
 }
 
-function requireHex64(value: string, label: string): void {
-    if (!/^[0-9a-f]{64}$/.test(value)) {
-        throw new Error(`paired-delta-report: ${label}-invalid`);
-    }
+/** Both identifiers are free-form, so the key is JSON-encoded rather than `:`-joined. */
+function coordinateKey(record: RolloutRecord): string {
+    return JSON.stringify([record.scenarioId, record.replicateIndex]);
 }
 
-function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
-    if (Object.values(metrics).some((value) =>
-        value === undefined || !Number.isFinite(value) || value < 0)) {
-        throw new Error("paired-delta-report: metric-invalid");
+/**
+ * The paired endpoint is `mc-on` minus a baseline, so the noise floor is measured on those deltas rather than on `mc-on` scores alone.
+ * A baseline that alternates between success and failure while `mc-on` stays constant moves the endpoint the lane sizes for, and scoring only `mc-on` would publish a zero floor for it.
+ */
+function coordinateDeltas(
+    records: readonly RolloutRecord[],
+    analysable: ReadonlySet<string>,
+): Map<string, number[]> {
+    const cells = new Map<string, Map<ArmId, number>>();
+    for (const record of records) {
+        if (record.cell.runHealth !== "completed") continue;
+        const key = coordinateKey(record);
+        if (!analysable.has(key)) continue;
+        if (record.cell.checksTotal === 0) {
+            throw new Error(`paired-delta-calibration: empty-check-vector-${record.scenarioId}`);
+        }
+        const scores = cells.get(key) ?? new Map<ArmId, number>();
+        scores.set(record.armId, record.cell.checksPassed / record.cell.checksTotal);
+        cells.set(key, scores);
     }
-    return Object.fromEntries(
-        Object.entries(metrics).sort(([left], [right]) => left.localeCompare(right)),
-    );
-}
-
-export function buildPairedDeltaReport(input: {
-    poolManifestFingerprint: string;
-    pinnedSnapshotId: string;
-    policyDocument: unknown;
-    analysis: FamilyDeltaAnalysis;
-    exclusions: readonly ExclusionCount[];
-    secondaryMetrics: SecondaryMetrics;
-    rawRegretRecords: readonly RawRegretLadder[];
-    runSummary: PairedDeltaReportBody["runSummary"];
-}): PairedDeltaReport {
-    const policy = parsePolicyOwnerDocument(
-        input.policyDocument,
-        "magic-context-x4l.14",
-    );
-    if (policy.status !== "ready" || policy.policyFingerprint === null) {
-        throw new Error("paired-delta-report: policy-not-ready");
+    const deltas = new Map<string, number[]>();
+    for (const [key, scores] of cells) {
+        const treatment = scores.get("mc-on");
+        if (treatment === undefined) continue;
+        const observed: number[] = [];
+        for (const baseline of ["mc-off", "compaction"] as const) {
+            const value = scores.get(baseline);
+            if (value !== undefined) observed.push(treatment - value);
+        }
+        if (observed.length > 0) deltas.set(key, observed);
     }
-    requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
-    if (input.pinnedSnapshotId.trim().length === 0) {
-        throw new Error("paired-delta-report: pinned-snapshot-id-invalid");
-    }
-    const exclusions = [...input.exclusions].sort((left, right) =>
-        `${left.armId}:${left.reasonCode}`.localeCompare(`${right.armId}:${right.reasonCode}`));
-    if (exclusions.some(({ count }) => !Number.isSafeInteger(count) || count < 1)) {
-        throw new Error("paired-delta-report: exclusion-count-invalid");
-    }
-    if (new Set(exclusions.map(({ armId, reasonCode }) => `${armId}:${reasonCode}`)).size !==
-        exclusions.length) {
-        throw new Error("paired-delta-report: duplicate-exclusion");
-    }
-    if (Object.values(input.secondaryMetrics.invalidSuccessRateByArm)
-        .some((rate) => rate !== undefined && rate > 1)) {
-        throw new Error("paired-delta-report: invalid-success-rate-invalid");
-    }
-    if (
-        !Number.isFinite(input.runSummary.spentUsd) ||
-        input.runSummary.spentUsd < 0 ||
-        !Number.isSafeInteger(input.runSummary.observedCostRollouts) ||
-        input.runSummary.observedCostRollouts < 0 ||
-        !Number.isSafeInteger(input.runSummary.estimatedCostRollouts) ||
-        input.runSummary.estimatedCostRollouts < 0
-    ) {
-        throw new Error("paired-delta-report: run-summary-invalid");
-    }
-    const body: PairedDeltaReportBody = {
-        poolManifestFingerprint: input.poolManifestFingerprint,
-        pinnedSnapshotId: input.pinnedSnapshotId,
-        policyFingerprint: policy.policyFingerprint,
-        analysis: input.analysis,
-        exclusions,
-        secondaryMetrics: {
-            invalidSuccessRateByArm: sortedMetrics(input.secondaryMetrics.invalidSuccessRateByArm),
-            tokensByArm: sortedMetrics(input.secondaryMetrics.tokensByArm),
-            wallClockMsByArm: sortedMetrics(input.secondaryMetrics.wallClockMsByArm),
-            turnsByArm: sortedMetrics(input.secondaryMetrics.turnsByArm),
-        },
-        regret: {
-            live: input.analysis.liveRegret,
-            providerMixed: input.analysis.providerMixedRegret,
-            raw: [...input.rawRegretRecords].sort((left, right) =>
-                left.coordinateId.localeCompare(right.coordinateId)),
-        },
-        runSummary: input.runSummary,
-    };
-    return {
-        schema: PAIRED_DELTA_REPORT_SCHEMA,
-        body,
-        reportFingerprint: canonicalFingerprint(body),
-    };
-}
-
-export function publishPairedDeltaReport(report: PairedDeltaReport, path: string): void {
-    if (
-        report.schema !== PAIRED_DELTA_REPORT_SCHEMA ||
-        canonicalFingerprint(report.body) !== report.reportFingerprint
-    ) {
-        throw new Error("paired-delta-report: fingerprint-mismatch");
-    }
-    publishJsonAtomically(report, path);
+    return deltas;
 }
 
 export function buildCalibrationRecord(input: {
@@ -254,27 +382,30 @@ export function buildCalibrationRecord(input: {
 }): PairedDeltaCalibrationRecord {
     requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
     const analysable = completePrimaryCoordinates(input.records);
+    const deltasByCoordinate = coordinateDeltas(input.records, analysable);
     const byFamily = new Map<string, number[]>();
     for (const familyId of new Set(input.scenarioFamilies.values())) {
         byFamily.set(familyId, []);
     }
+    /** Replicate depth is counted per scenario, so one scenario's complete replicates cannot stand in for another scenario that failed outright in the same family. */
+    const depthByScenario = new Map<string, number>();
     for (const record of input.records) {
-        if (record.armId !== "mc-on" || record.cell.runHealth !== "completed") continue;
+        if (record.armId !== "mc-on") continue;
         const familyId = input.scenarioFamilies.get(record.scenarioId);
         if (!familyId) {
             throw new Error(`paired-delta-calibration: unknown-scenario-${record.scenarioId}`);
         }
-        if (record.cell.checksTotal === 0) {
-            throw new Error(`paired-delta-calibration: empty-check-vector-${record.scenarioId}`);
-        }
-        if (!analysable.has(`${record.scenarioId}:${record.replicateIndex}`)) continue;
-        byFamily.get(familyId)!.push(
-            record.cell.checksPassed / record.cell.checksTotal,
+        const observed = deltasByCoordinate.get(coordinateKey(record));
+        if (observed === undefined) continue;
+        byFamily.get(familyId)!.push(...observed);
+        depthByScenario.set(
+            record.scenarioId,
+            (depthByScenario.get(record.scenarioId) ?? 0) + 1,
         );
     }
     const familyNoise = [...byFamily]
         .filter(([, values]) => values.length > 0)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([familyId, values]): CalibrationFamilyNoise => {
             const average = values.reduce((sum, value) => sum + value, 0) / values.length;
             const variance = values.length === 1
@@ -284,24 +415,30 @@ export function buildCalibrationRecord(input: {
             const spread = Math.max(...values) - Math.min(...values);
             return {
                 familyId,
-                replicateCount: values.length,
+                observationCount: values.length,
                 spread,
                 variance,
                 interval: { lower: 0, upper: spread },
             };
         });
-    const body: Omit<PairedDeltaCalibrationRecord, "recordFingerprint"> = {
+    /** Every selected scenario reaches the configured replicate depth, and one measurement per family reports zero variance, so pool sizing requires the depth the run was configured for. */
+    const depthComplete = [...input.scenarioFamilies.keys()].every((scenarioId) =>
+        (depthByScenario.get(scenarioId) ?? 0) >= input.decisions.replicateCount);
+    const observed = input.records.filter(({ costSource }) => costSource === "observed");
+    return ((body: Omit<PairedDeltaCalibrationRecord, "recordFingerprint">) =>
+        ({ ...body, recordFingerprint: canonicalFingerprint(body) }))({
         schema: PAIRED_DELTA_CALIBRATION_SCHEMA,
         poolManifestFingerprint: input.poolManifestFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
-        // A single completed coordinate per family reports zero variance, so
-        // sizing also requires the replicate depth the run was configured for.
         validForPoolSizing: input.runStatus === "completed" &&
             familyNoise.length === byFamily.size &&
-            familyNoise.every(({ replicateCount }) =>
-                replicateCount >= input.decisions.replicateCount),
-        measuredCostUsd: input.records.reduce((sum, record) => sum + record.costUsd, 0),
+            depthComplete,
+        /** A failed rollout is priced from its worst-case reserve, so those dollars are reported apart from provider-observed spend rather than inflating a measured total that later budgets read. */
+        measuredCostUsd: observed.reduce((sum, record) => sum + record.costUsd, 0),
+        estimatedReserveUsd: input.records
+            .filter(({ costSource }) => costSource === "estimated")
+            .reduce((sum, record) => sum + record.costUsd, 0),
         measuredWallClockMs: input.records.reduce(
             (sum, record) => sum + record.wallClockMs,
             0,
@@ -315,8 +452,7 @@ export function buildCalibrationRecord(input: {
                 input.decisions.familyCount,
             ),
         },
-    };
-    return { ...body, recordFingerprint: canonicalFingerprint(body) };
+    });
 }
 
 export function publishCalibrationRecord(

@@ -12,8 +12,7 @@ import {
 
 function createOpenCodeFixture(): Database {
     const db = new Database(":memory:");
-    // id auto-fills in insertion order; the oracle SQL orders by (time_created, id),
-    // so unique timestamps keep insertion order here.
+    // Unique timestamps preserve insertion order because the oracle SQL breaks time_created ties by id.
     db.exec(
         "CREATE TABLE message (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, time_created INTEGER, data TEXT)",
     );
@@ -103,9 +102,7 @@ describe("work metrics", () => {
         ).toEqual({ newWorkTokens: 244, totalInputTokens: 320 });
     });
 
-    // ── Incremental (watermark) fold ──────────────────────────────────────
-    // The incremental driver must produce byte-identical results to the
-    // window-function oracle, while only ever folding rows past its watermark.
+    // The incremental fold must match the window-function oracle while processing only rows after its watermark.
 
     function createIncrementalFixture(): Database {
         const db = new Database(":memory:");
@@ -158,7 +155,7 @@ describe("work metrics", () => {
         const first = computeOpenCodeWorkMetricsIncremental(db, "ses", carry);
         expect(first.metrics).toEqual(computeOpenCodeWorkMetrics(db, "ses"));
 
-        // New turns arrive; a second poll must fold only the new rows.
+        // A second poll must fold only new rows.
         insertWithId(db, "m3", "ses", 3, "build", 80, 3);
         insertWithId(db, "m4", "ses", 4, "build", 120, 4);
         const second = computeOpenCodeWorkMetricsIncremental(db, "ses", first.carry);
@@ -166,8 +163,7 @@ describe("work metrics", () => {
     });
 
     test("most-recent row stays volatile until a newer row supersedes it", () => {
-        // Mirrors OpenCode writing a row at stream start then finalizing tokens:
-        // a poll mid-stream then a poll after finalize must both equal the oracle.
+        // A poll before and after finalizing a stream-start row must each match the oracle.
         const db = createIncrementalFixture();
         insertWithId(db, "m1", "ses", 1, "build", 100, 5);
         insertWithId(db, "m2", "ses", 2, "build", 0, 0); // freshly-created, not yet finalized
@@ -176,7 +172,7 @@ describe("work metrics", () => {
         const midStream = computeOpenCodeWorkMetricsIncremental(db, "ses", carry);
         expect(midStream.metrics).toEqual(computeOpenCodeWorkMetrics(db, "ses"));
 
-        // Finalize the last row's tokens; the held-back row must re-fold fresh.
+        // After finalization, the held-back last row must be folded again with its updated tokens.
         db.prepare("UPDATE message SET data = ? WHERE id = ?").run(
             JSON.stringify({
                 role: "assistant",
@@ -201,9 +197,7 @@ describe("work metrics", () => {
     });
 
     test("same-timestamp rows: oracle SQL and incremental fold agree on (time_created, id) order", () => {
-        // Rows sharing a time_created must be ordered deterministically by id in
-        // BOTH paths, or the LAG/phase windows diverge from the fold. Insert out
-        // of id order at a single timestamp to exercise the tiebreaker.
+        // Both paths must order rows with equal time_created by id, or their LAG and phase windows diverge.
         const db = createIncrementalFixture();
         insertWithId(db, "m3", "ses", 5, "build", 80, 3);
         insertWithId(db, "m1", "ses", 5, "build", 100, 1);
@@ -216,15 +210,12 @@ describe("work metrics", () => {
             "ses",
             emptyWorkMetricsCarry(),
         );
-        // The fold reads rows ORDER BY time_created, id → m1(100) m2(200) m3(80) m4(120).
-        // deltas: 100 + 100 + 0 + 40 = 240; +lastOutput 4 = 244. peaks: 200 + 120 = 320.
         expect(oracle).toEqual({ newWorkTokens: 244, totalInputTokens: 320 });
         expect(metrics).toEqual(oracle);
     });
 
     test("same-timestamp resume across polls equals a full scan", () => {
-        // A watermark landing mid-tie must resume correctly: split a tied-ts
-        // group across two polls and confirm the second poll matches the oracle.
+        // Splitting equal-time_created rows across polls must still match the oracle on the second poll.
         const db = createIncrementalFixture();
         insertWithId(db, "m1", "ses", 5, "build", 100, 1);
         insertWithId(db, "m2", "ses", 5, "build", 200, 2);

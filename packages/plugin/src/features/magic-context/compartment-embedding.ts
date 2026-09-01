@@ -20,31 +20,23 @@ import {
 } from "./project-embedding-registry";
 
 /**
- * Compartment chunk embedding (v2).
  *
- * Each compartment's raw `[ordinal] U:/A:` conversational text (TC: tool
- * summaries stripped) is embedded — whole-compartment when it fits the
- * provider's input window, otherwise windowed — and stored in
- * `compartment_chunk_embeddings`. This is the semantic substrate for ctx_search
- * over session history.
+ * The system stores raw `[ordinal] U:/A:` text, with TC tool summaries stripped, in `compartment_chunk_embeddings` for `ctx_search`.
+ * The system embeds a whole compartment only when its text fits the provider input window.
+ * The system splits text that exceeds the provider input window into windows.
+ * `ctx_search` reads `compartment_chunk_embeddings` to search session history.
  *
- * The older per-compartment `p1_embedding` (summary vector) was retired once
- * chunk embeddings landed: it had no remaining reader (search uses chunks), and
- * the only prospective consumer — dreamer cross-compartment linking — does not
- * exist yet and can derive its own representation when built. The
- * `compartments.p1_embedding` column is left inert; dreamer v2 decides whether
- * to repopulate or drop it.
+ * `compartments.p1_embedding` is inert because search reads chunk embeddings.
  *
- * Fire-and-forget + best-effort: a missing/slow embedding provider must never
- * block or fail a historian publish. Gated by `memory.enabled` so a memory-off
- * user never hits the embedding endpoint.
+ * A missing or slow embedding provider must not block or fail a historian publish.
+ * `memory.enabled` prevents memory-off users from calling the embedding endpoint.
  */
 
 export interface CompartmentChunkToEmbed {
     id: number;
     startMessage: number;
     endMessage: number;
-    /** Optional publish-time chunk text. When present, TC: tool summaries are stripped. */
+    /** Embedding canonicalization strips `TC:` tool summaries from `sourceChunkText`. */
     sourceChunkText?: string;
 }
 
@@ -118,18 +110,17 @@ export async function embedAndStoreCompartmentChunks(
                       }
                     : {}),
             });
-            // `null` means no journaling lane owns this project, so the legacy
-            // path below embeds the windows. A boolean means the journaling lane
-            // owns this compartment: `true` applied its windows, `false` applied
-            // none of them and left the outcome in the page ledger — a failed
-            // page with its retry disposition, or receipts still awaiting
-            // application. Either way the compartment keeps its existing
-            // destination rows and no ledger page reaches 'complete', so the next
-            // publish re-derives the windows. Embedding them through the legacy
-            // path instead would write destination rows with no receipt behind
-            // them, which is the split state the ledger exists to prevent: a
-            // later reopen proof reads those rows as current, declines to reopen,
-            // and strands the group on idempotency_conflict.
+            // `null` means no journaling lane owns the project, so the legacy path embeds the windows.
+            // A boolean means the journaling lane owns the compartment.
+            // `true` means the journaling lane applied the windows; `false` means it applied none.
+            // When the result is `false`, the page ledger records either a failed page or receipts awaiting application.
+            // When the result is `false`, the compartment keeps its existing destination rows and no ledger page reaches `complete`.
+            // No ledger page reaches `complete`, so the next publish re-derives the windows.
+            // The legacy path must not embed windows when the journaling lane owns the compartment.
+            // The legacy path would write destination rows without receipts.
+            // Destination rows without receipts create a split state.
+            // Reopen proof treats those rows as current and declines to reopen them.
+            // `idempotency_conflict` persists because reopen proof treats destination rows without receipts as current.
             if (detailed === false) {
                 sessionLog(
                     sessionId,

@@ -1,16 +1,15 @@
 use std::hint::black_box;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::{wire_v2_header, Ring};
-use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
+use mc_shm_transport::descriptor::{HardwareProfileId, TransportDescriptor};
 use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::profile::{ProfileConfig, TargetProfile, WorkerTopology};
 use serde::{Deserialize, Serialize};
+
+const PROFILE: &str = "eventfd_sparse_ring";
 
 const ARMS: &[&str] = &[
     "h0_metadata_cacheline_ping_pong",
@@ -19,8 +18,6 @@ const ARMS: &[&str] = &[
     "copied_producer_leased_receiver",
     "direct_producer_copied_receiver",
     "direct_producer_leased_receiver",
-    "unix_socket",
-    "tcp",
     "h2_rust_napi_runtime_crossing",
     "injected_avoidable_operations",
     "ring",
@@ -31,7 +28,7 @@ struct Measurement {
     schema: u32,
     state: String,
     arm: String,
-    scheduling: String,
+    profile: String,
     payload_bytes: usize,
     iterations: u64,
     elapsed_ns: u128,
@@ -49,16 +46,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--child") {
         let arm = args.get(1).expect("child arm");
-        let scheduling = match args.get(2).map(String::as_str) {
-            Some("hot") => SchedulingMode::HotPinnedPoll,
-            Some("cold") => SchedulingMode::ColdParkWake,
-            _ => panic!("child scheduling"),
-        };
-        let iterations = args.get(3).unwrap().parse().unwrap();
-        let payload = args.get(4).unwrap().parse().unwrap();
+        let iterations = args.get(2).unwrap().parse().unwrap();
+        let payload = args.get(3).unwrap().parse().unwrap();
         println!(
             "{}",
-            serde_json::to_string(&measure(arm, scheduling, iterations, payload)).unwrap()
+            serde_json::to_string(&measure(arm, iterations, payload)).unwrap()
         );
         return;
     }
@@ -73,59 +65,44 @@ fn main() {
     let payload = if smoke { 256 } else { 4096 };
     let executable = std::env::current_exe().unwrap();
     let mut attempts = Vec::new();
-    for scheduling in ["hot", "cold"] {
-        // Fallback records carry the same canonical schedule label as child
-        // measurements, so grouping by `scheduling` never splits an arm
-        // between the CLI token and the canonical name.
-        let canonical_scheduling = scheduling_name(match scheduling {
-            "hot" => SchedulingMode::HotPinnedPoll,
-            _ => SchedulingMode::ColdParkWake,
-        });
-        for block in 0..periods {
-            let forward = block % 2 == 0;
-            for pass in 0..4 {
-                let mut order = ARMS.to_vec();
-                let reverse = matches!((forward, pass), (true, 1 | 2) | (false, 0 | 3));
-                if reverse {
-                    order.reverse();
-                }
-                for arm in order {
-                    let output = Command::new(&executable)
-                        .args([
-                            "--child",
-                            arm,
-                            scheduling,
-                            &iterations.to_string(),
-                            &payload.to_string(),
-                        ])
-                        .output()
-                        .expect("spawn isolated arm");
-                    let line = String::from_utf8_lossy(&output.stdout);
-                    let record = line
-                        .lines()
-                        .rev()
-                        .find_map(|line| serde_json::from_str::<Measurement>(line).ok())
-                        .unwrap_or_else(|| {
-                            failed(
-                                arm,
-                                canonical_scheduling,
-                                payload,
-                                iterations,
-                                "arm process failed",
-                            )
-                        });
-                    attempts.push(record);
-                }
+    for block in 0..periods {
+        let forward = block % 2 == 0;
+        for pass in 0..4 {
+            let mut order = ARMS.to_vec();
+            let reverse = matches!((forward, pass), (true, 1 | 2) | (false, 0 | 3));
+            if reverse {
+                order.reverse();
+            }
+            for arm in order {
+                let output = Command::new(&executable)
+                    .args([
+                        "--child",
+                        arm,
+                        &iterations.to_string(),
+                        &payload.to_string(),
+                    ])
+                    .output()
+                    .expect("spawn isolated arm");
+                let line = String::from_utf8_lossy(&output.stdout);
+                let record = line
+                    .lines()
+                    .rev()
+                    .find_map(|line| serde_json::from_str::<Measurement>(line).ok())
+                    .unwrap_or_else(|| failed(arm, payload, iterations, "arm process failed"));
+                attempts.push(record);
             }
         }
     }
     let report = serde_json::json!({
         "schema": 1,
         "state": "complete",
+        "local_verdict": "MECHANISM_SMOKE_ONLY",
+        "designated_host_verdict": "BLOCKED",
+        "blockers": ["no frozen ring A/A campaign", "no callback-budget sweep", "no designated-host campaign"],
         "campaign": if smoke { "smoke" } else { "manifest_schedule" },
         "manifest": "benches/manifests/v1.json",
         "period_unit": "fresh_arm_process",
-        "paired_process_arms": ["h0_metadata_cacheline_ping_pong", "h1_raw_descriptor_ring_payload_touch", "copied_producer_copied_receiver", "copied_producer_leased_receiver", "direct_producer_copied_receiver", "direct_producer_leased_receiver", "unix_socket", "tcp", "ring"],
+        "paired_process_arms": ["h0_metadata_cacheline_ping_pong", "h1_raw_descriptor_ring_payload_touch", "copied_producer_copied_receiver", "copied_producer_leased_receiver", "direct_producer_copied_receiver", "direct_producer_leased_receiver", "ring"],
         "gate_control_arms": ["injected_avoidable_operations"],
         "order_blocks": ["ABBA", "BAAB"],
         "counter_fields": ["body_copies", "native_allocations", "syscalls", "park_wakes", "generic_queue_hops", "scheduler_handoffs"],
@@ -134,24 +111,19 @@ fn main() {
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
-fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usize) -> Measurement {
-    if scheduling == SchedulingMode::ColdParkWake {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+fn measure(arm: &str, iterations: u64, payload: usize) -> Measurement {
     let result = match arm {
         "h0_metadata_cacheline_ping_pong" => run_h0(iterations),
         "h1_raw_descriptor_ring_payload_touch" | "direct_producer_leased_receiver" | "ring" => {
-            run_ring(scheduling, iterations, payload, false, false)
+            run_ring(iterations, payload, false, false)
         }
-        "copied_producer_copied_receiver" => run_ring(scheduling, iterations, payload, true, true),
-        "copied_producer_leased_receiver" => run_ring(scheduling, iterations, payload, true, false),
-        "direct_producer_copied_receiver" => run_ring(scheduling, iterations, payload, false, true),
-        "unix_socket" => run_unix(iterations, payload),
-        "tcp" => run_tcp(iterations, payload),
+        "copied_producer_copied_receiver" => run_ring(iterations, payload, true, true),
+        "copied_producer_leased_receiver" => run_ring(iterations, payload, true, false),
+        "direct_producer_copied_receiver" => run_ring(iterations, payload, false, true),
         "h2_rust_napi_runtime_crossing" => {
             Err("runtime mechanism tests exist; paired H2 campaign has not run")
         }
-        "injected_avoidable_operations" => run_ring(scheduling, iterations, payload, false, false),
+        "injected_avoidable_operations" => run_ring(iterations, payload, false, false),
         _ => Err("unknown arm"),
     };
     match result {
@@ -172,7 +144,7 @@ fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usiz
                 counters.generic_queue_hops = 1;
                 counters.scheduler_handoffs = 1;
             }
-            let disqualifications = counters.disqualifications(scheduling, false);
+            let disqualifications = counters.disqualifications(true);
             let reason = if disqualifications.is_empty() {
                 "smoke evidence is never designated-host qualification".to_owned()
             } else {
@@ -182,7 +154,7 @@ fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usiz
                 schema: 1,
                 state: "complete".to_owned(),
                 arm: arm.to_owned(),
-                scheduling: scheduling_name(scheduling).to_owned(),
+                profile: PROFILE.to_owned(),
                 payload_bytes: payload,
                 iterations,
                 elapsed_ns: elapsed.as_nanos(),
@@ -196,28 +168,16 @@ fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usiz
                 reason: Some(reason),
             }
         }
-        Err(reason) => failed(
-            arm,
-            scheduling_name(scheduling),
-            payload,
-            iterations,
-            reason,
-        ),
+        Err(reason) => failed(arm, payload, iterations, reason),
     }
 }
 
-fn failed(
-    arm: &str,
-    scheduling: &str,
-    payload: usize,
-    iterations: u64,
-    reason: &str,
-) -> Measurement {
+fn failed(arm: &str, payload: usize, iterations: u64, reason: &str) -> Measurement {
     Measurement {
         schema: 1,
         state: "failed".to_owned(),
         arm: arm.to_owned(),
-        scheduling: scheduling.to_owned(),
+        profile: PROFILE.to_owned(),
         payload_bytes: payload,
         iterations,
         elapsed_ns: 0,
@@ -229,13 +189,6 @@ fn failed(
         scheduler_handoffs: 0,
         checksum: 0,
         reason: Some(reason.to_owned()),
-    }
-}
-
-fn scheduling_name(scheduling: SchedulingMode) -> &'static str {
-    match scheduling {
-        SchedulingMode::HotPinnedPoll => "hot_pinned_poll",
-        SchedulingMode::ColdParkWake => "cold_park_wake",
     }
 }
 
@@ -289,39 +242,53 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
 
 // Smoke-only ring geometry differs from the host profile because the caller
 // drives both ends; depth and lease limit 32 prevent benchmark backpressure.
-fn ring_profile(scheduling: SchedulingMode) -> Result<TargetProfile, &'static str> {
+fn ring_profile() -> Result<TargetProfile, &'static str> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            scheduling,
-            HardwareProfileId::new("smoke").map_err(|_| "profile")?,
+            HardwareProfileId::new(PROFILE).map_err(|_| "profile")?,
         ),
         descriptor_depth: 32,
         arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
         max_spans: 2,
         max_leases: 32,
         mappings: 2,
-        pinned_workers: usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2,
+        pinned_workers: 0,
         worker_topology: WorkerTopology::CallerThread,
     })
     .map_err(|_| "profile")
 }
 
 fn run_ring(
-    scheduling: SchedulingMode,
     iterations: u64,
     payload_len: usize,
     copied_producer: bool,
     copied_receiver: bool,
 ) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str> {
-    let profile = ring_profile(scheduling)?;
+    let profile = ring_profile()?;
     let ring = Ring::create(&profile, 0).map_err(|_| "ring setup")?;
     let body = vec![0x5a; payload_len];
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return Err("ring counter mapping");
+    }
+    let park_wakes = mapped.cast::<AtomicU64>();
+    unsafe { park_wakes.write(AtomicU64::new(0)) };
     let child = unsafe { libc::fork() };
     if child < 0 {
+        unsafe { libc::munmap(mapped, 4096) };
         return Err("ring peer fork");
     }
     if child == 0 {
-        let status = ring_consumer(&ring, scheduling, iterations, copied_receiver);
+        let status = ring_consumer(&ring, iterations, copied_receiver, unsafe { &*park_wakes });
         unsafe { libc::_exit(status) };
     }
 
@@ -348,8 +315,10 @@ fn run_ring(
         reservation.write(source).map_err(|_| "write")?;
         reservation.commit(payload_len).map_err(|_| "commit")?;
     }
-    let status = wait_child(child)?;
-    if status != 0 {
+    let status = wait_child(child);
+    let park_wakes = unsafe { (*park_wakes).load(Ordering::Relaxed) };
+    unsafe { libc::munmap(mapped, 4096) };
+    if status? != 0 {
         return Err("ring peer failed");
     }
     if copied_receiver {
@@ -365,28 +334,28 @@ fn run_ring(
         copies,
         allocations,
         0,
-        u64::from(scheduling == SchedulingMode::ColdParkWake) * iterations,
+        park_wakes,
         checksum,
     ))
 }
 
 fn ring_consumer(
     ring: &Ring,
-    scheduling: SchedulingMode,
     iterations: u64,
     copied_receiver: bool,
+    park_wakes: &AtomicU64,
 ) -> i32 {
     for _ in 0..iterations {
         let deadline = Instant::now() + Duration::from_secs(2);
         let lease = loop {
             match ring.try_receive() {
                 Ok(Some(lease)) => break lease,
-                Ok(None) if Instant::now() < deadline => match scheduling {
-                    SchedulingMode::HotPinnedPoll => std::hint::spin_loop(),
-                    SchedulingMode::ColdParkWake => {
-                        std::thread::sleep(Duration::from_micros(50));
+                Ok(None) if Instant::now() < deadline => {
+                    park_wakes.fetch_add(1, Ordering::Relaxed);
+                    if ring.wait_for_data(deadline).is_err() {
+                        return 2;
                     }
-                },
+                }
                 _ => return 2,
             }
         };
@@ -419,69 +388,4 @@ fn wait_child(child: libc::pid_t) -> Result<i32, &'static str> {
     } else {
         Err("peer terminated")
     }
-}
-
-fn run_unix(
-    iterations: u64,
-    payload_len: usize,
-) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str> {
-    let (mut first, mut second) = UnixStream::pair().map_err(|_| "unix setup")?;
-    run_stream_pair(&mut first, &mut second, iterations, payload_len)
-}
-
-fn run_tcp(
-    iterations: u64,
-    payload_len: usize,
-) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|_| "tcp bind")?;
-    let address = listener.local_addr().map_err(|_| "tcp address")?;
-    let mut first = TcpStream::connect(address).map_err(|_| "tcp connect")?;
-    let (mut second, _) = listener.accept().map_err(|_| "tcp accept")?;
-    first.set_nodelay(true).map_err(|_| "tcp option")?;
-    second.set_nodelay(true).map_err(|_| "tcp option")?;
-    run_stream_pair(&mut first, &mut second, iterations, payload_len)
-}
-
-fn run_stream_pair<S>(
-    first: &mut S,
-    second: &mut S,
-    iterations: u64,
-    payload_len: usize,
-) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str>
-where
-    S: Read + Write,
-{
-    let body = vec![0x5a; payload_len];
-    let mut response = vec![0u8; payload_len];
-    let mut request = vec![0u8; payload_len];
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        return Err("stream peer fork");
-    }
-    if child == 0 {
-        for _ in 0..iterations {
-            if second.read_exact(&mut request).is_err() || second.write_all(&request).is_err() {
-                unsafe { libc::_exit(2) };
-            }
-        }
-        unsafe { libc::_exit(0) };
-    }
-    let mut checksum = 0u64;
-    let start = Instant::now();
-    for _ in 0..iterations {
-        first.write_all(&body).map_err(|_| "stream write")?;
-        first.read_exact(&mut response).map_err(|_| "stream read")?;
-        checksum = checksum.wrapping_add(response.iter().map(|byte| u64::from(*byte)).sum::<u64>());
-    }
-    if wait_child(child)? != 0 {
-        return Err("stream peer failed");
-    }
-    Ok((
-        start.elapsed(),
-        iterations * 2,
-        3,
-        iterations * 4,
-        0,
-        checksum,
-    ))
 }

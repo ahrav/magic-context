@@ -27,9 +27,7 @@ function getVersion(): string {
             if (typeof pkg.version === "string" && pkg.version.length > 0) {
                 return pkg.version;
             }
-        } catch {
-            // Try the source or published layout next.
-        }
+        } catch {}
     }
     return "0.0.0";
 }
@@ -157,9 +155,6 @@ export async function dispatchCli(
             });
         }
     } catch (error) {
-        // `return await` is load-bearing above: a bare `return promise` settles
-        // the async function's own promise, so a rejection bypasses this block
-        // and a cancelled prompt would exit 1 instead of 0.
         if (isPromptCancelledError(error)) return 0;
         throw error;
     }

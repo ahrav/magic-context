@@ -52,7 +52,7 @@ function verifyClaim(database: Database, claim: SeededProjectMemoryClaim): void 
     expect(result.outcome).toBe("applied");
 }
 
-/** Stamp the evidence a completed classify-memories pass leaves behind. */
+/** `markClassified` inserts the evidence produced by a completed `classify-memories` pass. */
 function markClassified(database: Database, claim: SeededProjectMemoryClaim): void {
     const revisionId = (
         database
@@ -126,8 +126,7 @@ describe("dream task backlog probes", () => {
     });
 
     test("classify backlog drops as claims gain classify evidence", () => {
-        // Reporting `pending == total` forever made classification look like it
-        // never caught up, even right after a pass completed.
+        // A completed pass must not report `pending === total` forever.
         const database = createClaimReaderTestDatabase();
         db = database;
         const projectIdentity = "git:u3-classify-backlog";
@@ -242,10 +241,9 @@ describe("dream task backlog probes", () => {
 
 describe("uniformly absent claims are not runnable work", () => {
     test("a quarantined claim leaves the backlog empty", () => {
-        // Lifecycle-active is not runnable: surfaceDecision drops quarantined
-        // claims on every surface, so counting the lifecycle head alone had
-        // curate opening a child session over a pool its runner sees as empty,
-        // and the backlog never drained.
+        // `surfaceDecision` excludes quarantined lifecycle-active claims from every surface.
+        // Counting lifecycle heads opens a child `curate` session when the runner pool is empty.
+        // An empty runner pool prevents the backlog from draining.
         const database = createClaimReaderTestDatabase();
         db = database;
         const projectIdentity = "git:u3-hidden-pool";
@@ -278,9 +276,9 @@ describe("uniformly absent claims are not runnable work", () => {
 
 describe("anti-memory is not maintenance work", () => {
     test("a project holding only anti-memory reports no backlog and no gate", () => {
-        // The reader excludes anti-memory on every non-explicit surface, so a
-        // gate that still counted it would report backlog no maintenance runner
-        // can ever see, and the scheduler would reopen the work forever.
+        // The reader excludes anti-memory on every non-explicit surface.
+        // A gate must not count anti-memory that no maintenance runner can see.
+        // Counting anti-memory that no maintenance runner can see causes the scheduler to reopen the work forever.
         const database = createClaimReaderTestDatabase();
         db = database;
         const projectIdentity = "git:u3-anti-only";
@@ -367,7 +365,6 @@ describe("evaluateTaskGate", () => {
             )
             .run("s1", "opencode", projectIdentity, 200);
 
-        // Never scanned → runs.
         expect(
             evaluateTaskGate("retrospective", {
                 db: database,
@@ -377,8 +374,7 @@ describe("evaluateTaskGate", () => {
                 promotionThreshold: 3,
             }),
         ).toBe(true);
-        // Session newer than watermark → runs (even if lastRunAt is newer — the
-        // session was updated mid-run, so its content hasn't been scanned).
+        // A session newer than the watermark runs even when `lastRunAt` is newer, because its content changed mid-run.
         expect(
             evaluateTaskGate("retrospective", {
                 db: database,
@@ -388,7 +384,6 @@ describe("evaluateTaskGate", () => {
                 promotionThreshold: 3,
             }),
         ).toBe(true);
-        // Watermark at/after the session update → nothing new → skip.
         expect(
             evaluateTaskGate("retrospective", {
                 db: database,

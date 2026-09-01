@@ -81,8 +81,7 @@ jobs:
               ;;
           esac
           # libFuzzer's -max_total_time bounds the run only when positive;
-          # zero would run the first target until the workflow timeout and
-          # starve the remaining targets.
+          # A zero value would starve the remaining targets.
           if [ "$FUZZ_SECONDS" -eq 0 ]; then
             echo "fuzz_seconds must be a positive number of seconds" >&2
             exit 1

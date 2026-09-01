@@ -1,9 +1,5 @@
 /**
- * Authenticated compatibility evaluation against the generated release
- * contract: daemon version against the half-open supported range, the three
- * fixed module versions against their ranges, and the exact five-part epoch
- * set. Pure report-only functions — a mismatch is returned, never acted on,
- * so no code path here can stop or replace a live daemon.
+ * These functions return mismatches without stopping or replacing live daemons.
  */
 
 import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
@@ -18,18 +14,15 @@ export type CompatibilityVerdict =
               DaemonReason,
               "incompatible_daemon" | "incompatible_module" | "incompatible_epochs"
           >;
-          /** Bounded machine detail naming the exact mismatch. */
+          /** detail identifies the mismatch. */
           detail: string;
       };
 
 type SemverTriple = [number, number, number];
 
 /**
- * Each part is a semver numeric identifier: a single `0`, or a non-zero digit
- * followed by any digits. `\d+` would also admit leading zeroes, which
- * `Number.parseInt` then silently normalizes — `00.01.000` would parse to
- * `[0, 1, 0]` and pass the range gate, so a non-canonical peer version would
- * satisfy a check whose verdict promises a canonical `X.Y.Z` value.
+ * `\d+` admits leading zeroes that `Number.parseInt` silently normalizes.
+ * Reject leading zeroes so compatible versions remain canonical `X.Y.Z` values.
  */
 const CANONICAL_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 export function parseSemverTriple(value: string): SemverTriple | null {
@@ -63,17 +56,7 @@ function inHalfOpenRange(
 }
 
 /**
- * Evaluate the handshake-authenticated `daemon_ver` (shape `mc-host/X.Y.Z`)
- * against the contract's half-open supported daemon range. The parameter is
- * the whole {@link AuthenticatedPeer} rather than its version string so the
- * compiler refuses untrusted connection-file publication metadata, whose
- * `daemonVer` is otherwise an identically typed string.
  *
- * The native binary gates the same value against the same contract range in
- * `daemon_version_compatible` (`crates/mc-module/src/bin/ck-mc-host.rs`). The
- * two implementations must accept exactly the same inputs; a divergence makes
- * a native `probe`/`doctor` result and this policy verdict contradict each
- * other for one daemon. Change both together, or neither.
  */
 export function evaluateDaemonCompatibility(peer: AuthenticatedPeer): CompatibilityVerdict {
     const authenticatedDaemonVer = peer.daemonVer;
@@ -108,9 +91,6 @@ const FIXED_MODULES: ReadonlyArray<{
 ];
 
 /**
- * Evaluate the strictly parsed catalog's fixed module versions against each
- * contract range. A missing fixed module, a non-semver `module_version`, or
- * an out-of-range version is `incompatible_module` naming that module.
  */
 export function evaluateModuleCompatibility(catalog: CatalogEntry[]): CompatibilityVerdict {
     const byId = new Map(catalog.map((entry) => [entry.module_id, entry]));
@@ -153,9 +133,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 /**
- * Map the sanitized Magic Context host-health metric names to the generated
- * release-contract names. Values stay unknown so the exact epoch evaluator,
- * rather than a coercion here, owns numeric validation.
+ * The epoch evaluator performs numeric validation without coercing values.
  */
 export function observedEpochsFromMagicContextMetrics(metrics: unknown): ObservedEpochs {
     const epochs = asRecord(asRecord(metrics)?.epochs);
@@ -174,12 +152,9 @@ export function observedEpochsFromMagicContextMetrics(metrics: unknown): Observe
 }
 
 /**
- * Evaluate the exact five-part Magic Context epoch set. The observed key set
- * must equal the contract's: `observed` arrives as decoded JSON, which carries
- * no type at runtime, so an extra key names an epoch this release cannot
- * interpret and is a mismatch rather than a value to ignore. Every contract
- * epoch must then be present, numeric, and exactly equal; missing,
- * non-numeric, stale, and future values all name the failing epoch.
+ * Treat `observed` as unknown because decoded JSON has no TypeScript type guarantee.
+ * An extra observed key names an epoch that this release cannot interpret and returns a mismatch.
+ * Non-numeric, stale, and future epoch values return a mismatch naming the failing epoch.
  */
 export function evaluateEpochCompatibility(observed: ObservedEpochs): CompatibilityVerdict {
     const expectedNames = new Set(Object.keys(releaseContract.epochs));
@@ -222,11 +197,9 @@ export interface CompatibilityInput {
 }
 
 /**
- * The single ordered source of truth for the compatibility gate: stage id,
- * the CLI check id it reports under, and its evaluator. `evaluateCompatibility`,
- * the managed probe's `evaluatedThrough` labels, and the policy's emitted
- * `compatibility.*` checks all derive from this list, so a stage added or
- * reordered in one place cannot leave the probe sequence and the reported
+ * All compatibility consumers derive stage order, check IDs, and evaluators from this list.
+ * `evaluateCompatibility`, managed-probe `evaluatedThrough` labels, and policy checks derive from this list.
+ * Deriving all consumers from this list prevents stage-order drift between probes and reported checks.
  * checks disagreeing.
  */
 export const COMPATIBILITY_STAGES = [
@@ -258,15 +231,14 @@ export const COMPATIBILITY_STAGES = [
 
 export type CompatibilityStage = (typeof COMPATIBILITY_STAGES)[number]["stage"];
 
-/** Position of `stage` in the ordered gate; the order is the array order. */
+/* */
 export function compatibilityStageIndex(stage: CompatibilityStage): number {
     return COMPATIBILITY_STAGES.findIndex((entry) => entry.stage === stage);
 }
 
 /**
- * The composed demand/status/doctor gate order: daemon range, then modules,
- * then epochs. First failure wins and is reported without any stop, replace,
- * or restart side effect (R17).
+ * Demand, status, and doctor evaluate daemon range, modules, then epochs.
+ * Compatibility evaluation never stops, replaces, or restarts a daemon.
  */
 export function evaluateCompatibility(input: CompatibilityInput): CompatibilityVerdict {
     for (const stage of COMPATIBILITY_STAGES) {

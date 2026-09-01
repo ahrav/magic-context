@@ -24,6 +24,7 @@
         "test:metamorphic-unit": "bun scripts/run-test-selection.ts --metamorphic-eval-unit --timeout 120000",
         "test:dreamer-eval-unit": "bun scripts/run-test-selection.ts --dreamer-eval-unit --timeout 120000",
         "test:paired-delta-unit": "bun scripts/run-test-selection.ts --paired-delta-unit --timeout 120000",
+        "freeze:paired-delta": "bun scripts/freeze-paired-delta-pool.ts",
         "validate:prospective-holdout": "bun scripts/prospective-holdout.ts validate",
         "test:incidents": "bun scripts/run-incident-pool.ts --mode ts --report artifacts/incident-pool-ts-report.json",
         "test:incidents:pi": "bun scripts/run-incident-pool.ts --harness pi --lane known-red --report artifacts/incident-pool-pi-report.json",

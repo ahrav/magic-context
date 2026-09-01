@@ -4,16 +4,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
 
 /**
- * Pi context-limit resolution from settings/models.json.
  *
- * Pi does not read OpenCode's models.dev path. The Pi e2e harness writes a
- * Pi-native `.pi/agent/models.json` model override, and the plugin must use
- * Pi's reported context window when persisting pressure into session_meta.
  *
- * This test sets the mock model's context window to 50_000 tokens and has the
- * shared MockProvider report 20_000 input tokens. Pi should persist exactly
- * 40% usage (20_000 / 50_000). Falling back to a default 128K/200K window
- * would produce a much lower percentage and fail this parity check.
  */
 
 let h: PiTestHarness;
@@ -60,8 +52,7 @@ describe("pi context-limit resolution", () => {
             { timeoutMs: 5_000, label: "pi last_context_percentage persisted" },
         );
 
-        // Pi's shared-window model reserves min(8,192, 25% of 50,000) =
-        // 8,192 output tokens, so 20,000 / 41,808 * 100 is the exact pressure.
+        // The exact pressure is 20,000 / 41,808 × 100 = 47.83773440489858%.
         expect(pct).toBe(47.83773440489858);
     }, 60_000);
 });

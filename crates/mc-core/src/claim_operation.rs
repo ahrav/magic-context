@@ -1,18 +1,15 @@
-//! Claim-operation encoding contract: the Rust twin of
+//! The Rust contract mirrors `packages/plugin/src/features/magic-context/memory/claim-operation-contract.ts`.
 //! `packages/plugin/src/features/magic-context/memory/claim-operation-contract.ts`.
-//! Both runtimes are proven against the golden corpus
 //! `memory/fixtures/claim-operation-contract-v1.json`.
 //!
-//! Canonical encoding rules (pinned by the encoding versions below):
-//! - values: null, booleans, safe integers (|n| <= 2^53 - 1), strings,
-//!   arrays, and objects. Floats with a fractional part, non-finite numbers,
-//!   and out-of-range integers are rejected. A float with zero fraction in
-//!   the safe range encodes as its integer value (matching JavaScript, where
-//!   `JSON.parse` cannot distinguish `1e3` from `1000`).
-//! - objects: keys sorted by Unicode code point (Rust `str` ordering).
-//! - strings: `"`, `\`, and U+0000-U+001F escaped as `\u00xx` lowercase; no
-//!   short escapes; every other code point emitted literally.
-//! - no insignificant whitespace.
+//! Canonical values are null, booleans, safe integers with |n| <= 2^53 - 1, strings, arrays, and objects.
+//! Floats with fractional parts, non-finite numbers, and out-of-range integers are rejected.
+//! Safe integral floats encode as integers.
+//! `JSON.parse` cannot distinguish `1e3` from `1000`.
+//! Objects sort keys by Unicode code point (Rust `str` ordering).
+//! Canonical strings escape `"`, `\`, and U+0000–U+001F as lowercase `\u00xx`.
+//! Canonical strings use no short escapes and emit every other code point literally.
+//! Canonical JSON contains no insignificant whitespace.
 //!
 //! Digests are SHA-256 hex over `<protocol>\n<canonical JSON>` UTF-8 bytes.
 
@@ -25,9 +22,8 @@ use sha2::{Digest, Sha256};
 
 pub const CLAIM_REQUEST_ENCODING_VERSION: u32 = 1;
 pub const CLAIM_RESULT_ENCODING_VERSION: u32 = 1;
-/// Version of the Rust-host staged-intent protocol. This is independent from
-/// request/result encoding versions so transport evolution cannot silently
-/// reinterpret persisted command bytes.
+/// The staged-intent protocol version is independent of request and result encoding versions.
+/// The separation prevents transport evolution from reinterpreting persisted command bytes.
 pub const CLAIM_INTENT_PROTOCOL_VERSION: u32 = 1;
 
 pub const CLAIM_REQUEST_DIGEST_PROTOCOL: &str = "mc-claim-request-v1";
@@ -38,15 +34,14 @@ pub const POLICY_HEADS_DIGEST_PROTOCOL: &str = "mc-claim-policy-heads-v1";
 
 pub const PUBLIC_CLAIM_ID_PREFIX: &str = "mcm_";
 
-/// Largest integer both runtimes represent exactly: 2^53 - 1.
+/// Both runtimes represent integers through 2^53 - 1 exactly.
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContractError {
-    /// A value outside the canonical vocabulary (float with fraction,
-    /// out-of-range integer, or non-finite number).
+    /// `NotCanonical` reports fractional floats, out-of-range integers, and non-finite numbers.
     NotCanonical(String),
-    /// A stored result envelope that fails strict decoding.
+    /// `MalformedResult` reports a stored result envelope that fails strict decoding.
     MalformedResult(String),
 }
 
@@ -61,8 +56,8 @@ impl std::fmt::Display for ContractError {
 
 impl std::error::Error for ContractError {}
 
-/// Extract the exact integer value of a JSON number when it lies within the
-/// cross-runtime safe range; `None` otherwise.
+/// Return the exact cross-runtime safe integer represented by a JSON number.
+/// `None` indicates that the number is not an exact cross-runtime safe integer.
 fn number_as_safe_integer(number: &Number) -> Option<i64> {
     if let Some(value) = number.as_i64() {
         return (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER)
@@ -137,7 +132,6 @@ fn encode_canonical_value(out: &mut String, value: &Value) -> Result<(), Contrac
     Ok(())
 }
 
-/// Canonicalize a JSON value into the pinned byte form.
 pub fn canonical_json_encode(value: &Value) -> Result<String, ContractError> {
     let mut out = String::new();
     encode_canonical_value(&mut out, value)?;
@@ -160,16 +154,14 @@ fn protocol_digest(protocol: &str, value: &Value) -> Result<String, ContractErro
     Ok(sha256_hex_utf8(&format!("{protocol}\n{canonical}")))
 }
 
-/// Canonical request digest for the operation identity.
+/// The canonical request digest identifies the operation.
 pub fn compute_claim_operation_request_digest(request: &Value) -> Result<String, ContractError> {
     protocol_digest(CLAIM_REQUEST_DIGEST_PROTOCOL, request)
 }
 
-/// True when `text` is exactly `expected_len` lowercase hexadecimal characters.
 ///
-/// The claim-operation contract, the intent ledger, and the claim mirror all fence
-/// on identities in this format. They share one definition so a change to the
-/// length or charset cannot leave one layer accepting IDs another rejects.
+/// The claim-operation contract, intent ledger, and claim mirror require identities in this format.
+/// A shared definition prevents layers from accepting incompatible ID lengths or character sets.
 pub fn is_lower_hex(text: &str, expected_len: usize) -> bool {
     text.len() == expected_len
         && text
@@ -177,14 +169,12 @@ pub fn is_lower_hex(text: &str, expected_len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Validate the opaque public claim identity: `mcm_` + 32 lowercase hex.
 pub fn is_valid_public_claim_id(candidate: &str) -> bool {
     candidate
         .strip_prefix(PUBLIC_CLAIM_ID_PREFIX)
         .is_some_and(|rest| is_lower_hex(rest, 32))
 }
 
-/// Canonical revision identity: public claim ID + revision number + exact
 /// content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionLocator {
@@ -193,7 +183,6 @@ pub struct RevisionLocator {
     pub content_digest: String,
 }
 
-/// Render `<publicId>/r<revision>/<sha256>`; `None` when a field is invalid.
 pub fn format_revision_locator(locator: &RevisionLocator) -> Option<String> {
     if !is_valid_public_claim_id(&locator.public_claim_id)
         || !(1..=MAX_SAFE_INTEGER).contains(&locator.revision)
@@ -207,7 +196,6 @@ pub fn format_revision_locator(locator: &RevisionLocator) -> Option<String> {
     ))
 }
 
-/// Parse and validate a revision locator string; `None` when malformed.
 pub fn parse_revision_locator(raw: &str) -> Option<RevisionLocator> {
     let mut parts = raw.split('/');
     let public_claim_id = parts.next()?;
@@ -231,8 +219,7 @@ pub fn parse_revision_locator(raw: &str) -> Option<RevisionLocator> {
     })
 }
 
-/// Claim-local fencing state: revision identity plus the lifecycle,
-/// applicability, and policy heads of the current revision.
+/// The token fences mutations with revision identity and current lifecycle, applicability, and policy heads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimMutationToken {
@@ -267,8 +254,6 @@ pub fn compute_claim_mutation_token_digest(
     protocol_digest(CLAIM_MUTATION_TOKEN_DIGEST_PROTOCOL, &token_value(token))
 }
 
-/// Digest over applicability stream heads: `{seq, streamKey}` pairs sorted
-/// by stream key.
 pub fn compute_applicability_heads_digest(
     heads: &[(String, i64)],
 ) -> Result<String, ContractError> {
@@ -281,7 +266,6 @@ pub fn compute_applicability_heads_digest(
     protocol_digest(APPLICABILITY_HEADS_DIGEST_PROTOCOL, &Value::Array(items))
 }
 
-/// Append-only policy ledger counts for the current revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyHeadCounts {
@@ -307,8 +291,7 @@ pub fn compute_policy_heads_digest(counts: &PolicyHeadCounts) -> Result<String, 
     )
 }
 
-/// Publication-freshness state, separate from mutation fencing: database
-/// incarnation, workspace epoch, and per-project claim/policy generations.
+/// The vector tracks publication freshness separately from mutation fencing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotVector {
@@ -347,7 +330,7 @@ pub fn compute_snapshot_vector_digest(vector: &SnapshotVector) -> Result<String,
     )
 }
 
-/// Stable identity of one semantic claim command.
+/// The ID identifies one semantic claim command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimCommandIdentity {
@@ -355,7 +338,7 @@ pub struct ClaimCommandIdentity {
     pub operation_key: String,
 }
 
-/// Context database and authority fence captured when a command is staged.
+/// Staging captures the context database and authority fence before context mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimIntentBinding {
@@ -365,8 +348,7 @@ pub struct ClaimIntentBinding {
     pub authority_generation: u64,
 }
 
-/// Durable staged-intent lifecycle. `acknowledged` is transport settlement,
-/// not a second semantic claim state.
+/// `acknowledged` is transport settlement, not a second semantic claim state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimIntentState {
@@ -401,7 +383,7 @@ impl ClaimIntentState {
     }
 }
 
-/// Versioned request used to durably stage a command before context mutation.
+/// The request durably stages a command before context mutation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimIntentStageRequest {
@@ -412,7 +394,7 @@ pub struct ClaimIntentStageRequest {
     pub request: Value,
 }
 
-/// Versioned intent inspection. Omitting `command` lists rows in creation order.
+/// When `command` is omitted, inspection lists rows in creation order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimIntentInspectRequest {
@@ -422,7 +404,6 @@ pub struct ClaimIntentInspectRequest {
     pub limit: u32,
 }
 
-/// One legal acknowledgement transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimIntentAckKind {
@@ -431,8 +412,7 @@ pub enum ClaimIntentAckKind {
     TerminalRejected,
 }
 
-/// Versioned acknowledgement. Result bytes are supplied only when recording
-/// `context-committed` or `terminal-rejected`; they must already use canonical
+/// Result bytes are supplied only when recording `context-committed` or `terminal-rejected`; they must already use canonical claim-result encoding.
 /// claim-result encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -445,7 +425,7 @@ pub struct ClaimIntentAckRequest {
     pub result_json: Option<String>,
 }
 
-/// Shared response row for stage, inspect, and acknowledgement APIs.
+/// The stage, inspect, and acknowledgement APIs return the same response row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimIntentWireRecord {
@@ -479,7 +459,6 @@ pub struct ClaimIntentAckResponse {
     pub intent: ClaimIntentWireRecord,
 }
 
-/// Stored result outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimResultOutcome {
     Applied,
@@ -515,7 +494,7 @@ pub struct ClaimOperationResultEffect {
     pub revision_locator: Option<String>,
 }
 
-/// The durable, replay-returned result envelope.
+/// The envelope is stored durably and returned during replay.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimOperationResult {
     pub result_encoding_version: u32,
@@ -592,8 +571,6 @@ fn decode_effect(entry: &Value, index: usize) -> Result<ClaimOperationResultEffe
     })
 }
 
-/// Strict decoder for a stored result envelope. Fails closed on an unknown
-/// encoding version, outcome, or malformed effect rows.
 pub fn decode_claim_operation_result(
     result_json: &str,
 ) -> Result<ClaimOperationResult, ContractError> {
@@ -858,8 +835,7 @@ mod tests {
                 case["effectCount"].as_u64().unwrap() as usize,
                 "case {name}"
             );
-            // The stored bytes are already canonical: re-encoding the parsed
-            // value must reproduce them exactly.
+            // Stored bytes are canonical: re-encoding the parsed value reproduces them exactly.
             let parsed: Value = serde_json::from_str(result_json).unwrap();
             assert_eq!(
                 canonical_json_encode(&parsed).unwrap(),

@@ -1,5 +1,8 @@
 # iceoryx-receive-expectation-tracks-the-delivered-stream
 
+Record invalidated 2026-08-31: iceoryx2 backend removed in `0f336d3c`; absent at
+HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
+
 ## Discovery trigger
 
 The ring derives both sequence cursors from shared memory. The producer reads

@@ -1,9 +1,5 @@
 /**
- * DG-1..3 reference generator.
  *
- * The reference side intentionally owns only canonical JSON and wire-visible fields. Rust
- * consumes the exact request fixtures in-process; neither side derives expected bytes from the
- * other. Keep this file dependency-free so regeneration works before the plugin is built.
  */
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -48,7 +44,6 @@ const golden = {
     id,
     family,
     input,
-    // The TS reference's canonical transform output is the wire-visible surface plus gates.
     expected: { ...output, wire: input.messages },
   })),
 };

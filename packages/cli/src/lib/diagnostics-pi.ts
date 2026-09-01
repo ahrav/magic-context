@@ -88,22 +88,22 @@ export interface PiDiagnosticReport {
         sizeKb: number;
     };
     /**
-     * Recent Pi sessions ranked by JSONL mtime, top 5. Used to anchor
-     * historian-dump lookups to real project directories and to power the
-     * session picker in `--issue`. Pi stores sessions as JSONL files under
-     * `~/.pi/agent/sessions/<slug>/*.jsonl` where `slug` is the project
-     * directory path with `/` replaced by `-` and bookended by `--`.
+     * `recentSessions` contains the five JSONL sessions with the newest mtimes.
+     * `--issue` uses these sessions in its session picker.
+     * Pi stores session JSONL files under `~/.pi/agent/sessions/<slug>/*.jsonl`.
+     * Pi derives each session slug by replacing `/` in the project directory with `-`.
+     * Pi wraps each session slug in `--`.
      */
     recentSessions: PiRecentSessionSummary[];
-    /** Historian dumps grouped by project directory + legacy tmp-dir fallback. */
+    /** The report keeps legacy tmp-dir dumps separate from project-grouped dumps. */
     historianDumps: PiHistorianDumpsReport;
 }
 
 export interface PiRecentSessionSummary {
     sessionId: string;
-    /** Project directory derived from Pi's session-slug folder. */
+    /** Pi's session-slug folder determines `directory`. */
     directory: string;
-    /** ISO timestamp of the JSONL file's mtime. */
+    /** The JSONL file's mtime determines `lastActiveAt` in ISO format. */
     lastActiveAt: string;
 }
 
@@ -133,7 +133,7 @@ function getSelfVersion(): string {
                 return pkg.version;
             }
         } catch {
-            // Try next layout (src vs bundled dist).
+            // The fallback supports both source and bundled layouts.
         }
     }
     return "unknown";
@@ -145,12 +145,7 @@ function currentUserHash(): string {
 }
 
 function redactSecretString(value: string): string {
-    // Apply the shared comprehensive redactor (OpenCode parity: adds
-    // github_pat_/ghp_/hf_/AKIA/Slack/Google/JWT and generic key=value forms that
-    // the bespoke version leaked) AND then the original looser patterns as a
-    // SUPERSET — the shared `sk-` pattern requires 32+ chars (real key length),
-    // so keep the looser `sk-{12,}` here too so short/synthetic sk- tokens are
-    // still caught. Redaction is safer over-broad than under.
+    // Keep the local `sk-{12,}` redaction because `redactSecretText` only redacts `sk-` tokens with at least 32 characters.
     return redactSecretText(value)
         .replace(/Bearer\s+[A-Za-z0-9._~+\-/=]+/g, "Bearer <REDACTED>")
         .replace(/sk-[A-Za-z0-9_-]{12,}/g, "sk-<REDACTED>")
@@ -159,10 +154,10 @@ function redactSecretString(value: string): string {
 }
 
 /**
- * Sanitize paths, usernames, and obvious secret material before writing issue
- * reports. The exact home path becomes <HOME>; the local username is replaced
- * with a stable short hash so reports can correlate repeated occurrences
- * without leaking the account name.
+ * `sanitizeString` redacts paths, usernames, and secret material before issue reports are written.
+ * `sanitizeString` replaces the exact home path with `<HOME>`.
+ * `sanitizeString` replaces the local username with a stable short hash.
+ * The stable hash correlates repeated occurrences without exposing the account name.
  */
 export function sanitizeString(value: string): string {
     const home = process.env.HOME || homedir();
@@ -220,17 +215,11 @@ function packageEntries(settings: Record<string, unknown>): unknown[] {
 }
 
 /**
- * Convert a Pi session-slug directory name back to its source project path.
+ * A session-slug directory encodes its source project path.
  *
- * Pi slugs the project directory by stripping leading `/`, replacing each
- * `/` with `-`, then bookending with `--`. Example:
- *   /Users/me/Work/foo  →  --Users-me-Work-foo--
+ * Pi strips the leading `/`, replaces `/` with `-`, and wraps the result in `--`.
  *
- * This is lossy when a path component contains literal `-` characters; the
- * reverse path will collapse them with the `/` separators. We accept the
- * loss because the diagnostics report shows the reconstructed path as a
- * lookup key, not as a navigation target — the worst-case is a path that
- * doesn't exist on disk, which the dump walker handles gracefully.
+ * Literal `-` characters in path components make session-slug reversal lossy.
  */
 function reverseSlugToDirectory(slug: string): string | null {
     if (!slug.startsWith("--") || !slug.endsWith("--")) return null;
@@ -240,13 +229,9 @@ function reverseSlugToDirectory(slug: string): string | null {
 }
 
 /**
- * Read recent Pi sessions from `~/.pi/agent/sessions/<slug>/*.jsonl`.
+ * Pi stores session JSONL files under `~/.pi/agent/sessions/<slug>/*.jsonl`.
  *
- * Returns the top 5 sessions ranked by JSONL mtime, with each entry
- * pointing at the project directory recovered from the slug. The session
- * ID is derived from the JSONL filename (Pi names files like
- * `<ISO-timestamp>_<uuid>.jsonl`). Empty array when `~/.pi/agent/sessions/`
- * doesn't exist (Pi not installed or never used).
+ * The session reader returns an empty array when `~/.pi/agent/sessions/` does not exist.
  */
 function collectPiRecentSessions(): PiRecentSessionSummary[] {
     const sessionsRoot = getPiSessionsRoot();
@@ -275,14 +260,9 @@ function collectPiRecentSessions(): PiRecentSessionSummary[] {
             for (const file of files) {
                 try {
                     const mtime = statSync(join(slugDir, file)).mtimeMs;
-                    // Pi filename shape: <ISO-timestamp>_<uuid>.jsonl
-                    // Strip the .jsonl extension; the rest IS the session ID
-                    // Pi uses internally (timestamp + uuid pair).
                     const sessionId = file.replace(/\.jsonl$/, "");
                     candidates.push({ sessionId, directory, mtime });
-                } catch {
-                    // Skip unreadable file
-                }
+                } catch {}
             }
         }
 

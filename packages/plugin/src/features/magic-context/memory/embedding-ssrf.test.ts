@@ -22,8 +22,6 @@ describe("blockedEmbeddingEndpointReason", () => {
 
     it("blocks the AWS IPv6 metadata service (fd00:ec2::254, all spellings)", () => {
         expect(blockedEmbeddingEndpointReason("http://[fd00:ec2::254]/latest")).toBeTruthy();
-        // Expanded, uppercase, and leading-zero forms all canonicalize to the
-        // same compressed hostname via WHATWG URL.
         expect(
             blockedEmbeddingEndpointReason("http://[fd00:ec2:0:0:0:0:0:254]/latest"),
         ).toBeTruthy();
@@ -40,8 +38,6 @@ describe("blockedEmbeddingEndpointReason", () => {
         expect(
             blockedEmbeddingEndpointReason("http://[::ffff:169.254.169.254]/latest"),
         ).toBeTruthy();
-        // Hex tail (a9fe:a9fe === 169.254.169.254) — the spelling WHATWG URL
-        // canonicalizes [::ffff:169.254.169.254] into.
         expect(blockedEmbeddingEndpointReason("http://[::ffff:a9fe:a9fe]/latest")).toBeTruthy();
     });
 

@@ -1,6 +1,3 @@
-//! Job capacity, retention, route-independence, restart fencing, and
-//! shutdown ownership for the Synapse lane.
-
 mod support;
 
 use std::sync::atomic::Ordering;
@@ -145,7 +142,6 @@ async fn queued_byte_boundary_is_exact_and_releases_on_completion() {
     let (channel, epoch) = open_synapse_route(&mut client).await;
     let lane = test_lane();
 
-    // Exactly eight queued text bytes are accepted.
     let frame = call(
         &mut client,
         channel,
@@ -156,7 +152,6 @@ async fn queued_byte_boundary_is_exact_and_releases_on_completion() {
     .await;
     assert!(frame.json()["result"]["job_id"].is_string());
 
-    // One more byte is refused while those bytes are still queued.
     let frame = call(
         &mut client,
         channel,
@@ -229,7 +224,7 @@ async fn completed_jobs_evict_oldest_first_under_count_pressure() {
     let body = wait_ready(&mut client, channel, epoch, &second_job, &second_key).await;
     assert!(body["result"]["done"].as_bool().expect("done"));
 
-    // The evicted job is now indistinguishable from a restart.
+    // Polling the evicted job returns the same response as after a restart.
     let mut params = constraints(&lane);
     params["job_id"] = first_job.into();
     params["request_key"] = first_key.into();
@@ -303,7 +298,7 @@ async fn jobs_survive_route_loss_and_serve_a_fresh_route() {
         .to_owned();
     let key = request_key(&lane, &page);
 
-    // Close the route while the job runs; the accepted job must not care.
+    // Closing the route does not cancel an admitted job.
     client
         .send_frame(support::raw_client::TY_GOODBYE, 0, channel, epoch, 0, b"")
         .await
@@ -327,7 +322,6 @@ async fn cancelled_query_before_cpu_admission_runs_no_inference() {
     let (channel, epoch) = open_synapse_route(&mut client).await;
     let lane = test_lane();
 
-    // Occupy the single CPU permit with a batch job.
     let frame = call(
         &mut client,
         channel,
@@ -338,7 +332,6 @@ async fn cancelled_query_before_cpu_admission_runs_no_inference() {
     .await;
     assert!(frame.json()["result"]["job_id"].is_string());
 
-    // Queue a query behind it, then cancel it before it can start.
     let mut params = constraints(&lane);
     params["text"] = "never embedded".into();
     let corr = client.next_corr();
@@ -364,7 +357,7 @@ async fn cancelled_query_before_cpu_admission_runs_no_inference() {
     assert_eq!(frame.corr, corr);
     assert_eq!(frame.error_code(), "cancelled");
 
-    // Only the batch ran; the cancelled queued query never reached the
+    // The cancelled queued query never reached the engine.
     // engine.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
@@ -461,8 +454,8 @@ async fn failed_jobs_report_their_stored_error() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The invariant failure marked the lane failing: new work is refused
-    // and later binds reject.
+    // The result-count invariant failure marks the lane failing; new work is refused.
+    // Later binds reject after the lane fails.
     let mut params = constraints(&lane);
     params["text"] = "after failure".into();
     let frame = call(&mut client, channel, epoch, "embed.query", params).await;
@@ -491,7 +484,6 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
     let (channel, epoch) = open_synapse_route(&mut client).await;
     let lane = test_lane();
 
-    // One retained completed job.
     let done_page = items(&[("done", "finished work")]);
     let frame = call(
         &mut client,
@@ -514,7 +506,6 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
     )
     .await;
 
-    // One running and one queued job.
     engine.set_delay(Duration::from_millis(300));
     for (id, text) in [("run", "running work"), ("wait", "queued work")] {
         let frame = call(
@@ -527,8 +518,7 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
         .await;
         assert!(frame.json()["result"]["job_id"].is_string());
     }
-    // Shutdown must observe the second job mid-flight, so wait until it has
-    // entered the native call before cancelling.
+    // The native call must start before cancellation so shutdown observes the second job in flight.
     let deadline = tokio::time::Instant::now() + BUDGET;
     while engine.calls.load(Ordering::SeqCst) < 2 {
         assert!(
@@ -538,22 +528,18 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // Graceful shutdown joins the running native call, cancels the queued
-    // wrapper, and releases retention before the handler drops.
+    // Graceful shutdown joins the running native call, cancels the queued wrapper, and releases retention before the handler drops.
     host.shutdown().await.expect("graceful shutdown");
 
-    // The queued job never ran: one call for the retained job, one for the
+    // The queued job never ran; the engine received one call for the retained job.
     // running job.
     assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
-    // Pairing results with item metadata indexes by position, so an engine
-    // that returns a different count would index out of bounds while the job
-    // table's lock is held — poisoning it for every later caller, including
-    // shutdown's admission close. The engine trait is an open seam, so the
-    // table cannot assume the count was validated upstream.
+    // JobTable requires one engine result for each input item.
+    // The engine trait is an open seam; JobTable cannot assume upstream result-count validation.
     let jobs = JobTable::new(SynapseLimits::default());
     let batch = |id: &str| {
         vec![BatchItem {
@@ -569,7 +555,6 @@ fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
         panic!("the first job is admitted");
     };
     jobs.start(seq).expect("the job starts");
-    // Two vectors for a one-item job.
     jobs.publish_ready(seq, vec![vec![0.5, 0.5], vec![0.5, 0.5]]);
 
     match jobs.poll(&job_id, "key-1", None) {
@@ -607,8 +592,7 @@ fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
         ),
     }
 
-    // The table and its result-byte bookkeeping survive both failures: a later
-    // job still admits, publishes, and serves.
+    // The table and result-byte bookkeeping survive a result-count failure and a result-byte failure; later jobs still admit, publish, and serve.
     let AdmitOutcome::Admitted { job_id, seq } =
         jobs.admit_uncharged_for_tests("key-3".to_owned(), batch("item:2"), 2)
     else {

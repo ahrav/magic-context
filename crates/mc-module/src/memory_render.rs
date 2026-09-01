@@ -1,18 +1,15 @@
-//! Pure rendering for the claim mirror and session-history prompt surfaces.
+//! This module performs pure rendering for claim-mirror and session-history prompt surfaces.
 
 use crate::decay_render::{render_decayed_compartments, DecayRenderCompartment};
 use mc_store::claim_mirror::{ClaimMirrorLifecycle, CommittedClaimMirrorRow};
 use std::cmp::Ordering;
 
-/// The body for an empty session history. The `<session-history>` tag is always present
-/// (never omitted) so the provider prompt-cache has a stable breakpoint to anchor on —
-/// an absent block would shift the bytes after it and bust the cache.
+/// `<session-history>` is never omitted so the provider prompt-cache retains a stable breakpoint.
+/// Omitting `<session-history>` would shift subsequent prompt bytes and invalidate the cache.
 pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
-/// The non-empty placeholder emitted for the m1 delta block when it has no new content.
-/// The m1 block is never fully empty because the provider prompt-cache needs a stable
-/// breakpoint to anchor on, so even an empty update still emits this marker.
+/// `M1_PLACEHOLDER` keeps the m1 delta block non-empty when it has no new content.
+/// The m1 block remains non-empty to preserve the provider prompt-cache breakpoint.
 pub const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
-/// Default history budget when a caller doesn't supply one.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
 fn escape_xml_attr(s: &str) -> String {
@@ -28,7 +25,7 @@ fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// The canonical project-memory claim categories, in render order.
+/// `MEMORY_CATEGORY_ORDER` defines the canonical project-memory categories in render order.
 pub(crate) const MEMORY_CATEGORY_ORDER: [&str; 5] = [
     "PROJECT_RULES",
     "ARCHITECTURE",
@@ -126,8 +123,8 @@ impl TryFrom<&CommittedClaimMirrorRow> for MirroredClaimMemory {
             .ok_or_else(|| MirroredClaimMemoryError::MissingCategory {
                 public_claim_id: row.public_claim_id.clone(),
             })?;
-        // Native surfaces have no warning renderer. Only positive categories cross this
-        // boundary so warning records stay silent instead of being rendered as facts.
+        // Only positive categories reach native surfaces because native surfaces do not render warnings.
+        // Native surfaces filter non-positive categories so warning records do not render as facts.
         if !is_positive_memory_category(category) {
             return Err(MirroredClaimMemoryError::NonPositiveCategory {
                 public_claim_id: row.public_claim_id.clone(),
@@ -184,19 +181,12 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     while !claim.content.is_char_boundary(end) {
         end -= 1;
     }
-    // Indent continuation lines exactly as `render_memory_line` does. Both feed the
-    // same `<project-memory>` block, so an unindented continuation breaks the block's
-    // line structure that m0 byte accounting and the prompt cache depend on.
+    // `<project-memory>` continuation lines must remain indented because m0 byte accounting and the prompt cache depend on its line structure.
     let content = escape_xml_content(&claim.content[..end]).replace('\n', "\n  ");
     format!("{}{source}: {content}", claim.public_claim_id)
 }
 
-/// Render the grouped claim block. Non-positive categories are dropped here, not
-/// only in `TryFrom`: the struct, its fields, and this function are all public, so
-/// a caller that assembles `MirroredClaimMemory` values by hand reaches the bytes
-/// without passing the conversion gate. Repeating the allow-list at the last
-/// boundary before bytes keeps a warning record silent on a surface that has no
-/// warning renderer instead of emitting it as an ordinary project fact.
+/// Native surfaces filter non-positive categories because callers can construct `MirroredClaimMemory` directly and native surfaces lack a warning renderer.
 pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
     let mut ordered = claims
         .iter()
@@ -226,8 +216,7 @@ pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) 
     lines.join("\n")
 }
 
-/// Render the `<user-profile>` baseline block: one `- <content>` line per user memory
-/// (already budget-trimmed by the caller). Empty set → empty string.
+/// The caller token-trims user memories; an empty set renders as an empty string.
 pub fn render_user_profile_block(profile_lines: &[String], wrapper: &str) -> String {
     if profile_lines.is_empty() {
         return String::new();
@@ -241,9 +230,9 @@ pub fn render_user_profile_block(profile_lines: &[String], wrapper: &str) -> Str
     lines.join("\n")
 }
 
-/// Render covered system-role messages as m0 text. The caller supplies content that has
-/// already been deduplicated in first-ordinal order; this function deliberately does not
-/// escape it so the prompt bytes inside each entry remain the original system content.
+/// The caller supplies system-role content deduplicated in first-ordinal order.
+/// The renderer preserves system-role content byte-for-byte.
+/// The renderer does not escape system-role content, preserving original prompt bytes in each entry.
 pub fn render_covered_system_messages_block(messages: &[String]) -> String {
     if messages.is_empty() {
         return String::new();
@@ -258,35 +247,26 @@ pub fn render_covered_system_messages_block(messages: &[String]) -> String {
     block
 }
 
-/// Inputs to [`render_m0`] after the caller has already chosen and token-budget-trimmed
-/// each sub-block. This renderer only assembles those blocks in order with framing; it
-/// does not decide which rows or history compartments fit the budget.
+/// `render_m0` receives blocks the caller has already chosen and token-budget-trimmed.
+/// `render_m0` does not choose which rows or history compartments fit the budget.
 pub struct M0Inputs<'a> {
-    /// The pre-rendered `<project-docs>` block (empty string when absent).
+    /// Callers pass an empty string when no `<project-docs>` block exists.
     pub project_docs: &'a str,
-    /// User-profile memory contents (trimmed); rendered as `- <content>` lines.
+    /// The caller token-trims user-profile memory.
     pub user_profile: &'a [String],
-    /// System-role prompt fragments whose ordinals are already covered by m0, deduplicated
-    /// and ordered by their first appearance before being passed in by the caller.
+    /// The caller deduplicates system-role fragments by ordinal before passing them to `render_m0`.
+    /// The caller orders system-role fragments by first appearance before passing them to `render_m0`.
     pub covered_system_messages: &'a [String],
-    /// The compartment history (trimmed/ordered chronological), decay-rendered here.
+    /// The caller supplies chronologically ordered, token-trimmed history; the renderer applies decay.
     pub compartments: &'a [DecayRenderCompartment],
-    /// The history budget in tokens (before the pressure multiplier).
+    /// `history_budget_tokens` is measured before applying the pressure multiplier.
     pub history_budget_tokens: f64,
-    /// The drift-pressure multiplier (≥1): a tighter effective budget → more decay
-    /// demotion. Maps to `effective_budget = budget / max(1, multiplier)`, keeping the
-    /// decay curve the single source of pressure math.
+    /// Values below 1 use an effective multiplier of 1; larger values tighten the effective budget and increase decay.
+    /// `decay_pressure_multiplier` produces `effective_budget = history_budget_tokens / max(1, decay_pressure_multiplier)`.
     pub decay_pressure_multiplier: f64,
 }
 
-/// Compose the m0 baseline: `<project-docs>` + `<user-profile>` +
-/// `<covered-system-messages>` + `<session-history>` + `<project-memory>`, joined by
-/// blank lines and trimmed. The session-history block is always present (empty history
-/// uses the `M0_EMPTY_BODY` placeholder — see its doc for why); the other blocks are
-/// omitted when empty. `estimate_tokens` is used inside the decay renderer for its
-/// budget-fit check (injected; under a loose budget the render is pure and
-/// estimator-independent). This function only composes; sub-block budget trims happen in
-/// the caller (they need the token estimator, a separate subsystem).
+/// `render_m0` expects the caller to pre-trim each sub-block.
 pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> String {
     let mut sections: Vec<String> = Vec::new();
     if !inputs.project_docs.is_empty() {
@@ -313,13 +293,6 @@ pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> 
     sections.join("\n\n").trim().to_string()
 }
 
-/// Assemble the m1 delta body from its (already-rendered) sub-blocks, in order:
-/// `<memory-updates>` → `<new-compartments>` → `<new-memories>` → `<new-user-profile>`,
-/// joining the non-empty pieces with newlines and wrapping them in
-/// `<session-history-since>`. Each piece is an empty string when absent (no rows / no
-/// change). When ALL are empty, returns the `placeholder` instead — m1 is the volatile
-/// half of the cached prefix and must never be fully empty, because the provider cache
-/// anchors a breakpoint at the m1 block and an empty block would shift it.
 pub fn assemble_m1(
     memory_updates: &str,
     new_compartments: &str,
@@ -347,17 +320,7 @@ pub fn assemble_m1(
     )
 }
 
-/// Render the `<new-compartments>` block: each new compartment at full-fidelity P1 (no
-/// decay applies to a newly-added compartment until it folds into the baseline), joined
-/// by a blank line. An empty slice returns an empty string so the caller can omit the
 /// block.
-/// Render the `<new-compartments>` block: each unfolded compartment at a FIXED tier (1),
-/// with NO clock/age/pressure input, so the bytes are a pure function of the compartment
-/// ROW fields. This row-purity is load-bearing for the m1 digest: `m1_revision_signal`
-/// uses `max_compartment_seq` as the complete m1-SOFT leg for compartments BECAUSE the
-/// only way these bytes change without a new sequence (a row mutation) routes to a HARD.
-/// If you add a time/age/pressure-varying input here, that completeness breaks — re-read
-/// the COMPLETENESS INVARIANT on `m1_revision_signal` before doing so.
 pub fn render_new_compartments(
     compartments: &[&crate::decay_render::DecayRenderCompartment],
 ) -> String {
@@ -427,9 +390,6 @@ mod tests {
         ));
     }
 
-    /// The conversion gate is not the only way into the renderer: the struct, its
-    /// fields, and `render_claim_memory_block` are public, so a hand-assembled slice
-    /// reaches the bytes directly. The allow-list has to hold on that path too.
     #[test]
     fn render_boundary_drops_non_positive_categories_built_without_the_conversion() {
         let hand_built = |category: &str, content: &str| MirroredClaimMemory {
@@ -457,8 +417,6 @@ mod tests {
         assert!(!block.contains("FUTURE_NEGATIVE_CATEGORY"));
         assert!(!block.contains("Unknown categories stay silent."));
 
-        // An all-warning slice renders no wrapper at all, so the surface cannot emit an
-        // empty `<project-memory>` block that implies the claims were considered.
         let only_negative = [hand_built("REJECTED_APPROACH", "Shelved design.")];
         assert_eq!(
             render_claim_memory_block(&only_negative, "project-memory"),
@@ -466,11 +424,7 @@ mod tests {
         );
     }
 
-    /// Extract the string entries of one `export const <name>` array from the
-    /// TypeScript source. The declaration match requires a non-identifier
-    /// character after the name so a sibling const that shares `name` as a
-    /// prefix (e.g. `CATEGORY_PRIORITY_LEGACY`) cannot silently redirect the
-    /// parse, and exactly one declaration must exist.
+    /// The pattern requires exactly one `export const <name>` declaration followed by a non-identifier character so prefixed constant names cannot match.
     fn typescript_string_array<'a>(source: &'a str, name: &str) -> Vec<&'a str> {
         let declaration = format!("export const {name}");
         let tails = source
@@ -508,10 +462,8 @@ mod tests {
             POSITIVE_MEMORY_CATEGORIES
         );
 
-        // CATEGORY_PRIORITY only orders rows; the writable taxonomies decide
-        // which categories can actually reach mirror rows. Anchoring the gate
-        // to them ensures a newly writable positive category fails this test
-        // instead of being silently dropped by the native surfaces.
+        // CATEGORY_PRIORITY only orders rows; writable taxonomies determine category validity.
+        // The test gates mirror-row categories against writable taxonomies so newly writable positive categories fail instead of being dropped.
         for name in ["V2_MEMORY_CATEGORIES", "PROMOTABLE_CATEGORIES"] {
             let categories = typescript_string_array(source, name);
             assert!(!categories.is_empty(), "TypeScript {name} parsed as empty");
@@ -526,10 +478,7 @@ mod tests {
 
     #[test]
     fn render_order_is_a_prefix_of_the_positive_vocabulary() {
-        // `claim_render_order` ranks with MEMORY_CATEGORY_ORDER while the
-        // inclusion gate uses POSITIVE_MEMORY_CATEGORIES. Pinning the order
-        // array to the vocabulary's prefix keeps a single-list edit from
-        // desyncing sort order from the inclusion gate.
+        // `claim_render_order` must keep `MEMORY_CATEGORY_ORDER` equal to the vocabulary prefix of `POSITIVE_MEMORY_CATEGORIES` so sorting and inclusion remain aligned.
         assert_eq!(
             MEMORY_CATEGORY_ORDER[..],
             POSITIVE_MEMORY_CATEGORIES[..MEMORY_CATEGORY_ORDER.len()]

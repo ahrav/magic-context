@@ -1,5 +1,19 @@
 # operation-counters-are-observed-not-declared
 
+> Refresh note, 2026-08-31: PR #131 (merge `5d638e3e8`) rewrote
+> `hardware_envelope.rs` and `evidence.rs` in ways that change this record's
+> mechanism, not just its line numbers: `park_wakes` is now observed through a
+> shared `AtomicU64` incremented at the wait site (`hardware_envelope.rs:283`,
+> `:354`), producer-side copy/allocation counting mixes per-site increments
+> (`:302-304`) with bulk arithmetic (`:325-326`), the `SchedulingMode` label and
+> the `iceoryx`/stream arms are gone, and
+> `OperationCounters::disqualifications` now takes an
+> `eventfd_wake_qualified` flag (`evidence.rs:22`) that waives the wake, syscall,
+> and handoff gates. The per-counter provenance table and the derived prose
+> below describe the pre-#131 bench and need mechanism-level re-derivation; the
+> table's internal line numbers are left as pre-rewrite evidence. Citations
+> outside the table were re-verified at HEAD.
+
 ## Discovery trigger
 
 The release gate in `benches/manifests/v1.json` names six counter fields as
@@ -11,27 +25,27 @@ gate to the site that writes it.
 
 ## Evidence trail
 
-`crates/mc-shm-transport/src/evidence.rs` declares the six fields at lines 9,
-11, 13, 15, 17, and 19, and reads them at lines 30, 33, 36, 40, 43, and 46 to
+`crates/mc-shm-transport/src/evidence.rs` declares the six fields at lines 7,
+9, 11, 13, 15, and 17, and reads them at lines 24, 27, 30, 34, 37, and 40 to
 emit reason codes. The type performs no counting; it classifies values handed
 to it.
 
 Every write to any of the six fields, repository-wide, is one of:
 
-- `crates/mc-shm-transport/tests/contract.rs:488-493` — a literal `1` per field
+- `crates/mc-shm-transport/tests/contract.rs:463-470` — a literal `1` per field
   in the `purity_gate_rejects_injected_copy_allocation_queue_and_wake` fixture
-  (`#[test]` at line 420, `fn` at line 421).
-- `crates/mc-shm-transport/benches/hardware_envelope.rs:162-167` — construction
+  (`#[test]` at line 461, `fn` at line 462).
+- `crates/mc-shm-transport/benches/hardware_envelope.rs:131-137` — construction
   from the `measure` tuple; `generic_queue_hops: 0` and `scheduler_handoffs: 0`
   are literals here.
-- `benches/hardware_envelope.rs:191-196` — all six overwritten with `1` under
+- `benches/hardware_envelope.rs:139-146` — all six overwritten with `1` under
   `if arm == "injected_avoidable_operations"`.
-- `benches/hardware_envelope.rs:212-217` — copied into the emitted
+- `benches/hardware_envelope.rs:161-166` — copied into the emitted
   `Measurement`.
-- `benches/hardware_envelope.rs:249-254` — all six zeroed in `failed()`.
+- `benches/hardware_envelope.rs:183-189` — all six zeroed in `failed()`.
 
 `OperationCounters` is imported by exactly two files outside its own module:
-`tests/contract.rs:10` and `benches/hardware_envelope.rs:14`. No production
+`tests/contract.rs:9` and `benches/hardware_envelope.rs:8`. No production
 (non-test, non-bench) code path increments any of the six fields.
 
 Per-counter provenance in the bench, by arm family:
@@ -108,7 +122,7 @@ counts across the fork boundary rather than having them inferred after
   repository-wide search for each of the six field names and for
   `OperationCounters` and `disqualifications`;
   `benches/hardware_envelope.rs` in full; `benches/manifests/v1.json`
-  `selection_gate`; `tests/contract.rs:486-509`;
+  `selection_gate`; `tests/contract.rs:462-485`;
   `docs/mc-host-shm-transport.md:25`.
 - Findings: the type has no constructor that observes anything and no
   production caller. Its doc comment calls it "Operation counters used to

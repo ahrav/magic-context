@@ -38,7 +38,7 @@ export interface CtxSessionUpgradeRuntimeDeps {
 	historianThinkingLevel?: string;
 	language?: string;
 	memoryEnabled: boolean;
-	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	/** The runtime permits a session started exactly in the canonical home directory only when user-level configuration enables `allowHomeProject`. */
 	allowHomeProject?: boolean;
 	autoPromote: boolean;
 	userMemoriesEnabled?: boolean;
@@ -51,16 +51,14 @@ export interface RegisterCtxSessionUpgradeDeps
 }
 
 /**
- * /ctx-session-upgrade (E6b/E6c parity with OpenCode E3.1/E3.2).
  *
- * Upgrades THIS Pi session to the v2 history format:
  *   1. Full recomp — rebuilds every legacy v1 compartment into the v2 tiered
  *      shape (recomp emits NO facts, so curated memories are untouched here).
  *   2. Memory migration — re-evaluates the project's memories into the v2
  *      5-category taxonomy (once per project, idempotent).
  *
- * Session-scoped recomp + project-scoped (once-per-project) migration. Uses the
- * historian model/runner, so it works even when the dreamer is disabled.
+ * Recomp is session-scoped; migration is project-scoped.
+ * The command uses the historian model and runner, so it works when the dreamer is disabled.
  */
 export function registerCtxSessionUpgradeCommand(
 	pi: ExtensionAPI,
@@ -116,25 +114,18 @@ export function registerCtxSessionUpgradeCommand(
 			}
 
 			// "Upgradable" = lacks usable v2 tiers: a pre-v2 `legacy=1` row OR a
-			// malformed `legacy=0` row with no `p1` (interrupted recomp / older
-			// partial-v2 build). Matching ONLY `legacy=1` would trap a session
-			// whose rows are tierless-but-not-flagged-legacy (parity with
-			// OpenCode runManagedUpgrade; dogfood 2026-05-30 AFT).
+			// malformed `legacy=0` row with an empty `p1`
+			// OpenCode runManagedUpgrade).
 			const compartments = getCompartments(currentDeps.db, sessionId);
 			const upgradableCount = compartments.filter(
 				(c) => c.legacy === 1 || !c.p1 || c.p1.trim() === "",
 			).length;
 
-			// The session main model leads the migration chain (parity with
-			// OpenCode's primaryModelId): a quality-sensitive consolidation should
-			// run on the user's working model, not the (possibly misconfigured)
-			// historian model. Historian model + fallbacks remain the safety net.
+			// Consolidation uses the user's working model instead of the historian model.
 			const sessionMainModel = ctx.model
 				? `${ctx.model.provider}/${ctx.model.id}`
 				: undefined;
 
-			// ── Guard: already-upgraded session (parity with OpenCode) ──────────
-			// No upgradable compartments → don't run a wasteful/risky full recomp.
 			if (upgradableCount === 0) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-session-upgrade",
@@ -160,11 +151,7 @@ export function registerCtxSessionUpgradeCommand(
 				readMessages: () => readPiSessionMessages(ctx),
 			} satisfies RawMessageProvider;
 
-			// Detached: the upgrade (multi-pass recomp + memory migration) runs in
-			// the background so the Pi REPL stays responsive (parity with OpenCode's
-			// `void runManagedUpgrade`). The command handler returns right after the
-			// "Rebuilding…" ack above. Provider registration, the `recomp`
-			// status-line flag, shutdown-drain tracking, and cleanup are owned by
+			// The handler runs the upgrade in the background to keep the Pi REPL responsive.
 			// spawnPiRecompRun.
 			spawnPiRecompRun({
 				sessionId,
@@ -175,7 +162,6 @@ export function registerCtxSessionUpgradeCommand(
 						projectIdentity: ctx.cwd,
 					}),
 				work: async () => {
-					// Step 1 — compartment upgrade via full recomp.
 					const recompResult = await executeContextRecompWithResult(
 						{
 							client: createPiHistorianClient({
@@ -205,14 +191,10 @@ export function registerCtxSessionUpgradeCommand(
 							historianTimeoutMs: currentDeps.historianTimeoutMs,
 							memoryEnabled: currentDeps.memoryEnabled,
 							autoPromote: currentDeps.autoPromote,
-							// Embedding substrate: without this the recomp publish path
-							// no-ops chunk embedding on an unregistered project, leaving
-							// rebuilt compartments out of ctx_search. Parity with OpenCode.
+							// The handler registers the project before recomp so rebuilt compartments receive embeddings.
+							// Rebuilt compartments must receive embeddings to appear in `ctx_search`.
 							ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-							// Recomp-runner model chain (parity with OpenCode
-							// recomp-orchestrator): configured fallbacks + the session's
-							// own model as the last-ditch retry, so an empty/invalid-but-
-							// HTTP-200 historian primary escalates instead of failing.
+							// The runner retries with configured fallbacks, then the session model, after the historian primary returns an empty or invalid HTTP-200 response.
 							fallbackModels: currentDeps.historianFallbacks,
 							fallbackModelId: sessionMainModel,
 							language: currentDeps.language,
@@ -220,19 +202,9 @@ export function registerCtxSessionUpgradeCommand(
 						{},
 					);
 
-					// Gate migration + "Complete" on `published` — the GROUND TRUTH
-					// that recomp actually rebuilt compartments (parity with OpenCode
-					// runManagedUpgrade). A recomp can no-op WITHOUT a "— Failed/Skipped"
-					// heading (lease/activeRuns guard returns "Historian already
-					// running…"), which isRecompFailure misses. Running migration +
-					// declaring Complete on a skipped recomp leaves tierless rows but
-					// migrated memories + a project-wide cache-bust from the epoch bump
-					// (dogfood 2026-05-30, AFT false-complete under concurrent processes).
-					// Require a POSITIVE full-success ("— Complete"), not merely the
-					// absence of a Failed/Skipped heading: a published "— Partial"
-					// rebuilt only a prefix (published===true, not a failure heading),
-					// and running migration + declaring Complete on it would migrate
-					// memories while leaving tierless legacy rows. Mirrors OpenCode's
+					// `published` confirms that recomp rebuilt compartments.
+					// `isRecompFailure` does not recognize lease- or active-runs no-ops (`Historian already running…`).
+					// `published` can accompany `— Partial`; do not migrate partial rebuilds because they leave tierless legacy rows.
 					// recomp-orchestrator gate.
 					if (
 						!recompResult.published ||
@@ -251,20 +223,10 @@ export function registerCtxSessionUpgradeCommand(
 						return;
 					}
 
-					// DEFERRED staging (background-safe): stage the native marker as a
-					// pending blob + signal a DEFERRED history refresh so the next
-					// transform pass (at a turn boundary) drains and applies it. The
-					// detached run must NOT apply the marker eagerly (appendCompaction
-					// mutates getBranch immediately, which from a background task could
-					// land mid-turn) nor use the eager history/materialization signals
-					// — those would force a materialization on whatever pass is
-					// running, possibly mid-turn, busting the cache. Mirrors the
-					// background historian's onPublished (signalPiDeferred*).
+					// Background runs must defer marker application until a turn boundary; eager application can mutate the active branch mid-turn.
 					//
-					// Isolated in its own try/catch: marker staging is best-effort (the
-					// next incremental historian pass re-stages a covering marker), so a
-					// throw here must NOT skip the refresh signals, the memory
-					// migration, or the "Complete" message below — recomp already
+					// `stagePiRecompMarker` failures must not prevent refresh signaling, migration, or the completion message.
+					// `stagePiRecompMarker` failures are recoverable because the next incremental historian pass stages a covering marker.
 					// published.
 					try {
 						stagePiRecompMarker({ db: currentDeps.db, sessionId, ctx });

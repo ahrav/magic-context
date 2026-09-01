@@ -251,7 +251,7 @@ fn valid_interrupted_reset_marker_resumes_without_opening_old_family() {
     let dir = tempfile::tempdir().unwrap();
     // Quarantine resume compares paths lexically. A symlinked root
     // (`/var` -> `/private/var`) fails that comparison when spellings are mixed.
-    // commentlint: allow(JUDGE)
+    //
     let root = dir.path().canonicalize().unwrap();
     let conn = seed_kernel(&root);
     conn.execute_batch("CREATE TABLE unexpected(value INTEGER) STRICT;")

@@ -69,23 +69,19 @@ describe("deterministic mural renderer", () => {
     });
 
     test("uses Anthropic's exact 28px tile token formula", () => {
-        // 1092x1092 is 39x39 patches; a 364x700 image is 13x25 patches.
         expect(muralImageTokenEstimateForDimensions(1092, 1092)).toBe(39 * 39);
         expect(muralImageTokenEstimateForDimensions(364, 700)).toBe(13 * 25);
     });
 
     test("fits the 7/50/200 size matrix while keeping full pools at the cap", () => {
         const expected = {
-            // 40 chars × 5px = 200px → 224px = 8 tiles; 14 lines × 9px =
-            // 126px → 140px = 5 tiles, for 8 × 5 = 40 image tiles.
+            // The 7-entry layout rounds 200px by 126px to 224px by 140px, using 40 tiles.
             7: [224, 140, 40],
-            // Three balanced columns make (3 × 40 + 2 gap chars) × 5px =
-            // 610px → 616px = 22 tiles; 34 lines × 9px = 306px → 308px =
-            // 11 tiles, for 22 × 11 = 242 image tiles.
+            // Three 40-character columns plus two gap characters require 616 px (22 tiles).
+            // The 34 lines require 308 px (11 tiles).
             50: [616, 308, 242],
-            // The capped three-column layout leaves 120 usable rows per column
-            // after the never-orphan-header rule: 120 × 9px = 1080px → 1092px
-            // = 39 tiles; 22 × 39 = 858 image tiles.
+            // The never-orphan-header rule leaves 120 usable rows per column.
+            // A 1092 px height uses 39 tiles, so the layout uses 858 image tiles.
             200: [616, 1092, 858],
         } as const;
 
@@ -102,8 +98,7 @@ describe("deterministic mural renderer", () => {
                 expect(result.width).toBeLessThan(MURAL_WIDTH);
                 expect(result.height).toBeLessThan(MURAL_HEIGHT);
             } else {
-                // The full pool still reaches the 1092px height cap; fitted columns
-                // leave its width at 616px rather than paying for blank side tiles.
+                // Fitted columns keep the full pool 616 px wide, avoiding blank side tiles.
                 expect(result.height).toBe(MURAL_HEIGHT);
             }
         }
@@ -112,9 +107,8 @@ describe("deterministic mural renderer", () => {
     test("never costs more tiles than the legacy 72-character single-column fixture", () => {
         const entries = syntheticEntries(50);
         const result = renderMural(entries);
-        // Alternating categories produce 50 banners + 50 body lines. The old
-        // single-column layout was 72 chars × 5px = 360px → 364px = 13 tiles
-        // wide and 100 × 9px = 900px → 924px = 33 tiles tall: 13 × 33 = 429.
+        // Alternating categories produce 50 banners and 50 body lines. The comparison single-column layout uses 72 characters and 100 lines.
+        // The single-column layout is 924 px tall (33 tiles), for 429 tiles.
         const legacyTiles = muralImageTokenEstimateForDimensions(
             Math.ceil((MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH) / MURAL_VISION_TILE) *
                 MURAL_VISION_TILE,
@@ -126,8 +120,6 @@ describe("deterministic mural renderer", () => {
     });
 
     test("fills all three columns on a 300-cue fixture (>80% line occupancy)", () => {
-        // 300 medium cues far exceed one column; with flat bands + full pool the
-        // three-column flow should be densely filled.
         const entries: MuralRenderEntry[] = Array.from({ length: 300 }, (_, index) => ({
             id: index + 1,
             category: CATEGORIES[index % CATEGORIES.length]!,
@@ -135,11 +127,9 @@ describe("deterministic mural renderer", () => {
             cue: `cue ${index} anchor→target relation`,
         }));
         const result = renderMural(entries);
-        // All three columns are used.
         expect(result.layoutItems.some((item) => item.column === 0)).toBe(true);
         expect(result.layoutItems.some((item) => item.column === 1)).toBe(true);
         expect(result.layoutItems.some((item) => item.column === 2)).toBe(true);
-        // Occupancy: filled content lines vs. total grid capacity > 80%.
         const rows = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
         const capacity = 3 * rows;
         expect(result.filledLineCount / capacity).toBeGreaterThan(0.8);
@@ -151,8 +141,8 @@ describe("deterministic mural renderer", () => {
         const result = renderMural([
             { id: 1, category: "PROJECT_RULES", importance: 90, cue: longCue },
         ]);
-        // No rendered line exceeds three legacy-width columns; the selected
-        // content width is narrower and continuation lines use two spaces.
+        // No rendered line exceeds three legacy-width columns.
+        // The content width is narrower than three legacy-width columns, and continuation lines use two spaces.
         expect(longestLine(result.muralText)).toBeLessThanOrEqual(
             MURAL_ROOM_WIDTH * 3 + 2, // three padded columns + 2 single-space gaps
         );
@@ -165,7 +155,7 @@ describe("deterministic mural renderer", () => {
                 expect([...slice].length).toBeLessThanOrEqual(MURAL_ROOM_WIDTH);
             }
         }
-        // The single entry still gets a placement (its first wrapped line).
+        // The single entry gets a placement for its first wrapped line.
         expect(result.renderedIds).toContain(1);
     });
 
@@ -174,7 +164,7 @@ describe("deterministic mural renderer", () => {
             { id: 1, category: "NAMING", importance: 50, cue: "short a" },
             { id: 2, category: "NAMING", importance: 50, cue: "short b" },
         ]);
-        // Both ids land on the SAME line (shared pair) → identical line number.
+        // The paired entries share one line number.
         const a = result.placements.get(1);
         const b = result.placements.get(2);
         expect(a).toBeDefined();
@@ -194,8 +184,8 @@ describe("deterministic mural renderer", () => {
     });
 
     test("prohibition ink: a ⊘ cue renders in the prohibition color, plain cues in body ink", () => {
-        // Two murals differing ONLY in whether the cue is a prohibition must
-        // produce different pixels (prohibition ink is a distinct color).
+        // Murals differing only by a prohibited cue must produce different pixels.
+        // Prohibited cues use a color distinct from normal cue text.
         const withProhibition = renderMural([
             { id: 1, category: "CONSTRAINTS", importance: 80, cue: "⊘cache write (ABI break)" },
         ]);
@@ -211,7 +201,7 @@ describe("deterministic mural renderer", () => {
         const result = renderMural([]);
         expect(result.renderedIds).toHaveLength(0);
         expect(result.filledLineCount).toBe(0);
-        // Still produces a valid (blank) PNG rather than throwing.
+        // An empty mural produces a valid blank PNG instead of throwing.
         expect(result.png.slice(0, 8)).toEqual(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
     });
 

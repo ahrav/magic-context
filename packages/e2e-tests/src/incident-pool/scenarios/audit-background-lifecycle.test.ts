@@ -347,8 +347,7 @@ describe("A47 lease-loss residual-write verifier", () => {
                 ),
             ),
         ).toContain("check-a47-single-terminal-lease-event");
-        // The precondition no longer restates this check, so a missing terminal
-        // event now reaches the verifier and fails it instead of leaving the
+        // A missing terminal event must reach the verifier so the case fails rather than remains unscored.
         // case unscored.
         expect(
             failedIds(
@@ -357,8 +356,7 @@ describe("A47 lease-loss residual-write verifier", () => {
                 ),
             ),
         ).toContain("check-a47-single-terminal-lease-event");
-        // The counter alone is the harness's own instrumentation: production
-        // must also report the loss, and the durable trace must carry exactly
+        // The harness counter does not prove production reported lease loss; the durable trace must contain exactly one marker.
         // one marker.
         expect(
             failedIds(

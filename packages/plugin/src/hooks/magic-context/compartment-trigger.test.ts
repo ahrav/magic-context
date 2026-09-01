@@ -27,7 +27,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* Cleanup may fail with EBUSY on Windows. */
         }
     }
     tempDirs.length = 0;
@@ -277,17 +277,11 @@ describe("checkCompartmentTrigger", () => {
     });
 
     it("does NOT cheap-skip below-floor tags when inMemoryTail is undefined (no historian suppression)", () => {
-        // Regression: with NO in-memory tail (post-restart / marker-drain lag),
-        // the cheap-gate cannot account for below-floor tags via
-        // estimateUntaggedInMemoryTailUpperBound (that path needs the tail). If a
-        // collapsed floor sits ABOVE live eligible tags, a SCOPED bound would
-        // exclude their tokens → falsely cheap-skip a needed historian fire. The
-        // fix uses floor 0 for the bound when inMemoryTail is undefined, so the
-        // gate stays conservative and falls through to the authoritative path,
-        // which then fires on the meaningful eligible head.
+        // When inMemoryTail is undefined, the cheap gate uses floor 0 so the bound includes below-floor tags.
+        // Using floor 0 keeps the cheap gate conservative and falls through to the authoritative path.
+        // The authoritative check then fires when the eligible head exceeds tail_size.
         useTempDataHome("compartment-trigger-belowfloor-undefined-tail-");
         const sessionId = "ses-belowfloor-undefined";
-        // Big narratable eligible head (m-1..m-6) + protected tail (m-7..m-11).
         createOpenCodeDb(sessionId, [
             { id: "m-1", role: "user", text: "a ".repeat(3500) },
             { id: "m-2", role: "assistant", text: "done" },
@@ -302,16 +296,12 @@ describe("checkCompartmentTrigger", () => {
             { id: "m-11", role: "user", text: "protected 5" },
         ]);
         const db = openDatabase();
-        // Tag the eligible head at LOW tag_numbers (1..3) carrying real tokens.
         insertCoveredMessageTag(db, sessionId, "m-1", 1, 3500);
         insertCoveredMessageTag(db, sessionId, "m-3", 2, 3500);
         insertCoveredMessageTag(db, sessionId, "m-5", 3, 3500);
 
-        // Pass a taggerFloorOverride ABOVE every tag (simulating a collapsed
-        // floor) with NO in-memory tail. Pre-fix: the scoped bound excludes tags
-        // 1..3 (bound 0, nullCount 0) → cheap-skip → shouldFire:false (WRONG).
-        // Post-fix: floor 0 includes them → bound >> budget → fall through →
-        // tail_size fires on the eligible head.
+        // taggerFloorOverride exceeds every tag to simulate a collapsed floor without inMemoryTail.
+        // A bound of 0 must not cheap-skip tags 1–3.
         const result = checkCompartmentTrigger(
             db,
             sessionId,
@@ -470,10 +460,7 @@ describe("checkCompartmentTrigger", () => {
     });
 
     it("projects aged reasoning only when the provider can clear it from the wire", () => {
-        // Match issue #274's shape: at 36.8% usage, 70% of tagged bytes are
-        // aged reasoning. Counting it as reclaimable projects 11.0%, below the
-        // 16.2% post-drop target; a provider that cannot clear it must instead
-        // fire the historian at the real 36.8% pressure.
+        // Providers that cannot clear aged reasoning must fire at 36.8% pressure because excluding it projects 11.0%, below the 16.2% target.
         useTempDataHome("compartment-trigger-unavailable-reasoning-");
         const sessionId = "ses-unavailable-reasoning";
         createOpenCodeDb(sessionId, [
@@ -490,8 +477,8 @@ describe("checkCompartmentTrigger", () => {
             { id: "m-11", role: "user", text: "protected tail 5" },
         ]);
         const db = openDatabase();
-        // Total tagged bytes = 1,000; tag 1's 700 reasoning bytes are old
-        // enough for clearing because tag 51 establishes the age cutoff.
+        // Excluding tag 1's aged reasoning leaves 300 reclaimable bytes.
+        // The provider gate excludes the 700 aged reasoning bytes from reclaimable bytes.
         insertTag(db, sessionId, "m-1", "message", 299, 1, 700);
         insertTag(db, sessionId, "m-11", "message", 1, 51);
         const runTrigger = (reasoningProjection: {
@@ -515,17 +502,14 @@ describe("checkCompartmentTrigger", () => {
                 reasoningProjection,
             );
 
-        // Mutation direction: removing the provider gate would count the 700
-        // reasoning bytes, project 11.0%, and make this assertion fail.
+        // Including the 700 reasoning bytes as reclaimable projects 11.0%.
         expect(runTrigger({ providerID: "opencode" })).toMatchObject({
             shouldFire: true,
             reason: "projected_headroom",
         });
-        // Anthropic safely clears reasoning through its empty-content sentinel,
-        // so the aged bytes stay projected as reclaimable and suppress this fire.
+        // Anthropic clears reasoning through its empty-content sentinel, so aged bytes remain reclaimable and suppress this fire.
         expect(runTrigger({ providerID: "anthropic" })).toEqual({ shouldFire: false });
-        // Pi clears typed thinking for every provider, so its explicit shared
-        // trigger capability retains the same projection on an OpenCode-like id.
+        // Pi clears typed thinking for every provider, so its shared trigger capability preserves the reclaimable-byte projection for OpenCode-like IDs.
         expect(runTrigger({ providerID: "opencode", canClearReasoning: true })).toEqual({
             shouldFire: false,
         });
@@ -568,8 +552,8 @@ describe("checkCompartmentTrigger", () => {
         const db = openDatabase();
         insertCoveredMessageTag(db, sessionId, "m-1", 1, 7_000);
 
-        // With T=90 the force band is 92. Reverting the trigger to literal 80
-        // would force-fire this runnable head instead of reaching the proactive floor.
+        // With T=90, the force band starts at 92.
+        // T=90's proactive floor prevents the runnable head from force-firing.
         expect(
             checkCompartmentTrigger(
                 db,
@@ -616,7 +600,6 @@ describe("checkCompartmentTrigger", () => {
     });
 
     it("does not fire when only unsummarized history is inside the protected tail", () => {
-        //#given: 3 messages, all 3 are user turns so protected tail covers all
         useTempDataHome("compartment-trigger-protected-only-");
         createOpenCodeDb("ses-protected-only", [
             { id: "m-1", role: "user", text: "a".repeat(200) },
@@ -636,12 +619,11 @@ describe("checkCompartmentTrigger", () => {
             6500,
         );
 
-        //#then: no eligible prefix — should not fire
+        // No eligible prefix prevents `checkCompartmentTrigger` from firing.
         expect(result).toEqual({ shouldFire: false });
     });
 
     it("fires proactively when meaningful eligible history exists before protected tail", () => {
-        //#given: 8 user turns with big content — last 5 are protected, first 3 are eligible
         useTempDataHome("compartment-trigger-eligible-prefix-");
         createOpenCodeDb("ses-eligible-prefix", [
             { id: "m-1", role: "user", text: "a ".repeat(3500) },
@@ -658,7 +640,6 @@ describe("checkCompartmentTrigger", () => {
         ]);
         const db = openDatabase();
 
-        //#when: no pending drops, percentage above proactive threshold
         const result = checkCompartmentTrigger(
             db,
             "ses-eligible-prefix",
@@ -669,32 +650,26 @@ describe("checkCompartmentTrigger", () => {
             6500,
         );
 
-        //#then: fires because the eligible prefix (m-1 to m-6) is meaningful
+        // The eligible prefix spans `m-1` through `m-6` and satisfies the meaningful-history threshold.
         expect(result).toMatchObject({ shouldFire: true, reason: "projected_headroom" });
     });
 
     it("does NOT tail_size-fire a tool-heavy tail whose narratable (TC) content is thin", () => {
-        //#given: a low-pressure session whose eligible head is dominated by huge
-        // tool OUTPUT (stripped to one-line TC: summaries in the chunked view).
-        // True-raw is enormous; the narratable content is a few hundred tokens.
-        // Pre-fix, tail_size fired on true-raw at 25% usage and produced a
-        // confetti compartment per few file reads (observed live on Pi:
-        // spans degraded 155 -> 27 messages/compartment over one session).
+        // The chunked view reduces each tool output to a one-line `TC:` summary.
+        // True-raw includes the tool output; narratable content contains only `TC:` summaries and short questions.
+        // `tail_size` must use narratable content rather than true-raw content.
         useTempDataHome("compartment-trigger-tool-heavy-");
         const sessionId = "ses-tool-heavy-thin";
         const messages: Array<{ id: string; role: string; text?: string }> = [];
         for (let i = 1; i <= 6; i++) {
             messages.push({ id: `m-u${i}`, role: "user", text: `short question ${i}` });
-            // Assistant turn whose part is a tool result carrying ~40K chars of
-            // output — counts fully toward true-raw, collapses to a TC: line.
+            // The tool output counts fully toward true-raw content but collapses to a `TC:` line.
             messages.push({ id: `m-a${i}`, role: "assistant", text: undefined });
         }
-        // Protected tail filler.
         for (let i = 1; i <= 5; i++) {
             messages.push({ id: `m-p${i}`, role: "user", text: `protected ${i}` });
         }
         createOpenCodeDb(sessionId, messages);
-        // Attach the huge tool outputs as tool parts on the assistant messages.
         const ocPath = join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db");
         const oc = new Database(ocPath);
         try {
@@ -723,10 +698,8 @@ describe("checkCompartmentTrigger", () => {
             closeQuietly(oc);
         }
         const db = openDatabase();
-        // Tag-token rows so the cheap pre-gate (live-tail upper bound vs
-        // triggerBudget) does NOT short-circuit — the point of this test is
-        // the tail_size METRIC, which only evaluates past the gate. The tool
-        // tags carry the huge output token counts (true-raw axis).
+        // Tag-token rows keep the live-tail upper bound above `triggerBudget`, so the pre-gate does not short-circuit before `tail_size`.
+        // The pre-gate must not short-circuit because `tail_size` runs only after it.
         for (let i = 1; i <= 6; i++) {
             insertTag(
                 db,
@@ -748,8 +721,8 @@ describe("checkCompartmentTrigger", () => {
             );
         }
 
-        //#when: LOW pressure (25%) — far below the proactive floor. The only
-        // trigger that could fire is tail_size.
+        // At 25% pressure, proactive triggers cannot fire.
+        // `tail_size` is the only trigger eligible at 25% pressure.
         const result = checkCompartmentTrigger(
             db,
             sessionId,
@@ -760,8 +733,7 @@ describe("checkCompartmentTrigger", () => {
             5_000,
         );
 
-        //#then: must NOT fire — the historian has nothing substantial to
-        // narrate. Pressure paths (63%/80%) remain the relief for occupancy.
+        // `tail_size` must not fire when narratable content is thin at 25% pressure.
         expect(result.shouldFire).toBe(false);
     });
 });

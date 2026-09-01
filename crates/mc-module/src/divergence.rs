@@ -1,8 +1,4 @@
-//! First-divergence attribution for served CK block sequences.
 //!
-//! The comparison intentionally treats appending after the previously served set as normal
-//! tail growth. It only reports a mismatch when an existing served position changes, so the
-//! steady-state path compares block hashes and exits at the first changed position.
 
 use mc_store::ServedBlockFingerprint;
 use serde::{Deserialize, Serialize};
@@ -25,10 +21,9 @@ pub struct FirstDivergence {
     pub approx_token_depth: usize,
 }
 
-/// Compare the old and new served block sequences and return their first non-append mismatch.
 ///
-/// A missing old sequence is a cold start, not a divergence. Likewise, a new sequence that
-/// retains every old entry in order and only appends blocks is normal tail growth.
+/// An empty old sequence is a cold start, not a divergence.
+/// A new sequence that retains every old entry in order and only appends blocks is not a divergence.
 pub fn first_divergence(
     old: &[ServedBlockFingerprint],
     new: &[ServedBlockFingerprint],
@@ -69,8 +64,6 @@ pub fn first_divergence(
         });
     }
 
-    // The old sequence being a prefix of the new one is append-only growth, not a bust
-    // attribution. A shorter new sequence removes a previously served tail block.
     if new.len() < old.len() {
         let index = new.len();
         let old_block = &old[index];

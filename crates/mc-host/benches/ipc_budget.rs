@@ -1,19 +1,13 @@
-//! IPC budget benchmark: Criterion scalar regression fixtures plus the
-//! canonical retained-evidence collector, on one custom entry point.
+//! `main` combines Criterion scalar regression fixtures with retained-evidence collection.
 //!
-//! Modes (environment-driven so `cargo bench` arguments stay Criterion's):
-//! - default: Criterion scalar groups (developer regression diagnostics,
-//!   never tail evidence).
-//! - `MC_IPC_BUDGET_ROLE=host`: process-isolated echo host child role.
-//! - `MC_IPC_BUDGET_MODE=collect`: run one arm attempt and publish
-//!   transactional evidence (exit 0 for complete/skipped, nonzero for
-//!   configuration, correctness, or artifact failures).
-//! - `MC_IPC_BUDGET_MODE=plan`: print the deterministic counterbalanced
+//! Modes use environment variables so `cargo bench` arguments remain available to Criterion.
+//! `run_criterion` runs Criterion scalar groups for developer regression diagnostics.
+//! `MC_IPC_BUDGET_ROLE=host` selects the process-isolated echo-host child role.
+//! `MC_IPC_BUDGET_MODE=collect` runs one arm attempt and publishes transactional evidence.
+//! `MC_IPC_BUDGET_MODE=plan` prints the deterministic counterbalanced block schedule.
 //!   block schedule.
-//! - `MC_IPC_BUDGET_MODE=aggregate`: verify, merge, and summarize a run
-//!   directory into byte-stable summary data.
-//! - `MC_IPC_BUDGET_MODE=finalize-interrupted`: move leftover running
-//!   manifests to the `interrupted` terminal state.
+//! `MC_IPC_BUDGET_MODE=aggregate` verifies, merges, and summarizes a run directory into byte-stable summary data.
+//! `MC_IPC_BUDGET_MODE=finalize-interrupted` moves running manifests to the `interrupted` terminal state.
 
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
@@ -53,10 +47,7 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// Parses an env knob, defaulting only when the variable is unset. A
-/// present but malformed value is a configuration error: silently
-/// substituting the default would finalize evidence for a workload the
-/// operator did not request, without recording any error.
+/// `env_parse` rejects malformed present values to avoid recording evidence for an unrequested workload.
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     match env_var(name) {
         None => Ok(default),
@@ -95,11 +86,7 @@ fn main() {
     run_criterion();
 }
 
-// --- child host role ---------------------------------------------------
-
-/// Echo host child: pins the whole process (before any Tokio thread
-/// exists), publishes, prints READY, and shuts down on stdin EOF so the
-/// parent's exit always tears it down.
+/// `run_child_host` pins the process before creating Tokio threads and exits on stdin EOF.
 fn run_child_host() {
     if let Some(cpu) = env_var("MC_IPC_BUDGET_HOST_CPU") {
         let cpu: u32 = cpu.parse().expect("MC_IPC_BUDGET_HOST_CPU");
@@ -134,8 +121,7 @@ fn run_child_host() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         println!("READY {}", publication.display());
-        // Blocking stdin read on a spawn_blocking thread: EOF means the
-        // parent is gone or done.
+        // `ChildHost` treats stdin EOF as the host shutdown signal.
         let _ = tokio::task::spawn_blocking(|| {
             let mut sink = Vec::new();
             let _ = std::io::stdin().read_to_end(&mut sink);
@@ -146,8 +132,8 @@ fn run_child_host() {
     });
 }
 
-/// A spawned child host process and its publication path. Dropping closes
-/// stdin (shutting the host down) and reaps the child.
+/// Dropping `ChildHost` closes stdin and reaps the child.
+/// `ChildHost::drop` closes stdin to stop the host, then reaps the child.
 struct ChildHost {
     child: Child,
     publication: PathBuf,
@@ -169,14 +155,9 @@ impl ChildHost {
             Some(cpu) => cmd.env("MC_IPC_BUDGET_HOST_CPU", cpu.to_string()),
             None => cmd.env_remove("MC_IPC_BUDGET_HOST_CPU"),
         };
-        // Fate-bind the host to this collector: when the collector dies
-        // without unwinding (plain SIGTERM from the runner's interrupt
-        // trap, SIGKILL, OOM), ChildHost::drop never runs, and the
-        // pinned host would otherwise survive as an orphan holding its
-        // CPU and temp directory into subsequent attempts. The signal is
-        // installed after fork, so a collector that died in that window
-        // has already reparented this child and no notification will
-        // arrive; the parent-pid recheck closes that race.
+        // `PR_SET_PDEATHSIG` terminates the host when collector death bypasses `ChildHost::drop`, preventing orphaned pinned hosts.
+        // `PR_SET_PDEATHSIG` is installed after `fork`, so collector death before installation cannot notify the child.
+        // The parent-PID recheck detects a collector that dies before the signal is installed.
         let collector_pid = std::process::id();
         unsafe {
             use std::os::unix::process::CommandExt;
@@ -198,7 +179,7 @@ impl ChildHost {
         }
         let mut child = cmd.spawn().map_err(|err| format!("spawn host: {err}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
-        // The receiver enforces the deadline because BufReader::lines can
+        // The receiver enforces the deadline because `BufReader::lines` can block indefinitely.
         // block indefinitely.
         let (line_tx, line_rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
         std::thread::spawn(move || {
@@ -244,7 +225,7 @@ impl ChildHost {
         &self.publication
     }
 
-    /// True when the child is still running (a dead child fails the arm).
+    /// alive returns true only while the child runs; a dead child fails the arm.
     fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -266,8 +247,6 @@ impl Drop for ChildHost {
         let _ = self.child.wait();
     }
 }
-
-// --- collection mode ----------------------------------------------------
 
 struct CollectConfig {
     out: PathBuf,
@@ -307,8 +286,6 @@ fn read_collect_config() -> Result<CollectConfig, String> {
         }
         None => None,
     };
-    // Validated here so every later read of the rate (attempt naming,
-    // the open-loop collector) sees a well-formed value.
     env_parse::<u64>("MC_IPC_BUDGET_RATE", 0)?;
     Ok(CollectConfig {
         out,
@@ -350,16 +327,7 @@ fn host_id() -> HostId {
         })
         .unwrap_or_else(|| std::env::consts::ARCH.to_owned());
     HostId {
-        // Manifests are retained in the repository, so the hostname field
-        // carries an operator-chosen label, falling back to a hashed
-        // machine fingerprint rather than a shared constant: `compatible`
-        // treats host-identity equality as proof of one machine, and a
-        // shared default would merge histograms across physically
-        // different hosts that happen to share kernel and CPU strings.
         hostname: env_var("MC_IPC_BUDGET_HOST_LABEL").unwrap_or_else(|| {
-            // An empty machine-id (minimal or not-yet-initialized
-            // images) must not hash to one shared identity; fall through
-            // to the hostname, and to "unknown" only when both sources
             // are empty.
             let id = std::fs::read_to_string("/etc/machine-id")
                 .ok()
@@ -454,8 +422,7 @@ fn attempt_name(cfg: &CollectConfig) -> String {
     name
 }
 
-/// Runs one arm attempt end to end. Exit code 0 covers complete and
-/// structured-skip; nonzero is reserved for configuration, correctness, or
+/// Exit code 0 covers complete and structured-skip outcomes; nonzero indicates configuration, correctness, or infrastructure failure.
 /// artifact failures.
 fn run_collect() -> i32 {
     let cfg = match read_collect_config() {
@@ -487,15 +454,13 @@ fn run_collect() -> i32 {
 
 enum PairResolution {
     Pair((u32, u32)),
-    /// Auto-selected class unavailable on this host: structured skip.
+    /// An unavailable auto-selected class produces a structured skip.
     Skip(String),
-    /// Explicit pair rejected: configuration failure, recorded on a
     /// failed attempt.
     Invalid((u32, u32), String),
 }
 
-/// Resolves the ordered pair before any attempt directory exists, so a
-/// malformed configuration fails before measurement.
+/// `run_collect` resolves the ordered pair before creating an attempt directory so malformed configuration fails before measurement.
 fn resolve_pair(cfg: &CollectConfig) -> Result<PairResolution, String> {
     let topology = read_topology(Path::new("/")).map_err(|err| format!("topology: {err}"))?;
     let allowed = effective_affinity().map_err(|err| format!("affinity: {err}"))?;
@@ -534,8 +499,7 @@ fn finalize_skip(cfg: &CollectConfig, reason: &str) -> i32 {
     }
 }
 
-/// Owns the attempt lifecycle around one arm body: begin, measure, stamp,
-/// then finalize to exactly one of Complete or Failed.
+/// `run_collect` owns one arm's lifecycle: begin, measure, stamp, then finalize to exactly one of `Complete` or `Failed`.
 fn run_attempt(
     cfg: &CollectConfig,
     pair: (u32, u32),
@@ -652,13 +616,11 @@ fn check_host_alive(host: &mut ChildHost) -> Result<(), String> {
     Ok(())
 }
 
-/// Correctness is a gate, not an outcome to average over: a live host
-/// returning wrong bodies, protocol errors, or unexpected frames
-/// satisfies conservation, and publishing the successful subset would
-/// select latency from only the requests the host answered correctly.
-/// A histogram overflow is a valid measured terminal excluded from every
-/// percentile, so retaining the attempt would survivorship-bias the
-/// tails toward the faster subset; it fails the attempt the same way.
+/// Wrong bodies, protocol errors, and unexpected frames are correctness failures.
+/// The collector publishes failed requests so failures cannot improve reported latency.
+/// Histogram overflows are excluded from every percentile.
+/// Accepting histogram overflows would bias tail latency toward faster requests.
+/// Histogram overflows invalidate the attempt because excluding them biases tail latency toward faster requests.
 fn check_correctness(outcomes: &perf_measurement::OutcomeCounts) -> Result<(), String> {
     let correctness_failures =
         outcomes.protocol_error + outcomes.body_mismatch + outcomes.unexpected_frame;
@@ -728,9 +690,8 @@ fn collect_ring_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), St
         "scheduled": result.scheduled,
         "elapsed_secs": result.elapsed.as_secs_f64(),
     });
-    // The results and outcomes get a checksummed record; aggregation
-    // compares the manifest copies against it, so a manifest edit to any
-    // scalar (not just the p50 the gap pairing recomputes) fails loudly.
+    // Aggregation rejects sidecars whose results or outcomes differ from the manifest.
+    // Any manifest scalar that differs from the sidecar fails aggregation.
     let record = serde_json::json!({
         "results": results,
         "outcomes": result.outcomes,
@@ -773,11 +734,11 @@ fn collect_ring_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Stri
             result.outcomes
         ));
     }
-    // Drain-time transport failures do not mark the run truncated (the
-    // window itself completed), but a live peer that left measured
-    // requests unanswered or closed during the drain still lost
-    // responses; retaining the attempt would publish latency from only
-    // the successful subset.
+    // Drain-time transport failures do not truncate a completed measurement window.
+    // A peer that closes during drain can leave measured requests unanswered.
+    // Unanswered measured requests invalidate the attempt.
+    // Publishing only completed requests would bias latency toward successful requests.
+    // Delete
     let transport_failures = result.outcomes.peer_closed
         + result.outcomes.write_failure
         + result.outcomes.unresolved_at_drain;
@@ -813,9 +774,9 @@ fn collect_ring_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Stri
         "scheduled_slots": result.scheduled_slots,
         "elapsed_secs": result.elapsed.as_secs_f64(),
     });
-    // The results and outcomes get a checksummed record like the serial
-    // and throughput arms; the histograms cover only the percentiles,
-    // leaving scheduled_slots and the outcome counters unprotected
+    // The sidecar preserves results and outcome counters that histograms do not contain.
+    // Histograms do not contain scheduled_slots or outcome counters.
+    // Delete
     // otherwise.
     let record = serde_json::json!({
         "results": results,
@@ -858,17 +819,15 @@ fn collect_ring_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<()
             result.outcomes
         ));
     }
-    // The throughput arm has no scheduled count independent of its
-    // outcomes (`terminal` is `outcomes.total()`), so a conservation
-    // check against it proves nothing; response loss surfaces instead as
-    // an undrained in-flight request, which `run_throughput` returns as
-    // an error. Host liveness and correctness stay as gates.
+    // Throughput has no scheduled count independent of outcome totals.
+    // A conservation check against `outcomes.total()` would be tautological.
+    // Response loss instead appears as an undrained in-flight request.
     check_host_alive(&mut host)?;
     check_correctness(&result.outcomes)?;
     if result.successful == 0 {
-        // Every measured completion can land in the post-window drain
-        // (depth 1 with latency longer than the remaining window), which
-        // is a valid drain but not a measured operating point.
+        // A measured request can complete during the post-window drain.
+        // At depth 1, a request whose latency exceeds the remaining window completes during drain.
+        // Measured requests can complete during the post-window drain.
         return Err(format!(
             "throughput window produced no measured successful completion \
              (outcomes: {:?}); the point is invalid for this host",
@@ -885,10 +844,8 @@ fn collect_ring_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<()
         "drained": result.drained,
         "measured_secs": result.measured.as_secs_f64(),
     });
-    // The throughput arm writes no histogram, so its counters get their
-    // own checksummed sidecar; aggregation compares the manifest's
-    // results and outcomes against it, exactly like the histogram-backed
-    // arms' scalar checks.
+    // Delete
+    // Aggregation validates throughput counters against the sidecar because the arm writes no histogram.
     let record = serde_json::json!({
         "results": results,
         "outcomes": result.outcomes,
@@ -909,10 +866,7 @@ fn collect_ring_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<()
     Ok(())
 }
 
-// --- plan / aggregate / finalize ----------------------------------------
-
-/// Default open-loop offered-rate points; byte-identical to the script's
-/// `BUDGET_RATES` default so the plan preview matches execution.
+/// `BUDGET_RATES` uses this exact default, so plan previews match execution.
 pub const DEFAULT_RATES: &str = "20000 50000 80000";
 
 /// Cross-NUMA paired tail in forward orientation. The script's
@@ -950,10 +904,6 @@ pub fn plan_block_entries(same_l3: &[String], cross: &[String], rates: &[u64]) -
     entries
 }
 
-/// Attempt directory names the standard schedule produces for one run:
-/// every same-L3 arm per block (one open-loop attempt per rate) plus the
-/// cross-NUMA paired tail. The names mirror `attempt_name` exactly so
-/// aggregation can verify the planned set is fully present.
 fn expected_attempt_names(blocks: u32, rates: &[u64]) -> Vec<String> {
     let mut names = Vec::new();
     for block in 1..=blocks {
@@ -970,10 +920,8 @@ fn expected_attempt_names(blocks: u32, rates: &[u64]) -> Vec<String> {
     names
 }
 
-/// Persists the planned attempt set at run creation, so aggregation can
-/// detect a deleted or omitted attempt directory: a missing repetition
-/// leaves no residue for the manifest checks to reject, and a partial
-/// run would otherwise summarize as a valid smaller experiment.
+/// The persisted plan lets aggregation reject missing attempts.
+/// Without a persisted plan, aggregation can summarize a partial run as a smaller valid experiment.
 fn run_record_plan() -> i32 {
     let out = PathBuf::from(match env_var("MC_IPC_BUDGET_OUT") {
         Some(out) => out,
@@ -1002,10 +950,6 @@ fn run_record_plan() -> i32 {
             let path = out.join("run-plan.json");
             let mut text = serde_json::to_string_pretty(&plan).expect("serialize plan");
             text.push('\n');
-            // Create-new semantics: rewriting an existing plan (say with
-            // a smaller block count after losing a block) would let
-            // aggregation accept the surviving subset, defeating the
-            // completeness guarantee the plan provides.
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1084,12 +1028,10 @@ fn run_aggregate() -> i32 {
     }
 }
 
-/// Builds the byte-stable run summary from complete attempts only.
+/// Aggregation excludes attempts with a running or missing manifest.
 fn aggregate(run_dir: &Path) -> Result<String, String> {
-    // Attempts holding only a running manifest are crash residue that
-    // finalize-interrupted has not converted, and a directory with no
-    // manifest at all is a failed Attempt::begin; aggregating past
-    // either would publish a complete-looking summary that silently
+    // Aggregation excludes attempts with a running or missing manifest.
+    // Aggregation excludes attempts with a running or missing manifest.
     // omits repetitions.
     let mut unfinalized = 0usize;
     let entries =
@@ -1120,12 +1062,8 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
              MC_IPC_BUDGET_MODE=finalize-interrupted over this directory first"
         ));
     }
-    // The persisted plan is required: a lost or omitted run-plan.json
-    // would otherwise skip the completeness check and let a partial copy
-    // summarize as a valid smaller experiment — the exact failure the
-    // plan exists to prevent. (Runs predating the plan file also predate
-    // the record sidecars, so they are already rejected below and need
-    // the harness at their collection commit.)
+    // Aggregation requires `run-plan.json` to reject missing attempts.
+    // Aggregation requires `run-plan.json` to reject missing attempts.
     let plan_path = run_dir.join("run-plan.json");
     if !plan_path.is_file() {
         return Err(format!(
@@ -1157,12 +1095,11 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         names
     };
     let attempts: Vec<evidence::LoadedAttempt> = evidence::load_attempts(run_dir)?;
-    // Every attempt directory must be bound to the plan and to the
-    // identity its manifest records: an extra unplanned attempt would
-    // silently join the aggregates, and a renamed or copied directory
-    // (an r80000 attempt posing as r20000, or a skip renamed onto a
-    // planned path) would satisfy the plan while measuring nothing or
-    // the wrong operating point.
+    // Every attempt directory must match a planned attempt and its manifest identity.
+    // Unplanned attempts must not contribute to aggregates.
+    // A renamed directory can misrepresent its planned operating point.
+    // A renamed skip can satisfy the plan without measuring its operating point.
+    // A mismatched directory can measure the wrong operating point.
     for a in &attempts {
         let actual = a
             .dir
@@ -1214,10 +1151,8 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
     }
 
     let mut arms_summary = serde_json::Map::new();
-    // Groups are (arm, collection configuration): one ArmId can cover
-    // several operating points (the open-loop arm runs one attempt per
-    // offered rate), and pooling their histograms would merge different
-    // workloads into one distribution.
+    // Each open-loop attempt has one offered rate.
+    // Pooling open-loop histograms across rates would merge distinct workloads.
     type Group = (ArmId, Option<serde_json::Value>);
     let mut groups: Vec<Group> = Vec::new();
     for attempt in &attempts {
@@ -1262,10 +1197,9 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         if let Some(file) = hist_file {
             let merged = evidence::merge_arm_histograms(&group_attempts, arm, file)?;
             let total: u64 = merged.len();
-            // The headline floor derives from each repetition's verified
-            // histogram, not the manifest's recorded_samples scalar: the
-            // scalar is unprotected by any checksum, and an inflated
-            // value could unlock p99.9 for a repetition that never met
+            // The headline floor does not use manifest `recorded_samples`.
+            // The manifest `recorded_samples` scalar is not checksummed.
+            // An inflated `recorded_samples` value that reaches the floor would unlock p99.9 before the verified histogram does.
             // the floor.
             let mut headline_ok = true;
             for a in &complete {
@@ -1321,11 +1255,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                 }
             }
         }
-        // Record-backed arms: the manifest's results and outcomes are
-        // compared against their checksummed record sidecar, so a
-        // manifest edit to any scalar fails loudly. The serial arm's
-        // histogram covers only its percentiles; the throughput arm has
-        // no histogram at all.
+        // Record-backed arms compare manifest results and outcomes with their checksummed record sidecar.
         let record_file = match arm.name.as_str() {
             ARM_RING_SERIAL => Some("serial.json"),
             ARM_RING_OPEN => Some("open.json"),
@@ -1355,9 +1285,6 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             }
         }
         if arm.name == ARM_ATOMIC {
-            // Every atomic result field is recomputable from the
-            // checksummed batches.json record; the manifest's copy is
-            // otherwise unprotected beyond the median the gap pairing
             // recomputes.
             for a in &complete {
                 evidence::require_declared(a, "batches.json")?;
@@ -1411,15 +1338,12 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             ),
             None => arm.name.clone(),
         };
-        // Operating points of one arm stay distinct in the summary; the
-        // rate suffix matches the plan preview's `arm@class:rN` shape.
+        // The summary keeps each arm's operating points distinct.
         if let Some(rate) = collection.as_ref().and_then(|c| c["rate_per_sec"].as_u64()) {
             key.push_str(&format!(":r{rate}"));
         }
-        // Two groups can still share a key when they differ only in
-        // non-rate collection settings (a resumed run mixing serial
-        // measured_ops, say); a silent insert would replace one group's
-        // evidence with the other's.
+        // The summary key includes `measured_ops` to keep groups distinct.
+        // The builder rejects duplicate summary keys so an insert cannot replace a group.
         if arms_summary.contains_key(&key) {
             let fingerprint = perf_measurement::sha256_hex(
                 serde_json::to_string(&collection)
@@ -1435,9 +1359,6 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
     }
 
     let gaps = evidence::paired_gaps(&attempts)?;
-    // Gap statistics never pool topology classes or CPU pairs: rows from
-    // different classes or different ordered pairs measure different
-    // hardware paths, so each (class, pair) gets its own median and
     // bootstrap interval.
     let mut gaps_by_class: std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>)> =
         std::collections::BTreeMap::new();
@@ -1531,10 +1452,6 @@ fn run_finalize_interrupted() -> i32 {
     }
 }
 
-// --- criterion scalar fixtures -------------------------------------------
-
-/// Criterion output is a developer regression diagnostic; retained
-/// HdrHistogram evidence owns every tail conclusion.
 fn run_criterion() {
     let mut criterion = Criterion::default().configure_from_args();
 
@@ -1556,10 +1473,6 @@ fn run_criterion() {
             bencher.iter_custom(|iters| timed_exchanges(a, b, iters).expect("valid pinned pair"));
         });
         group.finish();
-        // Any pin the atomic fixture leaves on this thread propagates
-        // into the child host spawned below (an unpinned spawn inherits
-        // the parent's mask), time-slicing host and client on one core;
-        // restore the schedulable set captured before any group ran.
         if allowed.is_empty() {
             eprintln!("atomic_rtt: affinity not restored (allowed CPU set is empty)");
         } else if let Err(err) = linux_topology::set_current_thread_affinity(&allowed) {

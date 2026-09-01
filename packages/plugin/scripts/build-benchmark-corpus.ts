@@ -1,14 +1,13 @@
 #!/usr/bin/env bun
 /**
- * Author, build, and check the judged retrieval-benchmark release.
+ * This script authors, builds, and checks the judged retrieval-benchmark release.
  *
- * The authored artifact content below is the reviewed source of truth for
- * the checked-in `scripts/fixtures/retrieval-benchmark/` release. Commands:
- * `fingerprint`, `build`, and `check <manifest.json>`.
+ * The authored artifacts are the reviewed source of truth for the checked-in release.
+ * This script supports `fingerprint`, `build`, and `check <manifest.json>`.
  *
- * The builder is DB-free and cannot recover queries or mint approvals; the
- * approval records below bind one exact release tuple, and any content or
- * policy edit makes promotion fail until new operator approvals are recorded.
+ * The DB-free builder cannot recover queries or mint approvals.
+ * Approval records bind one exact release tuple.
+ * Any content or policy edit requires new operator approvals before promotion.
  */
 
 import { basename, dirname, resolve } from "node:path";
@@ -44,7 +43,7 @@ interface AuthoredEntry {
     partition: "development" | "holdout";
     slug: string;
     queryText: string;
-    /** Extra queries in the same paraphrase group targeting the same document. */
+    /** `paraphrases` entries target the same document and belong to the same paraphrase group. */
     paraphrases?: string[];
     mode: "explicit" | "automatic";
     sourceFilters: QueryScenario["sourceFilters"];
@@ -52,9 +51,9 @@ interface AuthoredEntry {
     docLocator: string;
     docTitle: string;
     docBody: string;
-    /** Additional structured aliases for the target document. */
+    /** `extraAliases` aliases identify the target document. */
     extraAliases?: Array<{ namespace: string; locator: string }>;
-    /** Pooled grade-0 distractor document, when present. */
+    /** `distractor`, when present, is a pooled grade-0 document. */
     distractor?: { kind: DocumentKind; locator: string; title: string; body: string };
 }
 
@@ -142,8 +141,8 @@ const AUTHORED: AuthoredEntry[] = [
         partition: "holdout",
         slug: "architecture-rationale-hold",
         queryText: "reason recovery drafts live outside the repository worktree",
-        // Explicit, not automatic: the target is a primer, and the production
-        // automatic path never searches primers (AUTO_SEARCH_SOURCES).
+        // The target document is a primer, and production automatic search excludes primers.
+        // `AUTO_SEARCH_SOURCES` excludes primers from production automatic search.
         mode: "explicit",
         sourceFilters: null,
         docKind: "primer",
@@ -338,19 +337,19 @@ const AUTHORED: AuthoredEntry[] = [
     },
 ];
 
-/** Fixture alias namespaces must byte-match production-encoded locators, so
- *  the mapping is the production codec's, not a local copy that can drift. */
+/** Fixture alias namespaces must byte-match production-encoded locators.
+ * The production codec defines the mapping; local copies can drift. */
 const ALIAS_NAMESPACE: Record<DocumentKind, string> = SOURCE_LOCATOR_KIND;
 
 const REFERENCE_TIME_MS = 1_755_400_000_000;
 
-/** Scenario message-history visibility for EXPLICIT scenarios:
- *  `searchMessages` and `searchCompartmentChunks` treat the cutoff as an
- *  inclusive maximum ordinal (0 excludes everything — ordinals are 1-based).
- *  Authored scenarios model a session whose seeded fixture history is fully
- *  compacted, so the cutoff sits far above any ordinal a harness seeds.
- *  Automatic scenarios carry null: the production automatic path searches
- *  all indexed history with no cutoff. */
+/**
+ * `searchMessages` and `searchCompartmentChunks` treat the cutoff as an inclusive maximum ordinal.
+ * Ordinal 0 excludes every result because ordinals are 1-based.
+ * Authored scenarios model sessions with fully compacted seeded fixture history.
+ * The cutoff exceeds every ordinal seeded by the harness.
+ * Automatic scenarios search all indexed history because `null` disables the cutoff.
+ * A `null` cutoff includes all indexed history. */
 const MESSAGE_ORDINAL_CUTOFF = 100_000;
 
 function makeScenario(
@@ -364,10 +363,10 @@ function makeScenario(
         category: entry.category,
         mode: entry.mode,
         queryText,
-        // Automatic scenarios declare the exact production source set: the
-        // automatic path always searches AUTO_SEARCH_SOURCES, so a narrower
-        // authored filter would remove competing lanes and inflate the
-        // target's rank against the real baseline.
+        // Automatic scenarios mirror the production source set.
+        // The production automatic path always searches `AUTO_SEARCH_SOURCES`.
+        // A narrower authored filter removes competing lanes.
+        // Removing competing lanes inflates the target's rank relative to the real baseline.
         sourceFilters:
             entry.mode === "automatic" ? [...AUTO_SEARCH_SOURCES] : entry.sourceFilters,
         fixtureScope: { projectScope: FIXTURE_PROJECT_SCOPE, sessionScope: null },
@@ -502,8 +501,8 @@ export function buildCorpusArtifacts(): AuthoredArtifacts {
     };
 }
 
-/** Operator approval records for the exact authored release tuple. Any edit
- *  to artifact content or policy versions invalidates both. */
+/** Operator approval records bind the exact authored release tuple.
+ * Any artifact-content or policy-version edit invalidates both operator approvals. */
 export const OPERATOR_APPROVALS = [
     {
         kind: "privacy",
@@ -546,11 +545,10 @@ function main(): void {
     if (command === "check") {
         const manifestPath = process.argv[3];
         if (!manifestPath) fail("usage: build-benchmark-corpus.ts check <manifest.json>");
-        // Trust anchor: the manifest fingerprint recomputed from THIS
-        // reviewed source (authored artifacts + pinned approvals), not from
-        // the release directory. A release with edited or fabricated
-        // approval records is internally consistent, so only an external
-        // expectation can authenticate them.
+        // The manifest fingerprint is recomputed from reviewed authored artifacts and pinned approvals.
+        // The manifest fingerprint is not derived from the release directory.
+        // A release with edited or fabricated approval records can remain internally consistent.
+        // Only an external expectation can authenticate approval records.
         const artifacts = buildCorpusArtifacts();
         const expectedManifestFingerprint = canonicalFingerprint(
             buildManifest({
@@ -563,7 +561,6 @@ function main(): void {
         const release = loadReviewedRelease(releaseDir, {
             expectedManifestFingerprint,
         });
-        // A release selector treats the directory name as authoritative, so
         // v1 bytes copied under a v2 directory must fail the check.
         if (basename(releaseDir) !== release.manifest.releaseVersion) {
             fail("check failed: directory name does not match manifest releaseVersion");

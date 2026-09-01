@@ -6,8 +6,8 @@ export interface DetailedEmbedItem {
     id: string;
     text: string;
     contentSha256: string;
-    /** Destination application-transaction group. A provider page never
-     *  crosses groups (R18); one group may span several pages. */
+    /** applicationGroup identifies the destination application-transaction group.
+     * A provider page never crosses application groups; one group may span multiple pages. */
     applicationGroup: string;
 }
 
@@ -19,8 +19,8 @@ export interface DetailedEmbedContext {
     laneRole: "primary" | "shadow";
 }
 
-/** One validated provider page: the durable versioned receipt (row id +
- *  state version) plus its immutable item set and in-memory vectors (R23). */
+/** rowId and stateVersion identify the validated provider-page receipt.
+ * */
 export interface EmbeddingPageReceipt {
     rowId: number;
     stateVersion: number;
@@ -45,39 +45,35 @@ export interface DetailedEmbedResult {
 
 export interface EmbeddingProvider {
     readonly modelId: string;
-    /** Maximum safe input window for one embedding request. Unknown providers default to 512. */
+    /** Providers without a known limit use 512 input tokens. */
     readonly maxInputTokens?: number;
-    /** Maximum UTF-8 bytes accepted for one embedding input, when the provider has a byte cap. */
+    /** Providers with a byte cap measure maxInputBytes in UTF-8 bytes. */
     readonly maxInputBytes?: number;
     initialize(): Promise<boolean>;
-    /** Embed a single text. `signal` lets callers abort the underlying network
-     *  request (or long-running local inference) before the provider's internal
-     *  timeout fires — used by transform-hot-path callers that have their own
-     *  sub-timeout (e.g. 3s auto-search wants to cancel the 30s embed fetch).
-     *  `purpose` selects asymmetric input_type on openai-compatible providers;
-     *  defaults to `"passage"` (indexed/stored content). */
+    /**
+     * signal aborts the underlying network request or local inference before the provider timeout.
+     * On OpenAI-compatible providers, purpose selects asymmetric input_type.
+     * purpose defaults to "passage" for indexed or stored content. */
     embed(
         text: string,
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ): Promise<Float32Array | null>;
-    /** Batch variant of `embed`. Same signal semantics: aborting cancels the
-     *  whole batch request (including the underlying HTTP call for remote providers).
+    /**
+     * An aborting signal cancels the whole batch request, including its underlying HTTP call for remote providers.
      *  `purpose` defaults to `"passage"`. */
     embedBatch(
         texts: string[],
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ): Promise<(Float32Array | null)[]>;
-    /** Domain-item batch form for providers that can preserve item identity across retries. */
+    /** embedItems preserves item identity across retries for providers that support it. */
     embedItems?(
         items: readonly { id: string; text: string; contentSha256: string }[],
         signal?: AbortSignal,
     ): Promise<Map<string, Float32Array>>;
-    /** Detailed batch capability: pages the items without crossing application
-     *  groups, journals each page in the durable ledger, and returns versioned
-     *  receipts for destination transactions. Only providers with a durable
-     *  page journal (Synapse) implement this. */
+    /** embedItemsDetailed pages items within application groups, journals each page, and returns versioned receipts for destination transactions.
+     * */
     embedItemsDetailed?(
         items: readonly DetailedEmbedItem[],
         context: DetailedEmbedContext,

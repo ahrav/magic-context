@@ -2,24 +2,12 @@
 /**
  * Microbenchmark for the nearest-prior tool-owner pick (inlined SQL below).
  *
- * Plan budget: average added latency from JOIN to `oc.message` must be
- * under 0.5 ms per invocation on a session with ≥30k tool tags.
  *
- * Result on prior measurement run (recorded in commit message of the
- * v3.3.1 backfill commit `7e542bd`): 0.0455 ms average across 10,000
- * iterations on the user's playground DB session
- * `ses_331acff95fferWZOYF1pG0cjOn` (30,828 tool tags). That's ~10× under
- * the 0.5 ms budget — JOIN-only stays. No migration v11 (denormalized
- * `tool_owner_time_created` column) is needed.
  *
  * Run:
- *   bun packages/plugin/scripts/benchmark-nearest-prior.ts <session_id>
  *
  * Requires:
- *   - `~/.local/share/cortexkit/magic-context/db.sqlite` (or
  *     XDG_DATA_HOME equivalent)
- *   - `~/.local/share/opencode/storage/sqlite/db.sqlite` (the OpenCode
- *     DB to ATTACH for the JOIN to `oc.message`)
  */
 
 import { existsSync } from "node:fs";
@@ -99,7 +87,7 @@ const stmt = db.prepare(
      LIMIT 1`,
 );
 
-// Warm-up: 1k iterations to prime SQLite plan cache.
+// The benchmark excludes 1,000 warm-up queries from timed samples.
 for (let i = 0; i < 1000; i += 1) {
     const row = candidateRows[i % candidateRows.length];
     stmt.get({

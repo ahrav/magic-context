@@ -8,10 +8,6 @@ import {
     tier,
 } from "./decay-curve";
 
-// These tests lock the council-verified invariants from
-// .alfonso/plans/decay-curve-formula.md §4 so the curve can never silently
-// regress into the old ad-hoc linear approximation.
-
 describe("decay-curve — tier boundaries", () => {
     it("newest compartment at importance 50 renders P1", () => {
         expect(tier(1, 50, 1)).toBe(1);
@@ -85,7 +81,6 @@ describe("decay-curve — verified invariants (formula §4)", () => {
             (c) => renderedTier(c.index, c.importance, pTight) < 5,
         ).length;
         expect(renderedGenerous).toBeGreaterThan(renderedTight);
-        // tight budget pressure must be >= generous (more squeeze)
         expect(pTight).toBeGreaterThanOrEqual(pGenerous);
     });
 
@@ -158,7 +153,6 @@ describe("decay-curve — budget pressure", () => {
                 TIER_COST[tier(c.index, c.importance, computeBudgetPressureTwoPass(comps, budget))],
             0,
         );
-        // Two-pass never renders MORE than single-pass for a tight budget.
         expect(cost2).toBeLessThanOrEqual(cost1);
     });
 });

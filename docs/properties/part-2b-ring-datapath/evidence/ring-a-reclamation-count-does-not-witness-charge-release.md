@@ -13,9 +13,9 @@ coincidentally ordered.
 
 ## Evidence trail
 
-**Where the charge is released.** `crates/mc-host/src/ring_transport.rs:291`,
+**Where the charge is released.** `crates/mc-host/src/ring_transport.rs:276`,
 `admission.release()`, on the endpoint OS thread, followed immediately by
-`let _ = done_tx.send(())` at `:292`.
+`let _ = done_tx.send(())` at `:277`.
 
 **Where the count is incremented.** `connection.rs:208-209`:
 
@@ -25,11 +25,11 @@ shared.ring.record_reclamation();
 ```
 
 `record_reclamation` is `self.reclamations.fetch_add(1, Ordering::Relaxed)`
-(`ring_transport.rs:221-223`), surfaced as
-`"reclamation": {"completed": ...}` at `:204`.
+(`ring_transport.rs:205-207`), surfaced as
+`"reclamation": {"completed": ...}` at `:192`.
 
 **The normal path orders them correctly.** `io` is
-`async move { let _ = done_rx.await; }` (`:301-303`), spawned as
+`async move { let _ = done_rx.await; }` (`:286-288`), spawned as
 `AbortOnDropHandle::new(shared.tracker.spawn(io))` at `connection.rs:190`, and
 awaited at the very end of `serve_generation`:
 
@@ -38,8 +38,8 @@ awaited at the very end of `serve_generation`:
 let _ = (&mut io_task).await;
 ```
 
-`done_rx` resolves only when `done_tx.send(())` runs at `ring_transport.rs:292`,
-which is after `admission.release()` at `:291`. So on the normal path
+`done_rx` resolves only when `done_tx.send(())` runs at `ring_transport.rs:277`,
+which is after `admission.release()` at `:276`. So on the normal path
 `record_reclamation` at `connection.rs:209` strictly follows the release. That is
 the correct ordering and it is not accidental: the comment at
 `connection.rs:341-346` explains that the join is deliberately unbounded because
@@ -66,9 +66,10 @@ increments the count.
 At that instant the endpoint thread may still be running. What stops it is
 `discard_unregistered_generation` (`connection.rs:350-354`), which calls
 `gen.writer.discard()` at `:353`. That cancels the `discard` token
-(`frame_channel.rs:701-703`), which `run_endpoint` observes in the `select!` at
-`ring_transport.rs:424` and returns. The thread then drops the `DuplexRing`,
-releases the charge at `:291`, and fires `done_tx` at `:292` — to a receiver
+(`frame_channel.rs:701-703`; not re-swept post-#131), which `run_endpoint`
+observes in the `select!` at
+`ring_transport.rs:443` and returns. The thread then drops the `DuplexRing`,
+releases the charge at `:276`, and fires `done_tx` at `:277` — to a receiver
 whose awaiting task was already aborted.
 
 So `reclamation.completed` increments before `accounting().active` decreases.
@@ -103,9 +104,9 @@ either a lower or an upper bound without knowing which paths ran.
 ## Timing windows and dependencies
 
 Window: from `connection.rs:209` to the endpoint thread reaching
-`ring_transport.rs:291`. Bounded by how quickly `run_endpoint` observes the
+`ring_transport.rs:276`. Bounded by how quickly `run_endpoint` observes the
 `discard` token, which is one loop pass — but only if the loop reaches the
-`select!` at `:422-442`. The `received == true` branch (`:409-415`) skips that
+`select!` at `:441-474`. The `received == true` branch (`:415-421`) skips that
 `select!` entirely, so a peer publishing continuously extends the window. That
 coupling is the subject of
 `ring-a-cancellation-close-requires-an-empty-inbound-observation`.
@@ -140,7 +141,7 @@ completes, assert `reclamation.completed` equals the number of connections whose
 charge is observably back, which catches the skipped-increment shape but not the
 ordering shape.
 
-Existing checks: `ring_transport.rs:804` asserts
+Existing checks: `ring_transport.rs:883` asserts
 `diagnostics["reclamation"]["completed"] == 1` after a direct
 `record_reclamation()` call in
 `diagnostics_report_fixed_identity_bounds_accounting_and_lifecycle_counts`. That
@@ -152,18 +153,18 @@ binary.
 
 ### Q: Should `record_reclamation` move onto the endpoint thread, immediately after `admission.release()`?
 
-- Sources examined: `ring_transport.rs:221-223` (`record_reclamation`, which
-  takes `&self` on `RingTransport`), `:239-292` (`prepare`'s thread closure and
+- Sources examined: `ring_transport.rs:205-207` (`record_reclamation`, which
+  takes `&self` on `RingTransport`), `:223-277` (`prepare`'s thread closure and
   what it captures), `connection.rs:208-209` (the current call site),
   `connection.rs:273-276` and `:347` (the two exits from `serve_generation`).
 - Findings: mechanically feasible and cheap. The closure already captures
-  `Arc<TargetProfile>` (`:249`) and could capture an
+  `Arc<TargetProfile>` (`:234`) and could capture an
   `Arc<RingTransport>` or a dedicated `Arc<AtomicU64>` just as easily; nothing
   about `record_reclamation` needs the connection's context. Moving it would make
   the count release-witnessed by construction and would also fix the
   skipped-increment shape, because every path that admits a charge spawns the
   thread that would then count it — except the `spawn` failure path at
-  `:294-296`, which admits and releases without a thread at all.
+  `:279-281`, which admits and releases without a thread at all.
 - Missing evidence: whether "reclamation" is intended to mean "charge returned"
   or "connection fully torn down". `docs/mc-host-shm-transport.md:49` couples them
   — "Joined endpoint teardown returns its admission charge when the mapping is

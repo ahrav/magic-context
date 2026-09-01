@@ -1,6 +1,5 @@
 /// <reference types="bun-types" />
-// Tests exercise server-side (Desktop) notification behavior — set OPENCODE_CLIENT
-// to prevent the TUI toast path from intercepting sendIgnoredMessage calls.
+// The tests set `OPENCODE_CLIENT` to prevent the TUI toast path from intercepting `sendIgnoredMessage` calls.
 process.env.OPENCODE_CLIENT = "desktop";
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
@@ -100,7 +99,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* Windows can retain file handles after tests; cleanup tolerates deletion failures. */
         }
     }
     tempDirs.length = 0;
@@ -465,9 +464,8 @@ describe("magic-context hook", () => {
     it("disables magic-context and warns when persistent storage is unavailable", () => {
         const dataHome = makeTempDir("hook-storage-disabled-");
         process.env.XDG_DATA_HOME = dataHome;
-        // Block mkdirSync at the cortexkit segment of the new shared path so
-        // openDatabase() falls into its in-memory fallback. (Plugin v0.16+
-        // moved DB to <XDG_DATA_HOME>/cortexkit/magic-context/.)
+        // The mock blocks `mkdirSync` at the `cortexkit` path segment so `openDatabase()` uses its in-memory fallback.
+        // openDatabase() falls back to an in-memory database when directory creation fails.
         writeFileSync(join(dataHome, "cortexkit"), "not-a-directory", "utf-8");
 
         const promptMocks = createPromptMocks();
@@ -625,10 +623,9 @@ describe("magic-context hook", () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-dream-notification-");
         const promptMocks = createPromptMocks();
         const deps = createMockDeps(promptMocks);
-        // Dreamer v2 per-task shape. Force a single AGENTIC task via
-        // `/ctx-dream curate` so the run is deterministic and goes through the
-        // generic dreamer-agent child-session path this test asserts. (verify now
-        // has its own non-agentic manifest runner — covered by verify.test.)
+        // The Dreamer v2 schedule stores state per task.
+        // The test invokes `/ctx-dream curate` to use the deterministic generic dreamer-agent child-session path.
+        // The command uses the generic dreamer-agent child-session path.
         deps.config = {
             ...deps.config,
             dreamer: {
@@ -765,7 +762,7 @@ describe("magic-context hook", () => {
                             type: "text",
                             text: "Implement sidekick migration",
                             // synthetic:true hides the prompt from the TUI
-                            // subagent pane while still feeding it to the LLM.
+                            // `synthetic: true` still sends the prompt to the LLM.
                             synthetic: true,
                         },
                     ],
@@ -800,9 +797,9 @@ describe("magic-context hook", () => {
             dreamer: {
                 inject_docs: true,
                 tasks: {
-                    // Use an AGENTIC task (curate) so the scheduler→executor wiring
-                    // drives the generic dreamer child-session path this test counts.
-                    // (verify now has its own non-agentic manifest runner.)
+                    // The test uses an AGENTIC `curate` task so the scheduler-to-executor wiring drives the generic Dreamer child-session path.
+                    // The scheduler-to-executor wiring drives the generic Dreamer child-session path that the test counts.
+                    // verify uses a non-agentic manifest runner.
                     curate: { schedule: "0 3 * * *", timeout_minutes: 10 },
                     verify: { schedule: "", timeout_minutes: 10 },
                     "maintain-docs": { schedule: "", timeout_minutes: 10 },
@@ -819,9 +816,9 @@ describe("magic-context hook", () => {
             const db = openDatabase();
             const projectPath = resolveProjectIdentity("/repo/project");
             const now = Date.now();
-            // Dreamer v2: a freshly-seeded task is NOT due until its next cron
-            // time. Pre-seed curate's schedule row as DUE (next_due_at in the
-            // past) so the background trigger actually runs it this pass.
+            // A freshly seeded Dreamer v2 task is not due until its next cron time.
+            // The test pre-seeds `curate`'s schedule row as due by setting `next_due_at` in the past.
+            // A past `next_due_at` makes the background trigger run the task.
             writeTaskScheduleState(db, {
                 projectPath,
                 task: "curate",
@@ -833,7 +830,7 @@ describe("magic-context hook", () => {
                 retryCount: 0,
             });
 
-            // The curate gate counts claims, so seed one claim before the due task runs.
+            // The test seeds one claim before the due task runs because the `curate` gate counts claims.
             seedProjectMemoryClaim(db, {
                 projectIdentity: projectPath,
                 content: "Dream me",

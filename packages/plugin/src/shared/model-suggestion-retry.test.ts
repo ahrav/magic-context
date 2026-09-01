@@ -126,8 +126,6 @@ describe("promptSyncWithModelSuggestionRetry", () => {
             }),
         ).rejects.toThrow("prompt aborted by external signal");
         // Pre-aborted signal MUST short-circuit before any upstream prompt
-        // call — Audit Finding #1 hardening. No round-trip wasted on a
-        // request the caller has already cancelled.
         expect(prompt).toHaveBeenCalledTimes(0);
     });
 
@@ -177,12 +175,7 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         expect(prompt).toHaveBeenCalledTimes(1);
     });
 
-    // #154: our timeout must force-stop the child's SERVER-SIDE run loop via
-    // session.abort — cancelling our client fetch alone leaves the child looping
-    // the LLM past the timeout (uncancellable, only dies on process exit).
     test("timeout fires session.abort on the child session", async () => {
-        // A prompt that respects the AbortController by hanging until aborted,
-        // then throwing — mirrors a real in-flight request our timeout cancels.
         const prompt = mock((opts: { signal?: AbortSignal }) => {
             return new Promise((_resolve, reject) => {
                 opts.signal?.addEventListener("abort", () => reject(new Error("aborted")));
@@ -198,8 +191,6 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         expect((abort.mock.calls[0]?.[0] as { path: { id: string } }).path.id).toBe("ses-test");
     });
 
-    // External abort (e.g. dreamer lease loss) mid-flight must also stop the
-    // server-side loop, not just our fetch.
     test("external abort fires session.abort on the child session", async () => {
         const controller = new AbortController();
         const prompt = mock((opts: { signal?: AbortSignal }) => {
@@ -345,9 +336,8 @@ describe("promptSyncWithValidatedOutputRetry", () => {
     test("preserves body.system when a failed Pi-shaped attempt mutates its body", async () => {
         const prompt = mock(async (args: PromptCall) => {
             if (prompt.mock.calls.length === 1) {
-                // Reproduce a facade/SDK that consumes the request body before
-                // rejecting the primary model. The fallback must not inherit
-                // that mutation and spawn without its task prompt.
+                // The facade consumes the request body before rejecting the primary model.
+                // The fallback must receive an unconsumed request body so it includes its task prompt.
                 delete args.body.system;
                 throw new Error("primary failed");
             }

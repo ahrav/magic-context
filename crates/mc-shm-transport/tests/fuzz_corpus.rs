@@ -1,9 +1,4 @@
-//! Stable-rust replay of every checked-in fuzz corpus input.
 //!
-//! Runs on stable with no libFuzzer or nightly requirement. Each corpus
-//! file passes through the same production decoder entry points the fuzz
-//! targets call; the harness asserts internally that no accepted input
-//! yields an out-of-range view.
 
 use std::fs;
 use std::path::Path;

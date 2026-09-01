@@ -44,10 +44,7 @@ describe("paired prospective comparison", () => {
         expect(() => assertAaSymmetry(left, failing(["check-alpha", "check-gamma"]))).toThrow(
             /aa-asymmetry/,
         );
-        // Committed rows are read as evidence, so the comparison leaves the caller's order alone.
         expect(left.failedChecks).toEqual(failedChecks);
-        // The committed path reaches the comparison through the paired build, which is where a
-        // hand-authored order would otherwise reject the epoch.
         expect(() => buildPairedFacts(closeManifest(), [
             { attempt: 0, cell: cell("release-n") },
             { attempt: 0, cell: cell("release-n-minus-1") },

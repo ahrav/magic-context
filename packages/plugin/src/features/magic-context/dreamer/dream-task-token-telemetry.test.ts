@@ -2,15 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-// Regression guard for dream-task token telemetry (Dreamer v2).
 //
-// The dashboard enriches each dream-run task row by grouping
-// `subagent_invocations` WHERE subagent='dreamer' GROUP BY task, then matching
-// `task` to the dream_runs row name. In v2 the dream_runs row name is the
-// CANONICAL task name (`config.task`), and the three specialized runners record
-// their LLM token usage from their own modules — so each must (a) call
-// recordChildInvocation, and (b) use subagent:"dreamer" with the EXACT canonical
-// task string, otherwise the dashboard shows "—" tokens for a real LLM call.
+// The dashboard groups dreamer subagent_invocations by task and matches task to the dream_runs row name.
+// dream_runs row names use config.task, so each invocation task must equal config.task.
+// Each specialized runner must record its own LLM token usage with subagent: "dreamer" and task: config.task.
+// Each specialized runner must call recordChildInvocation with subagent: "dreamer" and the canonical task name.
+// A mismatched invocation task makes the dashboard show "—" tokens for the LLM call.
 
 const HERE = import.meta.dir;
 

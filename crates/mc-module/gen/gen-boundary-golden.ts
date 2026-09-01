@@ -1,12 +1,6 @@
 /**
- * Generate the differential BOUNDARY/TRIGGER golden for the Rust mc-module port.
  *
- * Drives the real TypeScript formatter, protected-tail resolver, and trigger
- * decision ingredients from packages/plugin via Bun.resolveSync. The emitted
- * fixture contains the equivalent Rust grouped tail (BoundaryMsg[]) plus the TS
- * results the Rust tests assert against.
  *
- * Run: bun crates/mc-module/gen/gen-boundary-golden.ts
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

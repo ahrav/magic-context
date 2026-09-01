@@ -1,20 +1,16 @@
 /**
- * Tokenizer calibration harness.
  *
- * Measures the token-count drift between local ai-tokenizer estimates and
- * actual provider token counts for our real production system prompt and tool
- * definitions. Hits each provider directly using OAuth/API tokens from
- * `~/.local/share/opencode/auth.json`. No OpenCode dependency.
+ * The script measures drift between local ai-tokenizer estimates and provider input-token counts.
+ * The script uses the production system prompt and tool definitions.
+ * The script sends requests directly to each provider using credentials from `~/.local/share/opencode/auth.json`.
+ * The script does not depend on OpenCode.
  *
- * For each model:
- *   - Sends a SYSTEM-only request: real production system prompt + minimal user message.
- *   - Sends a TOOLS-only request: real production tools array + minimal user message.
- *   - Captures provider's reported input token count from the actual usage field.
- *   - Counts the same content locally with ai-tokenizer (raw + SDK with model calibration).
- *   - Computes drift ratios.
+ * The script sends a system-only request containing the production system prompt and a minimal user message.
+ * The script sends a tools-only request containing the production tools array and a minimal user message.
+ * The script reads the provider's input-token count from its usage field.
+ * The script counts identical content with ai-tokenizer in raw mode and SDK mode with model calibration.
  *
- * Output: a per-model JSON report with system_ratio and tools_ratio that the
- * sidebar can use as static calibration multipliers.
+ * The script emits per-model raw and SDK ratios for system prompts and tools.
  *
  * Usage:
  *   bun run packages/plugin/scripts/calibrate-tokenizer/index.ts
@@ -82,13 +78,11 @@ const ENCODINGS = {
     p50k_base: p50kEncoding,
 };
 
-// biome-ignore lint/suspicious/noExplicitAny: ai-tokenizer types are very strict
+// biome-ignore lint/suspicious/noExplicitAny: ai-tokenizer model types cannot represent this cast
 const ALL_MODELS = aiTokenizerModels as unknown as Record<string, any>;
 
 /**
- * Extract `chatgpt_account_id` from the JWT access token claims. The Codex
- * backend requires this header for every request; without it ChatGPT routes
- * the call to no account and returns 401.
+ * The Codex backend requires the `ChatGPT-Account-Id` header to route requests to the authenticated account.
  */
 function extractCodexAccountId(accessToken: string): string | undefined {
     try {
@@ -127,7 +121,6 @@ function localCounts(
     toolsSdk: number | null;
 } {
     const enc = pickEncoding(tokenizerKey);
-    // biome-ignore lint/suspicious/noExplicitAny: encoding type varies
     const tk = new Tokenizer(enc as any);
     const systemRaw = tk.count(systemText);
     const toolsRaw = tk.count(JSON.stringify(toolsArray));
@@ -139,7 +132,6 @@ function localCounts(
         const m = ALL_MODELS[tokenizerKey];
         try {
             const sysResult = sdkCount({
-                // biome-ignore lint/suspicious/noExplicitAny: cross-package type mismatch
                 tokenizer: tk as any,
                 model: m,
                 messages: [
@@ -159,7 +151,6 @@ function localCounts(
                 inputSchema: t.input_schema as Record<string, unknown>,
             }));
             const toolsResult = sdkCount({
-                // biome-ignore lint/suspicious/noExplicitAny: cross-package type mismatch
                 tokenizer: tk as any,
                 model: m,
                 messages: [{ role: "user", content: "x" }],
@@ -189,10 +180,7 @@ async function measureOne(
         const authEntry = auth[test.provider];
         if (!authEntry) throw new Error(`No auth for provider ${test.provider}`);
 
-        // Route OpenAI OAuth (ChatGPT Plus subscription) through the Codex backend
-        // since `api.openai.com` requires a paid API key, while OAuth tokens work via
-        // `chatgpt.com/backend-api/codex/responses`. The user's account chatgpt_account_id
-        // is encoded inside the JWT access token claims.
+        // `extractCodexAccountId` reads `chatgpt_account_id` from the `https://api.openai.com/auth` JWT claim.
         const useCodex =
             test.provider === "openai" &&
             authEntry.type === "oauth" &&

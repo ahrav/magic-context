@@ -1,25 +1,11 @@
 /**
- * Shared claim-operation request/result encoding contract (KTD3, KTD5; R2,
- * R5-R6, R20). TypeScript twin of `crates/mc-core/src/claim_operation.rs`;
- * both runtimes are proven against
  * `memory/fixtures/claim-operation-contract-v1.json`.
  *
- * Canonical encoding rules (pinned by CLAIM_REQUEST_ENCODING_VERSION /
- * CLAIM_RESULT_ENCODING_VERSION = 1):
- *   - values: null, booleans, safe integers, well-formed Unicode strings,
- *     arrays, and plain objects. Floats, non-finite numbers, integers
- *     outside +/-(2^53 - 1), lone surrogates, and non-plain values are
  *     rejected.
- *   - objects: keys sorted by Unicode code point (== UTF-8 byte order).
- *   - strings: '"', '\\', and U+0000-U+001F escaped ('\u00xx' with lowercase
- *     hex, no short escapes); every other code point emitted literally.
- *   - numbers: base-10 integers with no exponent, no fraction, no '-0'.
- *   - no insignificant whitespace.
- *   - byte values (digests, incarnation IDs) travel as lowercase hex strings.
+ * The encoder sorts object keys by Unicode code point, matching UTF-8 byte order.
  *
- * Digests are SHA-256 hex over `<protocol>\n<canonical JSON>` UTF-8 bytes.
+ * The protocol computes SHA-256 hex digests over UTF-8 `<protocol>\n<canonical JSON>` bytes.
  *
- * Dependency-light on purpose: `node:` imports only.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -48,8 +34,8 @@ export class CanonicalEncodingError extends Error {
     }
 }
 
-/** Unicode code-point comparison (== UTF-8 byte order, unlike JS `<` which
- * compares UTF-16 code units and misorders astral-plane keys). */
+/** Unicode code-point order matches UTF-8 byte order; JS `<` compares UTF-16 code units and misorders astral-plane keys.
+ * */
 export function compareCodePoints(left: string, right: string): number {
     const leftPoints = [...left];
     const rightPoints = [...right];
@@ -62,7 +48,6 @@ export function compareCodePoints(left: string, right: string): number {
     return leftPoints.length - rightPoints.length;
 }
 
-// The repo's TS lib target lacks String.prototype.isWellFormed, so isWellFormedUnicode scans UTF-16 code units directly. commentlint: allow(JUDGE)
 function isWellFormedUnicode(value: string): boolean {
     for (let index = 0; index < value.length; index++) {
         const unit = value.charCodeAt(index);
@@ -92,7 +77,7 @@ function encodeCanonicalString(value: string): string {
     return `${out}"`;
 }
 
-/** Canonicalize a JSON-shaped value into the pinned byte form. */
+/* */
 export function canonicalJsonEncode(value: unknown): string {
     if (value === null) return "null";
     switch (typeof value) {
@@ -136,14 +121,13 @@ function protocolDigest(protocol: string, value: unknown): string {
     return sha256HexUtf8(`${protocol}\n${canonicalJsonEncode(value)}`);
 }
 
-/** Canonical request digest for the operation identity (R6, KTD5). The
+/**
  * request must contain only the semantic fields — never clocks. */
 export function computeClaimOperationRequestDigest(request: unknown): string {
     return protocolDigest(CLAIM_REQUEST_DIGEST_PROTOCOL, request);
 }
 
 // ---------------------------------------------------------------------------
-// Public claim identity and revision locators (R2, KTD3)
 // ---------------------------------------------------------------------------
 
 export const PUBLIC_CLAIM_ID_PREFIX = "mcm_";
@@ -160,8 +144,8 @@ export function isValidPublicClaimId(candidate: string): boolean {
     return PUBLIC_CLAIM_ID_PATTERN.test(candidate);
 }
 
-/** Canonical revision identity: public claim ID + revision number + exact
- * content digest (KTD3). */
+/** Canonical revision identity combines the public claim ID, revision number, and exact content digest.
+ * */
 export interface RevisionLocator {
     readonly publicClaimId: string;
     readonly revision: number;
@@ -181,7 +165,7 @@ export function formatRevisionLocator(locator: RevisionLocator): string {
     return `${locator.publicClaimId}/r${locator.revision}/${locator.contentDigest}`;
 }
 
-/** Parse and validate a revision locator string; null when malformed. */
+/* */
 export function parseRevisionLocator(raw: string): RevisionLocator | null {
     const parts = raw.split("/");
     if (parts.length !== 3) return null;
@@ -195,13 +179,11 @@ export function parseRevisionLocator(raw: string): RevisionLocator | null {
 }
 
 // ---------------------------------------------------------------------------
-// Claim-local mutation token and snapshot vector (KTD3)
 // ---------------------------------------------------------------------------
 
 /**
- * Claim-local fencing state (R5): revision identity plus the lifecycle,
- * applicability, and policy heads of the CURRENT revision. Writes for an
- * unrelated claim never move any field.
+ * Claim-local fencing state combines revision identity with the lifecycle, applicability, and policy heads of the current revision.
+ * The operation never changes lifecycle, applicability, or policy heads for another claim.
  */
 export interface ClaimMutationToken {
     readonly tokenVersion: number;
@@ -209,9 +191,9 @@ export interface ClaimMutationToken {
     readonly revision: number;
     readonly contentDigest: string;
     readonly lifecycleSeq: number;
-    /** Digest over the sorted (streamKey, seq) head pairs. */
+    /** The digest covers sorted `(streamKey, seq)` head pairs. */
     readonly applicabilityHeadsDigest: string;
-    /** Digest over the append-only policy ledger counts. */
+    /** The digest hashes the append-only policy ledger counts. */
     readonly policyHeadsDigest: string;
 }
 
@@ -235,8 +217,8 @@ export function computeClaimMutationTokenDigest(token: ClaimMutationToken): stri
     return protocolDigest(CLAIM_MUTATION_TOKEN_DIGEST_PROTOCOL, tokenShape(token));
 }
 
-/** Digest over applicability stream heads: array of {seq, streamKey} sorted
- * by stream key. */
+/** The digest hashes {seq, streamKey} applicability-head pairs sorted by streamKey.
+ * */
 export function computeApplicabilityHeadsDigest(
     heads: ReadonlyArray<{ streamKey: string; seq: number }>,
 ): string {
@@ -246,8 +228,8 @@ export function computeApplicabilityHeadsDigest(
     return protocolDigest(APPLICABILITY_HEADS_DIGEST_PROTOCOL, sorted);
 }
 
-/** Append-only policy ledger counts for the current revision: any policy
- * append moves one count, so the digest fences every policy head. */
+/** Each policy append increments one current-revision ledger count, so the digest fences every policy head.
+ * */
 export interface PolicyHeadCounts {
     readonly maturitySeq: number;
     readonly approvalCount: number;
@@ -269,10 +251,7 @@ export function computePolicyHeadsDigest(counts: PolicyHeadCounts): string {
 }
 
 /**
- * Publication-freshness state, separate from mutation fencing (KTD3):
- * database incarnation, workspace epoch, and per-project claim/policy
- * generations, rechecked from a fresh snapshot before publication (R10).
- * Generation maps are keyed by decimal project ID strings.
+ * The snapshot vector tracks publication freshness separately from mutation fencing.
  */
 export interface SnapshotVector {
     readonly vectorVersion: number;
@@ -301,7 +280,6 @@ export function computeSnapshotVectorDigest(vector: SnapshotVector): string {
 }
 
 // ---------------------------------------------------------------------------
-// Stored operation results (KTD5, R6, R20)
 // ---------------------------------------------------------------------------
 
 export const CLAIM_RESULT_OUTCOMES = ["applied", "stale", "noop"] as const;
@@ -315,8 +293,8 @@ export interface ClaimOperationResultEffect {
     readonly revisionLocator: string | null;
 }
 
-/** The durable, replay-returned result envelope. Stored as canonical bytes;
- * replay returns those bytes verbatim (R6). */
+/**
+ * */
 export interface ClaimOperationResult {
     readonly resultEncodingVersion: number;
     readonly outcome: ClaimResultOutcome;
@@ -361,8 +339,8 @@ function isIntegerRecord(value: unknown): value is Record<string, number> {
     );
 }
 
-/** Strict decoder for a stored result envelope. Fails closed on an unknown
- * encoding version, outcome, or malformed effect rows. */
+/**
+ * */
 export function decodeClaimOperationResult(resultJson: string): ClaimOperationResult {
     let parsed: unknown;
     try {

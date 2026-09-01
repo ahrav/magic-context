@@ -1,30 +1,22 @@
-//! Deterministic decay renderer: turns a chronological compartment set into the
-//! markdown-heading history bytes that fill m0/m1.
+//! The renderer produces m0/m1 markdown-heading history from chronological compartments.
 //!
-//! Faithful port of the shared `decay-render.ts`. It picks a tier per compartment
-//! from age + importance + budget pressure (via [`mc_core::decay`], pressure computed
-//! ONCE per pass), renders the chosen paraphrase tier (P1..P4; P5 = archived =
-//! omitted), and demotes oldest-first under a hard token budget as a drift guard.
+//! The renderer computes budget pressure once per pass before selecting tiers from age and importance.
+//! P5 omits the compartment as archived.
+//! The budget guard demotes compartments oldest-first until rendered tokens fit the hard budget.
 //!
-//! This is byte-producing, so it lives in mc-module (mc-core stays pure decision
-//! math). The byte-identity invariant that matters is intra-module determinism (same
-//! compartments + budget → same bytes across passes); a differential golden cross-
-//! checks the v2 paraphrase path against the TS reference.
+//! The renderer lives in mc-module because it produces bytes; mc-core contains pure decision math.
 //!
-//! The budget-guard loop needs a token estimator, which is its own subsystem and a
-//! later port — so it is INJECTED (`estimate_tokens`). The renderer stays pure; with
-//! a budget loose enough that the guard never fires, the output is estimator-
-//! independent and purely curve-driven (which is what the golden exercises).
+//! The budget guard uses a caller-supplied token estimator.
+//! When the budget guard does not run, `estimate_tokens` does not affect the output.
 
 use mc_core::decay::{compute_budget_pressure, rendered_tier, DecayInput};
 use mc_store::StoredCompartment;
 
-/// Default history budget when a caller doesn't supply one.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: u32 = 60_000;
 
-/// The minimal compartment shape the renderer needs. `p1..p4` are the paraphrase
-/// tiers (None / empty = not a v2-tiered row); `legacy = Some(1)` marks a pre-v2
-/// flat-content row; `importance` defaults to 50 when absent.
+/// `p1` must be non-empty for a row to use v2 tier rendering.
+/// `legacy = Some(1)` identifies a pre-v2 row that renders from flat `content`.
+/// A legacy row renders from flat `content`; absent `importance` defaults to 50.
 #[derive(Debug, Clone, Default)]
 pub struct DecayRenderCompartment {
     pub start_message: i64,
@@ -42,9 +34,7 @@ pub struct DecayRenderCompartment {
 }
 
 impl From<&StoredCompartment> for DecayRenderCompartment {
-    /// Project a stored compartment into the renderer's input shape. Empty tier
-    /// strings stay empty (the `is_tiered_row`/`tier_body` logic distinguishes an
-    /// empty p1 = not-tiered from a non-empty p1 with an empty p4 = title-only).
+    /// An empty `p1` identifies a non-tiered row; an empty `p4` on a row with non-empty `p1` produces a title-only row.
     fn from(c: &StoredCompartment) -> Self {
         DecayRenderCompartment {
             start_message: c.start_message,
@@ -63,8 +53,6 @@ impl From<&StoredCompartment> for DecayRenderCompartment {
     }
 }
 
-/// Render a session's stored compartments (chronological, oldest first — the order
-/// [`mc_store::McStore::load_compartments`] returns) into the m0/m1 history body.
 pub fn render_stored_compartments(
     compartments: &[StoredCompartment],
     history_budget_tokens: f64,
@@ -102,8 +90,7 @@ fn format_date_range(start_date: Option<&str>, end_date: Option<&str>) -> String
 }
 
 fn sanitize_compartment_title(title: &str) -> String {
-    // Historian-authored titles are untrusted: controls and Unicode line/paragraph
-    // separators must collapse or they can forge a visually multiline heading.
+    // The renderer collapses controls and Unicode line and paragraph separators in titles to prevent multiline-heading forgery.
     let mut single_line = String::with_capacity(title.len());
     let mut replacing_control_run = false;
     for ch in title.chars() {
@@ -136,8 +123,7 @@ fn compartment_heading(c: &DecayRenderCompartment) -> String {
 }
 
 fn guard_compartment_body(body: &str) -> String {
-    // A rendered body cannot open a new compartment; indent heading-like lines so
-    // the next unindented `## ` line remains an unambiguous compartment boundary.
+    // The renderer indents heading-like body lines so only an unindented `## ` line can start a compartment.
     let guarded = body.replace("\n## ", "\n ## ");
     if guarded.starts_with("## ") {
         format!(" {guarded}")
@@ -146,17 +132,11 @@ fn guard_compartment_body(body: &str) -> String {
     }
 }
 
-/// A row is v2-tiered ONLY when `p1` is a non-empty string. Rows with empty/null `p1`
-/// (legacy rows, or the malformed pseudo-v2 state left by an interrupted upgrade —
-/// `legacy=0` but tiers never populated) render via flat `content`, never as an empty
-/// tier body. A VALID v2 row can still have an empty `p4` (a legitimate title-only
-/// heading); that is handled by the tier-body path, since such a row has a non-empty `p1`.
 fn is_tiered_row(c: &DecayRenderCompartment) -> bool {
     c.p1.as_deref().is_some_and(|p| !p.is_empty())
 }
 
-/// The v2 paraphrase tier body, with denser-tier and content fallbacks: the requested
-/// tier if present, else the densest populated denser tier, else flat content.
+/// The renderer uses the requested tier, then the densest populated denser tier, then flat content.
 fn tier_body(c: &DecayRenderCompartment, tier: u8) -> String {
     let tiers = [
         c.p1.as_deref(),
@@ -168,7 +148,6 @@ fn tier_body(c: &DecayRenderCompartment, tier: u8) -> String {
     if let Some(requested) = tiers.get(idx).copied().flatten() {
         return requested.trim().to_string();
     }
-    // walk denser (lower-index) tiers for a non-empty body
     for i in (0..idx).rev() {
         if let Some(t) = tiers[i] {
             if !t.is_empty() {
@@ -179,9 +158,7 @@ fn tier_body(c: &DecayRenderCompartment, tier: u8) -> String {
     c.content.trim().to_string()
 }
 
-/// Truncate to at most `max` characters (Unicode scalar values), trimming trailing
-/// whitespace and appending `…`. Char-boundary safe (vs the TS UTF-16 slice; they
-/// agree on the BMP-without-surrogate-pairs content the golden covers).
+/// The truncation function limits output to `max` Unicode scalar values; on truncation, it trims trailing whitespace and appends `…`.
 fn truncate_with_ellipsis(content: &str, max: usize) -> String {
     if content.chars().count() <= max {
         return content.to_string();
@@ -190,8 +167,7 @@ fn truncate_with_ellipsis(content: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Legacy flat-content tier rendering (no paraphrase columns): P1 = full, P2 = ≤1200
-/// chars, P3+ = ≤420 chars.
+/// Legacy rendering uses full content at P1, 1,200 characters at P2, and 420 characters at P3+.
 fn legacy_body_for_tier(content: &str, tier: u8) -> String {
     if tier <= 1 {
         content.to_string()
@@ -211,9 +187,7 @@ fn legacy_tier(c: &DecayRenderCompartment) -> u8 {
     }
 }
 
-/// Render a single compartment at an explicit tier. Exposed for the m1 "new
-/// compartments" block, which always renders newest compartments at P1 (full
-/// fidelity — no decay applies to brand-new deltas).
+/// `m1` renders new compartments at P1, bypassing decay.
 pub fn render_compartment_at_tier(c: &DecayRenderCompartment, tier: u8) -> String {
     render_one_compartment(c, tier)
 }
@@ -224,9 +198,7 @@ fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
     }
     let heading = compartment_heading(c);
 
-    // Legacy rows AND malformed pseudo-v2 rows (legacy=0 but no usable p1) render via
-    // flat `content`, never as an empty title-only heading — otherwise a
-    // `legacy=0, p1=''` row would silently drop the compartment body from m0/m1.
+    // Rows without a non-empty `p1` use flat `content` so P1–P3 can render their body.
     if c.legacy == Some(1) || !is_tiered_row(c) {
         let flat = c.content.trim();
         if tier >= 4 || flat.is_empty() {
@@ -246,11 +218,10 @@ fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
     )
 }
 
-/// Compute the rendered tier for each compartment, given budget pressure derived once
-/// from the whole set. `compartments` are chronological (oldest first); the decay
-/// curve indexes from newest (1 = newest). Legacy rows are governed by deterministic
-/// truncation, not the curve, and are EXCLUDED from the pressure inputs so unrelated
-/// legacy cost can't demote v2 paraphrases (budget honesty for mixed sessions).
+/// `render_decayed_compartments` computes pressure from non-legacy compartments.
+/// The decay curve indexes non-legacy compartments from newest, with index 1 as newest.
+/// Legacy rows use deterministic truncation and do not contribute to pressure.
+/// Excluding legacy rows prevents their cost from demoting v2 paraphrases.
 fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -> Vec<u8> {
     let v2_indices: Vec<usize> = compartments
         .iter()
@@ -260,7 +231,7 @@ fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -
         .collect();
     let v2_total = v2_indices.len();
 
-    // curve index per original index: 1-based from newest v2 row.
+    // The curve index is 1-based from the newest v2 row.
     let mut curve_index_by_original = std::collections::HashMap::new();
     let mut curve_inputs = Vec::with_capacity(v2_total);
     for (v2_ordinal, &original_index) in v2_indices.iter().enumerate() {
@@ -299,10 +270,8 @@ fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -
         .collect()
 }
 
-/// Render the decayed compartment-history body (no `<session-history>` wrapper —
-/// callers add their own framing). Demotes oldest-first under the budget as a drift
-/// guard, measured by the injected `estimate_tokens` (the estimator is its own
-/// subsystem). Never renders session facts (v2 faithful).
+/// The renderer returns the decayed compartment-history body without a `<session-history>` wrapper.
+/// The renderer never renders session facts.
 pub fn render_decayed_compartments(
     compartments: &[DecayRenderCompartment],
     history_budget_tokens: f64,
@@ -347,9 +316,7 @@ pub fn render_decayed_compartments(
     body
 }
 
-/// Extract a top-level m0 block slice (e.g. "session-history") for budget measurement
-/// and token attribution. Returns the full `<tag>…</tag>` slice or None. Manual
-/// shortest-match (the non-greedy `<tag>[\s\S]*?</tag>`): the first `</tag>` after the
+/// The parser returns the first `<tag>…</tag>` slice, or `None`.
 /// first `<tag>`.
 pub fn extract_m0_block(m0_text: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
@@ -385,7 +352,7 @@ mod tests {
             ..Default::default()
         }
     }
-    /// A loose budget so the guard never fires (output is purely curve-driven).
+    /// The budget exceeds the curve-driven output, so the guard does not run.
     fn no_guard(_: &str) -> usize {
         0
     }
@@ -401,7 +368,7 @@ mod tests {
             importance: Some(50),
             ..Default::default()
         };
-        // index 1 (newest) → tier 1 → p1 body
+        // Index 1, the newest row, maps to tier 1 and the `p1` body.
         let out = render_decayed_compartments(std::slice::from_ref(&c), 60_000.0, no_guard);
         assert_eq!(out, "## 1-9 · T\nVERBOSE");
     }
@@ -492,14 +459,14 @@ mod tests {
             legacy: Some(1),
             ..Default::default()
         };
-        // has a U: line → legacy starts at P3 → ≤420 chars + ellipsis
+        // A legacy row with a `U:` line starts at P3; truncation limits its body to 420 Unicode scalar values and appends `…` only when truncated.
         let out = render_decayed_compartments(std::slice::from_ref(&c), 60_000.0, no_guard);
         assert!(out.ends_with('…'), "P3 truncates: {out}");
     }
 
     #[test]
     fn malformed_pseudo_v2_renders_flat_not_empty() {
-        // legacy=0 but p1 empty (interrupted upgrade) → flat content, not empty tier
+        // legacy=0 with an empty p1 renders flat content, not an empty tier
         let c = DecayRenderCompartment {
             start_message: 1,
             end_message: 2,
@@ -515,29 +482,26 @@ mod tests {
 
     #[test]
     fn budget_guard_demotes_oldest_first() {
-        // three compartments; a synthetic estimator (chars) forces demotion. Oldest
-        // (index 0, chronologically first) demotes first.
+        // The budget guard demotes compartments from oldest to newest.
+        // The oldest compartment (index 0) demotes first.
         let comps = vec![
             comp(1, 2, "OLD", "oldverbosebody", 50),
             comp(3, 4, "MID", "midverbosebody", 50),
             comp(5, 6, "NEW", "newverbosebody", 50),
         ];
         let chars = |s: &str| s.chars().count();
-        // tiny budget forces demotion until it fits
+        // The 80-character budget forces demotion until the output fits.
         let out = render_decayed_compartments(&comps, 80.0, chars);
         assert!(
             chars(&out) as f64 <= 80.0 || out.is_empty(),
             "fits budget: {}",
             chars(&out)
         );
-        // the newest should retain more fidelity than the oldest after demotion
         assert!(out.contains(" · NEW"), "newest survives: {out}");
     }
 
     #[test]
     fn stored_compartment_projects_and_renders() {
-        // a StoredCompartment converts directly into the renderer's input shape and
-        // renders the same as a hand-built compartment
         let stored = StoredCompartment {
             sequence: 1,
             start_message: 1,
@@ -554,7 +518,7 @@ mod tests {
         };
         let out = render_stored_compartments(std::slice::from_ref(&stored), 60_000.0, no_guard);
         assert_eq!(out, "## 1-9 · 2026-01-02→03 · Stored\nP1 full");
-        // an empty-p1 stored row is treated as not-tiered → flat content
+        // An empty `p1` makes a stored row non-tiered, so it renders flat content.
         let legacy_ish = StoredCompartment {
             sequence: 1,
             title: "Flat".into(),
@@ -590,8 +554,6 @@ mod tests {
         assert_eq!(extract_m0_block(m0, "missing"), None);
     }
 
-    // --- differential golden vs the TS reference (v2 paraphrase path, guard off) ---
-
     #[derive(Deserialize)]
     struct RawComp {
         #[serde(rename = "startMessage")]
@@ -625,10 +587,6 @@ mod tests {
 
     #[test]
     fn render_golden_matches_reference() {
-        // Generated by crates/mc-core/testdata/gen-golden.ts. All cases use a loose
-        // budget so the TS estimateTokens guard never fires → the Rust output (guard
-        // off) is the same purely-curve-driven body. Exercises the v2 paraphrase path,
-        // legacy truncation (ASCII), archive omission, and XML escaping.
         let raw = include_str!("../testdata/render-golden.json");
         let golden: RenderGolden = serde_json::from_str(raw).expect("parse render-golden.json");
         assert!(!golden.cases.is_empty(), "empty render golden");
@@ -783,15 +741,6 @@ mod tests {
 
     #[test]
     fn render_tight_golden_matches_reference_with_real_estimator() {
-        // The budget GUARD path: these cases use budgets tight enough that the TS
-        // renderDecayedCompartments demoted compartments oldest-first (via the REAL
-        // Claude estimateTokens). Here we run the SAME cases with the REAL
-        // mc_tokenizer::estimate_tokens. Because the tokenizer is bit-identical to
-        // ai-tokenizer (proven by mc-tokenizer's differential golden) AND the demotion
-        // loops are structurally identical, the Rust guard must reach the same tiers and
-        // emit byte-identical bodies — including the CJK cases where a char/N proxy would
-        // mis-demote. This is the end-to-end proof that activating the estimator is
-        // faithful, not just that the tokenizer counts match in isolation.
         let raw = include_str!("../testdata/render-tight-golden.json");
         let golden: RenderGolden = serde_json::from_str(raw).expect("parse render-tight-golden");
         assert!(!golden.cases.is_empty(), "empty tight render golden");
@@ -816,7 +765,6 @@ mod tests {
                     legacy: r.legacy,
                 })
                 .collect();
-            // The real estimator drives the guard, exactly as production's HARD arm does.
             let got =
                 render_decayed_compartments(&comps, case.budget, mc_tokenizer::estimate_tokens);
             assert_eq!(
@@ -824,9 +772,8 @@ mod tests {
                 "tight render mismatch in case {n} (budget {})",
                 case.budget
             );
-            // Confirm this case actually exercised the guard (the real estimator agrees the
-            // body fits): either it demoted to fit, or it hit the floor (empty). A case
-            // whose curve output already fit the tight budget wouldn't prove the guard.
+            // The guard stops when the output fits, every compartment reaches tier 5, or `guard` reaches zero.
+            // A curve output that already fits does not exercise the guard.
             if mc_tokenizer::estimate_tokens(&got) as f64 <= case.budget || got.is_empty() {
                 fired += 1;
             }

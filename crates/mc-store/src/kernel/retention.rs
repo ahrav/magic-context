@@ -3,6 +3,8 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use super::envelope::check_fence;
 use super::redaction::{clear_owner, identity};
 use super::{map_sqlite, KernelError, KernelStore};
+use crate::kernel::cas::gc::GcFaults;
+use crate::kernel::cas::ArtifactGcResult;
 
 pub const STAGING_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
@@ -33,6 +35,7 @@ impl StagingTerminalState {
 pub struct StagingMaintenanceResult {
     pub abandoned_runs: usize,
     pub deleted_runs: usize,
+    pub artifact_gc: ArtifactGcResult,
 }
 
 impl KernelStore {
@@ -164,18 +167,51 @@ impl KernelStore {
         &self,
         now: i64,
     ) -> Result<StagingMaintenanceResult, KernelError> {
+        self.run_staging_maintenance_inner(now, None, GcFaults::default())
+    }
+
+    fn run_staging_maintenance_inner(
+        &self,
+        now: i64,
+        hook: Option<&mut dyn FnMut()>,
+        faults: GcFaults,
+    ) -> Result<StagingMaintenanceResult, KernelError> {
         if now < 0 {
             return Err(KernelError::InvalidInput);
         }
+        self.run_capture_pin_maintenance(now)?;
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let abandoned_runs = abandon_expired(&tx, now)?;
         let deleted_runs = delete_aged(&tx, now)?;
         tx.commit().map_err(map_sqlite)?;
+        // Artifact reclamation acquires the writer itself, so the staging transaction
+        // commits and releases the writer before the sweep begins.
+        drop(writer);
+        let artifact_gc = self.run_artifact_gc(now, hook, faults)?;
         Ok(StagingMaintenanceResult {
             abandoned_runs,
             deleted_runs,
+            artifact_gc,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn run_staging_maintenance_with_hook_for_test(
+        &self,
+        now: i64,
+        mut hook: impl FnMut(),
+    ) -> Result<StagingMaintenanceResult, KernelError> {
+        self.run_staging_maintenance_inner(now, Some(&mut hook), GcFaults::default())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn run_staging_maintenance_with_fault_for_test(
+        &self,
+        now: i64,
+        fault: crate::kernel::cas::ArtifactGcFault,
+    ) -> Result<StagingMaintenanceResult, KernelError> {
+        self.run_staging_maintenance_inner(now, None, fault.into())
     }
 }
 

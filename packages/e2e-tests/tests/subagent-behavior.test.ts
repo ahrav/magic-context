@@ -8,43 +8,33 @@ import { isHistorianRequest } from "../src/cache-analysis";
  * Subagent-specific behavior.
  *
  * Subagents (child sessions with a non-empty `parentID`) run in REDUCED mode.
- * The plugin's live invariants for subagents are:
  *
- *  1. **isSubagent persisted on session.created** — the event handler reads
- *     `parentID` from the `session.created` event and writes
- *     `session_meta.is_subagent = 1`. Without this row, all downstream gates
- *     mis-classify the session as a primary agent.
+ * The `session.created` handler writes `session_meta.is_subagent = 1` from `parentID`.
+ * Without `session_meta.is_subagent = 1`, downstream gates classify the session as a primary agent.
  *
- *  2. **No historian / compartments** — subagents skip the compartment phase
- *     entirely. `fullFeatureMode = false` short-circuits `runCompartmentPhase`
- *     and `prepareCompartmentInjection` in `transform.ts`.
+ * Subagents skip the compartment phase.
+ * `fullFeatureMode = false` short-circuits `runCompartmentPhase`.
+ * `fullFeatureMode = false` short-circuits `prepareCompartmentInjection` in `transform.ts`.
  *
- *  3. **§N§ prefix injection (Unit B)** — subagents share the process-global
- *     `ctx_reduce` tool, so when `ctx_reduce` is enabled they DO get §N§
- *     prefixes + a minimal guidance block and self-manage their tool bloat.
- *     (A ctx_reduce-disabled subagent gets no prefix — nothing to act on.)
+ * `ctx_reduce` adds §N§ prefixes to subagents when enabled.
+ * The prefixes include a guidance block.
+ * `ctx_reduce`-disabled subagents receive no prefix.
  *
- *  4. **No Channel 2 nudge, no note-nudges, no compartments** — the
+ * Only primary agents receive Channel 2 nudges, note nudges, and compartments.
  *     synthetic-user ceiling nudge stays primary-only (`fullFeatureMode`).
  *     Subagents rely on Channel 1 + the ≥85% tiered emergency floor.
  *
- *  5. **Tiered emergency drop at ≥85%** — the subagent tool floor. At the
- *     force-materialize pass, `planEmergencyDrop` evicts tool tags T3→T2→T1
- *     to a target headroom (routine age-drops were removed). Without this,
- *     subagent context grows until provider overflow.
+ * At ≥85%, subagents begin the tiered emergency tool drop.
+ * During force materialization, `planEmergencyDrop` evicts tool tags T3→T2→T1 to preserve target headroom.
+ * Without the emergency drop, subagent context can grow until provider overflow.
  *
- *  6. **Subagents tolerate overflow errors** — when a subagent hits the
- *     provider's context limit, the plugin doesn't spin up historian to
- *     recover. It records the overflow and lets the error propagate so
- *     OpenCode's retry / parent-agent fallback can handle it.
+ * Subagents let provider overflow errors propagate.
+ * On provider context overflow, the plugin does not start historian recovery for subagents.
+ * The plugin records the overflow and propagates the error.
  *
- * Scenarios below target each invariant directly.
  */
 
 /**
- * Detects whether an outgoing provider request carries a §N§ tag prefix on any
- * user-message text. Subagents MUST NOT have this injected even though their
- * tags are still tracked in context.db.
  */
 function hasTagPrefixedUserMessage(body: Record<string, unknown>): boolean {
     const messages = body.messages as
@@ -72,12 +62,8 @@ beforeAll(async () => {
         modelContextLimit: 200_000,
         magicContextConfig: {
             execute_threshold_percentage: 40,
-            // Reasonable protected-tail that still leaves older tags eligible
-            // for dropping once we cross execute threshold.
+            // `protected_tags: 5` leaves older tags eligible for dropping above the execute threshold.
             protected_tags: 5,
-            // Keep noise out of the test — no compaction markers (they touch
-            // opencode.db and aren't part of the subagent invariant set), no
-            // dreamer, no sidekick, no auto-search hints in subagent mode.
             dreamer: { disable: true },
             sidekick: { disable: true },
         },
@@ -109,17 +95,10 @@ describe("subagent behavior", () => {
             const parent = await h.createSession();
             const child = await h.createChildSession(parent, "child-test");
 
-            // The `session.created` event is delivered asynchronously from
-            // OpenCode's event bus into the plugin's event handler. Wait for
-            // the child's row to reflect it.
+            // OpenCode persists the child row asynchronously after `session.created`.
+            // OpenCode persists the child row asynchronously after `session.created`.
+            // OpenCode persists the child row asynchronously after `session.created`.
             //
-            // Note on primary (parent) sessions: OpenCode emits
-            // `parentID: undefined` in session.created for root sessions,
-            // and `getSessionCreatedInfo` rejects payloads where parentID
-            // isn't a string. Primary sessions therefore get their
-            // session_meta row lazily on the first message.updated, not at
-            // session.created. That's existing behavior outside this test's
-            // scope — we only verify the child-side persistence here.
             await h.waitFor(() => h.isSubagent(child) === true, {
                 timeoutMs: 5_000,
                 label: "child is_subagent=true",
@@ -127,8 +106,6 @@ describe("subagent behavior", () => {
 
             expect(h.isSubagent(child)).toBe(true);
 
-            // After the parent sends any prompt, its row MUST exist with
-            // is_subagent=false. We drive one turn to create it and verify.
             await h.sendPrompt(parent, "parent kick");
             await h.waitFor(() => h.isSubagent(parent) === false, {
                 timeoutMs: 5_000,
@@ -142,9 +119,6 @@ describe("subagent behavior", () => {
     it(
         "subagent WITH ctx_reduce enabled DOES inject §N§ tag prefixes (self-management)",
         async () => {
-            // Unit B: subagents share the process-global ctx_reduce tool, so
-            // with ctx_reduce enabled (the harness default) they get §N§
-            // prefixes and self-manage their own tool-output bloat.
             h.mock.setDefault({
                 text: "ok",
                 usage: {
@@ -171,8 +145,6 @@ describe("subagent behavior", () => {
             const requests = h.mock.requests();
             expect(requests.length).toBeGreaterThanOrEqual(2);
 
-            // At least one request for this child session should now carry a
-            // §N§ prefix on a user message (the later turn, once tags exist).
             const tagged = requests.filter((r) => hasTagPrefixedUserMessage(r.body));
             expect(tagged.length).toBeGreaterThan(0);
         },
@@ -200,7 +172,6 @@ describe("subagent behavior", () => {
                 label: "child is_subagent=true",
             });
 
-            // Fill up some history.
             for (let i = 1; i <= 5; i++) {
                 await h.sendPrompt(
                     child,
@@ -208,9 +179,7 @@ describe("subagent behavior", () => {
                 );
             }
 
-            // Spike input tokens to cross 40% of 200K (= 80K). For a primary
-            // session this would trigger the historian. For a subagent,
-            // compartment phase is short-circuited entirely.
+            // Crossing 80,000 input tokens starts the historian for primary sessions, but subagents skip the compartment phase.
             h.mock.setDefault({
                 text: "spike",
                 usage: {
@@ -222,7 +191,7 @@ describe("subagent behavior", () => {
             });
             await h.sendPrompt(child, "subagent spike: this would trigger historian in a primary.");
 
-            // One more turn to let the transform process the post-spike state.
+            // The extra turn lets the transform process the post-spike state.
             h.mock.setDefault({
                 text: "post-spike",
                 usage: {
@@ -234,7 +203,7 @@ describe("subagent behavior", () => {
             });
             await h.sendPrompt(child, "subagent post-spike turn.");
 
-            // Give any async runner a chance — we shouldn't see historian fire.
+            // Asynchronous transforms can update historian state after the prompt resolves.
             await Bun.sleep(500);
 
             const historianRequests = h.mock
@@ -245,11 +214,9 @@ describe("subagent behavior", () => {
             );
             expect(historianRequests.length).toBe(0);
 
-            // No compartments should exist for the subagent.
             expect(h.countCompartments(child)).toBe(0);
 
-            // The `compartment_in_progress` flag should NEVER have been set
-            // for this subagent session.
+            // The compartment phase never sets `compartment_in_progress` for subagent sessions.
             const row = h
                 .contextDb()
                 .prepare(
@@ -264,22 +231,10 @@ describe("subagent behavior", () => {
     it(
         "subagent scheduler returns execute when usage crosses threshold (heuristic cleanup gate)",
         async () => {
-            // Real subagents rarely use tools in the test harness because
-            // emitting a `tool_use` block forces OpenCode to invoke a real
-            // tool, and there's no matching tool registered in the mock
-            // environment. Instead of trying to simulate tool traffic, we
-            // verify the adjacent invariant: when a subagent crosses the
-            // execute threshold, the plugin's scheduler returns "execute"
-            // and the transform records that state in session_meta
-            // (`last_context_percentage`). This is the gate that lets
-            // heuristic cleanup fire for subagents — without it, subagents
-            // would never drop tool tags at all.
+            // `tool_use` causes OpenCode to invoke a real tool, but the mock environment registers no matching tool.
+            // Recording `last_context_percentage` lets heuristic cleanup run for subagents.
+            // Without heuristic cleanup, subagents retain tool tags.
             //
-            // For the actual "tool tags get dropped" invariant, plugin-side
-            // unit tests in `transform-postprocess-phase.test.ts` and
-            // `heuristic-cleanup.test.ts` cover the path with full fidelity
-            // — the e2e harness's job here is just to prove the subagent
-            // code path reaches that gate, not to re-verify the cleanup
             // math itself.
 
             h.mock.setDefault({
@@ -300,11 +255,9 @@ describe("subagent behavior", () => {
                 label: "child is_subagent=true",
             });
 
-            // Baseline traffic below threshold.
             await h.sendPrompt(child, "subagent turn 1: meaningful content");
             await h.sendPrompt(child, "subagent turn 2: more content");
 
-            // Read the baseline recorded percentage.
             const baseRow = h
                 .contextDb()
                 .prepare(
@@ -315,7 +268,7 @@ describe("subagent behavior", () => {
             console.log(`[TEST] subagent baseline percentage: ${basePct.toFixed(1)}%`);
             expect(basePct).toBeLessThan(40);
 
-            // Spike above the execute threshold (40% of 200K = 80K).
+            // The spike exceeds the execute threshold: 40% of 200K is 80K.
             h.mock.setDefault({
                 text: "spike",
                 usage: {
@@ -327,7 +280,7 @@ describe("subagent behavior", () => {
             });
             await h.sendPrompt(child, "subagent spike: cross execute threshold");
 
-            // Wait for the message.updated event to land and update percentage.
+            // `message.updated` updates the context percentage asynchronously.
             await h.waitFor(
                 () => {
                     const row = h
@@ -352,7 +305,7 @@ describe("subagent behavior", () => {
             );
             expect(spikedRow?.last_context_percentage ?? 0).toBeGreaterThanOrEqual(40);
 
-            // Compartment state must remain untouched — this is a subagent.
+            // Subagent sessions leave compartment state unchanged.
             const row = h
                 .contextDb()
                 .prepare(
@@ -361,7 +314,6 @@ describe("subagent behavior", () => {
                 .get(child) as { compartment_in_progress: number } | null;
             expect(row?.compartment_in_progress ?? 0).toBe(0);
 
-            // Historian must not have fired for the subagent.
             const historianReqs = h.mock
                 .requests()
                 .filter((r) => isHistorianRequest(r.body));
@@ -374,10 +326,8 @@ describe("subagent behavior", () => {
     it(
         "subagent overflow surfaces the provider error without triggering emergency recovery",
         async () => {
-            // Issue #32-style recovery is a PRIMARY-only path. For subagents,
-            // a provider overflow should propagate cleanly — the plugin must
-            // NOT mark the subagent for emergency recovery (which would try
-            // to run historian on a session that can't run historian).
+            // Emergency recovery is PRIMARY-only; provider overflows propagate for subagents.
+            // The plugin must not mark subagents for emergency recovery because they cannot run historian.
 
             h.mock.addMatcher((body) => {
                 if (isHistorianRequest(body)) return null;
@@ -404,15 +354,10 @@ describe("subagent behavior", () => {
                     timeoutMs: 15_000,
                 });
             } catch {
-                // expected — provider returned 400
             }
 
-            // Allow event bus delivery for any state the plugin may record.
             await Bun.sleep(1_000);
 
-            // CRITICAL: the plugin must NOT have triggered emergency recovery
-            // for the subagent. Emergency recovery runs historian, and
-            // subagents can't run historian — this would cause a wedge.
             const row = h
                 .contextDb()
                 .prepare(
@@ -429,8 +374,6 @@ describe("subagent behavior", () => {
             expect(row?.needs_emergency_recovery ?? 0).toBe(0);
             expect(row?.compartment_in_progress ?? 0).toBe(0);
 
-            // Historian must not have been called at any point for the
-            // subagent (parent has its own unrelated lifecycle).
             const historianReqs = h.mock
                 .requests()
                 .filter((r) => isHistorianRequest(r.body));

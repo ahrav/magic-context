@@ -217,20 +217,3 @@ impl ArenaCounts {
             == Some(capacity)
     }
 }
-
-/// Writes one byte per resident page before activation.
-///
-/// # Safety
-/// `base..base.add(len)` must be writable for this call.
-pub(crate) unsafe fn prefault(base: *mut u8, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let page = 4096usize;
-    for offset in (0..len).step_by(page) {
-        // SAFETY: caller provides a writable mapping and offset is below len.
-        unsafe { base.add(offset).write_volatile(0) };
-    }
-    // SAFETY: len is nonzero and caller provides the full writable range.
-    unsafe { base.add(len - 1).write_volatile(0) };
-}

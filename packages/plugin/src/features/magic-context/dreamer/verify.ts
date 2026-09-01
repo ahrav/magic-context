@@ -72,11 +72,7 @@ export const DREAM_VERIFY_SESSION_TITLE = "magic-context-dream-verify";
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
 
 /**
- * Longest trimmed replacement body an update entry may carry. Applying a longer
- * body would write a revision no reviewer can read back, so the manifest is
- * rejected before any write. Exported because a caller that predicts whether
- * this stage accepts a manifest has to test the same bound, and a second copy of
- * the number would let the prediction and the gate disagree.
+ * Reject manifests whose trimmed replacement body exceeds VERIFY_UPDATE_CONTENT_MAX_LENGTH before any write.
  */
 export const VERIFY_UPDATE_CONTENT_MAX_LENGTH = 20_000;
 
@@ -388,13 +384,7 @@ function validateVerifyBatch(
 }
 
 /**
- * Route a verification outcome to the writer that owns the claim's category.
  *
- * The generic recorder refuses anti-memory because generic revision paths drop
- * the TTL, outcome, and scope invariants the typed writer maintains. A
- * verification event carries none of that state, so the typed API exposes its
- * own recorder; routing here keeps every outcome in this file going through one
- * call shape instead of each branch remembering which writer applies.
  */
 function stageVerificationOutcome(
     db: Database,
@@ -521,11 +511,6 @@ function stageVerificationItem(
                   ),
         );
         if (item.value.category === ANTI_MEMORY_CATEGORY) {
-            // The revision inherits the old deadline, so a warning corrected
-            // shortly before it expires would vanish right after the verifier
-            // confirmed its replacement content. Renew on the same rule the
-            // `verify` branch applies: an UPDATE is the stronger verdict and
-            // must not leave the shorter validity window.
             const revised = readAntiMemory(db, item.binding.publicClaimId);
             const extendBelow = nowMs + ANTI_MEMORY_DEFAULT_TTL_MS / 2;
             if (revised !== null && revised.expiresAt !== null && revised.expiresAt < extendBelow) {

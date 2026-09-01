@@ -1,9 +1,8 @@
-//! Allocator-oriented retained-size estimates for memory-budgeted module holders.
+//! This module estimates allocator-oriented retained sizes for memory-budgeted module holders.
 //!
-//! The estimates count inline collection elements, heap capacities, tree nodes, and `Arc`
-//! allocation headers. Rust does not expose allocator size classes or `BTreeMap` node occupancy,
-//! so tree entries use a documented three-word node/slack allowance. The same routines feed cache
-//! admission and telemetry; the numbers are estimates, but they cannot diverge between those paths.
+//! The estimates include inline collection elements, heap capacities, tree nodes, and `Arc` allocation headers.
+//! Rust does not expose allocator size classes or `BTreeMap` node occupancy.
+//! Cache admission and telemetry use the same routines, so their estimates cannot diverge.
 
 use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
@@ -31,8 +30,8 @@ pub(crate) fn btree_map_allocation_bytes<K, V>(len: usize) -> usize {
 }
 
 pub(crate) fn hash_map_allocation_bytes<K, V>(map: &HashMap<K, V>) -> usize {
-    // hashbrown keeps a control byte per bucket and normally admits seven entries per eight
-    // buckets. `capacity()` is the admission capacity, so expand it back to bucket count.
+    // hashbrown uses one control byte per bucket and admits seven entries per eight buckets.
+    // The calculation converts admission capacity to bucket count because `capacity()` reports admission capacity.
     let buckets = map.capacity().saturating_mul(8).saturating_add(6) / 7;
     buckets.saturating_mul(
         size_of::<K>()
@@ -179,10 +178,10 @@ pub(crate) fn ck_wire_block_retained_bytes(block: &CkWireBlock) -> usize {
     size_of::<CkWireBlock>()
         .saturating_add(kind_heap_bytes(&block.kind))
         .saturating_add(provider_extras_heap_bytes(&block.provider_extras))
-        // Deserialized CK blocks retain their original JSON in addition to typed fields. The
-        // field is private to mc-store, so serialization is the lossless way to inspect its
-        // actual shape. Constructed/modified blocks may have cleared it; charging the equivalent
-        // tree in that case is conservative and avoids an accounting side channel in mc-store.
+        // Deserialized CK blocks retain their original JSON in addition to typed fields.
+        // Because `mc_store` keeps the original JSON field private, serialization is the only lossless inspection method.
+        // Constructed or modified CK blocks may clear the original JSON.
+        // When no original JSON is retained, accounting charges the equivalent JSON tree.
         .saturating_add(serialized_value_retained_bytes(block))
 }
 
@@ -206,7 +205,6 @@ pub(crate) fn ck_wire_message_retained_bytes(message: &CkWireMessage) -> usize {
         .saturating_add(origin_heap_bytes(message.origin.as_ref()))
         .saturating_add(provider_extras_heap_bytes(&message.provider_extras))
         .saturating_add(harness_meta_heap_bytes(&message.meta))
-        // Message deserialization also retains the complete original object, independently of
-        // each block's original object accounted above.
+        // Message deserialization retains the complete original object independently of every block's original object.
         .saturating_add(serialized_value_retained_bytes(message))
 }

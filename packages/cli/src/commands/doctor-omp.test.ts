@@ -75,8 +75,6 @@ describe("OMP doctor", () => {
         process.env.HOME = root;
         process.env.PI_CODING_AGENT_DIR = agentDir;
         process.env.XDG_CONFIG_HOME = join(root, ".config");
-        // Redirect explicitly: Bun caches os.homedir(), so deleting this can
-        // make integrity_check reach the user's real context.db.
         process.env.XDG_DATA_HOME = join(root, ".local", "share");
         const prompts = new MockPrompts();
 

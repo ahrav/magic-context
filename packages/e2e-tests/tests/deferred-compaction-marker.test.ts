@@ -6,36 +6,16 @@ import { buildMockHistorianPayload } from "../src/mock-historian";
 import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
- * Plan v6: deferred compaction marker — publish-time persistence and
+ * Historian persists pending marker state during publication and defers marker advancement to materialization.
  * defer-pass stability.
  *
- * Cache-stability is the north star. The plan defers compaction-marker
- * movement out of historian's publish path into a later materializing
- * transform pass — so a single cache-bust cycle covers both the
- * `<session-history>` rebuild AND the marker boundary advance.
+ * Deferring marker advancement lets one cache-bust cycle rebuild `<session-history>` and advance the marker boundary.
  *
- * This test drives:
- *   1. Multiple turns with compaction markers (always-on since v0.21.4) to trigger
  *      historian publication.
- *   2. After publish: asserts the `pending_compaction_marker_state` column on
- *      `session_meta` is populated (in-tx pending blob, plan v6 §4).
- *   3. Sends a small follow-up turn (defer pass with low pressure): asserts
- *      the pending blob is STILL there (no mutation on defer pass).
  *
- * If a regression breaks the in-tx pending write OR causes defer passes to
- * mutate / consume the pending blob, this test catches it.
  *
- * NOTE: We do not assert the actual drain firing here. Drain timing depends on
- * the next materialization pass (execute-pass + history-was-consumed), which is
- * provider-pressure-dependent and brittle to script in a mocked e2e. Drain
- * correctness is covered by unit tests in
- * `compaction-marker-manager.test.ts` (apply / already-current / stale-skip /
- * retryable-failure outcomes) and by transform-postprocess unit tests
- * exercising the drain branch directly. This e2e specifically proves the
- * persistence + defer-stability half of the contract.
+ * The test omits drain assertions because drain requires a materialization pass that consumes history.
  *
- * Assertions are against the plugin's own `session_meta` table — the
- * canonical state for "did historian publish write a pending blob".
  */
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
@@ -95,8 +75,6 @@ describe("deferred compaction marker (plan v6)", () => {
     it("writes pending blob in-tx on publish and holds it across defer passes", async () => {
             h.mock.reset();
 
-            // Mock historian: return a valid response that covers the actual
-            // chunk range we receive.
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
                 const range = findOrdinalRange(body);
@@ -128,7 +106,7 @@ describe("deferred compaction marker (plan v6)", () => {
                 };
             });
 
-            // Default response: small. Won't move us across the threshold.
+            // The default response remains below the 40% threshold.
             h.mock.setDefault({
                 text: "fill",
                 usage: {
@@ -141,7 +119,7 @@ describe("deferred compaction marker (plan v6)", () => {
 
             const sessionId = await h.createSession();
 
-            // Drive 10 small turns to build eligible tail.
+            // Ten small turns build an eligible tail.
             for (let i = 1; i <= 10; i++) {
                 await h.sendPrompt(
                     sessionId,
@@ -161,8 +139,7 @@ describe("deferred compaction marker (plan v6)", () => {
             });
             await h.sendPrompt(sessionId, "turn 11: trigger turn with real content.");
 
-            // Reset to small responses so the publish doesn't get re-triggered
-            // by every follow-up turn.
+            // Small responses prevent follow-up turns from re-triggering publication.
             h.mock.setDefault({
                 text: "after-trigger",
                 usage: {
@@ -173,15 +150,10 @@ describe("deferred compaction marker (plan v6)", () => {
                 },
             });
 
-            // Turn 12: gives the transform a fresh pass to start historian
-            // (same pattern as historian-success.test.ts).
+            // Turn 12 gives the historian transform a fresh pass.
             await h.sendPrompt(sessionId, "turn 12: post-trigger follow-up.");
 
-            // ── ASSERTION 1: pending blob populated after publish ─────────
         if (RUST_MODE) {
-            // a5b7d61d moved Rust publication and its pending delta into the
-            // module transaction. `pending_m1_delta` is the authority-level
-            // equivalent of the legacy context.db marker blob.
             const stack = h.mcHostStack;
             if (!stack)
                 throw new Error("Rust marker check requires the hermetic module stack");

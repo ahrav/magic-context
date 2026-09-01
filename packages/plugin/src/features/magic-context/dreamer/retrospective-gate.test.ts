@@ -33,7 +33,6 @@ describe("parseFrictionGateVerdict", () => {
     });
 
     test("a stray number in prose BEFORE the verdict line does not fabricate ordinals", () => {
-        // '2024' must not leak into the ordinals; the verdict line is 'n'.
         const v = "I reviewed all 2024 messages.\nn";
         expect(parseFrictionGateVerdict(v)).toEqual({ hit: false, ordinals: [] });
     });
@@ -44,8 +43,6 @@ describe("parseFrictionGateVerdict", () => {
     });
 
     test("a prose 'yes…' line (no colon) is NOT a verdict — scanning continues to a real y:N", () => {
-        // Old bug: the prose line early-returned, harvesting its stray '3' AND
-        // swallowing the real verdict below. Colon-required fixes both.
         const v = "yes, the user was clearly upset about issue 3 earlier.\ny: 7";
         expect(parseFrictionGateVerdict(v)).toEqual({ hit: true, ordinals: [7] });
     });
@@ -96,8 +93,8 @@ function u(sessionId: string, ts: number, text: string): RetrospectiveRawMessage
     return { sessionId, ordinal: 0, role: "user", text, ts };
 }
 
-/** A scripted provider: `since` returns rows with ts > watermark; `before`
- *  returns the newest `count` rows with ts <= watermark. */
+/** The scripted provider's `since` method returns rows with `ts > watermark`.
+ * The `before` method returns the newest `count` rows with `ts <= watermark`. */
 class ScriptedProvider implements RetrospectiveRawProvider {
     constructor(
         private readonly sessions: string[],
@@ -117,8 +114,8 @@ class ScriptedProvider implements RetrospectiveRawProvider {
         sinceMs: number,
         capPerSession: number,
     ): RetrospectiveSinceRead {
-        // Mirror the real readers: oldest-first, capped per session, with the
-        // exact truncation signal.
+        // The test provider returns each session's oldest rows first and caps each session independently.
+        // The test provider reports whether each per-session result was truncated.
         const limit = Math.max(1, Math.floor(capPerSession));
         const eligible = (this.rowsBySession.get(sessionId) ?? [])
             .filter((r) => r.ts > sinceMs)
@@ -167,7 +164,6 @@ describe("readRetrospectiveScanWindow", () => {
 
         const win = await readRetrospectiveScanWindow(provider, "proj", 200, 2);
         const texts = win.messages.map((m) => m.text);
-        // since (>200): new1, new2. overlap (<=200, last 2): old1, old2.
         expect(texts.sort()).toEqual(["new1", "new2", "old1", "old2"]);
         // watermark only advances to the newest SINCE row, never pulled back by overlap.
         expect(win.maxScannedTs).toBe(300);
@@ -182,9 +178,9 @@ describe("readRetrospectiveScanWindow", () => {
     });
 
     test("backlog: keeps the OLDEST since-rows and never advances the watermark past a dropped row (global cap)", async () => {
-        // 6 new post-watermark rows, global cap 3. Must keep the oldest 3 and
-        // stop the watermark BELOW the first dropped row, so the dropped newer
-        // rows are re-read next run (no permanent loss).
+        // With six post-watermark rows and a global cap of three, the scan keeps the oldest three and stops the watermark below the first dropped row.
+        // The scan stops the watermark below the first dropped row so later rows are re-read next run.
+        // Stopping below the first dropped row causes every dropped newer row to be re-read next run.
         const rows = new Map([
             [
                 "s1",
@@ -205,11 +201,9 @@ describe("readRetrospectiveScanWindow", () => {
             capPerSession: 100,
         });
         expect(win.messages.map((m) => m.text)).toEqual(["a1", "a2", "a3"]);
-        // watermark = newest KEPT ts (a3 @ 130). The dropped rows a4..a6 are all
-        // NEWER, so they're re-read next run — nothing lost.
+        // The watermark is the newest kept timestamp, `a3 @ 130`; `a4` through `a6` are newer and are re-read next run.
         expect(win.maxScannedTs).toBe(130);
 
-        // Next run from the advanced watermark re-reads a4..a6 (nothing lost).
         const win2 = await readRetrospectiveScanWindow(provider, "proj", win.maxScannedTs, 0, {
             maxMessagesPerRun: 3,
             capPerSession: 100,
@@ -219,10 +213,9 @@ describe("readRetrospectiveScanWindow", () => {
     });
 
     test("same-ms group split by the global cap: watermark clamps below it so the sibling is not lost", async () => {
-        // Two sessions, each individually UNsaturated (so saturatedFrontier stays
-        // +Inf), but the GLOBAL cap of 3 splits a same-ms (130) pair: a3 kept, b3
-        // dropped. A ts-only watermark of 130 would skip b3 forever; the clamp
-        // must stop the watermark BELOW 130 so b3 is re-read next run.
+        // Neither session is saturated, so `saturatedFrontier` remains `+Inf`; the global cap can still split rows with the same timestamp.
+        // The global cap keeps `a3` and drops `b3` even though both have timestamp `130`; a timestamp-only watermark of `130` would skip `b3` forever.
+        // The watermark must remain below `130` so the next run re-reads dropped `b3`.
         const rows = new Map([
             ["s1", [u("s1", 110, "a1"), u("s1", 120, "a2"), u("s1", 130, "a3")]],
             ["s2", [u("s2", 130, "b3")]],
@@ -233,12 +226,10 @@ describe("readRetrospectiveScanWindow", () => {
             maxMessagesPerRun: 3,
             capPerSession: 100,
         });
-        // kept = oldest 3 = a1,a2,a3 (b3 dropped by the global cap).
         expect(win.messages.map((m) => m.text).sort()).toEqual(["a1", "a2", "a3"]);
-        // watermark clamped to 129 (just below the split ts) — NOT 130.
         expect(win.maxScannedTs).toBe(129);
 
-        // Next run re-reads a3 (idempotence dedups) AND the previously-dropped b3.
+        // With a watermark of `129`, the next run re-reads `a3` and previously dropped `b3`; idempotence deduplicates `a3`.
         const win2 = await readRetrospectiveScanWindow(provider, "proj", win.maxScannedTs, 0, {
             maxMessagesPerRun: 3,
             capPerSession: 100,
@@ -248,8 +239,8 @@ describe("readRetrospectiveScanWindow", () => {
     });
 
     test("backlog: a per-session-saturated batch caps the watermark at its frontier", async () => {
-        // capPerSession 2: the session returns its OLDEST 2 but holds newer
-        // unseen rows. The watermark must not pass the last-kept ts.
+        // When `capPerSession` is `2`, the provider returns the session's oldest two rows and leaves newer rows unseen.
+        // The watermark must not pass the last kept timestamp because newer rows remain unseen.
         const rows = new Map([
             ["s1", [u("s1", 110, "a1"), u("s1", 120, "a2"), u("s1", 130, "a3")]],
         ]);
@@ -260,18 +251,16 @@ describe("readRetrospectiveScanWindow", () => {
             capPerSession: 2,
         });
         expect(win.messages.map((m) => m.text)).toEqual(["a1", "a2"]);
-        // saturated (got exactly 2) → frontier = lastKept(120) − 1 = 119.
+        // Because the provider returned exactly two rows, saturation sets `frontier` to 119.
         expect(win.maxScannedTs).toBe(119);
     });
 
     test("saturation uses the explicit `truncated` signal, not messages.length", async () => {
-        // A provider whose normalized output is SHORTER than its cap (e.g. rows
-        // dropped during normalization) but which DID truncate. A length-based
-        // guess (length < cap → not saturated) would false-negative and let the
-        // watermark jump past unseen rows. The explicit signal must win.
+        // A provider can report `truncated=true` after normalization drops rows, even when its normalized output is shorter than its cap.
+        // A length-based saturation guess false-negatives after normalization drops rows.
+        // The provider's `truncated` signal overrides normalized result length.
         const provider: RetrospectiveRawProvider = {
             listProjectSessions: () => [{ sessionId: "s1" }],
-            // returns 1 row but reports truncated=true (cap was hit upstream).
             readUserMessagesSince: () => ({
                 messages: [u("s1", 130, "kept")],
                 truncated: true,
@@ -282,7 +271,7 @@ describe("readRetrospectiveScanWindow", () => {
             maxMessagesPerRun: 100,
             capPerSession: 5,
         });
-        // frontier = lastKept(130) − 1 = 129 even though only 1 row < cap 5.
+        // The explicit truncation signal sets `frontier` to `129` even though one normalized row is below cap `5`.
         expect(win.maxScannedTs).toBe(129);
     });
 
@@ -357,7 +346,7 @@ describe("readRetrospectiveScanWindow", () => {
     });
 
     test("dedupes a row that appears in both since and overlap reads", async () => {
-        // A provider whose `before` overlaps the `since` boundary row.
+        // The `before` read includes the row at the `since` boundary.
         const rows = new Map([["s1", [u("s1", 200, "boundary"), u("s1", 250, "after")]]]);
         const provider: RetrospectiveRawProvider = {
             listProjectSessions: () => [{ sessionId: "s1" }],
@@ -365,11 +354,11 @@ describe("readRetrospectiveScanWindow", () => {
                 messages: (rows.get("s1") ?? []).filter((r) => r.ts > since),
                 truncated: false,
             }),
-            // deliberately also return the boundary row (ts == watermark) in overlap
+            // The overlap read also returns the boundary row at timestamp 200.
             readUserMessagesBefore: () => [u("s1", 200, "boundary")],
         };
         const win = await readRetrospectiveScanWindow(provider, "proj", 199, 5);
-        // "boundary" (ts 200) is > 199 so in since AND returned by overlap → one copy.
+        // The boundary row at timestamp 200 is greater than 199, so both reads return it; deduplication leaves one copy.
         expect(win.messages.filter((m) => m.text === "boundary")).toHaveLength(1);
     });
 });
@@ -380,7 +369,7 @@ describe("retrospective processed-window idempotence", () => {
         expect(isRetrospectiveWindowProcessed(db, "proj", "k1")).toBe(false);
         recordRetrospectiveWindowProcessed(db, "proj", "k1");
         expect(isRetrospectiveWindowProcessed(db, "proj", "k1")).toBe(true);
-        // scoped by project + key
+        // The database keys processed windows by `(project, key)`.
         expect(isRetrospectiveWindowProcessed(db, "proj", "k2")).toBe(false);
         expect(isRetrospectiveWindowProcessed(db, "other", "k1")).toBe(false);
     });

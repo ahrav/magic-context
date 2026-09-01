@@ -229,14 +229,10 @@ describe("claim-current verify gate", () => {
             const anti = seedAntiMemory(db);
             const claim = getProjectMemoryClaimByPublicId(db, anti);
             if (!claim) throw new Error("missing anti-memory claim");
-            // The archive verdict for an anti-memory records outcome "stale"
-            // and leaves the record lifecycle-active until its TTL lapses.
-            // The gate must treat that as terminal, not as never-verified.
+            // An anti-memory archive verdict keeps the record lifecycle-active until its TTL expires.
+            // An anti-memory archive verdict keeps the record lifecycle-active until its TTL expires.
+            // The gate treats an anti-memory archive verdict as terminal rather than never verified.
             //
-            // Written directly because the generic operation refuses this
-            // category: production records it through the typed staging path
-            // inside the verification transaction. What this test pins is how
-            // the gate READS a stale outcome, not how the event was produced.
             db.prepare(
                 "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'gate-test', ?)",
             ).run(claim.currentRevisionId, 2_000);

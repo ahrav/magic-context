@@ -1,9 +1,8 @@
 /**
- * OpenAI-compatible chat adjacency invariant used by GitHub Copilot's wire format.
+ * GitHub Copilot's wire format requires OpenAI-compatible chat adjacency.
  *
- * Every assistant message with `tool_calls` must be immediately followed by
- * `role: "tool"` messages whose `tool_call_id` values cover exactly the ids
- * declared on that assistant message (order among tool messages may vary).
+ * Each assistant message with `tool_calls` must be immediately followed by `role: "tool"` messages whose `tool_call_id` values cover exactly the declared ids.
+ * The required tool messages may appear in any order.
  *
  * Copilot re-translates this shape to Bedrock/Claude server-side; violating
  * adjacency here reproduces the orphan-tool wire failure (`tool_use` without

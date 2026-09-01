@@ -16,21 +16,19 @@ import {
 } from "./read-session-raw";
 import type { MessageLike } from "./transform-operations";
 
-/** The maximum request page size accepted by the module facade. */
+/** The module facade accepts request pages up to 512 KiB. */
 export const MODULE_PAGE_MAX_BYTES = 512 * 1024;
-/** Large individual values are split so one message cannot exceed a page. */
+/** Chunking splits large values so each message fits one page. */
 export const MODULE_ITEM_CONTINUATION_CHUNK_BYTES = 64 * 1024;
-// The module-side reassembler recognizes this continuation envelope for
-// authority state sync and live transform requests.
+// The module reassembles this envelope for authority state sync and live transform requests.
 export const MODULE_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 export const MODULE_ORDINAL_PAGE_SIZE = 500;
 export const CLAIM_INTENT_PROTOCOL_VERSION = 1;
 export const CLAIM_REQUEST_ENCODING_VERSION = 1;
 export const CLAIM_MIRROR_PROTOCOL_VERSION = 1;
 export const CLAIM_MIRROR_VERSION = 1;
-// Byte bound shared with the module's `validate_claim` (`claim_mirror.rs`).
-// Both sides must measure the same unit or a label can pass here and be
-// rejected there, which suppresses the mirror lane.
+// `CLAIM_PROVENANCE_LABEL_MAX_BYTES` matches the bound in the module's `validate_claim` (`claim_mirror.rs`).
+// The facade and module must measure bytes in the same unit; otherwise, the module rejects labels accepted here and suppresses the mirror lane.
 export const CLAIM_PROVENANCE_LABEL_MAX_BYTES = 512;
 
 export interface ClaimIntentBinding {
@@ -358,8 +356,7 @@ function validateCommittedClaimMirrorRow(
     }
     const provenanceLabel = record.provenanceLabel;
     // The module validates this bound in BYTES (`claim_mirror.rs` uses `str::len`).
-    // Measuring UTF-16 code units here would admit a label the module then rejects,
-    // which suppresses the whole mirror lane for the workspace.
+    // The facade must measure UTF-8 bytes; UTF-16 code units could admit a label the module rejects and suppresses the mirror lane.
     if (
         provenanceLabel !== null &&
         (typeof provenanceLabel !== "string" ||
@@ -974,9 +971,9 @@ export async function resolveOrdinalsForModule(args: {
         return false;
     });
 
-    // Keep the caller-owned OpenCode objects untouched. A shallow root projection is
-    // sufficient because the encoder only reads nested fields; unlike the old JSON clone,
-    // this does not walk or duplicate the full message tree on every pass.
+    // The encoder must not mutate caller-owned OpenCode objects.
+    // A shallow root projection is sufficient because the encoder only reads nested fields.
+    // The shallow root projection avoids walking or duplicating the full message tree on every pass.
     const annotated: Array<Record<string, unknown>> = new Array(visibleMessages.length);
     const resolved: Array<number | undefined> = new Array(annotated.length);
     let firstUnresolved:
@@ -1008,12 +1005,8 @@ export async function resolveOrdinalsForModule(args: {
     }
 
     /**
-     * OpenCode can place an unpersisted synthetic nudge between two persisted
-     * messages in one wire snapshot. It is not part of canonical raw history,
-     * so it borrows the preceding canonical ordinal instead of consuming a
-     * slot. Only explicit synthetic messages get this exception. A genuine
-     * persisted-but-unpaged message remains unresolved and is rejected below;
-     * the stored-row count and ordinal self-heal checks still catch drift.
+     * An unpersisted explicit synthetic message borrows its preceding canonical ordinal.
+     * Persisted unpaged messages remain unresolved and are rejected.
      */
     for (let index = 0; index < resolved.length; index += 1) {
         if (resolved[index] !== undefined || !isSyntheticWireMessage(visibleMessages[index])) {
@@ -1089,21 +1082,19 @@ export function moduleWireBodyBytes(payload: {
 }
 
 /**
- * Page a transform request without changing any message value. Continuation
- * markers are understood by the module and are only used when a single item is
- * larger than the normal page envelope.
+ * Paging must preserve every message value.
+ * The module understands continuation markers for a single item that exceeds the page limit.
  */
 export interface ModuleTransformWirePage {
     page: Record<string, unknown>;
-    /** UTF-8 byte length of `JSON.stringify(page)`, counted while paging. */
+    /** The byte count must equal the UTF-8 length of the serialized page. */
     bytes: number;
 }
 
 export function buildPagedModuleTransformPayloads(
     body: Record<string, unknown>,
 ): ModuleTransformWirePage[] {
-    // The unpaged path must stringify once to know it fits. Return that length so
-    // the transport telemetry does not serialize the same body a second time.
+    // The returned serialized length prevents transport telemetry from serializing the body twice.
     const unpagedBytes = Buffer.byteLength(JSON.stringify(body));
     if (unpagedBytes <= MODULE_PAGE_MAX_BYTES) return [{ page: body, bytes: unpagedBytes }];
 
@@ -1140,9 +1131,7 @@ export function buildPagedModuleTransformPayloads(
             session_id: body.session_id,
             shadow_generation: body.shadow_generation,
             transform_page_id: transformPageId,
-            // Authority transforms do not carry a shadow generation. A stable
-            // transform generation still belongs to the page envelope so both
-            // lanes use the same all-or-none paging contract.
+            // A stable transform generation keeps authority and shadow lanes under the same all-or-none paging contract.
             transform_generation: body.shadow_generation ?? 0,
             transform_page_index: args.index,
             transform_page_total: args.total,
@@ -1151,16 +1140,13 @@ export function buildPagedModuleTransformPayloads(
             ...pageArrays,
         };
         if (args.complete) Object.assign(page, scalarFields);
-        // Admission already counted candidate sizes incrementally. Stringify once
-        // here so transport telemetry can reuse the exact UTF-8 length.
+        // The returned `bytes` value is the serialized page's exact UTF-8 length.
         return { page, bytes: Buffer.byteLength(JSON.stringify(page)) };
     };
     const hasItems = (arrays: Record<string, unknown[]>): boolean =>
         Object.values(arrays).some((values) => values.length > 0);
 
-    // Page admission used to clone and canonicalize the entire candidate page for every
-    // message. The wire representation is unchanged, so count its UTF-8 bytes incrementally
-    // and only build the digest once a page is actually emitted.
+    // The encoder assigns digests only to emitted pages.
     const serializedItemBytes = (value: unknown): number =>
         Buffer.byteLength(JSON.stringify(value) ?? "null");
     const pageByteLength = (args: {
@@ -1324,10 +1310,7 @@ function toolCallId(part: Record<string, unknown>, messageId: string, blockIndex
 }
 
 /**
- * Map raw OpenCode parts to the CK block indexes used by the Rust module. The
- * drop seed must name the same block the module would reduce; counting raw
- * parts is not enough because ignored parts disappear and completed tools
- * become a call/result pair.
+ * The drop seed uses CK block indexes rather than raw OpenCode-part indexes.
  */
 export function moduleRawBlockMappings(message: RawMessageParts | null): ModuleRawBlockMapping[] {
     if (!message) return [];

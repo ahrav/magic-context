@@ -51,7 +51,7 @@ export interface LiveMetamorphicOptions {
     admit?: (derivatives: readonly HistorianEvalScenario[]) => string[];
     execute?: LiveScenarioExecutor;
     deadlineAtMs?: number | null;
-    /** Headroom one role may consume, reserved before starting it so the deadline is not overshot mid-call. commentlint: allow(JUDGE) */
+    /** Headroom one role may consume, reserved before starting it so the deadline is not overshot mid-call. */
     roleBudgetMs?: number;
     nowMs?: () => number;
     onProgress?: (report: MetamorphicReport) => void;
@@ -143,7 +143,7 @@ function canaryHit(
     role: LiveRole,
     key: PairKey | null,
 ): InjectionCanaryHit {
-    /** Only the derivative ran a transform, so any other role's coordinates would name a transform that never touched it. commentlint: allow(JUDGE) */
+    /** Only the derivative ran a transform, so any other role's coordinates would name a transform that never touched it. */
     const coordinates = role === "derivative" ? key : null;
     return {
         scenarioId,
@@ -269,7 +269,7 @@ export async function runLiveMetamorphicEval(
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;
     const roleBudgetMs = options.roleBudgetMs ?? 0;
-    /** Reserves the role's budget rather than asking whether the deadline passed, because a role started just under it runs past it. commentlint: allow(JUDGE) */
+    /** Reserves the role's budget rather than asking whether the deadline passed, because a role started just under it runs past it. */
     const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() + roleBudgetMs >= deadlineAtMs;
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
         observe({ kind: "deadline-exhausted", nextRole });
@@ -332,7 +332,7 @@ export async function runLiveMetamorphicEval(
     } catch (error) {
         const reason = getErrorMessage(error);
         entries.push({ ...controlKey, kind: "error", error: reason });
-        /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. commentlint: allow(JUDGE) */
+        /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. */
         if (controlA === null || controlB === null) {
             return observe({
                 kind: "control-error",
@@ -343,7 +343,7 @@ export async function runLiveMetamorphicEval(
         return observe();
     }
 
-    /** Keyed by base scenario alone: the executor takes no seed, so every pair sharing a base would re-run identical paid traffic. commentlint: allow(JUDGE) */
+    /** Keyed by base scenario alone: the executor takes no seed, so every pair sharing a base would re-run identical paid traffic. */
     const baselines = new Map<string, LiveObservation | Error>();
 
     for (const pair of prepared.pairs) {
@@ -374,7 +374,7 @@ export async function runLiveMetamorphicEval(
                 observe();
                 continue;
             }
-            /** An ERROR score already forces exit 1 through the baseline verdict, so its derivatives would be paid-for and unusable. commentlint: allow(JUDGE) */
+            /** An ERROR score already forces exit 1 through the baseline verdict, so its derivatives would be paid-for and unusable. */
             if (baseline.score.verdict === "ERROR") {
                 entries.push({
                     ...pair.key,

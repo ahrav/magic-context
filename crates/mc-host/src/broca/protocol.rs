@@ -1,12 +1,4 @@
-//! The five-operation Broca application protocol (R3, R6-R8): strict
-//! bounded request decoding and the canonical response/event encoders whose
-//! JSON shapes `mc-module`'s `HistorianProducer` consumes today.
 //!
-//! Reuses the strict envelope, object-only, and depth-scanning machinery
-//! from `crate::synapse::protocol` rather than a second parsing stack: both
-//! surfaces must classify malformed, duplicate-keyed, over-depth,
-//! over-bound, binary, unknown-method, and unknown-field bodies identically,
-//! before any state exists (R3).
 
 use crate::control::check_string;
 use crate::synapse::protocol::{
@@ -18,17 +10,12 @@ pub use crate::synapse::protocol::RequestError;
 use super::backend::{BackendError, FinishReason, Harness};
 use super::config::{MAX_OUTPUT_TOKENS_BOUND, MAX_SEND_BODY_BYTES, TEMPERATURE_RANGE};
 
-/// Whole-body structural depth cap, matching the profile convention set by
-/// the Synapse surface: level eight is valid, level nine is not.
 const MAX_BODY_DEPTH: usize = 8;
-/// Bound on encoded diagnostic strings inside error units, so a provider
-/// failure can never bloat replay past the terminal headroom (R12, R19).
+/// The encoder caps error-unit diagnostics at 512 bytes to preserve terminal replay headroom.
 const MAX_UNIT_DIAGNOSTIC_BYTES: usize = 512;
 pub const MAX_RUN_ID_BYTES: usize = 128;
 const MAX_MODEL_FIELD_BYTES: usize = 256;
 
-/// Exact `run.status` vocabulary (R7). No aliases, no substrings: producers
-/// switch on these strings verbatim.
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_COMPLETED: &str = "completed";
@@ -36,8 +23,6 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_CANCELLED: &str = "cancelled";
 pub const STATUS_MISSING: &str = "missing";
 
-/// One strictly decoded Broca operation. Anything not representable here was
-/// rejected before any run state could exist (R3).
 #[derive(Debug, PartialEq)]
 pub enum Request {
     Send(SendRequest),
@@ -47,9 +32,6 @@ pub enum Request {
     Delete,
 }
 
-/// Validated `session.send` parameters (R6). Owned strings because the
-/// supervisor retains them for the run's lifetime anyway; at the 512 KiB
-/// body cap the owned copy is cheap enough that borrowing buys nothing.
 #[derive(Clone, PartialEq)]
 pub struct SendRequest {
     pub prompt: String,
@@ -61,8 +43,6 @@ pub struct SendRequest {
 }
 
 impl SendRequest {
-    /// Logical bytes the supervisor retains for this request while the run
-    /// exists — the term R12's "immutable request bytes" charges.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.prompt
             .len()
@@ -74,8 +54,7 @@ impl SendRequest {
 
 impl std::fmt::Debug for SendRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Prompt and system text are the caller's private content (R19):
-        // diagnostics report lengths only.
+        // Prompt and system text are caller-private content:
         f.debug_struct("SendRequest")
             .field("prompt_len", &self.prompt.len())
             .field("system_len", &self.system.as_ref().map(String::len))
@@ -88,8 +67,7 @@ impl std::fmt::Debug for SendRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Request schema. Closed structs throughout: `deny_unknown_fields` refuses
-// junk at the key, derived deserialization rejects duplicate fields, and
+// Closed request structs reject unknown and duplicate fields.
 // `MapOnly` refuses the positional-sequence form for every object.
 // ---------------------------------------------------------------------------
 
@@ -105,8 +83,6 @@ struct SendParams {
     system: Option<String>,
 }
 
-/// The nested `{provider, model}` object `HistorianProducer` sends after
-/// splitting its canonical `provider/model` string at the first slash.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelParams {
@@ -133,9 +109,7 @@ struct RunIdParams {
     run_id: String,
 }
 
-/// Accepts exactly `[]`. R6 requires an *empty* tools array — a present key
-/// proving the caller holds the tool-less contract — so the first element,
-/// whatever it is, fails the whole request before it is even decoded.
+/// `tools` must be present and equal `[]`.
 struct EmptyTools;
 
 impl<'de> serde::Deserialize<'de> for EmptyTools {
@@ -168,10 +142,7 @@ fn decode<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, RequestErr
     serde_json::from_slice(body).map_err(|err| schema(err.to_string()))
 }
 
-/// No-allocation checks that run before any deserializer byte is read:
-/// binary rejection, the 512 KiB body cap, and the structural depth bound
-/// (R3, R6). Runs before the supervisor is ever consulted, so an oversize
-/// body is rejected before backend admission.
+/// The pre-deserialization checks allocate nothing and read no body bytes.
 fn preflight(body: &[u8], binary: bool) -> Result<(), RequestError> {
     if binary {
         return Err(schema("broca requests are JSON only"));
@@ -185,8 +156,6 @@ fn preflight(body: &[u8], binary: bool) -> Result<(), RequestError> {
     Ok(())
 }
 
-/// Typed decode after [`preflight`]. Only the five contract methods exist;
-/// anything else is refused without creating state (R3).
 fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
     let envelope: MapOnly<MethodEnvelope> = decode(body)?;
     match envelope.0.method.as_ref() {
@@ -196,9 +165,6 @@ fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
         }
         "session.subscribe" => {
             let envelope: MapOnly<RequiredParams<SubscribeParams>> = decode(body)?;
-            // `start` is the only supported replay origin: cursor replay is
-            // exclusive and can drop units on reattach, which is why the
-            // producer always re-drains from the beginning (R8).
             if envelope.0.params.0.from != "start" {
                 return Err(schema("subscribe supports only from=\"start\""));
             }
@@ -215,8 +181,6 @@ fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
             Ok(Request::Cancel { run_id })
         }
         "session.delete" => {
-            // The session is the route identity; the producer sends empty
-            // params and nothing else is accepted.
             let _: MapOnly<OptionalParams<NoParams>> = decode(body)?;
             Ok(Request::Delete)
         }
@@ -224,8 +188,6 @@ fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
     }
 }
 
-/// [`preflight`] plus [`decode_request`], for callers that hold the whole
-/// body — the composition the component's `handle` uses.
 pub fn parse_request(body: &[u8], binary: bool) -> Result<Request, RequestError> {
     preflight(body, binary)?;
     decode_request(body)
@@ -237,23 +199,17 @@ fn parse_run_id(params: RunIdParams) -> Result<String, RequestError> {
 }
 
 fn parse_send(params: SendParams) -> Result<Request, RequestError> {
-    // The body cap already bounds prompt and system size; check_string adds
-    // the nonempty and NUL rules.
+    // The body cap bounds `prompt` and `system`; `check_string` enforces nonempty, NUL-free values.
     check_string("prompt", &params.prompt, MAX_SEND_BODY_BYTES, true).map_err(schema)?;
     let model = params.model.0;
     check_string("provider", &model.provider, MAX_MODEL_FIELD_BYTES, true).map_err(schema)?;
     check_string("model", &model.model, MAX_MODEL_FIELD_BYTES, true).map_err(schema)?;
-    // The canonical form splits at the FIRST slash, so a slash inside the
-    // provider segment could never have come from a canonical string and
-    // would make the round trip ambiguous.
+    // Reject `/` in `provider` because canonical `provider/model` splits at the first slash.
     if model.provider.contains('/') {
         return Err(schema("provider must not contain '/'"));
     }
-    // Both fields become one argv token (`--model provider/model`) for the
-    // harness CLI. A leading '-' would make that token flag-shaped to the
-    // child's own argument parser, turning request data into an option —
-    // rejected here, before any adapter builds argv, so no adapter can
-    // forget the rule.
+    // Reject leading `-` in `provider` and `model`: `--model provider/model` would otherwise pass request data as a CLI option.
+    // The request validator applies the leading-dash restriction before adapter argv construction so every adapter enforces it.
     if model.provider.starts_with('-') {
         return Err(schema("provider must not start with '-'"));
     }
@@ -263,9 +219,7 @@ fn parse_send(params: SendParams) -> Result<Request, RequestError> {
     let system = match params.system {
         None => None,
         Some(system) => {
-            // The wire's empty-as-absent rule: producers omit an empty
-            // system, so an explicit empty string is a malformed request
-            // rather than a second spelling of "absent".
+            // Reject empty `system`: producers omit it, so accepting `""` would create a second encoding for absence.
             check_string("system", &system, MAX_SEND_BODY_BYTES, true).map_err(schema)?;
             Some(system)
         }
@@ -288,9 +242,7 @@ fn parse_send(params: SendParams) -> Result<Request, RequestError> {
 }
 
 // ---------------------------------------------------------------------------
-// Response and event encoding. Field names are pinned by what
-// `HistorianProducer` parses today (its `unit_*` helpers and
-// `classify_run_state`); changing any name here breaks the Rust consumer.
+// Response and event field names must remain compatible with `HistorianProducer`'s `unit_*` helpers and `classify_run_state`.
 // ---------------------------------------------------------------------------
 
 pub fn send_response_body(run_id: &str) -> Vec<u8> {
@@ -302,14 +254,10 @@ pub fn status_response_body(run_id: &str, state: &str) -> Vec<u8> {
         .expect("status response serializes")
 }
 
-/// Shared by `run.cancel` and `session.delete`: both settle unary after
-/// their lifecycle work completes, and the producer discards the body.
 pub fn ok_response_body() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "ok": true })).expect("ok response serializes")
 }
 
-/// Wraps a unit in the `{kind: "control", unit}` envelope the producer's
-/// `control_unit` helper unwraps.
 fn control_event(unit: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "kind": "control", "unit": unit }))
         .expect("control event serializes")
@@ -327,9 +275,9 @@ pub fn harness_dispatch_unit(run_id: &str, harness: Harness) -> Vec<u8> {
     }))
 }
 
-/// Assistant text in the nested content-block shape the producer's
-/// `unit_text` extracts; a step-level length-class finish reason rides the
-/// unit's own `finish_reason` field (R18).
+/// `assistant_message_unit` emits the nested content-block shape consumed by `unit_text`.
+/// `finish_reason` is unit-level rather than nested under `message`.
+/// Length-class finish reasons use the unit-level `finish_reason` field.
 pub fn assistant_message_unit(
     run_id: &str,
     text: &str,
@@ -349,8 +297,8 @@ pub fn assistant_message_unit(
     control_event(unit)
 }
 
-/// The successful in-band terminal (R8). Length-class reasons survive here
-/// verbatim so a length-capped completion never masquerades as an error.
+/// `run_finished` is the successful in-band terminal.
+/// Preserving length-class reasons prevents length-capped completions from being reported as errors.
 pub fn run_finished_unit(run_id: &str, finish_reason: FinishReason) -> Vec<u8> {
     control_event(serde_json::json!({
         "type": "run_finished",
@@ -359,10 +307,8 @@ pub fn run_finished_unit(run_id: &str, finish_reason: FinishReason) -> Vec<u8> {
     }))
 }
 
-/// The classified in-band error terminal (R8, R18). The producer reads
-/// `class`, `message`, and `retry_after_secs` from the nested `error`
-/// object; the message is truncated so a provider failure cannot outgrow the
-/// terminal headroom or leak unbounded provider output (R12, R19).
+/// `error` is the classified in-band error terminal.
+/// `bounded` prevents provider messages from exceeding the diagnostic byte limit after JSON escaping.
 pub fn error_unit(run_id: &str, error: &BackendError) -> Vec<u8> {
     let mut body = serde_json::json!({
         "class": error.class.as_wire_str(),
@@ -381,11 +327,9 @@ pub fn error_unit(run_id: &str, error: &BackendError) -> Vec<u8> {
     }))
 }
 
-/// Truncates a diagnostic so its JSON-ENCODED form stays within
-/// [`MAX_UNIT_DIAGNOSTIC_BYTES`]: escaping expands `"`/`\\` and short-escape
-/// controls to two bytes and other control characters to six (`\u00XX`), so
-/// a raw-byte bound alone would let two 512-byte fields encode to ~6 KiB and
-/// overrun the terminal headroom charged at admission.
+/// `bounded` counts JSON-escaped bytes before truncating diagnostics.
+/// `bounded` charges two bytes for `"`, `\\`, and short JSON escapes.
+/// Other ASCII control characters require six JSON-escaped bytes.
 fn bounded(value: &str) -> &str {
     let mut encoded = 0usize;
     for (index, c) in value.char_indices() {

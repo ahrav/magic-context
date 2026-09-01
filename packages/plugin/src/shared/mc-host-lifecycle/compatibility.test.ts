@@ -46,10 +46,7 @@ describe("daemon version range (U3 scenario 12)", () => {
     });
 
     test("the gate consumes an authenticated peer, never a bare version string", () => {
-        // Taking the whole peer is what keeps untrusted publication metadata —
-        // a structurally similar record whose `daemonVer` has the same type —
-        // out of this range check. A bare string carries no `daemonVer` and
-        // reaches no verdict at all.
+        // A bare version string lacks `daemonVer`, so `evaluateDaemonCompatibility` throws instead of returning a verdict.
         expect(evaluateDaemonCompatibility(peer(releaseContract.versions.daemon))).toEqual({
             ok: true,
         });
@@ -133,8 +130,7 @@ describe("exact epoch comparison", () => {
     });
 
     test("an unknown epoch key fails even when every expected epoch matches", () => {
-        // Decoded JSON can carry keys the contract does not name; the observed
-        // set must equal the contract's, not merely cover it.
+        // Decoded JSON can contain keys absent from the contract; the observed key set must equal the contract key set.
         const withFuture = { ...healthyEpochs, future_contract: 99 };
         const verdict = evaluateEpochCompatibility(withFuture as never);
         expect(verdict.ok).toBe(false);
@@ -173,16 +169,14 @@ describe("semver parsing", () => {
     });
     test("leading zeroes are rejected rather than normalized", () => {
         expect(parseSemverTriple("0.1.0")).toEqual([0, 1, 0]);
-        // Each of these would parse to an in-range triple under `\d+`, so the
-        // range gate would accept a non-canonical version.
         for (const bad of ["00.1.0", "0.01.0", "0.1.00", "00.01.000", "01.2.3"]) {
             expect(parseSemverTriple(bad)).toBeNull();
         }
     });
 
     test("a non-canonical daemon version fails the compatibility gate", () => {
-        // `00.01.000` normalizes to `[0, 1, 0]`, which is inside the supported
-        // half-open range, so only canonical-form rejection keeps this closed.
+        // Canonical validation rejects leading-zero spellings that `\d+` parses as in-range triples.
+        // `00.01.000` normalizes to `[0, 1, 0]`, which is within the supported half-open range; canonical validation must reject it.
         const verdict = evaluateDaemonCompatibility(peer("mc-host/00.01.000"));
         expect(verdict.ok).toBe(false);
         if (!verdict.ok) {
@@ -192,8 +186,7 @@ describe("semver parsing", () => {
     });
 
     test("leading-zero components are not canonical", () => {
-        // `00.1.0` and `0.1.0` would otherwise parse to the same triple, so two
-        // distinct spellings of one version would both be accepted as canonical.
+        // `00.1.0` and `0.1.0` parse to the same triple.
         for (const bad of ["00.1.0", "0.01.0", "0.1.00", "01.2.3", "0.0.01"]) {
             expect(parseSemverTriple(bad)).toBeNull();
         }

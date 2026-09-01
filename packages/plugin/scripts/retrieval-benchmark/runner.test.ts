@@ -44,7 +44,7 @@ afterAll(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** Observed message-lane cardinality of the seeded scale-1000 fixture. */
+/* */
 const DENOMINATOR_1K = 329;
 
 const WARM_STATE = {
@@ -130,8 +130,8 @@ function tinyProfile(overrides: {
     });
 }
 
-/** Deterministic clocks: every monotonic read advances one tick, so any
- *  duration equals the number of interleaved clock reads, not wall time. */
+/**
+ * Each `now` call advances the monotonic clock one tick; durations measure interleaved clock reads, not wall time. */
 function counterHooks(extra: Partial<RunnerHooks> = {}): RunnerHooks {
     let tick = 0;
     return {
@@ -319,10 +319,6 @@ describe("cache-layer lifecycle (scenario 4)", () => {
             const coldLayers = new Map(cold?.cacheLayers.map((l) => [l.layer, l]));
             const coldResets = coldLayers.get("processVector")?.resets ?? 0;
             expect(coldResets).toBeGreaterThan(0);
-            // Cold cases invalidate once per measured sample; warm cases
-            // with an active memory lane invalidate once at case start (the
-            // stale-fixture guard before priming), which the layer records
-            // as a verification path, not a reset.
             const warmStartInvalidations = result.report.evidence.cases.filter((c) =>
                 c.cacheLayers.some(
                     (l) =>
@@ -429,10 +425,6 @@ describe("policy timing separation (scenario 5)", () => {
 
             for (const scenario of result.report.evidence.scenarios) {
                 expect(scenario.latencySamplesMs).toHaveLength(3);
-                // Under the one-tick counter clock an untraced delivery costs
-                // exactly one tick between the two external reads; the traced
-                // pass consumes a tick per span edge, so its root duration can
-                // never be one of the policy samples.
                 for (const sample of scenario.latencySamplesMs) {
                     expect(sample).toBe(1);
                 }
@@ -662,9 +654,6 @@ describe("workflow and package-script contract (U7 scenario 5)", () => {
             expect(run).toContain(`"$arch" != "${expected.arch}"`);
             expect(profileHostClass(expected.profile)).toBe(expected.profile);
 
-            // Until per-host baselines are published from the reference
-            // hosts, the regression verdict is informational: the step must
-            // not fail the job, and its artifact is archived regardless.
             const regressionStep = (job.steps ?? []).find((step) =>
                 step.run?.includes("benchmark-retrieval.ts regression"),
             );

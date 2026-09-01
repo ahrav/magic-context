@@ -1,7 +1,4 @@
-//! In-process fixtures shared by mc-module's parity tests.
 //!
-//! These builders keep test inputs stable across facade and transform tests. They are compiled
-//! only for tests so the production crate has no fixture or mutation surface.
 
 use serde_json::{json, Value};
 
@@ -37,7 +34,6 @@ pub struct InProcessFixture {
 }
 
 impl InProcessFixture {
-    /// The JSON accepted by the state-import facade.
     pub fn state_import(&self) -> Value {
         json!({
             "kind": "state_import",
@@ -57,7 +53,6 @@ impl InProcessFixture {
         })
     }
 
-    /// The canonical transform request used by handler tests.
     pub fn handle_transform(&self) -> Value {
         json!({
             "kind": "transform",
@@ -70,7 +65,6 @@ impl InProcessFixture {
         })
     }
 
-    /// Alias documenting the in-process call seam used by facade tests.
     pub fn call_transform(&self) -> Value {
         self.handle_transform()
     }
@@ -79,7 +73,7 @@ impl InProcessFixture {
 pub struct FixtureBuilder;
 
 impl FixtureBuilder {
-    /// Open an isolated module store and retain its directory for project-shaped fixtures.
+    /// `StoreFixture` retains `dir` so the isolated database remains available to `store`.
     pub fn store() -> StoreFixture {
         let dir = tempfile::tempdir().expect("fixture store directory");
         let store = mc_store::McStore::open(&descriptor(dir.path())).expect("fixture store");

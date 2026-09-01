@@ -32,8 +32,8 @@ function candidateSortKey(candidate: PrimerCandidate): string {
     return `${primerOccurrenceKey(candidate)}\u001f${candidate.id}`;
 }
 
-/** `invalid` latches the zero-dimension and dimension-mismatch cases, which
- *  yield no centroid however many vectors follow. */
+/** `invalid` permanently suppresses centroid output after a zero-dimensional or mismatched vector.
+ * */
 interface CentroidAccumulator {
     sum: Float32Array | null;
     count: number;
@@ -45,8 +45,8 @@ function createAccumulator(): CentroidAccumulator {
     return { sum: null, count: 0, dims: 0, invalid: false };
 }
 
-/** `accumulateVector` preserves caller order so Float32 rounding matches a
- *  left-to-right sum over the candidate sequence. */
+/** `accumulateVector` preserves caller order so Float32 rounding matches left-to-right candidate summation.
+ * */
 function accumulateVector(state: CentroidAccumulator, vector: Float32Array): void {
     state.count += 1;
     if (state.sum === null) {

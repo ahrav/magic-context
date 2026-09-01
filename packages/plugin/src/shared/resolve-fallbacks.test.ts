@@ -3,11 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { parseProviderModel, resolveFallbackChain } from "./resolve-fallbacks";
 
 describe("resolveFallbackChain", () => {
-    // Policy: user-config-only. There is NO builtin provider-agnostic chain —
-    // when the user configures no fallback_models the result is EMPTY, and the
-    // runner's session-model last resort (a model the user actually has) is the
-    // only fallback. A hardcoded chain named providers the user may not have and
-    // produced `Model not found` retry storms.
+    // resolveFallbackChain has no built-in provider-agnostic fallback chain.
     test("returns empty when user provides nothing (no builtin chain)", () => {
         expect(resolveFallbackChain(undefined)).toEqual([]);
     });

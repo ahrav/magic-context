@@ -1,10 +1,9 @@
 /**
- * Host-owned claim approval and enforcement command workflows shared by the
- * OpenCode and Pi harnesses (KD1; KTD5-KTD6). Two-step stale-safe
- * confirmation: the first invocation shows the owning project, exact
- * revision, and content digest; repeating the same command within the window
- * records exactly one idempotent action. Neither workflow is reachable from
- * any agent tool schema.
+ * Host commands own claim approval and enforcement workflows.
+ * OpenCode and Pi share the workflows.
+ * The first invocation displays the owning project, exact revision, and content digest.
+ * Repeating the same command within 60 seconds records one idempotent action.
+ * Agent tool schemas cannot invoke either workflow.
  */
 
 import { spawn } from "node:child_process";
@@ -62,10 +61,9 @@ export interface ClaimCommandDeps {
     host: "opencode" | "pi";
     sessionId: string;
     nowMs?: number;
-    /** Injectable artifact evaluator; the default runs `bun test` for test
-     * artifacts and rejects other kinds. Receives the absolute path of an
-     * immutable same-directory snapshot of the artifact, not the live
-     * artifact path (KTD6). */
+    /** The default evaluator runs `bun test` for test artifacts and rejects other kinds.
+     * The evaluator receives an absolute path to an immutable same-directory artifact snapshot.
+     * */
     evaluateArtifact?: (
         snapshotPath: string,
         kind: EnforcementArtifactKind,
@@ -394,9 +392,8 @@ const ENFORCE_USAGE = [
 ].join("\n");
 
 /**
- * Split command arguments on whitespace while honoring double- and
- * single-quoted segments, so an artifact path containing spaces survives as
- * one token. Quotes are removed from the token; there is no escape syntax.
+ * The parser preserves quoted artifact paths as one token and supports no escape syntax.
+ * The parser removes quotes from tokens and supports no escape syntax.
  */
 function tokenizeCommandArgs(text: string): string[] {
     const tokens: string[] = [];
@@ -407,16 +404,15 @@ function tokenizeCommandArgs(text: string): string[] {
     return tokens;
 }
 
-/** Re-quote a parsed token for a rendered command so copying the generated
- * confirmation reproduces the same tokenization. */
+/** The renderer re-quotes parsed tokens so copied confirmations preserve tokenization.
+ * */
 function quoteCommandArg(value: string): string {
     return /\s/.test(value) ? `"${value}"` : value;
 }
 
-/** ponytail: the default evaluator only knows `bun test`; policy/config
- * artifact evaluators plug in through `deps.evaluateArtifact` when needed.
- * The child process runs detached from the event loop so a slow or hanging
- * test cannot freeze the host that serves every other hook and transform. */
+/**
+ * The asynchronous child process prevents a slow or hanging test from blocking the host event loop.
+ * */
 function defaultEvaluateArtifact(
     snapshotPath: string,
     kind: EnforcementArtifactKind,
@@ -431,14 +427,10 @@ function defaultEvaluateArtifact(
         });
     }
     return new Promise((resolve) => {
-        // `detached` puts the runner at the head of its own process group so
-        // the timeout can kill the whole tree: a test that spawns servers,
-        // watchers, or shell children must not leave them running — holding
-        // inherited output descriptors and mutating the project — past the
+        // The timeout kills the runner's process group so spawned test processes do not outlive the test.
         // advertised budget.
         const run = spawn("bun", ["test", snapshotPath], { cwd: projectRoot, detached: true });
-        // Only the diagnostic tail is ever surfaced; retaining full streams
-        // for a noisy 120-second run would grow the shared plugin process
+        // The runner retains only diagnostic tails to bound memory used by noisy test output.
         // without bound.
         const OUTPUT_TAIL_CHARS = 4_096;
         let output = "";
@@ -453,8 +445,7 @@ function defaultEvaluateArtifact(
                     process.kill(-run.pid, "SIGKILL");
                     return;
                 } catch {
-                    // Group already gone or unsupported: fall back to the
-                    // direct child below.
+                    // If process-group termination is unavailable, the timeout kills the direct child process.
                 }
             }
             run.kill("SIGKILL");
@@ -478,9 +469,9 @@ function defaultEvaluateArtifact(
     });
 }
 
-/** Canonicalize an artifact path inside the owning project: aliases, absolute
- * inputs, `..` escapes, and symlink escapes are rejected (KTD6). Escape
- * checking reuses the shared predicates in `verification-paths.ts`. */
+/**
+ * The command accepts artifact paths only inside the owning project and rejects aliases, absolute paths, `..` escapes, and symlink escapes.
+ * */
 function canonicalizeArtifactPath(
     projectRoot: string,
     input: string,
@@ -499,11 +490,10 @@ function canonicalizeArtifactPath(
     return { canonicalPath: relative(rootReal, real).split(sep).join("/"), absolutePath: real };
 }
 
-/** Re-resolve the artifact's LIVE path and require it to still identify an
- * in-project regular file. `canonicalizeArtifactPath` resolved symlinks at
- * parse time, but the artifact or a parent directory replaced by a symlink
- * AFTER that resolution would make every later read follow the replacement
- * — recording ENFORCED authority for bytes outside the owning root. */
+/** The evaluator re-resolves the live artifact path before evaluation and requires an in-project regular file.
+ * The evaluator re-resolves the path because the artifact or a parent directory can become a symlink after parsing.
+ * A replacement after path resolution could make later reads follow bytes outside the owning root.
+ * Recording those bytes would grant ENFORCED authority outside the owning root. */
 function requireArtifactStillBound(projectRoot: string, absolutePath: string): string {
     const rootReal = safeRealpath(resolve(projectRoot)) ?? resolve(projectRoot);
     const live = safeRealpath(absolutePath);
@@ -526,20 +516,18 @@ export async function executeClaimEnforceCommand(
     argsText: string,
 ): Promise<ClaimCommandResult> {
     const parts = tokenizeCommandArgs(argsText);
-    // Strict flag validation, mirroring /ctx-approve: a mistyped flag
-    // (`--revok`) must not silently select a different action — for enforce
-    // it would run a full evaluation treating the flag as a path argument.
-    // Supported flags: --revoke (revocation) and --kind <value> (artifact
-    // kind, value validated by the parser below).
+    // A mistyped flag must not silently select a different action.
+    // `--revok` must not silently select a different action.
+    // For `enforce`, treating an unrecognized flag as an artifact path would run a full evaluation.
     const unknownFlags = parts.filter(
         (part) => part.startsWith("--") && part !== "--revoke" && part !== "--kind",
     );
     if (unknownFlags.length > 0) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
-    // At most one occurrence of each flag, and --revoke and --kind never
-    // combine: duplicates would silently use the FIRST --kind pair and
-    // ignore the rest, committing arguments the user did not confirm.
+    // The parser rejects duplicate flags and the `--revoke --kind` combination.
+    // Duplicates would silently use the first `--kind` pair and ignore later arguments.
+    // The parser rejects duplicate flags so later arguments cannot be silently ignored.
     if (
         parts.filter((part) => part === "--kind").length > 1 ||
         parts.filter((part) => part === "--revoke").length > 1 ||
@@ -657,10 +645,8 @@ export async function executeClaimEnforceCommand(
         kind = value;
         parts.splice(kindFlagIndex, 2);
     }
-    // The default evaluator only knows `test`; without a host-supplied
-    // evaluator, a policy/config confirmation would walk the two-step flow
-    // and then always fail. Refuse up front instead of advertising a mode
-    // that cannot succeed.
+    // Without `deps.evaluateArtifact`, the command rejects `policy` and `config` before confirmation.
+    // Without `deps.evaluateArtifact`, only `test` can succeed; reject `policy` and `config` before confirmation.
     if (kind !== "test" && !deps.evaluateArtifact) {
         return {
             text: `## Claim Enforcement — Unavailable\n\nArtifact kind '${kind}' has no evaluator on this host; only 'test' artifacts are supported.`,
@@ -727,19 +713,11 @@ export async function executeClaimEnforceCommand(
                 return { artifactId, enforced: wasEnforced };
             },
             beforeMutate: async () => {
-                // Evaluation happens outside the write transaction AND off
-                // the event loop: the default evaluator runs a test process
-                // with a 120-second budget, and holding BEGIN IMMEDIATE (or
-                // the harness thread) that long would block every other
-                // memory/claim/backfill writer and hook.
+                // Evaluation runs outside the write transaction so the evaluator's 120-second budget does not block writers.
                 //
-                // The evaluator runs an immutable snapshot, never the live
-                // path: endpoint hashing alone cannot see a
-                // replace-then-restore during the run, which would bind a
-                // pass to bytes that were never evaluated (KTD6). The
-                // snapshot sits next to the artifact so relative imports and
-                // test-runner naming rules resolve identically, and its
-                // digest — the bytes that provably ran — is the digest
+                // The evaluator runs an immutable snapshot because endpoint hashing cannot detect a replace-then-restore during evaluation.
+                // The snapshot sits next to the artifact so relative imports resolve from the artifact's directory.
+                // The snapshot digest records the bytes that ran.
                 // recorded.
                 const liveBeforeRun = requireArtifactStillBound(
                     deps.projectRoot,
@@ -749,25 +727,14 @@ export async function executeClaimEnforceCommand(
                 bytesDigest = createHash("sha256").update(bytes).digest("hex");
                 const snapshotName = `mc-enforce-${randomUUID().slice(0, 8)}.${basename(canonical.absolutePath)}`;
                 const snapshotPath = join(dirname(canonical.absolutePath), snapshotName);
-                // Bun keys test snapshots by the test file's name, so the
-                // copy must carry the artifact's committed `.snap` under its
-                // own name — otherwise every committed snapshot reads as
-                // newly added and the run passes without comparing (KTD6).
+                // Bun keys snapshots by test-file name, so the copy carries the artifact's committed `.snap` under the copied test file's name; otherwise, Bun treats it as missing.
                 const snapDir = join(dirname(canonical.absolutePath), "__snapshots__");
                 const committedSnap = join(snapDir, `${basename(canonical.absolutePath)}.snap`);
                 const copiedSnap = join(snapDir, `${snapshotName}.snap`);
                 const carrySnapshots = existsSync(committedSnap);
-                // `wx` refuses a pre-existing path (a planted file or symlink
-                // under the nonce name), and read-only mode plus the
-                // post-run digest re-check below raise the bar against a
-                // watcher process replacing the snapshot around the run.
-                // This is hardening, not proof: a local adversary with
-                // project-directory write access sits in the same trust
-                // domain as the artifact and the database themselves.
-                // The snapshot write and the carried-copy setup run INSIDE
-                // the cleanup region: a failing copy (read-only or removed
-                // __snapshots__, full disk) must not strand the read-only
-                // mc-enforce-* test where broad test discovery would later
+                // `wx` prevents overwriting a pre-existing nonce path.
+                // The post-run digest rejects a changed evaluation snapshot.
+                // The snapshot write and carried-copy setup run inside `try` so cleanup removes a created snapshot if either operation fails.
                 // execute it.
                 let snapshotCreated = false;
                 try {
@@ -776,26 +743,19 @@ export async function executeClaimEnforceCommand(
                     if (carrySnapshots) copyFileSync(committedSnap, copiedSnap);
                     const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
                     evaluation = await evaluate(snapshotPath, kind, deps.projectRoot);
-                    // The recorded digest must describe the bytes the
-                    // evaluator ran: a snapshot replaced during the run
-                    // cannot be recorded.
                     if (sha256FileSync(snapshotPath) !== bytesDigest) {
                         throw new Error(
                             "the evaluation snapshot changed during the run; rerun the command",
                         );
                     }
                 } finally {
-                    // Remove nothing when the `wx` create itself refused: the
-                    // pre-existing path was not ours to delete.
+                    // `snapshotCreated` remains false when `wx` rejects an existing path, so cleanup does not delete that path.
                     if (snapshotCreated) {
                         rmSync(snapshotPath, { force: true });
-                        // Remove the carried copy AND any snapshot the run
-                        // created fresh under the copy's name.
+                        // Cleanup removes `copiedSnap`, including a snapshot created under that name by the run.
                         rmSync(copiedSnap, { force: true });
                     }
                 }
-                // A live artifact that drifted during the run cannot be
-                // recorded: the digest would describe bytes no longer on
                 // disk.
                 if (
                     sha256FileSync(

@@ -32,7 +32,7 @@ import { ballastProse } from "../ballast";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { validScenario, validScenarioRaw } from "./test-support";
 
-/** Deep key-order permutation: same semantics, different byte order. */
+/** Reversing object keys preserves semantics but changes serialized bytes. */
 function permuteKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(permuteKeys);
     if (typeof value === "object" && value !== null) {
@@ -163,10 +163,7 @@ describe("parseScenario", () => {
     });
 
     test("whitespace-only contract strings reject like empty ones", () => {
-        // Production transcript formatting trims and can discard a blank
-        // message, and a blank probe answer is not scoreable, so a
-        // whitespace-only value would freeze a scenario whose runtime input the
-        // gold contract cannot match.
+        // Production transcript formatting trims whitespace and can discard blank messages.
         const edits: Array<(raw: Record<string, unknown>) => void> = [
             (raw) => {
                 raw.title = "   ";
@@ -191,8 +188,8 @@ describe("parseScenario", () => {
     test("two expected claims sharing a category and normalized predicate reject", () => {
         const raw = validScenarioRaw();
         const claims = (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims;
-        // Distinct id, same expectation: whitespace and case are normalized away,
-        // so this is one gold written twice and would double-count on recall.
+        // The validator rejects duplicate gold expectations after whitespace and case normalization because they double-count recall.
+        // The validator rejects duplicate gold expectations after whitespace and case normalization because they double-count recall.
         claims.push({
             id: "exp-lru-cache-again",
             category: "ARCHITECTURE",
@@ -221,7 +218,7 @@ describe("parseScenario", () => {
             family: "explored-never-accepted",
             predicate: { kind: "normalized-substring", value: "use Redis for the session cache" },
         });
-        // Family is part of the identity precisely so this stays legal.
+        // The family differentiates otherwise identical expectations.
         expect(lintScenario(parseScenario(raw))).toEqual([]);
     });
 
@@ -267,8 +264,7 @@ describe("parseScenario", () => {
                 },
             ],
         ];
-        // Bounded before mapping: the lint compares every absent predicate with
-        // every claim, so uncapped arrays hang freeze lint rather than failing it.
+        // The lint compares every absent predicate with every claim, so caps bound its work.
         for (const [label, edit] of cases) {
             const raw = validScenarioRaw();
             edit(raw);
@@ -282,9 +278,7 @@ describe("parseScenario", () => {
         for (const index of [0, 1]) {
             const raw = validScenarioRaw();
             delete (raw.probes as Record<string, unknown>[])[index].sourceClaimRef;
-            // Without it the probe's gold answer has no declared source range, so
-            // the runtime cannot separate an injection-budget trim (the KTD6
-            // ERROR) from a model failure.
+            // Each probe gold answer requires a declared source range.
             expect(() => parseScenario(raw)).toThrow(/probes\[\d\]: fields-invalid/);
         }
     });
@@ -295,15 +289,13 @@ describe("parseScenario", () => {
             { length: MAX_PROBE_CHOICES + 1 },
             (_unused, index) => `option ${index}`,
         );
-        // Nested arrays need their own cap: a scenario can stay under the probe
-        // cap while each probe carries an enormous option list.
+        // Nested arrays require separate caps because a scenario can remain within the probe cap while exceeding a nested-array cap.
         expect(() => parseScenario(raw)).toThrow(/choices: above-operational-maximum/);
     });
 
     test("multiple-choice options that normalize alike reject", () => {
         const raw = validScenarioRaw();
-        // Two spellings of one option: `probeIdentity` treats them as the same
-        // answer, so a model picking the non-gold spelling would be scored wrong.
+        // `probeIdentity` canonicalizes option spellings before comparing answers.
         (raw.probes as Array<{ choices?: string[] }>)[1].choices = ["in-process lru", " In-Process   LRU "];
         expect(() => parseScenario(raw)).toThrow(/choices: duplicate/);
     });
@@ -317,8 +309,7 @@ describe("parseScenario", () => {
     test("a probe copied verbatim under a new id rejects", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Same question, same gold answer, same backing claim: one question asked
-        // twice, which double-weights that behavior in probe accuracy.
+        // Probes with the same question, gold answer, and backing claim ask one question.
         probes.push({ ...probes[0], id: "probe-capacity-again" });
         expect(() => parseScenario(raw)).toThrow(/probes\.identity: duplicate/);
     });
@@ -340,16 +331,14 @@ describe("parseScenario", () => {
     test("two probes asking the same question of different claims stay distinct", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Same question, different backing claim — and a different gold value,
-        // because probes sharing an answer value are refused separately: they run
-        // in one session, so the earlier exchange would answer the later probe.
+        // Probes run in one session, so an earlier exchange can answer a later probe with the same gold value.
         probes.push({
             ...probes[0],
             id: "probe-capacity-of-lru",
             sourceClaimRef: "exp-lru-cache",
             goldAnswer: "in-process lru cache",
         });
-        // The backing claim is part of the identity, so this is a different probe.
+        // The backing claim differentiates probes with the same question and gold answer.
         expect(parseScenario(raw).probes).toHaveLength(4);
     });
 
@@ -374,9 +363,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects two probes sharing an answer value even on different claims", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Different backing claim, same gold value: the earlier exchange still puts
-        // the later probe's answer in recent history, which is what makes the copy
-        // work — the claim behind each probe is irrelevant to that.
+        // When probes share a gold value, the earlier response places the later answer in recent history regardless of backing claim.
         probes.push({
             id: "probe-other-4096",
             question: "How many entries does the cache hold?",
@@ -390,9 +377,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects two choices that differ only by XML encoding", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // `compareProbeAnswer` decodes before comparing, so these are ONE option as far as
-        // scoring is concerned — and a model picking the nominally-wrong encoding would be
-        // scored correct. Normalizing alone accepted the pair.
+        // `compareProbeAnswer` decodes option spellings before comparing them.
         probes.push({
             id: "probe-encoded-choices",
             question: "Which marker was used?",
@@ -421,10 +406,6 @@ describe("gold and probe freeze guards", () => {
 
     test("rejects two claim-id probes whose same-category claims one promotion can satisfy", () => {
         const raw = validScenarioRaw();
-        // Distinct references, unrelated predicates, same category — so one promoted
-        // claim stating both satisfies both expectations and resolves to one public id
-        // for both probes. The subsumption check does not see it: neither predicate
-        // contains the other.
         (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims.push({
             id: "exp-eviction",
             category: "ARCHITECTURE",
@@ -442,8 +423,6 @@ describe("gold and probe freeze guards", () => {
 
     test("accepts two claim-id probes on different categories", () => {
         const raw = validScenarioRaw();
-        // Different categories cannot be satisfied by one claim, so neither probe can
-        // resolve to the other's id.
         (raw.probes as Record<string, unknown>[]).push({
             id: "probe-claim-capacity",
             question: "Which claim records the capacity?",
@@ -456,9 +435,6 @@ describe("gold and probe freeze guards", () => {
     test("rejects two claim-id probes on one claim, whose runtime answer is identical", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Both answer with the same public claim id, so the earlier exchange hands
-        // the later probe its answer verbatim — and both answer surfaces are empty,
-        // which is why the surface comparison alone exempted this pair.
         probes.push({
             id: "probe-claim-again",
             question: "Which claim id records the cache architecture?",
@@ -471,9 +447,6 @@ describe("gold and probe freeze guards", () => {
     test("rejects two probes on one claim whose answer surfaces overlap", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // An exact probe on exp-lru-cache whose gold answer is already a choice of
-        // the multiple-choice probe on the same claim: probes share one session, so
-        // the earlier exchange answers the later one.
         probes.push({
             id: "probe-store-exact",
             question: "Name the cache that backs sessions.",
@@ -485,19 +458,15 @@ describe("gold and probe freeze guards", () => {
     });
 
     test("accepts an exact and a claim-id probe on one claim, whose answers cannot substitute", () => {
-        // The canonical scenario already pairs a multiple-choice and a claim-id
-        // probe on exp-lru-cache: one answers with a value, the other with a
-        // runtime claim id, so neither exchange supplies the other's answer.
         expect(() => parseScenario(validScenarioRaw())).not.toThrow();
     });
 
     test("rejects an earlier answer value that contains a later probe's answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // The surfaces are not equal, so the intersection check exempts the pair —
-        // but "limit 4096 bytes" states "4096", and it states it inside the ACCEPTED
-        // envelope, which `probeResponseLeak` deliberately exempts at runtime. If this
-        // does not refuse it, nothing does.
+        // The scenario is invalid because an earlier accepted response states the later gold answer `4096` despite disjoint answer surfaces.
+        // The scenario is invalid because an earlier accepted response states the later gold answer `4096` despite disjoint answer surfaces.
+        // The scenario is invalid because an earlier accepted response states the later gold answer `4096` despite disjoint answer surfaces.
         probes.unshift({
             id: "probe-limit-phrase",
             question: "How was the cap described?",
@@ -511,8 +480,7 @@ describe("gold and probe freeze guards", () => {
     test("accepts a containing answer value when it runs LAST", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Same pair, reversed. The containing value now appears only after the probe
-        // it would expose, so no reply the answering model saw carried it.
+        // The scenario is valid because the response containing the gold value follows the exposed probe and is absent from that probe's history.
         probes.push({
             id: "probe-limit-phrase",
             question: "How was the cap described?",
@@ -526,8 +494,7 @@ describe("gold and probe freeze guards", () => {
     test("a containing value is matched as a complete value, not a substring", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // The earlier answer holds the characters of "409" but states "4096"; a bare
-        // substring test would refuse this legitimate pair.
+        // The earlier answer is "4096", so a substring match would incorrectly treat it as the complete value "409".
         probes.unshift({
             id: "probe-limit-phrase",
             question: "How was the cap described?",
@@ -542,9 +509,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects an earlier probe whose question states a later probe's answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // The gold answers are "yes" and "4096" — no overlap, so the answer-surface
-        // comparison exempts the pair. But this question puts "4096" into raw
-        // history ahead of the probe whose answer it is, and probes share one
+        // The gold answers "yes" and "4096" do not overlap, but the earlier question places "4096" in the later probe's session history.
         // resumed session.
         probes.unshift({
             id: "probe-capacity-confirm",
@@ -560,9 +525,8 @@ describe("gold and probe freeze guards", () => {
     test("accepts the same pair when the exposing question runs LAST", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Identical to the pair above with the order reversed. Probes run in array
-        // order, so a question appended after the probe it would expose is never in
-        // that probe's history — refusing it would cost a legitimate probe.
+        // The parser accepts the pair because the exposing question runs after the probe and is absent from its history.
+        // The parser accepts the pair because the exposing question runs after the probe and is absent from its history.
         probes.push({
             id: "probe-capacity-confirm",
             question: "Was the session cache capacity set to 4096 entries?",
@@ -577,8 +541,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects a multiple-choice question that points at its own correct option", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Naming the gold option while leaving another choice unstated does not restate
-        // the option list — it points at one, and the prompt then carries the selection.
+        // The question names the gold option without restating every choice, but it still exposes the correct selection.
         probes.push({
             id: "probe-store-steered",
             question: "memcached is correct; which cache was rejected second?",
@@ -593,10 +556,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects a self-answering multiple-choice question that names every option too", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Every choice named AND the correct one identified. A rule keyed on whether
-        // some choice went unstated accepts this; no containment rule separates
-        // restating a list from pointing into it, so the exemption is gone and any
-        // question stating its own gold answer is refused.
+        // The question names every choice and identifies the correct one, so it exposes its own gold answer.
         probes.push({
             id: "probe-store-steered-all",
             question: "memcached, not hazelcast, is correct; which cache was rejected second?",
@@ -611,9 +571,7 @@ describe("gold and probe freeze guards", () => {
     test("a multiple-choice question that names no option value freezes", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // The prompt renders `Choose exactly one of: ...` itself, so the question does
-        // not need the values — which is why refusing the ones that carry them costs an
-        // author only a rewrite.
+        // Multiple-choice prompts render `Choose exactly one of: ...`, so questions need not repeat choice values.
         probes.push({
             id: "probe-store-clean",
             question: "Which cache was rejected second?",
@@ -626,16 +584,13 @@ describe("gold and probe freeze guards", () => {
     });
 
     test("probe diagnostics name the failure class and ids, never the answer text", () => {
-        // The contract's parsing rule is that diagnostics never echo artifact values,
-        // so a freeze log or CI transcript cannot leak corpus content.
+        // Diagnostics never echo artifact values, preventing freeze logs and CI transcripts from leaking corpus content.
         const selfAnswering = validScenarioRaw();
         (selfAnswering.probes as Record<string, unknown>[])[0].question = "What limit was set to 4096?";
         expect(() => parseScenario(selfAnswering)).toThrow(/self-answering/);
         expect(() => parseScenario(selfAnswering)).not.toThrow(/4096/);
 
-        // Probe ids are deliberately digit-free here: an id echoed in the message is
-        // fine (ids are what the diagnostic is FOR), so an id carrying the value would
-        // make this assertion pass or fail for the wrong reason.
+        // The test uses digit-free probe IDs because diagnostics may echo IDs; an ID containing the value would confound the assertion.
         const sharedSurface = validScenarioRaw();
         (sharedSurface.probes as Record<string, unknown>[]).push({
             id: "probe-capacity-again",
@@ -651,9 +606,8 @@ describe("gold and probe freeze guards", () => {
     test("a question stating the ESCAPED form of its own answer is still self-answering", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // `compareProbeAnswer` accepts `A&amp;B` for an authored gold of `A&B`, so a raw
-        // collision check let the escaped form sit in the prompt and still score. Every
-        // guard canonicalizes through `containsCompleteValue` now, so the two agree.
+        // `compareProbeAnswer` accepts `A&amp;B` for authored `A&B`; `containsCompleteValue` must canonicalize escaped forms too.
+        // `containsCompleteValue` canonicalizes escaped forms, so prompts cannot contain values accepted by `compareProbeAnswer`.
         probes.push({
             id: "probe-escaped-self",
             question: "The marker is A&amp;B — what is the marker?",
@@ -667,9 +621,7 @@ describe("gold and probe freeze guards", () => {
     test("an oversized numeric entity is refused, not a thrown RangeError", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // `String.fromCodePoint` throws outside the Unicode range, and the decoder runs over
-        // authored and model text alike — so an entity naming no character must pass through
-        // as written rather than crash the parse.
+        // `String.fromCodePoint` throws for invalid code points, so the decoder leaves entities that name no character unchanged.
         probes.push({
             id: "probe-bad-entity",
             question: "What does &#999999999; denote?",
@@ -683,8 +635,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects an exact probe whose question states its own gold answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // No history needed at all: the value the probe rewards is in the prompt it
-        // is answering, so a correct reply proves nothing about injected memory.
+        // The rewarded value appears in the prompt, so a correct reply cannot prove injected-memory recall.
         probes.push({
             id: "probe-capacity-restated",
             question: "The capacity is 4096 entries — what is the session cache capacity?",
@@ -698,7 +649,7 @@ describe("gold and probe freeze guards", () => {
     test("a question that shares only a digit prefix with an answer is not exposure", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Appended after probe-capacity, so its mention of 4096 exposes nothing.
+        // Because `probe-capacity-confirm` follows `probe-capacity`, it cannot expose `4096` to `probe-capacity`.
         probes.push({
             id: "probe-capacity-confirm",
             question: "Was the session cache capacity set to 4096 entries?",
@@ -707,9 +658,7 @@ describe("gold and probe freeze guards", () => {
             goldAnswer: "yes",
             sourceClaimRef: "exp-cache-capacity",
         });
-        // "4096" contains the characters of "4", and the question above runs first.
-        // Matching by bare substring would refuse this pair; the answer is a
-        // complete value, and "4" is stated nowhere.
+        // Bare-substring matching would reject the pair because "4096" contains "4"; no source turn states "4" as a complete value.
         probes.push({
             id: "probe-replica-count",
             question: "How many cache replicas were configured?",
@@ -722,9 +671,8 @@ describe("gold and probe freeze guards", () => {
 
     test("rejects same-category predicate subsumption, which credits one fact to two golds", () => {
         const raw = validScenarioRaw();
-        // "LRU cache" is contained in the existing "in-process LRU cache", so any
-        // claim matching the latter matches both and recall reads 2/2 for one
-        // authored fact. The ids and strings differ, so the identity check misses it.
+        // A claim matching "in-process LRU cache" also matches "LRU cache", so one fact would satisfy two same-category gold claims.
+        // The overlapping predicates produce 2/2 recall.
         (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims.push({
             id: "exp-lru-short",
             category: "ARCHITECTURE",
@@ -755,7 +703,7 @@ describe("gold and probe freeze guards", () => {
     test("rejects a choice containing the option separator the prompt renders with", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Rendered as "A | B | C", so the model cannot tell two options from three.
+        // The rendering `A | B | C` does not reveal whether it represents two options or three.
         probes[1].choices = ["A | B", "in-process lru"];
         probes[1].goldAnswer = "in-process lru";
         expect(() => parseScenario(raw)).toThrow(/choice-separator/);
@@ -773,12 +721,9 @@ describe("lintScenario probe backing", () => {
     test("flags a probe answer the backing gold claim does not require", () => {
         const raw = validScenarioRaw();
         const gold = raw.gold as { expectedClaims: Array<{ id: string; predicate: { value: string } }> };
-        // Still authored in the claim's source range, so the existing
-        // not-authored-in-source-range rule stays quiet; what changes is that a
-        // claim satisfying this predicate need not carry the probe's answer.
-        // The historian then gets full recall while no injected claim bears the
-        // answer, and the probe tier reports error-trimmed — an infrastructure
-        // outcome excluded from scoring — instead of failing the extraction.
+        // Claims authored in the source range do not trigger `not-authored-in-source-range`.
+        // A claim can satisfy the predicate without carrying the probe's answer.
+        // The historian can receive full recall although no injected claim contains the probe answer, producing the excluded `error-trimmed` probe tier instead of an extraction failure.
         gold.expectedClaims[0].predicate.value = "in-process";
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics.some((entry) => /probe-store\.goldAnswer: not-required-by-exp-lru-cache/.test(entry))).toBe(
@@ -794,9 +739,7 @@ describe("lintScenario probe backing", () => {
 describe("lintScenario", () => {
     test("flags a trigger recipe whose build turns cross the execution threshold", () => {
         const raw = validScenarioRaw();
-        // 50% of the context limit on every ordinary turn: the historian would
-        // launch during filler or authored turns, before driveHistorianRun
-        // starts counting, misaligning run rows against scripted outputs.
+        // The historian would launch during filler or authored turns before `driveHistorianRun` starts counting, misaligning run rows with scripted outputs.
         (raw.trigger as Record<string, unknown>).usageTokensPerTurn = 100_000;
         const diagnostics = lintScenario(parseScenario(raw));
         expect(
@@ -806,9 +749,8 @@ describe("lintScenario", () => {
 
     test("flags a recipe whose padding cannot clear the protected tail within the cap", () => {
         const raw = validScenarioRaw();
-        // Light ballast against the same tail target: the capped padding turns
-        // cannot build the tail, and the symptom at runtime would be an
-        // unrelated-looking run-never-fired or probe-gold-uncovered.
+        // Capped padding turns cannot clear the protected tail when `ballastTokensPerTurn` is 1.
+        // Capped padding cannot clear the protected tail, causing `run-never-fired` or `probe-gold-uncovered`.
         (raw.trigger as Record<string, unknown>).ballastTokensPerTurn = 1;
         const diagnostics = lintScenario(parseScenario(raw));
         expect(
@@ -818,7 +760,7 @@ describe("lintScenario", () => {
 
     test("flags a trigger recipe whose spike never crosses the execution threshold", () => {
         const raw = validScenarioRaw();
-        // Below 40%, so no run ever launches and the scenario can only end as
+        // A spike below 40% never launches a run, so the scenario ends as `run-never-fired`.
         // run-never-fired.
         (raw.trigger as Record<string, unknown>).spikeUsageTokens = 10_000;
         const diagnostics = lintScenario(parseScenario(raw));
@@ -828,9 +770,8 @@ describe("lintScenario", () => {
     test("accepts a well-formed scenario carrying each of the seven hard-negative families", () => {
         const raw = validScenarioRaw();
         raw.families = [...HARD_NEGATIVE_FAMILIES];
-        // Each predicate is a formation the pre-epilogue transcript actually
-        // contains: a hard negative the historian was never exposed to would
-        // pass its absence check vacuously, so the lint requires the evidence.
+        // Each hard-negative predicate must match a formation in the pre-epilogue transcript.
+        // A hard-negative predicate with no pre-epilogue formation passes its absence check vacuously.
         const authoredFormations = [
             "use Redis for the session cache",
             "TTL eviction",
@@ -887,10 +828,9 @@ describe("lintScenario", () => {
 
     test("rejects an expected-absent predicate that contradicts a gold claim", () => {
         const raw = validScenarioRaw();
-        // "LRU cache" is a normalized substring of the gold claim
-        // "in-process LRU cache": any content satisfying the gold predicate
-        // necessarily trips the forbidden formation, so the scenario could
-        // never pass once frozen.
+        // The gold predicate's `LRU cache` normalized substring matches `in-process LRU cache`.
+        // Any content satisfying the gold predicate also matches the forbidden formation.
+        // The scenario cannot pass because gold-predicate matches also match the forbidden formation.
         (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> }).expectedAbsent[0].predicate.value =
             "LRU cache";
         const diagnostics = lintScenario(parseScenario(raw));
@@ -901,8 +841,7 @@ describe("lintScenario", () => {
 
     test("rejects a compartment minCount above the transcript's message capacity", () => {
         const raw = validScenarioRaw();
-        // 4 turns = 8 messages; compartments partition messages, so 9 can
-        // never be satisfied.
+        // Four turns contain eight messages, so a nine-message compartment cannot fit within them.
         (raw.gold as { compartments: { minCount: number } }).compartments.minCount = 9;
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics.some((d) => d.includes("minCount: exceeds-message-capacity"))).toBe(true);
@@ -910,9 +849,9 @@ describe("lintScenario", () => {
 
     test("rejects a gold claim whose predicate is absent from its declared source range", () => {
         const raw = validScenarioRaw();
-        // Range [1,1] is the LRU-cache decision turn; "4096" is authored in turn
-        // 2. The range is what the leakage gate guards and what the scorer treats
-        // as the fact's origin, so a predicate that is not in it names no
+        // `[1,1]` is the LRU-cache decision turn, and it contains the authored value `4096`.
+        // `[1,1]` is the leakage gate's guarded range and the scorer's fact-origin range.
+        // The predicate matches only text outside `sourceTurnRange`, so no in-range turn can establish the fact origin.
         // authored fact.
         (raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> }).expectedClaims[1].sourceTurnRange =
             [1, 1];
@@ -946,8 +885,7 @@ describe("lintScenario", () => {
         (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> }).expectedAbsent[0].predicate.value =
             "use Kafka for the session cache";
         const diagnostics = lintScenario(parseScenario(raw));
-        // Discard-last can drop the epilogue, so the historian may never see the
-        // formation and the absence check would pass without measuring anything.
+        // Discarding the last turn can hide the formation from the historian, allowing the absence check to pass without evaluating it.
         expect(diagnostics).toContain(
             "hse-auth-rejected-redis.gold.expectedAbsent.abs-redis-active.predicate: not-authored-before-epilogue",
         );
@@ -1007,10 +945,9 @@ describe("lintScenario", () => {
     test("rejects a gold answer an EARLIER probe's suffix already rendered", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // Appended after the multiple-choice probe, so `Choose exactly one of:` is already
-        // in the resumed session's raw history when this exact probe is asked. Scoping the
-        // surface to the probe's OWN suffix fixed a false refusal and opened this mirror
-        // hole; the surface is ordered, so it holds every suffix rendered up to this probe.
+        // The exact probe runs after the multiple-choice probe.
+        // `Choose exactly one of:` is in the resumed session's raw history when the exact probe runs.
+        // The ordered surface contains every suffix rendered before the exact probe.
         probes.push({
             id: "probe-choose-word",
             question: "Which verb did the instructions use?",
@@ -1027,9 +964,8 @@ describe("lintScenario", () => {
     test("rejects a gold answer an earlier claim-id prompt's suffix rendered", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // The canonical scenario's third probe is claim-id, whose suffix says
-        // "the identifier before the colon". A later exact probe answering "identifier"
-        // copies it from history.
+        // The canonical scenario's third probe, claim-id, includes the suffix `the identifier before the colon`.
+        // A later exact probe can answer `identifier` from that suffix in its history.
         probes.push({
             id: "probe-identifier-word",
             question: "What did the instructions call the id?",
@@ -1045,8 +981,7 @@ describe("lintScenario", () => {
 
     test("a multiple-choice probe IS rejected for its own prompt's choice wording", () => {
         const raw = validScenarioRaw();
-        // The same word, for the probe type whose prompt does render it — so the split
-        // narrows the surface without losing the check.
+        // The claim-id prompt renders `identifier`, so the lint must check it.
         const probes = raw.probes as Record<string, unknown>[];
         const store = probes.find((probe) => probe.id === "probe-store") as Record<string, unknown>;
         store.choices = ["choose", "memcached"];
@@ -1065,16 +1000,15 @@ describe("lintScenario", () => {
 
     test("an oversized probe answer is a named diagnostic, not a regex blow-up", () => {
         const raw = validScenarioRaw();
-        // The answer is escaped into a `RegExp` by `containsCompleteValue` and scanned
-        // all-pairs, so an unbounded value has to be refused before any scan reads it.
+        // Escaping each answer prevents regex metacharacters from changing all-pairs matching.
+        // The parser rejects oversized answers before all-pairs scanning.
         (raw.probes as Record<string, unknown>[])[0].goldAnswer = "y".repeat(2_001);
         expect(() => parseScenario(raw)).toThrow(/goldAnswer: above-operational-maximum/);
     });
 
     test("rejects a probe gold answer absent from its claim's source range", () => {
         const raw = validScenarioRaw();
-        // Valid reference, unsupported answer: the frozen probe would reward a
-        // hallucinated 2048 and mark the transcript-supported 4096 wrong.
+        // A frozen probe with `goldAnswer` `2048` would reward a hallucinated answer and reject the transcript-supported `4096`.
         (raw.probes as Record<string, unknown>[])[0].goldAnswer = "2048";
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics).toContain(
@@ -1084,8 +1018,8 @@ describe("lintScenario", () => {
 
     test("a probe gold answer is checked against its own claim's range, not the whole transcript", () => {
         const raw = validScenarioRaw();
-        // "4096" is authored in turn 2, but this probe now claims the LRU decision
-        // turn as its provenance, so the answer is not supported where it says.
+        // The transcript authors `4096` in turn 2.
+        // The probe attributes provenance to the LRU-decision turn, which does not author the answer.
         (raw.probes as Record<string, unknown>[])[0].sourceClaimRef = "exp-lru-cache";
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics).toContain(
@@ -1095,8 +1029,7 @@ describe("lintScenario", () => {
 
     test("a probe gold answer must be a complete authored value, not a substring", () => {
         const raw = validScenarioRaw();
-        // "4" occurs inside "4096" and nowhere else, so plain containment would
-        // freeze a probe that rewards a wrong answer.
+        // Complete-value matching prevents `4` from matching `4096`.
         (raw.probes as Record<string, unknown>[])[0].goldAnswer = "4";
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics).toContain(
@@ -1105,18 +1038,17 @@ describe("lintScenario", () => {
     });
 
     test("a complete gold answer still matches inside a sentence", () => {
-        // The boundary is letter-or-digit adjacency, so surrounding prose and
-        // punctuation are fine; only a longer alphanumeric run rejects.
+        // Only letter-or-digit adjacency prevents a complete-value match.
+        // Adjacent punctuation does not prevent a match; adjacent letters or digits do.
         expect(lintScenario(validScenario())).toEqual([]);
     });
 
     test("evidence is searched as the historian receives it, not as authored", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
-        // Production strips `<system-reminder>` blocks before the chunk builder
-        // runs, so a predicate authored only inside one is never seen by the
-        // historian and its recall failure would be inevitable. Both messages of
-        // the turn have to be moved, since either can carry the evidence.
+        // Production strips `<system-reminder>` blocks before chunk construction.
+        // The historian never receives predicates authored only in stripped `<system-reminder>` blocks.
+        // Recall fails when the only supporting predicate is in a stripped block.
         turns[1].user = "No — decided against it. <system-reminder>Use the in-process LRU cache.</system-reminder>";
         turns[1].assistant = "Understood; recorded that decision.";
         const diagnostics = lintScenario(parseScenario(raw));
@@ -1128,15 +1060,13 @@ describe("lintScenario", () => {
     test("a directive-only turn is not authored evidence and renders no block", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
-        // Production drops a user message whose cleaned text is a Magic Context
-        // directive, so evidence there is never seen and the block never exists.
+        // Production drops a user message whose cleaned text is a Magic Context directive.
         turns[1].user = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT] Use the in-process LRU cache.";
         turns[1].assistant = "Understood; recorded that decision.";
         const scenario = parseScenario(raw);
         expect(lintScenario(scenario)).toContain(
             "hse-auth-rejected-redis.gold.expectedClaims.exp-lru-cache.sourceTurnRange: predicate-not-authored",
         );
-        // One block short of two-per-turn, and none of them carries the directive.
         const blocks = renderedTranscriptBlocks(scenario);
         expect(blocks).toHaveLength(scenario.transcript.turns.length * 2 - 1);
         expect(blocks.some((block) => block.includes("SYSTEM DIRECTIVE"))).toBe(false);
@@ -1147,18 +1077,13 @@ describe("lintScenario", () => {
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
         turns[1].user = "No — decided against it. Use the in-process LRU cache.";
         turns[1].assistant = "Understood; recorded that decision.";
-        // Same words, not stripped: the control that proves the previous test
-        // fails on the reminder and not on the rewritten turn.
+        // The unchanged-message control isolates `<system-reminder>` stripping from turn rewriting.
         expect(lintScenario(parseScenario(raw))).toEqual([]);
     });
 
     test("headroom lint measures the ballast the harnesses actually send", () => {
         const scenario = validScenario();
         const blocks = renderedTranscriptBlocks(scenario);
-        // `ballastProse` takes only a token count, and `TestHarness.ballast` plus
-        // its pi/rust twins forward exactly that, so every turn must carry these
-        // bytes. Pinned because the lint measuring bytes no runner sends is the
-        // failure this rendering exists to prevent.
         const harnessBallast = ballastProse(scenario.trigger.ballastTokensPerTurn);
         expect(harnessBallast.length).toBeGreaterThan(0);
         expect(blocks.filter((block) => block.includes(harnessBallast))).toHaveLength(
@@ -1169,12 +1094,8 @@ describe("lintScenario", () => {
     test("headroom lint accounts per block, as production budgets", () => {
         const scenario = validScenario();
         const authored = renderedTranscriptBlocks(scenario);
-        // Filler blocks are measured too: the runner prepends them and they consume
-        // the same chunk budget.
         const blocks = [...renderedFillerBlocks(scenario), ...authored];
-        // Production tokenizes each formatBlock result and accumulates the counts,
-        // so the lint must sum the same per-block estimates. Estimation is not
-        // additive across concatenation, which is what makes this observable.
+        // The lint must sum per-block token estimates because estimates are non-additive across concatenation.
         expect(authored).toHaveLength(scenario.transcript.turns.length * 2);
         expect(renderedFillerBlocks(scenario)).toHaveLength((10 - scenario.transcript.turns.length) * 2);
         const summed = blocks.reduce((total, block) => total + estimateTokens(block), 0);
@@ -1195,10 +1116,9 @@ describe("lintScenario", () => {
         turns[2].assistant = "Done: committed the capacity change in a1b2c3d4e5.";
         const blocks = renderedTranscriptBlocks(parseScenario(raw));
         const block = blocks.find((candidate) => candidate.includes("capacity change"));
-        // `compactTextForSummary` lifts the hash out of the prose and `formatBlock`
-        // re-attaches it as a `commits:` suffix. Hard-coded empty commitHashes and
-        // raw text produced different bytes, and so a different token count, from
-        // what the historian receives.
+        // `compactTextForSummary` removes the hash from prose.
+        // `formatBlock` appends the hash as a `commits:` suffix.
+        // `commitHashes: []` and unprocessed text produce different bytes.
         expect(block).toContain("commits: a1b2c3d4e5");
         expect(block).not.toContain("in a1b2c3d4e5");
     });
@@ -1317,18 +1237,13 @@ describe("release tuple and manifest", () => {
         const a = validScenario();
         const rawB = validScenarioRaw();
         rawB.id = "hse-second-scenario";
-        // A distinct id is no longer enough to make a second corpus entry: the
-        // tuple rejects semantic duplicates regardless of name, so `b` has to
-        // differ in substance. Editing an epilogue turn keeps every gold range
-        // and predicate valid.
+        // The tuple rejects semantically duplicate scenarios regardless of ID; changing an epilogue turn preserves gold ranges and predicates.
         (rawB.transcript as { turns: Array<{ user: string }> }).turns[3].user = "That is all for today.";
         const b = parseScenario(rawB);
         expect(buildReleaseTuple([a, b])).toEqual(buildReleaseTuple([b, a]));
     });
 
     test("release tuple rejects an empty corpus", () => {
-        // A vacuous release still produces a bindable fingerprint, so approvals
-        // could promote a corpus that measures nothing.
         expect(() => buildReleaseTuple([])).toThrow(/releaseTuple\.scenarios: empty/);
     });
 
@@ -1338,8 +1253,6 @@ describe("release tuple and manifest", () => {
         rawCopy.id = "hse-auth-rejected-redis-copy";
         rawCopy.title = "A relabelled copy of the same evaluation";
         const copy = parseScenario(rawCopy);
-        // Identity fingerprints cover id and title, so they differ here by
-        // construction; only the id-independent check can see the duplicate.
         expect(scenarioFingerprint(copy)).not.toBe(scenarioFingerprint(a));
         expect(() => buildReleaseTuple([a, copy])).toThrow(/releaseTuple\.scenarios\.semantic: duplicate/);
     });
@@ -1349,8 +1262,6 @@ describe("release tuple and manifest", () => {
         const rawCopy = validScenarioRaw();
         rawCopy.id = "hse-auth-rejected-redis-permuted";
         rawCopy.title = "The same evaluation with its arrays permuted";
-        // canonicalJson preserves array order, so a permuted copy would otherwise
-        // hash differently while running the identical transcript and checks.
         (rawCopy.gold as { expectedClaims: unknown[] }).expectedClaims.reverse();
         (rawCopy.probes as unknown[]).reverse();
         const copy = parseScenario(rawCopy);
@@ -1362,7 +1273,6 @@ describe("release tuple and manifest", () => {
         const rawReordered = validScenarioRaw();
         rawReordered.id = "hse-turns-reordered";
         const turns = (rawReordered.transcript as { turns: unknown[] }).turns;
-        // Turn order is meaning: the decision turn now precedes the proposal.
         [turns[0], turns[1]] = [turns[1], turns[0]];
         (rawReordered.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> }).expectedClaims[0].sourceTurnRange =
             [0, 0];
@@ -1374,8 +1284,6 @@ describe("release tuple and manifest", () => {
         const a = validScenario();
         const rawCopy = validScenarioRaw();
         rawCopy.id = "hse-auth-rejected-redis-respelled";
-        // Every comparison of a predicate runs through normalizeContent, so a
-        // respelling that normalizes alike evaluates identically.
         (rawCopy.gold as { expectedClaims: Array<{ predicate: { value: string } }> }).expectedClaims[0].predicate.value =
             "  IN-PROCESS   lru   Cache ";
         const copy = parseScenario(rawCopy);
@@ -1386,8 +1294,6 @@ describe("release tuple and manifest", () => {
         const rawCopy = validScenarioRaw();
         rawCopy.id = "hse-auth-rejected-redis-renumbered";
         rawCopy.title = "The same evaluation with every local id renamed";
-        // `exp-*`, `abs-*`, and `probe-*` are labels, not semantics. Renaming them
-        // and rewriting the probe references leaves the evaluation identical.
         const renames: Record<string, string> = {
             "exp-lru-cache": "exp-a1",
             "exp-cache-capacity": "exp-a2",
@@ -1454,8 +1360,6 @@ describe("release tuple and manifest", () => {
             releaseTuple: tuple,
             tombstones: ["hse-known-wrong"],
         });
-        // Same tuple, same approvals, tombstone silently dropped: the errata
-        // resurrection this binding exists to prevent.
         const dropped = {
             schema: MANIFEST_SCHEMA,
             releaseVersion: "v1",
@@ -1491,8 +1395,6 @@ describe("release tuple and manifest", () => {
 
     test("one actor cannot hold both governance seats", () => {
         const tuple = buildReleaseTuple([validScenario()]);
-        // Trivially different spellings are the same actor: the string validator
-        // preserves the authored value, so an exact comparison would pass them.
         for (const [privacyApprover, goldApprover] of [
             ["operator-a", "operator-a"],
             ["alice", " alice "],
@@ -1533,8 +1435,6 @@ describe("release tuple and manifest", () => {
             });
         };
         const v1 = manifest("v1", ["hse-known-wrong", "hse-also-wrong"]);
-        // Freshly approved and internally consistent, so approval binding cannot
-        // catch it: only the predecessor shows the resurrection.
         const resurrects = manifest("v2", ["hse-also-wrong"]);
         expect(() => assertReleaseSuccession(v1, resurrects)).toThrow(
             /releaseSuccession\.tombstones: dropped-hse-known-wrong/,
@@ -1543,17 +1443,11 @@ describe("release tuple and manifest", () => {
         const carriesForward = manifest("v2", ["hse-known-wrong", "hse-also-wrong", "hse-newly-wrong"]);
         expect(() => assertReleaseSuccession(v1, carriesForward)).not.toThrow();
 
-        // Supplied backwards, the inheritance direction is meaningless, so the
-        // version order is checked rather than silently passing.
         expect(() => assertReleaseSuccession(carriesForward, v1)).toThrow(/not-later-than-previous/);
         expect(() => assertReleaseSuccession(v1, v1)).toThrow(/not-later-than-previous/);
     });
 
     test("a historical predecessor stays readable across a policy rotation", () => {
-        // parseManifest pins the privacy/sanitizer constants, which is right for a
-        // release being published but makes a formerly valid predecessor
-        // unparseable the moment either rotates — exactly when its tombstones
-        // still have to be carried forward.
         const rotated = {
             schema: MANIFEST_SCHEMA,
             releaseVersion: "v1",
@@ -1573,7 +1467,6 @@ describe("release tuple and manifest", () => {
 
         const previous = parseReleaseLineage(rotated);
         expect(previous.tombstones).toEqual(["hse-known-wrong"]);
-        // And the gate still works from it.
         expect(() =>
             assertReleaseSuccession(previous, { releaseVersion: "v2", tombstones: ["hse-known-wrong"] }),
         ).not.toThrow();
@@ -1583,8 +1476,6 @@ describe("release tuple and manifest", () => {
     });
 
     test("lineage parsing still rejects a malformed predecessor", () => {
-        // Ignoring the tuple and approvals must not mean trusting anything: a bad
-        // version or id would weaken the gate silently.
         expect(() => parseReleaseLineage({ schema: "wrong", releaseVersion: "v1", tombstones: [] })).toThrow(
             /schema: version-invalid/,
         );
@@ -1601,8 +1492,6 @@ describe("release tuple and manifest", () => {
         expect(() =>
             assertTombstonesRetired([scenario], { releaseVersion: "v2", tombstones: [scenario.id] }),
         ).toThrow(/releaseTombstones\.scenarios: still-published-hse-auth-rejected-redis/);
-        // The corpus and the tombstone set arrive from opposite directions, so
-        // neither buildReleaseTuple nor parseManifest can see this on its own.
         expect(() =>
             assertTombstonesRetired([scenario], { releaseVersion: "v2", tombstones: ["hse-retired-elsewhere"] }),
         ).not.toThrow();
@@ -1610,9 +1499,8 @@ describe("release tuple and manifest", () => {
 
     test("privacy and sanitizer versions must be the ones the lane implements", () => {        const tuple = buildReleaseTuple([validScenario()]);
         for (const key of ["privacyPolicyVersion", "sanitizerVersion"] as const) {
-            // A manifest that invents a version and recomputes the fingerprint
-            // over it would present the corpus as reviewed under a policy no code
-            // here enforces, so the check cannot rely on the binding alone.
+            // The check must validate the manifest version independently of its fingerprint binding.
+            // A fingerprint with an invented version approves an unenforced policy.
             const forgedTuple = { ...tuple, [key]: "made-up" };
             const releaseFingerprint = releaseApprovalFingerprint({
                 releaseVersion: "v1",
@@ -1647,15 +1535,14 @@ describe("parseModelRoute", () => {
     });
 
     test("trims surrounding whitespace off both components", () => {
-        // These strings go straight to OpenCode as model identifiers, so a
-        // provider of "anthropic " would fail to resolve.
+        // OpenCode receives these strings as model identifiers.
+        // OpenCode cannot resolve the provider ID "anthropic " because of its trailing space.
         expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "anthropic / claude-sonnet-4-5")).toEqual({
             providerID: "anthropic",
             modelID: "claude-sonnet-4-5",
         });
-        // Per SEGMENT, not just the outer edges: trimming the joined model id
-        // leaves interior padding around a legitimate slash in place, and the
-        // route then fails at provider dispatch instead of here.
+        // parseModelRoute must trim each segment independently; trimming the joined model identifier leaves padding around interior slashes.
+        // The route otherwise fails at provider dispatch instead of in `parseModelRoute`.
         expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "openrouter / vendor / model-1")).toEqual({
             providerID: "openrouter",
             modelID: "vendor/model-1",
@@ -1668,8 +1555,7 @@ describe("parseModelRoute", () => {
         ["empty provider component", "/claude-sonnet-4-5"],
         ["no separator", "claude-sonnet-4-5"],
         ["empty value", ""],
-        // `modelParts.join("/")` is non-empty for all three, so checking the
-        // joined value alone accepted a model id of "/" or "a//b".
+        // Checking only `modelParts.join("/")` accepts `/` and `a//b` as model IDs.
         ["trailing separator", "anthropic//"],
         ["whitespace-only interior segment", "anthropic/ / "],
         ["empty interior segment", "anthropic/a//b"],

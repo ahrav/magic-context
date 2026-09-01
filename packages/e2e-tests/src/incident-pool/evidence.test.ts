@@ -70,7 +70,7 @@ function findVariant(catalog: IncidentCatalog, variantId: string) {
 describe("source inventory completeness (R1)", () => {
     it("covers every scanned source item and distinct claim exactly once", () => {
         const inventory = committedInventory();
-        // Throws on any missing, extra, or drifted item/claim.
+        // verifySourceCompleteness throws when an item or claim is missing, extra, or drifted.
         verifySourceCompleteness(inventory, scanSources());
 
         const byId = new Map(
@@ -205,7 +205,6 @@ describe("mutation evidence normalization (R11)", () => {
         expect(
             new Set(view.records.map((record) => record.evidenceId)).size,
         ).toBe(EXPECTED_MUTATION_RECORDS);
-        // Both committed shapes normalize into the one view.
         expect(
             view.records.some((record) => record.shape === "mutations"),
         ).toBe(true);
@@ -305,8 +304,6 @@ describe("mutation evidence normalization (R11)", () => {
         const artifact = inventory.items.find(
             (item) => item.id === "src-mutation-goldens-dg-1",
         )!;
-        // A second inventory row for the same normalized record is a duplicate
-        // link even though its claim id is unique.
         artifact.claims.push({
             ...artifact.claims[0]!,
             id: "claim-mutation-dg-1-one-byte-input-copy",
@@ -544,12 +541,10 @@ describe("verifier-change mutation replay gate (R14)", () => {
             "ev-fm-oc-1-rung-swap",
         ]);
 
-        // Every bound crafted mutation replayed red: gate passes.
         assertMutationReplayResults(view, verifier, {
             "ev-fm-oc-1-rung-swap": true,
             "ev-fm-oc-1-rung-deletion": true,
         });
-        // One mutation stopped producing red (or was skipped): gate fails.
         expect(() =>
             assertMutationReplayResults(view, verifier, {
                 "ev-fm-oc-1-rung-swap": true,
@@ -593,8 +588,6 @@ describe("committed repository state", () => {
         const view = validateEvidenceAndSources(state.inventory, state.catalog);
         expect(view.records).toHaveLength(EXPECTED_MUTATION_RECORDS);
 
-        // Every executable variant carries a fingerprint-bound baseline; red
-        // baselines carry expected failed checks plus observation signatures.
         for (const family of state.catalog.families) {
             for (const variant of family.variants) {
                 if (variant.lane === "adjudication-only") continue;

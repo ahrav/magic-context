@@ -8,7 +8,7 @@
     "targetMinimumDetectableDelta": 0.15,
     "minimumAnalyzableFamilyCount": 4,
     "bootstrapResamples": 5000,
-    "poolManifestFingerprint": "a46f9b125c06cb25f0e16917badab4898aa162a335fe948a76889310e7628a9e",
+    "poolManifestFingerprint": "8f0b1ef9eb33a819353eaf34794c39e482f79e21a2217b10908c36b7024e4613",
     "modelMatrix": [
       {
         "providerId": "anthropic",
@@ -35,5 +35,5 @@
       "pinned-model-echo-matched"
     ]
   },
-  "policyFingerprint": "ab7ea8d3b1fc431e9f286540e0bc7f46c4811eefe8d3cd36349d2d03e2f3410c"
+  "policyFingerprint": "631175e3d8eb27ebaf7a9774c6d5008f615c4fd8c450db1d78c7513a4f064409"
 }

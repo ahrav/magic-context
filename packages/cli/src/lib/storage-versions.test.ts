@@ -20,8 +20,6 @@ describe("storage versions probe", () => {
         try {
             const versions = readStorageVersions(db);
 
-            // A fully migrated DB sits exactly at the fence: the upstream-lane query
-            // and the compile-time constant must agree, and the probe reports both.
             expect(versions.context_db_schema_version).toBe(LATEST_SUPPORTED_VERSION);
             expect(versions.plugin_supported_version).toBe(LATEST_SUPPORTED_VERSION);
             expect(formatStorageVersions(versions)).toBe(
@@ -36,7 +34,6 @@ describe("storage versions probe", () => {
     it("reports the legacy lane of an unsupported older database", () => {
         const db = new Database(":memory:");
         try {
-            // A DB last touched by an older binary: the upstream lane stops at 50.
             db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
             db.prepare("INSERT INTO schema_migrations (version) VALUES (?)").run(50);
 

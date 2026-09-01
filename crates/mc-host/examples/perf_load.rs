@@ -3,20 +3,17 @@
 //! the shared measurement contract lives in
 //! `tests/support/perf_measurement.rs`.
 //!
-//! Timing semantics: issue time is captured after admission and
-//! immediately before frame construction. Closed-loop arms report
-//! issue-to-validated-terminal latency (serial mode, `--pipeline 1` via
-//! `--serial`, is the only closed-loop shape whose value is an RTT).
-//! Open-loop arms report scheduled-to-completion, issue-to-completion, and
-//! scheduler-lag distributions separately, preserving the original arrival
-//! schedule. Every scheduled request resolves to exactly one terminal
+//! The sender captures issue time after admission, immediately before frame construction.
+//! Closed-loop arms report issue-to-validated-terminal latency.
+//! Only `--serial` (`--pipeline 1`) has RTT-valued closed-loop latency.
+//! Open-loop arms report scheduled-to-completion, issue-to-completion, and scheduler-lag distributions separately.
+//! Open-loop arms preserve the original arrival schedule.
+//! Every scheduled request resolves to exactly one terminal outcome.
 //! outcome.
 //!
-//! `--workload raw|json` selects the request body: `json` sends the
-//! committed compact-JSON fixture and validates every echoed terminal
-//! body against the fixture bytes; `raw` (the default) sends the legacy
-//! payload (mode byte plus optional sleep-ms), non-comparable with the
-//! JSON fixture arms.
+//! `--workload json` sends the compact-JSON fixture.
+//! `json` validates every echoed terminal body against the fixture bytes.
+//! `raw` sends a mode byte plus optional sleep-ms and is not comparable with JSON fixture arms.
 
 #[path = "../tests/support/raw_client.rs"]
 mod raw_client;
@@ -38,17 +35,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore, TryAcquireError};
 
 const MODULE_ID: &str = "perf-echo";
-/// Bound on post-send drain before pending requests resolve as
-/// `UnresolvedAtDrain`; the drain loop can never hang on a lost response.
+/// Pending requests become `UnresolvedAtDrain` after the five-second post-send drain.
+/// The drain loop terminates after five seconds even when a response is lost.
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Workload {
-    /// Legacy raw body (mode byte + optional sleep), non-comparable with
-    /// the JSON fixture arms.
     Raw,
-    /// Committed compact JSON fixture; terminal bodies are validated
-    /// against the fixture bytes before counting success.
+    /// `Json` validates terminal bodies against `FIXTURE_BODY` before counting success.
     Json,
 }
 
@@ -129,25 +123,21 @@ fn body_bytes(opts: &Opts) -> Vec<u8> {
 }
 
 struct ConnResult {
-    /// Issue-to-validated-terminal (closed loop: the primary value; open
-    /// loop: the issue-based distribution).
+    /// Open loop reports issue-to-validated-terminal latency as the issue-based distribution.
     issue_latencies_ns: Vec<u64>,
-    /// Scheduled-to-completion (open loop only; coordinated-omission
     /// honest).
     sched_latencies_ns: Vec<u64>,
-    /// Issue minus scheduled: load-generator lag, never server latency.
+    /// `issue - scheduled` measures load-generator lag, not server latency.
     sched_lag_ns: Vec<u64>,
     sent: u64,
     measured_scheduled: u64,
-    /// Requests resolved by a response, including pre-warmup traffic:
-    /// `resolved - measured` is the warmup traffic volume in the RESULT
-    /// line, a distinction the window-gated outcome counters lose.
+    /// Responses resolve requests even before the measurement window opens.
+    /// `resolved - measured` reports warmup traffic because window-gated outcome counters exclude it.
     resolved: u64,
     outcomes: OutcomeCounts,
     error_codes: HashMap<String, u64>,
     closed_early: bool,
-    /// A wire-protocol regression observed by the reader (unsolicited
-    /// request terminal); the run fails with this reason.
+    /// The reader fails the run when it observes an unsolicited request terminal.
     protocol_violation: Option<String>,
     inflight_full: u64,
 }
@@ -175,9 +165,9 @@ async fn run_conn(
     let (read_half, mut write_half) = stream.into_split();
     let body = Arc::new(body_bytes(&opts));
     let expect_fixture = opts.workload == Workload::Json;
-    // The response-length cap tracks the echoed request: the raw
-    // workload legitimately echoes multi-megabyte bodies, while
-    // MAX_BODY_LEN alone is sized for the fixture and error terminals.
+    // The response-length cap permits raw workload requests with multi-megabyte echoed bodies.
+    // `raw` can echo bodies up to the configured payload size.
+    // `MAX_BODY_LEN` covers only the fixture and error terminals.
     let max_response_len = u32::try_from(body.len())
         .unwrap_or(u32::MAX)
         .max(perf_measurement::MAX_BODY_LEN);
@@ -210,14 +200,10 @@ async fn run_conn(
             let mut corr: u64 = 1_000_000;
             let mut k: u64 = 0;
             let mut inflight_full = 0u64;
-            // Connection `idx` owns every `conns`-th slot of the exact
-            // global arrival schedule, so the aggregate offered rate is
-            // exact for any rate, not only divisors of 1e9.
+            // Connection `idx` owns every `conns`-th global arrival slot, preserving the aggregate offered rate even when `rate` does not divide 1e9.
             let idx = idx as u64;
             loop {
-                // Open loop: the arrival schedule is absolute; a late wake
-                // issues immediately (lag recorded), never a catch-up
-                // burst of extra slots.
+                // In open loop, the sender issues a late scheduled slot immediately and records its lag without adding catch-up slots.
                 let scheduled = if rate > 0 {
                     let at =
                         start + Duration::from_nanos(open_loop_offset_ns(k * conns + idx, rate));
@@ -234,20 +220,13 @@ async fn run_conn(
                 };
                 let permit = match inflight.clone().try_acquire_owned() {
                     Ok(permit) => permit,
-                    // The reader closes the semaphore once the connection
-                    // is gone; the schedule must stop rather than record
-                    // the rest of the window as missed slots against a
-                    // connection that no longer exists.
+                    // When the reader closes the semaphore after its connection ends, the sender stops the schedule.
                     Err(TryAcquireError::Closed) => break,
                     Err(TryAcquireError::NoPermits) => {
                         inflight_full += 1;
                         if rate > 0 {
-                            // Open loop: a saturated window drops the slot
-                            // (the reader records MissedSlot) and holds the
-                            // absolute schedule. Waiting for a permit here
-                            // would throttle the offered rate down to the
-                            // completion rate and hide the overload behind
-                            // a conserved-looking outcome table.
+                            // In open loop, the sender drops a slot when no in-flight permit is available.
+                            // In open loop, waiting for an in-flight permit would throttle the offered rate to the completion rate and hide overload in the outcome table.
                             let scheduled_ns = scheduled.duration_since(start).as_nanos() as u64;
                             if scheduled_ns >= warmup_ns {
                                 measured_sent.fetch_add(1, Ordering::Release);
@@ -260,12 +239,7 @@ async fn run_conn(
                         }
                         match inflight.clone().acquire_owned().await {
                             Ok(permit) => {
-                                // The permit wait can outlive the send
-                                // window; a request issued past the
-                                // deadline would count toward a
-                                // throughput that still divides by the
-                                // fixed window. Dropping the permit
-                                // returns it unused.
+                                // The sender drops a permit acquired after the send deadline because issuing then would inflate throughput measured over the fixed window.
                                 if Instant::now() >= send_deadline {
                                     break;
                                 }
@@ -279,14 +253,10 @@ async fn run_conn(
                 corr += 1;
                 k += 1;
                 let scheduled_ns = scheduled.duration_since(start).as_nanos() as u64;
-                // The measured RTT starts here: after the in-flight permit
-                // wait, immediately before frame construction.
+                // The RTT measurement starts after the sender acquires an in-flight permit.
                 let issue_ns = Instant::now().duration_since(start).as_nanos() as u64;
-                // Open-loop window membership follows the scheduled time
-                // (the arrival process defines the window); closed-loop
-                // follows the issue time. Classifying an open-loop request
-                // by a late issue would move pre-warmup arrivals into the
-                // measured distribution under scheduler lag.
+                // Open-loop classification uses scheduled time so scheduler lag cannot move a pre-warmup arrival into the measured window.
+                // Classifying a late open-loop request by issue time moves pre-warmup arrivals into the measured distribution under scheduler lag.
                 let window_ns = if rate > 0 { scheduled_ns } else { issue_ns };
                 if meta_tx.send((corr, scheduled_ns, issue_ns)).is_err() {
                     break;
@@ -301,9 +271,7 @@ async fn run_conn(
                 );
                 frame.extend_from_slice(&body);
                 if write_half.write_all(&frame).await.is_err() {
-                    // The slot is scheduled and terminal: mark it so the
-                    // reader records WriteFailure instead of letting the
-                    // stale meta entry rot into UnresolvedAtDrain.
+                    // The sender marks the request terminal so the reader records `WriteFailure` instead of `UnresolvedAtDrain`.
                     if window_ns >= warmup_ns {
                         measured_sent.fetch_add(1, Ordering::Release);
                     }
@@ -335,8 +303,7 @@ async fn run_conn(
     };
     let mut read_half = read_half;
     let mut pending: HashMap<u64, (u64, u64)> = HashMap::new();
-    // Window membership mirrors the sender: scheduled time in open loop,
-    // issue time in closed loop.
+    // Open-loop classification uses scheduled time, while closed-loop classification uses issue time, so scheduler lag cannot move a pre-warmup arrival into the measured window.
     let open_loop = opts.rate > 0;
     let in_window = move |sched: u64, issue: u64| {
         if open_loop {
@@ -350,14 +317,12 @@ async fn run_conn(
                       outcomes: &mut OutcomeCounts| {
         while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
             if issue == u64::MAX {
-                // Missed open-loop slot: terminal at the scheduler, never
-                // issued, so it carries a scheduled time but no issue time.
+                // A missed open-loop slot is terminal at the scheduler and has a scheduled time but no issue time.
                 if sched >= warmup_ns {
                     outcomes.record(Outcome::MissedSlot);
                 }
             } else if sched == u64::MAX {
-                // Write-failure marker: the request's scheduled/issue pair
-                // is already in `pending` (meta precedes the write).
+                // The sender sends metadata before writing, so the write-failure marker can recover the scheduled and issue times from `pending`.
                 if let Some((sched0, issue0)) = pending.remove(&corr) {
                     if in_window(sched0, issue0) {
                         outcomes.record(Outcome::WriteFailure);
@@ -378,11 +343,7 @@ async fn run_conn(
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
-        // `read` (unlike `read_exact`) is cancellation-safe: a cancelled
-        // branch loses no partially read header or body bytes, so the
-        // other select arms can win without desyncing the frame stream —
-        // and a peer that stalls mid-body cannot pin the reader past the
-        // sender-completion and drain-deadline arms.
+        // `read` is cancellation-safe, so cancelling a select branch retains partial frame bytes and cannot desynchronize the frame stream; the drain deadline bounds peers that stall mid-body.
         let read = tokio::select! {
             biased;
             read = async {
@@ -400,11 +361,7 @@ async fn run_conn(
                 drain_deadline = Some(Instant::now() + DRAIN_BUDGET);
                 None
             }
-            // Absolute backstop, armed from the start: with a peer that
-            // withholds responses, a saturated closed-loop sender parks
-            // on permits and never signals completion, so no
-            // sender-driven drain deadline would ever arm and the run
-            // would wedge on the socket read.
+            // The start-armed backstop ends runs when a peer withholds responses: saturated closed-loop senders wait on permits and never arm the sender-driven drain deadline.
             () = tokio::time::sleep_until((send_deadline + DRAIN_BUDGET).into()),
                 if !done_wait =>
             {
@@ -423,8 +380,8 @@ async fn run_conn(
                     None => std::future::pending().await,
                 }
             }, if done_wait => {
-                // Drain budget exhausted: everything still pending is a
-                // terminal unresolved outcome.
+                // The reader records every pending request as `UnresolvedAtDrain` when the drain budget expires.
+                // The reader rejects peer-controlled frame lengths before allocation to bound memory use.
                 drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
                 for (_, (sched, issue)) in pending.drain() {
                     if in_window(sched, issue) {
@@ -459,9 +416,7 @@ async fn run_conn(
                     }
                     header_filled = 0;
                     let frame = raw_client::decode_header(&header);
-                    // Untrusted 32-bit length: refuse the allocation and
-                    // fail the connection, since the stream cannot resync
-                    // past an unread body.
+                    // The reader fails the connection because the stream cannot resynchronize past the unread body.
                     if frame.len > max_response_len {
                         result.closed_early = true;
                         break;
@@ -477,11 +432,7 @@ async fn run_conn(
         let frame = pending_frame.take().expect("frame body completed");
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
         drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
-        // Frame-type tri-state, matching the bench receivers and the
-        // wire contract's host-to-consumer set: request terminals
-        // (response, error, stream) must resolve an outstanding request;
-        // pings, pushes, and the shutdown goodbye are legal without one
-        // (pong is consumer-to-host only); anything else is a
+        // Only RESPONSE, ERROR, STREAM_DATA, and STREAM_END may resolve pending requests; PING, PUSH, and GOODBYE may be unsolicited; all other types violate the protocol.
         // wire-protocol regression.
         if !matches!(
             frame.ty,
@@ -491,17 +442,13 @@ async fn run_conn(
                 frame.ty,
                 raw_client::TY_PING | raw_client::TY_PUSH | raw_client::TY_GOODBYE
             ) {
-                // A skippable connection frame must still satisfy the
-                // wire contract's structural rules (version, pure-header
-                // shape, identity) before it is skipped.
+                // Skipped connection frames must have a valid version, pure-header shape, and matching `(channel, epoch, corr)`.
                 if let Some(violation) = raw_client::connection_frame_violation(&frame) {
                     result.protocol_violation = Some(violation);
                     result.closed_early = true;
                     break;
                 }
-                // Goodbye for this route (or the generation) is an
-                // orderly teardown; the run resolves its pending work as
-                // connection loss and the exit gates fail it.
+                // GOODBYE for `(channel, epoch)` or `(0, 0)` closes the connection.
                 if frame.ty == raw_client::TY_GOODBYE
                     && ((frame.channel, frame.epoch) == (channel, epoch)
                         || (frame.channel == 0 && frame.epoch == 0))
@@ -526,9 +473,7 @@ async fn run_conn(
         inflight.add_permits(1);
         resolved += 1;
         let measured = in_window(sched, issue);
-        // Records a validation failure: warmup suppresses recording,
-        // never validation, so a pre-warmup violation fails the run as a
-        // protocol regression instead of hiding behind the boundary.
+        // Warmup validation failures set protocol_violation instead of recording an outcome.
         macro_rules! record_failure {
             ($outcome:expr, $label:expr) => {
                 if measured {
@@ -541,10 +486,8 @@ async fn run_conn(
                 }
             };
         }
-        // Route and wire identity: the pending identity on the wire is
-        // (channel, epoch, corr), so a frame that resolves an
-        // outstanding correlation on the wrong channel, epoch, or wire
-        // version is a routing or protocol failure, never a success.
+        // The wire identity is `(channel, epoch, corr)`.
+        // A terminal on the wrong channel, epoch, or wire version is a protocol failure.
         if (frame.channel, frame.epoch) != (channel, epoch) || frame.ver != raw_client::WIRE_VERSION
         {
             record_failure!(Outcome::UnexpectedFrame, "route or version mismatch");
@@ -555,16 +498,14 @@ async fn run_conn(
         }
         match frame.ty {
             TY_RESPONSE => {
-                // A success requires the terminal-response flag shape
-                // (non-binary, last) alongside the body contract; a flag
-                // regression is a wire failure, not a body mismatch.
+                // A successful terminal response must use `FLAGS_RESPONSE_TEXT_LAST`.
                 if frame.flags != raw_client::FLAGS_RESPONSE_TEXT_LAST {
                     record_failure!(Outcome::UnexpectedFrame, "response flags");
                 } else if expect_fixture && body_buf.as_slice() != FIXTURE_BODY {
                     record_failure!(Outcome::BodyMismatch, "fixture body");
                 } else if !expect_fixture && body_buf.as_slice() != body.as_slice() {
-                    // The raw echo contract is byte-for-byte: a
-                    // same-length corrupted response is not a successful
+                    // The raw echo contract compares bodies byte-for-byte.
+                    // Same-length corruption is a body mismatch.
                     // echo either.
                     record_failure!(Outcome::BodyMismatch, "raw echo bytes");
                 } else if measured {
@@ -593,14 +534,10 @@ async fn run_conn(
         }
     }
 
-    // The reader owns permit returns; once it exits, a parked sender
-    // would otherwise wait forever on a saturated window.
+    // The reader returns permits before it exits so senders blocked on a saturated window cannot wait forever.
     inflight.close();
 
-    // The join is bounded: closing the semaphore cannot interrupt a
-    // sender parked in write_all against a peer that stopped reading,
-    // and an unbounded await here would wedge the whole run — the exact
-    // failure the reader's backstop deadline exists to prevent.
+    // A bounded sender join prevents write_all from wedging the run after the peer stops reading.
     let mut sender = sender;
     result.inflight_full = match tokio::time::timeout(DRAIN_BUDGET, &mut sender).await {
         Ok(Ok((count, _write_half))) => count,
@@ -611,14 +548,9 @@ async fn run_conn(
             0
         }
     };
-    // The sender has exited, so the meta channel is complete. This drain
-    // runs unconditionally and after the sender: a write-failure or
-    // missed-slot marker can be enqueued without forcing the reader
-    // through its drain paths (the reader exits normally once every
-    // successfully written request resolves), and a drain racing a live
-    // sender could miss a marker enqueued after it finished.
+    // The reader drains metadata after the sender exits so queued write-failure and missed-slot markers are not missed.
     drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
-    // A closed connection resolves every remaining in-flight request.
+    // When the sender times out, the reader records `Outcome::PeerClosed` for each remaining request in the measurement window.
     if result.closed_early {
         for (_, (sched, issue)) in pending.drain() {
             if in_window(sched, issue) {
@@ -687,7 +619,7 @@ fn print_latency(kind: &str, samples: Vec<u64>) {
 async fn main() {
     let opts = parse_opts();
     if opts.rate > 0 {
-        // Fail malformed offered rates before any traffic is generated.
+        // The client fails malformed offered rates before generating traffic.
         validate_open_loop_rate(opts.rate).expect("offered rate");
     }
     let info = raw_client::discover(&opts.publication).expect("publication");
@@ -757,8 +689,6 @@ async fn main() {
         Workload::Raw => "raw-legacy",
         Workload::Json => perf_measurement::FIXTURE_LABEL,
     };
-    // The JSON workload always sends the fixed fixture regardless of
-    // --payload; the label reports the bytes actually sent per request.
     let payload_bytes = body_bytes(&opts).len();
     println!(
         "RESULT label={} loop={} workload={} conns={} payload={} rate={} pipeline={} secs={} \
@@ -814,10 +744,6 @@ async fn main() {
         eprintln!("wire-protocol violation: {reason}: aborting with failure status");
         std::process::exit(1);
     }
-    // Correctness is a gate for the retained results, exactly as in the
-    // IPC-budget collectors: a run whose host answered with wrong
-    // bodies, protocol errors, or unexpected frames must not exit
-    // successfully on the strength of the surviving subset.
     let correctness_failures =
         outcomes.protocol_error + outcomes.body_mismatch + outcomes.unexpected_frame;
     if correctness_failures > 0 {
@@ -827,10 +753,6 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    // A connection retired before the requested window, or transport
-    // failures resolving in-flight requests, conserve a shortened prefix
-    // that looks healthy in the outcome table; the retained results
-    // would silently describe a partial window.
     let transport_failures =
         outcomes.peer_closed + outcomes.write_failure + outcomes.unresolved_at_drain;
     if closed > 0 || transport_failures > 0 {
@@ -840,9 +762,6 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    // A run with no successful measured observation is an invalid
-    // operating point regardless of conservation — a window where every
-    // slot missed still conserves — matching the IPC-budget collector.
     if outcomes.success == 0 {
         eprintln!("no successful measured observation: aborting with failure status");
         std::process::exit(1);

@@ -107,24 +107,18 @@ export function computeOpenCodeWorkMetrics(openCodeDb: Database, sessionId: stri
     };
 }
 
-// ── Incremental (watermark) work-metrics ───────────────────────────────────
 //
-// `computeOpenCodeWorkMetrics` recomputes from a window-function json_extract
-// scan over EVERY assistant row of the session. That is O(session age) and was
-// running on every transform pass — the dominant transform cost on long
-// sessions (47K assistant rows ≈ 250ms/pass). Both halves of the metric are
-// strictly left-to-right accumulations, so nothing before a watermark ever
-// changes. The fold below reproduces the SQL semantics exactly while letting
+// Both metric components are strictly left-to-right accumulations.
+// Rows before the watermark cannot change the metrics.
 // callers process only rows newer than the last-seen `(time_created, id)`.
-// The window-function SQL above is retained as the equivalence oracle in tests.
 
-/** A single assistant row's usage, as folded by `foldWorkMetricsRows`. */
+/* */
 export interface AssistantUsageRow {
-    /** json_extract(data,'$.agent'); null when absent (its own partition). */
+    /** The query extracts `data.$.agent`; absent values form a separate partition. */
     agent: string | null;
     timeCreated: number;
     id: string;
-    /** input + cache.read + cache.write. */
+    /** `prompt` includes `input`, `cache.read`, and `cache.write`. */
     prompt: number;
     output: number;
 }
@@ -132,22 +126,22 @@ export interface AssistantUsageRow {
 interface AgentCarry {
     prevPrompt: number;
     phaseId: number;
-    /** Max qualifying prompt in the current (open) phase. */
+    /** `phasePeak` stores the maximum qualifying prompt in the open phase. */
     phasePeak: number;
-    /** Whether the current phase has at least one qualifying row. */
+    /** `phaseHasQualifying` records whether the open phase has a qualifying row. */
     phaseHasQualifying: boolean;
-    /** Summed peaks of already-closed qualifying phases. */
+    /** `closedPhaseSum` stores peaks from closed qualifying phases. */
     closedPhaseSum: number;
     lastOutput: number;
     seen: boolean;
 }
 
-/** Resumable accumulator: fold new rows into this to extend the metric. */
+/** Callers fold new rows into this accumulator to extend the metrics. */
 export interface WorkMetricsCarry {
     perAgent: Map<string, AgentCarry>;
-    /** Σ max(0, prompt - prevPrompt) across every folded row (metric A body). */
+    /** `newWorkSum` equals Σ max(0, prompt - prevPrompt) across folded rows. */
     newWorkSum: number;
-    /** Watermark: last folded row's ordering key. */
+    /** `lastTimeCreated` and `lastId` identify the last folded row. */
     lastTimeCreated: number;
     lastId: string;
 }
@@ -159,13 +153,13 @@ export function emptyWorkMetricsCarry(): WorkMetricsCarry {
 }
 
 /**
- * Fold rows (which MUST be in (timeCreated, id) ascending order and strictly
- * newer than `carry`'s watermark) into the carry, mutating and returning it.
+ * Rows must be in ascending `(timeCreated, id)` order.
+ * Rows must be strictly newer than `carry`'s watermark.
  *
  * Mirrors OPEN_CODE_WORK_METRICS_SQL:
  *  - delta per row = max(0, prompt - LAG(prompt) per agent), default LAG 0.
- *  - phase_id = cumulative count of (prompt < prevPrompt) per agent; a dropping
- *    row starts (and belongs to) the new phase.
+ * A row with `prompt < prevPrompt` starts a new phase.
+ * The dropping row belongs to the new phase.
  *  - phase peak counts only QUALIFYING rows (prevPrompt > 0 OR phase_id == 0).
  *  - metric A = Σ deltas + Σ (last output per agent); metric B = Σ phase peaks.
  */
@@ -192,8 +186,7 @@ export function foldWorkMetricsRows(
         const prev = st.prevPrompt; // LAG default 0 for the first row per agent.
         carry.newWorkSum += Math.max(0, cur - prev);
 
-        // A drop closes the current phase and opens the next; the dropping row
-        // belongs to the new phase (matches the inclusive cumulative phase_id).
+        // The dropping row belongs to the new phase because `phase_id` counts rows inclusively.
         if (st.seen && cur < prev) {
             if (st.phaseHasQualifying) st.closedPhaseSum += st.phasePeak;
             st.phaseId += 1;
@@ -228,7 +221,7 @@ function cloneCarry(carry: WorkMetricsCarry): WorkMetricsCarry {
     };
 }
 
-/** Current metric value implied by the carry (cheap; no DB access). */
+/* */
 export function metricsFromCarry(carry: WorkMetricsCarry): WorkMetrics {
     let totalInput = 0;
     let lastOutputSum = 0;
@@ -266,7 +259,7 @@ interface AssistantUsageDbRow {
     output: number;
 }
 
-/** Read assistant usage rows strictly newer than the carry watermark. */
+/* */
 export function readAssistantUsageRowsAfter(
     openCodeDb: Database,
     sessionId: string,
@@ -286,17 +279,13 @@ export function readAssistantUsageRowsAfter(
 }
 
 /**
- * Extend `carry` with assistant rows newer than its watermark and return the
- * up-to-date metrics. On a fresh carry this folds the whole session once (cold
- * start); subsequent calls fold only new rows (≈0 when idle).
+ * A fresh carry folds the whole session once.
+ * Subsequent calls fold only rows newer than the watermark.
  *
- * The single most-recent assistant row is NEVER committed into the durable
- * carry — OpenCode writes the row at stream start and finalizes `data.tokens`
- * at completion, so a poll mid-stream would otherwise freeze that row at a
- * partial/zero value. Instead the watermark is advanced only through the
- * second-to-last row; the last row is re-read every poll and folded into a
- * throwaway clone for the returned value, so the result always matches a full
- * re-scan even while the latest turn is still streaming.
+ * The function keeps the newest assistant row out of `carry` so the next poll re-reads it.
+ * The function advances `carry`'s watermark through the second-to-last row.
+ * The function re-reads the newest assistant row on every poll and folds it into a cloned `carry`.
+ * The returned metrics include the held-back row without committing that row to `carry`.
  */
 export function computeOpenCodeWorkMetricsIncremental(
     openCodeDb: Database,
@@ -310,13 +299,10 @@ export function computeOpenCodeWorkMetricsIncremental(
         carry.lastId,
     );
     if (rows.length === 0) {
-        // No uncommitted rows at all (only possible when the session has zero
-        // assistant rows, since the held-back last row always re-reads).
+        // The zero-row branch is reachable only when the session has no assistant rows.
         return { carry, metrics: metricsFromCarry(carry) };
     }
-    // Durably commit everything except the most-recent row.
     if (rows.length > 1) foldWorkMetricsRows(rows.slice(0, -1), carry);
-    // Fold the held-back last row into a throwaway clone for the return value.
     const view = foldWorkMetricsRows([rows[rows.length - 1]], cloneCarry(carry));
     return { carry, metrics: metricsFromCarry(view) };
 }

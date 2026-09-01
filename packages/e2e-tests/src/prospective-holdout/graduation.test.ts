@@ -70,8 +70,6 @@ function coordinatePair(
         seed,
         releaseN,
         releaseNMinus1,
-        // Mirrors the derivation in buildPairedFacts: a coordinate is complete only when both
-        // arms reach `completed`.
         status: releaseN.runHealth === "completed" && releaseNMinus1.runHealth === "completed"
             ? "complete"
             : "incomplete",
@@ -93,8 +91,6 @@ function candidateFor(
         semanticRevisionId: "rev-first",
         secondPrivacyApproval: {
             approver: "privacy-reviewer",
-            // Names the admitted case directly so an empty or cross-case pair set still reaches
-            // the constructor's own rejections rather than failing while building the subject.
             subjectFingerprint: canonicalFingerprint({
                 epochId: context.close.body.epochId,
                 caseId: context.close.body.cases[0]!.caseId,
@@ -180,17 +176,10 @@ describe("prospective incident graduation", () => {
             const graduation = join(root, "graduation");
             const file = `${candidate.source.case_id}.json`;
             mkdirSync(graduation, { recursive: true });
-            // Creating and removing an entry updates the holding directory's modification time,
-            // so a staging entry that lives beside the graduation directory rather than inside it
-            // is observable on the parent. Backdating the parent first makes the comparison exact
-            // instead of dependent on timestamp resolution.
             const backdated = new Date(Date.now() - 600_000);
             utimesSync(root, backdated, backdated);
             appendGraduationCandidate(candidate, join(graduation, file));
             expect(statSync(root).mtimeMs).toBeGreaterThan(backdated.getTime());
-            // Readers require every name here to be a candidate, so a staging entry a killed
-            // publisher left inside this directory reads as a malformed candidate and wedges
-            // every later scan.
             expect(readdirSync(graduation)).toEqual([file]);
         } finally {
             rmSync(root, { recursive: true, force: true });

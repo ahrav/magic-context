@@ -1,13 +1,11 @@
 /**
- * Storage and resolution over `git_anchors` / `git_anchor_representations`
- * (migration v85). Transaction-local writers: every `InCurrentTransaction`
- * function requires a caller-held write transaction
- * (`db.transaction(fn).immediate()`), matching the storage-claims convention.
+ * Caller must hold a write transaction.
+ * Call `db.transaction(fn).immediate()` to hold the required write transaction.
  *
- * Resolution is strength-ordered and ambiguity-preserving: full commit OID,
- * then tree OID, then stable patch ID. Multiple candidates at a level return
- * `ambiguous` immediately without consulting weaker evidence; anchors are
- * never merged. No level beyond `patch_id` exists.
+ * Resolution checks a full commit OID before weaker evidence.
+ * Resolution checks a tree OID before a stable patch ID.
+ * Multiple candidates at one level return `ambiguous` without consulting weaker evidence.
+ * `patch_id` is the weakest resolution level.
  */
 
 import type { Database } from "../../../shared/sqlite";
@@ -17,7 +15,7 @@ import {
 } from "../storage-claim-applicability-schema.ts";
 import type { GitAnchorCapture } from "./git-anchor-reader.ts";
 
-/** Versioned protocol tag for raw git OID and path representations. */
+/** `GIT_OID_PROTOCOL` identifies the versioned encoding for raw Git OIDs and paths. */
 export const GIT_OID_PROTOCOL = "git-oid-v1";
 
 export interface GitAnchorRepresentationInput {
@@ -40,11 +38,9 @@ function assertFullOid(value: string, objectFormat: "sha1" | "sha256", label: st
 }
 
 /**
- * Identity values of one representation in
- * `GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS` order, after the leading
- * `anchor_id`. Shared by the in-batch dedup key and the idempotency
- * pre-check so both always agree with the DDL UNIQUE constraint and the
- * append-only collision trigger derived from the same column list.
+ * The returned values follow `GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS` after `anchor_id`.
+ * The in-batch deduplication key and idempotency pre-check use these identity values.
+ * The deduplication key and idempotency pre-check must use the DDL UNIQUE-constraint identity columns.
  */
 function representationIdentityValues(
     representation: GitAnchorRepresentationInput,
@@ -96,7 +92,7 @@ export interface CreateGitAnchorInput {
     representations: GitAnchorRepresentationInput[];
 }
 
-/** Requires a caller-held write transaction. Returns the new anchor id. */
+/** Caller must hold a write transaction; the function returns the new anchor ID. */
 export function createGitAnchorInCurrentTransaction(
     db: Database,
     input: CreateGitAnchorInput,
@@ -122,8 +118,8 @@ export function createGitAnchorInCurrentTransaction(
 }
 
 /**
- * Requires a caller-held write transaction. Appends representations to an
- * existing anchor, skipping rows that already exist (idempotent); the
+ * Caller must hold a write transaction; the function appends representations to an existing anchor.
+ * The function skips existing representation rows, making repeated calls idempotent.
  * project id derives from the anchor row.
  */
 export function appendGitAnchorRepresentationsInCurrentTransaction(
@@ -154,9 +150,6 @@ export function appendGitAnchorRepresentationsInCurrentTransaction(
 }
 
 /**
- * Map a reader capture to representation rows: commit OID, tree OID, patch
- * ID (when present), and one `path` row per changed path. Abbreviated OIDs
- * throw — abbreviations are rejected as persisted identities.
  */
 export function anchorRepresentationsFromCapture(
     capture: GitAnchorCapture,

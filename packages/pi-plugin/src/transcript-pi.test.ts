@@ -53,11 +53,6 @@ describe("createPiTranscript", () => {
 		transcript.commit();
 		const output = transcript.getOutputMessages();
 
-		// commit() now syncs mutations from `working` back into source so
-		// downstream callers (e.g. `<session-history>` injection) can splice
-		// or unshift on the same array Pi sent us. Output is therefore the
-		// SAME reference as the source input, with mutations applied in
-		// place at the dirty indices.
 		expect(output).toBe(messages);
 		expect(textOf(output[0] as never)).toBe("hello tagged");
 		expect(textOf(output[1] as never)).toBe("world");
@@ -182,7 +177,6 @@ describe("createPiTranscript", () => {
 			action: "dismiss",
 			note_id: 42,
 		});
-		// non-tool (text) part has no input
 		expect(textPart?.getToolInput?.() ?? null).toBeNull();
 	});
 
@@ -396,8 +390,7 @@ describe("createPiTranscript", () => {
 		]);
 		const toolResultParts = transcript.messages[1]?.parts ?? [];
 
-		// Truncated-mode drop: every block (incl. the image) must become a text
-		// "[truncated]" sentinel — the image bytes must NOT survive on the wire.
+		// Truncation replaces every block, including images, with the text sentinel `"[truncated]"` so image bytes are not sent.
 		for (const part of toolResultParts) {
 			expect(part.setToolOutput("[truncated]")).toBe(true);
 		}
@@ -412,7 +405,6 @@ describe("createPiTranscript", () => {
 			{ type: "text", text: "[truncated]" },
 		]);
 
-		// Replay must be byte-identical (defer-pass cache stability).
 		const replay = createPiTranscript(output as never, "ses-truncated-image", [
 			"entry-assistant",
 			"entry-tool-result",

@@ -1,12 +1,7 @@
 /// <reference types="bun-types" />
 
 /**
- * Focused tests for clearMessageTokensCache. The cache is consumed by the
- * transform path (see transform.ts) and invalidated from event-handler.ts on
- * message.removed / message.updated / session.compacted / session.deleted.
  *
- * These tests exercise the two invalidation modes directly so the per-message
- * path has coverage separate from the session-wide clear path.
  */
 
 import { describe, expect, it } from "bun:test";

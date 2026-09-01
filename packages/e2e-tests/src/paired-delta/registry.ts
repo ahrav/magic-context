@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import manifestJson from "../../pools/paired-delta-manifest.json";
 import {
     PAIRED_DELTA_MANIFEST_SCHEMA,
+    parsePairedDeltaManifest,
     type PairedDeltaManifest,
     type PairedDeltaManifestEntry,
     type RunMode,
@@ -19,13 +21,12 @@ export interface RegisteredPairedDeltaScenario {
 
 export type PairedDeltaRegistry = Map<string, RegisteredPairedDeltaScenario>;
 
-const CALIBRATION_IDS = new Set([
-    "var-compaction-deploy-region",
-    "var-compaction-schema-version",
-    "var-exact-symbol",
-    "var-superseded-timeout",
-    "var-rejected-database",
-]);
+/** The manifest is the sole source of run-mode membership. */
+const runModesByScenarioId = new Map(
+    parsePairedDeltaManifest(manifestJson).scenarios.map(
+        ({ scenarioId, runModes }) => [scenarioId, runModes],
+    ),
+);
 
 const fileByScenarioId = new Map(
     pairedDeltaScenarios.map(({ scenarioId }) => [
@@ -34,15 +35,26 @@ const fileByScenarioId = new Map(
     ]),
 );
 
+/** The path is derived from the id by slug convention, so a file moved into a subdirectory or renamed away from its id resolves to a path that does not exist. Checked here, where the scenario is still in hand, rather than left to surface as a bare `ENOENT` from the digest. commentlint: allow(JUDGE) */
+function assertImplementationFile(
+    scenarioId: string,
+    implementationFile: string,
+    root: string,
+): void {
+    if (existsSync(resolve(root, implementationFile))) return;
+    throw new Error(
+        `paired-delta scenario ${scenarioId} expects ${implementationFile}; ` +
+            "a scenario's file name must be its id without the `var-` prefix",
+    );
+}
+
 export function buildPairedDeltaRegistry(): PairedDeltaRegistry {
     return new Map(pairedDeltaScenarios.map((declaration) => [
         declaration.scenarioId,
         {
             declaration,
             implementationFile: fileByScenarioId.get(declaration.scenarioId)!,
-            runModes: CALIBRATION_IDS.has(declaration.scenarioId)
-                ? ["calibration", "weekly", "release"]
-                : ["release"],
+            runModes: runModesByScenarioId.get(declaration.scenarioId) ?? ["release"],
         },
     ]));
 }
@@ -52,17 +64,36 @@ function semanticInput(declaration: ScenarioDeclaration): unknown {
     return { contract: "paired-delta-scenario/v1", ...serializable };
 }
 
+/** Lane-owned files only, and that boundary is a correctness requirement rather than a tradeoff. A digest input must change only when the pool's own meaning changes; hashing a file the pool does not own breaks that, because `pull_request` CI evaluates the merge commit, so any upstream edit to a shared file makes every entry drift on a branch that touched no scenario — and it fails in CI while passing locally, which is the least debuggable shape available. Shared primitives are guarded by their own tests and by every lane that uses them, not by this fingerprint. Deliberately coarse within the boundary: over-triggering a refreeze costs one command, under-triggering hides a semantic change. commentlint: allow(JUDGE) */
+const LANE_VALIDATION_FILES = [
+    "src/paired-delta/contract.ts",
+    "src/paired-delta/scenarios/support.ts",
+    /** Where every declaration is passed through `parseScenarioDeclaration`; dropping that call would admit unvalidated declarations while leaving every other digest input byte-identical. commentlint: allow(JUDGE) */
+    "src/paired-delta/scenarios/index.ts",
+] as const;
+
+/** Read once per root rather than once per scenario: these files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. commentlint: allow(JUDGE) */
+const laneBytesByRoot = new Map<string, ReadonlyArray<readonly [string, Buffer]>>();
+
+function laneValidationBytes(root: string): ReadonlyArray<readonly [string, Buffer]> {
+    const cached = laneBytesByRoot.get(root);
+    if (cached !== undefined) return cached;
+    const bytes = LANE_VALIDATION_FILES.map((path) =>
+        [path, readFileSync(resolve(root, path))] as const);
+    laneBytesByRoot.set(root, bytes);
+    return bytes;
+}
+
 function verifierBundleDigest(root: string, implementationFile: string): string {
     const hash = createHash("sha256");
-    for (const path of [
-        "src/paired-delta/scenarios/support.ts",
-        implementationFile,
-    ]) {
-        const bytes = readFileSync(resolve(root, path));
+    for (const [path, bytes] of laneValidationBytes(root)) {
         hash.update(path);
         hash.update("\0");
         hash.update(bytes);
     }
+    hash.update(implementationFile);
+    hash.update("\0");
+    hash.update(readFileSync(resolve(root, implementationFile)));
     return hash.digest("hex");
 }
 
@@ -71,12 +102,15 @@ export function computeManifestEntries(
     root = resolve(import.meta.dir, "../.."),
 ): PairedDeltaManifestEntry[] {
     return [...registry.values()]
-        .map(({ declaration, implementationFile, runModes }) => ({
+        .map(({ declaration, implementationFile, runModes }) => {
+            assertImplementationFile(declaration.scenarioId, implementationFile, root);
+            return {
             scenarioId: declaration.scenarioId,
             semanticFingerprint: canonicalFingerprint(semanticInput(declaration)),
             verifierBundleDigest: verifierBundleDigest(root, implementationFile),
             runModes,
-        }))
+            };
+        })
         .sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
 }
 
@@ -99,7 +133,11 @@ export function assertFrozenPool(
             actual.semanticFingerprint !== frozen.semanticFingerprint ||
             actual.verifierBundleDigest !== frozen.verifierBundleDigest
         ) {
-            throw new Error(`paired-delta frozen scenario drift: ${actual.scenarioId}`);
+            throw new Error(
+                `paired-delta frozen scenario drift: ${actual.scenarioId}; ` +
+                    "after an intentional change, regenerate with " +
+                    "`bun run --cwd packages/e2e-tests freeze:paired-delta`",
+            );
         }
     }
 }

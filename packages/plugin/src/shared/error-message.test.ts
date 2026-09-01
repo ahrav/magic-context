@@ -22,15 +22,12 @@ describe("describeError", () => {
         const desc = describeError(err);
         expect(desc.name).toBe("NotFoundError");
         expect(desc.message).toBe("");
-        // brief must still carry a useful signal even with empty message
         expect(desc.brief).toContain("NotFoundError");
     });
 
     it("falls back to constructor.name when .name is missing", () => {
-        // Simulate an SDK-shaped object where .name is an empty string
         const err = Object.assign(new Error("x"), { name: "" });
         const desc = describeError(err);
-        // Falls back to constructor.name ("Error")
         expect(desc.name).toBe("Error");
     });
 

@@ -1,35 +1,17 @@
 /**
- * Pi-side heuristic cleanup — mirrors OpenCode's `applyHeuristicCleanup`
  * (packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts).
  *
- * Same four passes, in the same order, with the same DB persistence
- * semantics. The only Pi-specific pieces are:
  *
- *   - Tool fingerprinting walks Pi `AgentMessage[]` instead of
- *     OpenCode `MessageLike[]`. Pi assistant messages carry tool calls
- *     as parts of type `"toolCall"` with `{ id, name, arguments }`.
- *     OpenCode's `extractToolInfo` checks `"tool" | "tool_use" |
- *     "tool-invocation"` shapes that don't exist in Pi.
- *   - Stale `ctx_reduce` removal also walks Pi shape directly. New discovery is
- *     gated to providers that can safely drop empty sentinels; Pi persists
- *     `tags.status='dropped'` and lets `applyFlushedStatuses` replay existing
- *     drops on every provider, which is the cache-stable mechanism Pi already uses.
+ * Pi assistant messages represent tool calls as `"toolCall"` parts with `{ id, name, arguments }`.
+ * `ctx_reduce` removal reads Pi message shape directly; only providers that can drop empty sentinels discover new stale calls.
+ * `applyFlushedStatuses` replays existing dropped tags for every provider.
  *
- *   - Everything else (drop aged tools, strip system injections from
- *     message tags, age-tier caveman compression) is tag-driven and
- *     uses the shared `TagTarget` interface produced by `tagTranscript`,
- *     so the OpenCode helpers `applyCavemanCleanup` and
- *     `stripSystemInjection` are called as-is — they don't know about
- *     the harness shape.
+ * `applyCavemanCleanup` and `stripSystemInjection` consume `TagTarget` and require no Pi-specific adaptation.
  *
- * Runs behind the same scheduler-execute / explicit-flush /
- * force-materialization gating as OpenCode (gating is the caller's
- * responsibility — this function unconditionally executes when called).
+ * The cleanup entry point executes unconditionally; callers enforce scheduler-execute, explicit-flush, and force-materialization gating.
  *
- * Cache safety: every mutation persists to the DB (`tags.status`,
- * `tags.drop_mode`, `source_contents`, `tags.caveman_depth`). Subsequent
- * defer passes read these durable signals via `applyFlushedStatuses` +
- * `replayCavemanCompression` so the visible message bytes stay stable
+ * `tags.status`, `tags.drop_mode`, `source_contents`, and `tags.caveman_depth` persist cleanup state so defer passes preserve visible message bytes.
+ * Defer passes read persisted cleanup state through `applyFlushedStatuses` and `replayCavemanCompression`.
  * across passes.
  */
 
@@ -88,23 +70,18 @@ const DEDUP_SAFE_TOOLS = new Set([
 export interface PiHeuristicCleanupConfig {
 	protectedTags: number;
 	/**
-	 * Whether this pass may discover NEW stale ctx_reduce strips. Existing dropped
-	 * tags still replay through applyFlushedStatuses on every provider.
+	 * `staleReduceStripEnabled` permits discovery of new stale `ctx_reduce` strips; existing drops replay for every provider.
 	 */
 	staleReduceStripEnabled: boolean;
 	/**
-	 * Tiered target-headroom emergency drop (Phase 2). Provided only on the
-	 * derived force-band materialize (cache-busting) pass; undefined on routine execute
-	 * passes (routine age-based tool drops were removed). Mirrors OpenCode's
-	 * `applyHeuristicCleanup` emergency config.
+	 * `emergency` configures tiered target-headroom drops.
 	 */
 	emergency?: {
 		currentTotalInputTokens: number;
 		ceilingTokens: number;
 	};
 	/**
-	 * Age-tier caveman text compression settings. Caller is responsible
-	 * for forwarding this only for primary sessions where caveman is enabled.
+	 * Forward `caveman` only for primary sessions with caveman enabled.
 	 */
 	caveman?: CavemanCleanupConfig;
 }
@@ -120,16 +97,8 @@ export interface PiHeuristicCleanupResult {
 }
 
 /**
- * Pi `AgentMessage[]` walker for tool-dedup fingerprinting.
  *
- * Returns one entry per assistant `toolCall` part whose tool name is
- * in DEDUP_SAFE_TOOLS, keyed by composite `<ownerMsgId>\x00<callId>` so
- * the dedup pass can match fingerprints to tool tags without collapsing
- * cross-owner reused call IDs.
  *
- * Mirrors OpenCode's `buildToolFingerprints` semantics, just with Pi
- * shape: assistant `content: PiToolCall[]` instead of OpenCode
- * `parts: [{ type: "tool_use" | "tool" | "tool-invocation", ... }]`.
  */
 function buildPiToolFingerprints(
 	messages: readonly unknown[],
@@ -147,7 +116,6 @@ function buildPiToolFingerprints(
 		if (msg.role !== "assistant") continue;
 		if (!Array.isArray(msg.content)) continue;
 		// ownerMsgId MUST match the id the transcript tagged this message with
-		// (resolvePiStableId) — real entry id when resolvable, index fallback else.
 		const ownerMsgId = resolveStableId(message, i);
 		if (!ownerMsgId) continue;
 		for (const part of msg.content) {
@@ -162,15 +130,7 @@ function buildPiToolFingerprints(
 			if (typeof p.name !== "string") continue;
 			if (!DEDUP_SAFE_TOOLS.has(p.name)) continue;
 			if (typeof p.id !== "string" || p.id.length === 0) continue;
-			// Skip sentinel toolCalls — these are already-dropped tool
-			// shells we keep around to preserve `id` ↔ `toolCallId`
-			// pairing for the provider serializer (see transcript-pi.ts
-			// `replaceWithSentinel` for assistant toolCall parts). Their
-			// `arguments` carry the `__magic_context_dropped__` marker
-			// instead of real input; including them in dedup
-			// fingerprints would collapse all dropped tools onto one
-			// fingerprint and is a no-op anyway since tags are already
-			// persisted as dropped.
+			// Sentinel `toolCall` parts represent already-dropped tools; skip them.
 			const args = p.arguments;
 			if (
 				args &&
@@ -185,9 +145,7 @@ function buildPiToolFingerprints(
 			} catch {
 				continue; // unrepresentable args — skip dedup for this call
 			}
-			// Owner in BOTH key AND value: cross-owner identical read tools
-			// are distinct invocations, while same-owner parallel duplicates
-			// still share a fingerprint and can be deduplicated.
+			// Include `ownerMsgId` in both the key and fingerprint so tools from different assistant messages remain distinct.
 			const fingerprint = `${ownerMsgId}:${p.name}:${serialized}`;
 			const compositeKey = `${ownerMsgId}\x00${p.id}`;
 			fingerprints.set(compositeKey, fingerprint);
@@ -199,19 +157,11 @@ function buildPiToolFingerprints(
 /**
  * Identify stale `ctx_reduce` tool calls by COMPOSITE (owner, callId) identity.
  *
- * A bare-callId match is unsafe: Pi/OpenCode can reuse a tool callId across
- * assistant turns (the reason tool tags carry tool_owner_message_id), so a stale
- * ctx_reduce call in an OLD assistant message must NOT cause a FRESH ctx_reduce
- * reusing the same callId in a recent turn to be dropped. We key by
- * `${ownerStableId}\x00${callId}` — the owner being the assistant message that
- * holds the toolCall part (resolveStableId of that message), which is exactly
- * what the tag row's tool_owner_message_id records.
+ * A bare `callId` match is unsafe because Pi/OpenCode can reuse tool call IDs across assistant messages.
  *
- * The newest ctx_reduce arcs are selected before the age cutoff is applied and
- * remain visible as housekeeping exemplars. Returns both a composite set (for
- * tags carrying an owner) and a bare-callId set (legacy NULL-owner rows written
- * before composite identity, matched by callId alone — same lazy-adoption
- * fallback the rest of the tag pipeline uses).
+ * The newest `ctx_reduce` calls remain visible even when they precede `toolAgeCutoff`.
+ * Return composite IDs for owner-tagged rows and bare call IDs for legacy NULL-owner rows.
+ * Match legacy NULL-owner rows by `callId` alone.
  */
 function collectStaleReduceCallIds(
 	messages: readonly unknown[],
@@ -278,19 +228,9 @@ function collectStaleReduceCallIds(
 }
 
 /**
- * Apply heuristic cleanup to a Pi session. Mirrors OpenCode's
- * `applyHeuristicCleanup` 1:1 in semantics; differences are limited
- * to message-shape walking for tool fingerprinting (everything else
- * goes through `TagTarget` and shared helpers).
  *
- * Run order matches OpenCode:
- *   1. Drop aged tools (or all tools when `dropAllTools=true`).
- *   2. Strip system injections from message tags.
- *   3. Tool dedup (drop older identical calls of read-only tools).
- *   4. Age-tier caveman text compression (when enabled).
  *
- * Each pass commits within its own `db.transaction` so partial
- * progress survives mid-pass failures.
+ * Each cleanup pass uses its own transaction, so completed passes survive a later pass failure.
  */
 export function applyPiHeuristicCleanup(
 	sessionId: string,
@@ -299,14 +239,9 @@ export function applyPiHeuristicCleanup(
 	piMessages: readonly unknown[],
 	config: PiHeuristicCleanupConfig,
 	preloadedTags?: TagEntry[],
-	// Stable-id resolver — MUST be the same one the transcript tagged with, so the
-	// owner ids built here match `target.message.info.id` in messageIdToMaxTag.
-	// When omitted (older tests), falls back to the legacy index-based pi-msg-* id.
+	// Use the transcript's stable-ID resolver so owner IDs match `messageIdToMaxTag` keys.
 	resolveId?: (msg: unknown, index: number) => string | undefined,
 ): PiHeuristicCleanupResult {
-	// Resolve owner/stable ids the same way the transcript tagged messages, so the
-	// ids built here key into messageIdToMaxTag (= target.message.info.id) correctly.
-	// Legacy fallback (no resolver) keeps the old index-based pi-msg-* scheme.
 	const resolveStableId = (msg: unknown, index: number): string | undefined => {
 		if (resolveId) return resolveId(msg, index);
 		if (!msg || typeof msg !== "object") return undefined;
@@ -317,17 +252,10 @@ export function applyPiHeuristicCleanup(
 			: `pi-msg-${index}-${role}`;
 	};
 
-	// All work in this function short-circuits on `tag.status !== "active"`.
-	// See OpenCode `applyHeuristicCleanup` for the full P0 perf rationale.
 	const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
-	// `maxTag` must reflect the true session max (including dropped/compacted)
-	// so the protected-cutoff window is anchored to the most recent tag
-	// regardless of status. `getMaxTagNumberBySession` resolves with a
-	// single backward index seek (O(log N)).
+	// `maxTag` includes dropped and compacted tags so the protected window anchors to the latest tag regardless of status.
 	const maxTag = getMaxTagNumberBySession(db, sessionId);
 	const protectedCutoff = maxTag - config.protectedTags;
-	// Stale ctx_reduce removal uses the protected-tail window after first retaining
-	// the newest housekeeping exemplars; only older calls can become stale.
 	const toolAgeCutoff = protectedCutoff;
 
 	let droppedTools = 0;
@@ -336,26 +264,15 @@ export function applyPiHeuristicCleanup(
 	let droppedInjections = 0;
 	let droppedStaleReduceCalls = 0;
 
-	// ── Pass 1: tiered target-headroom emergency drop ─────────────────
-	// Replaces the old need-blind aged-drop + dropAllTools nuke. Runs only when
-	// the caller supplies `emergency` (derived force-band cache-busting pass). Selection is
-	// pure (`planEmergencyDrop`); we apply it and advance the persisted watermark
-	// so each tag drops once. Mirrors OpenCode `applyHeuristicCleanup`.
 	if (config.emergency) {
 		const emergency = config.emergency;
 		const priorInputSample = getEmergencyInputSample(db, sessionId);
-		// Plan ONLY over tags in the live window that would ACTUALLY reclaim
-		// bytes (canDrop, not mere drop() presence) — keeps the floor math equal
-		// to the on-wire tail and avoids phantom under-evict. Mirrors OpenCode.
 		const droppableTags = tags.filter(
 			(t) =>
 				t.status === "active" &&
 				t.type === "tool" &&
 				targets.get(t.tagNumber)?.canDrop?.(),
 		);
-		// Floor accounting needs the FULL active live-window set (all types) —
-		// narrowing it to the droppable subset folds real conversation/
-		// reasoning tail into the "irreducible prefix" and under-evicts.
 		const activeTags = tags.filter((t) => t.status === "active");
 		const plan = planEmergencyDrop({
 			tags: droppableTags as readonly EmergencyDropTag[],
@@ -397,18 +314,15 @@ export function applyPiHeuristicCleanup(
 						emergencyDroppedTools++;
 					}
 				}
-				// The sample is latched after the transaction below for every acting
-				// emergency pass, including zero removals.
+				// The emergency pass records its input sample after the transaction, even when it removes no target.
 			})();
 			sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
 		} else {
 			sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
 		}
-		// Record every acting emergency sample, including when no target was eligible.
 		setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
 	}
 
-	// ── Pass 1b: stale ctx_reduce calls (Pi persisted-drop replay) ──────
 	const staleReduce = config.staleReduceStripEnabled
 		? collectStaleReduceCallIds(
 				piMessages,
@@ -427,10 +341,6 @@ export function applyPiHeuristicCleanup(
 				if (tag.status !== "active") continue;
 				if (tag.type !== "tool") continue;
 				if (!tag.messageId) continue;
-				// Composite match for tags carrying an owner — prevents a reused
-				// callId in a fresh turn from being dropped by a stale call in an
-				// old turn. Legacy NULL-owner rows fall back to bare callId match
-				// (lazy adoption: they predate composite identity).
 				const matched = tag.toolOwnerMessageId
 					? staleReduce.composite.has(
 							`${tag.toolOwnerMessageId}\x00${tag.messageId}`,
@@ -449,7 +359,6 @@ export function applyPiHeuristicCleanup(
 		})();
 	}
 
-	// ── Pass 2: strip system injections from message tags ─────────────
 	db.transaction(() => {
 		for (const tag of tags) {
 			if (tag.status !== "active") continue;
@@ -489,7 +398,6 @@ export function applyPiHeuristicCleanup(
 		}
 	})();
 
-	// ── Pass 3: tool dedup (Pi-shape fingerprinter) ───────────────────
 	const toolFingerprints = buildPiToolFingerprints(piMessages, resolveStableId);
 	if (toolFingerprints.size > 0) {
 		const tagsByCompositeKey = new Map<string, TagEntry>();
@@ -515,11 +423,10 @@ export function applyPiHeuristicCleanup(
 			for (const [, group] of fingerprintGroups) {
 				if (group.length <= 1) continue;
 				group.sort((a, b) => a.tagNumber - b.tagNumber);
-				// Keep the newest, drop the rest.
+				// Deduplication retains the newest matching tag and drops older matches.
 				for (let i = 0; i < group.length - 1; i++) {
 					const tag = group[i];
 					const target = targets.get(tag.tagNumber);
-					// Deduplication stays full-drop; only emergency recent arcs keep skeletons.
 					const result = target?.drop?.() ?? "absent";
 					if (result === "incomplete") continue;
 					updateTagDropMode(db, sessionId, tag.tagNumber, "full");
@@ -544,7 +451,6 @@ export function applyPiHeuristicCleanup(
 		);
 	}
 
-	// ── Pass 4: age-tier caveman text compression ─────────────────────
 	let compressedTextTags = 0;
 	let mutatedTextTags = 0;
 	if (config.caveman?.enabled) {

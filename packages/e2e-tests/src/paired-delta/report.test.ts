@@ -3,47 +3,89 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { PRIMARY_ARM_IDS, type PrimaryArmId } from "./contract";
+import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { POLICY_OWNER_SCHEMA } from "../prospective-holdout/contract";
+import { pairedFactsFingerprint } from "../prospective-holdout/report";
+import { cellResultFixture } from "../prospective-holdout/test-fixtures";
 import { estimateFamilyDeltas } from "./estimator";
 import {
-    buildCalibrationRecord,
     PAIRED_DELTA_REPORT_SCHEMA,
+    buildCalibrationRecord,
     buildPairedDeltaReport,
     publishPairedDeltaReport,
 } from "./report";
+import { PRIMARY_ARM_IDS } from "./contract";
+
+type PrimaryArm = (typeof PRIMARY_ARM_IDS)[number];
 import type { RolloutRecord } from "./runner";
 
 const H1 = "1".repeat(64);
 const H2 = "2".repeat(64);
 
-function report() {
-    const policy = {
+function pair(seed: number): PairedCaseFact {
+    return {
+        caseId: `case-${"a".repeat(32)}`,
+        familyId: "fam-a",
+        implementationFingerprint: H2,
+        model: "fixture/model",
+        seed,
+        platform: "linux-x64",
+        releaseN: cellResultFixture("release-n"),
+        releaseNMinus1: cellResultFixture("release-n-minus-1"),
+        status: "complete",
+    };
+}
+
+const pairs = [pair(9), pair(7)];
+const PAIRED_FACTS = pairedFactsFingerprint(pairs);
+
+function policyDocument(minimumAnalyzableFamilyCount = 2) {
+    const payload = { minimumAnalyzableFamilyCount, targetMinimumDetectableDelta: 0.1 };
+    return {
         schema: POLICY_OWNER_SCHEMA,
         owner: "magic-context-x4l.14",
         status: "ready",
-        policy: { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0.1 },
-        policyFingerprint: canonicalFingerprint({
-            minimumAnalyzableFamilyCount: 2,
-            targetMinimumDetectableDelta: 0.1,
-        }),
+        policy: payload,
+        policyFingerprint: canonicalFingerprint(payload),
     };
-    const analysis = estimateFamilyDeltas({
+}
+
+function analysisFixture(policyFingerprint: string) {
+    return estimateFamilyDeltas({
         observations: [
             { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
             { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.1, runHealth: "completed" },
+            { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+            { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.1, runHealth: "completed" },
             { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "retrieval", delta: 0.1, runHealth: "completed" },
             { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "formation", delta: 0.2, runHealth: "completed" },
         ],
         minimumAnalyzableFamilyCount: 2,
         bootstrapSeed: 17,
         bootstrapResamples: 2000,
+        lane: {
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "anthropic-model-20260830",
+            policyFingerprint,
+            pairedFactsFingerprint: PAIRED_FACTS,
+        },
     });
+}
+
+function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]> = {}) {
+    const policy = policyDocument();
     return buildPairedDeltaReport({
         poolManifestFingerprint: H1,
         pinnedSnapshotId: "anthropic-model-20260830",
         policyDocument: policy,
-        analysis,
+        pairs,
+        analysis: analysisFixture(policy.policyFingerprint),
+        runSummary: {
+            status: "completed" as const,
+            spentUsd: 12.5,
+            observedCostRollouts: 6,
+            estimatedCostRollouts: 1,
+        },
         exclusions: [
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
             { armId: "compaction", reasonCode: "deadline-exceeded", count: 1 },
@@ -54,22 +96,7 @@ function report() {
             wallClockMsByArm: { "mc-on": 4000, "mc-off": 3000 },
             turnsByArm: { "mc-on": 8, "mc-off": 7 },
         },
-        rawRegretRecords: [
-            {
-                coordinateId: "var-a:0",
-                familyId: "fam-a",
-                retrieval: 0.1,
-                formation: 0.2,
-                representation: null,
-                label: "raw-non-inferential",
-            },
-        ],
-        runSummary: {
-            status: "completed",
-            spentUsd: 12.5,
-            observedCostRollouts: 9,
-            estimatedCostRollouts: 1,
-        },
+        ...overrides,
     });
 }
 
@@ -85,14 +112,43 @@ describe("paired-delta report", () => {
         ]);
         expect(built.body.regret.providerMixed.map(({ endpoint }) => endpoint)).toEqual(["retrieval"]);
         expect(built.body.regret.live.map(({ endpoint }) => endpoint)).toEqual(["formation"]);
-        expect(built.body.regret.raw[0]!.label).toBe("raw-non-inferential");
-        expect(built.body.runSummary).toEqual({
-            status: "completed",
-            spentUsd: 12.5,
-            observedCostRollouts: 9,
-            estimatedCostRollouts: 1,
-        });
+        expect(built.body.regret.raw).toEqual([{
+            coordinateId: "var-a:0",
+            familyId: "fam-a",
+            retrieval: 0.1,
+            formation: 0.2,
+            representation: null,
+            label: "raw-non-inferential",
+        }]);
         expect(built.reportFingerprint).toBe(canonicalFingerprint(built.body));
+    });
+
+    it("derives the raw regret ladder from the analyzed records in a total order", () => {
+        const policy = policyDocument(1);
+        const analysis = estimateFamilyDeltas({
+            observations: [
+                { coordinateId: "var-a:0", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-b", endpoint: "retrieval", delta: 0.5, runHealth: "completed" },
+                { coordinateId: "var-a:1", familyId: "fam-a", endpoint: "retrieval", delta: 0.4, runHealth: "completed" },
+            ],
+            minimumAnalyzableFamilyCount: 1,
+            bootstrapSeed: 17,
+            bootstrapResamples: 2000,
+            lane: {
+                poolManifestFingerprint: H1,
+                pinnedSnapshotId: "anthropic-model-20260830",
+                policyFingerprint: policy.policyFingerprint,
+                pairedFactsFingerprint: PAIRED_FACTS,
+            },
+        });
+        const built = report({ policyDocument: policy, analysis });
+        // Ordering is keyed on both identifiers, so `var-a:0` under `fam-b` cannot precede `var-a:1` by caller order alone.
+        expect(built.body.regret.raw.map(({ coordinateId, familyId, retrieval }) =>
+            [coordinateId, familyId, retrieval])).toEqual([
+            ["var-a:0", "fam-b", 0.5],
+            ["var-a:1", "fam-a", 0.4],
+        ]);
     });
 
     it("changes fingerprint when a lane fact changes and publishes atomically", () => {
@@ -114,6 +170,31 @@ describe("paired-delta report", () => {
         }
     });
 
+    it("rejects an analysis estimated for a different lane", () => {
+        const built = report();
+        expect(() => buildPairedDeltaReport({
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "different-model-20260831",
+            policyDocument: {
+                schema: POLICY_OWNER_SCHEMA,
+                owner: "magic-context-x4l.14",
+                status: "ready",
+                policy: { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0.1 },
+                policyFingerprint: built.body.policyFingerprint,
+            },
+            pairs,
+            analysis: built.body.analysis,
+            exclusions: [],
+            secondaryMetrics: {
+                invalidSuccessRateByArm: {},
+                tokensByArm: {},
+                wallClockMsByArm: {},
+                turnsByArm: {},
+            },
+            runSummary: built.body.runSummary,
+        })).toThrow(/analysis-lane-binding-mismatch/);
+    });
+
     it("rejects a non-ready or wrongly owned pre-registration document", () => {
         const built = report();
         expect(() => buildPairedDeltaReport({
@@ -126,6 +207,7 @@ describe("paired-delta report", () => {
                 policy: {},
                 policyFingerprint: H2,
             },
+            pairs,
             analysis: built.body.analysis,
             exclusions: [],
             secondaryMetrics: {
@@ -134,24 +216,117 @@ describe("paired-delta report", () => {
                 wallClockMsByArm: {},
                 turnsByArm: {},
             },
-            rawRegretRecords: [],
-            runSummary: {
-                status: "cost-cap-reached",
-                spentUsd: 1,
-                observedCostRollouts: 0,
-                estimatedCostRollouts: 1,
-            },
+            runSummary: built.body.runSummary,
         })).toThrow(/policy: identity-invalid/);
+    });
+
+    it("keeps ladder rows distinct when an identifier contains the key separator", () => {
+        const policy = policyDocument(1);
+        // `a:b` + `c` and `a` + `b:c` share one `:`-joined key.
+        const analysis = estimateFamilyDeltas({
+            observations: [
+                { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "a:b", familyId: "c", endpoint: "retrieval", delta: 0.5, runHealth: "completed" },
+                { coordinateId: "a", familyId: "b:c", endpoint: "formation", delta: 0.7, runHealth: "completed" },
+            ],
+            minimumAnalyzableFamilyCount: 1,
+            bootstrapSeed: 17,
+            bootstrapResamples: 2000,
+            lane: {
+                poolManifestFingerprint: H1,
+                pinnedSnapshotId: "anthropic-model-20260830",
+                policyFingerprint: policy.policyFingerprint,
+                pairedFactsFingerprint: PAIRED_FACTS,
+            },
+        });
+        const built = report({ policyDocument: policy, analysis });
+        expect(built.body.regret.raw.map(({ coordinateId, familyId, retrieval, formation }) =>
+            [coordinateId, familyId, retrieval, formation])).toEqual([
+            ["a", "b:c", null, 0.7],
+            ["a:b", "c", 0.5, null],
+        ]);
+    });
+
+    it("rejects a ready policy whose estimator settings the analysis does not honor", () => {
+        const policy = policyDocument(2);
+        expect(() => report({
+            policyDocument: policyDocument(5),
+            analysis: analysisFixture(canonicalFingerprint({
+                minimumAnalyzableFamilyCount: 5,
+                targetMinimumDetectableDelta: 0.1,
+            })),
+        })).toThrow(/policy-minimum-family-count-mismatch/);
+        expect(() => report({
+            policyDocument: {
+                schema: POLICY_OWNER_SCHEMA,
+                owner: "magic-context-x4l.14",
+                status: "ready",
+                policy: { targetMinimumDetectableDelta: 0.1 },
+                policyFingerprint: canonicalFingerprint({ targetMinimumDetectableDelta: 0.1 }),
+            },
+            analysis: analysisFixture(canonicalFingerprint({ targetMinimumDetectableDelta: 0.1 })),
+        })).toThrow(/policy-minimum-family-count-missing/);
+        expect(report({ policyDocument: policy, analysis: analysisFixture(policy.policyFingerprint) })
+            .body.analysis.minimumAnalyzableFamilyCount).toBe(2);
+    });
+
+    it("rejects an analysis stamped for a different cohort than the supplied pairs", () => {
+        expect(() => report({ pairs: [pair(9)] }))
+            .toThrow(/analysis-paired-facts-mismatch/);
+    });
+
+    it("rejects a ready policy whose detectable delta is unusable", () => {
+        const payload = { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0 };
+        expect(() => report({
+            policyDocument: {
+                schema: POLICY_OWNER_SCHEMA,
+                owner: "magic-context-x4l.14",
+                status: "ready",
+                policy: payload,
+                policyFingerprint: canonicalFingerprint(payload),
+            },
+            analysis: analysisFixture(canonicalFingerprint(payload)),
+        })).toThrow(/policy-detectable-delta-invalid/);
+    });
+
+    it("rejects arm and reason identifiers outside the declared contract", () => {
+        expect(() => report({
+            exclusions: [{ armId: "mc-onn" as never, reasonCode: "provider-unavailable", count: 1 }],
+        })).toThrow(/exclusion-arm-invalid-mc-onn/);
+        expect(() => report({
+            exclusions: [{ armId: "mc-off", reasonCode: "provider-gone" as never, count: 1 }],
+        })).toThrow(/exclusion-reason-code-invalid-provider-gone/);
+        expect(() => report({
+            secondaryMetrics: {
+                invalidSuccessRateByArm: {},
+                tokensByArm: { "mc-onn": 1 } as never,
+                wallClockMsByArm: {},
+                turnsByArm: {},
+            },
+        })).toThrow(/metric-arm-invalid-mc-onn/);
+    });
+
+    it("separates a schema mismatch from a fingerprint mismatch when publishing", () => {
+        const built = report();
+        expect(() => publishPairedDeltaReport(
+            { ...built, schema: "paired-delta-report/v2" as never },
+            "/unused",
+        )).toThrow(/schema-invalid/);
     });
 });
 
-function calibrationRecord(
+function rolloutRecord(
     scenarioId: string,
     replicateIndex: number,
+    armId: PrimaryArm,
     checksPassed: number,
-    armId: PrimaryArmId = "mc-on",
-    runHealth: RolloutRecord["cell"]["runHealth"] = "completed",
+    options: {
+        runHealth?: RolloutRecord["cell"]["runHealth"];
+        costSource?: RolloutRecord["costSource"];
+    } = {},
 ): RolloutRecord {
+    const runHealth = options.runHealth ?? "completed";
     return {
         schema: "paired-delta-rollout/v1",
         poolManifestFingerprint: H1,
@@ -181,21 +356,23 @@ function calibrationRecord(
         ],
         usage: { input: 10, output: 5, cacheCreation: 0, cacheRead: 0 },
         costUsd: 1.25,
-        costSource: "observed",
+        priorAttemptsCostUsd: 0,
+        maxAttemptCostUsd: 1.25,
+        costSource: options.costSource ?? "observed",
         wallClockMs: 1000,
         turns: 3,
         harnessDisposed: true,
     };
 }
 
-/** A coordinate contributes to the noise floor only when every primary arm completed. */
+/** A coordinate contributes paired deltas only when every primary arm completed. */
 function coordinate(
     scenarioId: string,
     replicateIndex: number,
-    checksPassed: number,
+    scores: Partial<Record<PrimaryArm, number>> & { "mc-on": number },
 ): RolloutRecord[] {
     return PRIMARY_ARM_IDS.map((armId) =>
-        calibrationRecord(scenarioId, replicateIndex, checksPassed, armId));
+        rolloutRecord(scenarioId, replicateIndex, armId, scores[armId] ?? 2));
 }
 
 describe("paired-delta calibration record", () => {
@@ -208,40 +385,49 @@ describe("paired-delta calibration record", () => {
         replicateCount: 3,
         cadence: "weekly-and-release",
     } as const;
-    const records = [
-        ...coordinate("var-a", 0, 0),
-        ...coordinate("var-a", 1, 1),
-        ...coordinate("var-a", 2, 2),
-        ...coordinate("var-b", 0, 2),
-        ...coordinate("var-b", 1, 2),
-        ...coordinate("var-b", 2, 2),
+    const build = (
+        records: readonly RolloutRecord[],
+        overrides: {
+            runStatus?: RolloutRecord["cell"]["runHealth"] extends never ? never : Parameters<
+                typeof buildCalibrationRecord
+            >[0]["runStatus"];
+            targetMinimumDetectableDelta?: number;
+            scenarioFamilies?: ReadonlyMap<string, string>;
+        } = {},
+    ) => buildCalibrationRecord({
+        records,
+        scenarioFamilies: overrides.scenarioFamilies ?? families,
+        runStatus: overrides.runStatus ?? "completed",
+        poolManifestFingerprint: H1,
+        pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+        targetMinimumDetectableDelta: overrides.targetMinimumDetectableDelta ?? 0.15,
+        decisions,
+    });
+    const noisy = [
+        ...coordinate("var-a", 0, { "mc-on": 2, "mc-off": 0, compaction: 0 }),
+        ...coordinate("var-a", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+        ...coordinate("var-a", 2, { "mc-on": 2, "mc-off": 1, compaction: 1 }),
+        ...coordinate("var-b", 0, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+        ...coordinate("var-b", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+        ...coordinate("var-b", 2, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
     ];
 
-    it("derives measured family spread, variance, cost, and wall clock", () => {
-        const built = buildCalibrationRecord({
-            records,
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
-        });
+    it("measures family noise on the paired deltas, not on mc-on scores alone", () => {
+        const built = build(noisy);
 
         expect(built.validForPoolSizing).toBe(true);
-        expect(built.measuredCostUsd).toBe(22.5);
-        expect(built.measuredWallClockMs).toBe(18000);
+        // Every mc-on cell scores 1.0, so an mc-on-only floor would be zero for both families.
         expect(built.familyNoise).toEqual([
             {
                 familyId: "fam-one",
-                replicateCount: 3,
+                observationCount: 6,
                 spread: 1,
-                variance: 0.25,
+                variance: 0.2,
                 interval: { lower: 0, upper: 1 },
             },
             {
                 familyId: "fam-two",
-                replicateCount: 3,
+                observationCount: 6,
                 spread: 0,
                 variance: 0,
                 interval: { lower: 0, upper: 0 },
@@ -251,131 +437,79 @@ describe("paired-delta calibration record", () => {
         expect(recordFingerprint).toBe(canonicalFingerprint(body));
     });
 
+    it("reports estimated reserves apart from provider-observed spend", () => {
+        const built = build([
+            ...noisy,
+            rolloutRecord("var-a", 0, "mc-off", 0, {
+                runHealth: "crash",
+                costSource: "estimated",
+            }),
+        ]);
+
+        expect(built.measuredCostUsd).toBe(18 * 1.25);
+        expect(built.estimatedReserveUsd).toBe(1.25);
+    });
+
     it("sizes the pool from the worst measured variance and the target delta", () => {
-        const noisy = buildCalibrationRecord({
-            records,
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
-        });
-        const quiet = buildCalibrationRecord({
-            records: [
-                ...coordinate("var-a", 0, 2),
-                ...coordinate("var-a", 1, 2),
-                ...coordinate("var-a", 2, 2),
-                ...coordinate("var-b", 0, 2),
-                ...coordinate("var-b", 1, 2),
-                ...coordinate("var-b", 2, 2),
-            ],
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
-        });
+        const quiet = build([
+            ...coordinate("var-a", 0, { "mc-on": 2 }),
+            ...coordinate("var-a", 1, { "mc-on": 2 }),
+            ...coordinate("var-a", 2, { "mc-on": 2 }),
+            ...coordinate("var-b", 0, { "mc-on": 2 }),
+            ...coordinate("var-b", 1, { "mc-on": 2 }),
+            ...coordinate("var-b", 2, { "mc-on": 2 }),
+        ]);
 
         expect(quiet.decisions.poolSize).toBe(decisions.familyCount);
-        expect(noisy.decisions.poolSize).toBeGreaterThan(quiet.decisions.poolSize);
-        expect(noisy.decisions.poolSize).toBe(
-            Math.ceil(((1.959964 + 0.841621) ** 2 * 0.25) / 0.15 ** 2) *
-            decisions.familyCount,
+        expect(build(noisy).decisions.poolSize).toBeGreaterThan(quiet.decisions.poolSize);
+        expect(build(noisy).decisions.poolSize).toBe(
+            Math.ceil(((1.959964 + 0.841621) ** 2 * 0.2) / 0.15 ** 2) * decisions.familyCount,
         );
     });
 
     it("widens the pool as the target delta shrinks", () => {
-        const size = (targetMinimumDetectableDelta: number): number =>
-            buildCalibrationRecord({
-                records,
-                scenarioFamilies: families,
-                runStatus: "completed",
-                poolManifestFingerprint: H1,
-                pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-                targetMinimumDetectableDelta,
-                decisions,
-            }).decisions.poolSize;
-
-        expect(size(0.05)).toBeGreaterThan(size(0.15));
+        expect(build(noisy, { targetMinimumDetectableDelta: 0.05 }).decisions.poolSize)
+            .toBeGreaterThan(build(noisy).decisions.poolSize);
     });
 
     it("rejects a non-positive target delta", () => {
-        expect(() => buildCalibrationRecord({
-            records,
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0,
-            decisions,
-        })).toThrow(/target-delta-invalid/);
+        expect(() => build(noisy, { targetMinimumDetectableDelta: 0 }))
+            .toThrow(/target-delta-invalid/);
     });
 
     it("marks cap-terminated calibration invalid for sizing", () => {
-        expect(buildCalibrationRecord({
-            records,
-            scenarioFamilies: families,
-            runStatus: "cost-cap-reached",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
-        }).validForPoolSizing).toBe(false);
+        expect(build(noisy, { runStatus: "cost-cap-reached" }).validForPoolSizing).toBe(false);
     });
 
-    it("publishes a partial record when a family has no completed mc-on rollouts", () => {
-        const built = buildCalibrationRecord({
-            records: records.filter(({ scenarioId }) => scenarioId === "var-a"),
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
-        });
-
-        expect(built.validForPoolSizing).toBe(false);
-        expect(built.familyNoise.map(({ familyId }) => familyId)).toEqual(["fam-one"]);
-    });
-
-    it("ignores mc-on cells whose paired baseline arms did not complete", () => {
-        const built = buildCalibrationRecord({
-            records: [
-                ...coordinate("var-a", 0, 0),
-                ...coordinate("var-a", 1, 1),
-                ...coordinate("var-a", 2, 2),
-                calibrationRecord("var-b", 0, 2, "mc-on"),
-                calibrationRecord("var-b", 0, 0, "mc-off", "unavailable"),
-                calibrationRecord("var-b", 0, 2, "compaction"),
-            ],
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
-        });
+    it("ignores coordinates whose paired baseline arms did not complete", () => {
+        const built = build([
+            ...coordinate("var-a", 0, { "mc-on": 2, "mc-off": 0, compaction: 0 }),
+            ...coordinate("var-a", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+            ...coordinate("var-a", 2, { "mc-on": 2, "mc-off": 1, compaction: 1 }),
+            rolloutRecord("var-b", 0, "mc-on", 2),
+            rolloutRecord("var-b", 0, "mc-off", 0, { runHealth: "unavailable" }),
+            rolloutRecord("var-b", 0, "compaction", 2),
+        ]);
 
         expect(built.familyNoise.map(({ familyId }) => familyId)).toEqual(["fam-one"]);
         expect(built.validForPoolSizing).toBe(false);
     });
 
-    it("rejects a family measured on fewer replicates than the run configured", () => {
-        const built = buildCalibrationRecord({
-            records: [
-                ...coordinate("var-a", 0, 0),
-                ...coordinate("var-a", 1, 1),
-                ...coordinate("var-a", 2, 2),
-                ...coordinate("var-b", 0, 2),
-            ],
-            scenarioFamilies: families,
-            runStatus: "completed",
-            poolManifestFingerprint: H1,
-            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
-            targetMinimumDetectableDelta: 0.15,
-            decisions,
+    it("requires every selected scenario to reach the configured replicate depth", () => {
+        // `var-b` and `var-c` share a family, so one scenario's full depth must not cover the other's absence.
+        const built = build([
+            ...coordinate("var-a", 0, { "mc-on": 2, "mc-off": 0, compaction: 0 }),
+            ...coordinate("var-a", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+            ...coordinate("var-a", 2, { "mc-on": 2, "mc-off": 1, compaction: 1 }),
+            ...coordinate("var-b", 0, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+            ...coordinate("var-b", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+            ...coordinate("var-b", 2, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+        ], {
+            scenarioFamilies: new Map([
+                ["var-a", "fam-one"],
+                ["var-b", "fam-two"],
+                ["var-c", "fam-two"],
+            ]),
         });
 
         expect(built.familyNoise.map(({ familyId }) => familyId))

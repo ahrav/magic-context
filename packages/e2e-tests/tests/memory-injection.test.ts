@@ -5,16 +5,8 @@ import { TestHarness } from "../src/harness";
 import { promoteMemoryToVerified } from "../src/test-db";
 
 /**
- * Memory injection — regression test for v0.9.1.
  *
- * Before v0.9.1, if a session had no compartments yet, prepareCompartmentInjection
- * returned null and <session-history> was never built. Memories were therefore not
- * injected until historian published its first compartment.
  *
- * This test writes a project-scoped memory through ctx_memory before any
- * compartment exists, then opens a fresh session and asserts that its first
- * request contains <session-history> with <project-memory> carrying the saved
- * directive — proving injection works even with zero compartments.
  */
 
 let h: TestHarness;
@@ -74,19 +66,15 @@ describe("memory injection", () => {
             },
         });
 
-        // Write through the public tool so each mode commits to its own authority
-        // store. A fresh session then proves first-turn project-memory injection.
         const directive = "test seeded directive: always prefer bun over npm for running scripts";
         const writerSessionId = await h.createSession();
         emitMemoryWriteOnce(directive);
         await h.sendPrompt(writerSessionId, "remember the project package-manager rule");
-        // v86 trust policy: an agent write starts CANDIDATE and is hidden
-        // from automatic injection; promote through the real verification API.
         promoteMemoryToVerified(h.contextDbPath(), directive);
 
         const memorySessionId = await h.createSession();
 
-        // Clear captured requests so the assertion targets only the fresh session.
+        // Resetting the mock excludes requests from the writer session.
         h.mock.reset();
         h.mock.setDefault({
             text: "ack 2",
@@ -103,9 +91,7 @@ describe("memory injection", () => {
         const req = h.mock.lastRequest();
         expect(req).not.toBeNull();
 
-        // The <session-history> block is prepended to the first user message in
-        // the visible array. Flatten everything and assert on the whole payload
-        // — this way the test survives cosmetic ordering changes.
+        // fullBody lets the assertions search every request-body field.
         const fullBody = JSON.stringify(req!.body);
         expect(fullBody).toContain("<session-history>");
         expect(fullBody).toContain("<project-memory>");

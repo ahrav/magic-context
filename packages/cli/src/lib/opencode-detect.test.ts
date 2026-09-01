@@ -10,8 +10,7 @@ import {
 
 const HOME = "/virt/home";
 
-// Build hermetic deps over a virtual set of "existing" paths and a fixed OS, so
-// no host filesystem / real `opencode` install can leak into the result.
+// The fixture prevents host filesystem state and installed `opencode` from affecting detection.
 function deps(
     existing: Set<string>,
     platform: NodeJS.Platform = "darwin",

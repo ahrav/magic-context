@@ -239,10 +239,7 @@ describe("mode manifest validator", () => {
     });
 
     it("claims a historian-eval harness test in the OpenCode selection once it exists", () => {
-        // `assertSrcTestsClassified` runs on every CLI path, so a harness test
-        // excluded from `historianEvalUnitFiles` with no other claimant would
-        // break `--mode ts` and `--incident-unit` the moment the file lands.
-        // Proven against a temp root because the declared name has no file yet.
+        // The isolated root lets this test materialize HISTORIAN_EVAL_HARNESS_TESTS without adding repository files.
         const root = mkdtempSync(join(tmpdir(), "hse-selection-"));
         try {
             const files = [

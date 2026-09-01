@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-/** FM-OC-6: a real SIGKILL on an emergency-armed session refuses before LKG admission. */
+/* */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
@@ -75,7 +75,6 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
             try {
                 await h.sendPrompt(sessionId, `FM-OC-6 armed dead module at ${RUST_EMERGENCY_WALL_PCT}%`);
             } catch {
-                // OpenCode may surface the refusal as a resolved session error.
             }
             await h.waitForRustPasses(passCountBeforeRefusal + 1);
             await h.waitFor(

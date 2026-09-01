@@ -1,5 +1,5 @@
-//! Request dispatch: correlation fencing, at-most-once handler invocation,
-//! ordered streaming, and first-terminal-wins settlement under races.
+//! The dispatcher fences correlations and invokes each handler at most once.
+//! The dispatcher orders streams and lets the first terminal settle each race.
 
 mod support;
 
@@ -43,7 +43,6 @@ async fn a_unary_request_dispatches_once_with_one_matching_terminal() {
     assert_eq!(frame.body, body, "the opaque body round-trips unchanged");
     assert_eq!(host.handler.dispatch_count(), 1);
 
-    // No second terminal follows.
     assert!(
         tokio::time::timeout(Duration::from_millis(300), client.expect_frame())
             .await
@@ -150,8 +149,8 @@ async fn streams_are_ordered_and_end_with_exactly_one_terminal() {
     host.shutdown_gracefully().await;
 }
 
-/// Each generation owns its correlation namespace, and within one generation
-/// correlations must strictly increase (protocol §8.3, V18, V44).
+/// Each generation owns its correlation namespace.
+/// Correlations strictly increase within a generation.
 #[tokio::test]
 async fn correlation_namespaces_are_per_generation_and_strictly_increasing() {
     let host = TestHost::start().await;
@@ -168,8 +167,8 @@ async fn correlation_namespaces_are_per_generation_and_strictly_increasing() {
         .await
         .expect("route b");
 
-    // route_open already consumed correlation 1 on each generation, so send the
-    // next correlation on both and confirm terminals do not cross.
+    // route_open consumes correlation 1 on each generation.
+    // Terminals remain scoped to their generation when both generations reuse a correlation.
     let first_corr = first.next_corr();
     first
         .send_frame(
@@ -303,7 +302,7 @@ async fn saturated_request_capacity_returns_server_busy_without_dispatch() {
         .await
         .expect("route");
 
-    // Occupy the only pending slot with a request that never completes.
+    // The never-completing request exhausts the sole pending slot.
     let holding = client.next_corr();
     client
         .send_frame(
@@ -317,7 +316,7 @@ async fn saturated_request_capacity_returns_server_busy_without_dispatch() {
         .await
         .expect("send holding");
 
-    // Wait until the handler is actually holding the slot.
+    // The handler holds the pending slot before cancellation.
     let deadline = tokio::time::Instant::now() + BUDGET;
     while host.handler.dispatch_count() == 0 {
         assert!(tokio::time::Instant::now() < deadline, "handler never ran");
@@ -352,8 +351,8 @@ async fn saturated_request_capacity_returns_server_busy_without_dispatch() {
     host.shutdown_gracefully().await;
 }
 
-/// Cancel and completion race on one settlement object; exactly one terminal
-/// may reach the wire (protocol §9.2, V33, V34).
+/// Cancel and completion race on one settlement object; exactly one terminal may reach the wire.
+/// Cancel and completion race on one settlement object; exactly one terminal may reach the wire.
 #[tokio::test]
 async fn cancel_and_completion_settle_exactly_once() {
     let host = TestHost::start().await;
@@ -426,7 +425,7 @@ async fn cancel_and_completion_settle_exactly_once() {
         "a late Cancel must be an idempotent no-op"
     );
 
-    // An unknown correlation is likewise inert, and the connection survives.
+    // A Cancel for an unknown correlation is a no-op, and the connection survives.
     client
         .send_frame(TY_CANCEL, FLAGS_PURE_HEADER, channel, epoch, 99_999, &[])
         .await
@@ -522,7 +521,6 @@ async fn cancelling_a_stream_stops_it_with_one_terminal() {
         .await
         .expect("send");
 
-    // Consume the emitted items, then cancel mid-stream.
     let mut seen = 0;
     while seen < 2 {
         let frame = client.frame_within(BUDGET).await.expect("stream item");
@@ -548,7 +546,7 @@ async fn cancelling_a_stream_stops_it_with_one_terminal() {
     host.shutdown_gracefully().await;
 }
 
-/// A request-handler panic is correlation-local and redacted (plan KTD9).
+/// A request-handler panic is correlation-local and redacted.
 #[tokio::test]
 async fn a_handler_panic_maps_to_one_redacted_internal_error() {
     let host = TestHost::start().await;
@@ -698,9 +696,9 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
         )
         .await
         .expect("send");
-    // An oversized stream item fails the request outright: the handler's
-    // later unary response loses to the already-settled error terminal, so
-    // the client can never observe a truncated-but-successful stream.
+    // An oversized stream item settles the request with an error terminal; a later unary response cannot reach the client.
+    // The handler's later unary response loses to the error terminal that settled the correlation.
+    // The client cannot observe a truncated-but-successful stream.
     let frame = client.frame_within(BUDGET).await.expect("bounded terminal");
     assert_eq!(frame.corr, corr);
     assert_eq!(frame.error_code(), "internal_error");
@@ -711,7 +709,7 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
 #[tokio::test]
 async fn concurrent_handler_output_is_reserved_before_allocation() {
     let host = TestHost::start_with(|config| {
-        // The cached catalog subtracts from the resident budget at startup;
+        // The cached catalog reduces the resident budget at startup.
         // 64 KiB of headroom keeps the egress budget at its one-frame floor.
         config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + 64 * 1024;
     })
@@ -870,7 +868,7 @@ async fn closing_a_route_settles_its_admitted_work() {
         .expect("terminal for the closed route's work");
     assert_eq!(frame.error_code(), "cancelled");
 
-    // Cleanup completed exactly once for the route.
+    // The route cleanup callback runs exactly once.
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let gones = host.handler.route_gones();
@@ -898,7 +896,7 @@ async fn concurrent_requests_never_interleave_frame_bytes() {
         .await
         .expect("route");
 
-    // Overlap streams and unary work so the single writer is contended.
+    // Overlapping streams and unary work contend for the single writer.
     let mut expected = HashSet::new();
     for _ in 0..6 {
         let corr = client.next_corr();
@@ -929,8 +927,8 @@ async fn concurrent_requests_never_interleave_frame_bytes() {
             .expect("send unary");
     }
 
-    // Every frame must decode cleanly, which is only true if no two frames'
-    // bytes interleaved on the socket.
+    // A clean frame decode requires non-interleaved socket writes.
+    // No two frames' bytes interleave on the socket.
     let mut settled = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while settled.len() < expected.len() {
@@ -957,8 +955,6 @@ async fn concurrent_requests_never_interleave_frame_bytes() {
     host.shutdown_gracefully().await;
 }
 
-/// The direct profile's Broca declaration (R13): 96 reserved pending slots
-/// and 96 reserved handler tasks on the reserved class.
 fn broca_reservation() -> ResourceDeclaration {
     ResourceDeclaration {
         reserved_handler_tasks: 96,
@@ -969,16 +965,14 @@ fn broca_reservation() -> ResourceDeclaration {
     }
 }
 
-/// Saturating every reserved permit through blocked settlement rejects the
-/// next reserved-class request while a general request still dispatches and
-/// settles (plan KTD2, AE9).
+/// The next reserved-class request is rejected while a general request dispatches.
 #[tokio::test]
 async fn saturated_broca_reserve_cannot_consume_a_general_slot() {
     let (mc, synapse, broca) = support::stub_trio();
     let broca = broca.with_resources(broca_reservation());
     let composite = StaticComposite::new(mc.clone(), synapse, broca.clone()).expect("distinct ids");
     let host = CompositeTestHost::start(composite, |config| {
-        // Exactly one general slot in each pool beside the 96-slot reserve.
+        // Each pool has one general slot beside the 96-slot reserve.
         config.limits.max_pending_requests = 97;
         config.limits.max_handler_tasks = 97;
     })
@@ -993,8 +987,7 @@ async fn saturated_broca_reserve_cannot_consume_a_general_slot() {
         .await
         .expect("magic-context binds");
 
-    // 64 subscription-shaped plus 32 command-shaped unsettled requests: all
-    // 96 reserved pending and task permits held by hanging handler tasks.
+    // Hanging handler tasks hold all 96 reserved pending-request and task permits.
     for _ in 0..96 {
         let corr = client.next_corr();
         client
@@ -1068,8 +1061,7 @@ async fn saturated_broca_reserve_cannot_consume_a_general_slot() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The converse isolation: exhausting the general class rejects further
-/// general requests while a reserved-class request still dispatches.
+/// Exhausting general capacity rejects further general requests while a reserved-class request dispatches.
 #[tokio::test]
 async fn saturated_general_capacity_cannot_consume_the_broca_reserve() {
     let (mc, synapse, broca) = support::stub_trio();
@@ -1090,7 +1082,6 @@ async fn saturated_general_capacity_cannot_consume_the_broca_reserve() {
         .await
         .expect("broca binds");
 
-    // Occupy the single general slot with a request that never settles.
     let holding = client.next_corr();
     client
         .send_frame(

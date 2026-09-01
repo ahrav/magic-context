@@ -1,55 +1,35 @@
 /**
- * Magic Context — Pi subagent extension entry.
+ * `PiSubagentRunner` loads this entry to register subagent tools.
  *
- * This is a lean extension entry loaded ONLY in child Pi processes
- * spawned by `PiSubagentRunner` (sidekick, dreamer, historian, etc.).
- * It registers Magic Context's tool surface for the subagent — nothing
+ * `PiSubagentRunner` loads this entry only in child Pi processes.
+ * The subagent entry registers only Magic Context tools intended for subagents.
  * else.
  *
- * Why this exists: Magic Context's main entry (`./index.ts`) registers
- * historian, dreamer, transform pipeline, nudges, system-prompt injection,
- * command palette, and agent_end cleanup. Pi child processes now keep extension
- * discovery ON so provider extensions can register models and AFT can register
- * its tools. Recursion is prevented by the child environment instead:
- * `MAGIC_CONTEXT_PI_SUBAGENT=1` makes the full Magic Context entry return before
- * it registers anything. This lean explicit entry is not guarded because it is
- * the only Magic Context code children should run.
+ * `MAGIC_CONTEXT_PI_SUBAGENT=1` makes `./index.ts` return before registering its handlers.
+ * Child Pi processes keep extension discovery enabled for provider models and AFT tools.
+ * `MAGIC_CONTEXT_PI_SUBAGENT=1` prevents recursion by making the full entry return before registration.
+ * The subagent entry is unguarded because child Pi processes must load its scoped tools.
  *
- * Loading the full entry in subagents would still be wrong because it would:
- *   1. Wire historian/dreamer/event handlers that can recursively spawn more
+ * The full entry must not load in subagents because its handlers can recursively spawn subagents and alter subagent prompts.
  *      subagents.
- *   2. Waste startup time on DB work, resource discovery, and timer wiring.
- *   3. Inject prompt content the subagent prompt doesn't expect (key files,
- *      project docs, user profile, session history, etc.).
+ * The full entry performs database work, resource discovery, and timer wiring in subagents.
+ * The full entry injects key files, project documentation, user profiles, and session history into subagent prompts.
  *
- * What this entry registers for `--no-session` children:
- *   - `ctx_search` — read-only search over shared memories/messages/git
- *   - `ctx_memory` — dreamer only; sidekick is retrieval-only and uses ctx_search
+ * `--no-session` children receive `ctx_search`; dreamers receive `ctx_memory` only with `--magic-context-dreamer-actions`.
+ * `ctx_search` provides read-only search over shared memories, messages, and Git.
+ * Only dreamers receive `ctx_memory`; retrieval-only sidekicks use `ctx_search`.
  *
- * Session-scoped `ctx_note`/`ctx_expand` stay omitted because hidden child
- * sessions have no useful transcript or parent note id to target.
+ * Hidden child sessions omit `ctx_note` and `ctx_expand` because they have no useful transcript or parent note ID.
  *
- * Recursion guard: this entry never wires `pi.on("context", ...)`,
- * `pi.on("before_agent_start", ...)`, or any other event that could
- * trigger historian/dreamer/transform pipelines. Subagents only get the
- * tool surface — that's it.
  *
- * How parent passes this entry to the child:
- *   MAGIC_CONTEXT_PI_SUBAGENT=1 pi --print \
- *     --extension /absolute/path/to/dist/subagent-entry.js \
- *     --tools <agent-specific allow-list> \
+ * `PiSubagentRunner` starts child Pi processes with `MAGIC_CONTEXT_PI_SUBAGENT=1` and this entry's `--extension` path.
  *     [other flags...]
  *
- * Discovery remains enabled. The full Magic Context entry no-ops under the env
- * guard and this explicit lean entry supplies scoped Magic Context tools. Pi
- * applies the per-agent `--tools` list to the complete registry. OMP applies it
- * to built-ins only and appends discovered extension tools afterward, so its
- * list is an intended budget rather than an enforced extension-tool sandbox.
+ * Pi applies the per-agent `--tools` list to the complete registry.
+ * OMP applies `--tools` only to built-ins and appends discovered extension tools afterward.
+ * OMP's `--tools` list budgets tools but does not sandbox extension tools.
  *
- * Tool/action allowlists via Pi flags:
- *   --magic-context-dreamer-actions  Register ctx_memory with the dreamer
- *                                     action surface. Off by default; sidekick
- *                                     receives ctx_search only.
+ * `--magic-context-dreamer-actions` registers `ctx_memory` with the dreamer action surface.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -75,11 +55,7 @@ let openedDb: ContextDatabase | undefined;
 
 export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 	configureSynapseManagedDemandStart(managedDemandStart);
-	// Mark this Pi process as a Magic Context subagent in the shared
-	// harness state. session-scoped writes from any code path that
-	// reaches the shared core will tag rows with harness='pi' the same
-	// way the main extension does — but in practice subagents shouldn't
-	// be writing session-scoped state at all.
+	// Shared-core session writes tag rows with `harness='pi'`.
 	setHarness("pi");
 
 	pi.registerFlag(SUBAGENT_DREAMER_ACTIONS_FLAG, {
@@ -91,8 +67,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async () => {
 		try {
-			// Load shared config before opening storage so a trusted-group deployment
-			// never has its externally managed permissions re-tightened by a child.
+			// Loading shared config before storage prevents a child from re-tightening externally managed permissions in trusted-group deployments.
 			const directory = process.cwd();
 			const { config: cfg, registrationPromptSurface } = loadPiConfig({
 				cwd: directory,
@@ -116,13 +91,11 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				resolveProjectIdentity: (ctx) =>
 					resolveProjectIdentityForSession(ctx.cwd, cfg.allow_home_project),
-				// Sidekick is retrieval-only and consumes untrusted /ctx-aug prompt text,
-				// so only dreamer subagents register ctx_memory in child processes.
+				// `--magic-context-dreamer-actions` registers `ctx_memory` with dreamer actions.
 				memoryToolEnabled: dreamerActionsEnabled,
 				allowDreamerActions: dreamerActionsEnabled,
-				// `--no-session` children resolve getSessionId() to the ephemeral
-				// child session, so session-scoped ctx_note/ctx_expand would write
-				// orphaned notes / expand an empty transcript. Drop them; keep ctx_search.
+				// Hidden child sessions omit `ctx_note` and `ctx_expand` because they have no useful transcript or parent note ID.
+				// Hidden child sessions omit `ctx_note` and `ctx_expand` because they have no useful transcript or parent note ID.
 				sessionScopedToolsDisabled: true,
 				todowriteEnabled: cfg.todowrite.enabled !== false,
 				todowriteCommandEnabled: false,
@@ -147,9 +120,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 		if (openedDb) {
 			try {
 				openedDb.close();
-			} catch {
-				// ignore close errors during shutdown
-			}
+			} catch {}
 			openedDb = undefined;
 		}
 	});

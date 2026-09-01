@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 /// Per-generation entry cap; two full generations hold ~9.7 MB
 /// (hashbrown rounds each 65,536-entry map to 131,072 x 37-byte buckets).
-/// commentlint: allow(JUDGE)
+///
 const GENERATION_CAP: usize = 65_536;
 
 /// Contents shorter than this tokenize directly: hashing plus the lock
@@ -39,7 +39,7 @@ pub(crate) struct TokenCacheStats {
 }
 
 thread_local! {
-    /// Thread-local counters exclude updates from other threads. commentlint: allow(JUDGE)
+    /// Thread-local counters exclude updates from other threads.
     static LOCAL: Cell<TokenCacheStats> = const {
         Cell::new(TokenCacheStats {
             hits: 0,
@@ -53,8 +53,8 @@ thread_local! {
 
 /// Counters for the calling thread, monotonic for the life of the thread.
 ///
-/// `calls` equals `hits + misses + bypassed` in any single reading. commentlint: allow(JUDGE)
-/// Only differences are meaningful. commentlint: allow(JUDGE)
+/// `calls` equals `hits + misses + bypassed` in any single reading.
+/// Only differences are meaningful.
 pub(crate) fn local_stats() -> TokenCacheStats {
     LOCAL.with(Cell::get)
 }
@@ -88,7 +88,7 @@ fn insert_current(generations: &mut Generations, digest: [u8; 32], count: u32) {
 /// Callers must hash a domain-separated, injective encoding of `content`.
 /// Tail hygiene hashes `kind_name ‖ NUL ‖ content`; this module's raw path
 /// hashes `NUL ‖ content`, which no kind name can prefix.
-/// commentlint: allow(JUDGE)
+///
 pub(crate) fn count_with_digest(digest: [u8; 32], content: &str) -> usize {
     bump_local(|stats| stats.calls += 1);
     // ponytail: one global lock; shard per digest byte if concurrent sessions
@@ -129,10 +129,10 @@ pub fn clear() {
     *guard = Some(Generations::default());
 }
 
-/// Serializes tests whose assertions depend on shared cache contents. commentlint: allow(JUDGE)
+/// Serializes tests whose assertions depend on shared cache contents.
 ///
 /// Parallel test threads can clear a seeded cache hit before its assertion;
-/// counter deltas remain thread-local. commentlint: allow(JUDGE)
+/// counter deltas remain thread-local.
 #[cfg(test)]
 pub(crate) fn test_cache_guard() -> std::sync::MutexGuard<'static, ()> {
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());

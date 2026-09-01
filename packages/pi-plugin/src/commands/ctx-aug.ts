@@ -1,41 +1,17 @@
 /**
- * Pi-side `/ctx-aug` slash command.
  *
- * Mirrors the OpenCode `/ctx-aug` flow (see
  * packages/plugin/src/hooks/magic-context/command-handler.ts#executeAugmentation):
- *   1. Validate sidekick is configured.
- *   2. Show a "preparing augmentation" notification (hidden from the LLM).
- *   3. Spawn the sidekick subagent with the user's prompt.
- *   4. If sidekick returned useful text, append it to the prompt as a
+ * The command sends the preparing notification without including it in the LLM prompt.
  *      `<sidekick-augmentation>` block.
- *   5. Inject the (possibly augmented) prompt as a real user message that
- *      triggers a turn.
+ * The augmented user message starts the next turn.
  *
- * Implementation differences from OpenCode:
- * - OpenCode uses `client.session.create() + client.session.prompt()` to spawn
- *   sidekick as a child session with `parentID`. Pi has no such API; we
- *   instead spawn `pi --print --mode json` as a subprocess via
- *   `PiSubagentRunner` (see ../subagent-runner.ts).
- * - OpenCode commits the augmented prompt via a server-side `client.session
- *   .prompt()` call. Pi has a native `pi.sendUserMessage(content)` helper
- *   exposed on the `ExtensionAPI`, which is preferred over `ctx.sendUserMessage`
- *   in the command-handler signature because the slash command itself is
- *   already on the input pipeline; we want the augmented prompt to be queued
- *   as the next turn rather than steering an in-flight one.
- * - OpenCode bubbles sidekick failures back through the command handler. Pi
- *   deliberately degrades gracefully: if the sidekick subprocess fails, the
- *   original prompt is still sent unaugmented. This keeps slash-command UX
- *   usable when background model/provider configuration is flaky.
- * - OpenCode displays the "preparing" message as an ignored notification.
- *   Pi has `ctx.ui.notify()` which only renders in interactive mode. In RPC
- *   or print mode `ctx.hasUI === false` and `ctx.ui.notify()` is a no-op,
- *   which is the correct behavior.
+ * `pi.sendUserMessage(content)` queues the augmented prompt for the next turn.
+ * `pi.sendUserMessage(content)` queues the augmented prompt as the next turn.
+ * If the sidekick subprocess fails, Pi sends the original prompt unaugmented.
  *
- * Cache safety note: This is the same design we use in OpenCode — the
- * augmentation lands as a new user message rather than mutating any cached
- * prefix. There's no provider-cache concern because every `<sidekick-
- * augmentation>` invocation produces a one-shot user turn, not a
- * persisted prefix change.
+ * The augmentation is sent as a new user message rather than mutating a cached prefix.
+ * Each `<sidekick-augmentation>` invocation creates a one-shot user turn.
+ * The augmentation does not persist as a prefix change.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -51,25 +27,21 @@ import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { PiSubagentRunner } from "../subagent-runner";
 
 /**
- * Configuration for Pi's sidekick agent.
  *
- * Same shape as OpenCode's `SidekickConfig` minus the OpenCode-specific
- * agent-name/fallback wiring — Pi just needs a model identifier and an
- * optional override for system prompt and timeout.
  */
 export interface PiSidekickConfig {
-	/** Provider/model identifier in `provider/model` form, e.g. `anthropic/claude-haiku-4-5`. */
+	/** The `model` value must use `provider/model` form, such as `anthropic/claude-haiku-4-5`. */
 	model: string;
-	/** Override for sidekick system prompt. Defaults to SIDEKICK_SYSTEM_PROMPT. */
+	/* */
 	systemPrompt?: string;
-	/** Hard timeout in ms. Defaults to 30s — sidekick is expected to be fast. */
+	/* */
 	timeoutMs?: number;
-	/** Pi only: explicit thinking level (--thinking <level>) for sidekick subagent. */
+	/** `thinking_level` sets Pi's `--thinking <level>` value for the sidekick subagent. */
 	thinking_level?: string;
-	/** Ordered fallback chain after the primary sidekick model. */
+	/** `fallbackModels` are tried after the primary sidekick model. */
 	fallbackModels?: readonly string[];
 	language?: string;
-	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	/** User-level configuration can allow sessions started exactly in the canonical home directory. */
 	allowHomeProject?: boolean;
 }
 
@@ -78,13 +50,7 @@ type ResolveSidekickConfig = (ctx: {
 }) => PiSidekickConfig | undefined;
 
 /**
- * Register the `/ctx-aug` slash command on Pi.
  *
- * The command is a no-op when `config` is undefined (sidekick disabled in
- * config). Pi's command UI will still show the command but invoking it
- * will print a "not configured" message to the user, matching OpenCode's
- * behavior of surfacing the missing configuration via notification rather
- * than hiding the command entirely.
  */
 export function registerCtxAugCommand(
 	pi: ExtensionAPI,
@@ -97,8 +63,7 @@ export function registerCtxAugCommand(
 		handler: async (args, ctx) => {
 			const prompt = args.trim();
 
-			// Use Pi's session entry IDs for log correlation. The session
-			// manager's branch always has at least the current entry.
+			// The session label uses the branch's last entry ID to correlate logs.
 			const branch = ctx.sessionManager.getBranch();
 			const lastEntryId =
 				branch.length > 0 ? branch[branch.length - 1]?.id : "unknown";
@@ -121,9 +86,7 @@ export function registerCtxAugCommand(
 				return;
 			}
 
-			// Inform the user. In print/rpc mode this is a no-op (hasUI=false),
-			// which is correct: the user invoked /ctx-aug from a non-interactive
-			// context and just wants the augmented turn to fire.
+			// `ctx.hasUI` gates the progress notification; augmentation still runs without a UI.
 			if (ctx.hasUI) {
 				ctx.ui.notify(
 					"🔍 Preparing augmentation… 2-10s depending on your sidekick provider.",
@@ -135,12 +98,6 @@ export function registerCtxAugCommand(
 				model: currentConfig.model,
 			});
 
-			// Spawn sidekick as a Pi subprocess. The subagent inherits the
-			// current project's cwd so its tool calls (notably `ctx_search`)
-			// resolve against the same project identity as the invoking
-			// session. This is what makes cross-harness memory sharing work:
-			// sidekick sees the same memories whether spawned from Pi or
-			// OpenCode at the same cwd.
 			const projectIdentity = resolveProjectIdentityForSession(
 				ctx.cwd,
 				currentConfig.allowHomeProject,
@@ -172,10 +129,7 @@ export function registerCtxAugCommand(
 			});
 
 			if (!result.ok) {
-				// Failure modes: timeout, model_failed, spawn_failed, aborted, etc.
-				// In all cases we still want the user's prompt to reach the agent —
-				// the worst sidekick can do is fail silently, so we send the prompt
-				// unaugmented and tell the user via UI notification (interactive
+				// If the sidekick subprocess fails, Pi sends the original prompt unaugmented.
 				// only).
 				log(
 					`[magic-context][pi] /ctx-aug: sidekick failed (${result.reason}): ${result.error}`,
@@ -196,10 +150,6 @@ export function registerCtxAugCommand(
 				`/ctx-aug: sidekick returned ${sidekickText.length} chars in ${result.durationMs}ms`,
 			);
 
-			// If sidekick returned the literal "no relevant memories" sentinel
-			// (or near-empty text), skip the augmentation block entirely —
-			// the agent gets a cleaner prompt. This matches OpenCode's
-			// `isEmptySidekickResult` shortcut behavior.
 			if (isEmptySidekickResult(sidekickText)) {
 				pi.sendUserMessage(prompt);
 				return;

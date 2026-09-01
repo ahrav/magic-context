@@ -1,19 +1,5 @@
 /**
- * Versioned sparse benchmark profiles (KTD14, R58).
  *
- * A profile enumerates an EXACT bounded case set — anchor sweeps plus
- * required interaction corners — never an implicit Cartesian product. For
- * reference-host profiles (`host.class` arm-neon / x86-avx2) every axis
- * endpoint (corpus scale 1K-1M, dims 128-1024, candidate K 5-100, filter
- * selectivity 0.1%-100%, concurrency 1-8) plus the 100K/384 audit cell and
- * the 1M/1024/concurrency-8 corner must be present, or the profile rejects
- * at parse time. The CI host class runs the deterministic SMALL profile:
- * it still must cover both modes, all-cold and all-warm cache states, and
- * all-lane plus single-lane cases, but it is exempt from the heavy
- * scale/dims/K/selectivity/concurrency endpoints — seeding 1M-scale
- * fixtures inside a CI-sized deterministic check is infeasible by design,
- * and CI latency is informational only. A resource preflight prices each
- * case before any allocation so an undersized host fails first.
  */
 
 import { z } from "zod";
@@ -26,22 +12,18 @@ export const PROFILE_SCHEMA_VERSION = "retrieval-benchmark-profile/v1";
 export const PROFILE_AXIS_ENDPOINTS = {
     scale: { min: 1_000, max: 1_000_000 },
     dims: { min: 128, max: 1_024 },
-    // The K ceiling is the production bound itself, not a copy: the runner
-    // feeds candidateK.effective straight into unifiedSearch, which throws
-    // CandidateDepthError above MAX_CANDIDATE_DEPTH, and reference profiles
-    // are required to cover this max endpoint.
     candidateK: { min: 5, max: MAX_CANDIDATE_DEPTH },
     selectivityFraction: { min: 0.001, max: 1 },
     concurrency: { min: 1, max: 8 },
 } as const;
 
-/** R59 audit cell: 100K corpus, 384 dims, automatic mode. */
+/* */
 export const AUDIT_CELL = { scale: 100_000, dims: 384 } as const;
 
-/** Discrete rounding rule for declared selectivity cardinalities. */
+/* */
 export const SELECTIVITY_ROUNDING_TOLERANCE = 1;
 
-/** Hard ceiling on enumerated cases per profile (anti-Cartesian guard). */
+/* */
 export const MAX_PROFILE_CASES = 64;
 
 export const CACHE_LAYERS = [
@@ -65,8 +47,8 @@ const selectivitySchema = z.strictObject({
         .number()
         .min(PROFILE_AXIS_ENDPOINTS.selectivityFraction.min)
         .max(PROFILE_AXIS_ENDPOINTS.selectivityFraction.max),
-    /** Named production predicates that realize the fraction (no support
-     *  flag or report-only percentage substitutes for execution). */
+    /**
+     * */
     predicate: z.strictObject({
         projectScope: z.string().min(1),
         sessionScope: z.string().min(1).nullable(),
@@ -106,7 +88,7 @@ const caseSchema = z.strictObject({
             .max(PROFILE_AXIS_ENDPOINTS.candidateK.max),
     }),
     mode: z.enum(["explicit", "automatic"]),
-    /** null = all enabled source lanes. */
+    /* */
     sourceLanes: z.array(z.enum(SOURCE_FILTERS)).nullable(),
     concurrency: z
         .number()
@@ -143,20 +125,20 @@ const profileSchema = z.strictObject({
 export type BenchmarkProfile = z.infer<typeof profileSchema>;
 
 const F32_BYTES = 4;
-/** Row/index/FTS overhead multiplier over the raw vector payload. */
+/* */
 const FIXTURE_DISK_OVERHEAD = 2;
-/** Per-worker runtime baseline outside the vector payload. */
+/* */
 const WORKER_BASELINE_RSS_BYTES = 64 * 1024 * 1024;
 
 export interface CaseResourceEstimate {
     caseId: string;
-    /** Raw f32 vector payload: scale x dims x 4 bytes. */
+    /* */
     vectorPayloadBytes: number;
-    /** Vector payload multiplied across closed-loop workers. */
+    /* */
     workerPayloadBytes: number;
     peakRssBytes: number;
     fixtureDiskBytes: number;
-    /** `VACUUM INTO` needs a full second copy while both files exist. */
+    /* */
     vacuumHeadroomBytes: number;
     requiredDiskBytes: number;
 }
@@ -183,9 +165,8 @@ export interface ProfileResourceEstimate {
     maxPeakRssBytes: number;
     maxRequiredDiskBytes: number;
     maxFixtureDiskBytes: number;
-    /** Every unique (scale, dims) fixture is seeded eagerly and retained for
-     *  the whole run, so the profile-level disk requirement is the SUM of the
-     *  unique fixtures' requirements, not the largest single case. */
+    /**
+     * */
     totalRequiredDiskBytes: number;
 }
 
@@ -222,9 +203,6 @@ export interface PreflightResult {
 }
 
 /**
- * Price every case against the actual host BEFORE any fixture allocation:
- * an undersized host fails here with the offending case named, instead of
- * exhausting memory or disk hours into a matrix run.
  */
 export function checkHostResources(
     profile: BenchmarkProfile,
@@ -272,10 +250,6 @@ export function verifySelectivityObservation(
     if (Math.abs(observed.eligibleCount - cell.eligibleCount) > SELECTIVITY_ROUNDING_TOLERANCE) {
         diagnostics.push("selectivity: observed eligible count outside rounding tolerance");
     }
-    // The production message index pushes the ordinal predicate into the
-    // scan, so the executed scan visits exactly the observed eligible set —
-    // the only scan cardinality this harness can verify. Any other declared
-    // value would label the case with a workload no evidence supports.
     if (Math.abs(cell.expectedScannedCount - observed.eligibleCount) > SELECTIVITY_ROUNDING_TOLERANCE) {
         diagnostics.push("selectivity: declared scanned count does not match the verifiable scan");
     }
@@ -351,10 +325,6 @@ export function parseProfile(value: unknown): BenchmarkProfile {
         const states = CACHE_LAYERS.map((layer) => profileCase.cacheState[layer]);
         if (states.every((state) => state === "cold")) hasAllCold = true;
         if (states.every((state) => state === "warm")) hasAllWarm = true;
-        // Lane coverage counts what the case EXECUTES: the predicate's
-        // sources narrow execution exactly like the lane axis, so a case
-        // whose predicate drops lanes cannot satisfy the all-lane endpoint,
-        // and a predicate-only single-lane case does satisfy single-lane.
         const lanes = profileCase.sourceLanes;
         const predicateSources = profileCase.selectivity.predicate.sources;
         const effectiveLanes =
@@ -364,9 +334,6 @@ export function parseProfile(value: unknown): BenchmarkProfile {
                   ? predicateSources
                   : lanes.filter((lane) => predicateSources.includes(lane));
         if (effectiveLanes === null) hasAllLanes = true;
-        // A disjoint lane axis and predicate would execute NO source lane:
-        // every query returns empty rankings while the case still counts as
-        // evidence. Reject the contradiction at parse time.
         if (effectiveLanes !== null && effectiveLanes.length === 0) {
             diagnostics.push(
                 `profile.cases[${index}].sourceLanes: empty effective lane set (sourceLanes and selectivity.predicate.sources do not intersect)`,
@@ -390,22 +357,11 @@ export function parseProfile(value: unknown): BenchmarkProfile {
             hasScaleDimsConcurrencyCorner = true;
         }
         validateSelectivity(index, profileCase.selectivity, diagnostics);
-        // Prepared statements and the SQLite page cache both live on the
-        // connection in this runtime, so their declared states must agree.
-        // Enforced at parse time: runBenchmark seeds every fixture before
-        // constructing the cache controller, and a reference-scale profile
-        // must not spend hours seeding 1M-row snapshots before reporting a
-        // configuration error knowable at load time.
         if (profileCase.cacheState.connectionStatement !== profileCase.cacheState.sqlitePage) {
             diagnostics.push(
                 `profile.cases[${index}].cacheState: connectionStatement and sqlitePage states must agree in-process`,
             );
         }
-        // Connection-statement, SQLite-page, and OS-page warmth comes only
-        // from executed searches; with zero warmups the first measured
-        // sample runs cold while the case evidence still claims warm. The
-        // process-vector layer is exempt: the cache controller primes it
-        // explicitly at case start.
         const warmthNeedsExecution =
             profileCase.cacheState.connectionStatement === "warm" ||
             profileCase.cacheState.sqlitePage === "warm" ||
@@ -417,8 +373,6 @@ export function parseProfile(value: unknown): BenchmarkProfile {
         }
     }
 
-    // Full axis-endpoint coverage is a reference-host obligation; CI host
-    // profiles require only mode, cache-state, and lane coverage.
     const requiresFullAxisCoverage = profile.host.class !== "ci";
     const endpointChecks: Array<[boolean, string]> = requiresFullAxisCoverage
         ? [
@@ -466,9 +420,6 @@ export function parseProfile(value: unknown): BenchmarkProfile {
         if (!present) diagnostics.push(diagnostic);
     }
 
-    // Anti-Cartesian guard: the enumerated case count must stay strictly
-    // below the axis-value product, otherwise the profile has silently
-    // re-derived the full grid it was supposed to sample from.
     const axisProduct =
         scales.size * dims.size * ks.size * fractions.size * concurrencies.size * modes.size;
     if (profile.cases.length >= axisProduct) {
@@ -493,7 +444,7 @@ export function parseProfile(value: unknown): BenchmarkProfile {
     return profile;
 }
 
-/** Same promoter-serialization byte rule the release loader enforces. */
+/* */
 export function loadProfileFile(path: string): BenchmarkProfile {
     return parseProfile(
         readCanonicalJsonFile(path, (code) => new ContractError([`profile: ${code}`])),

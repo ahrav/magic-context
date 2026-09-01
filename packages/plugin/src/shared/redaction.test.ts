@@ -4,10 +4,13 @@ import { describe, expect, test } from "bun:test";
 
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
 import {
+    credentialValueFormat,
     hasShareabilitySensitiveText,
+    isCredentialBearingConfigKey,
     redactSecretText,
     SECRET_QUALIFIERS,
     SECRET_WORDS,
+    urlCredentialFinding,
 } from "./redaction";
 
 describe("redaction vocabulary fixture", () => {
@@ -50,8 +53,7 @@ describe("redactSecretText — token counts and scalar diagnostics stay visible"
     });
 
     test("still redacts real secret string values", () => {
-        // High-entropy / non-scalar values must always be redacted; only bare
-        // numeric/boolean scalars are exempt from the key-based match.
+        // Key-based matching exempts numeric and boolean scalar values.
         const syntheticApiKey = "sk-abc123XYZ" + "secretvalue"; // gitleaks:allow redaction-test fixture
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).toContain("<REDACTED:");
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).not.toContain(syntheticApiKey);
@@ -109,5 +111,249 @@ describe("hasShareabilitySensitiveText", () => {
     test("a public IP / port alone is not flagged by the private-range rules", () => {
         // 8.8.8.8 is public; no private-range or localhost pattern should match.
         expect(hasShareabilitySensitiveText("DNS resolver at 8.8.8.8")).toBe(false);
+    });
+});
+
+describe("isCredentialBearingConfigKey", () => {
+    test("judges a config key by its final word, unlike the redaction predicate", () => {
+        // `isSecretKey` needs a qualifier before the secret word, which is right for
+        // masking and wrong for a guard that refuses to write a credential to disk.
+        for (const key of [
+            "masterKey",
+            "dbPassword",
+            "webhookSecret",
+            "signingSecret",
+            "encryptionKey",
+            "APIKEY",
+            "apikey",
+            "Cookie",
+            "Proxy-Authorization",
+            "idToken",
+            "accessToken",
+            "dbPasswords",
+            "customCookies",
+            "backupPassphrases",
+            "apitoken",
+            // A `*Token` qualifier that names an issuer rather than a quantity.
+            "botToken",
+            "webhookToken",
+            "slackToken",
+            "csrfToken",
+            "verificationToken",
+            // An identity token is a credential, whatever the plural suggests.
+            "identityTokens",
+            // A trailing descriptor names the field, not the thing.
+            "dbPasswordValue",
+            "masterKeyId",
+            "apiKeyHeader",
+            "accessTokenValue",
+            // An all-caps glued name gives the camel-case split nothing to break on, so its descriptor has to come off the compacted form.
+            "DBPASSWORDVALUE",
+            "MASTERKEYID",
+            "APIKEYHEADER",
+            "ACCESSTOKENVALUE",
+            // A trailing enumerator distinguishes a rotated pair; it does not change what
+            // the field holds.
+            "apiKey2",
+            "apiKey2Value",
+            "APIKEY2",
+            // A counting qualifier excuses a plural count, not one singular bearer token.
+            "cacheToken",
+            "cachedToken",
+            // The same logical field must not depend on the caller's casing.
+            "dbkey",
+            "oauthkey",
+            "jwtkey",
+            // The common all-caps form glues a vendor onto the field.
+            "OPENAIAPIKEY",
+            "ANTHROPICAPIKEY",
+            "AZUREOPENAIAPIKEY",
+            // Acronym casing puts the whole compound in one segment, ahead of the qualifier.
+            "primaryAPIKey",
+            "publicAPIKey",
+            "cacheAPIKey",
+            // A connection string embeds its own credential and matches no vendor shape.
+            "connectionString",
+            "storageConnectionString",
+            "databaseUrl",
+            // The abbreviation is as common as the word.
+            "dbPwd",
+            "databasePwd",
+            "PWD",
+            // An enumerator can sit outside the descriptor as easily as inside it.
+            "apiKeyValue2",
+            "passwordValue2",
+            "clientSecretHeader3",
+            "APIKEYVALUE2",
+            /** The Rails-style compound ends in `base`, so neither the `key` branch nor a peeled descriptor reaches the credential inside it. commentlint: allow(JUDGE) */
+            "secretKeyBase",
+            "SECRET_KEY_BASE",
+            "jwtSecretKeyBase",
+            "secret_key_base",
+        ]) {
+            expect(isCredentialBearingConfigKey(key)).toBe(true);
+        }
+
+        // `token` also counts things, so it stays qualified.
+        for (const key of [
+            "maxTokens",
+            "promptTokens",
+            "tokenBudget",
+            "idleTokens",
+            "idealTokens",
+            "baseURL",
+            "models",
+            /** The `secretkeybase` compound is matched whole, so an ordinary `base` tail stays benign. commentlint: allow(JUDGE) */
+            "apiBaseUrl",
+            "codebase",
+            "database",
+            "keyBase",
+            // `key` names a position in a data structure at least as often as a credential.
+            "foreignKey",
+            "primaryKey",
+            "partitionKey",
+            "sortKey",
+            "hotkey",
+            // Structural keys keep their descriptors too.
+            "primaryKeyId",
+            "foreignKeyValue",
+            // Peeling a descriptor off the compacted form must not promote a structural key.
+            "PRIMARYKEYID",
+            "FOREIGNKEYVALUE",
+            "HOTKEY",
+            "PARTITIONKEY",
+            // An ordinary word ending in these letters names no key at all, and this
+            // predicate aborts a spawn when it matches.
+            "monkey",
+            "turkey",
+            "hockey",
+            "monkeys",
+            "MONKEY",
+            "donkeyCount",
+            // Published by definition, and not routable through extraEnv.
+            "publicKey",
+            "PUBLICKEY",
+            "publicKeyId",
+            // Plural counts keep their exemption.
+            "cachedTokens",
+            "cacheTokens",
+            // A published keypair half is not a secret, and cannot be routed through extraEnv.
+            "publicSigningKey",
+            "publicSshKey",
+            "publicVerificationKey",
+            // The exemption has to cover the plural the credential rule accepts.
+            "publicSigningKeys",
+            "publicSshKeys",
+            // A separated enumerator must not become the qualifier.
+            "public_key_value_2",
+            "primary_key_id_2",
+            "cached_tokens_value_2",
+            // A camelCase split leaves the digit attached to the descriptor.
+            "publicKeyValue2",
+            "primaryKeyValue2",
+            "primaryKeyId2",
+            "cachedTokensValue2",
+        ]) {
+            expect(isCredentialBearingConfigKey(key)).toBe(false);
+        }
+    });
+});
+
+describe("urlCredentialFinding", () => {
+    test("reads a URL's own namespaces without echoing a secret key", () => {
+        // A bare parameter is parsed as a key with an empty value.
+        expect(urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key as a URL parameter name",
+        );
+        expect(urlCredentialFinding("https://host/#sk-ant-abcdefghijklmnopqrstuv&view=1")).toBe(
+            "Anthropic-style key as a URL parameter name",
+        );
+        // The label never contains the matched key.
+        expect(urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv")).not.toContain(
+            "sk-ant-",
+        );
+        // A composite query key satisfies both key rules; the winner must not name it.
+        expect(
+            urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv-apiKey=1"),
+        ).not.toContain("sk-ant-");
+        expect(urlCredentialFinding("https://host/v1?trace=sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key value in query key trace",
+        );
+        expect(urlCredentialFinding("https://host/c?sv=2021-08-06&sig=Zm9vYmFyYmF6")).toBe(
+            "signed-URL credential parameter sig",
+        );
+        expect(urlCredentialFinding("https://host.internal/v1")).toBe(null);
+        expect(urlCredentialFinding("not a url")).toBe(null);
+    });
+});
+
+describe("credentialValueFormat", () => {
+    test("names the format a credential announces, and nothing else", () => {
+        expect(credentialValueFormat("Bearer sk-live-abcdefghij")).toBe(
+            "HTTP authorization scheme",
+        );
+        expect(credentialValueFormat("sk-ant-abcdefghijklmnopqrstuv")).toBe("Anthropic-style key");
+        expect(credentialValueFormat("ghp_abcdefghijklmnopqrstuvwxyz012345")).toBe("GitHub token");
+        expect(credentialValueFormat("postgres://user:pw@host/db")).toBe("credential-bearing URI");
+        // The password-only shape, whose username segment is empty.
+        expect(credentialValueFormat("redis://:supersecret@cache.internal:6379")).toBe(
+            "credential-bearing URI",
+        );
+        // A bare token in the username position, with no password at all.
+        expect(credentialValueFormat("https://ghp_abcdefghijklmnop@github.internal")).toBe(
+            "credential-bearing URI",
+        );
+        expect(credentialValueFormat("-----BEGIN RSA PRIVATE KEY-----")).toBe("PEM private key");
+
+        // Leading text used to defeat every rule at once, because all of them were
+        // anchored at position zero.
+        expect(credentialValueFormat("note: sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key",
+        );
+        expect(credentialValueFormat("{env:HOME} sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key",
+        );
+        expect(credentialValueFormat("see postgres://user:pw@host/db for details")).toBe(
+            "credential-bearing URI",
+        );
+        expect(credentialValueFormat("token=ghp_abcdefghijklmnopqrstuvwxyz012345")).toBe(
+            "GitHub token",
+        );
+        // A prefix inside a longer opaque run is a coincidence, not a token boundary.
+        expect(credentialValueFormat("Zm9vYmFyhf_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(null);
+
+        // `SECRET_TEXT_PATTERNS` redacts these formats, so config validation must reject
+        // them under innocuous keys.
+        expect(credentialValueFormat("github_pat_abcdefghijklmnopqrstuv0123456789")).toBe(
+            "GitHub fine-grained token",
+        );
+        expect(credentialValueFormat("hf_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(
+            "Hugging Face token",
+        );
+        for (const prefix of [
+            "xoxa",
+            "xoxb",
+            "xoxp",
+            "xoxr",
+            "xoxs",
+            "xoxu",
+            "xoxv",
+            "xoxc",
+            "xapp",
+        ]) {
+            expect(credentialValueFormat(`${prefix}-0123456789abcdef`)).toBe("Slack token");
+        }
+
+        for (const value of [
+            "run-42",
+            "application/json",
+            "https://example.test/path",
+            "",
+            // Prose that opens with a scheme word: one payload, not four words.
+            "Basic auth is optional here",
+            "Bearer tokens are supported",
+        ]) {
+            expect(credentialValueFormat(value)).toBeNull();
+        }
     });
 });

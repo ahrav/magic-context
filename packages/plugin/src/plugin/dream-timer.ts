@@ -64,18 +64,14 @@ import { closeQuietly } from "../shared/sqlite-helpers";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./boot-quiet";
 import type { PluginContext } from "./types";
 
-/** Check interval for dream schedule (15 minutes). */
+/* */
 const DREAM_TIMER_INTERVAL_MS = 15 * 60 * 1000;
-/** Wall-clock budget for post-sweep commit backlog drain (matches indexer embed sweep). */
+/** The post-sweep commit backlog drain has a 5-minute wall-clock budget. */
 const GIT_COMMIT_BACKLOG_DRAIN_MAX_MS = 5 * 60 * 1000;
-/** First maintenance passes are spread across 30 seconds after boot quiet ends. */
+/* */
 const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
 
 /**
- * Per-project work registered with the timer. The timer is a process-wide
- * singleton, but Desktop OpenCode can load the same plugin once per project
- * within one process — every load needs its directory's git commits indexed,
- * its dream schedule checked, and its config respected.
  */
 interface ProjectRegistration {
     directory: string;
@@ -95,21 +91,12 @@ interface ProjectRegistration {
     embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
     /**
-     * Per-registration retrospective raw-source provider factory. Each harness
-     * brings its own (the same way it brings its own `client`): OpenCode reads
-     * opencode.db, Pi reads its JSONL sessions. When omitted, the timer defaults
-     * to the OpenCode provider (preserving OpenCode behavior exactly).
      */
     retrospectiveRawProvider?: (
         db: Database,
         projectIdentity: string,
     ) => RetrospectiveRawProvider | null;
     /**
-     * Per-registration primer raw-source provider factory for the SCHEDULED
-     * refresh-primers task. Pi supplies a JSONL-backed factory so the open-book
-     * primer seed renders the origin compartment's raw U:/TC: lines; OpenCode
-     * omits it (buildPrimerSeed reads opencode.db directly). When omitted on Pi,
-     * scheduled refresh-primers silently falls back to a closed-book seed.
      */
     primerRawProviderFactory?: (
         sessionId: string,
@@ -126,26 +113,21 @@ interface ProjectRegistration {
     };
 }
 
-/** Singleton timer state. */
+/* */
 let activeTimer: ReturnType<typeof setInterval> | null = null;
 const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const startupJitters = new Map<string, number>();
 let nextStartupJitterSlot = 0;
 
 /**
- * Clear the module-scope startup jitter slots. Slots are handed out for the
- * lifetime of the module and are otherwise released only when the last project
- * unregisters, so a test whose timing depends on which slots its projects
- * receive must clear them before registering.
  */
 export function resetStartupJitterSlotsForTests(): void {
     startupJitters.clear();
     nextStartupJitterSlot = 0;
 }
 
-/** True when `directory` exists and is a directory. Any stat error (gone,
- *  permission, ENOENT) → false: a directory we can't read is treated as gone for
- *  the dead-directory guard. */
+/**
+ * */
 function directoryStillExists(directory: string): boolean {
     try {
         return statSync(directory).isDirectory();
@@ -155,15 +137,6 @@ function directoryStillExists(directory: string): boolean {
 }
 
 /**
- * Open the shared DB for timer work, returning null (with one clear log) when
- * storage is unavailable. openDatabase() returns a typed-null on the
- * schema-fence path BUT THROWS on a fatal open (corrupt/unwritable DB) — both
- * mean "storage unavailable" here, so we catch the throw and degrade to null
- * too. Every timer entry point MUST null-check before using the handle —
- * otherwise the null reaches `db.transaction(...)` deep in embedding
- * registration and throws a confusing TypeError. Crucially, this also keeps a
- * fatal-open throw from escaping the awaited startup registration in index.ts
- * and aborting the whole plugin load (which would disable the transform).
  */
 function openTimerDatabaseOrNull(context: string): Database | null {
     let db: Database | null;
@@ -181,20 +154,15 @@ function openTimerDatabaseOrNull(context: string): Database | null {
     }
     return db;
 }
-/** All projects that have called startDreamScheduleTimer in this process,
- *  keyed by directory so re-registration of the same directory is idempotent. */
+/**
+ * registeredProjects uses directories as keys, so re-registering a directory replaces its registration. */
 const registeredProjects = new Map<string, ProjectRegistration>();
 
 /**
- * Register the calling project with the process-wide dream + maintenance
- * timer. The timer itself is a singleton (we only need one setInterval per
- * process), but every registered project gets its per-directory work — git
- * commit indexing, dream schedule check, dream queue processing — on each
- *  tick. The first registration schedules a quiet-period startup pass so
- *  fresh installs do not create a writer burst during concurrent boot.
+ * The singleton timer runs maintenance for every registered project.
+ * The quiet-period startup pass prevents concurrent boot from creating a writer burst.
  *
- * Returns a cleanup that removes this project's registration. The timer
- * itself stops only when the last project unregisters.
+ * The cleanup removes the project registration and stops the timer after the last project unregisters.
  */
 export async function startDreamScheduleTimer(
     args: ProjectRegistration,
@@ -206,11 +174,8 @@ export async function startDreamScheduleTimer(
     const embeddingSweepEnabled = args.memoryEnabled === true;
     const commitIndexingEnabled = args.gitCommitIndexing?.enabled === true;
 
-    // The timer also owns global message-history privacy maintenance, so an
-    // enabled plugin registers even when project dream/embedding/git work is off.
+    // The plugin registers even when project work is disabled because the timer maintains global message-history privacy.
 
-    // Idempotent registration — re-registering the same directory replaces
-    // the prior config (e.g., if config was reloaded for that project).
     const previousRegistration = registeredProjects.get(args.directory);
     const isNewRegistration = previousRegistration === undefined;
     if (previousRegistration && previousRegistration !== args) {
@@ -229,10 +194,7 @@ export async function startDreamScheduleTimer(
     }
 
     if (!activeTimer) {
-        // First registration in this process starts a quiet-period timer.
-        // Startup work is scheduled only after the quiet period and is
-        // staggered per project so a multi-project process does not create
-        // one writer burst.
+        // Startup passes wait for the quiet period and are staggered to avoid a multi-project writer burst.
         log(
             `[dreamer] started independent schedule timer (every ${DREAM_TIMER_INTERVAL_MS / 60_000}m)`,
         );
@@ -268,32 +230,25 @@ export async function startDreamScheduleTimer(
     };
 }
 
-/** Shared chunk-backfill budget for ONE tick across every registered project.
- *  Kept under DREAM_TIMER_INTERVAL_MS so a multi-project backlog drain can
- *  never outrun the interval that scheduled it. */
+/** All registered projects share one chunk-backfill budget per tick.
+ * The chunk-backfill budget stays below DREAM_TIMER_INTERVAL_MS so backlog draining cannot exceed its scheduling interval.
+ * */
 const CHUNK_BACKFILL_TICK_BUDGET_MS = 10 * 60 * 1000;
 
-/** One tick runs at a time: interval ticks are fire-and-forget, so without
- *  this guard a backlogged tick would overlap its successor and stack
- *  maintenance passes over the same projects. */
+/** tickInProgress prevents fire-and-forget interval ticks from overlapping backlogged ticks.
+ * */
 let tickInProgress = false;
 
 /**
- * Single tick body. Runs global message-history maintenance once, then
- * iterates every registered project for its per-directory work.
+ * Each tick runs global message-history maintenance once, then each registered project's per-directory work.
  */
 function runTick(origin: "startup" | "interval"): void {
     if (tickInProgress) {
         log(`[dreamer] timer tick (${origin}) skipped — previous tick still running`);
         return;
     }
-    // A startup wave's passes run on `startupQueue`, outside the tick that
-    // scheduled them, so `tickInProgress` is already clear while the wave
-    // drains — and one wave can outlast DREAM_TIMER_INTERVAL_MS, because it
-    // spends a whole CHUNK_BACKFILL_TICK_BUDGET_MS plus its memory and git
-    // drains. An interval pass drives the same provider and database, so it
-    // yields to the wave; periodic maintenance it skips is picked up by the
-    // next interval, whereas queueing it behind the wave builds a backlog.
+    // Startup passes run outside their scheduling tick, so an interval tick skips while a startup wave drains.
+    // An interval tick skips while a startup wave drains.
     if (origin === "interval" && startupQueueDepth > 0) {
         log(`[dreamer] timer tick (${origin}) skipped — startup wave still draining`);
         return;
@@ -305,10 +260,6 @@ function runTick(origin: "startup" | "interval"): void {
             const db = openTimerDatabaseOrNull("maintenance tick");
             if (!db) return;
             runMessageHistoryMaintenance(db);
-            // Per-project work — git commit indexing, dream schedule check,
-            // dream queue processing. We iterate all registered projects so
-            // Desktop's "open all projects at once" workflow indexes every one,
-            // not just whichever project happened to register the timer first.
             const chunkDeadlineAt = Date.now() + CHUNK_BACKFILL_TICK_BUDGET_MS;
             for (const reg of registeredProjects.values()) {
                 if (origin === "startup") {
@@ -318,9 +269,6 @@ function runTick(origin: "startup" | "interval"): void {
                 }
             }
             if (origin === "startup") return;
-            // Refresh planner stats once per tick (after per-project work).
-            // Self-gating: a no-op unless a table's row count drifted enough to
-            // warrant re-ANALYZE, and analysis_limit bounds any work it does.
             runSqliteOptimize(db);
         } catch (error) {
             log("[magic-context] timer-triggered maintenance check failed:", error);
@@ -360,26 +308,16 @@ function startupJitterMs(directory: string): number {
     return jitter;
 }
 
-/** Startup passes arrive on jittered per-project timers, so unlike the
- *  interval loop they do not run back to back on their own. Chaining them
- *  keeps one project's expensive drains off the shared provider and DB while
- *  another project is still draining, and lets every pass of one startup wave
- *  share a single chunk-backfill budget exactly as one interval tick does. */
+/** The startup queue serializes jittered passes to prevent concurrent draining of the shared provider and database.
+ * All startup passes in a wave share one chunk-backfill budget. */
 let startupQueue: Promise<void> = Promise.resolve();
 let startupQueueDepth = 0;
 let startupChunkDeadlineAt = 0;
 
 /**
- * True while `reg` is still the live registration for its directory. A
- * registration stops being live when its directory unregisters (the instance is
- * disposed) or re-registers with a fresh config, and a stale one carries a
- * disposed instance's `client`, progress sink, and module client.
+ * `reg` becomes stale when its directory unregisters or re-registers with new config; stale registrations retain disposed clients and sinks.
  *
- * Both ends of the startup queue consult this, because the queue is serialized:
- * an entry waits out every earlier project's drains — one shared
- * chunk-backfill budget plus each project's git backlog and smart-note drains
- * and its due dreamer tasks — so a wave can hold an entry far past the point
- * where its registration was replaced or removed.
+ * The enqueue and dequeue paths recheck registration liveness because queued work can outlive a registration.
  */
 function isLiveRegistration(reg: ProjectRegistration): boolean {
     return registeredProjects.get(reg.directory) === reg;
@@ -425,9 +363,8 @@ async function runProjectMaintenance(
     reg: ProjectRegistration,
     origin: "startup" | "interval",
     db: Database,
-    /** Shared chunk-backfill deadline for every project in one maintenance
-     *  wave: the interval loop runs them back to back, the startup queue
-     *  chains them, and both spend one budget. */
+    /** `chunkDeadlineAt` is shared by every project in an interval tick or startup wave.
+     * */
     chunkDeadlineAt: number,
 ): Promise<void> {
     const projectMaintenanceEnabled =
@@ -460,12 +397,7 @@ async function runProjectMaintenance(
 }
 
 /**
- * Run all per-project maintenance for one registration: git commit indexing
- * (when enabled) plus dream schedule check + queue processing (when enabled).
  *
- * Each registered project gets its own pass per tick — Desktop loads the
- * plugin once per project in the same process, and every project needs its
- * own commits indexed and its own dream schedule honored.
  */
 async function sweepProject(
     reg: ProjectRegistration,
@@ -473,13 +405,9 @@ async function sweepProject(
     db: Database,
     gitCommitEnabled?: boolean,
 ): Promise<void> {
-    // Dead-directory guard: a registration whose directory no longer exists
-    // (e.g. a finalized mason worktree) can't have meaningful dreamer work —
-    // git indexing + key-files/verify would ENOENT reading from the gone path.
-    // Skip it and unregister so it stops being swept. For a `dir:` identity
-    // (path-unique → truly orphaned once the path is gone) also GC its schedule
-    // rows; a `git:` identity is SHARED across worktrees/clones, so a single dead
-    // worktree must NOT delete the shared project's schedule.
+    // Git indexing and key-file verification would receive ENOENT when reading the removed directory.
+    // A `dir:` identity is path-unique, so a missing directory leaves its schedule rows orphaned.
+    // A `git:` identity is shared across worktrees and clones, so one dead worktree must not delete the shared project's schedule.
     if (!directoryStillExists(reg.directory)) {
         log(
             `[dreamer] project directory no longer exists (${reg.projectIdentity}); skipping + unregistering`,
@@ -512,11 +440,8 @@ async function sweepProject(
         );
     }
 
-    // Primer re-embedding lives on this always-reachable sweep, not only in the
-    // promote-primers dream task: primer SEARCH stays enabled when dreamer
-    // scheduling is disabled, and search skips vectors whose model id differs
-    // from the query's, so a provider-identity change would otherwise leave
-    // those projects without semantic primer retrieval indefinitely.
+    // Re-embed primers during this sweep because primer search remains enabled when Dreamer scheduling is disabled.
+    // A provider-identity change would otherwise prevent semantic primer retrieval indefinitely.
     try {
         const reembedded = await reembedStalePrimerEmbeddings(db, reg.projectIdentity);
         if (reembedded > 0) {
@@ -546,25 +471,18 @@ async function sweepProject(
     try {
         await runCompiledSmartNoteSweep(reg, db);
 
-        // Dreamer v2: per-task cron scheduling. The scheduler seeds/reads
-        // task_schedule_state, evaluates each task's cron + activity gate, and
-        // runs due tasks grouped by conflict-domain under keyed leases. The
-        // executor runs in THIS registration's own checkout (not a sibling
-        // worktree the shared git:<sha> identity might resolve to).
+        // The scheduler runs due tasks grouped by conflict domain under keyed leases.
+        // The executor uses this registration's checkout, not another worktree that shares its `git:<sha>` identity.
         const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreamerConfig, reg.language);
         const executor = createDreamTaskExecutor({
             client: reg.client,
             sessionDirectory: reg.directory,
             openOpenCodeDb,
-            // Each registration brings its own provider factory (Pi supplies the
-            // JSONL provider); default to OpenCode when none is given.
+            // Pi registrations supply a JSONL provider factory; the executor uses OpenCode when `reg.retrospectiveRawProvider` is nullish.
             retrospectiveRawProvider:
                 reg.retrospectiveRawProvider ??
                 ((db) => new OpenCodeRetrospectiveRawProvider({ contextDb: db, openOpenCodeDb })),
-            // Pi-only: scheduled refresh-primers needs the JSONL factory to render
-            // the open-book seed. OpenCode omits it (buildPrimerSeed reads
-            // opencode.db directly). Without this the scheduled Pi task ran
-            // closed-book, defeating the open-book primer redesign.
+            // Pi scheduled `refresh-primers` tasks require the JSONL factory to read prior messages.
             primerRawProviderFactory: reg.primerRawProviderFactory,
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
             ensureProjectRegistered: reg.ensureRegistered,
@@ -588,10 +506,8 @@ async function sweepProject(
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
         }
 
-        // PRIVACY backstop: remove crash-orphaned children carrying raw user or
-        // project text only after the longest swept task's timeout has elapsed.
-        // OpenCode-only (Pi subprocess children die with their process); skip
-        // when no opencode.db.
+        // The cleanup removes crash-orphaned children carrying raw user or project text only after the longest swept task's timeout elapses.
+        // Only OpenCode needs orphan cleanup because Pi subprocess children die with their process.
         const privacySweepTimeouts = runtimeConfigs
             .filter((c) => (PRIVACY_SENSITIVE_CHILD_TASKS as readonly string[]).includes(c.task))
             .map((c) => c.timeoutMinutes);
@@ -622,19 +538,12 @@ async function sweepProject(
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
     const bridge = findModuleNoteEvaluationBridgeForDrain(reg.projectIdentity, reg.directory);
     if (bridge) {
-        // Deliberately NOT gated on bridge.available(): drain is the path that
-        // re-registers a dropped evaluator, so gating it on availability would
-        // make a failed boot registration or a module restart permanently
-        // unrecoverable for this process. The bridge itself suppresses local
-        // claims and publishes wake ownership when the wake plane is present.
+        // Do not gate drain on `bridge.available()`: drain re-registers a dropped evaluator.
+        // Gating drain on `bridge.available()` would make failed boot registration or module restart unrecoverable for this process.
+        // The bridge suppresses local claims and publishes wake ownership when the wake plane is present.
         //
-        // Sandbox-only: this per-tick sweep mirrors the legacy due-check
-        // cadence (cheap QuickJS runs) plus registration recovery. Billable
-        // compile and fallback claims belong to the cron-scheduled
-        // evaluate-smart-notes task, which drains with the full budgets.
-        // exclude_billable filters the authority's selection; the zero
-        // budgets are the client-side guard for replayed or slot-recovered
-        // claims, which bypass selection and are released instead of
+        // The cron-scheduled `evaluate-smart-notes` task drains compile and fallback claims with full budgets.
+        // Zero budgets release replayed or slot-recovered claims that bypass authority selection.
         // executed.
         const result = await bridge.drain({
             deadline: Date.now() + 60_000,
@@ -649,10 +558,7 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
         }
         return;
     }
-    // No bridge with module-managed notes (dreamer or the task schedule is
-    // disabled): the legacy sweep below writes context.db, which the
-    // authority guard triggers reject, and the thrown abort would skip every
-    // other due Dreamer task for this project.
+    // When a module-managed project has no bridge, return before the legacy sweep writes `context.db`; the authority guard rejects that write and aborts other due Dreamer tasks.
     if (getAuthorityManagedMarker(db, reg.projectIdentity)) return;
     const leaseKey = leaseKeyFor("evaluate-smart-notes", reg.projectIdentity);
     const holderId = crypto.randomUUID();
@@ -675,11 +581,7 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
 }
 
 /**
- * Index commits for the current project and drain embeddings. Runs in the
- * background under the timer's fire-and-forget contract.
  *
- * Project identity resolution happens inside the indexer so we always read
- * the same `git:<sha>` identity used by memories and ctx_search.
  */
 function startGitSweepLeaseRenewal(
     db: Database,
@@ -730,14 +632,13 @@ async function sweepGitCommits(args: {
             maxCommits: gitCommitIndexing.max_commits,
         });
         if (result.nonIndexable) {
-            // Not a repo / repo with no commits: park on the long re-probe
-            // cooldown so the timer doesn't retry (and log) every tick.
+            // The re-probe cooldown prevents retries and logs on every timer tick.
             if (!parkGitSweepNonIndexable(db, projectIdentity, holderId)) {
                 releaseGitSweepLease(db, projectIdentity, holderId);
             }
             return;
         }
-        // Drain any remaining embedding backlog from this sweep (indexer caps per run).
+        // The indexer caps each run, so the sweep drains the remaining embedding backlog.
         let drainedEmbeddings = 0;
         if (result.embedded > 0) {
             drainedEmbeddings = await embedUnembeddedCommits(db, projectIdentity);

@@ -82,10 +82,10 @@ export class OmpAdapter implements HarnessAdapter {
             (plugin) => plugin.name === OMP_PLUGIN_PACKAGE && plugin.enabled,
         );
         if (!enabledAfter) {
-            // A project override can keep the plugin disabled even when the
-            // global install/enable command exits 0. New installs are removed.
-            // Existing installs restore the exact lockfile enable state; never
-            // infer global state from the project-effective plugin list.
+            // A project override can keep the plugin disabled despite a zero exit status.
+            // Recovery uninstalls a newly installed plugin that remains disabled.
+            // Existing installs restore the prior runtime enable state when it is known.
+            // The recovery path must not infer global state from the project-effective plugin list.
             if (!installed) {
                 runOmpCommand(omp.path, ["plugin", "uninstall", OMP_PLUGIN_PACKAGE], 120_000);
             } else if (originalRuntimeEnabled !== undefined) {
@@ -156,8 +156,6 @@ export class OmpAdapter implements HarnessAdapter {
     }
 
     getLogPath(): string {
-        // OMP executes the Pi-compatible runtime, which intentionally keeps the
-        // existing `pi` DB/log discriminator for cross-host session semantics.
         return getMagicContextLogPath("pi");
     }
 

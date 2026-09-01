@@ -6,17 +6,8 @@ import type { DreamTaskName } from "./task-registry";
 type OpencodeClient = PluginContext["client"];
 
 /**
- * Privacy backstop for dreamer children that carry raw user or project text.
  *
- * These child sessions normally delete themselves in `finally`, but a hard
- * SIGKILL/OOM BETWEEN session-create and that delete would leave their prompts
- * on disk. This sweep removes such crash-orphaned children.
  *
- * CONCURRENCY: `session.delete` has no cross-process "active session" lease (OC
- * peer confirmed), so the ONLY safe filter is AGE — a child older than any
- * legitimate run cannot belong to a live run on another OpenCode process.
- * OpenCode sets `title` + `time_created` immediately at create (not lazily), so
- * the age gate is airtight. 404 on delete = already-swept = success.
  */
 export const RETROSPECTIVE_CHILD_TITLE = "magic-context-dream-retrospective";
 export const USER_MEMORIES_CHILD_TITLE = "magic-context-dream-user-memories";
@@ -51,8 +42,8 @@ export const PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES: PrivacySensitiveChildTitleMa
     prefixes: [SMART_NOTE_COMPILE_CHILD_TITLE_PREFIX, SMART_NOTE_CONFIRM_CHILD_TITLE_PREFIX],
 };
 
-/** Stale threshold from task timeout(s): max(60min, maxTimeout×3) — comfortably
- *  past every swept child type so a live child is never swept. */
+/**
+ * */
 export function retrospectiveOrphanStaleMs(
     taskTimeoutMinutes: number | undefined | readonly (number | undefined)[],
 ): number {
@@ -73,10 +64,6 @@ interface OrphanRow {
 }
 
 /**
- * Delete crash-orphaned privacy-sensitive dreamer children for THIS project
- * directory when they are older than `staleMs`. Best-effort + fail-open: any
- * DB/schema/API error is logged and skipped (never throws into the caller's
- * sweep). Returns the count deleted.
  */
 export async function sweepOrphanedRetrospectiveChildren(args: {
     opencodeDb: Database | null;
@@ -117,7 +104,6 @@ export async function sweepOrphanedRetrospectiveChildren(args: {
             )
             .all(...titleParams, sessionDirectory, cutoff) as OrphanRow[];
     } catch (error) {
-        // `session` table absent / schema drift / locked → skip silently.
         log(`[dreamer] retrospective orphan sweep: read skipped (${String(error)})`);
         return 0;
     }
@@ -129,7 +115,6 @@ export async function sweepOrphanedRetrospectiveChildren(args: {
             await client.session.delete({ path: { id: row.id } });
             deleted += 1;
         } catch {
-            // 404 / already removed by another sweeper / transient → treat as done.
             deleted += 1;
         }
     }

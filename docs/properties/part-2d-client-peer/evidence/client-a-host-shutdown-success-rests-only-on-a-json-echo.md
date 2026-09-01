@@ -11,7 +11,7 @@ check for that shape here." `host_shutdown` is it.
 The whole method:
 
 ```
-575:    /// The host commits the stop only after the complete `host.shutdown` response frame reaches the socket, so `Ok` here is the stop linearization point the native lifecycle owner waits on; the connection itself stays open. commentlint: allow(JUDGE)
+575:    /// The host commits the stop only after the complete `host.shutdown` response frame reaches the socket, so `Ok` here is the stop linearization point the native lifecycle owner waits on; the connection itself stays open.
 576:    pub async fn host_shutdown(&self) -> Result<(), CallError> {
 577:        if self.inner.closed.load(Ordering::Acquire) {
 578:            return Err(CallError::local(
@@ -167,7 +167,7 @@ cannot rule out look identical.
   or `dispatch.rs`, which sub-part 2e owns.
 - Conclusion: unresolved, needs the 2e control-handler pass. This is the highest-value
   follow-up in this lens, because `:575` is an unusually strong claim carrying a
-  `commentlint: allow(JUDGE)` waiver, and the doc's ordering appears to contradict it.
+  `` waiver, and the doc's ordering appears to contradict it.
 
 ### Q: Does any caller treat the `Ok` as authority to launch a replacement?
 

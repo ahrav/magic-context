@@ -1,6 +1,3 @@
-//! Wire-level conformance for the four Synapse operations over a real
-//! authenticated route, using the deterministic test engine.
-
 mod support;
 
 use support::synapse::{
@@ -43,9 +40,7 @@ async fn yield_until(predicate: impl Fn() -> bool) {
     panic!("condition did not become true");
 }
 
-/// Limits admitting `max_waiting_queries` waiters. Waiting queries and the
-/// queued-batch budget share one scratch pool; the default 64 MiB queued
-/// budget leaves no waiter headroom, so it is shrunk to 8 MiB.
+/// Waiting queries and queued batches share a scratch pool, so 64 MiB leaves no waiter headroom; use 8 MiB.
 fn waiter_limits(max_waiting_queries: usize) -> SynapseLimits {
     SynapseLimits {
         max_waiting_queries,
@@ -82,14 +77,7 @@ async fn bounded_query_waiters_are_fifo_and_reject_bound_plus_one() {
 
     let first = spawn_query(&host, &lane, "first", 30_000).await;
     yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
-    // Each waiter travels its own connection, so admission order follows when
-    // its task reaches the socket rather than the spawn order here. A waiter
-    // blocks before the engine, so `engine.calls` cannot witness its arrival
-    // and there is nothing for `yield_until` to observe; a single yield is one
-    // scheduler turn, which need not carry a spawn through write, dispatch,
-    // and semaphore acquisition. Draining the queue the way the rest of this
-    // suite does keeps the FIFO assertion below from depending on how many
-    // await points that path happens to contain.
+    // Each waiter uses a separate connection, so spawn order does not determine admission order.
     let second = spawn_query(&host, &lane, "second", 30_000).await;
     for _ in 0..100 {
         tokio::task::yield_now().await;
@@ -168,9 +156,6 @@ async fn expired_waiter_releases_its_slot_without_engine_work() {
         .expect("expired query terminal")
         .1;
     assert_eq!(expired_terminal.error_code(), "timeout");
-    // The queued-waiter arm (the worker's deadline while waiting for the
-    // CPU permit) and the awaiting-result arm carry distinct messages; a
-    // waiter that never started must report the queued expiry.
     assert_eq!(
         expired_terminal.json()["message"],
         "the query deadline expired while queued"
@@ -314,13 +299,6 @@ async fn shutdown_cancels_waiters_but_drains_started_query() {
         .expect("waiting query terminal")
         .1;
     assert_eq!(waiting_terminal.error_code(), "cancelled");
-    // Two producers emit `cancelled`: route settlement's generation cancel
-    // ("request cancelled") and the component's own shutdown arm ("the host
-    // is shutting down"). Host shutdown settles routes — cancelling admitted
-    // work — before the composite's shutdown callback cancels the synapse
-    // closing token, so the dispatcher's message is the one a client
-    // observes; pinning it keeps this test honest about which producer
-    // cancelled the waiter.
     assert_eq!(waiting_terminal.json()["message"], "request cancelled");
     assert_eq!(
         *engine.call_texts.lock().expect("call text lock"),
@@ -360,12 +338,6 @@ async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
     )
     .await
     .expect("send queued query");
-    // Positive occupancy proof: with two permits (one running, one waiter),
-    // a third query rejecting `queue_full` proves the lost query was
-    // admitted and holds the waiter slot — without it, a scheduling race
-    // could kill the route before admission and pass this test vacuously.
-    // (An admitted probe would park behind the gated engine, so a vacuous
-    // run now fails loudly instead of passing.)
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
@@ -402,23 +374,18 @@ async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
     clock_task.await.expect("clock keeper task");
 }
 
-/// The startup scratch formula's promise holds at runtime: at the largest
-/// feasible `max_waiting_queries` for these limits, boundary+1 concurrent
-/// queries each carrying a maximal text are all admitted — none is rejected
-/// `queue_full` by resident accounting — and each returns a response.
+/// Resident accounting rejects the bound-plus-one request with `queue_full`.
 #[tokio::test(start_paused = true)]
 async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
-    // The feasible boundary under the startup scratch formula, pinned so a
-    // formula or pool change must recompute it deliberately:
-    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
-    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
-    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
-    //   queued text bytes = max_queued_request_bytes          =   8,388,608
-    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
-    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
-    //   K + 1 <= (182,519,040 - 113,037,312) / 2,097,408 = 33.13 -> K = 32
+    // `BOUNDARY` is the largest feasible value under the startup scratch formula.
+    // Formula or pool changes require recomputing `BOUNDARY`.
+    // Each waiter slot reserves 2,097,408 bytes: twice `max_text_bytes` plus 256.
+    // Queued text reserves `max_queued_request_bytes` (8,388,608 bytes).
+    // Queued metadata reserves 3,940,352 bytes for 64 jobs.
+    // Worst-case parsing reserves 100,708,352 bytes.
+    // `BOUNDARY` is 32 because at most 33 waiter charges fit in the reservable pool.
     const BOUNDARY: usize = 32;
     mc_host::synapse::SynapseComponent::ready_with_engine(
         test_lane(),
@@ -450,8 +417,7 @@ async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
         waiters.push(spawn_query(&host, &lane, &text, 30_000).await);
         tokio::task::yield_now().await;
     }
-    // Every waiter holds its decoded maximal text while the engine gate is
-    // closed, so all boundary+1 charges coexist in the scratch pool here.
+    // Each waiter retains its decoded maximal text while the closed engine gate makes all boundary+1 charges coexist in the scratch pool.
     for _ in 0..1_000 {
         tokio::task::yield_now().await;
     }
@@ -523,7 +489,7 @@ async fn models_list_returns_exactly_the_certified_entry() {
     assert_eq!(models[0]["status"], "ready");
     assert_eq!(models[0]["recommended_batch"]["rows"], 16);
     assert_eq!(models[0]["recommended_batch"]["token_budget"], 8192);
-    // No legacy aliases: the canonical schema owns the response.
+    // The response accepts no legacy aliases.
     assert!(body["result"].get("entries").is_none());
     assert!(models[0].get("model_id").is_none());
 
@@ -721,7 +687,7 @@ async fn embed_query_rejects_every_constraint_violation() {
     let frame = call(&mut client, channel, epoch, "embed.query", params).await;
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // Unsupported methods and malformed envelopes.
+    // The server rejects unsupported methods and malformed envelopes.
     let frame = call(
         &mut client,
         channel,
@@ -817,7 +783,7 @@ async fn embed_batch_always_returns_a_job_descriptor() {
 #[tokio::test]
 async fn batch_result_over_retention_cap_is_rejected_before_inference() {
     let engine = DeterministicEngine::new();
-    // Eight f32 components, one ID byte, and one 64-byte content hash.
+    // Each encoded record contains eight `f32` components, one ID byte, and one 64-byte content hash.
     let limits = SynapseLimits {
         max_retained_result_bytes: 8 * 4 + 1 + 64,
         ..SynapseLimits::default()
@@ -852,20 +818,20 @@ async fn embed_batch_validation_creates_no_job_and_no_inference() {
     let (channel, epoch) = open_synapse_route(&mut client).await;
     let lane = test_lane();
 
-    // Wrong supplied content hash.
+    // The server rejects a supplied content hash that differs from the hash computed from the content.
     let page = items(&[("item:0", "text")]);
     let mut params = batch_params(&lane, &page);
     params["items"][0]["content_sha256"] = sha256_hex("other text").into();
     let frame = call(&mut client, channel, epoch, "embed.batch", params).await;
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // Wrong supplied request key.
+    // The server rejects an invalid supplied request key.
     let mut params = batch_params(&lane, &page);
     params["request_key"] = sha256_hex("not the canonical key").into();
     let frame = call(&mut client, channel, epoch, "embed.batch", params).await;
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // Duplicate item IDs.
+    // The server rejects duplicate item IDs.
     let page = items(&[("dup", "a"), ("dup", "b")]);
     let frame = call(
         &mut client,
@@ -877,7 +843,7 @@ async fn embed_batch_validation_creates_no_job_and_no_inference() {
     .await;
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // One item past the count bound.
+    // The server rejects batches with more items than the count bound.
     let page = items(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5")]);
     let frame = call(
         &mut client,
@@ -889,7 +855,7 @@ async fn embed_batch_validation_creates_no_job_and_no_inference() {
     .await;
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // One item over the per-text bound.
+    // The server rejects text that exceeds the per-text bound.
     let long = "x".repeat(33);
     let page = items(&[("a", long.as_str())]);
     let frame = call(
@@ -902,7 +868,7 @@ async fn embed_batch_validation_creates_no_job_and_no_inference() {
     .await;
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // Aggregate text over the batch bound.
+    // The server rejects batches whose aggregate text exceeds the batch bound.
     let chunk = "y".repeat(32);
     let page = items(&[("a", chunk.as_str()), ("b", chunk.as_str()), ("c", "z")]);
     let frame = call(
@@ -971,7 +937,7 @@ async fn equal_replays_reuse_one_job_and_one_inference() {
     let page = items(&[("item:0", "replay me")]);
     let params = batch_params(&lane, &page);
 
-    // Replay while queued or running.
+    // Replays received while a job is queued or running do not rerun the job.
     let first = call(&mut client, channel, epoch, "embed.batch", params.clone()).await;
     let job_id = first.json()["result"]["job_id"]
         .as_str()
@@ -980,7 +946,7 @@ async fn equal_replays_reuse_one_job_and_one_inference() {
     let second = call(&mut client, channel, epoch, "embed.batch", params.clone()).await;
     assert_eq!(second.json()["result"]["job_id"], job_id.as_str());
 
-    // Replay after completion.
+    // Replays after completion return the completed result without rerunning the job.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let third = call(&mut client, channel, epoch, "embed.batch", params.clone()).await;
     assert_eq!(third.json()["result"]["job_id"], job_id.as_str());
@@ -992,8 +958,7 @@ async fn equal_replays_reuse_one_job_and_one_inference() {
         "equal replays run inference exactly once"
     );
 
-    // The retained key resent with any payload difference (order, IDs,
-    // texts, hashes) is a permanent conflict and never reruns the job.
+    // Resending a retained key with changed order, IDs, texts, or hashes creates a permanent conflict and never reruns the job.
     for other in [
         items(&[("item:0", "different text")]),
         items(&[("item:1", "replay me")]),
@@ -1059,7 +1024,6 @@ async fn result_pages_preserve_order_and_cursor_discipline() {
         params
     };
 
-    // Wait for readiness.
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let frame = call(
@@ -1117,8 +1081,7 @@ async fn result_pages_preserve_order_and_cursor_discipline() {
         assert_eq!(frame.error_code(), "schema_violation");
     }
 
-    // Re-reading a previously issued page boundary is allowed (a lost
-    // response is retried with the same cursor).
+    // Re-reading a previously issued page boundary is allowed when a lost response is retried with the same cursor.
     let frame = call(
         &mut client,
         channel,
@@ -1208,11 +1171,11 @@ async fn maximum_page_with_escaped_ids_fits_its_output_reservation() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The manifest bounds the model name at 128 bytes and constrains no
-/// character within them, so a name of control characters serializes to six
-/// bytes each. The reservation holds the serialized body, so it charges the
-/// escaped length; charging the source bytes undercounts by 640 and the
-/// buffer runs out mid-serialization.
+/// The manifest permits any 128-byte model name.
+/// Control characters in model names serialize as six-byte JSON escapes.
+/// The reservation charges the serialized body length.
+/// Charging source bytes undercounts the reservation by 640 bytes.
+/// Control-character escapes add 640 bytes to the serialized model name.
 #[test]
 fn a_model_name_needing_escapes_fits_its_output_reservation() {
     let engine = DeterministicEngine::new();
@@ -1290,11 +1253,7 @@ async fn wrong_request_key_for_a_live_job_is_a_schema_violation() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// An out-of-envelope top-level field can carry an array of arbitrarily many
-/// two-byte elements. A `serde_json::Value` node costs 32 bytes, so admitting
-/// the field and materializing its value spends an order of magnitude more
-/// transient memory than the body the ingress charge covers. Refusing the
-/// field at its key leaves the array unread.
+/// Rejecting an unknown field before its value leaves the value unread.
 #[test]
 fn an_unknown_top_level_field_is_rejected_without_reading_its_value() {
     let lane = test_lane();
@@ -1317,17 +1276,16 @@ fn an_unknown_top_level_field_is_rejected_without_reading_its_value() {
         .expect_err("a field outside the request envelope is refused");
     assert_eq!(error.code, "schema_violation");
 
-    // The identical request without that field still parses, so the rejection
-    // is the unknown field and not the request shape.
+    // The parser rejects an unknown field before validating the remaining request.
     let accepted =
         protocol::parse_request_unreserved(br#"{"method":"models.list"}"#, false, &lane, &limits)
             .expect("the envelope without out-of-schema fields is accepted");
     assert_eq!(accepted, protocol::Request::ModelsList);
 }
 
-/// A routed request nested nine levels deep — with `params` preceding
-/// `method` and delimiters hidden inside strings — is refused at the depth
-/// preflight, while string content never counts toward depth.
+/// Requests nested nine levels deep reach the depth preflight.
+/// The depth preflight rejects requests with `params` before `method` and delimiters in strings.
+/// String content never counts toward depth.
 #[tokio::test]
 async fn a_routed_depth_nine_request_is_a_schema_violation() {
     let engine = DeterministicEngine::new();
@@ -1356,8 +1314,7 @@ async fn a_routed_depth_nine_request_is_a_schema_violation() {
         .expect("terminal");
     assert_eq!(frame.error_code(), "schema_violation");
 
-    // The same structural characters inside a string are payload, not depth:
-    // an equivalent query with a delimiter-heavy text still embeds.
+    // String content never counts toward depth.
     let mut params = constraints(&lane);
     params["text"] = "}}}}}}}}{{{{[[[[]]]]".into();
     let frame = call(&mut client, channel, epoch, "embed.query", params).await;
@@ -1371,14 +1328,12 @@ async fn a_routed_depth_nine_request_is_a_schema_violation() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A configuration advertising a request whose parse reservation exceeds the
-/// fixed scratch ceiling is rejected before the ready-engine seam publishes.
+/// Configurations whose parse reservation exceeds the scratch ceiling are rejected before publication.
 #[tokio::test]
 async fn a_body_above_resident_capacity_is_a_permanent_size_violation() {
     let engine = DeterministicEngine::new();
     let limits = SynapseLimits {
-        // Inflating the per-item term pushes the maximal advertised body's
-        // reservation past the fixed scratch pool.
+        // Inflating the per-item term can exceed the fixed scratch pool.
         max_batch_items: 10_000_000,
         max_text_bytes: 30 * 1024 * 1024,
         max_batch_text_bytes: 30 * 1024 * 1024,

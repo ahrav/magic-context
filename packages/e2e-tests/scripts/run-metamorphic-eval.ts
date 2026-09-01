@@ -159,7 +159,7 @@ export function stagingReportPath(destination: string): string {
 function writeReportFile(destination: string, report: MetamorphicReport): void {
     mkdirSync(dirname(destination), { recursive: true });
     const staging = stagingReportPath(destination);
-    /** lstat, not existsSync: writeFileSync would follow a symlink here and overwrite its target, then renameSync would publish the link. commentlint: allow(JUDGE) */
+    /** lstat, not existsSync: writeFileSync would follow a symlink here and overwrite its target, then renameSync would publish the link. */
     const occupant = lstatSync(staging, { throwIfNoEntry: false });
     if (occupant !== undefined) {
         if (!occupant.isFile() && !occupant.isSymbolicLink()) {
@@ -177,11 +177,11 @@ function writeReportFile(destination: string, report: MetamorphicReport): void {
 }
 
 export function partialReportPath(destination: string): string {
-    /** Appended rather than substituted for `.json`, because substituting maps `foo` and `foo.json` onto one partial. commentlint: allow(JUDGE) */
+    /** Appended rather than substituted for `.json`, because substituting maps `foo` and `foo.json` onto one partial. */
     return `${destination}.partial.json`;
 }
 
-/** Walks to the nearest existing ancestor and realpaths it, because a lexical resolve treats a symlinked corpus and its target as unrelated. commentlint: allow(JUDGE) */
+/** Walks to the nearest existing ancestor and realpaths it, because a lexical resolve treats a symlinked corpus and its target as unrelated. */
 function canonicalPath(path: string): string {
     const absolute = resolve(path);
     let existing = absolute;
@@ -204,13 +204,13 @@ function removeRegularFile(path: string): void {
     if (existsSync(path) && lstatSync(path).isFile()) rmSync(path);
 }
 
-/** Every path the runner itself writes, so preflight covers the staging files that publication touches only at the very end. commentlint: allow(JUDGE) */
+/** Every path the runner itself writes, so preflight covers the staging files that publication touches only at the very end. */
 function reportDestinations(reportPath: string): string[] {
     const partialPath = partialReportPath(reportPath);
     return [reportPath, stagingReportPath(reportPath), partialPath, stagingReportPath(partialPath)];
 }
 
-/** Suffixes the runner derives for its own auxiliary files and unlinks during preflight. commentlint: allow(JUDGE) */
+/** Suffixes the runner derives for its own auxiliary files and unlinks during preflight. */
 const RESERVED_REPORT_SUFFIXES = [".tmp", ".partial.json"] as const;
 
 function requireOwnableReportPath(reportPath: string): void {
@@ -223,7 +223,7 @@ function requireOwnableReportPath(reportPath: string): void {
     }
 }
 
-/** Resolves each corpus entry, because a scenario symlink can target a path the directory-level containment check does not cover. commentlint: allow(JUDGE) */
+/** Resolves each corpus entry, because a scenario symlink can target a path the directory-level containment check does not cover. */
 function corpusFileTargets(corpusDirectory: string): Set<string> {
     if (!existsSync(corpusDirectory)) return new Set();
     try {
@@ -248,7 +248,7 @@ function requireReplaceableReportPath(label: string, path: string): void {
     }
 }
 
-/** The namespace is a directory every live run reuses, so it takes a directory rule rather than the report-file shape check. commentlint: allow(JUDGE) */
+/** The namespace is a directory every live run reuses, so it takes a directory rule rather than the report-file shape check. */
 function requireUsableArtifactNamespace(path: string): void {
     const occupant = lstatSync(path, { throwIfNoEntry: false });
     if (occupant === undefined) return;
@@ -294,7 +294,7 @@ export function prepareLiveOutputPaths(
     }
     validateReportDestinations(label, reportPath, corpusDirectory, [...outputs, artifactNamespace], outputs);
     requireUsableArtifactNamespace(artifactNamespace);
-    /** The control run creates the namespace as a directory, so renameSync could never publish a report that lives inside it. commentlint: allow(JUDGE) */
+    /** The control run creates the namespace as a directory, so renameSync could never publish a report that lives inside it. */
     if (outputs.some((path) => containsPath(artifactNamespace, path))) {
         throw new Error(`live report paths must stay outside the artifact namespace: ${artifactNamespace}`);
     }
@@ -426,7 +426,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
      */
     const startedAtMs = Date.now();
     const parsed = parseArgs(args);
-    /** Output preflight precedes corpus loading and selection, whose throws would otherwise leave a previous green report at the destination. commentlint: allow(JUDGE) */
+    /** Output preflight precedes corpus loading and selection, whose throws would otherwise leave a previous green report at the destination. */
     if (!parsed.live) {
         prepareDeterministicOutputPaths(parsed.reportPath, parsed.corpusDirectory);
         const deterministicCorpus = loadCorpus(parsed.corpusDirectory);
@@ -445,7 +445,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
     const prepared = prepareLivePreamble(corpus);
     if (prepared === null) return 1;
     const roleBudgetMs = liveRoleBudgetMs(selected.scenarios, prepared.mode);
-    /** Inclusive, matching the runner's own gate, so a deadline it would refuse never reaches paid setup. commentlint: allow(JUDGE) */
+    /** Inclusive, matching the runner's own gate, so a deadline it would refuse never reaches paid setup. */
     if (parsed.deadlineMinutes !== null && parsed.deadlineMinutes * 60_000 <= roleBudgetMs) {
         console.error(
             `--deadline-minutes ${parsed.deadlineMinutes} does not exceed one role's budget of ${Math.ceil(roleBudgetMs / 60_000)} minutes; no scenario role could start`,

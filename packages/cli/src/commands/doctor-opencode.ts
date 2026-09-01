@@ -66,21 +66,12 @@ import { clearPluginCache } from "./doctor-opencode-cache";
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
 
 /**
- * Resolve the MC compaction mode for the doctor using the SAME loader the
- * plugin uses and the SAME accessor. On load failure the helper takes the
- * preserve-existing-native-fields branch: it returns `false` so doctor never
- * repairs native compaction fields when it cannot read the MC config, and
- * emits a diagnostic. This is distinct from the boot/TUI path, which fails
- * toward mode-on when it cannot supply the resolved value.
  */
 function resolveCompactionEnabledForDoctor(): boolean {
     try {
         const config = loadPluginConfig(process.cwd());
         return isCompactionEnabled(config);
     } catch (error) {
-        // Preserve-existing-native-fields: do not assume either mode. Doctor
-        // reports the load failure and treats native compaction fields as
-        // off-limits for repair (same as compaction-off mode).
         console.warn(
             `[magic-context] Could not load Magic Context config to resolve compaction mode; ` +
                 `preserving existing native compaction fields. ` +
@@ -151,11 +142,7 @@ export function migrateLegacyAgentEnabledConfigForDoctor(
 }
 
 /**
- * Check whether the `review-user-memories` dreamer task is scheduled while the
- * dreamer itself is disabled, a no-op combination where candidate promotions
- * will never run. In v2, user-memory collection is gated by the task schedule
- * (non-empty = enabled), replacing the v1 `dreamer.user_memories` block.
- * Returns the warning message when the combination is wrong, or null otherwise.
+ * A non-empty `dreamer.tasks["review-user-memories"].schedule` conflicts with `dreamer.disable=true`; disabled Dreamer prevents new promotions.
  */
 export function checkUserMemoriesDreamerCompatibility(
     mcConfig: Record<string, unknown>,
@@ -170,8 +157,6 @@ export function checkUserMemoriesDreamerCompatibility(
 }
 
 /**
- * Fetch the latest version of an npm package from the registry. Returns null
- * on any error so the doctor can report "check unavailable" rather than fail.
  */
 async function fetchNpmLatest(pkg: string, timeoutMs = 5000): Promise<string | null> {
     try {
@@ -193,7 +178,7 @@ async function fetchNpmLatest(pkg: string, timeoutMs = 5000): Promise<string | n
     }
 }
 
-/** Self-version with src/dist layout fallback. */
+/* */
 function getSelfVersion(): string {
     const req = createRequire(import.meta.url);
     for (const relPath of ["../../package.json", "../package.json"]) {
@@ -235,13 +220,11 @@ export function collectNpmReleaseAgeWarnings(): string[] {
                 );
             }
         }
-    } catch {
-        // Can't read .npmrc — skip.
-    }
+    } catch {}
     return ageWarnings;
 }
 
-/** Compare semver-like strings. Returns -1 if a<b, 0 if equal, 1 if a>b. */
+/* */
 function compareVersions(a: string, b: string): number {
     const pa = a.split(/[.-]/).map((s) => Number.parseInt(s, 10));
     const pb = b.split(/[.-]/).map((s) => Number.parseInt(s, 10));
@@ -255,8 +238,6 @@ function compareVersions(a: string, b: string): number {
     }
     return 0;
 }
-
-// ── Issue flow ──────────────────────────────────────────────────────
 
 function isGhInstalled(): boolean {
     try {
@@ -303,10 +284,6 @@ async function runIssueFlow(): Promise<number> {
         const report = await collectDiagnostics();
         s.stop("Diagnostics collected");
 
-        // Ask the user which session this issue relates to. Only show the
-        // picker when there's more than one recent session — otherwise the
-        // single-session case is unambiguous, and the no-session case
-        // (Node-only run without bun:sqlite) skips filtering entirely.
         let sessionFilter: string | null = null;
         if (report.recentSessions.length > 1) {
             const choice = await selectOne(
@@ -380,29 +357,9 @@ async function runIssueFlow(): Promise<number> {
     }
 }
 
-// ── Embedding configuration check ───────────────────────────────────
-
 /**
- * Validate the user's embedding configuration by probing the configured
- * endpoint. Runs only for `openai-compatible` providers — `local` needs no
- * network check and `off` degrades cleanly by design.
  *
- * Known footguns we surface specifically:
- *   - `{env:VAR}` in api_key when VAR is not exported → auth will fail with
- *     a literal `Bearer {env:VAR}` header.
- *   - Endpoint pointing at a specific route (e.g. `.../chat/completions`)
- *     rather than the provider base (e.g. `.../v1`) — gets detected by the
- *     real probe returning 404/405.
- *   - Provider that accepts the URL shape but doesn't implement embeddings
- *     (OpenRouter's /v1 for example) — same detection path.
  */
-// Local embeddings need the native ONNX runtime (onnxruntime-node). On Windows
-// it sometimes fails to install (its native binary download is interrupted), and
-// the plugin's static `import "onnxruntime-node"` then throws on every embedding
-// (#128). Surface it here with the fix instead of leaving users with the cryptic
-// resolver error in the log. Shared by the explicit-`local` branch AND the
-// no-config / default-provider path (local is the default, so a missing config
-// still means local embeddings).
 function checkLocalEmbeddingRuntimeForDoctor(activeModel = DEFAULT_LOCAL_EMBEDDING_MODEL): {
     issues: number;
     localRuntimeBroken?: boolean;
@@ -425,9 +382,6 @@ async function checkEmbeddingConfig(
     magicContextConfigPath: string,
 ): Promise<{ issues: number; localRuntimeBroken?: boolean; unverified?: boolean }> {
     if (!existsSync(magicContextConfigPath)) {
-        // No config → local provider defaults apply. Still verify the local
-        // runtime: local is the DEFAULT, so "no config" means local embeddings,
-        // and a broken onnxruntime-node would silently fail (#128/#6).
         return checkLocalEmbeddingRuntimeForDoctor();
     }
 
@@ -439,9 +393,6 @@ async function checkEmbeddingConfig(
         return { issues: 1 };
     }
 
-    // Substitute {env:} and {file:} before parsing so api_key / endpoint
-    // reflect the values the runtime will actually see, and so we can report
-    // unresolved tokens as concrete issues.
     const substituted = substituteConfigVariables({
         text: rawText,
         configPath: magicContextConfigPath,
@@ -494,8 +445,6 @@ async function checkEmbeddingConfig(
 
     let localIssues = 0;
 
-    // Static configuration hygiene checks — raise before the network probe so
-    // users get the specific guidance even when they're offline.
     if (!endpoint) {
         log.error("Embedding provider is openai-compatible but 'endpoint' is missing");
         return { issues: 1 };
@@ -505,9 +454,6 @@ async function checkEmbeddingConfig(
         return { issues: 1 };
     }
 
-    // Flag unresolved {env:} residue — the substitution pass above would have
-    // replaced resolved tokens, so any leftover {env: here means either the
-    // env var was missing or the user wrote the literal text.
     if (apiKey && /\{env:[^}]+\}/.test(apiKey)) {
         log.warn(
             "api_key still contains {env:...} after substitution — the referenced environment variable is not set in this shell",
@@ -519,9 +465,6 @@ async function checkEmbeddingConfig(
         localIssues++;
     }
 
-    // Surface any substitution warnings for the *user* config — we can't
-    // tell which substitutions fed the embedding block specifically, but if
-    // the block is broken and there are env-var warnings, they're almost
     // certainly related.
     if (substituted.warnings.length > 0) {
         for (const w of substituted.warnings.slice(0, 3)) {
@@ -532,7 +475,6 @@ async function checkEmbeddingConfig(
         }
     }
 
-    // Run the live probe.
     const probeSpinner = spinner();
     probeSpinner.start(
         `Testing embedding endpoint ${sanitizeDiagnosticEndpoint(endpoint)} (model: ${sanitizeDiagnosticText(model)})`,
@@ -602,8 +544,6 @@ async function checkEmbeddingConfig(
     }
 }
 
-// ── Main doctor entry ───────────────────────────────────────────────
-
 function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[]): void {
     log.info("OpenCode installations:");
     log.info("  marker   | path | version | source");
@@ -627,8 +567,6 @@ export async function runDoctor(
 
     let issues = 0;
     let fixed = 0;
-    // Aligned with Pi doctor: emit a PASS/WARN/FAIL summary at the end so
-    // results are scannable.
     let passCount = 0;
     let warnCount = 0;
     let failCount = 0;
@@ -663,15 +601,10 @@ export async function runDoctor(
         authorityDb?.close();
     }
 
-    // 1. Check OpenCode is installed. Keep every rung so a stale CLI cannot
-    // hide a newer install that the user actually runs.
     const installationReports = describeOpenCodeInstallations(detectOpenCodeInstallations());
     const activeInstallation = installationReports[0];
     if (!activeInstallation) {
         fail("OpenCode is not installed or not in PATH");
-        // Help users whose binary IS on PATH but is shadowed by a wrapper
-        // script or lives in a directory not searched by our detection
-        // (e.g. tool-version shims that only inject PATH at shell time).
         log.info("Doctor checked ~/.opencode/bin/opencode and each entry in $PATH.");
         log.info(
             "If `which opencode` succeeds outside doctor, your wrapper or shim may not be readable by Node — please share that wrapper in the issue.",
@@ -683,8 +616,6 @@ export async function runDoctor(
         logOpenCodeInstallationTable(installationReports);
     }
     if (activeInstallation.kind === "desktop") {
-        // Desktop ships no invocable CLI; the rest of doctor operates on config
-        // and the plugin cache (both present for a Desktop install), so continue.
         pass(
             installationReports.length > 1
                 ? "OpenCode Desktop selected for plugin checks (CLI not installed)"
@@ -700,7 +631,6 @@ export async function runDoctor(
         );
     }
 
-    // 1b. CLI vs npm latest
     const selfVersion = getSelfVersion();
     const [npmLatest, pluginNpmLatest] = await Promise.all([
         fetchNpmLatest(CLI_PACKAGE_NAME),
@@ -714,7 +644,6 @@ export async function runDoctor(
         pass(`Magic Context CLI v${selfVersion} is current (npm latest v${npmLatest})`);
     }
 
-    // 2. Check config paths exist
     const paths = detectConfigPaths();
 
     if (paths.opencodeConfigFormat === "none") {
@@ -723,10 +652,8 @@ export async function runDoctor(
         pass(`OpenCode config: ${paths.opencodeConfig}`);
     }
 
-    // 3. Check magic-context.jsonc exists + parses + loads through schema
     if (existsSync(paths.magicContextConfig)) {
         pass(`Magic Context config: ${paths.magicContextConfig}`);
-        // 3a. Validate JSONC parses (with config-variable substitution)
         try {
             const raw = readFileSync(paths.magicContextConfig, "utf-8");
             const substituted = substituteConfigVariables({
@@ -740,10 +667,6 @@ export async function runDoctor(
                 `magic-context.jsonc parse failed: ${err instanceof Error ? err.message : String(err)}`,
             );
         }
-        // 3b. Validate config loads through plugin schema. loadPluginConfig
-        // recovers from invalid leaf settings field-by-field and surfaces
-        // soft warnings via configWarnings, so we can ask the schema to
-        // load and report them without bailing on the doctor run.
         try {
             const result = loadPluginConfig(process.cwd());
             const warnings = result.configWarnings ?? [];
@@ -764,32 +687,25 @@ export async function runDoctor(
         log.info("  Run 'setup' to create one with model recommendations");
     }
 
-    // 3b. Migrate deprecated experimental config keys in magic-context.jsonc
     if (existsSync(paths.magicContextConfig)) {
         try {
             const mcRaw = readFileSync(paths.magicContextConfig, "utf-8");
             const mcConfig = parse(mcRaw) as Record<string, unknown>;
             let mcChanged = false;
 
-            // Remove deprecated compaction_markers config — always-on since v0.21.4.
             //
-            // The flag lived in two places across releases:
-            //   - `experimental.compaction_markers` (early experimental phase)
-            //   - top-level `compaction_markers` (graduated stable, default true,
+            // The migration removes `experimental.compaction_markers` and top-level `compaction_markers` because the schema rejects both.
+            // The migration removes top-level `compaction_markers` because the schema rejects it.
             //     v0.9.0+)
             //
-            // As of v0.21.4 the feature is mandatory and the knob is gone from
-            // the schema. We clean BOTH locations so users don't see a
-            // "compaction_markers is not allowed" warning at plugin load.
+            // The schema rejects `experimental.compaction_markers` and top-level `compaction_markers`.
+            // The migration removes `experimental.compaction_markers` and top-level `compaction_markers` because the schema rejects both.
             //
-            // Intentional: comment-json stores comments on hidden Symbol keys
-            // attached to the parent object via their associated key. Deleting
-            // a key drops its immediately-preceding "before-property" comment.
-            // We accept that single-comment loss; the rest of the user's
-            // comments (block comments, other properties' before-comments,
-            // trailing comments on sibling keys) survive untouched. We do NOT
-            // delete the `experimental` object even when it becomes empty,
-            // because its header comment is anchored there.
+            // `comment-json` stores property comments on hidden `Symbol` keys of the parent object.
+            // Deleting a key removes only its immediately preceding before-property comment.
+            // Deleting a key removes only its immediately preceding before-property comment.
+            // Deleting a key preserves block comments, other properties' before-property comments, and sibling trailing comments.
+            // The migration preserves an empty `experimental` object because its header comment is anchored to that object.
             const experimental = mcConfig.experimental as Record<string, unknown> | undefined;
             if (experimental && "compaction_markers" in experimental) {
                 delete experimental.compaction_markers;
@@ -806,10 +722,8 @@ export async function runDoctor(
                 fixed++;
             }
 
-            // Remove deprecated auto_drop_tool_age / drop_tool_structure — Phase 2
-            // replaced need-blind routine tool drops with the tiered target-headroom
-            // emergency drop (always full-drop), so both knobs are gone from the
-            // schema and would trigger a "not allowed" warning at plugin load.
+            // The migration removes `auto_drop_tool_age` and `drop_tool_structure` because the schema rejects both.
+            // The migration removes `auto_drop_tool_age` and `drop_tool_structure` because the schema rejects both.
             for (const deadKey of ["auto_drop_tool_age", "drop_tool_structure"]) {
                 if (deadKey in mcConfig) {
                     delete mcConfig[deadKey];
@@ -827,24 +741,11 @@ export async function runDoctor(
                 fixed += agentEnabledMigration.fixes;
             }
 
-            // Migrate experimental.user_memories → dreamer.user_memories.
-            // The feature is now stable and lives under dreamer config (since
-            // dreamer owns candidate review and promotion). We preserve the
-            // user's existing enabled state so users who had it enabled keep
-            // it enabled, and users who had it explicitly disabled stay opted
-            // out. New users (no existing setting) get the new default:
-            // enabled=true under dreamer.user_memories.
             if (experimental && "user_memories" in experimental) {
                 const dreamer = (mcConfig.dreamer as Record<string, unknown> | undefined) ?? {};
                 const oldUM = experimental.user_memories;
                 const existingUM = dreamer.user_memories;
                 if (existingUM === undefined) {
-                    // No dreamer.user_memories yet — move the old value over.
-                    // Coerce primitives (e.g., `experimental.user_memories: true`)
-                    // to object shape so the Zod schema accepts them. Without
-                    // this coercion, a primitive would trip schema validation
-                    // and silently fall back to defaults — losing the user's
-                    // explicit opt-in/out state.
                     if (typeof oldUM === "boolean") {
                         dreamer.user_memories = { enabled: oldUM };
                     } else {
@@ -856,23 +757,14 @@ export async function runDoctor(
                     typeof existingUM === "object" &&
                     existingUM !== null
                 ) {
-                    // Both blocks exist — merge field-by-field so we don't drop
-                    // sub-fields like `promotion_threshold` that the user set
-                    // under experimental. Existing dreamer.user_memories fields
-                    // win (user already graduated them).
+                    // The merge preserves legacy fields missing from `dreamer.user_memories`.
                     const merged = {
                         ...(oldUM as Record<string, unknown>),
                         ...(existingUM as Record<string, unknown>),
                     };
                     dreamer.user_memories = merged;
                 } else if (typeof oldUM === "object" && oldUM !== null) {
-                    // Old block is a proper object but new block is a malformed
-                    // primitive (e.g., user wrote `dreamer.user_memories: true`
-                    // as a shortcut). Without this branch we'd silently drop
-                    // the old block's sub-fields like `promotion_threshold`.
-                    // Coerce the primitive to { enabled: <primitive-as-bool> }
-                    // shape, then merge — old sub-fields fill in, new enabled
-                    // preserves what the user literally typed.
+                    // The migration converts primitive `dreamer.user_memories` values to `enabled: Boolean(existingUM)` before merging legacy fields.
                     const coerced: Record<string, unknown> = {
                         ...(oldUM as Record<string, unknown>),
                         enabled: Boolean(existingUM),
@@ -882,7 +774,6 @@ export async function runDoctor(
                         `Coerced malformed dreamer.user_memories (${typeof existingUM}) to object form while merging sub-fields from experimental.user_memories`,
                     );
                 }
-                // else: both are primitive/malformed — nothing safe to merge.
                 mcConfig.dreamer = dreamer;
                 delete experimental.user_memories;
                 mcChanged = true;
@@ -900,13 +791,7 @@ export async function runDoctor(
                 fixed++;
             }
 
-            // Relocate graduated feature flags out of the (retired) experimental.*
-            // namespace to their new homes:
-            //   - temporal_awareness / caveman_text_compression / mural → top-level keys
-            //   - auto_search / git_commit_indexing → memory.* (recall features)
-            // We preserve the user's explicit values so opt-ins/opt-outs survive;
-            // the destination wins when a user has already started graduating,
-            // merging sub-fields so partial settings aren't dropped.
+            // When both values exist, `dreamer.user_memories` takes precedence over `experimental.user_memories`.
             const relocateGraduated = (
                 key: string,
                 dest: Record<string, unknown>,
@@ -943,19 +828,14 @@ export async function runDoctor(
                 if (Object.keys(memoryDest).length > 0) {
                     mcConfig.memory = memoryDest;
                 }
-                // The experimental.* namespace is fully retired; drop the now-empty
-                // block so it does not linger as obsolete clutter. (Accepts the loss
-                // of the block's anchored header comment — the block no longer exists.)
+                // The migration preserves an empty `experimental` object because its header comment is anchored to that object.
+                // `experimental` deletion also removes its attached comment.
                 if (Object.keys(experimental).length === 0 && "experimental" in mcConfig) {
                     delete mcConfig.experimental;
                     mcChanged = true;
                 }
             }
 
-            // Dreamer v2: convert the legacy v1 dreamer shape (window schedule,
-            // tasks array, user_memories/pin_key_files blocks) into the per-task
-            // `tasks` record. Runs AFTER the experimental migrations above so a
-            // relocated dreamer.user_memories/pin_key_files is folded into tasks.
             if (migrateDreamerV2ForDoctor(mcConfig)) {
                 mcChanged = true;
                 log.success(
@@ -964,9 +844,7 @@ export async function runDoctor(
                 fixed++;
             }
 
-            // Remove `compartment_token_budget` — replaced by auto-derivation from
-            // main/historian model context in later versions. The value is no longer
-            // read; leaving it in config is harmless but misleading.
+            // `compartment_token_budget` is ignored because model context derives the budget.
             if ("compartment_token_budget" in mcConfig) {
                 delete mcConfig.compartment_token_budget;
                 mcChanged = true;
@@ -984,19 +862,11 @@ export async function runDoctor(
         }
     }
 
-    // 4. Check plugin is in opencode.json
     if (paths.opencodeConfigFormat !== "none") {
         try {
             const raw = readFileSync(paths.opencodeConfig, "utf-8");
             const config = parse(raw) as Record<string, unknown>;
-            // Operate on the raw plugin array. Entries can be:
-            //   • a string  "@cortexkit/opencode-magic-context@latest"
-            //   • a tuple   ["@pkg/name@latest", { ...options }]
-            //   • a dev URL "file:///abs/path/.../packages/plugin"
-            // We MUST preserve every entry shape on write — filtering out
-            // tuples (or stripping options) would silently drop user config.
-            // matchesPluginEntry / isDevPathPluginEntry are imported from
-            // ../adapters/opencode and accept both strings and tuples.
+            // The migration preserves string entries, tuple entries with options, and dev URLs unchanged on write.
             const rawPlugins: unknown[] = Array.isArray(config?.plugin) ? config.plugin : [];
             const existingIdx = rawPlugins.findIndex(
                 (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
@@ -1016,8 +886,7 @@ export async function runDoctor(
             const configName =
                 paths.opencodeConfigFormat === "jsonc" ? "opencode.jsonc" : "opencode.json";
 
-            // Helper: extract the plain string (or first element of a tuple) so
-            // we can compare against the desired @latest entry.
+            // `pluginEntryName` extracts a tuple's package-name slot for `@latest` comparison.
             const entryAsString = (entry: unknown): string | null => {
                 if (typeof entry === "string") return entry;
                 if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
@@ -1033,10 +902,7 @@ export async function runDoctor(
                 const oldEntry = rawPlugins[existingIdx];
                 const oldEntryStr = entryAsString(oldEntry) ?? "";
 
-                // Dev-path entries (file://, absolute, relative) are detected
-                // so we don't double-add @latest, but we MUST NOT replace them
-                // — that would silently disable the developer's local plugin
-                // checkout. Always log as-is and leave the entry alone, even
+                // The migration detects dev-path entries and leaves them unchanged to avoid disabling local checkouts.
                 // under --force.
                 if (isDevPathPluginEntry(oldEntry)) {
                     pass(`Plugin registered in ${configName} (dev path: ${oldEntryStr})`);
@@ -1044,15 +910,13 @@ export async function runDoctor(
                     const isPinned = isPinnedOpenCodePluginSpecifier(oldEntryStr);
 
                     if (isPinned && !options.force) {
-                        // Warn but don't change — user intentionally pinned
+                        // The migration warns without changing pinned entries.
                         warn(
                             `Plugin pinned to ${oldEntryStr} in ${configName} — use 'doctor --force' to upgrade`,
                         );
                     } else {
-                        // Upgrade versionless entry to @latest, or --force upgrades pinned.
-                        // If the existing entry is a tuple, preserve options by
-                        // updating only the package-name slot; otherwise replace
-                        // with the plain string entry.
+                        // The migration upgrades versionless entries to `@latest`; `--force` also upgrades pinned entries.
+                        // For tuple entries, the migration updates only the package-name slot and preserves options; for string entries, it replaces the entry.
                         if (Array.isArray(oldEntry) && oldEntry.length >= 1) {
                             const replacement = [...oldEntry];
                             replacement[0] = PLUGIN_ENTRY_WITH_VERSION;
@@ -1069,8 +933,7 @@ export async function runDoctor(
                     }
                 }
             } else {
-                // Auto-add plugin entry — preserves comments AND every existing
-                // tuple/options entry the user already had.
+                // The migration adds the plugin without modifying existing tuple entries or their options.
                 rawPlugins.push(PLUGIN_ENTRY_WITH_VERSION);
                 config.plugin = rawPlugins;
                 writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
@@ -1082,20 +945,13 @@ export async function runDoctor(
         }
     }
 
-    // 5. Check for conflicts
-    // The resolved MC compaction mode is threaded in explicitly via the same
-    // loader + accessor the plugin boot uses. On load failure the helper takes
-    // the preserve-existing-native-fields branch (returns false) and emits a
-    // diagnostic, so doctor never assumes either mode.
+    // Doctor resolves compaction mode through the loader and accessor used at plugin boot.
+    // On load failure, the helper returns false, preserves native compaction fields, and emits a diagnostic.
     const cwd = process.cwd();
     const compactionEnabled = resolveCompactionEnabledForDoctor();
     const conflictResult = detectConflicts(cwd, { compactionEnabled });
 
-    // Doctor has no OpenCode server handle, so it uses the file-based
-    // compaction check (the same one the plugin falls back to when its
-    // resolved-config fetch fails). Name the arm so a #309-shaped report tells
-    // us which check produced the verdict — the running server's resolved
-    // config may differ from what the file reader sees.
+    // Doctor uses the file-based compaction check because it has no OpenCode server handle.
     log.info(
         "Compaction check: file-based; the running server's resolved config may differ — `opencode debug config` is authoritative",
     );
@@ -1104,10 +960,8 @@ export async function runDoctor(
         for (const reason of conflictResult.reasons) {
             fail(`Conflict: ${reason}`);
         }
-        // Auto-fix conflicts. In compaction-off mode the fixer skips native
-        // compaction fields (compaction.auto/prune) — it may report, never
-        // repair, native compaction fields in that mode. DCP and OMO hook
-        // fixes keep their existing policy in BOTH modes.
+        // When `compactionEnabled` is false, Doctor does not repair native `compaction.auto` or `compaction.prune` fields.
+        // DCP and OMO hook fixes run whether `compactionEnabled` is true or false.
         const actions = fixConflicts(cwd, conflictResult.conflicts, { compactionEnabled });
         for (const action of actions) {
             pass(`Fixed: ${action}`);
@@ -1117,10 +971,7 @@ export async function runDoctor(
             warn("Restart OpenCode for conflict fixes to take effect");
         }
     } else {
-        // Honest compaction state label in both modes. When MC compaction is
-        // OFF, native compaction.auto=true is the intended state (native
-        // compaction active), not a conflict; when auto=false as well, nothing
-        // manages the window (no-manager configuration) — report it plainly.
+        // When compaction is off, native `compaction.auto=true` activates native compaction and is not a conflict.
         if (!compactionEnabled) {
             if (conflictResult.nativeCompaction.auto || conflictResult.nativeCompaction.prune) {
                 pass(
@@ -1136,15 +987,13 @@ export async function runDoctor(
         }
     }
 
-    // 6. Check tui.json
     const tuiAdded = ensureTuiPluginEntry();
     if (tuiAdded) {
         pass("Added TUI sidebar plugin to tui.json");
         warn("Restart OpenCode to see the sidebar");
         fixed++;
     } else if (existsSync(paths.tuiConfig)) {
-        // Check for pinned version in tui config. Same tuple/dev-path rules
-        // as the main opencode config — preserve every entry shape on write.
+        // The upgrader preserves tuple options and dev-path entries when updating the TUI plugin.
         try {
             const tuiRaw = readFileSync(paths.tuiConfig, "utf-8");
             const tuiConfig = parse(tuiRaw) as Record<string, unknown>;
@@ -1183,7 +1032,6 @@ export async function runDoctor(
                             `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
                         );
                     } else if (tuiPinned && options.force) {
-                        // Preserve tuple options when upgrading.
                         if (Array.isArray(tuiEntry) && tuiEntry.length >= 1) {
                             const replacement = [...tuiEntry];
                             replacement[0] = PLUGIN_ENTRY_WITH_VERSION;
@@ -1211,11 +1059,8 @@ export async function runDoctor(
         fail("Could not create or verify the TUI sidebar config");
     }
 
-    // 7. Check user memories + dreamer compatibility.
-    // In v2, user-memory collection is gated by the `review-user-memories` task
-    // schedule (non-empty = enabled), replacing the v1 `dreamer.user_memories`
-    // block. The task needs the dreamer to actually run to promote candidates,
-    // so warn loudly when the combination is wrong.
+    // A non-empty `review-user-memories` schedule enables user-memory collection.
+    // Dreamer must run before promoting candidates.
     if (existsSync(paths.magicContextConfig)) {
         try {
             const mcRaw = readFileSync(paths.magicContextConfig, "utf-8");
@@ -1225,37 +1070,32 @@ export async function runDoctor(
                 log.warn(warning);
                 issues++;
             }
-        } catch {
-            // Config parse failed — skip this check
-        }
+        } catch {}
     }
 
-    // 7b. Validate embedding configuration — runs a real probe against the
-    // configured endpoint so users catch misconfigured URL / missing env var /
-    // wrong provider issues before relying on semantic memory search.
+    // Doctor probes the configured endpoint before semantic memory search so configuration errors fail before search.
     const embeddingCheck = await checkEmbeddingConfig(paths.magicContextConfig);
     issues += embeddingCheck.issues;
     if (embeddingCheck.issues > 0) failCount += embeddingCheck.issues;
     else if (embeddingCheck.unverified) warnCount++;
     else passCount++;
 
-    // 7c. Shared context DB exists, opens, integrity_check, row counts.
-    // This catches corrupted DB files and misaligned storage paths early.
+    // The DB checks detect corrupted files and misaligned storage paths before use.
     const dbPath = join(getMagicContextStorageDir(), "context.db");
     if (!existsSync(dbPath)) {
         log.info(`Shared context DB not yet created at ${dbPath} (will be created on first run)`);
     } else {
         log.info(`Shared context DB exists at ${dbPath}`);
         try {
-            // The schema compatibility check runs before integrity checks so a
-            // newer schema can never be reported healthy by an older CLI.
+            // Run schema compatibility checks before integrity checks so an older CLI cannot report a newer database schema healthy.
+            // An older CLI cannot report a database with a newer schema healthy.
             const db = openExistingContextDatabase(dbPath, { readonly: true });
             if (db === null) {
                 throw new Error(`Shared context DB no longer exists at ${dbPath}`);
             }
             try {
                 pass("Opened the shared DB with a supported schema");
-                // Stable storage-version probe: live DB schema vs this binary's fence.
+                // The storage-version check compares the live DB schema with this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 log.info(formatStorageVersions(storageVersions));
                 const fenceCheck = checkStorageVersionFence(storageVersions);
@@ -1277,7 +1117,7 @@ export async function runDoctor(
                     );
                 }
 
-                // Row counts across the major tables — informational, not pass/fail.
+                // Row counts are informational and do not affect pass/fail status.
                 try {
                     const counts: Record<string, number> = {};
                     for (const table of ["tags", "compartments", "notes", "claims", "dream_runs"]) {
@@ -1287,7 +1127,7 @@ export async function runDoctor(
                                 | undefined;
                             counts[table] = row?.c ?? 0;
                         } catch {
-                            // Table may not exist on a brand-new DB before migrations run
+                            // A brand-new DB may lack the queried table before migrations run.
                             counts[table] = 0;
                         }
                     }
@@ -1296,7 +1136,7 @@ export async function runDoctor(
                         .join(", ");
                     log.info(`Shared DB row counts: ${summary}`);
                 } catch {
-                    // Don't fail the doctor on row-count introspection issues
+                    // Row-count introspection failures do not fail doctor.
                 }
             } finally {
                 db.close();
@@ -1317,7 +1157,6 @@ export async function runDoctor(
         }
     }
 
-    // 8. Check plugin npm cache — clear only if outdated
     const cacheResult = await clearPluginCache({
         force: options.force,
         latestVersion: pluginNpmLatest,
@@ -1353,10 +1192,8 @@ export async function runDoctor(
         pass("Plugin cache clean (no cached version found)");
     }
 
-    // 9. Check for min-release-age / before restrictions in ~/.npmrc.
-    // OpenCode installs plugins with npm under the hood, so npm's age guards
-    // apply. We don't check Bun's bunfig.toml anymore — the unified CLI uses
-    // npx and the auto-update checker uses npm install, neither of which read
+    // OpenCode installs plugins through npm, so npm's age guards apply.
+    // The unified CLI uses npx, and the auto-update checker uses npm install; neither reads bunfig.toml.
     // bunfig.
     {
         const ageWarnings = collectNpmReleaseAgeWarnings();
@@ -1378,8 +1215,6 @@ export async function runDoctor(
         }
     }
 
-    // 10. Show diagnostics info (log file, historian dumps)
-
     const logPath = getMagicContextLogPath("opencode");
     if (existsSync(logPath)) {
         const logStat = statSync(logPath);
@@ -1389,11 +1224,7 @@ export async function runDoctor(
         log.info(`Log file: ${logPath} (not yet created)`);
     }
 
-    // Historian dumps live per-project under `<dir>/.cortexkit/magic-context/historian/`.
-    // We surface them grouped by project so users can see which session's dumps are
-    // where. Falls back to the legacy tmp-dir layout when collectDiagnostics returns
-    // empty buckets (Node-only runs, no OpenCode DB, no historian has run yet under
-    // the new path).
+    // We group dumps by project so users can identify each project's dumps.
     const diagnostics = await collectDiagnostics();
     const dumpBuckets = diagnostics.historianDumps.byProject;
     if (dumpBuckets.length > 0) {
@@ -1412,19 +1243,15 @@ export async function runDoctor(
             }
         }
     }
-    // Legacy tmp-dir dumps from pre-Phase 3 plugin versions — still listed if
-    // present so users can find old artifacts without spelunking the tmp dir.
     const legacy = diagnostics.historianDumps.legacyDumps;
     if (legacy.count > 0) {
         log.info(`Legacy historian dumps (pre-v0.18.x): ${legacy.count} file(s) in ${legacy.dir}`);
     }
 
-    // 11. Check OMO config
     if (paths.omoConfig) {
         log.info(`OMO config found: ${paths.omoConfig}`);
     }
 
-    // Summary — aligned with Pi doctor format.
     console.log("");
     log.message(`Summary: PASS ${passCount} / WARN ${warnCount} / FAIL ${failCount}`);
     if (issues === 0 && fixed === 0) {

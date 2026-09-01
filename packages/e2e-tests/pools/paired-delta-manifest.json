@@ -3,63 +3,93 @@
   "scenarios": [
     {
       "scenarioId": "var-compaction-deploy-region",
-      "semanticFingerprint": "59a968aafcaa96af5d6129be45e8abaa2d160469273a1122eb48ccd8d0112eac",
-      "verifierBundleDigest": "3ed41e16c1d3dffc804a2cbea277b7ec1df5892d69470ba17dd380ad3146535c",
-      "runModes": ["calibration", "weekly", "release"]
+      "semanticFingerprint": "6d342d10e247d9cf075282509934c78fb91d5349e50a6c8341c1930ab487d38e",
+      "verifierBundleDigest": "301a65e0c244ab12b1bf956624999e13df5da47a5d5cdfc4ae4fc4db65467c68",
+      "runModes": [
+        "calibration",
+        "weekly",
+        "release"
+      ]
     },
     {
       "scenarioId": "var-compaction-feature-state",
-      "semanticFingerprint": "c74550c6f90d607c87b36565cbfdd1c239ef39d56b30129e6cdc4941d1c09cb0",
-      "verifierBundleDigest": "3fcd18bcde9973d12f1e65c70cdda18b6418ad9b77d271633ca37bb70abc028b",
-      "runModes": ["release"]
+      "semanticFingerprint": "2829d3febccfb4a1836a80d0c76a1d2829d401dda94115cb9f7a92adaa5c62d1",
+      "verifierBundleDigest": "ecf5e586d107d59d8a7fde80ccae9ef53efd7f55a1dbe643ca25017ca4cb541c",
+      "runModes": [
+        "release"
+      ]
     },
     {
       "scenarioId": "var-compaction-schema-version",
-      "semanticFingerprint": "524e461bc018b413c6eac47a73ce1bab407fefeab7e52831c407d222bcc789c2",
-      "verifierBundleDigest": "e7a8e8296620936065f0eb6f96b37801b79687a389f2a6c487c9616b7f36c3fe",
-      "runModes": ["calibration", "weekly", "release"]
+      "semanticFingerprint": "2a83e1355df9f6f5bc794863c4fdc16d530b8f8799516ede42ba9bf482028190",
+      "verifierBundleDigest": "444d94556cc39bd53ab264ad5dd902d95e119e4a0320ad320a1e442a7b1dc347",
+      "runModes": [
+        "calibration",
+        "weekly",
+        "release"
+      ]
     },
     {
       "scenarioId": "var-exact-path",
-      "semanticFingerprint": "dd1a19380f2348b3a67e2cca0a57d3ffe266565ab82dcd7da383b9d13a29042d",
-      "verifierBundleDigest": "b5d8d2e3af919cd5737718fba7831b00e7c6e7850df134832d3e79cd9475b973",
-      "runModes": ["release"]
+      "semanticFingerprint": "4ca9c97d4404bb7b6fbca660302790aa39800cb319e37adad68e7ccce1a1bb6d",
+      "verifierBundleDigest": "b24aa0ed2ed280b1d68244e2b5a163eb5007772e92fca7274e43a2ac66845f54",
+      "runModes": [
+        "release"
+      ]
     },
     {
       "scenarioId": "var-exact-symbol",
-      "semanticFingerprint": "59fd0af1cc81577067dd380a9ad09ebcd023cad7931b9b0210e94d5f71b6e2da",
-      "verifierBundleDigest": "fecf763546144494f477d1d8d0b8a024ad96b4c7a28a2af7f59287a4f0452915",
-      "runModes": ["calibration", "weekly", "release"]
+      "semanticFingerprint": "e726ede0f72a0b7f9b95a823426bca5bba7d51ebfc04b2882b60a36b2fba13ab",
+      "verifierBundleDigest": "7c5183afbcfd46dcddb3597b021b89717446c4dfbcb0bde44bc9bc0983cf86f5",
+      "runModes": [
+        "calibration",
+        "weekly",
+        "release"
+      ]
     },
     {
       "scenarioId": "var-exact-ticket",
-      "semanticFingerprint": "bc5eb3ccc907ae3d2c1aff321162119155ed98158b84107117ae1db28958962a",
-      "verifierBundleDigest": "348296570f390bb203716fed25c83cb4bc313415062e79cf417ab67af050000c",
-      "runModes": ["release"]
+      "semanticFingerprint": "a3212003455b629f79a5e43d97f6e0cca230d4f63c348ca2b2f696d824f4b123",
+      "verifierBundleDigest": "5e9fa6792d35ec3b826af5252ba06feaec722e1886c87a7cd60a746252947016",
+      "runModes": [
+        "release"
+      ]
     },
     {
       "scenarioId": "var-rejected-database",
-      "semanticFingerprint": "54883d608097499e57419a573ab0e76ee97b4c54f861f696d3c7b575493928dd",
-      "verifierBundleDigest": "253c5f55397bbd3360dd9ac6bd3f82034d39f500abffc229684b076a21dd0643",
-      "runModes": ["calibration", "weekly", "release"]
+      "semanticFingerprint": "3d720f624777892f235e67501d212bf6be544a230eb00e1530859a510800ae38",
+      "verifierBundleDigest": "b539a2902e31ebec84e597c462cec1d1e0a98a68b86cd65692300daba61f35a3",
+      "runModes": [
+        "calibration",
+        "weekly",
+        "release"
+      ]
     },
     {
       "scenarioId": "var-rejected-queue",
-      "semanticFingerprint": "5360f72977d7e79a52b345fb92800518cfb78850a87b01e5ace04bfe34ae83cc",
-      "verifierBundleDigest": "44955f7a2c6d807349f54b88cbbb3def9488a237d4429bde10be4ef551d7f324",
-      "runModes": ["release"]
+      "semanticFingerprint": "ca723e464c1e181a527fb84ec9898bce65edabb115fbc1963a76a48886a12750",
+      "verifierBundleDigest": "4ddaebf0c25500bafd185fb5a4907c678b112973d980923c96a02cdb4793b06b",
+      "runModes": [
+        "release"
+      ]
     },
     {
       "scenarioId": "var-superseded-owner",
-      "semanticFingerprint": "0fc32a2f756edba4011a72424c3ff9207a0c4cf1839030d2bd7df22811374c57",
-      "verifierBundleDigest": "e5ce181d9941841552f1a7aebfedf39e680aaa70ac202a0acbfb1ee87fa16ad3",
-      "runModes": ["release"]
+      "semanticFingerprint": "f0c7c07e54a04b4d7ddd877fe84bbcdcfb2bf1e1051e9b529943a9e7e4998706",
+      "verifierBundleDigest": "271b592b5d9ffb3bbf9b4bc0d080dbda9cf79c3eac81976857aa8b03dceff656",
+      "runModes": [
+        "release"
+      ]
     },
     {
       "scenarioId": "var-superseded-timeout",
-      "semanticFingerprint": "5a4011dea258d97ed334e0a8cfe6d6a01e9aba6fcae2dc798187eb5a086326cf",
-      "verifierBundleDigest": "d38ed0494730cda27f9e9f6da9371345f878395aa9aaa315f75866dbdc7a5b2b",
-      "runModes": ["calibration", "weekly", "release"]
+      "semanticFingerprint": "5168a935b6026bb7c16b7b260edfdcba04f81d1937646cacbdb999c4c3b91fd1",
+      "verifierBundleDigest": "296c89834bb101f6ebbf603753d0c955ee809fbea83f0ded690da45e4954d8dc",
+      "runModes": [
+        "calibration",
+        "weekly",
+        "release"
+      ]
     }
   ]
 }

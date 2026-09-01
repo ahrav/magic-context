@@ -7,13 +7,13 @@ interface OpenAICompatibleEmbeddingProviderOptions {
     endpoint?: string;
     model?: string;
     apiKey?: string;
-    /** Default/passage `input_type` body field (e.g. NVIDIA NIM 'passage'). */
+    /** `inputType` supplies the default or passage `input_type` body field. */
     inputType?: string;
-    /** Optional query `input_type` for search embeddings; falls back to inputType when unset. */
+    /** The provider uses `queryInputType` for search embeddings and falls back to `inputType` when it is unset. */
     queryInputType?: string;
-    /** Optional `truncate` body field (e.g. NVIDIA NIM 'NONE'/'START'/'END'). */
+    /** `truncate` supplies the optional `truncate` body field. */
     truncate?: string;
-    /** Maximum safe input tokens for chunk embeddings. */
+    /** `maxInputTokens` caps chunk embeddings at a safe input-token count. */
     maxInputTokens?: number;
 }
 
@@ -21,10 +21,8 @@ interface EmbeddingResponseBody {
     data?: Array<{
         embedding?: number[];
     }>;
-    /** The model the endpoint actually served. OpenAI and most compatible
-     *  servers echo back the requested model; LMStudio/Ollama return the model
-     *  they ACTUALLY ran, which can differ from the request when the requested
-     *  model isn't loaded and the server substitutes a loaded one. */
+    /** The endpoint reports its model in `model`.
+     * */
     model?: string;
 }
 
@@ -39,8 +37,7 @@ type ParsedEmbeddingModel = {
 
 function parseEmbeddingModel(model: string): ParsedEmbeddingModel {
     const lastColon = model.lastIndexOf(":");
-    // Colons in host-like prefixes (for example `host:port/model`) are not
-    // model tags because they occur before the final slash.
+    // Colons before the final slash are part of host-like prefixes, not model tags.
     if (lastColon > model.lastIndexOf("/")) {
         return { base: model.slice(0, lastColon), tag: model.slice(lastColon + 1) };
     }
@@ -62,22 +59,9 @@ function matchNormalizedEmbeddingModels(a: string, b: string): boolean {
 }
 
 /**
- * Whether the model an endpoint served is the model we asked for.
  *
- * Exact match after trim+lowercase, with TOKEN-BOUNDARY prefix/suffix tolerance
- * so a server that version-expands a name (`text-embedding-3-small` →
- * `…-small-v1`) or trims a vendor prefix (`openai/text-embedding-3-small` →
- * `text-embedding-3-small`) still counts as a match. OpenRouter routing tags
- * such as `:free` are ignored when only one side has a tag, while tags on both
- * sides must be equal so Ollama model-size tags remain distinct.
  *
- * Crucially this is NOT a plain substring test. A loose `a.includes(b)` would
- * MATCH a broadly-configured name against an unrelated served model that merely
- * contains it as a middle token — e.g. configured `qwen3-embedding`, served
- * `text-embedding-qwen3-embedding-0.6b` → store 0.6b vectors under the broad
- * identity (wrong-dim corruption, the exact failure this guard exists to stop).
- * So the shorter name must align on a `-`/`/` boundary as a genuine PREFIX or
- * SUFFIX of the longer, never as an interior fragment.
+ * Boundary-only matching prevents unrelated models from matching as interior fragments.
  */
 export function embeddingModelsMatch(served: string, requested: string): boolean {
     const a = served.trim().toLowerCase();
@@ -85,8 +69,6 @@ export function embeddingModelsMatch(served: string, requested: string): boolean
     const servedModel = parseEmbeddingModel(a);
     const requestedModel = parseEmbeddingModel(b);
 
-    // Matching tags identify the same provider-specific model variant. Different
-    // tags can identify different weights or sizes, so they must never be ignored.
     if (
         servedModel.tag !== undefined &&
         requestedModel.tag !== undefined &&
@@ -95,33 +77,23 @@ export function embeddingModelsMatch(served: string, requested: string): boolean
         return false;
     }
 
-    // With zero or one tag, compare the untagged names using every existing rule.
     return matchNormalizedEmbeddingModels(servedModel.base, requestedModel.base);
 }
 
 /**
- * Circuit breaker constants. Shared across all callers of this provider so a
- * hung/saturated endpoint (e.g., LMStudio overloaded by parallel council
- * subagents) cannot keep dragging every plugin operation through its timeout.
+ * All callers share one circuit breaker, so failures from one caller can affect other callers.
  *
- * State machine (canonical three-state):
- *   - CLOSED:     issue requests; track failures in a rolling window. After
- *                 FAILURE_THRESHOLD failures within FAILURE_WINDOW_MS → OPEN.
- *   - OPEN:       short-circuit every call and return nulls immediately, no
- *                 HTTP. After OPEN_DURATION_MS elapses → HALF_OPEN.
- *   - HALF_OPEN:  let exactly ONE call through as a probe. Any other caller
- *                 during the probe short-circuits (no stampede on recovery).
- *                 Probe success → CLOSED; probe failure → OPEN immediately
- *                 for another OPEN_DURATION_MS.
+ * CLOSED issues requests and opens the breaker after FAILURE_THRESHOLD failures within FAILURE_WINDOW_MS.
+ * OPEN short-circuits calls and returns null without making an HTTP request.
+ * After OPEN_DURATION_MS, OPEN transitions to HALF_OPEN.
+ * HALF_OPEN permits exactly one probe request.
+ * Additional callers short-circuit while the HALF_OPEN probe is running.
+ * A successful probe closes the circuit; a failed probe opens it immediately.
+ * A failed half-open probe reopens the circuit for `OPEN_DURATION_MS`.
  *
  * Design notes:
- *   - The half-open probe uses `halfOpenProbeInFlight` to prevent concurrent
- *     callers from all sending real requests the moment the open timer elapses
- *     (stampede). Only the first caller becomes the probe; the rest short-
- *     circuit as if the circuit were still OPEN.
- *   - A single failure on the probe re-opens the circuit. This matches the
- *     canonical pattern: if the probe fails, the endpoint is still sick.
- *   - On success, we fully close and reset failure counters.
+ * Only the first caller after `circuitOpenUntil` elapses may probe the endpoint.
+ * Limiting recovery to one probe prevents a request stampede.
  */
 const FAILURE_THRESHOLD = 3;
 const FAILURE_WINDOW_MS = 60_000;
@@ -142,18 +114,15 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     private readonly truncate: string;
     private initialized = false;
 
-    // Circuit breaker state (per provider instance — resets when config
-    // changes because a new provider instance is created).
     private failureTimes: number[] = [];
     private circuitOpenUntil = 0;
     private openLogged = false;
-    /** One-shot guard so a persistent model substitution doesn't flood the log
-     *  with one line per batch. Resets with the provider instance (i.e. on any
-     *  config change), so a corrected config logs again if it regresses. */
+    /** `modelMismatchLogged` prevents repeated warnings for persistent model substitution.
+     * Logs at most one model-substitution warning per provider instance.
+     * */
     private modelMismatchLogged = false;
-    /** True while a half-open probe is in flight. Only the caller who set this
-     *  to true is allowed to make a real HTTP call; everyone else short-
-     *  circuits as if the circuit were still OPEN. */
+    /**
+     * */
     private halfOpenProbeInFlight = false;
 
     constructor(options: OpenAICompatibleEmbeddingProviderOptions) {
@@ -173,11 +142,10 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             model: this.model,
             ...(this.apiKey ? { api_key: this.apiKey } : {}),
             ...(this.inputType ? { input_type: this.inputType } : {}),
-            // truncate participates in identity (it changes which text an
-            // over-long input embeds). MUST mirror getEmbeddingProviderIdentity
-            // exactly — a missing field here makes the provider write under a
-            // different model_id than reads/GC resolve, silently zeroing results
-            // and reaping valid vectors.
+            // `truncate` participates in identity because it changes which portion of an overlong input is embedded.
+            // Read, write, and GC identity calculations must include the same optional fields.
+            // Otherwise writes use a `model_id` that reads and GC do not resolve.
+            // An identity mismatch can return zero results and reap valid vectors.
             ...(this.truncate ? { truncate: this.truncate } : {}),
         });
     }
@@ -192,10 +160,8 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             return false;
         }
 
-        // SSRF guard: refuse cloud-metadata / link-local endpoints. Memory
-        // content (which can carry captured secrets) is the request body, and
-        // the endpoint can be influenced by project config. Loopback + private
-        // LAN ranges stay allowed so self-hosted embeddings (LMStudio/Ollama)
+        // The provider rejects cloud-metadata and link-local endpoints because embedding request bodies can contain captured secrets.
+        // LAN ranges remain allowed for self-hosted LM Studio and Ollama endpoints.
         // keep working.
         const blockedReason = blockedEmbeddingEndpointReason(this.endpoint);
         if (blockedReason) {
@@ -233,32 +199,19 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             return [];
         }
 
-        // Coerce empty / whitespace-only inputs to a single space before the POST.
-        // Some OpenAI-compatible providers (e.g. jina via litellm) reject an empty
-        // string with HTTP 400 "Input content cannot be empty", which fails the
-        // WHOLE batch (the response is all-null) — so one empty input would block
-        // embedding every other text sent with it. A space embeds fine (verified)
-        // and yields a stable near-zero-information vector. Callers should avoid
-        // sending empty content where possible, but this is the single chokepoint
-        // that guarantees a stray empty string can't 400 the request.
         const requestTexts = texts.map((t) => (t.trim().length === 0 ? " " : t));
 
         if (!(await this.initialize())) {
             return Array.from({ length: texts.length }, () => null);
         }
 
-        // Pre-flight: caller already gave up? Don't bother making a request.
         if (signal?.aborted) {
             return Array.from({ length: texts.length }, () => null);
         }
 
-        // Circuit check — and, if transitioning to half-open, claim the probe slot.
-        // Both the claim AND the AbortController setup run inside try/finally so
-        // that the half-open probe slot is guaranteed to be released even if any
-        // intermediate step throws. Previously the claim was outside the try,
-        // which was safe in practice (non-throwable code between claim and try)
-        // but structurally fragile — a future refactor could introduce a throw
-        // point and permanently wedge the circuit in half-open.
+        // The circuit check atomically claims the half-open probe slot.
+        // `try`/`finally` releases the probe slot when setup throws.
+        // Every claimed probe slot is released so the circuit cannot remain half-open permanently.
         let isProbe = false;
         let internalController: AbortController | undefined;
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -270,10 +223,6 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 return Array.from({ length: texts.length }, () => null);
             }
             isProbe = claim === "probe";
-            // Set up an AbortController that fires on EITHER the caller's
-            // signal OR our internal fetch timeout. This lets a 3s auto-search
-            // timeout cancel the underlying HTTP POST instead of leaving it
-            // dangling for the full 30s FETCH_TIMEOUT_MS.
             internalController = new AbortController();
             timeoutHandle = setTimeout(() => internalController?.abort(), FETCH_TIMEOUT_MS);
             onOuterAbort = () => internalController?.abort();
@@ -291,18 +240,14 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 body: JSON.stringify({
                     model: this.model,
                     input: requestTexts,
-                    // Optional provider-specific fields (e.g. NVIDIA NIM requires
-                    // input_type; truncate is accepted by several providers).
-                    // Omitted entirely when unset so standard OpenAI endpoints are
+                    // The provider omits unset fields to preserve compatibility with standard OpenAI endpoints.
                     // unaffected.
                     ...(inputTypeForRequest ? { input_type: inputTypeForRequest } : {}),
                     ...(this.truncate ? { truncate: this.truncate } : {}),
                 }),
-                // SSRF: refuse to FOLLOW redirects. The pre-flight SSRF check only
-                // validates the configured endpoint; default redirect-follow would
-                // let an allowed host 307/308 the bearer token + memory content to
-                // a link-local/metadata target. A legitimate /embeddings POST never
-                // redirects, so `redirect: "error"` rejects the response instead.
+                // The pre-flight SSRF check validates only the configured endpoint.
+                // Default redirect-following can send embedding request bodies to a destination that the pre-flight SSRF check did not validate.
+                // Fetch rejects redirect responses when `redirect` is `"error"`.
                 redirect: "error",
                 signal: internalController.signal,
             });
@@ -315,10 +260,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 return Array.from({ length: texts.length }, () => null);
             }
 
-            // Read body as text first so we can produce useful diagnostics on
-            // empty / malformed responses (LMStudio / Cerebras / Fireworks
-            // sometimes return a 200 status with an empty body when the model
-            // is overloaded or the upstream connection dropped mid-response).
+            // Reading the body as text enables diagnostics for malformed response bodies.
             const rawBody = await response.text();
             if (rawBody.trim().length === 0) {
                 log(
@@ -339,14 +281,8 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 this.recordFailure(isProbe);
                 return Array.from({ length: texts.length }, () => null);
             }
-            // Model-substitution guard. A local server (LMStudio/Ollama) can
-            // return HTTP 200 with a DIFFERENT model's vectors when the
-            // requested model isn't the one currently loaded — e.g. a shared
-            // endpoint where another tool keeps a smaller embedding model hot.
-            // The substituted vectors have a different dimensionality and live
-            // in a different vector space, so storing them under our requested
-            // model's identity silently corrupts the index. Refuse the result
-            // instead of trusting the substitute.
+            // Vectors from another model must not be indexed under the requested model.
+            // Indexing vectors under another model's identity silently corrupts the index, so the client refuses them.
             const servedModel = typeof body.model === "string" ? body.model : "";
             if (this.model && servedModel && !embeddingModelsMatch(servedModel, this.model)) {
                 if (!this.modelMismatchLogged) {
@@ -366,8 +302,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 return Array.isArray(embedding) ? Float32Array.from(embedding) : null;
             });
 
-            // A response with no usable vectors is still a failure — the
-            // endpoint is up but not actually embedding.
+            // A response with no usable vectors is a failed embedding response.
             if (results.every((r) => r === null)) {
                 this.recordFailure(isProbe);
             } else {
@@ -376,17 +311,14 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
 
             return results;
         } catch (error) {
-            // AbortError (our fetch timeout or outer caller abort) lands here too.
+            // The catch block also receives `AbortError` from the fetch timeout or the caller abort signal.
             const isAbort =
                 error instanceof Error &&
                 (error.name === "AbortError" || error.message.includes("aborted"));
             if (isAbort) {
-                // Distinguish outer-caller abort (not our problem — don't penalize
-                // the endpoint) from our internal timeout (endpoint is slow).
+                // Caller aborts do not penalize the endpoint; internal timeouts do.
                 if (signal?.aborted) {
-                    // Caller gave up. Don't count this against the endpoint.
-                    // Half-open probe slot is released without state change so
-                    // the next real call can probe again.
+                    // Releasing the half-open probe slot without changing circuit state lets the next real call probe again.
                 } else {
                     log(
                         `[magic-context] openai-compatible embedding request timed out after ${FETCH_TIMEOUT_MS}ms`,
@@ -420,31 +352,24 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     }
 
     /**
-     * Decide what this caller should do:
-     *   - "allow":         CLOSED — proceed with a real request, not as a probe
-     *   - "probe":         HALF_OPEN — this caller owns the probe slot
-     *   - "short_circuit": OPEN or half-open probe already in flight — return nulls
+     * "allow" means the circuit is CLOSED; the caller makes a non-probe request.
+     * "probe" means the circuit is HALF_OPEN; the caller owns the probe slot.
+     * "short_circuit" means the circuit is OPEN or a half-open probe is in flight; the caller returns nulls.
      *
-     * Claiming the probe slot (setting `halfOpenProbeInFlight = true`) is done
-     * here, synchronously, so concurrent callers see the flag and short-circuit.
+     * This function synchronously sets `halfOpenProbeInFlight` before returning so concurrent callers short-circuit.
      */
     private claimProbeOrShortCircuit(): "allow" | "probe" | "short_circuit" {
         if (this.circuitOpenUntil === 0) {
-            // CLOSED — normal operation.
             return "allow";
         }
         if (Date.now() < this.circuitOpenUntil) {
-            // OPEN — short-circuit.
             return "short_circuit";
         }
-        // Open timer elapsed — transition to HALF_OPEN.
+        // The circuit enters HALF_OPEN after `circuitOpenUntil` elapses.
         if (this.halfOpenProbeInFlight) {
-            // Someone else is already probing; short-circuit.
             return "short_circuit";
         }
-        // Claim the probe slot. Do NOT reset circuitOpenUntil yet — that
-        // happens on probe success via recordSuccess(). If the probe fails,
-        // recordFailure() will push circuitOpenUntil forward.
+        // The half-open transition sets `halfOpenProbeInFlight` but preserves `circuitOpenUntil` until `recordSuccess()`.
         this.halfOpenProbeInFlight = true;
         log("[magic-context] openai-compatible embedding: circuit half-open, probing endpoint");
         return "probe";
@@ -452,7 +377,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
 
     private recordFailure(isProbe: boolean): void {
         if (isProbe) {
-            // Canonical half-open: single probe failure re-opens the circuit.
+            // A single half-open probe failure reopens the circuit.
             this.circuitOpenUntil = Date.now() + OPEN_DURATION_MS;
             if (!this.openLogged) {
                 log(
@@ -477,7 +402,6 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 );
                 this.openLogged = true;
             }
-            // Clear the window; when the circuit half-opens later we start
             // counting fresh.
             this.failureTimes = [];
         }
@@ -498,7 +422,6 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         if (Date.now() < this.circuitOpenUntil) {
             return this.halfOpenProbeInFlight ? "half_open" : "open";
         }
-        // Timer elapsed but no probe has been issued yet — logically half-open.
         return "half_open";
     }
     _getFailureCount(): number {

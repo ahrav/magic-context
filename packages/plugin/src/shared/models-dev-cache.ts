@@ -1,28 +1,18 @@
 /**
- * Resolve per-model context limits from OpenCode's SDK — the single source of
- * truth — for OpenCode sessions.
+ * OpenCode sessions resolve per-model limits only through OpenCode's SDK.
  *
- * `client.config.providers()` returns OpenCode's fully-resolved config: the
- * live models.dev cache + compiled-in snapshot + opencode.json custom-provider
- * overrides + auth-plugin caps (e.g. the Codex-OAuth gpt-5.5 400k cap). We
- * consume ONLY that. We no longer read OpenCode's `models.json` file ourselves:
- * a torn read mid-write produced impossible limits (a 6748 "limit" for a session
- * that had run for hours), and a stale on-disk copy out-voted the live
- * auth-resolved cap (922k vs the real 400k). OpenCode reads that file safely in
- * its own process and hands us the merged answer.
+ * Use `client.config.providers()` to resolve OpenCode session limits.
+ * Avoid direct reads of `models.json`; a concurrent write can expose partial data.
  *
  * Layers:
- *   1. `apiCache` (authoritative): warmed once at startup from the SDK; seeded
- *      from a persisted last-known-good file on cold start so a restart uses the
- *      real limit immediately (no 128k-default budget-collapse window).
+ * Warm `apiCache` once at startup from the SDK.
+ * Seed `apiCache` from persisted values so restarts retain limits before SDK warming completes.
  *
- * All cached values are bounded to a sane [20k, 3M] range on insert, so torn /
- * unconfigured-default garbage can never be returned or persisted. The startup
- * warm retries a couple times when OpenCode's provider service isn't ready yet.
+ * Clamp cached values to [20,000, 3,000,000] before returning or persisting them.
+ * Retry startup warming when OpenCode's provider service is unavailable.
  *
- * Pi does NOT use this — it resolves from its own `ctx.getModel().contextWindow`
- * (instant at extension load), so `getSdkContextLimit()` returns `undefined`
- * for Pi and Pi's own path is used.
+ * Pi resolves its limit through `ctx.getModel().contextWindow`, not `getSdkContextLimit()`.
+ * `getSdkContextLimit()` returns `undefined` for Pi.
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -46,19 +36,12 @@ interface OpencodeClientLike {
     };
 }
 
-// Plausible bounds for a real model's prompt limit. A value outside this range
-// is physically impossible for an agentic session and signals a transient/garbage
-// read — e.g. a torn read of OpenCode's `models.json` mid-write once produced
-// `contextLimit=6748` (smaller than a single system prompt) for a session that
-// had been running for hours past 200k+ (issue #117). Such values must be
-// REJECTED, not trusted as a "smaller real cap". A genuinely smaller real limit
-// still comes through the overflow-detection path (detectedContextLimit).
+// Reject out-of-range catalog limits; `detectedContextLimit` handles lower observed limits.
 export const MIN_SANE_LIMIT = 20_000;
 export const MAX_SANE_LIMIT = 3_000_000;
 
-/** True when `limit` is a plausible real prompt window — used to reject torn /
- *  unconfigured-default garbage in BOTH harnesses (OpenCode's SDK values and
- *  Pi's reported `contextWindow`). Exported so Pi applies the identical bound. */
+/** `isSaneLimit` rejects torn and unconfigured-default values from both harnesses.
+ * Export `isSaneLimit` so Pi and OpenCode reject the same values. */
 export function isSaneLimit(limit: number | undefined): limit is number {
     return typeof limit === "number" && limit >= MIN_SANE_LIMIT && limit <= MAX_SANE_LIMIT;
 }
@@ -84,8 +67,8 @@ interface CachedModelMetadata {
     vision?: boolean;
 }
 
-// Proven-separate allowlist only. Unknown providers reserve by default because
-// wasting some input capacity is safer than a shared-window hard rejection.
+// Only allowlisted providers use separate output quotas.
+// Unknown providers reserve output capacity to avoid shared-window rejections.
 const SEPARATE_OUTPUT_QUOTA_PROVIDERS = new Set(["google", "google-antigravity"]);
 const MIN_PLAUSIBLE_CONTEXT_LIMIT = 1024;
 const OUTPUT_RESERVE_CAP_RATIO = 0.25;
@@ -93,32 +76,25 @@ let outputReserveConfig: OutputReserveConfig | undefined;
 const reserveClampLogSeen = new Set<string>();
 
 /**
- * Authoritative source (OpenCode only): populated async from the SDK
- * `config.providers()`, which is OpenCode's fully-resolved config — models.dev +
- * compiled-in snapshot + opencode.json overrides + auth-plugin caps (e.g. the
- * Codex-OAuth gpt-5.5 400k cap). When present, this WINS unconditionally; the
- * disk file is never consulted (no torn-read exposure, no stale value
- * out-voting the live limit). Pi never warms this — it has its own
- * `contextWindow` source — so for Pi this stays null and resolution falls
- * through to the file fallback exactly as before.
+ * `apiCache` is populated asynchronously from OpenCode's SDK.
+ * `client.config.providers()` is the resolved OpenCode configuration source.
+ * Ignore persisted values after `apiCache` has SDK data.
+ * Pi does not populate apiCache because it resolves limits from contextWindow; it falls through to the file fallback.
  */
 let apiCache: Map<string, CachedModelMetadata> | null = null;
 let apiLoadedAt = 0;
 
-// Persisted last-known-good apiCache (OpenCode). Survives restart so a cold
-// start uses the real limit instantly instead of falling to the disk file or the
-// 128k default for the warm-up window (which over-shrinks the history budget).
-// Harness-scoped: only OpenCode warms/persists apiCache, so Pi's file (which is
-// never written) stays absent and Pi seeds nothing — keeping Pi byte-identical.
+// The persisted OpenCode apiCache survives restarts, so cold starts use limits before SDK warm-up.
+// Only OpenCode warms and persists apiCache; Pi does not seed it.
 let persistSeedLoaded = false;
 
 function persistFilePath(): string {
     return join(getMagicContextStorageDir(), `model-context-limits-${getHarness()}.json`);
 }
 
-/** Seed apiCache from the persisted last-known-good file once per process, only
- *  when apiCache hasn't been warmed yet. Values are sane-filtered on load so a
- *  stale garbage entry can never resurrect. */
+/** Seeding before SDK warm-up preserves last-known-good limits across restarts.
+ * Invalid persisted metadata is discarded before it enters apiCache.
+ * */
 function loadPersistedApiCacheOnce(): void {
     if (persistSeedLoaded || apiCache !== null) return;
     persistSeedLoaded = true;
@@ -160,13 +136,12 @@ function loadPersistedApiCacheOnce(): void {
             );
         }
     } catch {
-        // No persisted cache yet, or unreadable — fall through to file/SDK.
+        // Persisted-cache read failures leave apiCache unset.
     }
 }
 
-/** Atomically persist the current (sane-filtered) apiCache so the next process
- *  cold-starts with the real limits. Temp-write + rename so a concurrent reader
- *  never sees a torn file (the exact failure mode we're eliminating). */
+/** Temp-write and rename prevent readers from observing a torn file.
+ * */
 function persistApiCache(): void {
     if (!apiCache) return;
     const obj: Record<string, CachedModelMetadata> = {};
@@ -193,7 +168,7 @@ function persistApiCache(): void {
         }
         renameSync(tmp, target);
     } catch {
-        // best-effort — a failed persist only loses cold-start warmth, not correctness
+        // A failed persist loses only cold-start cache warmth, not correctness.
     }
 }
 
@@ -211,7 +186,7 @@ function modelKeyLookupOrder(providerID: string, modelID: string): string[] {
     return [...new Set(candidates)];
 }
 
-/** Resolve the user-tier output reservation for one runtime model. */
+/* */
 export function resolveOutputReserve(
     providerID: string,
     modelID: string,
@@ -239,14 +214,12 @@ export function setOutputReserveConfig(config: OutputReserveConfig | undefined):
 }
 
 /**
- * Resolve the usable prompt budget from raw provider metadata.
  *
- * A genuinely smaller input cap is already pre-carved and wins unchanged. All
- * other providers reserve generated tokens from the shared context window by
- * default, except the small allowlist whose APIs document a separate output
- * quota. `output_reserve` overrides that shared/separate decision, including 0
- * to disable reservation. Reservation can never leave less than half the raw
- * context window or the module's 1024-token plausibility floor.
+ * A smaller input cap takes precedence unchanged.
+ * Providers outside the separate-output-quota allowlist reserve generated tokens from the shared context window by default.
+ * The allowlisted APIs use a separate output quota.
+ * output_reserve = 0 disables output-token reservation; other values override the provider default.
+ * Reservation leaves at least half the raw context window and at least 1024 tokens.
  */
 export function resolveLimit(
     limit: ModelLimit | undefined,
@@ -313,9 +286,7 @@ function setCachedModelMetadata(
           ? inputLimit
           : undefined;
 
-    // Validate the raw provider metadata before reservation. A legitimate 20K
-    // context may resolve below MIN_SANE_LIMIT after carving output, but it must
-    // still remain cached; the 50%/1024 usable floor protects the result.
+    // Raw-metadata validation precedes reservation so a valid raw limit remains cacheable after output reservation.
     if (rawLimit === undefined) return;
 
     const values = [model?.capabilities, model?.modalities, model?.input, model?.attachment];
@@ -329,8 +300,8 @@ function setCachedModelMetadata(
                 .includes("vision"),
     );
     const value: CachedModelMetadata = {
-        // Keep a sane raw fallback for old persisted-cache readers. Runtime
-        // resolution below uses context/input/output so user overrides stay live.
+        // The sane raw limit remains the fallback when no reserved limit is usable.
+        // The resolver resolves context, input, and output limits at use time so user overrides remain live.
         limit: rawLimit,
         contextLimit: isSaneLimit(contextLimit) ? contextLimit : undefined,
         inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
@@ -340,8 +311,7 @@ function setCachedModelMetadata(
     cache.set(key, value);
 
     // OpenCode creates derived model IDs from experimental.modes
-    // e.g. gpt-5.4 + modes.fast → gpt-5.4-fast. These inherit the same
-    // context limit as the parent model.
+    // Derived IDs such as gpt-5.4-fast inherit their parent model's context limit.
     const modes = model?.experimental?.modes;
     if (modes && typeof modes === "object") {
         for (const mode of Object.keys(modes)) {
@@ -351,20 +321,13 @@ function setCachedModelMetadata(
 }
 
 /**
- * Asynchronously refresh the API-layer cache from OpenCode's SDK.
  *
- * Call this at plugin startup and from the issue #77 regression-recovery path.
- * OpenCode's `/config/providers` endpoint returns every provider with full
- * model metadata — including `limit.context` — resolved through the same path
- * OpenCode itself uses (live cache + compiled-in snapshot + opencode.json
- * overrides + derived experimental modes + auth-plugin caps).
+ * Plugin startup and authentication recovery refresh model metadata.
+ * The provider endpoint supplies resolved model metadata.
  *
- * `retries`/`retryDelayMs`: when OpenCode's provider service isn't ready at our
- * startup, `config.providers()` can return an empty/no-providers payload. Retry
- * a few times so the cache warms instead of leaving the session on the 128k
- * default until the next restart. A successful load (any providers) stops early.
+ * The loader retries empty provider responses so startup can populate the limit cache.
+ * At startup, `config.providers()` can return no providers.
  *
- * Safe to call concurrently; only overwrites the cache on success.
  */
 export async function refreshModelLimitsFromApi(
     client: OpencodeClientLike,
@@ -381,28 +344,16 @@ export async function refreshModelLimitsFromApi(
     }
 }
 
-// Once-per-process latch for the after-auth re-warm below.
 let authRewarmDone = false;
 
 /**
- * Re-warm the limit cache ONCE per process, after auth is provably live.
+ * After a successful warm, `authRewarmDone` prevents further `config.providers()` calls until reset.
  *
- * The startup warm (index.ts) can run before the user's provider auth is
- * loaded. When it does, an auth-conditional limit patch hasn't applied yet, so
- * `config.providers()` returns the RAW catalog limit (e.g. OpenAI gpt-5.5 OAuth
- * is downshifted to a 272k input cap by OpenCode's Codex auth plugin only when
- * `ctx.auth.type === "oauth"`; before auth loads it reports the raw 922k). That
- * too-high value gets cached AND persisted as last-known-good, survives
- * restarts, and the existing recovery only re-resolves a too-LOW limit
- * (overflow / `percentage > 100`), so a too-HIGH one never self-corrects: the
- * sidebar shows huge headroom while the backend rejects at the real cap (#179).
+ * Authentication-specific limits can differ from unauthenticated catalog limits.
+ * The startup cache can contain unauthenticated limits.
  *
- * The first `message.updated` carrying usage tokens proves a request succeeded,
- * so auth + providers are fully resolved. Re-warming there overwrites any stale
- * pre-auth limit with the live auth-adjusted one. Idempotent and cheap: a single
- * `config.providers()` round-trip, then a no-op for the rest of the process. The
- * latch is set before the await so concurrent `message.updated` events don't
- * stack duplicate warms; a failed warm resets it so a later message retries.
+ * `authRewarmDone` is set before the await to suppress concurrent refreshes.
+ * A failed refresh clears `authRewarmDone` so a later call can retry.
  */
 export async function refreshModelLimitsAfterAuthOnce(client: OpencodeClientLike): Promise<void> {
     if (authRewarmDone) return;
@@ -411,12 +362,12 @@ export async function refreshModelLimitsAfterAuthOnce(client: OpencodeClientLike
     if (!ok) authRewarmDone = false;
 }
 
-/** Test-only: reset the after-auth re-warm latch between cases. */
+/* */
 export function resetAuthRewarmLatchForTest(): void {
     authRewarmDone = false;
 }
 
-/** Single SDK fetch + cache rebuild. Returns true when providers were loaded. */
+/* */
 async function refreshModelLimitsOnce(client: OpencodeClientLike): Promise<boolean> {
     try {
         const result = await client.config.providers();
@@ -451,8 +402,7 @@ async function refreshModelLimitsOnce(client: OpencodeClientLike): Promise<boole
         const previousSize = apiCache?.size ?? null;
         apiCache = map;
         apiLoadedAt = Date.now();
-        // Persist the freshly-resolved (sane-filtered) limits so the next process
-        // cold-starts with the real values instead of the 128k default.
+        // `persistApiCache` preserves sane-filtered limits for the next cold start.
         persistApiCache();
 
         if (previousSize === null) {
@@ -478,24 +428,17 @@ async function refreshModelLimitsOnce(client: OpencodeClientLike): Promise<boole
 }
 
 /**
- * Resolve a model's prompt limit from OpenCode's SDK (`config.providers()`),
- * the single source of truth: it already merges models.dev + compiled-in
- * snapshot + opencode.json overrides + auth-plugin caps (e.g. the Codex-OAuth
- * gpt-5.5 400k cap). We deliberately do NOT read OpenCode's `models.json` file
- * ourselves — a torn read of that file mid-write produced garbage limits, and a
- * stale on-disk copy out-voted the live auth-resolved cap (922k vs the real
- * 400k). OpenCode reads that file safely within its own process and exposes the
- * merged result here.
+ * The resolver uses OpenCode's `config.providers()` SDK result for prompt limits.
+ * The resolver does not read OpenCode's `models.json` file directly.
+ * A read of that file during a write can produce invalid limits.
  *
  * Resolution:
- *   1. Seed `apiCache` from the persisted last-known-good file once (cold start).
- *   2. Resolve the sane raw SDK metadata into its output-reserved usable value.
- *   3. `undefined` when the SDK hasn't reported this model yet → the caller
- *      defaults / retries (the startup warm retries when OpenCode isn't ready).
+ * Cold start seeds `apiCache` from the persisted last-known-good file once.
+ * The resolver converts raw SDK metadata into an output-reserved usable limit.
+ * `undefined` leaves fallback and retry behavior to the caller.
  *
- * OpenCode-only: Pi never warms `apiCache` (it resolves from its own
- * `ctx.model.contextWindow`), so for Pi this returns `undefined` and Pi's
- * own resolution path is used.
+ * Pi resolves limits from `ctx.model.contextWindow` instead of warming `apiCache`.
+ * Pi uses `ctx.model.contextWindow` when this function returns `undefined`.
  */
 export function getSdkWindowGeometry(
     providerID: string,
@@ -586,10 +529,8 @@ export function getSdkContextLimit(
 }
 
 /**
- * Return only a provider-declared input cap. A combined context window is useful
- * for scheduling but is not safe as a fail-closed prompt boundary.
  */
-/** Resolve image-input support from the same models.dev metadata cache as limits. */
+/** Image-input support uses the same models.dev metadata cache as limits. */
 export function modelSupportsVision(providerID: string, modelID: string): boolean {
     loadPersistedApiCacheOnce();
     if (!apiCache) return false;
@@ -615,13 +556,8 @@ export function getSdkInputLimit(providerID: string, modelID: string): number | 
 }
 
 /**
- * Look up a model's limit in the cache, with an ollama-style tag-suffix
- * fallback. ollama invokes cloud models with a tag at runtime
- * (`deepseek-v4-pro:cloud`) while the underlying metadata key is tag-less
- * (`deepseek-v4-pro`), so an exact-only match misses.
+ * Exact lookup precedes fallback so models with tagged metadata remain distinct.
  *
- * Strategy: exact match first (never collapses a legitimately-tagged model),
- * then retry once with the last `:tag` segment stripped.
  */
 function lookupMetadataWithTagFallback(
     cache: Map<string, CachedModelMetadata> | null,
@@ -639,14 +575,14 @@ function lookupMetadataWithTagFallback(
     return undefined;
 }
 
-/** Clear in-memory caches (for testing and the regression-recovery refetch). */
+/* */
 export function clearModelsDevCache(): void {
     apiCache = null;
     apiLoadedAt = 0;
     persistSeedLoaded = false;
 }
 
-/** Inspection helpers (for logging / debugging). */
+/* */
 export function getModelsDevCacheState(): {
     apiLoaded: boolean;
     apiCount: number;

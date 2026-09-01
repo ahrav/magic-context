@@ -325,10 +325,6 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 				expect(explicit.get(toolId)?.parameters).toEqual(
 					implicit.get(toolId)?.parameters,
 				);
-				// Pi uses TypeBox rather than OpenCode's Zod adapter, so its
-				// parameter object has host metadata. The A1 contract here is that
-				// IDs stay aligned and prompt-surface selection leaves those
-				// Pi-owned bytes unchanged.
 				expect(
 					Object.keys(implicit.get(toolId)?.parameters.properties ?? {}).sort(),
 				).toEqual(Object.keys(expected.parameters).sort());

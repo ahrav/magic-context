@@ -8,10 +8,6 @@
       "hard": 60000,
       "p95": 25000
     },
-    "fresh_macos_transport_aggregate": {
-      "hard": 15000,
-      "p95": 5000
-    },
     "linux_generation_stage": {
       "hard": 45000,
       "p95": 20000
@@ -19,10 +15,6 @@
     "linux_synapse_certification_post_publication": {
       "hard": 90000,
       "p95": 45000
-    },
-    "macos_generation_stage": {
-      "hard": 10000,
-      "p95": 3000
     },
     "retained_transport": {
       "hard": 5000,
@@ -193,28 +185,12 @@
     "reason": "offline semantic-oracle evidence not yet recorded against real locked ORT/model bytes"
   },
   "package_size_limits_bytes": {
-    "@cortexkit/mc-host-darwin-arm64": {
-      "compressed_max": 62914560,
-      "unpacked_max": 157286400
-    },
-    "@cortexkit/mc-host-darwin-x64": {
-      "compressed_max": 62914560,
-      "unpacked_max": 157286400
-    },
     "@cortexkit/mc-host-linux-x64-gnu": {
       "compressed_max": 471859200,
       "unpacked_max": 734003200
     }
   },
   "platform_floors": {
-    "darwin-arm64": {
-      "dev_fd_exec": true,
-      "os_min": "13.5"
-    },
-    "darwin-x64": {
-      "dev_fd_exec": true,
-      "os_min": "13.5"
-    },
     "linux-x64-gnu": {
       "glibc_min": "2.28",
       "kernel_min": "4.18",
@@ -226,7 +202,7 @@
     "id": "mc-host-release",
     "version": "0.38.0"
   },
-  "release_contract_sha256": "0d5e2af2b901424ac78a39ff8b674ac8ad8a7f343ba88368037f11a84dcf940d",
+  "release_contract_sha256": "ab3b41c0f4f99f917dc4ac03515a2a36f50d5cb0dde603b4518cf47480e975e2",
   "rust_runtime": {
     "fastembed": "6.0.0",
     "ort": "2.0.0-rc.13",

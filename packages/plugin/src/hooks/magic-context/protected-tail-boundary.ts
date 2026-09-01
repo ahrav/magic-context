@@ -56,12 +56,10 @@ export interface ResolvedBoundaryContext {
     cacheNamespace: string;
     createdAt?: number;
     /**
-     * Durable per-message token totals (sum of the message's active tag
-     * token_counts), keyed by real message id. When present, the boundary's
-     * token index reads these instead of re-tokenizing the raw session — the
-     * restart-durable fast path. A message missing here (or with a NULL-count
-     * tag) falls back to live tokenization. Built once in resolveBoundaryContext
-     * from the tag store; omitted (→ all-live) when the caller has no tag store.
+     * Maps each real message ID to the sum of its active tags' `token_counts`.
+     * When present, `storedTokenTotals` lets the boundary token index avoid re-tokenizing raw session messages.
+     * A missing message entry or NULL tag-store count falls back to live tokenization.
+     * When no tag store exists, omit `storedTokenTotals` to tokenize every message live.
      */
     storedTokenTotals?: Map<string, number>;
 }
@@ -158,7 +156,7 @@ const NORMAL_HYSTERESIS_TOKENS = 256;
 
 export const RECOVERY_NO_HEAD_LIMIT = 2;
 
-/** A tiny complete head is still worth summarizing at force pressure; below this, wait for a real arc/user turn. */
+/** At force pressure, summarize a complete eligible head at or above `deriveMinForceEligibleTokens(scaledN)`; otherwise wait for a real arc or user turn. */
 export const MIN_FORCE_ELIGIBLE_TOKENS_CAP = 1_000;
 
 export function deriveMinForceEligibleTokens(scaledN: number): number {
@@ -349,9 +347,8 @@ function fenceWrapupBoundaryForToolArcs(args: {
         let next = boundary;
         for (const arc of args.arcs) {
             if (arc.resOrdinal === null) {
-                // An open invocation at or after the watermark is already in the kept
-                // tail. An older open invocation is treated as stale/interrupted, which
-                // matches the normal boundary resolver's staleness rule.
+                // An open invocation at or after the watermark is already in the kept tail.
+                // An open invocation before the watermark is stale or interrupted.
                 continue;
             }
             if (
@@ -384,11 +381,10 @@ function applyHeadCap(args: {
     for (const arc of arcs) {
         const resOrdinal = arc.resOrdinal;
         if (resOrdinal === null) {
-            // Mirror the boundary fence: only a RECENT open arc (the in-flight
-            // call) caps the head. A stale open arc in the eligible head is an
-            // interrupted invocation and must not shrink the head to its
-            // ordinal (which, for a dead arc at the head edge, would collapse
-            // the eligible region and starve the historian).
+            // Only a recent open arc, the in-flight call, caps the eligible head.
+            // A stale open arc in the eligible head must not cap the head.
+            // A stale open arc in the eligible head must not shrink the head to that arc's ordinal.
+            // Do not cap the head at a stale arc's ordinal: a dead arc at the head edge would collapse the eligible region and starve the historian.
             if (
                 arc.invOrdinal >= recentOpenArcCutoff &&
                 arc.invOrdinal >= offset &&
@@ -448,10 +444,9 @@ export function resolveProtectedTailBoundary(
     const createdAt = ctx.createdAt ?? Date.now();
     const messages = readRawSessionMessages(ctx.sessionId);
     const storedTotals = ctx.storedTokenTotals;
-    // When a tail-only slice is primed, `messages` holds just the eligible tail
-    // with absolute ordinals; the index must be sized to the ABSOLUTE total so
-    // every offset-forward query matches a whole-session read. null → whole
-    // session (index uses messages.length, unchanged).
+    // When a tail-only slice is primed, `messages` holds the eligible tail with absolute ordinals.
+    // Size the index to the absolute session message count.
+    // A `null` slice indexes the whole session with `messages.length`.
     const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
@@ -495,11 +490,10 @@ export function resolveProtectedTailBoundary(
 
     if (ctx.mode === "manual-full-recomp") {
         const arcs = buildToolArcs(messages);
-        // Staleness gate (mirrors the trigger path): only the current in-flight
-        // call — an open arc within the live recent window — may hold back a full
-        // recomp. A stale/interrupted open arc (its result will never arrive)
-        // must NOT block /ctx-recomp; otherwise the same dead invocation that
-        // froze the historian also freezes the user's manual escape hatch.
+        // Only an open arc within the live recent window may hold back a full recomp.
+        // A stale or interrupted open arc must not block `/ctx-recomp` because its result will never arrive.
+        // A stale or interrupted open arc must not block `/ctx-recomp`.
+        // A dead invocation must not freeze the historian or `/ctx-recomp`.
         const recompTarget = deriveProtectedTailTokenTarget({
             contextLimit: ctx.contextLimit,
             executeThresholdPercentage: ctx.executeThresholdPercentage,
@@ -561,12 +555,8 @@ export function resolveProtectedTailBoundary(
         : target.N;
     const arcs = buildToolArcs(messages);
     let boundary = index.findSuffixStartForTokens(scaledN);
-    // The size-walk start (last scaledN tokens) is the live protected-tail
-    // window. Open tool arcs at/after it may be the current in-flight call and
-    // are protected; open arcs before it are stale (interrupted) and must not
-    // fence the boundary. This auto-scales with context (scaledN scales with the
-    // window), so a single dead invocation at the eligible-head edge can no
-    // longer collapse the boundary to offset and freeze the historian.
+    // Open tool arcs at or after recentOpenArcCutoff remain protected.
+    // Open arcs before recentOpenArcCutoff do not fence the boundary.
     const recentOpenArcCutoff = boundary;
     let boundaryReason = boundary === 1 ? "whole-session-smaller-than-tail" : "size-walk";
     const tokenAtBoundary = index.tokenForOrdinal(boundary);
@@ -601,20 +591,9 @@ export function resolveProtectedTailBoundary(
     let runtimeFloor = offset;
     if (ctx.migrationFloorActive) runtimeFloor = Math.max(runtimeFloor, ctx.priorBoundaryOrdinal);
     let protectedTailStart = Math.max(boundary, runtimeFloor);
-    // Live-prompt floor: on routine (non-emergency) passes the boundary must
-    // never cross the newest MEANINGFUL user message — compacting the prompt
-    // the agent is actively answering replaces it with a narration mid-turn
-    // and renders the compaction divider at the live tail (observed in
-    // production on a tool-heavy session: the in-flight turn's suffix was all
-    // assistant/tool messages, so pure token sizing left the current prompt
-    // eligible — structurally impossible under v2's user-turn rule, regained
-    // here). Emergency-scaled re-resolution (force-band/95 second attempt) may
-    // deliberately cross it: a sparse session with one user turn and a huge
-    // assistant tail must stay compactable under genuine pressure (#132),
-    // and overflow is strictly worse than narrating the live prompt.
-    // The floor lifts at the derived force pressure for the same reason — the
-    // sparse #132 session (one user turn, huge assistant tail) must expose a
-    // runnable head on the force path's FIRST attempt, not only after the
+    // Except for the hysteresis reset, non-emergency passes below forceMaterializationPercentage lower protectedTailStart to the newest meaningful user message at or after offset.
+    // Emergency-scaled passes may compact the newest meaningful user message.
+    // usagePercentage at or above forceMaterializationPercentage skips the live-prompt floor when emergencyTailScale is unset.
     // emergency-scaled retry.
     const forceMaterializationPercentage = escalationBands(
         ctx.executeThresholdPercentage,
@@ -632,7 +611,6 @@ export function resolveProtectedTailBoundary(
             protectedTailStart = Math.min(protectedTailStart, lastMeaningfulUserOrdinal);
         }
     }
-    // Keep defer-pass cache keys stable when a tiny token fluctuation would move the ideal by one message.
     if (
         protectedTailStart > offset &&
         index.rangeTokens(offset, protectedTailStart) <= NORMAL_HYSTERESIS_TOKENS
@@ -695,13 +673,6 @@ export function resolveBoundaryContext(args: {
     providerShapeVersion?: "opencode-v1" | "pi-folded-v1";
     cacheNamespace?: string;
     /**
-     * Tagger load-scoping floor (OpenCode only). When > 0, the stored-token map
-     * is loaded only for tags at/above this floor (the live wire) instead of
-     * scanning the whole session's tags (~100k rows → ~50ms every pass). The
-     * boundary only indexes the live slice (all >= floor), and any slice message
-     * the scoped map misses degrades to live tokenization of the same content,
-     * so the cut point is byte-identical. Omit / 0 = full scan (Pi, recomp,
-     * tests) — unchanged.
      */
     taggerFloor?: number;
 }): ResolvedBoundaryContext {
@@ -728,10 +699,6 @@ export function resolveBoundaryContext(args: {
         meta = seedResult;
         migrationFloorActive = seedResult.seeded;
     }
-    // Durable token source: sum each message's precomputed tag token_counts so
-    // the boundary indexes raw messages without re-tokenizing 60k+ messages on
-    // a cold pass (the 16s→ms win). Best-effort: a store failure just falls back
-    // to all-live tokenization.
     let storedTokenTotals: Map<string, number> | undefined;
     try {
         storedTokenTotals = getAllStatusTagTokenTotalsFlat(
@@ -801,11 +768,6 @@ export function resolveWrapupProtectedTailBoundary(
     const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
     const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
 
-    // The keep watermark counts RAW messages (any role), not user turns: in
-    // agentic sessions one user turn can span 100+ tool messages, so a
-    // user-turn count would keep an unbounded token tail and defeat the
-    // pre-model-switch use case. Raw counting gives a bounded, predictable
-    // keep; the arc fence and user-boundary snap below still keep the actual
     // cut safe.
     const rawMessagesAboveLastCompartment = Math.max(0, anchorRawMessageCount - offset + 1);
     const keep = Math.max(1, Math.floor(args.messagesToKeep));
@@ -841,10 +803,7 @@ export function resolveWrapupProtectedTailBoundary(
             arcs,
             lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
         });
-        // User snapping can move from a later tool invocation to an earlier queued
-        // user turn that sits inside another closed tool arc. Re-fence after the
-        // snap; the fence helper iterates so overlapping arcs move to a stable
-        // invocation boundary instead of splitting an invocation/result pair.
+        // Re-fence after semantic snapping to preserve tool-arc boundaries.
         if (refenced !== targetProtectedTailStart) boundaryReason = "manual-wrapup-tool-arc";
         targetProtectedTailStart = refenced;
     }
@@ -906,10 +865,6 @@ export function resolveWrapupProtectedTailBoundary(
 export function getRawHistoryEligibility(db: Database, sessionId: string): RawHistoryEligibility {
     const lastCompartmentEnd = getLastCompartmentEndMessage(db, sessionId);
     const offset = Math.max(1, lastCompartmentEnd + 1);
-    // When a tail-only slice is primed in scope, its `.length` is the tail size,
-    // not the absolute total — read the stashed absolute count instead. Without a
-    // tail slice (whole-session array or Pi provider) this is null and we use the
-    // array length exactly as before.
     const absoluteCount = getCachedAbsoluteMessageCount(sessionId);
     const rawMessageCount = absoluteCount ?? readRawSessionMessages(sessionId).length;
     return {
@@ -952,9 +907,6 @@ export function validateBoundarySnapshot(args: {
         };
     }
     const messages = readRawSessionMessages(snapshot.sessionId);
-    // Readers preserve ordinal slots for malformed rows by skipping the element
-    // but keeping later message ordinals absolute. Compare against the same
-    // gap-preserving measure the resolver used, not the compacted array length.
     const currentRawMessageCount = messages.reduce(
         (max, message) => Math.max(max, message.ordinal),
         messages.length,
@@ -991,11 +943,6 @@ export function validateBoundarySnapshot(args: {
             };
         }
     }
-    // Apply the SAME clamp the resolver applies (`offset = Math.max(1, end+1)`,
-    // line ~328): a zero-compartment session has lastCompartmentEnd = -1, so
-    // the unclamped expectation (0) would mismatch the clamped snapshot offset
-    // (1) and permanently reject every FIRST-compartment snapshot as stale —
-    // a fresh session could never publish its first compartment.
     const expectedOffset = Math.max(
         1,
         getLastCompartmentEndMessage(args.db, snapshot.sessionId) + 1,
@@ -1040,10 +987,6 @@ export function createDefaultBoundarySnapshotForTests(
         1,
         Math.min(rawMessageCount + 1, getLegacyProtectedTailStartOrdinal(sessionId)),
     );
-    // Real true-raw sum over the eligible head — the trigger semantics under
-    // test (tail_size vs TC, isMeaningful) depend on this being the genuine
-    // tool-output-inclusive size, not a hardcoded 0 (which made tests of the
-    // true-raw/TC distinction pass vacuously).
     const index = buildTrueRawTokenIndex(sessionId, messages, {
         providerShapeVersion: "opencode-v1",
         cacheNamespace: `test:${sessionId}`,

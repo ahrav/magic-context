@@ -82,7 +82,7 @@ classes the original map did not name.
 | F10 macOS ring execution | A macOS host that actually constructs a `Ring` | **No** — the macOS CI step names two integration files and excludes the lib target, so no macOS job reaches `Ring::create` |
 | F11 non-4096 page host | A kernel page size other than 4096, or an injectable page size in the layout and prefault paths | **No** — and note CI already provisions a 16 KiB host every run, which is precisely the one that constructs no `Ring` |
 | F12 duplex-capable peer | A peer harness able to hold frames outstanding in both directions at once | **No** — the test peer's send and receive are both synchronous and thread-confined |
-| F13 iceoryx cross-process pairing (moot: `0f336d3c` deleted the iceoryx backend) | Two processes sharing one iceoryx service | **No, and not constructible** — the service name is random, private, and has no accessor; the port bounds are consumed by the creator. Requires an API change |
+| F13 iceoryx cross-process pairing (invalidated: `0f336d3c` deleted the iceoryx backend) | Two processes sharing one iceoryx service | **No, and not constructible** — the service name is random, private, and has no accessor; the port bounds are consumed by the creator. Requires an API change |
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
@@ -96,11 +96,11 @@ classes the original map did not name.
 | macos-object-creation-leaks-no-shm-name | F10 plus F3 on `shm_unlink`, or a kill in the open-to-unlink window, plus an oracle over the Darwin shm namespace | No |
 | layout-region-offsets-are-real-page-aligned | F11 | No |
 | page-size-dependent-setup-runs-on-a-non-4096-page-host | F11 | No |
-| iceoryx-descriptor-rejection-is-terminal-or-declared (moot: backend deleted by `0f336d3c`) | A sequence or identity mismatch in a delivered sample: either an external config setting the discard strategy, or F2 against the provider segment | No |
-| iceoryx-receive-expectation-tracks-the-delivered-stream (moot: backend deleted by `0f336d3c`) | A delivered-versus-expected sequence divergence: a restart (blocked by F13), a malformed sample (F2), or a discard-strategy config plus a full buffer | No |
-| iceoryx-cross-process-pairing-is-reachable-or-declared (moot: backend deleted by `0f336d3c`) | F13 | No, and not constructible without an API change |
-| iceoryx-completion-is-observable-to-the-host (moot: backend deleted by `0f336d3c`) | None; the gap is visible in the public surface | No — there is no observation to assert against |
-| iceoryx-saturation-is-bounded-non-blocking-backpressure (moot: backend deleted by `0f336d3c`) | None; count operations past each cap. Publish arm hangs, so needs a terminating timeout in the harness | No |
+| iceoryx-descriptor-rejection-is-terminal-or-declared (invalidated: backend deleted by `0f336d3c`) | A sequence or identity mismatch in a delivered sample: either an external config setting the discard strategy, or F2 against the provider segment | No |
+| iceoryx-receive-expectation-tracks-the-delivered-stream (invalidated: backend deleted by `0f336d3c`) | A delivered-versus-expected sequence divergence: a restart (blocked by F13), a malformed sample (F2), or a discard-strategy config plus a full buffer | No |
+| iceoryx-cross-process-pairing-is-reachable-or-declared (invalidated: backend deleted by `0f336d3c`) | F13 | No, and not constructible without an API change |
+| iceoryx-completion-is-observable-to-the-host (invalidated: backend deleted by `0f336d3c`) | None; the gap is visible in the public surface | No — there is no observation to assert against |
+| iceoryx-saturation-is-bounded-non-blocking-backpressure (invalidated: backend deleted by `0f336d3c`) | None; count operations past each cap. Publish arm hangs, so needs a terminating timeout in the harness | No |
 | wire-header-fully-validated-before-any-consumer-acts | A peer-authored header satisfying the transport's two checks and violating one host rule | Partial — one such header exists in a test, but only the downstream quarantine is asserted |
 | ingress-charge-matches-the-bytes-copied-from-shared-storage | None to pin it; F2 writing the descriptor page to demonstrate impact | No |
 | every-shm-header-consumer-applies-its-role-gate | A role-invalid publish into each direction; the peer arm needs the frame to originate host-side | Partial — host arm only, one type |
@@ -139,7 +139,6 @@ Counting the full 58-record catalog:
 7. **F8, cross-artifact assertions** — 3 properties.
 8. **F13** — requires an API change, so it is a design decision rather than a
    harness investment.
-
 
 ## Coverage checks to add
 
@@ -213,7 +212,7 @@ What changed: F1's availability now records that
 `crates/mc-host/tests/support/shm_process.rs`, the harness that implemented it,
 was deleted by `ed487e11` along with the provider it drove, so the kill harness
 this file assumed no longer exists. F13 and the five iceoryx property rows are
-marked moot, because `0f336d3c` deleted the iceoryx backend, its tests, and its
+marked invalidated, because `0f336d3c` deleted the iceoryx backend, its tests, and its
 Cargo feature. Everything else, including the transport-side fault classes and
 the leverage ranking, is unchanged.
 
@@ -234,3 +233,72 @@ them a re-derived fault requirement:
   **Yes** in the F1 column, so no property in this catalog now has a non-vacuous
   process-kill oracle.
 - Leverage item 5, which claimed the harness already existed.
+
+## Eventfd delivery pass (Group N), 2026-08-31
+
+PR #131 (merge `5d638e3e8`) replaced polling with sparse eventfd doorbells and
+page-granular reclamation. The seven Group N records need four fault classes
+the map above does not name. Because signals are written only when a waiter
+was parked, the recurring hazard is the lost wake, whose only symptom is a
+healthy channel that stopped — so the enabling situations below matter more
+than usual: a wake test that never proves something was parked passes forever
+while testing nothing.
+
+| Class | Description | Available today |
+| --- | --- | --- |
+| F14 lost-wake construction | A parked waiter (nonzero epoch in the shared wake page, or a bridge blocked in its charge/write poll) plus a concurrent publisher or releaser, with the oracle that progress resumes inside an explicit bound | **Partial** — `two_process_zero_copy_exchange_uses_authenticated_grant` and `ring_bridge_drains_inbound_and_queued_writes` park a real waiter, but the wake always lands mid-block; nothing schedules it into the arm sequence |
+| F15 doorbell fd substitution | A doorbell slot in the setup transfer carrying a blocking eventfd, a non-eventfd, or a dead descriptor | **Partial** — `doorbell_attachment_requires_nonblocking_eventfd` builds both bad descriptors, but only against `Doorbell::from_fd`; no harness substitutes one into a full attach handshake |
+| F16 wake race scheduling | Landing a `signal_wake` between a waiter's generation read and its blocking poll — a window of tens of instructions | **No** — needs true concurrency (F4) with repetition, or a loom/shuttle model (F5); neither exists |
+| F17 reclamation over the arena wrap | A released byte run that shares a page with a live lease, and separately one that crosses the arena end; amplified by a non-4096 page size (F11) | **Partial** — the pure function is swept across three page sizes and the live-neighbor case is constructed in-process; the trailing-partial-page exception has never been reached with a wrapped cursor, and none of it runs on a non-4096 host |
+
+| Property | Required faults and enabling state | Non-vacuous today |
+| --- | --- | --- |
+| attach-validates-doorbell-eventfds | F15 in a full attach: one substituted doorbell in an otherwise valid `[OwnedFd; 3]` | Partial — unit-level rejection arms exist; the attach-ordering claim (no partial state on rejection) is untested |
+| wake-published-during-readiness-callback-is-not-lost | A publication strictly inside an unacknowledged callback (F14); enabling situation `shm_publish_during_readiness_callback` | Partial — constructed at the raw-addon level (`mechanism.ts:211-278`); the `NativeChannel` wrapper and multi-channel variants are not |
+| queued-write-needs-no-second-wake | Two or more writes queued before one coalesced wake is drained, then silence; enabling situation `shm_queued_writes_exceed_one_per_wake` | **Yes** — `ring_bridge_drains_inbound_and_queued_writes` builds exactly this and bounds each completion at 250 ms |
+| released-charges-wake-blocked-readers | Read-budget exhaustion with the bridge parked in its charge poll, then a concurrent `ByteCharge` drop (F14 with a shrunken budget); enabling situation `shm_read_budget_exhausted_with_parked_bridge`, witnessed as `read_budget.used == capacity` at the moment a further frame is published, followed by bounded resumption after one `ByteCharge` drop (in-module test; `used()` is `#[cfg(test)]`) | No — the blocking arm has never executed under any test |
+| capacity-recheck-after-a-wake-race | F16 against `reserve_until`'s arm ladder, plus a parked epoch the release provably hit; enabling situation `shm_capacity_signal_hit_parked_epoch` witnesses block-then-wake coverage only — F16's arm window has no constructible runtime marker | No — the existing cross-process wake lands mid-block, three orders of magnitude away from the window |
+| reclamation-excludes-pages-with-live-wrapped-bytes | F17: a shared partial page beside a live lease, a wrap-crossing run, and the trailing-page exception under a wrapped cursor; enabling situations `shm_partial_page_shared_with_live_lease`, `shm_arena_wrap_with_live_lease` | Partial — the first two shapes are pinned by unit tests; the exception-under-wrap shape and any non-4096 page size are not |
+| reactor-callback-is-one-in-flight | Doorbell or kick edges during a pending callback, ideally from several channels at once; enabling situation `shm_kick_during_pending_callback` | Partial — single-channel deferral is pinned (`callbacks === 2`); multi-channel coalescing and a hostile double-acknowledge are not |
+
+### Coverage checks to add (Group N)
+
+Same rule as above: assert the independent preconditions, never the violation.
+A lost wake is the violation; a parked waiter and a concurrent signal are the
+preconditions, and both are legal on a correct system.
+
+| Coverage check | Situation it witnesses | Why it is safe |
+| --- | --- | --- |
+| `shm_publish_during_readiness_callback` | A commit landed while `pending` was true in the reactor | Both events are legal; the marker does not claim the wake was lost |
+| `shm_queued_writes_exceed_one_per_wake` | The bridge's write queue held two or more entries at one eventfd drain | Ordinary burst behavior |
+| `shm_read_budget_exhausted_with_parked_bridge` | `read_budget.used == capacity` at the moment a further frame is published, followed by bounded resumption after one `ByteCharge` drop | Backpressure is a legal state; pairs with the release that ends it |
+| `shm_capacity_signal_hit_parked_epoch` | Block-then-wake coverage: `signal_wake` swapped a nonzero parked epoch on the capacity page (fires on every ordinary mid-block wake; F16's arm window has no constructible runtime marker) | The signal side of the handshake working as designed |
+| `shm_partial_page_shared_with_live_lease` | A reclaim ran while a live lease held bytes on a page the released run touched | The exact shape the rounding protects; legal and expected |
+| `shm_kick_during_pending_callback` | `kick` was set while a callback was unacknowledged. On the `poll` side this needs a race, not a call order: `poll` only reaches the kick when `try_receive()` came back empty and `arm_data_wait()` then returned `Ok(false)` because data or a generation change landed before the arm's recheck (`lib.rs:1176-1182`, `:1227-1235`, `ring.rs:840-852`) | The deferral path's precondition, not its failure |
+
+Do not add `sometimes(wake_was_lost)` or `always(!wake_was_lost)` paired with
+it; a lost-wake marker can only fire by observing the defect. The oracle is
+bounded resumption after the witnessed precondition.
+
+### Leverage notes (Group N)
+
+1. **F16 via a loom model of a hand transcription of the wake protocol** —
+   the cheapest valid oracle in this group, but not free: the atomics live
+   in an mmapped page loom cannot instrument, so `reserve_until` and
+   `signal_wake` must be transcribed over loom atomics and kept in sync
+   manually, including the Release-not-SeqCst parked resets. Two threads,
+   no process or fd machinery, and it is the only way to reach the
+   instruction-scale window deliberately. Covers
+   `capacity-recheck-after-a-wake-race` and the arm half of
+   `wake-published-during-readiness-callback-is-not-lost`.
+2. **F14 completion for the budget path** — one test with a small
+   `ByteCounter` and a cross-thread drop unblocks
+   `released-charges-wake-blocked-readers`, the only Group N record with no
+   check at all.
+3. **F17's missing shape** — the trailing-page exception under a wrapped
+   cursor is one in-process test away, and F11 (a 16 KiB host, already
+   provisioned in CI) multiplies the value of every reclamation test that
+   exists.
+4. **F15 through a real handshake** — low urgency: the unit gate is tight and
+   the substitution surface is one function; worth folding into any future
+   hostile-setup fixture rather than building alone.

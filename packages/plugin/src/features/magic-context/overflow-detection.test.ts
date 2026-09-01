@@ -35,8 +35,6 @@ describe("overflow-detection / extractErrorMessage", () => {
 });
 
 describe("overflow-detection / detectOverflow", () => {
-    // Each sample is a real-world error message from the provider listed.
-    // These assertions lock in coverage across the full OpenCode pattern set so
     // future regex edits can't silently regress provider support.
     test.each<[string, string, number | undefined, ContextLimitProvenance | undefined]>([
         ["anthropic", "prompt is too long: 210000 tokens > 200000 maximum", 200000, "prompt_only"],
@@ -166,16 +164,13 @@ describe("overflow-detection / parseReportedLimit", () => {
     });
 
     test("returns first plausible match when multiple numbers present", () => {
-        // Prefer 'maximum context length is N' over the fallback 'max.*context.*N' pattern
         const msg = "maximum context length is 128000 tokens (limit 999)";
         expect(parseReportedLimit(msg)).toEqual({ value: 128000, provenance: "combined" });
     });
 });
 
 describe("llama.cpp context-size limit extraction", () => {
-    // The old greedy pattern (/context size.*(\d+)/) backtracked to a
-    // single-digit capture that the plausibility clamp discarded, so these
-    // messages detected overflow but silently lost the limit value.
+    // The capture must include the full context-size limit because the plausibility clamp rejects single-digit captures.
     test("extracts the limit from llama.cpp-style messages", () => {
         expect(
             parseReportedLimit(
@@ -189,7 +184,7 @@ describe("llama.cpp context-size limit extraction", () => {
     });
 
     test("does not capture a number more than 40 chars past the phrase", () => {
-        // Guards the anchor: distant numbers (e.g. request ids) must not bind.
+        // The anchor prevents distant numbers, such as request IDs, from binding.
         expect(
             parseReportedLimit(
                 "context size problem occurred while handling the request submitted at position 99999999 tokens",

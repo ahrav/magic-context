@@ -35,28 +35,25 @@ describe("mutation battery (R13/KTD5)", () => {
             expect(result).toBeDefined();
             expect(result!.green).toBe(true);
         }
-        // The reference scenario declares proposed-but-rejected, so the
-        // rejected-proposal class must actually apply (not be skipped).
+        // The rejected-proposal class must apply because the reference scenario declares proposed-but-rejected.
         expect(byClass.get("rejected-proposal-active")!.applicable).toBe(true);
         expect(byClass.get("speculation-promoted")!.applicable).toBe(false);
     });
 
     test("a class landing at a DIFFERENT stage is red, in both directions", () => {
         const scenario = validScenario();
-        // A semantic class (expected stage: scored) whose crafted output
-        // dies in validation instead — the silent stage migration the
-        // battery exists to catch.
+        // A semantic mutation must reach scoring; validation rejection is a stage migration.
+        // The battery rejects mutations that land at a stage other than their expected stage.
         const semanticAtValidation = checkMutationOutcome("dropped-gold-fact", overlappingPayload(), scenario);
         expect(semanticAtValidation.green).toBe(false);
         expect(semanticAtValidation.detail).toContain("landed at validation-rejected");
 
-        // A structural class (expected stage: validation-rejected) whose
-        // output validates and scores instead.
+        // A structural mutation must be rejected during validation; scoring is a stage migration.
         const structuralAtScored = checkMutationOutcome("structural-overlap", goldenRawOutput(), scenario);
         expect(structuralAtScored.green).toBe(false);
         expect(structuralAtScored.detail).toContain("expected stage validation-rejected");
 
-        // A scored class whose output PASSES (mutation not detected at all).
+        // The battery rejects a scored class whose output passes because it did not detect the mutation.
         const passingMutation = checkMutationOutcome("dropped-gold-fact", goldenRawOutput(), scenario);
         expect(passingMutation.green).toBe(false);
         expect(passingMutation.detail).toContain("scored PASS");
@@ -92,8 +89,6 @@ describe("mutation battery (R13/KTD5)", () => {
         expect(
             predicateMatches({ kind: "normalized-substring", value: "in-process lru cache" }, wordPerturbed),
         ).toBe(false);
-        // Nearness anchor: the perturbation edits inside the value rather
-        // than replacing it; everything but the inserted marker survives.
         expect(normalizeContent(wordPerturbed).replace("-alt-", "")).toBe(normalizeContent("in-process lru cache"));
 
         // Single-word predicates must not survive via substring containment.
@@ -123,8 +118,8 @@ describe("mutation battery (R13/KTD5)", () => {
     });
 
     test("evidence parser rejects a green entry without full class coverage (forged shell)", () => {
-        // Internally consistent but truncated: one skipped-class row is the
-        // cheapest shape a forger could hand-write.
+        // One skipped-class row is internally consistent but omits the remaining mutation classes.
+        // One skipped-class row is internally consistent but omits the remaining mutation classes.
         const forged = {
             schema: MUTATION_EVIDENCE_SCHEMA,
             green: true,
@@ -172,9 +167,7 @@ describe("mutation battery (R13/KTD5)", () => {
     });
 
     test("evidence parser rejects a green entry that marks an unconditionally applied class skipped", () => {
-        // Full class coverage AND an applied false-authoritative class, but
-        // one always-applied class flipped to skipped: the shape that claims
-        // green while demonstrating only part of the battery.
+        // A report can claim green while an always-applied mutation class is skipped.
         const results = MUTATION_CLASSES.map((mutationClass) => ({
             mutationClass,
             applicable: mutationClass !== "wrong-category",
@@ -197,12 +190,9 @@ describe("mutation battery (R13/KTD5)", () => {
     });
 
     test("evidence parser rejects duplicate scenario entries that would mask a red result", () => {
-        // The masking shape: a real red entry followed by a green entry for the
-        // SAME scenario. `checkMutationEvidence` indexes by scenarioFingerprint
-        // into a Map, where the later duplicate wins, so the admission gate would
-        // read this scenario as green. Artifact-level `green` stays false and
-        // internally consistent throughout, so uniqueness is the only check that
-        // can see it.
+        // Duplicate entries for one scenario can mask a red result because `checkMutationEvidence` keeps the later entry by `scenarioFingerprint`.
+        // Duplicate scenario fingerprints can make `checkMutationEvidence` read a scenario as green while artifact-level `green` remains false.
+        // Only scenario-fingerprint uniqueness detects the duplicate's masking effect.
         const artifact = runMutationBattery([validScenario()]);
         const green = JSON.parse(JSON.stringify(artifact.scenarios[0])) as Record<string, unknown>;
         const red = JSON.parse(JSON.stringify(green)) as {
@@ -218,8 +208,7 @@ describe("mutation battery (R13/KTD5)", () => {
         };
         expect(() => parseMutationEvidence(forged)).toThrow(/scenarioId: duplicate/);
 
-        // Re-keying the duplicate to dodge the id check must not get through
-        // either: the fingerprint is what the promotion-side Map indexes on.
+        // A distinct entry ID does not prevent masking when duplicate entries share a `scenarioFingerprint`.
         const renamed = { ...red, scenarioId: "hse-other" };
         expect(() => parseMutationEvidence({ ...forged, scenarios: [renamed, green] })).toThrow(
             /scenarioFingerprint: duplicate/,
@@ -233,16 +222,14 @@ describe("mutation battery (R13/KTD5)", () => {
         const probe = evidence.results.find((result) => result.mutationClass === "probe-wrong-answer");
         expect(probe?.green).toBe(true);
         expect(probe?.detail).toContain(`all ${scenario.probes.length} probe(s)`);
-        // claim-id only ever appears after another probe in the corpus, so a
-        // probes[0]-only battery would never reach this comparison branch.
+        // A battery that mutates only `probes[0]` never compares `claim-id`.
         expect(probe?.detail).toContain("claim-id");
     });
 
     test("a LATER probe that accepts the wrong answer turns the probe class red", () => {
         const scenario = validScenario();
-        // Gold answer equal to the battery's wrong answer: the comparison
-        // PASSES, so the mutation is not detected. Placed last, this is
-        // invisible to a battery that only mutates probes[0].
+        // When the gold answer equals the battery's wrong answer, the comparison passes and does not detect the mutation.
+        // Placing that probe last makes the undetected mutation invisible to a battery that mutates only `probes[0]`.
         const colliding = {
             id: "probe-collides",
             question: "Which marker does the battery send?",
@@ -261,9 +248,7 @@ describe("mutation battery (R13/KTD5)", () => {
         const scenario = validScenario();
         const raised = { ...scenario, gold: { ...scenario.gold, compartments: { minCount: 3 } } };
         const evidence = runScenarioMutationBattery(raised);
-        // A fixed single-compartment baseline would trip the scorer's
-        // compartment-count structural finding, so every mutation would be
-        // red for the wrong reason and promotion would reject the scenario.
+        // A fixed single-compartment baseline would trigger the scorer's compartment-count structural finding, making every mutation red for the wrong reason and causing promotion to reject the scenario.
         expect(evidence.results.some((result) => result.mutationClass === "baseline-fixture")).toBe(false);
         expect(evidence.green).toBe(true);
     });

@@ -62,12 +62,6 @@ const STATUS_COLOR: Record<TodoStatus, Parameters<Theme["fg"]>[0]> = {
 const snapshotsBySession = new Map<string, TodoSnapshot>();
 const MAX_TODOWRITE_RENDER_CACHE_ENTRIES = 50;
 
-// Current Pi versions build transcript tool components from streaming
-// assistant updates, so todowrite can first render with partial or missing
-// args. Later tool start/end events mark the call complete but do not replace
-// the args already captured on that component. Cache validated todos by
-// toolCallId so transcript renders can recover the final list when the
-// component keeps stale args.
 const cachedTodowriteTodosByToolCallId = new Map<string, TodoItem[]>();
 
 type ToolRenderContext = { toolCallId?: string } | undefined;
@@ -217,8 +211,6 @@ function countTodos(todos: readonly TodoItem[]): TodoCounts {
 }
 
 function activeTitleCount(todos: readonly TodoItem[]): number {
-	// OpenCode's todowrite title excludes only completed todos; cancelled items
-	// remain in the model-visible active count for wire-shape parity.
 	return todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
 }
 
@@ -311,9 +303,7 @@ export function renderTodowriteResult(
 			try {
 				const parsed = parseTodos(JSON.parse(text));
 				if (parsed !== null) todos = parsed;
-			} catch {
-				// Leave the renderer empty if the tool result is not a todo list.
-			}
+			} catch {}
 		}
 	}
 	const renderedTodos =
@@ -397,9 +387,6 @@ export class TodoOverlay {
 	private lastTodoKeys = new Set<string>();
 
 	setUICtx(sessionId: string, ctx: ExtensionUIContext): void {
-		// Pi invalidates widget instances on /reload and session replacement. The
-		// factory-form widget below can recover only if we forget the old registration
-		// when either the UI proxy or the foreground session identity changes.
 		if (ctx !== this.uiCtx || sessionId !== this.sessionId) {
 			this.uiCtx = ctx;
 			this.sessionId = sessionId;
@@ -425,10 +412,6 @@ export class TodoOverlay {
 		}
 
 		if (!this.widgetRegistered) {
-			// Use factory-form registration once and read module state at render time.
-			// Re-registering on every todowrite fights Pi's widget lifecycle; refreshing
-			// the existing factory via requestRender keeps /reload invalidation and TUI
-			// resize handling reliable.
 			this.uiCtx.setWidget(
 				WIDGET_KEY,
 				(tui, theme) => {

@@ -30,8 +30,7 @@ describe("Pi compaction-off mode", () => {
 			expect(
 				await handlePiSessionBeforeCompact({ db, compactionOff: false, ctx }),
 			).toEqual({ cancel: true });
-			// Mutation direction: returning cancel here would prevent Pi from owning
-			// the window and leave an off-mode session with no compactor.
+			// Returning `cancel` prevents Pi's native compactor from running.
 			expect(
 				await handlePiSessionBeforeCompact({ db, compactionOff: true, ctx }),
 			).toBeUndefined();
@@ -146,9 +145,7 @@ describe("Pi compaction-off mode", () => {
 			expect(first.notice).toContain("compaction-off mode");
 			expect(getCompactionModeRecord(db, sessionId)).toBe("off_notice_pending");
 
-			// Simulate restart after the clears committed but before the caller
-			// reached Pi's UI. The pending record, not process memory, requests
-			// the same notice again.
+			// A durable pending record reissues the notice during reconciliation.
 			const restarted = reconcilePiCompactionMode({
 				db,
 				sessionId,

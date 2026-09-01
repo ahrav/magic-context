@@ -431,7 +431,7 @@ production encoder output back through `decode_header` plus
 `encode_owned_frame` and `encode_split_frame` call site
 (`dispatch.rs:292`, `:329`, `:723`, `:802`, `:1458`, `connection.rs:779`, `:866`,
 `client.rs:1329`, `:2092`, plus `wire.rs:615`) and every `decode_header` call site
-(`ring_transport.rs:471`, `:569`, `:701`, `client.rs:1908`, plus the test-side
+(`ring_transport.rs:503`, `:730`, the test-only-hook site `:593`, `client.rs:1978`, plus the test-side
 `raw_client.rs:286` and `:556`): no test composes one with the other. This is the
 `Existing check: none.` on
 [encoder-never-emits-a-frame-its-own-decoder-rejects](catalog.md#encoder-never-emits-a-frame-its-own-decoder-rejects).

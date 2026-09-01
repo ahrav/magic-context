@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
     NativeChannel,
     type NativeReceiveLease,
-    NativeStartupError,
     type ProducerCursor,
     probeCapabilities,
 } from "@cortexkit/mc-shm-native";
@@ -23,7 +23,6 @@ import {
     MAX_FRAME_BODY_LEN,
     PROTOCOL_VERSION,
 } from "./protocol";
-import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import { ShmFrameChannel } from "./shm-frame-channel";
 import {
     type ContractPeerFrame,
@@ -32,6 +31,12 @@ import {
     runFrameChannelContractScenario,
     waitUntil,
 } from "./test-support/frame-channel-contract";
+
+test("production shared-memory delivery has no timer polling", () => {
+    const source = readFileSync(new URL("./shm-frame-channel.ts", import.meta.url), "utf8");
+    expect(source).not.toContain("setInterval");
+    expect(source).not.toContain(".poll(");
+});
 
 function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0): EnvelopeHeader {
     return {
@@ -45,30 +50,13 @@ function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0):
     };
 }
 
-test("shared-memory failures collapse to five terminal diagnostic classes", () => {
-    const cases: readonly [Error, string][] = [
-        [new NativeStartupError("missing_addon"), "missing_addon"],
-        [new NativeStartupError("wrong_platform_binary"), "setup_failure"],
-        [new NativeStartupError("debug_build"), "setup_failure"],
-        [new NativeStartupError("checksum_mismatch"), "setup_failure"],
-        [new NativeStartupError("capability_unavailable"), "setup_failure"],
-        [new Error("shared-memory identity mismatch"), "identity_mismatch"],
-        [new Error("shared-memory setup failed /private/secret?token=abc"), "setup_failure"],
-        [new Error("peer closed unexpectedly /private/secret"), "peer_death"],
-        [new Error("shared-memory resource limit exhausted handle=77"), "resource_exhaustion"],
-    ];
-    for (const [error, expected] of cases) {
-        expect(classifySharedMemoryFailure(error)).toBe(expected);
-    }
-});
-
 function publish(peer: NativeChannel, header: EnvelopeHeader, body: Uint8Array): void {
     peer.produce(encodeHeader(header), body.byteLength, (cursor) => cursor.write(body));
 }
 
 function take(peer: NativeChannel): NativeReceiveLease {
     let lease: NativeReceiveLease | undefined;
-    expect(peer.poll((value) => (lease = value))).toBe(true);
+    expect(peer.drainOne((value) => (lease = value))).toBe(true);
     if (!lease) throw new Error("missing native lease");
     return lease;
 }
@@ -124,7 +112,7 @@ const shmContractFactory: FrameChannelContractFactory = async (overrides = {}) =
     const drain = (): void => {
         if (!reading || cleaning) return;
         while (
-            pair.second.poll((lease) => {
+            pair.second.drainOne((lease) => {
                 const header = decodeHeader(lease.header);
                 const body = new Uint8Array(lease.byteLength);
                 let offset = 0;
@@ -357,7 +345,7 @@ describe("mandatory shared-memory channel", () => {
                     }),
                 ).toThrow(expected);
                 expect(alias?.byteLength).toBe(0);
-                expect(peer.poll(() => {})).toBe(false);
+                expect(peer.drainOne(() => {})).toBe(false);
 
                 generation.request({
                     channel: 7,
@@ -437,7 +425,8 @@ describe("mandatory shared-memory channel", () => {
             },
         } as unknown as NativeReceiveLease;
         const native = {
-            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+            startReadiness: (handler: () => void) => handler(),
+            drainOne: (deliver: (lease: NativeReceiveLease) => void) => {
                 if (delivered) return false;
                 delivered = true;
                 deliver(nativeLease);
@@ -574,11 +563,44 @@ describe("mandatory shared-memory channel", () => {
             expect((caught as McHostCallError).kind).toBe("not_sent");
             expect((caught as McHostCallError).code).toBe("ring_full");
         }
-        // A publication must not hold the event loop for a request deadline;
+        // A publication must not hold the event loop for ring capacity;
         // the loop is also the only consumer draining the inbound ring.
-        expect(blockMs).toBeLessThanOrEqual(5);
+        expect(blockMs).toBe(0);
         // Every refused attempt returns its charge.
         expect(budget.used).toBe(0);
+    });
+
+    test("a saturated outbound ring cannot block inbound readiness", async () => {
+        if (!probeCapabilities().available) return;
+        const pair = NativeChannel.createTestPair();
+        const received: bigint[] = [];
+        const channel = new ShmFrameChannel({
+            nativeChannel: pair.first,
+            budget: new ByteBudget(1 << 20),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    received.push(frame.header.corr);
+                    frame.body.release();
+                },
+                onClosed: () => {},
+            },
+        });
+        channel.beginFrames();
+        const body = { byteLength: 0, fill: () => {} };
+        for (let index = 0; index < pair.descriptorDepth; index++) {
+            channel.produce(responseHeader(FrameType.Request, BigInt(index + 1), 0), body);
+        }
+        publish(pair.second, responseHeader(FrameType.Response, 99n, 0), new Uint8Array());
+
+        expect(() => channel.produce(responseHeader(FrameType.Request, 100n, 0), body)).toThrow(
+            McHostCallError,
+        );
+        await waitUntil(() => received.length === 1);
+        expect(received).toEqual([99n]);
+
+        channel.close();
+        pair.second.close();
     });
 
     test("a dropped setup socket retires the channel as eof after draining", async () => {
@@ -586,6 +608,7 @@ describe("mandatory shared-memory channel", () => {
         const frames: EnvelopeHeader[] = [];
         let peerAlive = true;
         let pending = true;
+        let ready: (() => void) | undefined;
         const nativeLease = {
             header: encodeHeader(responseHeader(FrameType.Response, 7n, 4)),
             byteLength: 4,
@@ -594,11 +617,15 @@ describe("mandatory shared-memory channel", () => {
             release: () => {},
         } as unknown as NativeReceiveLease;
         const native = {
-            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+            drainOne: (deliver: (lease: NativeReceiveLease) => void) => {
                 if (!pending) return false;
                 pending = false;
                 deliver(nativeLease);
                 return true;
+            },
+            startReadiness: (callback: () => void) => {
+                ready = callback;
+                callback();
             },
             close: () => {},
             peerClosed: () => !peerAlive,
@@ -620,12 +647,55 @@ describe("mandatory shared-memory channel", () => {
         expect(closes).toEqual([]);
 
         peerAlive = false;
+        ready?.();
         await waitUntil(() => closes.length === 1);
         // The frame that was already in the ring is delivered before the
         // connection retires, so a graceful Goodbye is never lost.
         expect(frames).toHaveLength(1);
         expect(closes[0]?.reason).toBe("eof");
         expect(channel.isClosed()).toBe(true);
+    });
+
+    test("setup EOF waits for every frame beyond one drain budget", async () => {
+        const closes: FrameChannelCloseReason[] = [];
+        const received: bigint[] = [];
+        const leases = Array.from({ length: 65 }, (_, index) => ({
+            header: encodeHeader(responseHeader(FrameType.Response, BigInt(index + 1), 0)),
+            byteLength: 0,
+            segmentCount: 1,
+            segment: () => new Uint8Array(),
+            release: () => {},
+        })) as unknown as NativeReceiveLease[];
+        const native = {
+            drainOne: (deliver: (lease: NativeReceiveLease) => void) => {
+                const lease = leases.shift();
+                if (!lease) return false;
+                deliver(lease);
+                return true;
+            },
+            startReadiness: (callback: () => void) => callback(),
+            close: () => {},
+            peerClosed: () => true,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    received.push(frame.header.corr);
+                    frame.body.release();
+                },
+                onClosed: (reason) => closes.push(reason),
+            },
+        });
+
+        channel.beginFrames();
+        expect(received).toHaveLength(64);
+        expect(closes).toEqual([]);
+        await waitUntil(() => closes.length === 1);
+        expect(received).toHaveLength(65);
+        expect(closes).toEqual(["eof"]);
     });
 
     test("handler throw releases JSON lease before fail-close", async () => {
@@ -658,7 +728,7 @@ describe("mandatory shared-memory channel", () => {
         const encoded = encodeHeader(responseHeader(FrameType.Response, 1n, 0));
         encoded[4] = PROTOCOL_VERSION + 1;
         expect(() => pair.second.produce(encoded, 0, () => {})).toThrow();
-        expect(pair.first.poll(() => {})).toBe(false);
+        expect(pair.first.drainOne(() => {})).toBe(false);
         pair.first.close();
         pair.second.close();
 

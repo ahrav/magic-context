@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-/** FM-OC-5: SIGSTOP makes the real transport time out; SIGCONT restores service. */
+/* */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";

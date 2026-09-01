@@ -104,11 +104,6 @@ describe("setup-opencode DCP preflight", () => {
     });
 });
 
-// --- Compaction-off mode writer (issue #266 S2) ---
-// In compaction-off mode the setup writer MUST NOT write
-// compaction.auto=false / compaction.prune=false into opencode.jsonc —
-// native compaction (or nothing) is the user's chosen window manager, so
-// pre-existing native compaction fields are left byte-for-byte as found.
 describe("setup-opencode compaction-off writer (issue #266)", () => {
     it("skips the compaction.auto=false write when compactionEnabled=false", () => {
         const root = tempDir();
@@ -120,7 +115,6 @@ describe("setup-opencode compaction-off writer (issue #266)", () => {
         const merged = parseJsonc(readFileSync(configPath, "utf-8")) as {
             compaction?: { auto?: boolean; prune?: boolean };
         };
-        // Pre-existing native compaction values preserved byte-for-byte.
         expect(merged.compaction).toEqual({ auto: true, prune: true });
     });
 
@@ -148,8 +142,6 @@ describe("setup-opencode compaction-off writer (issue #266)", () => {
         expect(merged.compaction).toBeUndefined();
     });
 
-    // Mutation direction: with mode ON, the write DOES happen. Proves the
-    // off-gate isn't just always-skip.
     it("mutation direction: same config gets auto=false when mode forced on", () => {
         const root = tempDir();
         const configPath = join(root, "opencode.jsonc");

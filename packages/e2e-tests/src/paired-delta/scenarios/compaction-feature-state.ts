@@ -6,5 +6,6 @@ export const compactionFeatureState = defineScenario({
     title: "Recover a feature state buried by compaction",
     evidence: "The release decision is feature ledger_sync disabled until the replay audit passes.",
     answer: "disabled",
+    answerMatch: "case-insensitive",
     locatorId: "mem-feature-state",
 });

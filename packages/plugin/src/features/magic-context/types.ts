@@ -4,15 +4,15 @@ export interface TagEntry {
     type: "message" | "tool" | "file";
     status: "active" | "dropped" | "compacted";
     /**
-     * How a dropped tool tag is rendered on every replay pass (frozen at drop
-     * time, re-derived deterministically from the original wire part each pass):
-     *  - "full": the whole tool call is removed from the transcript.
-     *  - "truncated": skeleton; keep the tool_use call, output -> [dropped N],
-     *    every input arg value clamped to 5 chars.
-     *  - "edit_marker": like "truncated" but for an edit/write superseded by a
-     *    later edit to the same file; keep the filePath verbatim and a short
-     *    region-hint prefix of the diff, so the agent still sees WHICH file and
-     *    region it edited. Only produced when the smart_drops config is on.
+     * A dropped tool tag's rendering policy is frozen when the tag is dropped.
+     * Each replay deterministically re-derives the rendering from the original wire part.
+     * `"full"` removes the entire tool call from the transcript.
+     * `"truncated"` retains the `tool_use` call and replaces its output with `[dropped N]`.
+     * `"truncated"` clamps every input argument value to five characters.
+     * `"edit_marker"` applies when a later edit supersedes an edit or write to the same file.
+     * `"edit_marker"` preserves `filePath` verbatim and a short diff region-hint prefix.
+     * `"edit_marker"` identifies the edited file and region.
+     * `"edit_marker"` is produced only when `smart_drops` is enabled.
      */
     dropMode: "full" | "truncated" | "edit_marker";
     toolName: string | null;
@@ -21,28 +21,25 @@ export interface TagEntry {
     reasoningByteSize: number;
     sessionId: string;
     /**
-     * Caveman compression depth applied to this tag's text part. 0 = none,
-     * 1 = lite, 2 = full, 3 = ultra. Only meaningful for `type: "message"`;
-     * tool/file tags stay at 0. Used by experimental age-tier caveman
-     * heuristic to avoid re-compressing text that already matches the
-     * target depth for its age band.
+     * `cavemanDepth` records the compression depth applied to a tag's text part.
+     * `cavemanDepth` values are 0 for none, 1 for lite, 2 for full, and 3 for ultra compression.
+     * `tool` and `file` tags always use `cavemanDepth` 0.
+     * The age-tier caveman heuristic avoids recompressing text already at its target depth.
+     * The target caveman depth depends on the tag's age band.
      */
     cavemanDepth: number;
     /**
-     * For `type: "tool"` tags: the assistant message id where the
-     * underlying tool call was invoked. Identity for a tool tag is the
-     * triple `(sessionId, messageId/callID, toolOwnerMessageId)` —
-     * including this field disambiguates collisions when OpenCode's
-     * per-turn callID counter produces the same id across turns.
+     * For `type: "tool"` tags, `toolOwnerMessageId` identifies the assistant message that invoked the underlying tool call.
+     * A tool tag is identified by `(sessionId, messageId/callID, toolOwnerMessageId)`.
+     * `toolOwnerMessageId` disambiguates repeated call IDs across turns.
+     * OpenCode can reuse a per-turn `callID` in different turns.
      *
      * NULL on:
-     *   - all `type: "message"` and `type: "file"` tags (not applicable)
-     *   - legacy tool tags written before plugin v0.16.x (the
-     *     tag-owner-fix migration v10). The runtime lazily adopts these
-     *     orphan rows on first observation; backfill populates them at
-     *     plugin startup against the OpenCode DB.
+     * `toolOwnerMessageId` is `NULL` for all `type: "message"` and `type: "file"` tags.
+     * Legacy tool tags can have a `NULL` `toolOwnerMessageId`.
+     * The runtime assigns `toolOwnerMessageId` to legacy tool tags on first observation.
+     * Plugin startup backfills missing `toolOwnerMessageId` values from the OpenCode DB.
      *
-     * See plan v3.3.1 in `.alfonso/plans/tag-owner-fix-plan.md`.
      */
     toolOwnerMessageId: string | null;
 }
@@ -78,7 +75,7 @@ export interface SessionMeta {
     toolReclaimWatermark: number;
     lastTodoState: string;
     cachedM0Bytes: Buffer | null;
-    /** Frozen image payload paired atomically with cachedM0Bytes. */
+    /** The cache updates `cachedM0MuralDataUrl` atomically with `cachedM0Bytes`. */
     cachedM0MuralDataUrl: string | null;
     cachedM0MuralHash: string | null;
     cachedM1Bytes: Buffer | null;
@@ -90,10 +87,9 @@ export interface SessionMeta {
     cachedM0ProjectUserProfileVersion: number | null;
     cachedM0MaxCompartmentSeq: number | null;
     /**
-     * Pi message stable-id scheme version (Pi-only; OpenCode ignores it).
-     * NULL/0 = legacy index-based `pi-msg-*` ids; >=1 = real-SessionEntry-id
-     * scheme. Drives the one-time forced execute+materialize cutover when a
-     * session's stored scheme is below PI_STABLE_ID_SCHEME.
+     * Pi uses the stored version to select its message stable-ID scheme; OpenCode ignores the version.
+     * Pi's stored scheme uses `NULL` or `0` for legacy index-based `pi-msg-*` IDs and values at least `1` for real `SessionEntry` IDs.
+     * The runtime forces one execute-and-materialize cutover for sessions whose stored scheme is below `PI_STABLE_ID_SCHEME`.
      */
     piStableIdScheme: number | null;
     cachedM0MaxMutationId: number | null;
@@ -101,11 +97,11 @@ export interface SessionMeta {
     cachedM0MaterializedAt: number | null;
     cachedM0SessionFactsVersion: number | null;
     cachedM0UpgradeState: string | null;
-    /** HARD-bust markers: provider-side cache-eviction signals (system/tools/model). */
+    /** HARD-bust markers signal provider-side cache eviction for system, tools, or model changes. */
     cachedM0SystemHash: string | null;
     cachedM0ToolSetHash: string | null;
     cachedM0ModelKey: string | null;
-    /** Pi-only HARD marker: project identity captured in the cached m[0] baseline. */
+    /** The Pi-only HARD marker records project identity in the cached `m[0]` baseline. */
     cachedM0ProjectIdentity: string | null;
     lastObservedModelKey: string | null;
     lastUsageContextLimit: number;
@@ -116,11 +112,11 @@ export interface SessionMeta {
     recoveryNoEligibleHeadCount: number;
     forceEmergencyBypassWindowStart: number;
     forceEmergencyBypassUsed: number;
-    /** Set only after an explicit OpenCode dialog choice; keeps the fresh dialog dismissed. */
+    /** An explicit OpenCode dialog choice sets `upgradeRemindedAt` and keeps the fresh dialog dismissed. */
     upgradeRemindedAt: number | null;
-    /** Most recent push reminder delivery, used for the bounded re-notification cooldown. */
+    /* */
     upgradeReminderLastSentAt: number | null;
-    /** Total delivered upgrade reminders; the hard cap prevents an endless nag loop. */
+    /* */
     upgradeReminderCount: number;
 }
 

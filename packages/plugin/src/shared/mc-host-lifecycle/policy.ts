@@ -16,8 +16,6 @@
  */
 
 import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
-import { classifySharedMemoryFailure } from "../mc-host-client/shared-memory-failure";
-import type { SharedMemoryDiagnostics, SharedMemoryResourceCounts } from "../mc-host-client/types";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
     COMPATIBILITY_STAGES,
@@ -56,24 +54,8 @@ import { type AdmissionIo, admitLifecycleFilesystem, resolveLifecycleDataRoot } 
 export const STORAGE_HARD_BUDGET_MS = 5_000;
 /** Fresh Linux request-to-authenticated-transport outer aggregate (hard). */
 export const OUTER_AGGREGATE_MS = 60_000;
-/**
- * Fresh macOS request-to-authenticated-transport outer aggregate (hard).
- *
- * Darwin is qualified against a far tighter bound than Linux, so applying the
- * Linux aggregate universally lets a hung macOS startup run four times past the
- * budget it was qualified for. Both values mirror
- * `release/mc-host-production-inputs.lock.json`
- * (`fresh_linux_transport_aggregate.hard`, `fresh_macos_transport_aggregate.hard`);
- * the generated contract does not carry them yet, so changing one there means
- * changing it here.
- */
-export const OUTER_AGGREGATE_MS_DARWIN = 15_000;
-
-/** The qualified outer aggregate for a platform-gate target. */
-export function aggregateForTarget(
-    target: "linux-x64-gnu" | "darwin-arm64" | "darwin-x64",
-): number {
-    return target === "linux-x64-gnu" ? OUTER_AGGREGATE_MS : OUTER_AGGREGATE_MS_DARWIN;
+export function aggregateForTarget(_target: "linux-x64-gnu"): number {
+    return OUTER_AGGREGATE_MS;
 }
 
 export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor";
@@ -96,8 +78,6 @@ export interface CompatibilitySnapshot {
 
 export interface ObservationalHealth extends CompatibilitySnapshot {
     readiness: DaemonReadiness;
-    /** Present when `host.status` completed and returned ring diagnostics. */
-    sharedMemory?: SharedMemoryDiagnostics;
 }
 
 /** Thrown after ring attachment and authentication when a control probe fails. */
@@ -216,7 +196,6 @@ function localResult(
                 ? { stop_committed: false, start_committed: false }
                 : null,
         readiness: null,
-        shared_memory: null,
         checks: [],
         versions: {
             release: releaseContract.release.version,
@@ -301,10 +280,6 @@ export class McHostLifecyclePolicy {
         this.payloadManifestDigest = options.payloadManifestDigest;
         this.payloadDirFallback = options.payloadDirFallback;
         this.defaultStartupEnvelope = options.defaultStartupEnvelope;
-        // Left undefined when the caller does not pin it: the qualified default
-        // depends on the platform-gate target, which `preflight` resolves per
-        // command rather than in the constructor — `checkPlatform`'s darwin arm
-        // can shell out to `sw_vers`, which does not belong in a constructor.
         this.outerAggregateMs = options.outerAggregateMs;
     }
 
@@ -553,15 +528,7 @@ export class McHostLifecyclePolicy {
         startedAt: number,
     ): Promise<DaemonResultV1> {
         const { signal } = request;
-        // The caller's budget is spent from `startedAt`, not from here.
-        // `start()` is async, but its synchronous prefix — data-root
-        // resolution, filesystem admission, and the platform gate, whose darwin
-        // arm can fall back to a `sw_vers` call bounded at 2s — runs inside the
-        // `this.start()` call *before* the promise reaches this method. Arming
-        // the full `deadlineMs` here would grant the waiter its whole budget
-        // after that work had already consumed the caller's, so a 100ms caller
-        // could block for seconds and then accept a result it had no time left
-        // to wait for.
+        // Subtract elapsed preflight time so it counts against the caller's deadline.
         const deadlineMs =
             request.deadlineMs === undefined
                 ? undefined
@@ -633,11 +600,7 @@ export class McHostLifecyclePolicy {
     private preflight(
         command: LifecycleCommand,
     ): { ok: true; root: string; deadlineMs: number } | { ok: false; result: DaemonResultV1 } {
-        // The aggregate is a request-to-transport bound, so preflight's own cost
-        // counts against it. `checkPlatform`'s darwin arm can spend up to two
-        // seconds in `sw_vers`, and handing the child a fresh full aggregate
-        // afterwards let the operation overrun the budget its platform was
-        // qualified against — the same mistake the demand waiter had.
+        // Preflight cost counts against the request-to-transport aggregate.
         const startedAt = monotonicNow();
         const rootResolution = resolveLifecycleDataRoot(this.env);
         if (!rootResolution.ok) {
@@ -798,39 +761,15 @@ export class McHostLifecyclePolicy {
             let observed: ObservationalHealth;
             try {
                 observed = await this.readinessProbe(remaining);
-            } catch (error) {
-                if (error instanceof ReadinessProbeControlError) return relabeled;
-                const failed: DaemonCheck = {
-                    id: "readiness.shared_memory",
-                    status: "fail",
-                    reason: "native_probe_unavailable",
-                    remediation: remediationForReason("native_probe_unavailable"),
-                };
-                return {
-                    ...relabeled,
-                    ok: false,
-                    reason: failed.reason,
-                    remediation: failed.remediation,
-                    readiness: {
-                        shared_memory: {
-                            state: "unavailable",
-                            reason: failed.reason,
-                        },
-                    },
-                    shared_memory: terminalSharedMemoryDiagnostics(
-                        classifySharedMemoryFailure(error),
-                    ),
-                    checks: [...relabeled.checks, failed].sort((left, right) =>
-                        left.id.localeCompare(right.id),
-                    ),
-                };
+            } catch {
+                return relabeled;
             }
             const { result: compatible } = this.applyCompatibility(relabeled, observed);
             const checksById = new Map(
                 compatible.checks.map((check) => [check.id, check] as const),
             );
             const addCheck = (
-                id: "readiness.shared_memory" | "readiness.storage" | "readiness.synapse",
+                id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
             ): void => {
                 const status =
@@ -846,8 +785,8 @@ export class McHostLifecyclePolicy {
                     remediation: remediationForReason(record.reason),
                 });
             };
-            if (observed.readiness.shared_memory) {
-                addCheck("readiness.shared_memory", observed.readiness.shared_memory);
+            if (observed.readiness.transport) {
+                addCheck("readiness.transport", observed.readiness.transport);
             }
             if (observed.readiness.storage) {
                 addCheck("readiness.storage", observed.readiness.storage);
@@ -858,12 +797,6 @@ export class McHostLifecyclePolicy {
             const checks = [...checksById.values()].sort((left, right) =>
                 left.id.localeCompare(right.id),
             );
-            // The check list is ordered by id because the v1 result requires
-            // lexicographically sorted unique check ids. The reported reason is
-            // NOT that order: the release contract ships one precedence list for
-            // failing reasons, and a lower-precedence readiness failure must
-            // never mask a higher-precedence one just because its check id
-            // sorts earlier (`readiness.shared_memory` before `readiness.storage`).
             checks.sort((left, right) => left.id.localeCompare(right.id));
             const failed = checks
                 .filter((check) => check.status === "fail")
@@ -880,7 +813,6 @@ export class McHostLifecyclePolicy {
                 reason: failed?.reason ?? "healthy",
                 remediation: failed?.remediation ?? null,
                 readiness: observed.readiness,
-                shared_memory: observed.sharedMemory ?? null,
                 checks,
             };
         } catch (error) {
@@ -1021,24 +953,4 @@ export class McHostLifecyclePolicy {
         }
         return localResult(command, false, state, "internal_error");
     }
-}
-
-function terminalSharedMemoryDiagnostics(
-    errorClass: SharedMemoryDiagnostics["error_class"],
-): SharedMemoryDiagnostics {
-    return {
-        state: "terminal",
-        error_class: errorClass,
-        artifact: {
-            profile: "mc-host-test-ring-v1",
-            wire_version: 2,
-            descriptor_schema: 2,
-        },
-        bounds: null,
-        accounting: null,
-        activation: { completed: 0 },
-        peer_death: { observed: errorClass === "peer_death" ? 1 : 0 },
-        reclamation: { completed: 0 },
-        exhaustion: { observed: errorClass === "resource_exhaustion" ? 1 : 0 },
-    };
 }

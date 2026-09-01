@@ -53,9 +53,8 @@ afterEach(() => {
 });
 
 /**
- * A minimal stand-in for the in-process client OpenCode hands the plugin
- * (`input.client`). `promptAsync` is the delivery primitive; `messages` backs
- * resolvePromptContext (empty by default).
+ * OpenCode passes this client as `input.client`.
+ * `promptAsync` delivers prompts; `messages` backs `resolvePromptContext`.
  */
 function fakeClient(
     promptAsync: (input: unknown) => Promise<unknown>,
@@ -103,11 +102,10 @@ describe("maybeDeliverChannel2", () => {
         setChannel2NudgeState(db, "ses-noclient", "pending");
         const delivered = await maybeDeliverChannel2("ses-noclient", {
             db,
-            // No client (e.g. a context with no client available).
             baseline: channel2Baseline(75_000, 100_000),
         });
         expect(delivered).toBe(false);
-        // Intent stays pending: delivery is simply unavailable, not consumed.
+        // Unavailable delivery does not consume pending intent.
         expect(getChannel2NudgeState(db, "ses-noclient")).toBe("pending");
     });
 
@@ -118,10 +116,9 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-unknown", {
             db,
             client: fakeClient(async () => ({})),
-            // No rendered-tail U/T measurement at this event.
+            // The event has no rendered-tail U/T measurement.
         });
-        // An unknown baseline must neither consume the cycle cap nor cancel the
-        // intent; a later final-stop with a real measurement decides.
+        // An unknown baseline neither consumes the cycle cap nor cancels the intent; a later final-stop with a real measurement decides.
         expect(delivered).toBe(false);
         expect(getChannel2NudgeState(db, "ses-unknown")).toBe("pending");
     });
@@ -130,15 +127,14 @@ describe("maybeDeliverChannel2", () => {
         useTempDataHome("ch2-stale-");
         const db = openDatabase()!;
         setChannel2NudgeState(db, "ses-stale", "pending");
-        // The absolute floor still holds, but severity is only 0.50. Revalidation
-        // must apply the same fourth-band predicate that armed the intent.
+        // The absolute floor holds, but severity is 0.50; `maybeDeliverChannel2` must reapply the fourth-band predicate that armed the intent.
         const delivered = await maybeDeliverChannel2("ses-stale", {
             db,
             client: fakeClient(async () => ({})),
             baseline: channel2Baseline(50_000, 100_000),
         });
         expect(delivered).toBe(false);
-        // Cancelled to '' (re-armable), NOT 'delivered' — cap preserved.
+        // `maybeDeliverChannel2` resets the state to `''` rather than `delivered`, preserving the cap.
         expect(getChannel2NudgeState(db, "ses-stale")).toBe("");
     });
 
@@ -251,8 +247,7 @@ describe("maybeDeliverChannel2", () => {
         setChannel2NudgeState(db, sessionId, "pending");
         const promptAsync = mock(async () => ({}));
         const client = fakeClient(promptAsync, async () => {
-            // resolvePromptContext yields between claim and promptAsync. This
-            // models the child writing its terminal report during that window.
+            // `resolvePromptContext` yields between the claim and `promptAsync` to model the child writing its terminal report in that window.
             expect(getChannel2NudgeState(db, sessionId)).toBe("claimed");
             openCodeDb
                 .prepare("UPDATE message SET data = ? WHERE id = ?")
@@ -293,12 +288,12 @@ describe("maybeDeliverChannel2", () => {
         expect(callArg.body.noReply).toBe(false);
         expect(callArg.body.parts[0]!.text).toContain("<system-reminder>");
         expect(callArg.body.parts[0]!.text).toContain("ctx_reduce");
-        // synthetic: true — skips OpenCode's queued-message wrapper (issue #129
-        // flip-bust) + TUI render, while still driving the run loop + model. Must
-        // NOT be ignored (that would strip it from the model).
+        // `synthetic: true` skips OpenCode's queued-message wrapper and TUI render while still driving the run loop and model.
+        // Do not set `synthetic: true`: OpenCode must render the message and include it in the model context.
+        // Do not set `synthetic: true`: OpenCode must include the message in the model context.
         expect(callArg.body.parts[0]!.synthetic).toBe(true);
         expect((callArg.body.parts[0] as { ignored?: boolean }).ignored).not.toBe(true);
-        // One-shot cap consumed.
+        // Delivery consumes the one-shot cap.
         expect(getChannel2NudgeState(db, "ses-go")).toBe("delivered");
     });
 
@@ -308,8 +303,7 @@ describe("maybeDeliverChannel2", () => {
         setChannel2NudgeState(db, "ses-confirm-lost", "pending");
 
         const promptAsync = mock(async () => {
-            // Simulate a sibling process consuming/cancelling the claim after the
-            // send returns but before this process can confirm claimed→delivered.
+            // A sibling can consume or cancel the claim after send returns and before this process changes `claimed` to `delivered`.
             setChannel2NudgeState(db, "ses-confirm-lost", "");
         });
         const delivered = await maybeDeliverChannel2("ses-confirm-lost", {
@@ -365,8 +359,7 @@ describe("maybeDeliverChannel2", () => {
 
         const secondPromptAsync = mock(async () => ({}));
         const firstPromptAsync = mock(async () => {
-            // Simulate boot healing a stale claim while the original promptAsync is
-            // still in flight, then a sibling process delivering the rewound intent.
+            // Boot healing can rewind a stale claim while the original `promptAsync` is in flight, allowing a sibling to deliver the rewound intent.
             db.prepare(
                 "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE session_id = ?",
             ).run(sessionId);
@@ -462,7 +455,7 @@ describe("maybeDeliverChannel2", () => {
         });
 
         expect(delivered).toBe(false);
-        // Reverted to pending so a later event retries — the single nudge isn't lost.
+        // The claim reverts to `pending` so a later event retries.
         expect(getChannel2NudgeState(db, "ses-fail")).toBe("pending");
     });
 

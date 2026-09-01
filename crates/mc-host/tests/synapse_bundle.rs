@@ -1,9 +1,9 @@
-//! Bundle validation and certified-inference conformance for the committed
+//! These tests validate bundle handling and certified-inference conformance for the synapse-tiny fixture.
 //! synapse-tiny fixture.
 //!
-//! Tests that touch native inference need a real ONNX Runtime shared
-//! library. Set `MC_SYNAPSE_TEST_ORT_LIBRARY` to its path; without it those
-//! tests skip (loudly) while every pre-ORT rejection path still runs.
+//! Native-inference tests require an ONNX Runtime shared library at `MC_SYNAPSE_TEST_ORT_LIBRARY`.
+//! Set `MC_SYNAPSE_TEST_ORT_LIBRARY` to the ONNX Runtime shared-library path.
+//! Without `MC_SYNAPSE_TEST_ORT_LIBRARY`, native-inference tests skip while pre-ORT rejection tests run.
 
 mod support;
 
@@ -75,8 +75,7 @@ fn config_for(dir: &Path, ort: &(PathBuf, String)) -> SynapseConfig {
     }
 }
 
-/// A syntactically valid ORT identity for rejection paths that fail before
-/// any native loading; the file never has to exist.
+/// Pre-ORT rejection tests use a syntactically valid ORT identity and never load the library.
 fn pre_ort_identity() -> (PathBuf, String) {
     (
         PathBuf::from("/nonexistent/libonnxruntime.so"),
@@ -115,14 +114,11 @@ async fn expect_disabled_with(mutate: impl FnOnce(&Path), expected_fragment: &st
     );
 }
 
-/// Infeasible limits are operator configuration error: startup must fail the
-/// host loudly rather than disable the lane while the host reports healthy.
+/// Infeasible limits fail host startup instead of disabling Synapse while the host remains healthy.
+/// Infeasible limits fail host startup instead of disabling Synapse while the host remains healthy.
 ///
-/// The check runs in `activate`, not `initialize`: bundle verification, ORT
-/// load, and model construction are post-publication work, so `initialize`
-/// only records that the lane is starting. An `Err` from `activate` is a
-/// host-fatal invariant failure — the same loud outcome, one phase later —
-/// which is why both phases are driven here rather than just the first.
+/// An `Err` from `activate` fails host startup.
+/// An `Err` from `activate` fails host startup.
 async fn expect_limits_fail_startup(
     mutate: impl FnOnce(&mut SynapseLimits),
     expected_fragment: &str,
@@ -153,19 +149,17 @@ async fn expect_limits_fail_startup(
 
 #[tokio::test(start_paused = true)]
 async fn waiting_query_memory_bound_rejects_both_construction_paths() {
-    // The startup scratch formula at default limits, pinned so a formula or
-    // pool change must recompute this boundary deliberately:
-    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
-    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
-    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
-    //   queued text bytes = max_queued_request_bytes          =  67,108,864
-    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
-    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
-    //   K = 4: 182,244,608 <= 182,519,040 (feasible boundary)
-    //   K = 5: 184,342,016 >  182,519,040 (rejected)
+    // At default limits, K=4 is the largest feasible waiter count.
+    // Available scratch after retained metadata is 182,519,040 bytes.
+    // Each waiter slot consumes 2 * max_text_bytes + 256 = 2,097,408 bytes.
+    // Queued text consumes max_queued_request_bytes = 67,108,864 bytes.
+    // Queued metadata consumes 64 jobs * (2*64 + 64 * 960) = 3,940,352 bytes.
+    // Worst-case parsing consumes 3 * 32 MiB + 64 * 640 + 4096 = 100,708,352 bytes.
+    // K = 4 consumes 182,244,608 bytes, within the 182,519,040-byte scratch bound.
+    // K = 5 consumes 184,342,016 bytes, exceeding the 182,519,040-byte scratch bound.
     const BOUNDARY: usize = 4;
 
-    // The accepted twin: the largest feasible K constructs on both paths.
+    // K=4, the largest feasible value, constructs on both paths.
     let accepted = SynapseLimits {
         max_waiting_queries: BOUNDARY,
         ..SynapseLimits::default()
@@ -175,7 +169,7 @@ async fn waiting_query_memory_bound_rejects_both_construction_paths() {
     SynapseComponent::ready_with_engine(test_lane(), DeterministicEngine::new(), accepted)
         .expect("the boundary configuration constructs through the engine path");
 
-    // One waiter past the boundary fails both paths with the scratch bound.
+    // Five waiter slots exceed the scratch bound on both construction paths.
     expect_limits_fail_startup(
         |limits| limits.max_waiting_queries = BOUNDARY + 1,
         "query admission capacity requires",
@@ -222,8 +216,7 @@ fn corpus() -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-ORT rejection paths: these must all disable Synapse before any native
-// model construction, so they run without an ONNX Runtime library.
+// Pre-ORT rejection paths disable Synapse before native model construction and do not require an ONNX Runtime library.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -249,16 +242,13 @@ async fn unconfigured_component_is_disabled_not_fatal() {
         component.health().await.status,
         mc_host::HealthStatus::Degraded
     );
-    // A lane that rejects every bind never parks a general handler task on
-    // query admission, so it must not spend one of the host's general
-    // handler-task slots: a host reserving all but one slot still starts.
+    // A lane that rejects every bind does not consume a general handler-task slot during query admission; a host reserving all but one slot still starts.
     assert_eq!(
         component.resources().general_task_hold_bound,
         0,
         "a disabled lane must declare no parked general handler tasks"
     );
-    // The bound survives for a lane that can serve: the running query plus
-    // every allowed waiter.
+    // A serving lane must fit the running query and every allowed waiter within the host's general handler-task limit.
     let ready = SynapseComponent::ready_with_engine(
         test_lane(),
         DeterministicEngine::new(),
@@ -330,8 +320,7 @@ async fn unlisted_extra_file_disables_the_lane() {
 
 #[tokio::test]
 async fn symlinked_artifact_disables_the_lane() {
-    // The entry set stays exactly as listed so this exercises the symlink
-    // rejection itself, not the unlisted-entry check that runs first. The
+    // The listed entry set makes this test reach symlink rejection before unlisted-entry rejection.
     // validator uses symlink_metadata, so the target never has to exist.
     expect_disabled_with(
         |dir| {
@@ -364,17 +353,14 @@ async fn duplicate_manifest_key_disables_the_lane() {
 
 #[tokio::test]
 async fn a_stale_fingerprint_disables_the_lane() {
-    // Every artifact is hash-verified against the manifest, so an owner who
-    // edits the embedding space and forgets to bump the fingerprint would
-    // otherwise serve a different space under the same lane identity. The
-    // digest stays well-formed here: only its binding to the contents breaks.
+    // Keeping `fingerprint` unchanged after an embedding-space edit serves a different embedding space under the same lane identity.
+    // The digest stays well-formed: only its binding to the contents breaks.
     expect_disabled_with(
         |dir| edit_manifest(dir, |m| m["fingerprint"] = "a1".repeat(32).into()),
         "canonical embedding-space fingerprint",
     )
     .await;
-    // A single embedding-space field moving without the fingerprint is the
-    // same fault from the other direction.
+    // Changing `table_epoch` without updating `fingerprint` also invalidates the canonical fingerprint.
     expect_disabled_with(
         |dir| edit_manifest(dir, |m| m["table_epoch"] = 9.into()),
         "canonical embedding-space fingerprint",
@@ -384,10 +370,7 @@ async fn a_stale_fingerprint_disables_the_lane() {
 
 #[test]
 fn the_committed_fixture_carries_its_canonical_fingerprint() {
-    // Guards against fixture drift in the default test run: the certified
-    // load path that would otherwise catch a stale fingerprint needs a native
-    // ONNX Runtime and skips without one, and every rejection test above
-    // passes whether or not this digest is correct.
+    // `the_committed_fixture_carries_its_canonical_fingerprint` detects fixture fingerprint drift when ONNX Runtime is unavailable.
     let limits = SynapseLimits {
         max_text_bytes: 123_456,
         ..SynapseLimits::default()
@@ -402,11 +385,9 @@ fn the_committed_fixture_carries_its_canonical_fingerprint() {
     );
 }
 
-/// The bundle manifest is the hinge between the two trust roots: the generation
-/// manifest hashes it, and it hashes every artifact. A load that accepts any
-/// self-consistent manifest at the pathname breaks that chain, so a bundle
-/// swapped in after the generation was validated could serve different
-/// embedding bytes under a selection the daemon still reported as valid.
+/// The generation manifest hashes the bundle manifest, which hashes every artifact.
+/// The loader rejects a bundle whose manifest digest differs from the generation's committed digest.
+/// A bundle swapped after generation validation can change embedding bytes while the selection remains valid.
 #[test]
 fn a_bundle_manifest_outside_the_committed_digest_does_not_load() {
     let limits = SynapseLimits::default();
@@ -433,10 +414,7 @@ fn a_bundle_manifest_outside_the_committed_digest_does_not_load() {
 
 #[tokio::test]
 async fn a_recommended_batch_above_the_admission_cap_disables_the_lane() {
-    // The recommended page size is published to clients verbatim while
-    // admission rejects anything over max_batch_items, so a manifest
-    // recommending more rows would make every conforming client build pages
-    // this host always refuses.
+    // `recommended_page_size` must not exceed `max_batch_items` because clients receive the recommendation verbatim while admission rejects larger batches.
     let dir = tempfile::tempdir().expect("temp bundle dir");
     copy_fixture_to(dir.path());
     let ort = pre_ort_identity();
@@ -484,8 +462,7 @@ async fn manifest_field_bounds_disable_the_lane() {
         "schema version",
     )
     .await;
-    // The epoch crosses the wire as a JSON number, so a value the client
-    // cannot hold exactly is refused rather than silently rounded into a
+    // `table_epoch` must not exceed 9_007_199_254_740_991 because JSON clients represent it as a number.
     // constraint mismatch.
     expect_disabled_with(
         |dir| {
@@ -583,8 +560,8 @@ async fn missing_bundle_directory_disables_the_lane() {
 }
 
 // ---------------------------------------------------------------------------
-// Native paths: exercised only when a certified ONNX Runtime library is
-// available to this process.
+// Tests exercise native paths only when a certified ONNX Runtime library is available to this process.
+// Native inference must be repeatable within tolerance, not bit-exact.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -623,7 +600,6 @@ async fn certified_bundle_loads_and_serves_expected_vectors() {
         }
     }
 
-    // Repeatability within tolerance, not bit-exactness.
     let first = component
         .embed_blocking(&["alpha beta gamma"])
         .expect("embed");
@@ -634,8 +610,7 @@ async fn certified_bundle_loads_and_serves_expected_vectors() {
         assert!((a - b).abs() <= tolerance);
     }
 
-    // The tokenizer truncates at max_tokens, so tokens past the boundary
-    // cannot change the vector.
+    // The tokenizer truncates at `max_tokens`, so later tokens cannot change the vector.
     let truncated = component
         .embed_blocking(&["alpha beta gamma delta epsilon zeta eta theta"])
         .expect("embed");
@@ -749,13 +724,11 @@ async fn wrong_ort_identity_disables_the_lane() {
 }
 
 // ---------------------------------------------------------------------------
-// Initialization-abort ownership: the blocking load is owned by the
-// component's incarnation tracker, so an abandoned `initialize` can outlive
-// neither the component's shutdown drain nor the instance lock.
+// The component's incarnation tracker owns the blocking load.
+// The blocking load cannot outlive the component's shutdown drain or instance lock.
 // ---------------------------------------------------------------------------
 
-/// A current-thread runtime with exactly one blocking thread, so one gate
-/// closure can deterministically queue every later `spawn_blocking`.
+/// One gate closure queues later `spawn_blocking` calls because the runtime has one blocking thread.
 fn single_blocking_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -764,10 +737,10 @@ fn single_blocking_thread_runtime() -> tokio::runtime::Runtime {
         .expect("test runtime")
 }
 
-/// Occupies the runtime's only blocking thread until the sender drops, so a
-/// later `spawn_blocking` (the component's bundle load) stays queued behind
-/// it — a deterministic window in which `initialize` can be dropped before
-/// its blocking work ran.
+/// The gate occupies the runtime's only blocking thread until its sender drops.
+/// The component's bundle-load `spawn_blocking` call stays queued behind the gate.
+/// The queued load lets callers drop `initialize` before the load runs.
+/// The blocking work does not run before `initialize` is dropped.
 fn blocking_pool_gate() -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let gate = tokio::task::spawn_blocking(move || {
@@ -785,9 +758,8 @@ fn a_dropped_activate_keeps_shutdown_waiting_for_the_blocking_load() {
         component.initialize().await.expect("initialize");
         let (gate_tx, gate) = blocking_pool_gate();
 
-        // One poll spawns the queued blocking load and the tracked wrapper
-        // that owns its completion; the drop then abandons `activate`
-        // exactly at its await on that wrapper.
+        // One poll spawns the queued blocking load and the tracked wrapper that owns its completion; dropping `activate` then abandons `activate`.
+        // The drop abandons `activate` while it awaits the tracked wrapper.
         let mut activate = Box::pin(SecondaryComponent::activate(&component));
         tokio::select! {
             biased;
@@ -798,8 +770,7 @@ fn a_dropped_activate_keeps_shutdown_waiting_for_the_blocking_load() {
         }
         drop(activate);
 
-        // The load has not run, so the incarnation tracker still owns it and
-        // shutdown's drain must hold.
+        // The load has not run, so the incarnation tracker still owns it; shutdown's drain must wait.
         let waited = tokio::time::timeout(Duration::from_millis(200), component.shutdown()).await;
         assert!(
             waited.is_err(),
@@ -813,9 +784,7 @@ fn a_dropped_activate_keeps_shutdown_waiting_for_the_blocking_load() {
             .expect("shutdown completes once the blocking load stopped")
             .expect("synapse shutdown returns cleanly");
 
-        // The dropped activate never installed a lane: the load's result
-        // was discarded at the tracked wrapper, so the lane still reports
-        // its pre-activation starting state.
+        // The dropped `activate` never installs a lane because the tracked wrapper discards the load result.
         assert!(matches!(component.status(), SynapseStatus::Starting));
     });
 }
@@ -866,7 +835,7 @@ fn an_abandoned_activation_holds_the_instance_lock_until_the_blocking_load_stops
             .join(mc_host::CONNECTION_FILE_NAME);
         let host = tokio::spawn(async move { mc_host::run(composite, config, run_shutdown).await });
 
-        // Transport publishes while the gated blocking load is still queued:
+        // Transport publishes while the gated blocking load remains queued.
         // activation never delays publication.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while std::fs::read(&publication).is_err() {
@@ -877,9 +846,8 @@ fn an_abandoned_activation_holds_the_instance_lock_until_the_blocking_load_stops
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Shutdown abandons the activation future, but the component's
-        // tracker still owns the queued blocking load: the lock must refuse
-        // a successor until that load stops.
+        // Shutdown abandons the activation future.
+        // The lock refuses a successor until the queued load stops.
         shutdown.cancel();
         let refused = mc_host::run(
             probe_composite(),
@@ -892,8 +860,7 @@ fn an_abandoned_activation_holds_the_instance_lock_until_the_blocking_load_stops
             "the lock must stay held while the blocking load is owned, got {refused:?}"
         );
 
-        // Releasing the gate lets the load run to completion; only then can
-        // shutdown drain and the guard drop.
+        // Shutdown drains and the guard drops after the load completes.
         drop(gate_tx);
         gate.await.expect("gate closure joins");
         let result = host.await.expect("run task joins");
@@ -904,10 +871,8 @@ fn an_abandoned_activation_holds_the_instance_lock_until_the_blocking_load_stops
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            // A pre-cancelled token makes each probe self-contained: `run`
-            // acquires the lock, observes shutdown before initialization
-            // completes, and hands its own guard to a reaper that releases
-            // it promptly — no listener, no publication.
+            // With a pre-cancelled token, `run` acquires the lock, observes shutdown before initialization, and hands its guard to a reaper that releases it before listener startup or publication.
+            // The reaper starts no listener and publishes nothing.
             let probe_shutdown = mc_host::CancellationToken::new();
             probe_shutdown.cancel();
             let outcome = mc_host::run(

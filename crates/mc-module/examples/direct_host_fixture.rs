@@ -77,13 +77,13 @@ mod unix {
 
     /// One release channel per blocked invocation, oldest first.
     ///
-    /// A counting semaphore cannot express this: a permit added just before
+    /// A counting semaphore alone can retain a release that cancellation leaves unconsumed, letting a later `Block` invocation resume without a matching `release-blocked-call`.
     /// cancellation wins the `biased` race in `execute` stays in the semaphore,
     /// and the next `Block` run consumes it immediately and completes without a
     /// matching `release-blocked-call`. That silently rewrites the fault schedule
     /// an E2E scenario is asserting against. Addressing a specific invocation
     /// makes an unconsumed release impossible to mistake for a pending one.
-    /// The queued value is the ack channel the run uses to confirm it resumed.
+    /// The queued sender delivers the acknowledgment channel the run uses to confirm it resumed.
     type BlockedQueue = Arc<Mutex<VecDeque<(u64, oneshot::Sender<oneshot::Sender<()>>)>>>;
 
     struct ControlledBackend {
@@ -115,9 +115,9 @@ mod unix {
         /// that the run selected the release branch: the `biased` select prefers
         /// shutdown and cancellation, so a release handed over at that instant is
         /// never consumed. Counting it here would report one invocation as both
-        /// released and cancelled and answer `accepted: true` for a run that never
-        /// resumed. The run therefore acknowledges consumption, and a release that
-        /// lost the race moves on to the next waiting invocation.
+        /// for a run that never resumed.
+        /// The run acknowledges release consumption.
+        /// A release that lost the race moves to the next waiting invocation.
         async fn release_blocked(&self) -> bool {
             loop {
                 let Some((_id, sender)) = self
@@ -161,7 +161,6 @@ mod unix {
             .is_ok()
     }
 
-    /// Registers one blocked invocation and returns its id and release channel.
     fn register_blocked(
         queue: &BlockedQueue,
         next_id: &AtomicU64,
@@ -249,8 +248,7 @@ mod unix {
                                 };
                                 take_blocked_slot(&counters);
                                 counters.released.fetch_add(1, Ordering::SeqCst);
-                                // Acknowledged after the accounting, so a
-                                // releaser that observes the ack also observes
+                                // The acknowledgment guarantees that the release waiter observes updated counters.
                                 // the counters.
                                 let _ = ack.send(());
                                 events.emit(BackendEvent::AssistantText {
@@ -592,9 +590,7 @@ mod unix {
                 return Ok(());
             }
             if host.is_finished() {
-                // Report the exit without consuming the handle: `run` owns the
-                // single await, and polling a completed `JoinHandle` twice
-                // panics, which would skip control-socket cleanup.
+                // Only `run` may await `host`; polling its completed `JoinHandle` again panics and skips control-socket cleanup.
                 return Err("host exited before readiness".into());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -642,11 +638,8 @@ mod unix {
             daemon_ver: "mc-module/direct-host-fixture".to_owned(),
             init: storage_init(&root),
             limits: mc_host::HostLimits {
-                // This composite is the only place that knows which components
-                // are linked, so it is the only place that can size the ceiling:
-                // the default ingress floor plus every linked component's
-                // declared retention. The runtime subtracts those declarations
-                // from ingress, so omitting one would either starve ingress or
+                // The composite must account for every linked component's declared retention.
+                // The composite must size `max_resident_bytes` for every linked component.
                 // fail startup.
                 max_resident_bytes: mc_host::HostLimits::default().max_resident_bytes
                     + mc_module::DECLARED_RETAINED_RESIDENT_BYTES
@@ -694,8 +687,6 @@ mod unix {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        // The host's own error is the specific one; a readiness failure is
-        // usually its symptom, so it reports only when the host itself is fine.
         host_result?;
         ready?;
         Ok(())

@@ -1,8 +1,5 @@
 import type { Database } from "../../shared/sqlite";
 
-// Intentional: the definition regex allows single quotes and parens because SQLite column
-// defaults use them (e.g. TEXT DEFAULT '', INTEGER DEFAULT 0). All callsites pass hardcoded
-// string literals — no user input reaches this function, so the regex is sufficient.
 export function ensureColumn(
     db: Database,
     table: string,

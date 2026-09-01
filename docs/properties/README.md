@@ -23,6 +23,12 @@ production runtime enforcement.
   byte-identical across that range, and of the `mc-host` files Part 1 cites only
   `generation.rs` changed, which no record depends on. The gap-closure records
   added in Groups I through M were verified against the later commit.
+- Eventfd reconciliation, 2026-08-31: Part 1 was reconciled against HEAD
+  `46278f47a` after PR #131 (merge `5d638e3e8`) replaced polling with sparse
+  eventfd delivery and confirmed the iceoryx2 backend's removal. This covers
+  the range from the `9c1eb4d1`/`e447c927` anchoring era to `46278f47a`, and
+  normalizes Part 1's interim `superseded-by-refactor` status to `invalidated`
+  per METHOD's `active | invalidated` vocabulary.
 
 ### External references consulted
 
@@ -95,7 +101,7 @@ files.
 
 | Part | Scope | Status |
 | --- | --- | --- |
-| [part-1-shm-transport](part-1-shm-transport/) | `crates/mc-shm-transport`, `packages/mc-shm-native`; boundary context from `crates/mc-host/src/{shm_provider,transport_negotiation,transport_provider,provider_recovery}.rs` | 58 records; portfolio evaluated; all 7 queued gaps closed |
+| [part-1-shm-transport](part-1-shm-transport/) | `crates/mc-shm-transport`, `packages/mc-shm-native`; boundary context from `crates/mc-host/src/{shm_provider,transport_negotiation,transport_provider,provider_recovery}.rs` | 65 records; portfolio evaluated; the 7 originally queued gaps are closed, and the Group N evaluation queued 4 new gaps (redispatch termination, acknowledgement-failure, multi-channel interleaving, coverage markers) for a follow-up discovery pass — see [portfolio-evaluation.md](part-1-shm-transport/portfolio-evaluation.md) |
 | [part-2a-host-lifecycle](part-2a-host-lifecycle/) | `crates/mc-host/src/{lifecycle,generation,connection,frame_read,panic_boundary}.rs` (~6.5k lines) | 55 records; portfolio evaluated; all 5 queued gaps mined and merged; 6 records superseded by the ring-transport refactor |
 | [part-2b-wire-and-channels](part-2b-wire-and-channels/) | `crates/mc-host/src/{wire,frame_channel,tcp_frame_channel,transport_negotiation,transport_provider,composite}.rs` (~4.9k) | **Superseded by the ring-transport refactor. Retained as salvage, not as a plan.** No catalog and none owed; synthesis never ran. Four completed lens files under `_lenses/` (A wire format, B channel egress, C negotiation and provider, D claims and existing checks) describe the pre-refactor surface; A, B and C propose 36 records between them and D is the claims-and-history inventory. Triage of those 36: 6 still valid, 9 invalid because their subject was deleted, 21 needing re-verification. **None of the 6 still-valid records has been absorbed by a successor part yet.** See [part-2b-wire-and-channels/README.md](part-2b-wire-and-channels/README.md) for the disposition and [Two directories share the number 2b](#two-directories-share-the-number-2b) below. |
 | part-2c-auth-and-control | `crates/mc-host/src/{auth,instance,control,config,connection_file}.rs` (~5k) | Parked — pending ring-transport refactor |
@@ -190,22 +196,22 @@ inventory and fault map as well. Two rows need reading with their footnote.
   work. Two were applied and are named in `catalog.md`. Treat the part as
   evaluated and not dispositioned.
 
-
 ### Records carrying a `Reachability:` line
 
 METHOD.md rule 4 requires a per-record reachability label. The field entered the
-record schema partway through, so the earliest parts predate it. Counts are of
-records in each part's `catalog.md`, where a record is a `###` heading whose first
-field is `Type:`.
+record schema partway through, so the earliest parts predated it; the backfill in
+`2930790ae` closed that gap. Counts are of records in each part's `catalog.md`,
+where a record is a `###` heading whose first field is `Type:`, re-derived against
+HEAD.
 
 | Rust part | Records | With `Reachability:` | Without |
 | --- | --- | --- | --- |
-| part-1-shm-transport | 58 | 0 | 58 |
-| part-2a-host-lifecycle | 55 | 17 | 38 |
-| part-2b-ring-datapath | 14 | 14 | 0 |
-| part-2c-setup-identity | 14 | 14 | 0 |
+| part-1-shm-transport | 65 | 65 | 0 |
+| part-2a-host-lifecycle | 55 | 55 | 0 |
+| part-2b-ring-datapath | 18 | 18 | 0 |
+| part-2c-setup-identity | 16 | 16 | 0 |
 | part-2d-client-peer | 14 | 14 | 0 |
-| part-2e-request-path | 14 | 14 | 0 |
+| part-2e-request-path | 16 | 16 | 0 |
 | part-2f-runtime-config | 14 | 14 | 0 |
 | part-3-store-core | 37 | 37 | 0 |
 | part-4a-historian | 24 | 24 | 0 |
@@ -213,18 +219,23 @@ field is `Type:`.
 | part-4c-handlers | 25 | 25 | 0 |
 | part-4d-facade | 25 | 25 | 0 |
 | part-4e-rendering | 26 | 26 | 0 |
-| part-4f-decisions | 26 | 26 | 0 |
+| part-4f-decisions | 27 | 27 | 0 |
 | part-2b-wire-and-channels | 0 | 0 | 0 |
-| **Total** | **370** | **274** | **96** |
+| **Total** | **386** | **386** | **0** |
 
-The whole shortfall is in the two earliest parts. Part 1 has none of the labels,
-and Part 2a has them on 17 of 55 records, the 17 being later additions. Every part
-from 2b-ring-datapath onward labels every record. `part-2b-wire-and-channels`
-scores zero because it has no catalog and is owed none; its 36 unlabelled lens
-records are working material, not records, and are not counted in the 370.
-Backfilling those 96 labels is
-per-record work: rule 4 requires the evidence for each label at authoring time, so
-they cannot be assigned from a preamble.
+Every Rust record now carries the label. The two earliest parts were the whole
+shortfall, and `2930790ae` backfilled them: Part 1 went from 0 labels to all of
+its records, and Part 2a from 17 of 55 to all 55. This table's Part 1 row also
+absorbs the seven Group N records added in the eventfd reconciliation pass.
+`part-2b-wire-and-channels` scores zero because it has no catalog and is owed
+none; its 36 unlabelled lens records are working material, not records, and are
+not counted in the 386.
+
+Four rows besides Part 1 were re-derived upward here (2b-ring-datapath 14 to 18,
+2c-setup-identity 14 to 16, 2e-request-path 14 to 16, 4f-decisions 26 to 27).
+Those records were added by earlier passes that did not revisit this table, so
+the drift predates this pass; the counts above are what the stated derivation
+rule yields at HEAD.
 
 ### Not yet opened on the Rust side
 

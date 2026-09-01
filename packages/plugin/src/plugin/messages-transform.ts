@@ -17,10 +17,7 @@ import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallbac
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { log, sessionLog } from "../shared/logger";
 
-// Error codes that SQLite raises for transient contention — should be retried
-// on next transform pass rather than surfaced as persistent failures. BUSY is
-// by far the most common in WAL mode; LOCKED is theoretically possible when a
-// shared-cache conflict occurs (extremely rare in our single-DB setup but
+// The next transform pass retries SQLITE_BUSY and SQLITE_LOCKED.
 // covered defensively).
 const TRANSIENT_SQLITE_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
 
@@ -43,61 +40,31 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
 }
 
 /**
- * Top-level transform wrapper. Catches errors so OpenCode's prompt loop
- * always proceeds — without this guard, a transient DB contention event can
- * crash the user's turn through OpenCode's Effect pipeline. See issue #23:
  * https://github.com/cortexkit/magic-context/issues/23
  *
- * Error handling is tiered:
  *
- * - **FailClosedBlockingError / EmergencyFailClosedError / RawFallbackContextLimitError**:
- *   Intentional loud aborts. Rethrown so the TUI surfaces the message and the turn does not
- *   silently fall through to native compaction or a provider-rejected raw prompt.
  *
- * - **SQLITE_BUSY**: Transient, expected from concurrent plugin processes
- *   (second OpenCode instance, long dreamer/historian child session, slow
- *   WAL checkpoint). Logged tersely; next pass will retry naturally. No
- *   persistent telemetry needed.
  *
- * - **Non-BUSY errors**: Schema corruption, programming bugs, type errors.
- *   These can silently disable magic-context for the entire session if the
- *   error repeats on every pass. We:
- *     1. Log with full detail (code, name, message, stack).
- *     2. Persist a short error summary into `session_meta.last_transform_error`
- *        so the sidebar/dashboard surfaces the failure state. The sidebar
- *        already reads this field; runPostTransformPhase's catch only fires
- *        for errors that reach it, and an error thrown early enough bypasses
- *        it entirely. Writing it here at the outer boundary guarantees
  *        observability.
- *     3. Return with messages unmodified for this pass.
  *
- * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
- * turns thrown errors into user-visible prompt failures. FailClosedBlockingError,
- * EmergencyFailClosedError, and RawFallbackContextLimitError are intentional exceptions.
- * We accept degraded behavior (no injection / no drops this turn) rather than
- * blocking the user for ordinary bugs — but deterministic inoperability must
- * block loudly when fail_closed_blocking is on.
+ * Errors other than `FailClosedBlockingError` leave the turn without injection or drops.
+ * When `fail_closed_blocking` is enabled, `FailClosedBlockingError` aborts the turn.
  *
- * Correctness is preserved because all persistent state mutations inside
- * the inner transform are idempotent across passes.
+ * Persistent state mutations in the inner transform are idempotent across passes.
  */
 export function createMessagesTransformHandler(args: {
     magicContext: MagicContextTransformHooks;
     /**
-     * Optional live getter so a healed storage reopen can swap in real hooks
-     * without rebuilding the outer wrapper.
+     * getMagicContext lets a healed storage reopen swap in real hooks without rebuilding the outer wrapper.
      */
     getMagicContext?: () => MagicContextTransformHooks;
     failClosed?: FailClosedController | null;
     failClosedBlockingEnabled?: boolean;
     /**
-     * Compaction-off mode (issue #266): the fail-closed BLOCKING wrapper is
-     * inert BY DESIGN — MC inoperability no longer risks unbounded growth
-     * because native compaction (or nothing) owns the window. A thrown or
-     * failed transform degrades to passthrough of the input messages: no
-     * blocking message, no cancelled request, one diagnostic. The enforce
-     * call still runs (its re-probe can heal storage mid-process), but any
-     * error it raises is converted to passthrough here.
+     * When compactionOff is true, fail-closed blocking is inert because native compaction or no compaction controls the context window.
+     * With compactionOff, a failed transform passes through the input messages without injection or drops.
+     * Passthrough emits no blocking message, cancels no request, and logs one diagnostic.
+     * When compactionOff is true, FailClosedBlockingError from failClosed.enforce degrades to passthrough.
      */
     compactionOff?: boolean;
     internalChildSessions?: Set<string>;
@@ -110,11 +77,9 @@ export function createMessagesTransformHandler(args: {
             typeof sessionId === "string" &&
             sessionId.length > 0 &&
             args.internalChildSessions?.has(sessionId) === true;
-        // Snapshot only the array, never nested messages: compaction-off gates
-        // every stage that writes retained message internals, and its additive
-        // path only prepends new synthetic message objects. A shallow snapshot
-        // can therefore restore the exact input without a hot-path deep clone.
-        // Proxy-guarded success and failure tests enforce that retained inputs
+        // Compaction-off gates every stage that writes retained message internals.
+        // The compaction-off additive path prepends only new synthetic message objects.
+        // Retained input messages remain read-only.
         // stay read-only.
         const compactionOffInputSnapshot = args.compactionOff ? [...output.messages] : null;
         const restoreCompactionOffInput = (): void => {
@@ -134,12 +99,7 @@ export function createMessagesTransformHandler(args: {
                     tryReopen: args.tryReopenStorage,
                 });
             } catch (error) {
-                // Compaction-off: fail_closed_blocking is inert BY DESIGN. A
-                // storage-unavailable gate that would otherwise throw (blocking
-                // the turn) degrades to passthrough of the input messages: no
-                // blocking message, no cancelled request, one diagnostic. The
-                // inner transform is skipped because storage is unavailable;
-                // the harness proceeds on the unmodified input.
+                // When compactionOff is true, a storage-unavailable fail-closed gate returns passthrough instead of blocking the turn.
                 if (args.compactionOff && isFailClosedBlockingError(error)) {
                     log(
                         `[magic-context] compaction-off: fail-closed inert, passing through: ${error.message}`,
@@ -174,8 +134,6 @@ export function createMessagesTransformHandler(args: {
             if (error instanceof RawFallbackContextLimitError) throw error;
             if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
                 if (!args.compactionOff) throw error;
-                // Inert by design: log a diagnostic and hand the harness back its
-                // own messages unchanged.
                 log(
                     `[magic-context] compaction-off: fail-closed inert, passing through: ${error instanceof Error ? error.message : String(error)}`,
                 );
@@ -183,8 +141,7 @@ export function createMessagesTransformHandler(args: {
                 return output.messages;
             }
             if (args.compactionOff) {
-                // Skip the LKG replay entirely: the contract for this mode is
-                // "return the input messages unmodified", never a cached
+                // When compactionOff is true, the transform does not replay LKG.
                 // transformed array.
                 restoreCompactionOffInput();
             } else if (sessionId && slotAtEntry && !entry) {
@@ -243,28 +200,17 @@ export function createMessagesTransformHandler(args: {
                 return output.messages;
             }
 
-            // Persistent non-transient errors are the real risk: silent forever
-            // disable unless we surface them. Persist to session_meta so the
-            // sidebar shows an obvious failure indicator.
             log(
                 `[magic-context] transform FAILED code=${code ?? "none"} name=${name ?? "none"}: ${message}. Continuing with unmodified messages for this pass.`,
                 error,
             );
 
-            // Best-effort: surface the error in session_meta so users see
-            // something is broken. We can only do this when we have a
-            // session id — the output's first message carries it.
             const persistSessionId = resolveSessionId(output);
             if (persistSessionId) {
                 try {
                     const db = openDatabase();
-                    // null = storage unavailable (schema fence); nothing to persist to.
                     if (db) {
                         const summary = truncateError(name, code, message);
-                        // Write-if-changed guard: when the same error repeats on
-                        // every transform pass (e.g. persistent schema corruption),
-                        // skip the DB write if lastTransformError already matches.
-                        // Prevents needless WAL churn during degraded operation.
                         const current = getOrCreateSessionMeta(
                             db,
                             persistSessionId,
@@ -276,8 +222,6 @@ export function createMessagesTransformHandler(args: {
                         }
                     }
                 } catch (persistError) {
-                    // Swallow — if we can't even write the error, we definitely
-                    // can't recover. Next pass may succeed.
                     log("[magic-context] failed to persist transform error:", persistError);
                 }
             }

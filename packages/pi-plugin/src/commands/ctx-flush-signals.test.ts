@@ -3,25 +3,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Regression coverage for the `/ctx-flush` signal contract.
  *
- * The bug: Pi `/ctx-flush` only signaled `historyRefresh`. OpenCode's
- * `onFlush` (`hook.ts:438-441`) signals all THREE refresh sets — so
- * Pi's `/ctx-flush` couldn't actually force pending-op materialization
- * (the whole point of the command) unless the scheduler was already
- * going to execute, and disk-backed adjuncts (project-docs,
- * user-profile, key-files) wouldn't refresh either.
  *
- * Source-inspection test rather than a runtime mock because the contract
- * is short and stable, and the bug is structural (which signals are
+ * This test inspects source because the contract is the presence of specific signal calls.
  * called).
  */
 
 const PATH = join(import.meta.dir, "ctx-flush.ts");
 const SRC = readFileSync(PATH, "utf8");
 
-// Strip comments so the contract checks look at code only — comments
-// legitimately reference signal names to explain WHY they're called.
+// `codeOnly` excludes lines beginning with `//` because comments can contain signal names without calls.
 const codeOnly = SRC.split("\n")
 	.filter((line) => !line.trim().startsWith("//"))
 	.join("\n");

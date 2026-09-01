@@ -1,23 +1,13 @@
 /// <reference types="bun-types" />
 
 /**
- * Incident regression #2: the cold-start seed omitted TS dropped-tag state, so
- * the first rust wire exploded (476K vs 110K) because previously-dropped content
- * came back at full size. The fix seeds TS drops as frozen reductions at cold
- * start so the first rust pass reproduces them.
+ * The cold-start seed preserves TS drops as frozen reductions so the first Rust pass does not re-expand dropped content.
  *
- * This drives the exact incident shape end to end:
- *   1. Build a session under TS mode and apply a ctx_reduce drop under pressure
- *      so a `[dropped §N§]` reduction exists in TS state.
- *   2. Flip the project config ts → rust and RESTART serve against the same data
- *      dir (opencode.db + context.db survive).
- *   3. The first rust pass must reproduce the drop (not re-expand it): the served
- *      wire is SMALLER than the raw message array, and does not balloon past a
- *      sane bound relative to the TS-mode wire.
+ * ctx_reduce must create a `[dropped §N§]` reduction in TS state.
+ * The restart uses the same data directory so `opencode.db` and `context.db` persist.
+ * The first Rust pass must preserve the drop rather than re-expand it.
+ * The served wire must be smaller than the raw message array.
  *
- * Assertion style: wire-size bounds and presence of the drop marker, from the
- * fake provider's full request bodies. Raw-array size is measured directly from
- * opencode.db (the bytes opencode would send with no transform).
  */
 
 import { Database } from "bun:sqlite";
@@ -26,8 +16,8 @@ import { join } from "node:path";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
-/** Sum of every message-part JSON byte for a session in opencode.db — the raw,
- *  untransformed array size opencode would otherwise send to the provider. */
+/**
+ * */
 function rawArrayBytes(h: RustTestHarness, sessionId: string): number {
     const ocPath = join(h.env.dataDir, "opencode", "opencode.db");
     const db = new Database(ocPath, { readonly: true });
@@ -47,9 +37,8 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
     let h: RustTestHarness;
 
     beforeAll(async () => {
-        // Small context limit + real content ballast so pressure genuinely
-        // crosses the execute threshold (the module measures true-raw content,
-        // not the mock's fabricated usage). Start in TS mode.
+        // The test uses a small context limit and real content ballast so true raw content crosses the execute threshold.
+        // rawArrayBytes measures persisted part data instead of mock usage.
         h = await RustTestHarness.create({
             modelContextLimit: 30_000,
             startInTsMode: true,
@@ -68,7 +57,6 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
     it("seeds TS dropped-tag state into the first rust pass without context expansion", async () => {
         const sessionId = await h.createSession();
 
-        // Build TS-mode state with taggable content.
         for (let i = 1; i <= 3; i += 1) {
             h.mock.setDefault({
                 text: `assistant reply ${i}`,
@@ -82,7 +70,6 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
         }
         await Bun.sleep(500);
 
-        // Drop the first visible tag via an agent-issued ctx_reduce.
         const tsWire = h.lastMainWireSerialized();
         const tags = [...new Set([...tsWire.matchAll(/§(\d+)§/g)].map((m) => Number(m[1])))].sort(
             (a, b) => a - b,
@@ -114,7 +101,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
         });
         await h.sendPrompt(sessionId, `turn 4: reduce tag ${dropTag}`);
 
-        // High real-content pressure so the pending drop APPLIES on an execute pass.
+        // Real-content pressure causes the pending drop to apply during an execute pass.
         for (let i = 5; i <= 7; i += 1) {
             h.mock.setDefault({
                 text: `pressure ${i}`,
@@ -124,14 +111,12 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
         }
         await Bun.sleep(800);
 
-        // TS-mode drop landed: the served wire carries a [dropped …] marker.
         expect(dropEmitted).toBe(true);
         const tsFinalWire = h.lastMainWireSerialized();
         expect(tsFinalWire).toContain("[dropped");
         const tsWireBytes = h.lastMainWireBytes();
         const rawBytes = rawArrayBytes(h, sessionId);
 
-        // FLIP ts → rust and restart serve against the same data dir.
         await h.restart({
             rust: true,
             magicContextConfig: {
@@ -141,8 +126,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
             },
         });
 
-        // First rust pass. The cold-start seed must translate the TS frozen
-        // reduction so the drop is reproduced, not re-expanded.
+        // The cold-start seed must translate the TS frozen reduction so the drop is reproduced rather than re-expanded.
         h.mock.setDefault({
             text: "after flip",
             usage: { input_tokens: 20_000, output_tokens: 20, cache_creation_input_tokens: 2_000 },
@@ -155,20 +139,12 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
         const rustWire = h.lastMainWireSerialized();
         const rustWireBytes = h.lastMainWireBytes();
 
-        // Invariant 1: the drop is seeded as a frozen reduction — the first rust
-        // wire still carries the [dropped …] marker (the dropped content did NOT
-        // come back at full size, the exact incident #2 explosion).
+        // The first Rust wire must retain the `[dropped …]` marker from the seeded frozen reduction.
         expect(rustWire).toContain("[dropped");
 
-        // Invariant 2: the first rust wire is SMALLER than the raw message array.
-        // If the seed were omitted, the dropped content would re-expand and the
-        // wire would meet or exceed the raw array (the incident behavior).
+        // The first Rust wire is smaller than the raw message array.
         expect(rustWireBytes).toBeLessThan(rawBytes);
 
-        // Invariant 3: no context expansion beyond a sane bound vs the TS-mode
-        // wire. The incident ballooned 4.3x (476K vs 110K); a correct seed keeps
-        // the rust wire within a small multiple of the TS wire. 2x is far below
-        // the incident and far above normal per-pass jitter (~4%).
         expect(rustWireBytes).toBeLessThan(tsWireBytes * 2);
     }, 300_000);
 });

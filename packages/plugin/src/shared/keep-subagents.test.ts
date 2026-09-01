@@ -26,7 +26,6 @@ describe("keep-subagents flag", () => {
     });
 
     it("#given a non-true value #then coerces to false (only strict true keeps)", () => {
-        // boot wiring passes `config.keep_subagents === true`, but guard anyway.
         setKeepSubagents(undefined as unknown as boolean);
         expect(shouldKeepSubagents()).toBe(false);
     });

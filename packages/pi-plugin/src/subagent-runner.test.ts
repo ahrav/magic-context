@@ -244,9 +244,7 @@ describe("subagent-runner pure helpers", () => {
 			"--print",
 			"--mode",
 			"json",
-			// `--no-session` keeps historian / sidekick / dreamer /
-			// recomp / compressor child sessions out of `pi resume`
-			// and the session picker (uses Pi's
+			// `--no-session` prevents historian, sidekick, dreamer, recomp, and compressor child sessions from appearing in `pi resume` or Pi's session picker.
 			// SessionManager.inMemory()).
 			"--no-session",
 			"--no-skills",
@@ -258,10 +256,7 @@ describe("subagent-runner pure helpers", () => {
 			TEST_SYSTEM_PROMPT_PATH,
 			"--model",
 			"anthropic/claude-sonnet",
-			// No --thinking flag: thinkingLevel not set in baseOptions,
-			// so Pi's own resolution handles it (correct for Anthropic).
-			// Users on providers like GitHub Copilot should set
-			// historian.thinking_level in their Pi magic-context.jsonc.
+			// `baseOptions` leaves `thinkingLevel` unset, so Pi resolves thinking for Anthropic.
 			"summarize this session",
 		]);
 	});
@@ -514,17 +509,12 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("always includes --no-session so child sessions don't appear in pi resume", () => {
-		// Pinned-down regression: the user-visible promise of magic-context
-		// hidden subagents is that historian/sidekick/dreamer runs never
-		// pollute Pi's session list. If this assertion ever fails, the
-		// child sessions WILL show up in `pi resume` again.
+		// Hidden historian, sidekick, and dreamer subagents must not appear in Pi's session list or `pi resume`.
 		const args = buildArgsForTest({
 			...baseOptions,
 			model: "anthropic/claude-sonnet",
 		});
 		expect(args).toContain("--no-session");
-		// And before --system-prompt / --model so they're parsed in the
-		// expected order alongside other startup-time flags.
 		const noSessionIdx = args.indexOf("--no-session");
 		const modelIdx = args.indexOf("--model");
 		expect(noSessionIdx).toBeLessThan(modelIdx);
@@ -545,8 +535,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("translates the canonical (OpenCode) provider to Pi's form at --model", () => {
-		// Shared config stores canonical ids; Pi names two auth-plugin providers
-		// differently. The spawned --model must carry Pi's form.
+		// `--model` receives Pi provider IDs rather than canonical provider IDs.
 		expect(
 			buildArgsForTest({ ...baseOptions, model: "openai/gpt-5.5" }),
 		).toEqual(expect.arrayContaining(["--model", "openai-codex/gpt-5.5"]));
@@ -561,7 +550,6 @@ describe("subagent-runner pure helpers", () => {
 				"google-antigravity/antigravity-gemini-3.5-flash",
 			]),
 		);
-		// Anthropic and other providers pass through unchanged.
 		expect(
 			buildArgsForTest({ ...baseOptions, model: "anthropic/claude-opus-4-8" }),
 		).toEqual(expect.arrayContaining(["--model", "anthropic/claude-opus-4-8"]));
@@ -587,7 +575,7 @@ describe("subagent-runner pure helpers", () => {
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
 		expect(args[idx + 1]).toBe("ctx_search");
-		// --no-tools would disable EVERYTHING including ctx_search — must not appear.
+		// `buildArgsForTest` omits `--no-tools` because it disables `ctx_search`.
 		expect(args).not.toContain("--no-tools");
 	});
 
@@ -644,10 +632,6 @@ describe("subagent-runner pure helpers", () => {
 		expect(idx).toBeGreaterThan(-1);
 		expect(args[idx + 1]).toBe("ctx_memory");
 		expect(args).not.toContain("--no-tools");
-		// No codebase/shell built-ins survive the allow-list. (ctx_memory itself is
-		// registered by the lean extension when a real bundle path is present; in
-		// this dev/test env SUBAGENT_ENTRY_PATH is undefined so --extension and the
-		// dreamer-actions flag are absent — the strict allow-list is independent.)
 		const toolList = args[idx + 1];
 		for (const denied of [
 			"read",
@@ -721,8 +705,7 @@ describe("subagent-runner pure helpers", () => {
 			"read,grep,find,ls,bash,write,edit,aft_outline,aft_zoom,aft_search",
 		);
 		expect(args).not.toContain("--no-tools");
-		// Edits docs, never the memory store: no ctx_memory, and the lean extension
-		// (which would register it) is not loaded for this agent.
+		// The agent edits docs without loading `ctx_memory`.
 		expect(args[idx + 1]).not.toContain("ctx_memory");
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
@@ -750,13 +733,11 @@ describe("subagent-runner pure helpers", () => {
 			"read,grep,find,ls,aft_outline,aft_zoom,aft_search,ctx_search",
 		);
 		expect(args).not.toContain("--no-tools");
-		// Source-safety + cache-neutrality: no write/edit/bash, and crucially no
-		// ctx_memory (its mutations bump the project memory epoch → bust m[0]).
+		// The allowlist excludes `write`, `edit`, `bash`, and `ctx_memory` because `ctx_memory` mutations bump the project memory epoch and bust `m[0]`.
 		const toolList = args[idx + 1];
 		for (const denied of ["write", "edit", "bash", "ctx_memory", "ctx_note"]) {
 			expect(toolList).not.toContain(denied);
 		}
-		// The lean extension loads (so ctx_search is registered to be gated), but
 		// the dreamer-actions flag (which adds ctx_memory) must NOT be present.
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
@@ -817,16 +798,13 @@ describe("subagent-runner pure helpers", () => {
 			throw new Error("malformed JSON must be an error, not noise");
 		}
 
-		// Plain-text stdout from co-loaded extensions (issue #211:
-		// "[Worker] Ready") is noise to skip, never a recorded error.
+		// Ignore non-event stdout only when an intact terminal `message_end` arrives.
 		const noise = __test.parsePiEventLine("[Worker] Ready");
 		expect(noise.ok).toBe(false);
 		if (!noise.ok) expect("noise" in noise).toBe(true);
 	});
 
-	// Issue #211: a co-loaded Pi extension printing "[Worker] Ready" to
-	// stdout interleaved with the event stream and failed the whole run as
-	// parse_failed even though the terminal message_end arrived intact.
+	// Ignore non-event stdout when a terminal `message_end` arrives intact.
 	it("ignores non-JSON stdout noise from co-loaded extensions", async () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
@@ -851,36 +829,28 @@ describe("subagent-runner pure helpers", () => {
 		}
 	});
 
-	// Subagent extension entry loading. These tests verify the
-	// runner's argv contract for loading Magic Context's lean subagent
-	// extension (./subagent-entry.js) inside spawned Pi child processes.
-	// The bundle is only present after `bun run build`; in unit tests
-	// running source via Bun directly, the dev fallback (no --extension)
-	// kicks in. Both shapes are valid and locked in.
+	// `dist/subagent-entry.js` is absent in unit tests unless `bun run build` runs.
+	// The source build omits `--extension` because `dist/subagent-entry.js` is absent.
 
 	it("dev mode (no bundle): does NOT pass --extension flag, so ctx_* tools are unavailable", () => {
 		// In dev mode (running .ts source), there's no dist/subagent-entry.js
-		// next to subagent-runner.ts, so resolveSubagentEntryPath() returns
-		// undefined and we skip the --extension flag. Discovered provider/AFT
 		// extensions still load; only Magic Context's explicit ctx_* entry is absent.
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "historian",
 			model: "anthropic/claude-sonnet",
 		});
-		// Neither --extension nor the legacy -x alias should appear when
-		// the bundle isn't built (this test runs the source, not the
-		// dist build). Pinning this is what lets us run unit tests
-		// without a build step. -x was removed in Pi 0.71+ and now hard-fails.
+		// `-x` hard-fails in Pi 0.71+.
+		// `-x` hard-fails in Pi 0.71+.
 		expect(args).not.toContain("--extension");
 		expect(args).not.toContain("-x");
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
 
 	it("does not set --magic-context-dreamer-actions for non-dreamer agents", () => {
-		// Even if the bundle were present, only dreamer-equivalent agents should
-		// receive ctx_memory in the child extension. Historian, sidekick,
-		// compressor etc. stay without the dreamer flag.
+		// Only dreamer-equivalent agents receive `--magic-context-dreamer-actions`.
+		// Only dreamer-equivalent agents receive `--magic-context-dreamer-actions`.
+		// Only dreamer-equivalent agents receive `--magic-context-dreamer-actions`.
 		for (const agent of ["historian", "sidekick", "compressor", "recomp"]) {
 			const args = buildArgsForTest({
 				...baseOptions,
@@ -897,8 +867,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const spawnImpl = mock(() => {
 			throw new Error("spawn must not be reached");
 		});
-		// Replace the runner's test seam with a throwing spawn so this assertion
-		// proves the guard runs before any child process is created.
+		// The throwing `spawnImpl` verifies that the prompt guard runs before process creation.
+		// The throwing `spawnImpl` verifies that the prompt guard runs before process creation.
 		const guardedRunner = new PiSubagentRunner({
 			piBinary: "pi-test",
 			spawnImpl: spawnImpl as never,
@@ -945,17 +915,15 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 	it("counts toolCall content parts from assistant message_end into toolCallCount (grounding gate)", async () => {
-		// The grounding gate (refresh-primers) treats toolCallCount === 0 as a
-		// closed-book paraphrase and refuses to commit. The count is derived from
-		// `toolCall` CONTENT parts on assistant message_end turns — NOT a tool
-		// event name. Pi has no `tool_result_end` (its real tool event is
-		// `tool_execution_end`), so content-part counting is robust to event-name
-		// drift. (Confirmed against Pi source via the PI peer.)
+		// `refresh-primers` treats `toolCallCount === 0` as a closed-book paraphrase and refuses to commit.
+		// `toolCallCount` is derived from `toolCall` content parts on assistant `message_end` turns.
+		// `toolCallCount` counts `toolCall` content parts, not tool event names.
+		// Pi emits `tool_execution_end`, not `tool_result_end`; count content parts instead.
+		// Pi emits `tool_execution_end`, so count content parts instead of event names.
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
 
 		const resultPromise = runner.run(baseOptions);
-		// Two intermediate tool-calling assistant turns (one toolCall part each).
 		child.writeStdoutLine({
 			type: "message_end",
 			message: {
@@ -980,7 +948,6 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				stopReason: "toolUse",
 			},
 		});
-		// Terminal assistant turn: text only, no toolCall → not counted.
 		child.writeStdoutLine({
 			type: "message_end",
 			message: {
@@ -1042,9 +1009,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 	});
 
 	it("with no piBinary override, spawns the host runtime + cli.js (Windows-safe, #177)", async () => {
-		// Default resolution must NOT spawn a bare "pi" (which ENOENTs on Windows
-		// because npm installs a pi.cmd shim, not a literal pi). It re-invokes the
-		// exact host CLI: process.execPath + process.argv[1], with no shell.
+		// Default resolution must not spawn bare `pi`, which ENOENTs on Windows.
+		// npm installs a `pi.cmd` shim rather than a literal `pi` executable on Windows.
 		const child = createMockChild();
 		const spawnImpl = mock(() => child as never);
 		const { PiSubagentRunner } = await import("./subagent-runner");
@@ -1068,16 +1034,11 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const [command, spawnArgs, opts] = (
 			spawnImpl.mock.calls as unknown[][]
 		)[0] as [string, string[], { shell?: boolean }];
-		// In this test runner argv[1] is a real on-disk script (bun/node test
-		// file), so the host-CLI branch fires: command is the runtime, the first
-		// arg is the running script, and the child is spawned without a shell.
 		expect(command).toBe(process.execPath);
 		expect(spawnArgs[0]).toBe(process.argv[1]);
 		expect(spawnArgs).toContain("--no-session");
-		// Never spawned through a shell (no cmd.exe in the path = no arg-escaping
-		// or injection on the untrusted prompt/task text).
+		// `shell: false` prevents `cmd.exe` from interpreting prompt or task text.
 		expect(opts.shell).toBeFalsy();
-		// Crucially, never a bare "pi".
 		expect(command).not.toBe("pi");
 	});
 
@@ -1468,10 +1429,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 	});
 
 	it("returns no_assistant for empty stdout and successful exit", async () => {
-		// Issue #238: an empty-stdout exit-0 primary now fires the one-shot
-		// isolated retry. When the isolated attempt ALSO exits 0 with no output,
-		// the run settles as no_assistant (the retry must not loop forever) and
-		// carries the no-protocol-output marker.
+		// An exit-0 primary with no stdout triggers one isolated retry. If that retry also exits 0 with no output, the run returns no_assistant with the no-protocol-output marker.
 		const first = createMockChild();
 		const second = createMockChild();
 		const { runner, spawnImpl } = runnerWith([first, second]);
@@ -2017,10 +1975,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 	});
 
 	it("retries once with --no-extensions after a silent exit-0 primary (no agent_end, zero stdout)", async () => {
-		// Issue #238: certain user extension sets make Pi --print exit 0 with
-		// ZERO stdout (no agent_end). The primary is classified no_assistant
-		// with no protocol output, which must fire the one-shot isolated retry
-		// instead of falling through every fallback model identically.
+		// An exit-0 primary with no stdout triggers one isolated retry with discovered extensions disabled.
 		const first = createMockChild();
 		const second = createMockChild();
 		const { runner, spawnImpl } = runnerWith([first, second]);
@@ -2033,7 +1988,6 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				...baseOptions,
 				model: "anthropic/claude-sonnet",
 			});
-			// Primary: exit 0, no stdout written at all.
 			first.emitClose(0);
 			await nextTick();
 			second.writeStdoutLine(
@@ -2070,10 +2024,10 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 	});
 
 	it("does not fire the isolated retry when agent_end arrived with empty assistant text", async () => {
-		// A legitimate empty model response: Pi's machinery worked (agent_end
-		// observed) but the model returned only whitespace. This is no_assistant
-		// WITH protocol output, so it must fall through to fallback models rather
-		// than spend the one-shot isolated retry.
+		// An observed `agent_end` with whitespace-only assistant text is protocol output.
+		// A whitespace-only assistant response returns `no_assistant`.
+		// Protocol output falls through to fallback models instead of using the isolated retry.
+		// Protocol output suppresses the one-shot isolated retry.
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child);
 		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
@@ -2105,7 +2059,6 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 					sawProtocolOutput: true,
 				});
 			}
-			// No isolated retry: exactly one spawn, discovery left enabled.
 			expect(spawnImpl).toHaveBeenCalledTimes(1);
 			expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
 			expect(
@@ -2119,11 +2072,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 	});
 
 	it("isolated retry argv keeps explicit --extension entries while dropping discovered extensions", () => {
-		// The one-shot isolated retry re-runs buildArgs with
-		// disableDiscoveredExtensions: true. That must add --no-extensions (drop
-		// DISCOVERED user extensions) WITHOUT removing explicit --extension
-		// entries — the subagent-entry extension and any user-tier allowlist
-		// entries — because those supply the models/tools the child needs.
+		// `disableDiscoveredExtensions: true` adds `--no-extensions` for discovered user extensions.
+		// Explicit `--extension` entries include the subagent-entry extension and user-tier allowlist entries.
+		// The subagent-entry and allowlisted user extensions supply the child models and tools.
 		const args = buildArgsForTest(
 			{
 				...baseOptions,
@@ -2167,8 +2118,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 
 		const resultPromise = runner.run({
 			...baseOptions,
-			// Historian now has an explicit read-only --tools allow-list; this asserts
-			// that spawn plumbing still passes model/cwd/prompt/env through around it.
+			// Historian's --tools allow-list must not alter the model, cwd, prompt, or env passed to spawn.
 			agent: "historian",
 			model: "anthropic/primary",
 			fallbackModels: ["openai/fallback"],
@@ -2209,7 +2159,6 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			expect.stringMatching(/system-prompt\.txt$/),
 			"--model",
 			"anthropic/primary",
-			// No --thinking: thinkingLevel not set in options above.
 			"summarize this session",
 		]);
 		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
@@ -2325,8 +2274,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
 			expect.arrayContaining(["--model", "anthropic/primary"]),
 		);
-		// The canonical (OpenCode) `openai/` provider is translated to Pi's
-		// `openai-codex/` form at the spawn boundary.
+		// The spawn boundary translates OpenCode's canonical `openai/` provider prefix to Pi's `openai-codex/` prefix.
 		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
 			expect.arrayContaining(["--model", "openai-codex/fallback"]),
 		);
@@ -2475,9 +2423,6 @@ describe("Pi subagent schema-fence probe", () => {
 			const { runner, spawnImpl } = runnerWith(createMockChild());
 			const result = await runner.run(baseOptions);
 
-			// Removing the pre-spawn probe makes this fake process launch, so the
-			// assertion proves Pi shares the stale-build fence rather than merely
-			// returning a matching failure from a later path.
 			expect(spawnImpl).not.toHaveBeenCalled();
 			expect(result).toMatchObject({
 				ok: false,

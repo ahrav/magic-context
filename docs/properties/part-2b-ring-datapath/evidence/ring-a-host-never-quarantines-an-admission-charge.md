@@ -7,7 +7,7 @@ safety mechanism in three places: `:21` ("Active and quarantined charges are
 reported separately"), `:65` ("active and quarantined accounting"), and `:79`
 ("quarantined charges remain within the configured process bound").
 `RingTransport::diagnostics` does report both figures
-(`crates/mc-host/src/ring_transport.rs:180-183`). The question is whether the
+(`crates/mc-host/src/ring_transport.rs:168-173`). The question is whether the
 quarantined figure can ever be non-zero on a host.
 
 It cannot. Following the charge-release mapping for
@@ -37,26 +37,26 @@ tree, both transport-crate tests:
 `mc-host` caller. There is no caller in `packages/mc-shm-native` either.
 
 **Why the host cannot call it even if it wanted to.** The `Admission` guard is
-moved into the endpoint thread closure at `ring_transport.rs:256` and consumed by
-`release()` at `:291`. `RingTransport` retains no handle to it (`:91-101` has no
+moved into the endpoint thread closure at `ring_transport.rs:240` and consumed by
+`release()` at `:276`. `RingTransport` retains no handle to it (`:83-92` has no
 `Admission` field), and nothing is passed back over the `done_tx` oneshot
-(`:248`, `:292`, which carries `()`). So by the time any host code could observe
+(`:233`, `:277`, which carries `()`). So by the time any host code could observe
 a reason to quarantine, the guard is gone.
 
 **The path that most obviously wants quarantine.** When `Ring::try_receive`
 fails descriptor validation it calls `self.enter_quarantine()` and returns
-`Err(RingError::Descriptor(error))` (`ring.rs:803-812`). Per Part 1's
+`Err(RingError::Descriptor(error))` (`ring.rs:1093-1100`). Per Part 1's
 `quarantine-authority-survives-peer-writes` the ring is then terminally
 quarantined and every subsequent operation on it fails. The host maps that error
 to `ReadClose::Corrupt("shared-memory receive failed")`
-(`ring_transport.rs:467`), `run_endpoint` sends the close and returns at
-`:400-405`, and then `:291` releases the charge in full. So the transport-level
+(`ring_transport.rs:499`), `run_endpoint` sends the close and returns at
+`:406-411`, and then `:276` releases the charge in full. So the transport-level
 quarantine and the host-level charge accounting disagree: the ring is condemned,
 the charge says the storage is free.
 
 **The counter-argument, which is strong.** `run_endpoint` takes `rings:
-DuplexRing` by value (`:365`), so returning drops the `DuplexRing` and unmaps
-both mappings before `:291` runs. If the mapping is genuinely gone, the arena
+DuplexRing` by value (`:359-368`), so returning drops the `DuplexRing` and unmaps
+both mappings before `:276` runs. If the mapping is genuinely gone, the arena
 bytes really are reclaimable by the OS and releasing the charge is correct. The
 Part 1 rationale for quarantine was different: it retains charges for storage
 whose *alias state* is unknown, specifically where a JavaScript alias may still
@@ -111,7 +111,7 @@ descriptor-validation failure:
 1. Prepare a connection. Attach a peer.
 2. Have the peer publish a frame, then corrupt the shared descriptor for a later
    sequence so `try_receive`'s
-   `validate` call at `ring.rs:807` fails. `crates/mc-shm-transport/tests/ring.rs`
+   `validate` call at `ring.rs:1095` fails. `crates/mc-shm-transport/tests/ring.rs`
    already constructs descriptor corruption, so the technique exists.
 3. Assert the host observes `ReadClose::Corrupt`, and then assert
    `accounting().quarantined` is non-zero and `accounting().active` returned to
@@ -119,7 +119,7 @@ descriptor-validation failure:
 
 Today step 3's second half fails by construction.
 
-`ring_transport.rs:799-800` asserts
+`ring_transport.rs:880` asserts
 `diagnostics["accounting"]["quarantined"]["arena_bytes"] == 0` on a fresh
 transport, which is the same value this property says can never change, so it is
 an existing check that passes vacuously.
@@ -130,8 +130,9 @@ an existing check that passes vacuously.
 
 - Sources examined: `.quarantine()` call sites across `crates/` and `packages/`
   (two, both in `crates/mc-shm-transport/tests/contract.rs`);
-  `profile.rs:522-541` and `:566-570` (the transition);
-  `ring_transport.rs:239-296` (guard ownership);
+  `profile.rs:522-541` and `:566-570` (the transition; `profile.rs` was not
+  re-swept post-#131);
+  `ring_transport.rs:223-281` (guard ownership);
   `docs/mc-host-shm-transport.md:21`, `:65`, `:79` (the three doc claims);
   Part 1's index rows for `quarantine-charge-transition-is-atomic` and
   `custody-terminal-transition-exactly-once`, both marked
@@ -153,10 +154,10 @@ an existing check that passes vacuously.
 
 ### Q: Does releasing the charge on a `Corrupt` exit actually over-admit?
 
-- Sources examined: `ring_transport.rs:365` (`run_endpoint` takes `rings` by
-  value), `:400-405` (the `Corrupt` exit), `:291` (release);
-  `ring.rs:803-812` (`enter_quarantine` on descriptor failure);
-  `profile.rs:531-535` (what quarantine retains).
+- Sources examined: `ring_transport.rs:359-368` (`run_endpoint` takes `rings` by
+  value), `:406-411` (the `Corrupt` exit), `:276` (release);
+  `ring.rs:1093-1100` (`enter_quarantine` on descriptor failure);
+  `profile.rs:531-535` (what quarantine retains; not re-swept post-#131).
 - Findings: the host's own mappings are dropped before the release, so from the
   host's perspective the bytes are free. The quarantine retention set is about
   storage that might still be aliased, and the alias hazard Part 1 identified

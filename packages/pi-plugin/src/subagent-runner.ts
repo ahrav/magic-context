@@ -36,27 +36,13 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 
 /**
- * Resolve the Pi CLI entry that should be spawned for historian/dreamer/
  * sidekick subagents.
  *
- * Why this isn't just "pi": when the Pi plugin runs inside an interactive
- * `pi` session, that user has the `pi` binary on PATH and `spawn("pi", ...)`
- * works. But in other deployment shapes the plugin runs without that:
- *   - CI runners and e2e harnesses: Pi is installed only into node_modules
- *     via `bun install` / `npm install`. No `pi` symlink on PATH.
- *   - npm-only user installs: same shape — `@earendil-works/pi-coding-agent`
- *     is in node_modules but its bin entry isn't globally linked.
- *   - Any environment where the user uses `npx` rather than the
- *     globally-installed Pi CLI.
+ * `pi` may be unavailable on PATH outside interactive Pi sessions.
+ * Interactive Pi sessions expose `pi` on PATH.
  *
- * Strategy: try to resolve `@earendil-works/pi-coding-agent`'s package.json
- * via Node's `require.resolve` rooted at this module, then spawn the
- * package's `dist/cli.js` directly. Pi's CLI ships with `#!/usr/bin/env node`
- * and npm sets the exec bit during install, so the OS spawns it under Node
- * with no extra runtime needed. Fall back to plain `pi` on PATH so the
- * happy path for interactive Pi users is unchanged.
+ * The resolved CLI path bypasses PATH lookup.
  *
- * Returns null when resolution fails — caller falls back to "pi" on PATH.
  */
 function resolveBundledPiCli(): string | null {
 	try {
@@ -72,44 +58,28 @@ function resolveBundledPiCli(): string | null {
 	}
 }
 
-/** How to spawn a Pi child: the binary plus any fixed leading args. Always
- *  spawned without a shell (see {@link resolvePiInvocation}). */
+/**
+ * */
 interface PiInvocation {
 	command: string;
 	prefixArgs: string[];
 }
 
 /**
- * Resolve how to spawn a Pi subagent, robust across POSIX and Windows.
  *
- * The key fix (#177): never depend on a bare `pi` on PATH or on a POSIX
- * shebang. On Windows a global npm install puts `pi.cmd` / `pi.ps1` on PATH (not
- * a literal `pi`), and Node's `spawn("pi")` without a shell looks for a file
- * named exactly `pi`, so it ENOENTs; and Windows ignores the `#!/usr/bin/env
- * node` shebang entirely, so spawning `dist/cli.js` "directly" only works on
- * POSIX. The reliable, cross-platform approach is to re-invoke the EXACT host
- * CLI the user is already running: `process.execPath` (the node/bun binary) plus
- * `process.argv[1]` (the absolute path to the running `cli.js`). That sidesteps
- * shim resolution completely and pins the child to the same Pi version/runtime.
+ * The resolver invokes the host runtime with `cli.js` before falling back to `pi` on PATH.
+ * Global npm installs expose `pi.cmd`, not literal `pi`, on Windows.
+ * Windows cannot execute `dist/cli.js` directly because it ignores its Node shebang.
+ * The resolver re-invokes the host CLI to avoid Windows shim and shebang handling.
+ * The host invocation avoids shim resolution and uses the host Pi version and runtime.
  *
- * Mirrors Pi's own `getPiInvocation` reference. MUST be evaluated in the host Pi
- * process (extensions load in-process, so `argv[1]` is the host `cli.js`).
+ * Extensions load in the host Pi process, so `argv[1]` names the host `cli.js`.
  *
  * Resolution order:
- *   1. argv[1] is a real on-disk script (not a bun-compiled `/$bunfs/root/`
- *      virtual path) -> `execPath cli.js ...` (node + absolute cli.js).
- *   2. execPath is a packaged binary (basename not node/bun) -> `execPath ...`
- *      (the compiled binary IS pi; no script arg).
- *   3. A bundled `@earendil-works/pi-coding-agent/dist/cli.js` resolves ->
- *      `execPath cli.js ...` (node + resolved cli.js).
- *   4. Last resort: bare `pi` on PATH.
+ * The resolver excludes Bun's `/$bunfs/root/` virtual paths because they cannot be passed as CLI script paths.
+ * A packaged single-file Pi binary requires no script argument.
  *
- * Everything is spawned WITHOUT a shell. The primary path (execPath + argv[1])
- * covers every real runtime because the extension loads in-process, so argv[1]
- * is the host cli.js; the bare-`pi` step is a near-unreachable backstop. We do
- * NOT fall back to a shell for it (which on Windows would resolve the .cmd shim
- * but pass the prompt/task text through cmd.exe, exposing arg-escaping and
- * injection), and we don't pull in cross-spawn just for a dead path.
+ * The runner spawns Pi without a shell to avoid `cmd.exe` argument escaping on Windows.
  */
 function resolvePiInvocation(): PiInvocation {
 	const execPath = process.execPath;
@@ -124,7 +94,6 @@ function resolvePiInvocation(): PiInvocation {
 	const execName = basename(execPath).toLowerCase();
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
 	if (!isGenericRuntime) {
-		// A packaged single-file binary: execPath itself is pi.
 		return { command: execPath, prefixArgs: [] };
 	}
 
@@ -137,30 +106,19 @@ function resolvePiInvocation(): PiInvocation {
 }
 
 /**
- * Resolve the path to the lean subagent extension entry that gets loaded
- * inside spawned Pi child processes. The bundle ships at
- * `dist/subagent-entry.js` next to `dist/index.js` (this module). We use
- * `import.meta.url` so the path resolves correctly regardless of where
- * the npm package is installed (or where it's symlinked from in dev).
+ * The resolver resolves `subagent-entry.js` relative to this module so spawned Pi processes load the bundled extension.
+ * The resolver uses `import.meta.url` so the extension path is independent of the package installation location.
  *
- * Falls back to undefined if the file isn't found at the expected
- * location — caller should treat that as a soft signal to skip the
- * `-x` flag (subagent will run without Magic Context tools, which is
- * acceptable for ctx_*-using agents in dev/test before the bundle exists).
+ * Callers must omit `-x` when this returns `undefined`.
+ * Subagents without the extension run without Magic Context tools.
  */
 function resolveSubagentEntryPath(): string | undefined {
 	try {
-		// Resolve from the current module's directory. In dev (running
-		// .ts via Bun) and in prod (running .js from dist/), this lands
-		// in the same directory as the runner itself.
+		// `dirname(fileURLToPath(import.meta.url))` is the runner's directory in Bun source and dist builds.
 		const here = dirname(fileURLToPath(import.meta.url));
 		const candidate = resolvePath(here, "subagent-entry.js");
 		if (existsSync(candidate)) return candidate;
 
-		// Dev fallback: when running source from packages/pi-plugin/src/
-		// the .js bundle doesn't exist yet; skip the --extension flag so
-		// tests running pre-build don't fail. Production builds always
-		// have the bundle.
 		return undefined;
 	} catch {
 		return undefined;
@@ -170,15 +128,12 @@ function resolveSubagentEntryPath(): string | undefined {
 const SUBAGENT_ENTRY_PATH = resolveSubagentEntryPath();
 
 /**
- * Grace period (ms) after we detect the terminal assistant message_end
- * before we SIGTERM the Pi child. Pi's print mode often finishes the agent
- * loop and emits agent_end / a clean stopReason but doesn't actually exit
- * the process for many seconds (sometimes never on its own). Without this
- * drain, every successful run would wait the full configured timeoutMs.
+ * The grace period starts after terminal assistant `message_end`.
+ * Pi's print mode can emit `agent_end` or a clean `stopReason` without exiting.
+ * Without `TERMINAL_DRAIN_GRACE_MS`, successful runs wait the full configured `timeoutMs`.
  *
- * 2s gives the child enough time to flush remaining stdout buffers and
- * shut down its stdio writers cleanly on the happy path; on the (frequent)
- * unhappy path we SIGTERM and recover the assembled result we already have.
+ * The 2-second grace period lets remaining stdout and stdio writers flush before SIGTERM.
+ * If Pi does not exit, the runner SIGTERMs Pi and returns the assembled result.
  */
 const TERMINAL_DRAIN_GRACE_MS = 2_000;
 
@@ -204,8 +159,8 @@ function expandHomePath(value: string): string {
 }
 
 /**
- * Positive OMP host identification. PI_CODING_AGENT_DIR alone is deliberately
- * insufficient because upstream Pi supports the same variable.
+ * `isOmpHostProcess` requires evidence beyond `PI_CODING_AGENT_DIR`.
+ * `PI_CODING_AGENT_DIR` cannot identify OMP because upstream Pi also supports it.
  */
 function isOmpHostProcess(): boolean {
 	const execName = basename(process.execPath).toLowerCase();
@@ -233,10 +188,8 @@ function normalizedOmpProfile(): string | undefined {
 		: undefined;
 }
 
-// OMP exposes a profile/custom agent directory via PI_CODING_AGENT_DIR.
-// A named profile is authoritative and deliberately ignores a stale/custom
-// override, matching OMP path resolution. Plain Pi also supports the same
-// variable, so never consume it without positive OMP host identification.
+// OMP uses `PI_CODING_AGENT_DIR` as the custom agent-directory override.
+// A named profile ignores PI_CODING_AGENT_DIR.
 function getHostAgentSettingsDir(): string {
 	if (!isOmpHostProcess()) return join(homedir(), ".pi", "agent");
 	const configRoot = join(
@@ -262,7 +215,7 @@ function resolveModelRefForHost(ref: string): string {
 }
 let configuredSubagentExtensions: readonly string[] | undefined;
 
-/** Configure the user-tier extension allowlist used by new Pi child runners. */
+/* */
 export function configurePiSubagentExtensions(
 	extensions: readonly string[] | undefined,
 ): void {
@@ -282,14 +235,11 @@ const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
 const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
 
 /**
- * Set of subagent agent ids that get ctx_memory in the lean child extension.
- * Sidekick is retrieval-only and uses ctx_search; only dreamer-equivalent
- * agents need memory mutation/list capabilities.
+ * `DREAMER_ACTION_AGENTS` grants `ctx_memory` in the lean child extension.
+ * Sidekick is retrieval-only and uses `ctx_search`.
+ * Dreamer-equivalent agents need memory mutation and listing capabilities.
  *
- * Membership uses the SAME agent strings the Pi callers actually pass
- * (see e.g. `dreamer/index.ts` passing `"magic-context-dreamer"`). If
- * a new dreamer-equivalent caller is added, register its agent id
- * here too. Mismatched agent strings silently disable the elevated
+ * DREAMER_ACTION_AGENTS must contain the exact agent IDs passed by Pi callers; mismatches disable elevated tools.
  * action surface.
  */
 const DREAMER_ACTION_AGENTS: ReadonlySet<string> = new Set([
@@ -299,31 +249,17 @@ const DREAMER_ACTION_AGENTS: ReadonlySet<string> = new Set([
 const SEARCH_ONLY_SUBAGENT_TOOL_AGENTS: ReadonlySet<string> = new Set([
 	"sidekick",
 	"dreamer-retrospective",
-	// Loads the lean extension so ctx_search is REGISTERED (the strict allow-list
-	// only gates an existing registration). Deliberately NOT in
-	// DREAMER_ACTION_AGENTS — that would add ctx_memory, whose mutations bump the
-	// project memory epoch and bust m[0], breaking the primers cache-neutral
+	// The strict allow-list can gate `ctx_search` only after the lean extension registers it.
+	// The strict allow-list only gates tools that Pi has registered.
 	// contract.
 	"dreamer-primer-investigator",
 ]);
 
 /**
- * Agents that must run under a HARD tool allow-list (`pi --tools <names>`), not
- * just a narrowed extension. The allow-list is a registry-build filter in Pi
- * (AgentSession._refreshToolRegistry): a tool enters the registry ONLY if its
- * name is in the set, so it strips Pi's built-ins (read/bash/edit/write) AND any
- * other extension tool, leaving exactly the named tools. This is the Pi mirror of
- * OpenCode's per-agent locked allow-list — every dreamer TASK agent runs under a
- * tight, per-task tool budget. The allow-list only KEEPS an existing
- * registration; for the ctx_* tools the lean extension must still have registered
- * them (see the *_SUBAGENT_TOOL_AGENTS sets above). For aft_* tools, Pi tolerates
- * names that no extension registered: unknown names are absent from the registry
- * after filtering, so listing optional AFT read tools is safe when AFT is not
- * installed while still allowing them when an AFT provider extension is present.
+ * Agents in `STRICT_TOOL_ALLOWLIST_ENTRIES` must run under Pi's hard `--tools` allow-list, not merely a narrowed extension.
+ * When AFT is absent, optional AFT tool names are absent; when a provider registers them, filtering allows them.
  *
- * HOST CAVEAT — this is a capability boundary on Pi only. OMP applies
- * `--tools` to built-ins and then appends discovered extension tools, so on
- * OMP these entries describe the intended budget rather than an enforced
+ * Pi enforces this capability boundary; OMP appends discovered extension tools after applying `--tools` to built-ins.
  * extension-tool sandbox.
  */
 const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
@@ -332,59 +268,34 @@ const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
 ])[] = [
 	["dreamer-retrospective", ["ctx_search"]],
 	["smart-note-compiler", []],
-	// Pi's live historian runner uses this Magic Context-specific id for first
-	// pass, repair, two-pass editor, recomp, and memory-migration prompts. It
-	// summarizes/offloads host-rendered input and may inspect local files, but it
-	// must not mutate source or memory. Keep only read-only Pi built-ins plus
-	// aft_search (no aft_outline/aft_zoom, no ctx_* tools).
+	// The historian runner must not mutate source files or memory.
+	// The historian runner permits only read-only Pi built-ins and `aft_search`; it excludes `aft_outline`, `aft_zoom`, and `ctx_*` tools.
 	["magic-context-historian", PI_HISTORIAN_TOOLS],
-	// Shared OpenCode agent ids that can be passed by tests or future Pi callers.
-	// Same historian surface as magic-context-historian: local read/search only,
-	// optional aft_search, never writes or ctx_* tools.
 	["historian", PI_HISTORIAN_TOOLS],
 	["historian-recomp", PI_HISTORIAN_TOOLS],
 	["historian-editor", PI_HISTORIAN_TOOLS],
-	// Sidekick augments the user's prompt by retrieving memory. It needs the lean
-	// ctx_search registration plus Pi's read-only built-ins for safe local context,
-	// but no write/bash/ctx_memory surface.
+	// Sidekick excludes `write`, `bash`, and `ctx_memory`.
 	["sidekick", [...PI_READ_ONLY_BUILTINS, "ctx_search"]],
-	// classify-memories: a pure metadata transform (prompt in → XML out). ZERO
-	// tools — it scores from the memory text and the host applies the columns.
 	["dreamer-classifier", []],
-	// review-user-memories: a pure JSON reviewer of behavioral observations. It
-	// calls NO tools — the host applies its verdict — so zero tools (mirrors the
-	// classifier). Not in any *_SUBAGENT_TOOL_AGENTS set → no extension loaded.
 	["dreamer-reviewer", []],
-	// refresh-primers code investigator: read-only investigation of the CURRENT
-	// source. Pi's own canonical read-only set is {read, grep, find, ls}
-	// (createReadOnlyToolDefinitions), plus ctx_search and the optional AFT read
-	// navigation tools OpenCode grants. NO bash/edit/write and NO ctx_memory.
 	[
 		"dreamer-primer-investigator",
 		[...PI_READ_ONLY_BUILTINS, ...PI_AFT_READ_TOOLS, "ctx_search"],
 	],
-	// map-memories / verify reader: read-only check against the CURRENT LOCAL
-	// source. Same read-only lock as the primer investigator but WITHOUT ctx_search
-	// — these tasks read local code, not cross-session recall. The host applies the
-	// manifest's DB writes, so no ctx_memory is needed.
 	["dreamer-memory-mapper", [...PI_READ_ONLY_BUILTINS, ...PI_AFT_READ_TOOLS]],
-	// maintain-docs: explores the codebase and writes ARCHITECTURE.md/STRUCTURE.md.
-	// All 7 Pi built-ins (read/grep/find/ls + bash/write/edit; git runs via bash),
-	// plus optional AFT read navigation. Deliberately NO ctx_memory/ctx_search — it
-	// edits docs, never the memory store. Not in any *_SUBAGENT_TOOL_AGENTS set, so
-	// the lean extension is never loaded and ctx_memory cannot leak in.
+	// AFT read navigation is optional; ctx_memory and ctx_search are unavailable.
+	// `dreamer-docs` is outside every `*_SUBAGENT_TOOL_AGENTS` set, so the lean extension cannot register `ctx_memory`.
 	[
 		"dreamer-docs",
 		[...PI_READ_ONLY_BUILTINS, "bash", "write", "edit", ...PI_AFT_READ_TOOLS],
 	],
-	// curate (base `dreamer`): memory-pool hygiene via ctx_memory ONLY. It is in
-	// DREAMER_ACTION_AGENTS so the lean extension registers ctx_memory; this
-	// allow-list then strips ALL 7 built-ins, leaving only the extension-provided
-	// ctx_memory (curate never reads code — a separate verify task owns that).
+	// `dreamer` belongs to `DREAMER_ACTION_AGENTS`, so the lean extension registers `ctx_memory`.
+	// `dreamer`'s allow-list removes all seven built-ins, leaving only extension-provided `ctx_memory`.
+	// `dreamer` has no code-reading tools.
 	["dreamer", ["ctx_memory"]],
-	// Pi dreamer facade default when body.agent is absent (`dreamer/index.ts`).
-	// Same ctx_memory-only lock as `dreamer`; must stay in sync with
-	// DREAMER_ACTION_AGENTS (every member needs a strict entry).
+	// `magic-context-dreamer` is the Pi facade default when `body.agent` is absent.
+	// `magic-context-dreamer` must retain the same `ctx_memory`-only allowlist as `dreamer`.
+	// Each DREAMER_ACTION_AGENTS member requires a strict allowlist entry.
 	["magic-context-dreamer", ["ctx_memory"]],
 ];
 
@@ -400,11 +311,10 @@ const ZERO_TOOL_PROMPT_REQUIRED_AGENTS: ReadonlySet<string> = new Set(
 
 /**
  * OMP validates `--tools` against built-in names before extensions register.
- * Translate Pi-only built-ins, discard extension tool names that cannot be
- * addressed by this flag, and deduplicate aliases.
+ * Extension tools cannot be passed to OMP's --tools flag.
  *
- * This narrows OMP's built-in surface only. OMP does not set
- * `restrictToolNames`, so discovered AFT/MCP/ctx tools remain available.
+ * resolveHostToolAllowlist narrows only OMP's built-in surface.
+ * It does not call `restrictToolNames`, so discovered AFT, MCP, and ctx tools remain available.
  */
 const OMP_TOOL_ALIASES: Readonly<Record<string, string>> = {
 	find: "glob",
@@ -469,15 +379,11 @@ type PiRunMode = {
 };
 
 const ALREADY_PROCESSING_PREFIX = "Agent is already processing";
-// Logged when the one-shot isolated retry (--no-extensions for discovered user
-// extensions) fires because a loaded extension started its own agent turn
-// before the child's prompt could run (issue #222). The text is asserted
-// verbatim by the subagent-runner tests; keep it stable.
+// A loaded extension starting its own agent turn triggers the isolated retry.
+// Subagent-runner tests require ALREADY_PROCESSING_PREFIX verbatim.
 const ISOLATED_RETRY_COLLISION_LOG_MESSAGE =
 	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
-// Logged when the same isolated retry fires for the issue #238 signature: the
-// child exited 0 but produced no protocol output at all (no agent_end / zero
-// stdout), which certain user extension sets cause in Pi --print mode.
+// The isolated retry fires when a child exits 0 without protocol output.
 const ISOLATED_RETRY_SILENT_LOG_MESSAGE =
 	"pi subagent: child exited successfully but emitted no protocol output (no agent_end, zero stdout); a loaded Pi extension likely broke print mode; retrying with an isolated extension set (user extensions disabled for this run)";
 const ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE =
@@ -492,7 +398,7 @@ const MODEL_RESOLUTION_ERROR_PATTERNS = [
 	/model.+not configured/i,
 ] as const;
 
-/** Canonical provider prefix -> the Pi provider form that last succeeded. */
+/** Each canonical provider prefix maps to the Pi provider form that last succeeded. */
 const PI_PROVIDER_FORM_CACHE = new Map<string, string>();
 
 type ProviderModelAttempt = {
@@ -509,42 +415,29 @@ type ExtensionRetryResult = {
 };
 
 /**
- * Pi-side implementation of `SubagentRunner`.
  *
- * Spawns `pi --print --mode json` as a child process and consumes its
- * NDJSON event stream over stdout until the `agent_end` event delivers
- * the full final message array. We extract the last assistant message's
- * concatenated text content and return it as the run result.
  *
- * Why subprocess instead of in-process?
- * - Pi's @earendil-works/pi-coding-agent has no in-process child-session
- *   API equivalent to OpenCode's `client.session.create() / .prompt()`.
+ * A subprocess isolates Pi's session manager from the host process.
+ * Pi exposes no in-process child-session API equivalent to OpenCode's `client.session.create() / .prompt()`.
  *   Sessions are tied to a SessionManager that runs the interactive UI
- *   loop, and the agent loop expects to own stdout/stderr.
- * - The print-mode subprocess path is the *only* officially supported
- *   single-shot invocation in Pi today, and it's stable: it emits a
- *   well-typed NDJSON event stream regardless of which provider/model
- *   is targeted. Spawning is more expensive (cold-start ~500ms) but
- *   subagent invocations already amortize that against many seconds of
- *   model latency, so the overhead is in the noise.
+ * Pi's agent loop requires exclusive ownership of stdout and stderr.
+ * Pi supports single-shot invocation only through its print-mode subprocess.
+ * `pi --print --mode json` emits typed NDJSON for every provider and model.
  *
- * Output protocol (each stdout line is one JSON object):
+ * Pi emits one JSON object per stdout line.
  *
- *   { type: "session", id, version, timestamp, cwd }
- *   { type: "agent_start" }
- *   { type: "turn_start" }
- *   { type: "message_start", message: { role, content, ... } }
- *   { type: "message_end",   message: { role, content, ... } }
- *   ... possibly more turn_start / message_start / message_end / turn_end on tool calls ...
- *   { type: "agent_end", messages: [ ... full final message array ... ] }
+ * Pi emits session records as `{ type: "session", id, version, timestamp, cwd }`.
+ * Pi emits `{ type: "agent_start" }` when an agent starts.
+ * Pi emits `{ type: "turn_start" }` when a turn starts.
+ * `message_start` contains a `message` object with `role`, `content`, and other fields.
+ * `message_end` contains a `message` object with `role`, `content`, and other fields.
+ * Tool calls can add `turn_start`, `message_start`, `message_end`, and `turn_end` events.
+ * `agent_end` contains the full final message array in `messages`.
  *
- * The `agent_end` event is the authoritative final state. We ignore
- * intermediate `message_*` events for result extraction (we only need
- * the last assistant message's text).
+ * The `agent_end` event is the authoritative final state.
+ * The runner extracts text only from the last assistant message in `agent_end`.
  *
- * Failure modes we handle explicitly:
- * - `agent_end` arrives but the last assistant message has stopReason
- *   "error" or "aborted" → `model_failed` with the embedded errorMessage.
+ * If the last assistant message in `agent_end` has `stopReason` `error` or `aborted`, return `model_failed` with its `errorMessage`.
  * - Process exits non-zero before `agent_end` is observed → `non_zero_exit`.
  * - Process exits zero with no assistant result → `no_assistant`.
  * - Malformed JSON output before completion → `parse_failed`.
@@ -552,26 +445,15 @@ type ExtensionRetryResult = {
  * - Caller's AbortSignal fires → kill the child + return `abort`.
  * - `timeoutMs` elapses before `agent_end` → kill + return `timeout`.
  *
- * What we deliberately don't expose:
- * - Tool call streaming. Subagents in Magic Context are configured with
- *   their own narrowed tool sets; if a model emits tool calls during a
- *   subagent run, those tools execute inside Pi's child process just
- *   fine — we just don't surface intermediate state to the caller.
- * - Per-turn token usage. Pi reports usage in each `message_end`, but
- *   the runner contract only returns the final assistant text. If the
- *   sidekick/historian/dreamer ever needs token accounting, we'll add
- *   a `usage` field to `SubagentRunResult.meta` rather than changing
- *   the core contract.
+ * `PiSubagentRunner` does not expose tool-call events; Pi executes tool calls in its child process.
+ * `PiSubagentRunner` does not expose intermediate tool-call state to callers.
+ * `PiSubagentRunner` returns only final assistant text, so callers cannot obtain the per-turn token usage reported in each `message_end`.
  */
 export class PiSubagentRunner implements SubagentRunner {
 	readonly harness = "pi";
 
 	/**
-	 * How to invoke a Pi subagent (command + fixed leading args + shell flag).
-	 * Resolved once at construction in the host process so `process.argv[1]`
-	 * points at the host `cli.js`. See {@link resolvePiInvocation} for the
-	 * cross-platform order; an explicit `options.piBinary` overrides it (test
-	 * seam + advanced users who point at their own pi build).
+	 * `PiSubagentRunner` resolves the invocation in the host process at construction so `process.argv[1]` identifies the host `cli.js`.
 	 */
 	private readonly invocation: PiInvocation;
 	private readonly spawnImpl: typeof childProcess.spawn;
@@ -622,9 +504,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			return firstRun.result;
 		}
 
-		// The canonical prefix is the second Pi choice for ambiguous providers.
-		// If the extension retry already ran, keep its isolated mode for this
-		// provider retry instead of starting a second independent retry tree.
+		// If an extension retry already ran, the provider retry retains isolated mode.
 		const fallbackOptions = {
 			...options,
 			model: providerAttempt.canonicalRef,
@@ -709,19 +589,12 @@ export class PiSubagentRunner implements SubagentRunner {
 			);
 			if (result.ok) return result;
 			lastResult = result;
-			// Pi print mode discovers extensions before reading stdin, and a loaded
-			// user extension can break the run in two ways that both look like the
-			// extension set is at fault:
-			//  1. (#222) it starts its own agent turn during startup, so the child
-			//     hits a prompt conflict before it can accept Magic Context's input
-			//     (non-zero exit + "Agent is already processing" on stderr);
-			//  2. (#238) it makes Pi --print exit 0 with NO protocol output at all
-			//     (no agent_end / zero stdout), classified as no_assistant.
-			// Either way, stop this extension-enabled attempt on the first model and
-			// let the outer caller retry the same run once with discovered extensions
-			// disabled, instead of burning every fallback model on the same doomed
-			// primary. Later top-level runs still start with extensions enabled (the
-			// degrade is per-attempt, not cached) so extension-provided models keep
+			// Pi print mode discovers extensions before reading stdin.
+			// A user extension can start an agent turn during startup, causing a prompt conflict before the child accepts Magic Context input.
+			// A user extension can make Pi `--print` exit 0 without protocol output.
+			// An extension-caused first-model failure triggers one retry with discovered extensions disabled.
+			// The retry prevents fallback models from repeating an extension-caused failure.
+			// Isolation applies only to the current attempt; later runs re-enable extensions so extension-provided models remain available.
 			// working normally.
 			if (
 				!this.spawnUsesNoExtensions(runMode) &&
@@ -797,9 +670,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				error: "pi subagent aborted by caller",
 				durationMs: Date.now() - startTime,
 			};
-			// Same best-effort contract as settle(): accounting must never throw
-			// out of the return path (a DB write failure here would propagate to
-			// the caller as a spurious spawn error). Telemetry is best-effort.
+			// The runner ignores accounting write failures so `run` still returns its `SubagentRunResult`.
 			try {
 				recordAccounting(result);
 			} catch (err) {
@@ -834,9 +705,8 @@ export class PiSubagentRunner implements SubagentRunner {
 			return result;
 		};
 
-		// A zero-tool child cannot receive its task instructions unless a system
-		// prompt is provided. Refuse before spawning so Pi cannot substitute a
-		// persisted user-mode prompt.
+		// A zero-tool child needs a system prompt to receive its task instructions.
+		// Otherwise, Pi can substitute a persisted user-mode prompt.
 		if (
 			ZERO_TOOL_PROMPT_REQUIRED_AGENTS.has(options.agent) &&
 			options.systemPrompt.trim().length === 0
@@ -856,13 +726,10 @@ export class PiSubagentRunner implements SubagentRunner {
 			);
 		}
 
-		// Large prompts (e.g. a ~50K-token historian chunk ≈ 200 KB) overflow
-		// Linux's per-argv-entry limit (MAX_ARG_STRLEN, 128 KiB) and make spawn()
-		// fail with E2BIG. Windows is stricter: CreateProcess caps the ENTIRE
-		// command line at 32,767 chars, so even small user prompts should stay out
-		// of argv there to leave room for flags and the temp-file system prompt.
-		// Pi's print mode concatenates stdin into the initial message, so when we
-		// pipe the prompt we must omit the positional argv to avoid duplication.
+		// On Linux, the runner pipes prompts larger than 128 KiB because `MAX_ARG_STRLEN` limits each argv entry.
+		// Windows `CreateProcess` caps the entire command line at 32,767 characters.
+		// On Windows, the runner pipes prompts instead of placing them in argv to reserve command-line space for flags and the generated-file system prompt.
+		// Pi print mode appends stdin to its initial message; the runner omits the positional argv prompt when piping stdin to prevent duplication.
 		const promptBytes = Buffer.byteLength(options.userMessage, "utf8");
 		const deliverViaStdin =
 			promptBytes > PROMPT_ARGV_MAX_BYTES || this.platform === "win32";
@@ -900,26 +767,18 @@ export class PiSubagentRunner implements SubagentRunner {
 			modelRef: modelRefOverride,
 		});
 
-		// The model spec is `provider/model` — Pi accepts that directly via
-		// `--model provider/id` (no separate `--provider` flag needed). When a
-		// fallback chain is configured, `buildArgs` emits Pi's `--models a,b,c`.
+		// Pi accepts `provider/model` through `--model`; no separate `--provider` flag is needed.
 
 		return new Promise<SubagentRunResult>((resolve) => {
 			let accountingMessages: unknown[] = [];
-			// Track whether we've already resolved so timeout/abort/exit don't
-			// double-resolve. JS promises tolerate double-resolve silently but
-			// we want explicit control so we can distinguish "timeout fired
-			// during normal completion race" from "timeout actually decided
+			// The `settled` guard lets timeout, abort, and exit handlers determine whether a timeout won a completion race.
 			// the outcome."
 			let settled = false;
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
 				settled = true;
 				cleanupSystemPromptFile();
-				// recordAccounting must never block resolution: a throw here (e.g.
-				// a DB write failure during token accounting) would leave the
-				// promise unresolved and hang the caller (historian/dreamer/
-				// sidekick). Accounting is best-effort telemetry; resolve regardless.
+				// `recordAccounting` failures must not prevent `settle` from resolving.
 				try {
 					recordAccounting(result, accountingMessages);
 				} catch (err) {
@@ -931,16 +790,12 @@ export class PiSubagentRunner implements SubagentRunner {
 				resolve(result);
 			};
 
-			// Helper that wraps the optional caller-provided progress
-			// callback so we never throw on its mistakes — historian/dreamer
-			// log handlers must not be allowed to crash the runner.
+			// `emitProgress` isolates progress callback failures from the runner.
 			const emitProgress = (event: SubagentProgressEvent) => {
 				if (!options.onProgress) return;
 				try {
 					options.onProgress(event);
-				} catch {
-					// progress callbacks are non-critical
-				}
+				} catch {}
 			};
 
 			let child: ReturnType<typeof childProcess.spawn>;
@@ -950,18 +805,14 @@ export class PiSubagentRunner implements SubagentRunner {
 					[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
 					{
 						cwd: options.cwd,
-						// Merge over the parent env so PATH/HOME/auth variables flow
-						// through for provider extensions. The guard only disables Magic
-						// Context's full entry; it must not replace the process env.
+						// The merged environment preserves `PATH`, `HOME`, and authentication variables for provider extensions.
+						// `MAGIC_CONTEXT_PI_SUBAGENT_ENV` must not replace `process.env`.
 						env: {
 							...process.env,
 							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
 						},
-						// stdout = JSON events; stderr = diagnostics. stdin is a pipe
-						// when we deliver the user message there (always on Windows, or
-						// for oversized prompts elsewhere). Otherwise it stays closed
-						// because the message rides in argv and print-mode would block
-						// reading an open, idle stdin.
+						// Pi writes JSON events to stdout and diagnostics to stderr; `deliverViaStdin` controls whether stdin is piped.
+						// When the message rides in argv, stdin stays closed because Pi print-mode blocks on open idle stdin.
 						stdio: [deliverViaStdin ? "pipe" : "ignore", "pipe", "pipe"],
 					},
 				);
@@ -989,79 +840,51 @@ export class PiSubagentRunner implements SubagentRunner {
 
 			emitProgress({ type: "spawned", argv: args, pid: child.pid });
 
-			// Stdin-delivery path: feed the message through stdin, then close it so
-			// Pi's print-mode stdin read resolves (it waits for EOF). Guarded by
-			// child.stdin presence (only opened when deliverViaStdin).
+			// The runner closes stdin after writing so Pi's print-mode read receives EOF.
 			if (deliverViaStdin && child.stdin) {
-				// A pipe failure (child exited early / was terminated mid-write)
-				// surfaces as an async "error" event on the stream, NOT via the
-				// try/catch around .end(). Without a listener, an EPIPE would
-				// become an unhandled 'error' that can crash the host process.
-				// Attach the no-throw listener BEFORE writing; the real failure
-				// reason is reported by the exit/stderr/timeout handlers below.
-				child.stdin.on("error", () => {
-					// EPIPE / destroyed-stream: non-fatal runner noise.
-				});
+				// Stream write failures emit asynchronous `error` events rather than throwing from `.end()`.
+				// An `error` listener prevents EPIPE from becoming an unhandled stream error.
+				// The runner attaches the `error` listener before `.end()` because write failures are asynchronous.
+				child.stdin.on("error", () => {});
 				try {
 					child.stdin.end(options.userMessage, "utf8");
 				} catch {
-					// Synchronous throw (e.g. already-destroyed stream); exit/stderr
-					// handlers below surface the actual failure.
+					// The `catch` ignores synchronous `.end()` failures.
 				}
 			}
 
-			// Capture stderr so we can attach it to error reasons. Pi prints
-			// unrecoverable errors (auth failures, network) here before the
-			// process exits. Also forward each chunk to the progress channel
-			// so historian failure logs see the message immediately rather
-			// than only at child exit (a hung child wouldn't surface this
+			// `emitProgress` forwards stderr before child exit, including while child exit is delayed.
 			// otherwise).
 			let stderr = "";
 			child.stderr?.on("data", (chunk: Buffer) => {
 				const text = chunk.toString("utf8");
 				stderr += text;
-				// Cap to prevent unbounded growth on chatty failures.
+				// `stderr` is capped at 16,000 characters to bound memory on chatty failures.
 				if (stderr.length > 16_000) {
 					stderr = `${stderr.slice(0, 16_000)}…[truncated]`;
 				}
 				emitProgress({ type: "stderr", chunk: text });
 			});
-			// A pipe 'error' (EPIPE/ECONNRESET on the child's stderr, e.g. child
-			// died mid-write) emits on the stream; with no listener Node rethrows
-			// it as an unhandled exception and crashes the HOST process. Swallow
-			// it — child death is already handled via 'close'/'error' on the child.
+			// Child stderr pipe failures emit `error` events on the stream.
+			// Unhandled stream `error` events can crash the host process.
 			child.stderr?.on("error", () => {});
 
-			// Track the final assistant text from `agent_end`. We don't
-			// resolve eagerly on `agent_end` — we wait for child exit so
-			// the OS has fully reaped the process before the caller's
-			// next action (preserving the "no zombie processes" property
-			// even if the caller immediately spawns another subagent).
+			// The runner waits for child exit after `agent_end` so the OS reaps the process before resolution.
 			let finalAssistantText: string | null = null;
 			let finalErrorMessage: string | null = null;
 			let finalStopReason: string | null = null;
 			let sawAgentEnd = false;
 			let parseError: string | null = null;
-			// Tool-invocation count for the grounding gate (refresh-primers:
-			// 0 tool calls = closed-book paraphrase, rejected). Derived at settle
-			// from the accumulated assistant message CONTENT (toolCall parts) via
-			// countToolCalls — NOT from a discrete tool-event, since Pi's --print
-			// stdout has no reliable tool-completion event name. The authoritative
-			// source is agent_end's full message array when present, else the
-			// accumulated message_end messages.
+			// `agent_end` provides the authoritative full message array; otherwise use accumulated `message_end` messages because stdout has no reliable tool-completion event.
 			let agentEndMessages: unknown[] | null = null;
 
-			// Terminal-drain state. Set when we detect the final assistant
-			// turn, used to short-circuit the full-timeout wait on Pi's
-			// often-doesn't-exit print-mode shutdown.
+			// Detecting the final assistant turn bypasses the full-timeout wait.
+			// Pi print mode can remain running after the final assistant turn.
 			let drainTimerStarted = false;
 			let drainTimerHandle: ReturnType<typeof setTimeout> | undefined;
 
-			// child.stdout/stderr can be null only when the corresponding stdio
-			// slot is "ignore"/"inherit"/<fd>. We always pass "pipe" for both
-			// (above), so they're guaranteed Readable streams here. Still treat
-			// a missing stream as a hard parse_failed rather than crashing — this
-			// guards against future stdio-config changes that drop the pipe.
+			// `child.stdout` and `child.stderr` can be null when their stdio slots are not pipes; this runner passes `"pipe"` for both.
+			// A missing stream settles as `parse_failed` instead of passing `null` to `createInterface`.
 			if (!child.stdout) {
 				settle({
 					ok: false,
@@ -1071,38 +894,29 @@ export class PiSubagentRunner implements SubagentRunner {
 				});
 				return;
 			}
-			// Same host-crash guard as stderr: an unguarded 'error' on the stdout
-			// pipe (child died mid-stream) would rethrow as an unhandled exception.
-			// readline does not attach its own error listener to the input stream.
+			// An `error` listener prevents an stdout pipe error from becoming an unhandled exception.
 			child.stdout.on("error", () => {});
 			const rl = createInterface({
 				input: child.stdout,
 				crlfDelay: Number.POSITIVE_INFINITY,
 			});
 
-			// Track event progress so a timeout can report whether the
-			// subagent was actively producing output (model hung on a
-			// long generation) vs silent (auth/network/spawn problem).
+			// Event progress lets timeout reports distinguish active output from silent failures.
 			let eventCount = 0;
 			let lastEventType: string | null = null;
 			let lastEventTimestamp = 0;
 
-			// Accumulate every assistant message we see. Pi's print mode in
-			// JSON output emits `message_end` events for both intermediate
-			// (tool-call) and terminal turns, with the final assistant
-			// message carrying stopReason="stop" and no toolCall content.
+			// The runner accumulates `message_end` messages because Pi emits intermediate and terminal turns.
+			// Pi emits `message_end` for intermediate tool-call and terminal turns.
+			// A successful final assistant turn has `stopReason="stop"` and no `toolCall` content.
 			//
-			// Why we accumulate instead of waiting for `agent_end`:
 			// Pi's print mode does NOT emit an `agent_end` event on stdout.
-			// That event exists in Pi's internal extension event channel
-			// only — the stdout JSON stream comes from `session.subscribe`,
-			// which receives only `message_start`/`message_end`/
+			// `agent_end` is available only through Pi's internal extension event channel.
+			// `session.subscribe` produces the stdout JSON stream without emitting `agent_end`.
 			// `tool_execution_*`/`compaction_*`/`session_info_changed`/
 			// `thinking_level_changed`/`queue_update`/`auto_retry_end`.
 			//
-			// We detect run completion the same way Pi itself does: watch
-			// `message_end` for the final assistant turn (stopReason="stop"
-			// + no toolCall content), then drain until natural child exit.
+			// The runner drains until the child exits naturally after a final assistant `message_end` with no `toolCall` content.
 			const accumulatedMessages: unknown[] = [];
 			accountingMessages = accumulatedMessages;
 
@@ -1110,11 +924,9 @@ export class PiSubagentRunner implements SubagentRunner {
 				if (line.length === 0) return;
 				const parsed = parsePiEventLine(line);
 				if (!parsed.ok) {
-					// Non-JSON stdout noise from co-loaded extensions is
-					// skipped silently. A malformed JSON event line is
-					// recorded but doesn't abort yet, so we can still
-					// consume the final message_end if it arrives intact
-					// later. If we never see one, this becomes parse_failed.
+					// `parsePiEventLine` skips non-JSON stdout noise.
+					// The runner defers parse failure so a later terminal event can still succeed.
+					// The runner sets `parse_failed` only when no later terminal event succeeds.
 					if ("noise" in parsed) return;
 					parseError = parsed.error;
 					return;
@@ -1143,10 +955,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					});
 				}
 
-				// Forward the full parsed event so debug callers can write
-				// a complete trace to the log. Emitted unconditionally and
-				// before any branch-specific handling so even unexpected
-				// event types end up in the log.
+				// The runner emits `raw_event` before branch handling so logs include unrecognized events.
 				emitProgress({
 					type: "raw_event",
 					eventType: typeof e.type === "string" ? e.type : undefined,
@@ -1154,9 +963,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					ms: elapsedMs,
 				});
 
-				// Backwards-compat: if Pi (or any pi-compatible runner) ever
-				// does emit `agent_end` with the full messages array, treat
-				// it as authoritative. Older Pi versions may have done this.
+				// `agent_end` with `messages` takes precedence over accumulated messages.
 				if (e.type === "agent_end" && Array.isArray(e.messages)) {
 					sawAgentEnd = true;
 					agentEndMessages = e.messages;
@@ -1174,14 +981,9 @@ export class PiSubagentRunner implements SubagentRunner {
 					return;
 				}
 
-				// Live path: accumulate every assistant/tool message Pi
-				// emits via session.subscribe. The terminal assistant turn
-				// is detected by Pi's stopReason vocabulary
-				// ("stop" | "length" | "toolUse" | "error" | "aborted")
-				// being a non-toolUse value AND no toolCall content in the
-				// assistant message body. "length" means the model hit its
-				// max-tokens cap mid-response — still terminal, but we
-				// surface it as model_failed so callers can react.
+				// `stopReason="length"` means the model exhausted its token limit mid-response.
+				// `stopReason="length"` is terminal even though the response was truncated.
+				// The runner maps `stopReason="length"` to `model_failed` because the model exhausted its token limit.
 				if (e.type === "message_end" && e.message) {
 					accumulatedMessages.push(e.message);
 					const m = e.message as {
@@ -1222,18 +1024,10 @@ export class PiSubagentRunner implements SubagentRunner {
 					}
 				}
 
-				// Pi's print mode finishes the agent loop but does NOT always
-				// exit the child process cleanly afterwards — observed
-				// pattern: assistant message_end with stopReason="stop"
-				// arrives at ~30s, then the child sits idle until killed.
-				// This isn't unique to one provider; it appears to be a
-				// generic Pi print-mode shutdown gap.
+				// After a terminal assistant turn, the runner allows 2 seconds for the child to flush stdout and exit naturally.
 				//
-				// To avoid waiting on the full timeoutMs (typically 5+
-				// minutes) every time, start a short drain timer the moment
-				// we detect a terminal assistant turn. Give the child 2s
-				// grace to flush + exit naturally; if it's still alive,
-				// SIGTERM it. This matches the upstream pi-subagents
+				// The runner starts the drain timer after terminal detection instead of waiting for `timeoutMs`.
+				// The runner gives the child 2 seconds to flush and exit naturally after a terminal turn.
 				// drain-after-stop pattern.
 				if (sawAgentEnd && !drainTimerStarted) {
 					drainTimerStarted = true;
@@ -1251,18 +1045,14 @@ export class PiSubagentRunner implements SubagentRunner {
 				}
 			});
 
-			// Hard timeout. We use SIGTERM first so the child can flush
-			// stdout cleanly, with SIGKILL as a backstop in case it hangs.
+			// The hard-timeout handler sends `SIGTERM` before `SIGKILL` so the child can flush stdout.
 			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 			if (typeof options.timeoutMs === "number" && options.timeoutMs > 0) {
 				timeoutHandle = setTimeout(() => {
 					if (settled) return;
 					terminateChild(child);
-					// Build a diagnostic suffix so callers can tell whether
-					// the subagent was hung silent (auth/network/no events)
-					// vs actively producing output but slow (model just
-					// taking too long). Without this, every timeout looks
-					// the same and operators can't distinguish them.
+					// `eventCount === 0` identifies a silent timeout.
+					// Malformed and non-object JSON leave the timeout classified as silent.
 					const sinceLastEvent =
 						lastEventTimestamp > 0 ? Date.now() - lastEventTimestamp : -1;
 					const progressSuffix =
@@ -1284,7 +1074,6 @@ export class PiSubagentRunner implements SubagentRunner {
 				}, options.timeoutMs);
 			}
 
-			// Caller-driven abort (e.g. dreamer lease loss).
 			const onAbort = () => {
 				if (settled) return;
 				terminateChild(child);
@@ -1321,11 +1110,9 @@ export class PiSubagentRunner implements SubagentRunner {
 				});
 				if (settled) return;
 
-				// Common case: terminal assistant message_end was observed.
-				// Pi print-mode often needs our drain SIGTERM after producing
-				// the final turn, so the captured stopReason/text is the source
-				// of truth; a signaled close here must not turn a valid answer
-				// into a fake subprocess failure.
+				// A drain `SIGTERM` stops Pi print mode after the final turn.
+				// Captured stopReason and text remain authoritative after the final turn.
+				// A signaled close must not convert a valid answer into a subprocess failure.
 				if (sawAgentEnd) {
 					const trimmedAssistantText = finalAssistantText?.trim() ?? null;
 					if (
@@ -1340,10 +1127,8 @@ export class PiSubagentRunner implements SubagentRunner {
 									? "pi agent_end did not include an assistant message"
 									: "pi assistant produced empty text",
 							durationMs: Date.now() - startTime,
-							// Pi machinery worked (agent_end / terminal message_end seen);
-							// the model just returned empty text. Mark protocol output as
-							// present so this legitimate empty response is NOT mistaken for
-							// the #238 silent failure and does not fire the isolated retry.
+							// agent_end or terminal message_end proves protocol output.
+							// sawProtocolOutput prevents the isolated retry after an empty completed turn.
 							meta: {
 								stderr: stderr.length > 0 ? stderr : undefined,
 								sawProtocolOutput: true,
@@ -1371,9 +1156,8 @@ export class PiSubagentRunner implements SubagentRunner {
 					settle({
 						ok: true,
 						assistantText: trimmedAssistantText,
-						// Prefer agent_end's authoritative full array; else the
-						// accumulated message_end stream. Counting toolCall content
-						// parts is event-name-independent (see countToolCalls).
+						// `agent_end` with `messages` takes precedence over accumulated `message_end` messages.
+						// countToolCalls counts toolCall content parts independently of event names.
 						toolCallCount: countToolCalls(
 							agentEndMessages ?? accumulatedMessages,
 						),
@@ -1383,9 +1167,6 @@ export class PiSubagentRunner implements SubagentRunner {
 					return;
 				}
 
-				// No agent_end. Either Pi crashed before completing the
-				// turn, or stdout was malformed. Distinguish based on
-				// exit code and parseError.
 				if (parseError !== null) {
 					settle({
 						ok: false,
@@ -1425,10 +1206,8 @@ export class PiSubagentRunner implements SubagentRunner {
 						stderr: stderr.length > 0 ? stderr : undefined,
 						exitCode: code,
 						signal,
-						// #238: distinguish the silent failure (zero JSON stdout lines,
-						// no agent_end) from a partial run that emitted some events but
-						// never completed a turn. Only the zero-output case fires the
-						// isolated retry; eventCount counts parsed protocol lines.
+						// The runner retries only when `eventCount === 0` and no `agent_end` was observed.
+						// The retry distinguishes no agent_end with zero parsed events from partial runs that did not complete a turn.
 						sawProtocolOutput: eventCount > 0,
 					},
 				});
@@ -1457,15 +1236,8 @@ function isPiExtensionCollisionFailure(
 }
 
 /**
- * Issue #238 signature: the child exited 0 but produced NO protocol output
- * (no agent_end and zero JSON stdout lines), so it was classified
- * `no_assistant`. Certain user extension sets make Pi --print silently exit
- * this way. `runOnce` marks this case with `meta.sawProtocolOutput === false`.
  *
- * Deliberately NOT triggered by a legitimate empty model response: when Pi's
- * machinery worked (agent_end / terminal message_end observed) but the model
- * returned empty text, `sawProtocolOutput` is true and the failure is a plain
- * `no_assistant` that should fall through to fallback models, not an isolated
+ * `agent_end` and terminal `message_end` set `sawProtocolOutput`, so `no_assistant` failures bypass isolated retry.
  * retry.
  */
 function isSilentNoAssistantFailure(
@@ -1479,9 +1251,8 @@ function isSilentNoAssistantFailure(
 }
 
 /**
- * Whether a failed primary attempt should fire the one-shot isolated retry
- * (--no-extensions for discovered user extensions). Covers both the #222
- * extension turn collision and the #238 silent exit-0 signature.
+ * A failed primary attempt receives at most one isolated retry.
+ * The retry disables discovered user extensions with `--no-extensions`.
  */
 function isIsolatedRetryTrigger(
 	result: SubagentRunResult,
@@ -1491,7 +1262,7 @@ function isIsolatedRetryTrigger(
 	);
 }
 
-/** Pick the accurate log message for whichever trigger fired the isolated retry. */
+/* */
 function isolatedRetryLogMessage(result: FailedRunResult): string {
 	return isPiExtensionCollisionFailure(result)
 		? ISOLATED_RETRY_COLLISION_LOG_MESSAGE
@@ -1583,26 +1354,19 @@ function isProviderCredentialFailure(
 }
 
 /**
- * Max bytes we will pass as the positional message argv argument. Linux caps a
- * SINGLE argv entry at MAX_ARG_STRLEN (128 KiB); a historian chunk clamps to
- * ~50K tokens (~200 KB), which overflows that limit and makes spawn() fail with
- * E2BIG on Linux. Above this threshold the prompt is delivered via piped stdin
- * instead (Pi's print mode concatenates stdin into the initial message — see
- * buildInitialMessage), and the positional arg is omitted to avoid duplication.
- * Set well below 128 KiB for multibyte/encoding headroom.
+ * Limit the positional message to 96 KiB because Linux permits at most 128 KiB per argv entry.
+ * Linux limits one argv entry to MAX_ARG_STRLEN (128 KiB).
+ * A ~50K-token (~200 KB) prompt exceeds that limit and causes `spawn()` to fail with `E2BIG` on Linux.
+ * Pipe prompts larger than 96 KiB through stdin to avoid Linux E2BIG errors.
+ * Pi's print mode concatenates stdin into the initial message.
+ * The 96 KiB limit leaves multibyte and encoding headroom below Linux's 128 KiB argv-entry limit.
  */
 export const PROMPT_ARGV_MAX_BYTES = 96 * 1024;
 
 /**
- * Build the argv for one `pi --print --mode json` invocation.
  *
- * Argument ordering matters: print mode treats positional args as
- * messages, so the user prompt must come last.
  *
- * When `omitPositionalMessage` is set, the user prompt is NOT appended as a
- * positional — the caller delivers it via piped stdin instead (oversized prompt
- * path, or all win32 runs). Pi concatenates stdin + positional, so the
- * positional MUST be omitted when piping or the prompt would be duplicated.
+ * Omit the positional message when piping to prevent prompt duplication.
  */
 export function buildArgs(
 	options: SubagentRunOptions,
@@ -1620,41 +1384,25 @@ export function buildArgs(
 		"--print",
 		"--mode",
 		"json",
-		// `--no-session` makes Pi use SessionManager.inMemory() — no
-		// JSONL is written to ~/.pi/agent/sessions/<cwd>/, so historian /
-		// sidekick / dreamer / recomp / compressor child sessions never
-		// show up in `pi resume` or the session picker. We don't need
-		// the persisted JSONL anyway: the result comes back through the
-		// `agent_end` event on stdout (see extractFinalAssistant). Maps
-		// directly to OpenCode's "hidden subagent" pattern, which lets
-		// historian etc. stay invisible to the user even though they're
-		// real LLM rounds the user pays for.
+		// `agent_end` on stdout supplies the result, so child sessions need no persisted JSONL.
 		"--no-session",
-		// Extension discovery is enabled by default so provider extensions can
-		// register their models. A configured user allowlist adds --no-extensions
-		// below and explicitly loads only its entries. Prevent recursive startup by
-		// setting MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes
-		// the main entry exit early before registering hooks, tools, or timers.
-		// Disable skills and the project context surface because subagents only
-		// need the minimal startup path.
+		// A configured user allowlist disables extension discovery with `--no-extensions` and explicitly loads only allowlisted entries.
+		// Subagents need neither skills nor project context.
 		"--no-skills",
 		// OMP rejects Pi's --no-prompt-templates and --no-context-files flags.
-		// It folds AGENTS.md-style context into rules, so --no-rules is the
-		// equivalent way to preserve the exact child system prompt.
+		// OMP folds AGENTS.md-style context into rules.
+		// `--no-rules` preserves the exact child system prompt.
 		...(ompHost
 			? (["--no-rules"] as const)
 			: (["--no-prompt-templates", "--no-context-files"] as const)),
-		// --no-tools is applied below only for unknown or explicitly zero-tool agents.
-		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
-		// discovered extension registry cannot leak unrelated tools into subagents.
+		// Only unknown or explicitly zero-tool agents receive `--no-tools` below.
+		// Known Magic Context children receive an explicit `--tools` allowlist.
 	];
 	if (
 		opts?.disableDiscoveredExtensions ||
 		opts?.subagentExtensions !== undefined
 	) {
-		// When an allowlist is active, or when the collision retry asks for an
-		// isolated child, disable auto-discovered extensions. Explicit entries are
-		// added below in their configured order.
+		// An active allowlist disables auto-discovered extensions.
 		args.push("--no-extensions");
 	}
 
@@ -1664,23 +1412,17 @@ export function buildArgs(
 		}
 	}
 
-	// Load Magic Context's lean subagent extension entry in children that need the
-	// scoped ctx_* tools. With no allowlist, discovered extensions remain enabled
-	// so provider and other auto-discovered extensions can register, while the full Magic Context entry sees
-	// MAGIC_CONTEXT_PI_SUBAGENT=1 and returns before wiring recursive hooks. The
-	// lean entry is explicitly loaded via --extension and is NOT guarded; it only
-	// registers subagent-scoped tools and never historian/dreamer/event handlers.
-	// When the bundle isn't present (e.g. running source from src/ without a build),
-	// skip the flag — the affected subagent simply lacks Magic Context ctx_* tools.
+	// The runner loads the lean subagent extension only for children that need scoped `ctx_*` tools.
+	// Without an allowlist, discovered extensions remain enabled so provider extensions can register models.
+	// The full Magic Context entry receives `MAGIC_CONTEXT_PI_SUBAGENT=1`.
+	// With `MAGIC_CONTEXT_PI_SUBAGENT=1`, the full Magic Context entry returns before registering hooks, tools, or timers.
+	// The lean entry does not check `MAGIC_CONTEXT_PI_SUBAGENT`; it registers only subagent-scoped tools.
+	// The runner omits `--extension` when the bundle is absent, so the child lacks Magic Context `ctx_*` tools.
 	//
-	// We use the long form `--extension` (not the `-e` short form) to
-	// avoid clashes with extension-registered flags. Older Pi versions
-	// also exposed `-x`, but that alias was removed in 0.71+ — newer
-	// versions hard-fail with "Unknown option: -x".
-	// Do not load the lean Magic Context extension for historian/compressor style
-	// subagents. They do not use ctx_* tools, and loading the entry would add
-	// startup cost and an avoidable tool-registration surface. Tool-using agents
-	// (sidekick/dreamer) still receive the lean entry.
+	// The runner uses `--extension`, not `-e`, because extension-registered flags can conflict with `-e`.
+	// Historian and compressor subagents do not use `ctx_*` tools.
+	// Loading the entry would add startup cost and tool-registration surface.
+	// Sidekick and dreamer subagents receive the lean entry.
 	const subagentEntryPath = opts?.subagentEntryPath ?? SUBAGENT_ENTRY_PATH;
 	const shouldLoadSubagentExtension =
 		subagentEntryPath &&
@@ -1689,17 +1431,15 @@ export function buildArgs(
 	if (shouldLoadSubagentExtension) {
 		args.push("--extension", subagentEntryPath);
 
-		// Only dreamer subagents get ctx_memory in the child extension. Sidekick
-		// loads the same entry for ctx_search but must stay read-only. The flag is
-		// read inside the subagent extension via `pi.getFlag(...)`.
+		// Only dreamer subagents get `ctx_memory` in the child extension.
+		// Sidekick loads the same entry for `ctx_search` but must remain read-only.
 		if (DREAMER_ACTION_AGENTS.has(options.agent)) {
 			args.push("--magic-context-dreamer-actions");
 		}
 	}
 
-	// Every child receives an explicit built-in tool gate. Pi applies this as
-	// hard registry isolation. OMP validates only built-in names and always
-	// appends discovered extension tools, so its gate is a built-in budget only.
+	// Pi applies every child's explicit built-in tool gate as hard registry isolation.
+	// OMP validates only built-in names and appends discovered extension tools.
 	const strictTools = STRICT_TOOL_ALLOWLIST.get(options.agent);
 	if (strictTools === undefined) {
 		sessionLog(
@@ -1717,51 +1457,38 @@ export function buildArgs(
 	}
 
 	if (opts?.systemPromptPath) {
-		// We intentionally use --system-prompt (replace) rather than
-		// --append-system-prompt (chain) because subagents are one-shot
-		// and have their own focused system prompt. Mixing in Pi's
-		// default coding-assistant prompt would dilute the historian
-		// / dreamer / sidekick role guidance. The runner always writes that
-		// prompt to a temp file and passes the ABSOLUTE path here because
-		// Windows CreateProcess caps the whole command line at 32,767 chars
-		// and the historian prompt alone is ~60 KB. A temp file also avoids
-		// Pi's existsSync ambiguity because we always hand it a path we created.
+		// `--system-prompt` replaces Pi's default prompt to preserve subagent role guidance.
+		// The runner writes each subagent prompt to a temporary file and passes its absolute path.
+		// The runner passes the generated prompt file by absolute path because Windows CreateProcess limits command lines to 32,767 characters.
+		// The historian prompt is about 60 KB, so embedding it can exceed Windows' 32,767-character command-line limit.
 		args.push("--system-prompt", opts.systemPromptPath);
 	}
 
 	if (typeof options.model === "string" && options.model.length > 0) {
-		// Pi's --models flag scopes the model picker list; it is not an ordered
-		// fallback chain. The runner implements fallback by spawning a fresh child
-		// per model, so each invocation receives exactly one --model.
+		// Pi's `--models` limits the model picker; it does not define a fallback order.
+		// The runner implements fallback by spawning one child per model, so each invocation receives one `--model`.
 		//
-		// The shared config stores the canonical (OpenCode) provider form; Pi
-		// names a few auth-plugin providers differently (openai->openai-codex,
-		// google->google-antigravity). Translate to Pi's form HERE, at the only
-		// point the model reaches the spawned process, so options.model stays
-		// canonical everywhere else (accounting, logging, fallback selection).
+		// The shared config stores the canonical (OpenCode) provider form.
+		// Pi names the auth-plugin provider `openai` as `openai-codex`.
+		// Translate to Pi's form when adding `--model` so `options.model` stays canonical elsewhere.
 		args.push(
 			"--model",
 			opts?.modelRef ?? resolveModelRefForHost(options.model),
 		);
 	}
 
-	// Pass --thinking <level> only when explicitly configured.
-	// Without an explicit level, Pi's own resolution runs (works for most
-	// providers; may fail for e.g. github-copilot/gpt-5.4 which injects
-	// "minimal" as a default that its own API then rejects). Users who hit
-	// this must set `historian.thinking_level` in their Pi magic-context.jsonc.
+	// Without an explicit level, Pi resolves the level.
+	// `github-copilot/gpt-5.4` rejects Pi's default `minimal` level.
 	if (options.thinkingLevel) {
 		args.push("--thinking", options.thinkingLevel);
 	}
 
 	// Positional message argument MUST come last in print-mode argv.
-	// Pi 0.7x parses print-mode prompts after all known flags without needing
-	// a `--` sentinel; newer builds hard-fail on that sentinel as an unknown
-	// option, so pass the prompt directly.
+	// Pi 0.7x parses print-mode prompts after all known flags.
+	// Newer Pi builds reject a `--` sentinel as an unknown option.
 	//
-	// Omitted whenever the caller pipes the message via stdin (oversized prompt
-	// path, or all win32 runs). Pi concatenates stdin + positional, so including
-	// both would duplicate it.
+	// The runner omits the positional message when it pipes the message through stdin for oversized prompts or on win32.
+	// Passing the prompt through stdin and as a positional argument would duplicate it.
 	if (!opts?.omitPositionalMessage) {
 		args.push(options.userMessage);
 	}
@@ -1770,21 +1497,17 @@ export function buildArgs(
 }
 
 /**
- * Extract the final assistant message's text + status from a Pi `agent_end`
  * messages array.
  *
- * Pi's AgentMessage shape (from @earendil-works/pi-ai):
+ * Pi defines `AgentMessage` in `@earendil-works/pi-ai`.
  *   {
- *     role: "user" | "assistant" | "toolResult",
- *     content: Array<{ type: "text" | "toolCall" | "toolResult", ... }>,
- *     stopReason?: "stop" | "error" | "aborted" | ...,
+ * Pi's `AgentMessage.role` is `user`, `assistant`, or `toolResult`.
+ * Pi's `AgentMessage.content` contains `text`, `toolCall`, and `toolResult` parts.
+ * Pi's `AgentMessage.stopReason` includes `stop`, `error`, and `aborted`.
  *     errorMessage?: string,
  *     ...
  *   }
  *
- * The "final assistant message" is the last element of the array with
- * role === "assistant". Its text content is the concatenation of every
- * `{ type: "text", text }` block in `content`.
  */
 export function extractFinalAssistant(messages: unknown[]): {
 	text: string | null;
@@ -1823,14 +1546,7 @@ export function extractFinalAssistant(messages: unknown[]): {
 }
 
 /**
- * Count tool invocations across a run from the assistant messages themselves —
- * each `toolCall` content part is one invocation. We derive the count from
- * message CONTENT (which `message_end` always carries, and `agent_end` carries
- * in its final array) rather than a discrete tool-completion EVENT, because
- * Pi's --print stdout vocabulary is message_start / message_end /
- * tool_execution_* (no `tool_result_end`), so keying on an event name is
- * fragile. The grounding gate only needs "did the agent call tools at all"
- * (count > 0), so counting requested toolCall parts is the robust signal.
+ * Each `toolCall` content part represents one invocation.
  */
 export function countToolCalls(messages: unknown[]): number {
 	let count = 0;
@@ -1857,13 +1573,6 @@ export function parsePiEventLine(
 	| { ok: true; event: unknown }
 	| { ok: false; error: string }
 	| { ok: false; noise: true } {
-	// Pi's --print JSON event stream emits one JSON OBJECT per line. Since
-	// subagent children load the user's full extension set (v0.30.4 dropped
-	// --no-extensions), any co-loaded extension that writes plain text to
-	// stdout (e.g. "[Worker] Ready") interleaves with the event stream.
-	// Such lines are noise to skip, not protocol corruption — only a line
-	// that CLAIMS to be an event (starts with "{") but fails to parse is a
-	// real error worth recording.
 	if (!line.trimStart().startsWith("{")) {
 		return { ok: false, noise: true };
 	}

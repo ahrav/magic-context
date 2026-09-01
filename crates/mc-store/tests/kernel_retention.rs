@@ -41,6 +41,37 @@ fn candidate(run: &str, candidate: &str, recorded_at: i64) -> StagingCandidateSp
     }
 }
 
+#[test]
+fn candidate_payload_too_large_to_inspect_is_rejected_rather_than_replaced() {
+    // Redaction cannot inspect text this long, so it replaces the whole value with one
+    // placeholder. Accepting that would store the placeholder as the candidate and
+    // classify a payload holding no secret as one that does, both without an error.
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let limit = mc_core::redaction::MAX_REDACTABLE_BYTES;
+
+    let mut oversized = candidate("run", "oversized", 0);
+    oversized.payload = "x".repeat(limit + 1);
+    assert_eq!(
+        store.stage_candidate(oversized).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let mut oversized_kind = candidate("run", "oversized-kind", 0);
+    oversized_kind.candidate_kind = "x".repeat(limit + 1);
+    assert_eq!(
+        store.stage_candidate(oversized_kind).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    // At the limit the payload is stored whole, so the rejections above are a size
+    // boundary rather than a placeholder standing in for the candidate.
+    let mut at_limit = candidate("run", "at-limit", 0);
+    at_limit.payload = "x".repeat(limit);
+    let row = store.stage_candidate(at_limit).unwrap();
+    assert_eq!(row.payload.len(), limit);
+}
+
 fn inspect(root: &std::path::Path) -> Connection {
     Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
 }
@@ -198,10 +229,11 @@ fn staging_cleanup_preserves_exact_denormalized_admission_facts() {
         .execute(
             "INSERT INTO admission_decisions(
                  admission_decision_id,candidate_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
-                 reason,decided_at
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
+                 outcome,sensitivity_class,policy_revision,reason,decided_at
              ) VALUES ('admission','candidate','fixture','source',7,'normal','tainted',
-                       'candidate','accepted','explicit',9,'proof',11)",
+                       'other','candidate','candidate','accepted','explicit','admit','normal',9,
+                       'proof',11)",
             [],
         )
         .unwrap();
@@ -426,7 +458,7 @@ fn remediation_supports_two_live_domains_and_keeps_receipt_as_caller_result() {
     );
 }
 
-const AWS_KEY: &str = "AKIAFFFFFFFFFFFFFFFF";
+const AWS_KEY: &str = "AKIAQ7RSTUVWXYZ23456";
 
 fn secret_candidate(recorded_at: i64) -> StagingCandidateSpec {
     let mut spec = candidate("run", "cand", recorded_at);

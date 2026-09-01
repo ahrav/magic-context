@@ -42,47 +42,34 @@ import {
 } from "./storage-mural-cues";
 
 /**
- * compress-cues: a NON-agentic single-shot transform (classify-memories shape).
- * For each project memory whose cue is missing or stale, the host renders one
- * prompt per chunk, a zero-tool agent emits ONE <cues> XML manifest, and the
- * host validates each cue and applies COLUMN-ONLY writes (mural_cue), either locally
- * under TS authority or through the module facade when MODULE owns memories. No per-memory
- * tool calls; no selection/ranking/packing (those are deterministic
- * in resolveMural / renderMural).
+ * The host renders one prompt per chunk for memories with missing or stale cues.
+ * A zero-tool agent emits one <cues> XML manifest per chunk.
+ * The host validates each cue and writes only mural_cue.
+ * resolveMural and renderMural deterministically select, rank, and pack memories.
  *
- * Gate: mural_cue IS NULL OR mural_cue_hash != sha256(content). Resumable — cues
- * are written per memory, so a partial run sticks and the next run picks up the
- * remaining gate set.
+ * The gate includes memories whose mural_cue is NULL or whose mural_cue_hash differs from sha256(content).
+ * Each successful memory write persists independently, so later runs retry only remaining gated memories.
  *
- * Economics: chunks are small (~40 memories), so after the initial backfill the
- * daily trickle is cheap. First run on a 470-memory pool is ~12 chunks; steady
- * state is a handful of new/edited memories per day.
  */
 
-/** Memories per compress call. Small so peak context stays bounded and a
- *  partial run leaves little re-work; the daily cadence drains any backlog. */
+/**
+ * The limit bounds peak context and rework after partial runs. */
 export const COMPRESS_CUES_CHUNK_SIZE = 40;
 
-/** Minimum wall-clock budget a single chunk is allowed before we consider it
- *  doomed. runCompressCues divides the remaining task deadline evenly across the
- *  chunks still to run; on a large backfill (e.g. a 470-memory pool = 12 chunks)
- *  that even split can hand a slow thinking model far less than it needs, so
- *  every chunk times out, contributes 0 cues, and the loop burns the whole
- *  deadline (and model quota) marching through chunks that can never finish.
- *  The floor keeps each attempted chunk's slice at least this large, and if the
- *  remaining budget drops below it we stop the run and bank progress instead of
- *  starting a chunk we already know cannot complete. */
+/** A chunk's even-split time slice can fall below CHUNK_TIMEOUT_FLOOR_MS.
+ * runCompressCues divides the remaining deadline among pending chunks.
+ * A timed-out chunk contributes zero cues.
+ * The run stops when its remaining budget is below the floor.
+ * The run preserves completed progress rather than starting a sub-floor chunk. */
 export const CHUNK_TIMEOUT_FLOOR_MS = 240_000;
 
-/** Three validation failures for one content hash are enough to stop spending
- * a child session on a response that is not going to change. */
+/** The latch stops launching child sessions after three validation failures for the same content hash.
+ * */
 export const CUE_REJECTION_LATCH_THRESHOLD = 3;
 
-/** How many chunks in a row may fail with a timeout-class error before the run
- *  stops early. A model that is consistently slower than its time slice will
- *  time out every chunk; continuing just burns the remaining chunks and quota.
- *  Two consecutive timeouts is enough to conclude the model cannot keep up
- *  within its slice, while still tolerating a single flaky/transient timeout. */
+/** The run stops after two consecutive timeout-class chunk failures.
+ * Stopping repeated timeouts preserves the remaining chunk budget.
+ * */
 const CONSECUTIVE_TIMEOUT_LIMIT = 2;
 
 export interface CompressCuesArgs {
@@ -100,18 +87,18 @@ export interface CompressCuesArgs {
     onProgress?: (processed: number) => void;
 }
 
-/** How a chunk failed, used by the run loop to decide whether to keep going.
- *  "timeout" means the model did not finish within its time slice; "other"
- *  covers validation failures (bad/missing manifest, length cap) and provider
- *  errors, which keep the existing per-chunk retry-next-run behavior. */
+/** The run loop uses the failure class to decide whether to continue.
+ * "timeout" means the model did not finish within its time slice.
+ * "other" covers validation failures, including bad or missing manifests and length-cap violations, plus provider errors.
+ * Validation and provider failures leave the chunk eligible for retry on the next run. */
 type ChunkFailureClass = "timeout" | "other";
 
 interface ChunkOutcome {
     compressed: number;
     skipped: number;
-    /** Present only when the chunk failed. Carries the failure class plus the
-     *  measured elapsed time so the run loop can log how long the doomed chunk
-     *  actually ran (helps an operator size chunk vs model). */
+    /** failure is present only when the chunk fails.
+     * failure records elapsed time for logging.
+     * The elapsed time supports chunk-size tuning. */
     failure?: {
         class: ChunkFailureClass;
         brief: string;
@@ -129,11 +116,11 @@ export interface CompressCuesResult {
     complete: boolean;
 }
 
-/** A claim selected for (re)compression. The revision locator captured at
- *  SELECTION time is the race guard: if the claim is revised between
- *  selection and write, the stored locator won't match the new revision, so
+/**
+ * The revision locator captured at selection prevents adopting a cue after the claim changes.
+ * If a claim is revised after selection, its stored locator does not match the new revision.
  *  resolveMural excludes the cue and the gate re-selects the claim next run
- *  — it never adopts a cue for content it wasn't compressed from. */
+ * The gate never adopts a cue for content that was not compressed. */
 interface CueCandidate {
     item: ProjectMemoryClaimSnapshot;
 }
@@ -152,7 +139,7 @@ function stripOwnIdToken(value: string, ownId: string): string {
     return value.replaceAll(ownId, "");
 }
 
-/** Truncate by codepoint budget, preferring a complete word when one exists. */
+/** The function truncates by code-point budget and prefers a complete word when available. */
 function truncateCue(value: string, budget: number): string {
     const trimmed = value.trim();
     const codepoints = [...trimmed];
@@ -170,9 +157,8 @@ function sanitizeCue(value: string, candidate: CueCandidate): string {
 }
 
 /**
- * Make a deterministic cue after the same response has failed validation three
- * times. The model's final candidate gets first choice; source content is the
- * second choice so a bad polarity or mechanism cannot keep the gate open.
+ * The final model candidate is validated before fallback candidates.
+ * The fallback uses source content only when the final model candidate fails validation.
  */
 function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string): string {
     const importance = candidate.item.importance;
@@ -187,9 +173,7 @@ function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string
         return sourceSlice;
     }
 
-    // Source content can itself contain grammar markers or an unmatched
-    // parenthesis. Remove only those validator controls as a final deterministic
-    // repair; the remaining text is still a bounded slice of the memory.
+    // Source content can contain grammar markers or unmatched parentheses.
     const grammarSafe = truncateCue(
         sourceSlice
             .replaceAll("⊘", "")
@@ -202,15 +186,13 @@ function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string
         return grammarSafe;
     }
 
-    // Memory content is normally non-empty; keep this guard deterministic for
-    // malformed legacy rows while preserving the validator's non-empty rule.
     return "memory";
 }
 
-/** Select the claims whose cue is missing or stale (locator or renderer-epoch
- * mismatch). Cue compression sends claim CONTENT to a child-model prompt — an
- * automatic surface — so the pool comes from the provider's `auto_inject`
- * decision, which applies policy before any limit. */
+/** The function selects claims whose cues are missing or stale because their locator or renderer epoch differs.
+ * Cue compression sends claim content to a child-model prompt, which is an automatic surface.
+ * The candidate pool uses the provider's `auto_inject` decision before any limit is applied.
+ * */
 function selectCandidates(db: Database, projectIdentity: string): CueCandidate[] {
     const projectIds = resolveProjectIdsForIdentities(db, [projectIdentity]);
     if (projectIds.length === 0) return [];
@@ -239,11 +221,8 @@ function selectCandidates(db: Database, projectIdentity: string): CueCandidate[]
     return candidates;
 }
 
-/** Compute the wall-clock slice for the next chunk: an even split of the
- *  remaining budget across the chunks still to run, but never below
- *  CHUNK_TIMEOUT_FLOOR_MS (a slice smaller than the model needs guarantees a
- *  timeout) and never more than the budget actually remaining. Exported for
- *  test; the run loop calls this once per chunk. */
+/**
+ * */
 export function computeChunkSliceMs(remainingMs: number, chunksRemaining: number): number {
     return Math.min(
         remainingMs,
@@ -280,25 +259,17 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
     );
     try {
         let consecutiveTimeouts = 0;
-        // Elapsed time of each chunk in the current consecutive-timeout streak,
-        // logged when the breaker trips so an operator can size chunk vs model.
+        // The breaker log records timeout-streak elapsed times so operators can size model chunks.
         let timeoutStreakElapsedMs: number[] = [];
         for (let i = 0; i < chunks.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
             if (remainingMs <= 0) break;
-            // Not enough budget left to give this chunk a fair (>= floor) slice.
-            // Starting it would just produce another timeout, so stop here and
-            // bank progress: cues already written are durable per memory, and the
-            // incomplete result keeps this task transient so cron retries it.
             if (remainingMs < CHUNK_TIMEOUT_FLOOR_MS) {
                 log(
                     `[dreamer] compress-cues: stopping before chunk ${i + 1}/${chunks.length} — remaining budget ${remainingMs}ms is below the ${CHUNK_TIMEOUT_FLOOR_MS}ms chunk floor; banking ${result.compressed} compressed cue(s)`,
                 );
                 break;
             }
-            // Even-split the remaining budget across the chunks still to run, but
-            // never hand a chunk less than the floor (a slice too small for the
-            // model guarantees a timeout).
             const sliceMs = computeChunkSliceMs(remainingMs, chunks.length - i);
             const chunk = chunks[i];
             if (!chunk) break;
@@ -313,18 +284,13 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
                 consecutiveTimeouts += 1;
                 timeoutStreakElapsedMs.push(outcome.failure.elapsedMs);
                 if (consecutiveTimeouts >= CONSECUTIVE_TIMEOUT_LIMIT) {
-                    // Circuit breaker: the model is consistently slower than its
-                    // time slice. Stop now instead of burning the remaining chunks
-                    // (and model quota) on attempts that will also time out.
                     log(
                         `[dreamer] compress-cues: circuit breaker tripped — ${consecutiveTimeouts} consecutive chunk timeouts (model too slow for its time slice); per-chunk elapsed [${timeoutStreakElapsedMs.join("ms, ")}ms] vs ${sliceMs}ms slice; stopping run incomplete with ${chunks.length - i - 1} chunk(s) unattempted`,
                     );
                     break;
                 }
             } else {
-                // A success or a non-timeout failure (validation/provider) breaks
-                // the streak: those keep the existing retry-next-run behavior and
-                // must not trip the timeout breaker.
+                // Only timeout-class failures increment consecutiveTimeouts.
                 consecutiveTimeouts = 0;
                 timeoutStreakElapsedMs = [];
             }
@@ -339,12 +305,10 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
     }
 }
 
-/** True when a chunk failed because the model did not finish within its time
- *  slice — the "prompt timed out after Nms" error thrown by promptWithTimeout in
- *  shared/model-suggestion-retry. Validation failures (bad/missing manifest,
- *  length-capped output) and provider errors are deliberately NOT timeout-class:
- *  those keep the existing per-chunk retry-next-run behavior and must not trip
- *  the consecutive-timeout circuit breaker. */
+/** A timeout-class failure occurs when the model does not finish within its time slice.
+ * Validation failures and provider errors are not timeout-class.
+ * Length-capped output is not timeout-class.
+ * */
 function isTimeoutClassError(error: unknown): boolean {
     return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
 }
@@ -375,15 +339,10 @@ async function compressOneChunk(
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create compress-cues session.");
 
-        // The candidate pool was frozen once at run start; later chunks wait
-        // behind provider calls, and child-session creation above is itself
-        // an await. A claim quarantined, rejected, or superseded in the
-        // meantime must not have its content sent to the child-model prompt,
-        // and a member revised after selection must not have its frozen
-        // bytes disclosed. Re-read the chunk through the provider immediately
-        // before the prompt is built: the provider applies policy before
-        // limits and rechecks its snapshot vector, and the revision-locator
-        // comparison drops members revised since selection.
+        // Child-session creation can delay later chunks, so re-read selected chunks before prompting.
+        // The child-model prompt excludes claims quarantined, rejected, or superseded after selection.
+        // The child-model prompt excludes members revised after selection to avoid disclosing bytes outside the frozen snapshot.
+        // The provider applies policy before limits and rejects a changed snapshot vector.
         const projectIds = resolveProjectIdsForIdentities(args.db, [args.projectIdentity]);
         const recheck = readProjectMemoryCurrentState(args.db, {
             publicClaimIds: chunk.map((candidate) => candidate.item.publicClaimId),
@@ -464,13 +423,7 @@ async function compressOneChunk(
             `[dreamer] compress-cues chunk failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        // A chunk failure is not fatal to the run: other chunks still compress,
-        // and this chunk's memories stay NULL and are retried next run. Rethrow
-        // only on abort (lease lost / deadline) so the scheduler records it.
         if (signal.aborted || error instanceof DreamerProviderOutputFailureError) throw error;
-        // Classify the failure so the run loop can drive the consecutive-timeout
-        // circuit breaker. The measured elapsed time lets the operator compare
-        // how long the model actually ran against the slice it was given.
         return {
             compressed: 0,
             skipped: 0,
@@ -495,12 +448,6 @@ async function compressOneChunk(
 }
 
 /**
- * Validate each returned cue independently and write the valid ones into the
- * derived cue table. The first validation failures are skipped (the claim
- * keeps a NULL cue); after the rejection latch trips, a deterministic
- * fallback is written instead of retrying forever. The stored key is the
- * SELECTION-time revision locator, so a claim revised mid-run doesn't adopt
- * a cue compressed from its old content.
  */
 export function applyCues(
     args: CompressCuesArgs,

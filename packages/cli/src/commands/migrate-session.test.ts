@@ -240,8 +240,8 @@ describe("planMigrateSession", () => {
         const oc = makeOpencodeDb();
         const ctx = makeContextDb();
         seedSession(oc, ctx);
-        // hasGitDir=true but no per-worktree project row → OpenCode would use
-        // global (empty repo, no commit/remote). Must NOT dead-end.
+        // OpenCode uses global when `hasGitDir` is true and no worktree project row exists.
+        // Migration accepts OpenCode's global-project fallback for an unregistered Git target.
         const plan = planMigrateSession(SID, "/home/u/unregistered", makeDeps(oc, ctx, true));
         expect(plan.ocProjectId).toBe("global");
         expect(plan.targetIsGit).toBe(true);
@@ -433,7 +433,6 @@ describe("applyMigrateSession — OpenCode + context re-stamp", () => {
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
         ).run(SID, FROM);
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx, false));
-        // Must not throw even though project_id/path/workspace_id columns are absent.
         applyMigrateSession(plan, makeDeps(oc, ctx, false));
         const row = oc.prepare("SELECT directory FROM session WHERE id = ?").get(SID) as {
             directory: string;
@@ -478,12 +477,9 @@ describe("applyMigrateSession — memory actions", () => {
 
     it("compensates the OpenCode move when the context.db transaction fails (no split-brain)", () => {
         const { oc, ctx } = setup();
-        // Force the context.db transaction to throw AFTER the OpenCode commit by
-        // dropping a table its transaction writes to.
         ctx.exec("DROP TABLE compartment_chunk_embeddings");
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
         expect(() => applyMigrateSession(plan, makeDeps(oc, ctx))).toThrow();
-        // OpenCode must be restored to its pre-migration values.
         const session = oc
             .prepare("SELECT directory, project_id FROM session WHERE id = ?")
             .get(SID) as { directory: string; project_id: string };
@@ -494,10 +490,8 @@ describe("applyMigrateSession — memory actions", () => {
     it("refuses to apply when the OpenCode session row is missing (no half-migration)", () => {
         const { oc, ctx } = setup();
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        // Session vanishes between plan and apply (e.g. deleted while we worked).
         oc.prepare("DELETE FROM session WHERE id = ?").run(SID);
         expect(() => applyMigrateSession(plan, makeDeps(oc, ctx))).toThrow(/not found/i);
-        // Context.db must be untouched — ownership stays on the source identity.
         const ownership = ctx
             .prepare("SELECT project_path FROM session_projects WHERE session_id = ?")
             .get(SID) as { project_path: string };

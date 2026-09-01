@@ -180,12 +180,7 @@ describe("parseCompartmentOutput — events (v2, stored not rendered)", () => {
     });
 
     it("anchors at_compartment as a 1-based index into the EMITTED compartment list (discard-last contract)", () => {
-        // The incremental runner's discard-last filter keeps an event iff
-        // `atCompartment <= persistedCompartments.length` (compartment-runner-incremental.ts).
-        // That is ONLY correct if at_compartment is a 1-based index into the
-        // emitted compartment list. This test pins that contract: if the parser
-        // ever changed to 0-based or absolute message ordinals, the filter would
-        // silently mis-classify events and this assertion would break first.
+        // `at_compartment` must index emitted compartments from 1 for the discard-last filter.
         const parsed = parseCompartmentOutput(`
 <output>
 <compartments>
@@ -204,18 +199,13 @@ describe("parseCompartmentOutput — events (v2, stored not rendered)", () => {
 </events>
 </output>`);
         expect(parsed.events).toHaveLength(2);
-        // First event anchors to emitted compartment #1 (1-based).
         expect(parsed.events[0].atCompartment).toBe(1);
-        // Second anchors to emitted compartment #2.
         expect(parsed.events[1].atCompartment).toBe(2);
 
-        // Simulate discard-last keeping only the first compartment (k=1 persisted).
         const persistedLength = 1;
         const publishable = parsed.events.filter(
             (e) => e.atCompartment == null || e.atCompartment <= persistedLength,
         );
-        // The event on the discarded tail (#2) is dropped; the kept-compartment
-        // event (#1) survives.
         expect(publishable).toHaveLength(1);
         expect(publishable[0].fields.summary).toContain("first");
     });
@@ -273,7 +263,6 @@ describe("parseCompartmentOutput — primer_candidates", () => {
             "How does prompt caching work?",
             "How does the materialization cache avoid busts?",
         ]);
-        // Legacy bullet form carries no origin tag.
         expect(parsed.primerCandidates.every((c) => c.originCompartmentIndex === undefined)).toBe(
             true,
         );
@@ -293,8 +282,7 @@ describe("parseCompartmentOutput — primer_candidates", () => {
 <meta><messages_processed>5-9</messages_processed><unprocessed_from>10</unprocessed_from></meta>
 </output>`);
 
-        // at_compartment is the 1-based index into the emitted compartments, NOT
-        // the start ordinal — so "1" → the first (and only) compartment here.
+        // `at_compartment` is a 1-based emitted-compartment index, not a start ordinal.
         expect(parsed.primerCandidates).toEqual([
             { question: "How does the m[0]/m[1] cache split work?", originCompartmentIndex: 1 },
         ]);
@@ -335,7 +323,6 @@ describe("parseCompartmentOutput — fact scoping (audit Fix 6)", () => {
 </causal_incident>
 </events>
 </output>`);
-        // Exactly one fact — from <facts>. The word "CONSTRAINTS" inside the
         // event field must not become a phantom CONSTRAINTS fact.
         expect(parsed.facts).toHaveLength(1);
         expect(parsed.facts[0].category).toBe("ARCHITECTURE");
@@ -344,7 +331,7 @@ describe("parseCompartmentOutput — fact scoping (audit Fix 6)", () => {
     });
 
     it("falls back to whole-text scan (minus events) when no <facts> wrapper", () => {
-        // Transition/older shape: bare category blocks, no <facts> wrapper.
+        // Fallback parsing accepts bare category blocks without a `<facts>` wrapper.
         const parsed = parseCompartmentOutput(`
 <output>
 <PROJECT_RULES>
@@ -365,9 +352,9 @@ describe("parseCompartmentOutput — fact scoping (audit Fix 6)", () => {
 
 describe("parseCompartmentOutput — lenient tier closing (issue #246)", () => {
     it("parses a mismatched close (<p1>…</p2>) into the correct tiers", () => {
-        // Exact observed failure shape: deepseek-v4-flash-free closes <p1> with
-        // </p2>. The opened <p1> must be terminated by the NEXT closing tier tag
-        // regardless of its digit, and the real <p2> must still parse cleanly.
+        // Mismatched tier closing tags occur in parser input.
+        // The parser terminates `<p1>` at the next closing tier tag, regardless of its digit.
+        // A mismatched `</p2>` closing `<p1>` must not suppress the actual `<p2>` tier.
         const parsed = parseCompartmentOutput(`
 <output>
 <compartments>
@@ -382,7 +369,7 @@ the full p1 narrative
 </compartments>
 </output>`);
         const c = parsed.compartments[0];
-        // p1 present (non-empty) ⇒ v2 tiered row, stored as legacy=0.
+        // A nonempty `<p1>` identifies a v2 tiered row with `legacy = 0`.
         expect(c.p1).toBe("the full p1 narrative");
         expect(c.content).toBe("the full p1 narrative"); // mirrors P1
         expect(c.p2).toBe("the condensed p2");
@@ -403,8 +390,8 @@ the full p1 narrative
     });
 
     it("over-capture guard never swallows a later tier's opener into an earlier body", () => {
-        // Even when a stray closing tag sits past the next opener, the earlier
-        // tier's body is cut at the next <p\d> opener, not extended to the close.
+        // A stray closing tag after the next opener does not extend the earlier tier's body.
+        // The parser ends a tier's body at the next `<p\d>` opener, not at a later closing tag.
         const parsed = parseCompartmentOutput(`
 <compartment start="1" end="2" title="x" importance="50">
 <p1>alpha<p2>beta</p1><p3>gamma</p3><p4/>

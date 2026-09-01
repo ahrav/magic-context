@@ -106,7 +106,7 @@ function liveMode(): LiveMetamorphicOptions["mode"] {
     };
 }
 
-/** Pairs only score when both roles report one system tuple, so a shared tuple is what lets these fixtures reach the invariant comparison. commentlint: allow(JUDGE) */
+/** Pairs only score when both roles report one system tuple, so a shared tuple is what lets these fixtures reach the invariant comparison. */
 function pairedObservation(
     claims: LiveObservation["injectedClaims"] = [],
     overrides: Partial<LiveObservation["score"]> = {},
@@ -1057,7 +1057,7 @@ describe("live metamorphic control tier", () => {
             mkdirSync(join(root, "out"));
 
             const first = prepareLiveOutputPaths(report, corpusDirectory);
-            /** A control run creates `first.artifactNamespace`; later runs must tolerate it. commentlint: allow(JUDGE) */
+            /** A control run creates `first.artifactNamespace`; later runs must tolerate it. */
             mkdirSync(first.artifactNamespace);
             expect(() => prepareLiveOutputPaths(report, corpusDirectory)).not.toThrow();
             expect(() => prepareLiveOutputPaths(join(root, "out", "sibling.json"), corpusDirectory)).not.toThrow();
@@ -1079,7 +1079,7 @@ describe("live metamorphic control tier", () => {
     });
 
     test("counts only admitted derivatives as applied coverage", async () => {
-        /** An identity derivative lints red on its fingerprint, which is the `rejected` branch that must not count as applied. commentlint: allow(JUDGE) */
+        /** An identity derivative lints red on its fingerprint, which is the `rejected` branch that must not count as applied. */
         const identity: Transform = {
             id: "identity-fixture",
             version: 1,

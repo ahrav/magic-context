@@ -1,9 +1,9 @@
-//! Independent raw protocol client for host conformance tests.
+//! This module implements an independent raw protocol client for host conformance tests.
 //!
-//! This oracle deliberately re-implements framing, header layout, and proof
-//! computation from the literal values in `docs/mc-host-wire-protocol.md`.
-//! It must never call `mc-host`'s encoders or proof helpers: expected bytes
-//! produced by the code under test prove only self-consistency
+//! The oracle reimplements framing, header layout, and proof computation from the protocol's literal values.
+//! The oracle derives proof computation from literal values in `docs/mc-host-wire-protocol.md`.
+//! The oracle must never call `mc-host`'s encoders or proof helpers.
+//! Proofs produced by the code under test prove only self-consistency.
 //! (protocol §14.1).
 
 #![allow(dead_code)]
@@ -37,27 +37,24 @@ pub const TY_HELLO: u8 = 9;
 pub const TY_HELLO_ACK: u8 = 10;
 pub const TY_GOODBYE: u8 = 11;
 
-/// Interactive priority, Normal admission, not binary, not last.
+/// The flags encode interactive priority, normal admission, binary 0, and last 0.
 pub const FLAGS_INTERACTIVE: u8 = 0b0000_0010;
-/// Passive priority, Normal admission: the shape host pure-header frames use.
+/// Host pure-header frames use passive priority and normal admission.
 pub const FLAGS_PURE_HEADER: u8 = 0b0000_0000;
-/// The flags a terminal non-binary response carries (protocol flag layout:
-/// bit0 BINARY, bits1-2 PRIORITY, bit3 LAST, bits4-5 ADMISSION, bits6-7
-/// reserved): Interactive priority, Normal admission, binary 0, last 1.
+/// A terminal non-binary response uses interactive priority, normal admission, binary 0, and last 1.
+/// The protocol assigns BINARY to bit 0, PRIORITY to bits 1-2, LAST to bit 3, ADMISSION to bits 4-5, and reserved bits to bits 6-7.
 pub const FLAGS_RESPONSE_TEXT_LAST: u8 = 0b0000_1010;
 
-/// Every flag bit a pure-header frame must clear (binary, last,
-/// admission, reserved); priority may be any valid value.
+/// Pure-header frames must clear binary, last, admission, and reserved bits.
+/// Pure-header frames may use any valid priority.
 pub const FLAGS_PURE_HEADER_FORBIDDEN: u8 = 0b1111_1001;
 
-/// Validates a host-originated connection frame (ping, push, goodbye)
-/// against the wire contract's structural rules before a receiver skips
-/// it: supported version; pure-header shape and `0/0/nonzero` identity
-/// for ping; pure-header shape, zero correlation, and a route-shaped or
-/// connection-shaped identity for goodbye; a route-shaped identity with
-/// zero correlation and clear reserved bits for push. Accepting a
-/// malformed frame solely by type would let a wire regression coexist
-/// with an otherwise successful run.
+/// `connection_frame_violation` validates host-originated ping, push, and goodbye frames before a receiver skips them.
+/// A receiver validates skipped connection frames against the wire contract's structural rules.
+/// Ping frames require the supported version, pure-header flags, and channel/epoch/correlation values of `0/0/nonzero`.
+/// Goodbye frames require pure-header flags, zero correlation, and a route-shaped or connection-shaped identity.
+/// Push frames require a route-shaped identity, zero correlation, and clear reserved bits.
+/// Type-only acceptance can hide wire regressions when the test run otherwise succeeds.
 pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
     if frame.ver != WIRE_VERSION {
         return Some(format!(
@@ -65,9 +62,7 @@ pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
             frame.ty, frame.ver
         ));
     }
-    // Generic flag-encoding rules ahead of the per-type shape: reserved
-    // bits 6-7 must be zero, and the 0b11 priority and admission
-    // encodings are reserved values.
+    // Bits 6-7 must be zero, and `0b11` is reserved for both priority and admission.
     if frame.flags & 0b1100_0000 != 0 {
         return Some(format!(
             "connection frame type {} with reserved flag bits {:#04x}",
@@ -137,7 +132,7 @@ pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
     None
 }
 
-/// A frame as it appears on the wire, decoded by hand.
+/// `RawFrame` stores a manually decoded wire frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFrame {
     pub len: u32,
@@ -162,7 +157,7 @@ impl RawFrame {
             .to_owned()
     }
 
-    /// Server retry hint carried by an error terminal, when present.
+    /// An error terminal may carry a server retry hint.
     pub fn error_retry_after_ms(&self) -> Option<u64> {
         self.json()["retry_after_ms"].as_u64()
     }
@@ -252,9 +247,7 @@ fn byte_array(value: &serde_json::Value) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// `HMAC-SHA256(key, domain || client_nonce || server_nonce ||
-/// u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`, written out
-/// from the protocol text rather than shared with the host.
+/// The proof is `HMAC-SHA256(key, domain || client_nonce || server_nonce || u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`.
 pub fn proof(
     key: &[u8],
     domain: &[u8],
@@ -275,7 +268,6 @@ pub fn proof(
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Encodes a v2 header by writing each field at its documented offset.
 pub fn header(len: u32, ty: u8, flags: u8, channel: u16, epoch: u32, corr: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN);
     out.extend_from_slice(&len.to_le_bytes());
@@ -288,7 +280,6 @@ pub fn header(len: u32, ty: u8, flags: u8, channel: u16, epoch: u32, corr: u64) 
     out
 }
 
-/// Decodes a v2 header by reading each field from its documented offset.
 pub fn decode_header(bytes: &[u8]) -> RawFrame {
     assert_eq!(bytes.len(), HEADER_LEN, "header must be 21 bytes");
     RawFrame {
@@ -462,7 +453,6 @@ impl RawClient {
         self.send_raw(&wire).await
     }
 
-    /// Sends a channel-0 control request and returns its correlation.
     pub async fn control(&mut self, body: &serde_json::Value) -> std::io::Result<u64> {
         let corr = self.next_corr();
         let encoded = serde_json::to_vec(body).expect("control body serializes");
@@ -471,7 +461,6 @@ impl RawClient {
         Ok(corr)
     }
 
-    /// Opens a route and returns `(channel, epoch)` on success.
     pub async fn route_open(
         &mut self,
         module_id: &str,
@@ -557,7 +546,6 @@ impl RawClient {
         ))
     }
 
-    /// Reads one complete frame, header first.
     pub async fn expect_frame(&mut self) -> std::io::Result<RawFrame> {
         let mut header_bytes = [0u8; HEADER_LEN];
         self.stream.read_exact(&mut header_bytes).await?;
@@ -570,7 +558,6 @@ impl RawClient {
         Ok(frame)
     }
 
-    /// Reads one frame within `budget`.
     pub async fn frame_within(&mut self, budget: Duration) -> Result<RawFrame, String> {
         match tokio::time::timeout(budget, self.expect_frame()).await {
             Ok(Ok(frame)) => Ok(frame),
@@ -579,7 +566,6 @@ impl RawClient {
         }
     }
 
-    /// Reads frames until one matches `corr`, collecting the skipped frames.
     pub async fn frames_until_corr(
         &mut self,
         corr: u64,
@@ -600,7 +586,7 @@ impl RawClient {
         }
     }
 
-    /// True when the host closed the connection without sending more frames.
+    /// Returns true when the host closed the connection without sending more frames.
     pub async fn closed_within(&mut self, budget: Duration) -> bool {
         let mut byte = [0u8; 1];
         match tokio::time::timeout(budget, self.stream.read(&mut byte)).await {
@@ -611,7 +597,6 @@ impl RawClient {
         }
     }
 
-    /// Drains frames until EOF, returning everything read.
     pub async fn drain_until_close(&mut self, budget: Duration) -> Vec<RawFrame> {
         let deadline = tokio::time::Instant::now() + budget;
         let mut frames = Vec::new();
@@ -630,7 +615,7 @@ impl RawClient {
 
 fn start_ring_stream_bridge(
     descriptor: serde_json::Value,
-    descriptors: [rustix::fd::OwnedFd; 2],
+    descriptors: [rustix::fd::OwnedFd; mc_host::setup_socket::RING_DESCRIPTOR_COUNT],
     mut setup: StdUnixStream,
 ) -> Result<(UnixStream, RawWriteSender), String> {
     let (client_stream, mut bridge_stream) =

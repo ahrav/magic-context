@@ -214,12 +214,8 @@ function readJournalRows(ck: CortexkitTestDb): MigrationPendingRow[] {
 }
 
 /**
- * Resolve the runtime ordinal of the RawMessage a JSONL entry participates
- * in, THROUGH THE RUNTIME READ PATH (convertEntriesToRawMessages — the same
- * basis readSessionChunk consumes). User/assistant entries map by their own
- * id; toolResult entries fold into the following user turn (or into a
- * synthetic user turn ahead of the next assistant / at the tail), matching
- * the reader's documented SYNTH_USER_ID_PREFIX contract.
+ * convertEntriesToRawMessages defines the ordinals that readSessionChunk consumes.
+ * A toolResult run before an assistant or at the tail maps to a synthetic user turn.
  */
 function runtimeOrdinalOfEntry(
     entries: Array<Record<string, unknown>>,
@@ -234,7 +230,7 @@ function runtimeOrdinalOfEntry(
     const message = entry?.message as { role?: string } | undefined;
     if (entry?.type !== "message" || message?.role !== "toolResult") return undefined;
 
-    // First toolResult id of the folded run (the synth-user id suffix).
+    // The synthetic user ID uses the first toolResult ID in the folded run.
     let firstRunId = entryId;
     for (let i = index - 1; i >= 0; i--) {
         const prior = entries[i];
@@ -265,7 +261,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            // Ignore EBUSY on Windows
+            // Cleanup failures do not mask test results.
         }
     }
 });
@@ -456,8 +452,8 @@ describe("migrateOpenCodeSessionToPi", () => {
             fs: {
                 writeFileAtomic: (path, data) => {
                     order.push("stage-write");
-                    // The stage file lands OUTSIDE the sessions tree (no harness
-                    // scanner suffix rules apply there).
+                    // The stage file lies outside the sessions tree.
+                    // No session-scanner suffix rules apply outside the sessions tree.
                     expect(path.startsWith(join(agentDir, ".mc-migrations"))).toBe(true);
                     expect(path).not.toContain(join(agentDir, "sessions"));
                     expect(data.endsWith("\n")).toBe(true);
@@ -485,7 +481,7 @@ describe("migrateOpenCodeSessionToPi", () => {
         expect(order[1]).toBe("db-commit");
         expect(order[2]).toBe("rename");
         expect(order).not.toContain("unlink");
-        // Success clears the journal row.
+        // A successful migration clears the journal row.
         expect(readJournalRows(cortexkitDb)).toEqual([]);
     });
 
@@ -513,7 +509,7 @@ describe("migrateOpenCodeSessionToPi", () => {
         const root = tempDir();
         const contextDbPath = join(root, "context.db");
         const contextDb = new Database(contextDbPath);
-        // Derive from the live fence so a routine schema bump cannot stale this fixture.
+        // The fixture derives its version from the live fence so schema bumps do not stale it.
         contextDb.exec(
             `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (${LATEST_SUPPORTED_VERSION + 1})`,
         );
@@ -595,10 +591,10 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             totalTokens: 25380,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         });
-        // Migration boundary marker is a user message — no `usage` field
-        // per Pi convention (only assistant messages carry usage). The
-        // synthetic-stub usage we computed for it is used internally by
-        // makeMessageEntry but discarded for non-assistant roles.
+        // Pi user messages omit `usage`; `makeMessageEntry` discards synthetic-stub usage for non-assistant roles.
+        // Pi user messages omit `usage`; `makeMessageEntry` discards synthetic-stub usage for non-assistant roles.
+        // Pi user messages omit `usage`; `makeMessageEntry` discards synthetic-stub usage for non-assistant roles.
+        // Pi user messages omit `usage`; `makeMessageEntry` discards synthetic-stub usage for non-assistant roles.
         expect(entries[2].message.role).toBe("user");
         expect(entries[2].message.usage).toBeUndefined();
     });
@@ -607,10 +603,9 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
         const db = makeDb();
         const { sessionId } = insertSyntheticSession(db);
 
-        // Set up a minimal cortexkit DB with the schema the migrator
-        // expects. We only care about compartments + session_facts here.
+        // The fixture defines only `compartments` and `session_facts`, the tables the migrator reads.
+        // The fixture defines only `compartments` and `session_facts`, the tables the migrator reads.
         const ck = makeCortexkitDb();
-        // Two compartments under the source session.
         // Compartment 0: covers msg_1 → msg_2 (exact boundary match).
         ck.prepare(
             "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
@@ -632,9 +627,9 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             0,
             5,
         );
-        // Compartment 1: end boundary "msg_unknown" doesn't directly map →
-        // must remap to nearest at-or-before. Stored as a legacy (v1) row to
-        // confirm the legacy flag is preserved verbatim through migration.
+        // Compartment 1's end boundary, "msg_unknown", has no direct entry mapping.
+        // Migration remaps the end boundary to the nearest entry at or before "msg_unknown".
+        // The v1 fixture row sets legacy=1 so the test verifies that migration preserves it verbatim.
         ck.prepare(
             "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, importance, legacy, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
         ).run(sessionId, 1, 3, 4, "msg_3", "msg_zzzz_unknown", "Comp 1", "summary 1", 50, 1, 6);
@@ -655,9 +650,8 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
         expect(result.factsCopied).toBe(1);
         expect(result.boundariesApproximated).toBe(1); // msg_zzzz_unknown remapped to nearest
 
-        // Read back the copied rows under the new Pi session id with
-        // harness='pi'. Boundary IDs must match Pi entry IDs that
-        // exist in the JSONL output.
+        // The test reads copied rows under the new Pi session ID with harness='pi'.
+        // Boundary IDs must match Pi entry IDs in the JSONL output.
         type Row = {
             session_id: string;
             sequence: number;
@@ -686,8 +680,8 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
         expect(piCompartments[0].title).toBe("Comp 0");
         expect(piCompartments[1].title).toBe("Comp 1");
 
-        // v2 tier/metadata must survive migration (regression: bespoke INSERT
-        // previously dropped p1-p4/importance/episode_type and forced legacy=0).
+        // Migration preserves v2 `p1`–`p4`, `importance`, `episode_type`, and `legacy` fields.
+        // Migration preserves v2 `p1`–`p4`, `importance`, `episode_type`, and `legacy` fields.
         expect(piCompartments[0].p1).toBe("p1 verbose");
         expect(piCompartments[0].p2).toBe("p2 mid");
         expect(piCompartments[0].p3).toBe("p3 terse");
@@ -699,7 +693,6 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
         expect(piCompartments[1].legacy).toBe(1);
         expect(piCompartments[1].p1).toBeNull();
 
-        // Verify boundary IDs reference real Pi entries in the JSONL.
         const entries = readJsonl(result.outputPath);
         const entryIds = new Set(
             entries.filter((e) => e.type === "message" && e.id).map((e) => e.id as string),
@@ -709,7 +702,6 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
         expect(entryIds.has(piCompartments[1].start_message_id)).toBe(true);
         expect(entryIds.has(piCompartments[1].end_message_id)).toBe(true);
 
-        // Facts copied with harness='pi'.
         type FactRow = {
             category: string;
             content: string;
@@ -846,7 +838,6 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
         expect(result.dryRun).toBe(true);
         expect(result.compartmentsCopied).toBe(1);
 
-        // No Pi rows actually inserted on dry run.
         const piCount = (
             ck.prepare("SELECT COUNT(*) as n FROM compartments WHERE harness = 'pi'").get() as {
                 n: number;
@@ -899,7 +890,7 @@ describe("migration journal — crash-safe lifecycle", () => {
         });
         expect(existsSync(result.outputPath)).toBe(true);
         expect(result.outputPath.startsWith(sessionsRoot)).toBe(true);
-        // The staged file was renamed away, not copied.
+        // Migration renames the staged file instead of copying it.
         expect(existsSync(join(root, ".mc-migrations", `${result.migrationKey}.jsonl`))).toBe(
             false,
         );
@@ -937,7 +928,7 @@ describe("migration journal — crash-safe lifecycle", () => {
         expect(rows[0].phase).toBe("staged");
         expect(rows[0].pi_session_id.length).toBeGreaterThan(0);
         expect(rows[0].content_sha256.length).toBe(64);
-        // Ordering proof: the staged row committed BEFORE any shared state.
+        // The staged row commits before the CortexKit transaction.
         expect(countPiCompartments(ck, rows[0].pi_session_id)).toBe(0);
     });
 
@@ -948,8 +939,7 @@ describe("migration journal — crash-safe lifecycle", () => {
         insertCompartment(ck, sessionId);
         const sessionsRoot = join(tempDir(), "sessions");
 
-        // Attempt 1 crashes AFTER the shared-state transaction committed but
-        // before the stage file reached its final path (rename failure).
+        // Attempt 1 crashes after the shared-state transaction commits and before the stage file reaches its final path.
         expect(() =>
             migrateOpenCodeSessionToPi({
                 db,
@@ -978,12 +968,10 @@ describe("migration journal — crash-safe lifecycle", () => {
         const firstPiSessionId = crashed[0].pi_session_id;
         expect(countPiCompartments(ck, firstPiSessionId)).toBe(1);
 
-        // The staged bytes are lost before the retry can roll forward.
+        // The retry cannot roll forward after the staged bytes are lost.
         unlinkSync(crashed[0].stage_path);
 
-        // Attempt 2 (real fs): the sweep reports the loss loudly, the journal
-        // identity is reused, and the upsert-shaped shared-state commit cannot
-        // UNIQUE-collide on the rows attempt 1 committed.
+        // The CortexKit transaction upserts rows committed by attempt 1, preventing UNIQUE conflicts.
         const result = migrateOpenCodeSessionToPi({
             db,
             cortexkitDb: ck,
@@ -997,7 +985,7 @@ describe("migration journal — crash-safe lifecycle", () => {
         expect(result.recovery?.lost).toHaveLength(1);
         expect(result.recovery?.lost[0].migration_key).toBe(result.migrationKey);
         expect(result.recovery?.lost[0].content_sha256).toBe(crashed[0].content_sha256);
-        // Exactly ONE set of shared rows — replaced, never duplicated.
+        // Recovery replaces shared rows instead of duplicating them.
         expect(countPiCompartments(ck, firstPiSessionId)).toBe(1);
         expect(readJournalRows(ck)).toEqual([]);
         expect(existsSync(result.outputPath)).toBe(true);
@@ -1115,8 +1103,6 @@ describe("sweepPendingMigrations — phase reconciliation", () => {
         const row = seedRow(ck, dir, { phase: "db_committed" });
         mkdirSync(dirname(row.stage_path), { recursive: true });
         writeFileSync(row.stage_path, '{"type":"session"}\n', "utf-8");
-        // The final path's parent directory never existed (the crash happened
-        // before anything created it) — the sweep must still complete the rename.
         expect(existsSync(dirname(row.final_path))).toBe(false);
 
         const report = sweepPendingMigrations(ck);
@@ -1152,7 +1138,6 @@ describe("sweepPendingMigrations — phase reconciliation", () => {
         const report = sweepPendingMigrations(ck);
 
         expect(report).toEqual({ completed: 0, rolledForward: 0, rolledBack: 0, lost: [row] });
-        // Never silently deleted: the checksum row survives to name the loss.
         expect(readJournalRows(ck)).toEqual([row]);
     });
 
@@ -1166,8 +1151,8 @@ describe("sweepPendingMigrations — phase reconciliation", () => {
 
 describe("compartment ordinals — Pi runtime reader basis", () => {
     function insertExpandingSession(db: ReturnType<typeof makeDb>): string {
-        // user A (1 entry), assistant B (reasoning + text + tool ⇒ 4 entries),
-        // user C (1 entry). B's toolResult folds into C's runtime turn.
+        // User A produces 1 entry; assistant B produces 4: reasoning, text, tool call, and tool result.
+        // User C produces 1 entry, and B's tool result folds into C's runtime turn.
         const sessionId = "ses_ord";
         db.prepare(
             "INSERT INTO session (id, title, directory, path, time_created) VALUES (?, ?, ?, ?, ?)",
@@ -1256,7 +1241,6 @@ describe("compartment ordinals — Pi runtime reader basis", () => {
         const entries = readJsonl(result.outputPath);
         const row = readPiCompartment(ck, result.piSessionId, 0);
 
-        // B's derived entries, located by content.
         const thinkingEntry = entries.find(
             (entry) =>
                 (entry.message as { content?: Array<{ thinking?: string }> })?.content?.[0]
@@ -1268,15 +1252,13 @@ describe("compartment ordinals — Pi runtime reader basis", () => {
         expect(thinkingEntry).toBeDefined();
         expect(toolResultEntry).toBeDefined();
 
-        // Boundary ids: FIRST derived entry for the start, LAST for the end.
+        // The migration uses B's first derived entry as the start boundary and B's last as the end boundary.
         expect(row.start_message_id).toBe(thinkingEntry.id);
         expect(row.end_message_id).toBe(toolResultEntry.id);
 
-        // Ordinals resolved THROUGH THE RUNTIME READ PATH.
         expect(row.start_message).toBe(runtimeOrdinalOfEntry(entries, thinkingEntry.id));
         expect(row.end_message).toBe(runtimeOrdinalOfEntry(entries, toolResultEntry.id));
-        // The mid-compartment spans the whole expansion: thinking, text,
-        // toolCall entries plus the folded toolResult turn ⇒ >= 4 ordinals.
+        // The mid-compartment spans B's thinking, text, tool call, and folded tool-result turn.
         expect(row.end_message - row.start_message).toBeGreaterThanOrEqual(3);
     });
 
@@ -1312,12 +1294,10 @@ describe("compartment ordinals — Pi runtime reader basis", () => {
                 "next C",
         );
 
-        // The start boundary is B's FIRST derived entry — the old last-entry
-        // remap would have picked the toolResult and shrunk the span.
+        // Selecting B's last derived entry as the start boundary would select toolResult and shorten the span.
         expect(row.start_message_id).toBe(thinkingEntry.id);
         expect(row.start_message_id).not.toBe(toolResultEntry.id);
         expect(row.start_message).toBe(runtimeOrdinalOfEntry(entries, thinkingEntry.id));
-        // The end boundary keeps last-entry semantics.
         expect(row.end_message_id).toBe(userCEntry.id);
         expect(row.end_message).toBe(runtimeOrdinalOfEntry(entries, userCEntry.id));
     });
@@ -1341,8 +1321,7 @@ describe("compartment ordinals — Pi runtime reader basis", () => {
 
         const entries = readJsonl(result.outputPath);
         expect(entries.some((entry) => entry.type === "compaction")).toBe(true);
-        // The runtime reader skips structural entries: the RawMessage sequence
-        // is identical with or without the marker, so ordinals cannot drift.
+        // The RawMessage sequence is identical with and without the marker, so ordinals cannot drift.
         expect(convertEntriesToRawMessages(entries).length).toBe(
             convertEntriesToRawMessages(entries.filter((entry) => entry.type !== "compaction"))
                 .length,

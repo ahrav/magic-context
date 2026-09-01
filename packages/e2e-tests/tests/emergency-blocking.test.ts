@@ -7,24 +7,14 @@ import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
- * Emergency handling when usage climbs to or above 95%.
  *
- * At >=95% (BLOCK_UNTIL_DONE_PERCENTAGE), the plugin takes one of two actions:
- *   (a) Block the transform on historian completion (standard 95% path).
- *   (b) Abort the in-flight request via client.session.abort() and notify the
- *       user (emergency-recovery path when historian has prior failures).
  *
- * Either way, the critical invariant is that MAGIC-CONTEXT invokes historian
- * when usage crosses 95% so durable history can be compacted before the next
- * model call. Without this, the next prompt would blow the provider context
+ * When usage crosses 95%, MAGIC-CONTEXT invokes historian to compact durable history before the next model call.
+ * Compaction preserves context capacity for the next model call.
  * limit.
  *
- * This test drives usage to ~97% of the mock's 200K limit and verifies that
- * at least one historian request is captured on the NEXT turn.
+ * The test drives usage to approximately 97% of the mock's 200K limit and requires a historian request on the next turn.
  *
- * Latency is intentionally NOT asserted because the plugin may either block
- * or abort — both behaviors are correct and protect the user, but they have
- * very different timing characteristics.
  */
 
 let h: TestHarness;
@@ -47,12 +37,8 @@ describe("emergency >=95%", () => {
         async () => {
             h.mock.reset();
 
-            // Fast historian mock so the test doesn't need to wait on a long
-            // delay. We only need historian to be INVOKED; what it does after
-            // that isn't part of this invariant. The payload must still be a
-            // VALID v2 tiered compartment: strict tier validation rejects an
-            // empty or flat output, re-enters the retry chain, and never
-            // publishes — so an invalid mock would hang the compartment wait.
+            // Use a fast valid historian payload because the test requires invocation, not completion.
+            // Strict tier validation rejects empty or flat v2 compartment payloads, retries them, and never publishes them; an invalid mock would hang the compartment wait.
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
                 const flat = JSON.stringify(body.messages ?? []);
@@ -87,7 +73,6 @@ describe("emergency >=95%", () => {
 
             const sessionId = await h.createSession();
 
-            // Fill-phase: 10 low-pressure turns to get enough history.
             for (let i = 1; i <= 10; i++) {
                 await h.sendPrompt(
                     sessionId,
@@ -95,7 +80,6 @@ describe("emergency >=95%", () => {
                 );
             }
 
-            // Turn 11: response carries ~97% of 200K limit.
             h.mock.setDefault({
                 text: "big",
                 usage: {
@@ -110,7 +94,7 @@ describe("emergency >=95%", () => {
                 "turn 11: meaningful spike turn that pushes usage past 95%.",
             );
 
-            // Give event handler a beat to persist 95%+ state.
+            // The test waits for the event handler to persist the 95%+ state.
             await Bun.sleep(300);
 
             // Turn 12: transform sees 97%. Historian must be invoked.
@@ -127,13 +111,11 @@ describe("emergency >=95%", () => {
                 sessionId,
                 "turn 12: post-emergency follow-up.",
             ).catch(() => {
-                // Emergency abort path cancels the in-flight request — any
-                // error here is expected, not a failure of the invariant.
+                // The emergency abort can reject the in-flight request.
+                // The aborted request may reject without failing this test.
             });
 
-             // The pressure observation is fold-independent and is asserted in
-             // both modes. Rust's module-side producer bypasses this mock, so its
-             // publication path is covered by the dedicated producer suite.
+             // The Rust producer bypasses this mock.
             const meta = h
                 .contextDb()
                 .prepare(
@@ -142,15 +124,11 @@ describe("emergency >=95%", () => {
                 .get(sessionId) as { last_input_tokens: number } | null;
             expect(meta?.last_input_tokens ?? 0).toBeGreaterThan(0);
             if (process.env.MC_E2E_MODE === "rust") {
-                // The Rust producer does not send its request through this mock;
-                // this test asserts only the shared pressure behavior.
                 console.log(`[rust-e2e] emergency historian assertions SKIPPED: ${FOLD_SKIP_REASON}`);
                 return;
             }
 
-            // 90s, not 30s: the historian pass runs a subprocess against the
-            // mock provider, which on GitHub-hosted runners is 3-5x slower
-            // than local hardware; the test's own budget below stays the
+            // The historian pass can run a subprocess, so this test uses a 90-second timeout.
             // real bound.
             try {
                 await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
@@ -158,9 +136,7 @@ describe("emergency >=95%", () => {
                     label: "emergency historian compartment",
                 });
             } catch (error) {
-                // Diagnostics before rethrow: pinpoint which stage of the
-                // emergency pipeline stalled (scheduling, the historian
-                // request, or compartment publish).
+                // Before rethrowing, diagnostics identify whether scheduling, the historian request, or compartment publication stalled.
                 const historianRequests = h.mock
                     .requests()
                     .filter((r) => isHistorianRequest(r.body)).length;
@@ -188,8 +164,6 @@ describe("emergency >=95%", () => {
             }
             expect(h.countCompartments(sessionId)).toBeGreaterThanOrEqual(1);
 
-            // The shared pressure observation above also proves the plugin saw
-            // the high-pressure turn before the follow-up rewrote its usage.
         },
         120_000,
     );

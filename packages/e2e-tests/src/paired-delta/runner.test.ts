@@ -1,35 +1,43 @@
 import { describe, expect, it } from "bun:test";
 import {
+    chmodSync,
+    mkdirSync,
+    mkdtempSync,
+    existsSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+    FileRolloutStore,
+    RolloutRecordsInvalidError,
+    RolloutStoreBusyError,
     ProviderUnavailableError,
     baseScriptFingerprint,
     computeRegretRungs,
     interventionFor,
     runPairedDelta,
     verifyDualMockResolution,
-    type RolloutCoordinate,
     type RolloutHandle,
     type RolloutObservation,
     type RolloutRecord,
     type RolloutStore,
     type RunPairedDeltaOptions,
+    type TokenUsage,
     type RunnerDependencies,
 } from "./runner";
 import type { ArmId, ScenarioDeclaration } from "./contract";
+import { LOCK_OWNER_FILE } from "../prospective-holdout/lock";
 
 const scenario: ScenarioDeclaration = {
     scenarioId: "var-runner-smoke",
     familyId: "fam-runner",
     title: "Runner smoke",
-    checks: [
-        {
-            id: "check-ladder",
-            appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-        },
-        {
-            id: "check-primary",
-            appliesToArms: ["mc-on", "mc-off", "compaction"],
-        },
-    ],
+    expectedAnswer: "alpha-17",
+    answerMatch: "case-insensitive",
+    checks: ["check-ladder", "check-primary"],
     criticalCheckIds: ["check-ladder"],
     turnScript: [
         { id: "turn-evidence", role: "user", content: "The identifier is alpha-17." },
@@ -38,11 +46,9 @@ const scenario: ScenarioDeclaration = {
     interventions: {
         r1: {
             insertAfterTurnId: "turn-evidence",
-            query: "alpha-17",
             locatorIds: ["mem-alpha"],
         },
         r2: { memories: [{ claim: "Identifier", evidence: "alpha-17" }] },
-        r3: { evidence: "alpha-17" },
     },
     absencePrecondition: { evidenceTurnId: "turn-evidence", minimumBallastBytes: 1024 },
     modelContextLimit: 4096,
@@ -69,7 +75,55 @@ class MemoryStore implements RolloutStore {
     }
 }
 
-function options(store = new MemoryStore()): RunPairedDeltaOptions {
+/** `findIndex` returns -1 for an absent arm and `splice(-1, 1)` then removes the last record, so the test would exercise a different arm and could pass for the wrong reason. commentlint: allow(JUDGE) */
+function storedRecord(armId: ArmId): RolloutRecord {
+    return {
+        schema: "paired-delta-rollout/v1",
+        poolManifestFingerprint: "a".repeat(64),
+        scenarioId: scenario.scenarioId,
+        armId,
+        replicateIndex: 0,
+        repoCommit: "commit-a",
+        pinnedProviderId: "mock-live",
+        pinnedSnapshotId: "snapshot-2026-08-01",
+        echoedProviderId: null,
+        echoedModelId: null,
+        baseScriptFingerprint: baseScriptFingerprint(scenario),
+        intervention: interventionFor(scenario, armId),
+        cell: {
+            armId,
+            checksPassed: 0,
+            checksTotal: 0,
+            criticalPassed: 0,
+            criticalTotal: 0,
+            invalidSuccess: false,
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        },
+        checks: [],
+        usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        costUsd: 0.25,
+        priorAttemptsCostUsd: 0,
+        maxAttemptCostUsd: 0.25,
+        costSource: "estimated",
+        wallClockMs: 1,
+        turns: 0,
+        harnessDisposed: true,
+    };
+}
+
+/** Mode bits do not restrain root, so a test that stages a filesystem failure with them would exercise the success path instead. Windows has no `getuid`. commentlint: allow(JUDGE) */
+function skipWhenPermissionsDoNotApply(): boolean {
+    return process.getuid?.() === 0;
+}
+
+function dropRecord(store: MemoryStore, armId: ArmId): void {
+    const index = store.records.findIndex((record) => record.armId === armId);
+    if (index < 0) throw new Error(`missing ${armId} record`);
+    store.records.splice(index, 1);
+}
+
+function options(store: RolloutStore = new MemoryStore()): RunPairedDeltaOptions {
     return {
         scenarios: [scenario],
         poolManifestFingerprint: "a".repeat(64),
@@ -96,9 +150,7 @@ function observation(
     passed = true,
 ): RolloutObservation {
     return {
-        checks: scenario.checks
-            .filter(({ appliesToArms }) => appliesToArms.includes(armId))
-            .map(({ id }) => ({ id, passed })),
+        checks: scenario.checks.map((id) => ({ id, passed })),
         claimedDone: true,
         absencePreconditionHeld: true,
         armIdentityMatches: true,
@@ -115,6 +167,7 @@ function dependencies(
     behavior: (armId: ArmId) => RolloutObservation | Error = (armId) =>
         observation(armId),
     events: string[] = [],
+    disposeBehavior: (armId: ArmId) => Error | void = () => {},
 ): RunnerDependencies {
     return {
         now: () => 100,
@@ -132,6 +185,8 @@ function dependencies(
                 },
                 async dispose() {
                     events.push(`dispose:${coordinate.armId}`);
+                    const failure = disposeBehavior(coordinate.armId);
+                    if (failure instanceof Error) throw failure;
                 },
             };
         },
@@ -180,7 +235,9 @@ describe("paired-delta runner", () => {
         const first = await runPairedDelta(options(firstStore), dependencies());
         const stored = first.records[0];
         if (!stored) throw new Error("missing fixture record");
-        stored.costUsd = 2;
+        // The dearest prior attempt, not the observed cost: an observed cost has to keep
+        // pricing its own counters, and the reserve reads this field for exactly this case.
+        stored.maxAttemptCostUsd = 2;
         const store = new MemoryStore([stored]);
         const events: string[] = [];
 
@@ -190,6 +247,20 @@ describe("paired-delta runner", () => {
         expect(result.reserveUsd).toBe(2);
         expect(events).not.toContain("create:mc-on");
         expect(store.records.filter(({ armId }) => armId === "mc-on")).toHaveLength(1);
+    });
+
+    it("refuses a non-resume run over records for the same matrix", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(options(store), dependencies());
+        const events: string[] = [];
+
+        await expect(
+            runPairedDelta(
+                { ...options(store), resume: false },
+                dependencies(undefined, events),
+            ),
+        ).rejects.toThrow(/resume the run or point at a fresh records path/);
+        expect(events).toHaveLength(0);
     });
 
     it("retries and replaces non-completed records on resume", async () => {
@@ -218,14 +289,19 @@ describe("paired-delta runner", () => {
 
         const result = await runPairedDelta(options(store), dependencies());
 
+        expect(result.status).toBe("invalid-stored-records");
         expect(result.invalidStoredCoordinates).toContainEqual({
             poolManifestFingerprint: "a".repeat(64),
             scenarioId: scenario.scenarioId,
             armId: "mc-on",
             replicateIndex: 0,
         });
-        expect(store.records).toHaveLength(3);
+        // The stale completed record cannot be replaced and the coordinate key
+        // carries no binding, so the other arms could never be compared with it:
+        // the run stops the coordinate instead of paying for them.
+        expect(store.records).toHaveLength(1);
         expect(store.records[0]?.echoedModelId).toBe("different-snapshot");
+        expect(result.coordinates[0]?.incomplete).toBe(true);
     });
 
     it("does not charge stale or out-of-matrix records to the resumed run", async () => {
@@ -247,6 +323,31 @@ describe("paired-delta runner", () => {
         expect(result.invalidStoredCoordinates).toHaveLength(1);
     });
 
+    it("blocks a coordinate before any arm pays when a later arm is stale", async () => {
+        const first = await runPairedDelta(options(), dependencies());
+        // The stale record belongs to `compaction`, which the primary order reaches last.
+        const stale = structuredClone(
+            first.records.find(({ armId }) => armId === "compaction")!,
+        );
+        stale.echoedModelId = "different-snapshot";
+        // `mc-on` is missing, so without a preflight it runs and pays first.
+        const store = new MemoryStore([stale]);
+        const events: string[] = [];
+
+        const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.invalidStoredCoordinates).toContainEqual({
+            poolManifestFingerprint: "a".repeat(64),
+            scenarioId: scenario.scenarioId,
+            armId: "compaction",
+            replicateIndex: 0,
+        });
+        // No arm may run for a coordinate whose comparison can never be valid.
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual([]);
+        expect(result.records).toHaveLength(0);
+    });
+
     it("always starts the first rollout then stops between rollouts at the cost cap", async () => {
         const constrained = { ...options(), maxCostUsd: 0 };
         const result = await runPairedDelta(constrained, dependencies());
@@ -262,6 +363,2188 @@ describe("paired-delta runner", () => {
 
         expect(result.status).toBe("deadline-reached");
         expect(result.records).toHaveLength(0);
+    });
+
+    it("bounds an in-flight rollout with the run deadline and still disposes", async () => {
+        const disposedArms: string[] = [];
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return await new Promise<RolloutObservation>(() => {});
+                        },
+                        async dispose() {
+                            disposedArms.push(coordinate.armId);
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+        expect(result.records[0]?.harnessDisposed).toBe(true);
+        expect(disposedArms).toEqual(["mc-on"]);
+    });
+
+    it("does not start the rollout when preparation outlives the deadline", async () => {
+        const calls: string[] = [];
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async prepare() {
+                            calls.push(`prepare:${coordinate.armId}`);
+                            // Preparation resolves after the deadline; `run()` must not start.
+                            await new Promise((resolve) => setTimeout(resolve, 60));
+                        },
+                        async run(): Promise<RolloutObservation> {
+                            calls.push(`run:${coordinate.armId}`);
+                            throw new Error("run must not start after the deadline");
+                        },
+                        async dispose() {
+                            calls.push(`dispose:${coordinate.armId}`);
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+        expect(result.records[0]?.harnessDisposed).toBe(true);
+        // The losing preparation resolves after the handle was disposed, so it is disposed
+        // again once it settles: whatever it finished setting up must not survive the run.
+        expect(calls.filter((call) => call === "dispose:mc-on")).toHaveLength(2);
+        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on", "dispose:mc-on"]);
+
+        // The late `prepare()` completion must not call `run()` after `dispose()`.
+        await new Promise((resolve) => setTimeout(resolve, 90));
+        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on", "dispose:mc-on"]);
+    });
+
+    it("refuses evidence from work that blocked past the deadline", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 20 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run(): Promise<RolloutObservation> {
+                            // Blocking holds the event loop, so the expiry macrotask cannot run
+                            // and the returned promise is already fulfilled.
+                            const until = Date.now() + 60;
+                            while (Date.now() < until) { /* spin */ }
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
+    it("attributes a late rejection to the deadline rather than its own error", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run(): Promise<RolloutObservation> {
+                            await new Promise((resolve) => setTimeout(resolve, 1));
+                            const until = Date.now() + 60;
+                            while (Date.now() < until) { /* spin */ }
+                            throw new ProviderUnavailableError("late provider failure");
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        // The rejection settles past the budget, so the deadline is the cause of record.
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
+    it("refuses evidence whose async continuation blocked past the deadline", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run(): Promise<RolloutObservation> {
+                            // Yields first, so the invocation-time check cannot see the overrun,
+                            // then holds the event loop past the deadline.
+                            await new Promise((resolve) => setTimeout(resolve, 1));
+                            const until = Date.now() + 60;
+                            while (Date.now() < until) { /* spin */ }
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
+    it("bounds rollout creation with the run deadline and disposes a late handle", async () => {        const disposedArms: string[] = [];
+        const lateHandle = (disposeFails: boolean) =>
+            async (armId: string): Promise<RolloutHandle> => {
+                // Creation outlives the deadline, then resolves while the run is
+                // settling the handle it abandoned.
+                await new Promise((resolve) => setTimeout(resolve, 60));
+                return {
+                    async run() {
+                        throw new Error("run must not start after the deadline");
+                    },
+                    async dispose() {
+                        if (disposeFails) throw new Error("harness would not stop");
+                        disposedArms.push(armId);
+                    },
+                };
+            };
+
+        const reclaimed = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                createRollout: ({ coordinate }) => lateHandle(false)(coordinate.armId),
+            },
+        );
+
+        expect(reclaimed.status).toBe("deadline-reached");
+        expect(reclaimed.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+        expect(reclaimed.records[0]?.harnessDisposed).toBe(false);
+        // The harness the abandoned creation owns is still reclaimed, and the run
+        // does not report until it knows.
+        expect(disposedArms).toEqual(["mc-on"]);
+
+        const unreclaimed = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                createRollout: ({ coordinate }) => lateHandle(true)(coordinate.armId),
+            },
+        );
+
+        // A late handle that will not dispose reaches the caller as contamination
+        // rather than as silence.
+        expect(unreclaimed.status).toBe("harness-unreclaimed");
+    });
+
+    it("gives the rollout only the deadline left after creation", async () => {
+        let now = 1_000;
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: now + 100 },
+            {
+                now: () => now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    // Creation consumes 90 of the run's 100ms budget, leaving 10.
+                    now += 90;
+                    return {
+                        async run() {
+                            // Longer than the 10ms that remain, shorter than the
+                            // 100ms measured before creation.
+                            await new Promise((resolve) => setTimeout(resolve, 40));
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
+    it("counts only the rollouts it reports when the cap stops the run", async () => {
+        const store = new MemoryStore();
+        const seeded = await runPairedDelta(options(store), dependencies());
+
+        expect(seeded.records).toHaveLength(3);
+
+        // Drop the first arm so the resumed run must execute before it reaches
+        // the two stored coordinates behind it.
+        dropRecord(store, "mc-on");
+        const spentBefore = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
+        const resumed = await runPairedDelta(
+            { ...options(store), maxCostUsd: spentBefore },
+            dependencies(),
+        );
+
+        expect(resumed.status).toBe("cost-cap-reached");
+        expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
+            .toBe(resumed.records.length);
+    });
+
+    it("keeps a replaced attempt's price as a reserve floor across resumes", async () => {
+        const store = new MemoryStore();
+        // Prices that put the failure estimate above the desk ceiling, so the
+        // floor cannot come from `deskCostCeilingUsd` instead.
+        const expensive = {
+            ...options(store),
+            pricesPerMillionTokens: { input: 100, output: 200, cacheCreation: 1, cacheRead: 1 },
+        };
+        await runPairedDelta(
+            expensive,
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+        const failedEstimate = store.records.find(({ armId }) => armId === "mc-off")?.costUsd;
+        if (failedEstimate === undefined) throw new Error("missing failed record");
+
+        expect(failedEstimate).toBeGreaterThan(expensive.deskCostCeilingUsd);
+
+        // The retry is cheaper, so after replacement the expensive attempt's
+        // price survives only in `priorAttemptsCostUsd`.
+        const second = await runPairedDelta(expensive, dependencies());
+        const retried = second.records.find(({ armId }) => armId === "mc-off");
+        const third = await runPairedDelta(expensive, dependencies());
+
+        expect(retried?.costUsd).toBeLessThan(failedEstimate);
+        expect(second.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
+        expect(third.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
+    });
+
+    it("records an uncanonicalizable intervention instead of losing the rollout", async () => {
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") {
+                    value.intervention = { kind: "none", value: 1n as unknown as null };
+                }
+                return value;
+            }),
+        );
+        const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+        expect(result.status).toBe("completed");
+        expect(malformed?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
+        expect(store.records.filter(({ armId }) => armId === "mc-off")).toHaveLength(1);
+        expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+    });
+
+    it("reports an unreclaimed harness even when the rollout timed out first", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return await new Promise<RolloutObservation>(() => {});
+                        },
+                        async dispose() {
+                            throw new Error("harness would not stop");
+                        },
+                    };
+                },
+            },
+        );
+
+        // The deadline bounded this arm; the harness threatens the ones after it.
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        expect(result.records[0]?.harnessDisposed).toBe(false);
+    });
+
+    it("refuses a stored vector that does not fit the scenario it would stand in for", async () => {
+        const store = new MemoryStore();
+        const first = await runPairedDelta(options(store), dependencies());
+        const stored = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stored || !first.records.length) throw new Error("missing fixture record");
+
+        // Unique, parser-valid ids that belong to no check the scenario declares.
+        stored.checks = stored.checks.map((check, index) => ({
+            ...check,
+            id: `check-drifted-${index}`,
+        }));
+        const events: string[] = [];
+        const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.invalidStoredCoordinates).toContainEqual({
+            poolManifestFingerprint: "a".repeat(64),
+            scenarioId: scenario.scenarioId,
+            armId: "mc-on",
+            replicateIndex: 0,
+        });
+        expect(result.records.some(({ armId }) => armId === "mc-on")).toBe(false);
+        expect(events).not.toContain("create:mc-on");
+    });
+
+    it("refuses a stored cell whose aggregates disagree with its own vector", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(options(store), dependencies());
+        const stored = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stored) throw new Error("missing fixture record");
+
+        stored.cell = { ...stored.cell, criticalPassed: 0 };
+        const result = await runPairedDelta(options(store), dependencies());
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.records.some(({ armId }) => armId === "mc-on")).toBe(false);
+    });
+
+    it("hands the adapter its own intervention copy", async () => {
+        const declared = structuredClone(scenario.interventions.r1);
+        const result = await runPairedDelta(
+            options(),
+            {
+                now: () => 100,
+                async createRollout({ coordinate, intervention }): Promise<RolloutHandle> {
+                    // An adapter resolving locator handles mutates what it was
+                    // given; neither the declaration nor the expected value may
+                    // follow it.
+                    if (intervention.kind === "scripted-retrieval") {
+                        (intervention.value as { locatorIds: string[] }).locatorIds =
+                            ["mcm_resolved"];
+                    }
+                    return {
+                        async run() {
+                            // mc-on fails its critical check, so the ladder runs
+                            // and R1 is actually created.
+                            const value = observation(coordinate.armId, coordinate.armId !== "mc-on");
+                            value.intervention = intervention;
+                            return value;
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(scenario.interventions.r1).toEqual(declared);
+        // The mutated descriptor no longer matches the declaration, so R1 is an
+        // exclusion instead of evidence.
+        expect(result.records.find(({ armId }) => armId === "r1")?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
+    });
+
+    it("reports an unreclaimed harness when disposal never settles", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {
+                            // Never settles; the run must not wait on it forever.
+                            await new Promise<void>(() => {});
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        // The paid record is still written rather than lost to the hang.
+        expect(result.records).toHaveLength(1);
+    }, 20_000);
+
+    it("persists a malformed rollout whose intervention cannot be serialized", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unserializable-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            const result = await runPairedDelta(
+                { ...options(), store },
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") {
+                        value.intervention = { kind: "none", value: 1n as unknown as null };
+                    }
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            expect(malformed?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+            // The store had to be able to write it, or the paid coordinate is
+            // repeated on the next resume.
+            expect(new FileRolloutStore(path, { readOnly: true }).list().filter(({ armId }) => armId === "mc-off"))
+                .toHaveLength(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses non-boolean observation gates", async () => {
+        for (const patch of [
+            { absencePreconditionHeld: "false" as unknown as boolean },
+            { armIdentityMatches: "false" as unknown as boolean },
+            { claimedDone: "yes" as unknown as boolean },
+        ]) {
+            const result = await runPairedDelta(
+                options(),
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") Object.assign(value, patch);
+                    return value;
+                }),
+            );
+
+            expect(result.records.find(({ armId }) => armId === "mc-off")?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+        }
+    });
+
+    it("refuses stored evidence whose declaration or disposal cannot be trusted", async () => {
+        const seed = async () => {
+            const store = new MemoryStore();
+            await runPairedDelta(options(store), dependencies());
+            return store;
+        };
+
+        for (const corrupt of [
+            (record: RolloutRecord) => {
+                record.baseScriptFingerprint = "f".repeat(64);
+            },
+            (record: RolloutRecord) => {
+                record.intervention = { kind: "gold-memory", value: null };
+            },
+            (record: RolloutRecord) => {
+                record.harnessDisposed = false;
+            },
+        ]) {
+            const store = await seed();
+            const stored = store.records.find(({ armId }) => armId === "mc-on");
+            if (!stored) throw new Error("missing fixture record");
+            corrupt(stored);
+            const events: string[] = [];
+
+            const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+            expect(result.status).toBe("invalid-stored-records");
+            expect(result.records.some(({ armId }) => armId === "mc-on")).toBe(false);
+            expect(events).not.toContain("create:mc-on");
+        }
+    });
+
+    it("classifies an arm identity mismatch as malformed", async () => {
+        const result = await runPairedDelta(
+            options(),
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") value.armIdentityMatches = false;
+                return value;
+            }),
+        );
+
+        // The contract admits this reason only with a malformed health.
+        expect(result.records.find(({ armId }) => armId === "mc-off")?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "arm-identity-mismatch",
+        });
+    });
+
+    it("refuses a live route that duplicates the fixture provider", async () => {
+        // The fixture provider selects the mock endpoint, whatever model is named under it.
+        for (const liveModelId of ["mock-sonnet", "some-other-model"]) {
+            await expect(
+                verifyDualMockResolution({
+                    liveProviderId: "mock-anthropic",
+                    liveModelId,
+                    modelContextLimit: 4096,
+                    async sendPrompt(route) {
+                        return { ...route, contextLimit: 4096 };
+                    },
+                }),
+            ).rejects.toThrow(/duplicates the fixture provider/);
+        }
+    });
+
+    it("persists a rollout whose other observation fields are not JSON-safe", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unwritable-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            const result = await runPairedDelta(
+                { ...options(), store },
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") {
+                        value.turns = 2n as unknown as number;
+                        value.echoedModelId = { id: "snapshot" } as unknown as string;
+                    }
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            expect(malformed?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+            expect(malformed?.turns).toBe(0);
+            expect(malformed?.echoedModelId).toBeNull();
+            store.release();
+            expect(new FileRolloutStore(path, { readOnly: true }).list().filter(({ armId }) => armId === "mc-off"))
+                .toHaveLength(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses a records path a live foreign holder still owns", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-foreign-lock-"));
+        const live = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+        try {
+            const path = join(root, "records.json");
+            // The owner record another process would have written: a live pid, a
+            // foreign nonce, and a lease that has not expired.
+            mkdirSync(`${path}.lock`, { recursive: true });
+            writeFileSync(
+                join(`${path}.lock`, LOCK_OWNER_FILE),
+                `${JSON.stringify({ pid: live.pid, nonce: "foreign-nonce", acquiredAt: Date.now() })}\n`,
+            );
+
+            expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
+
+            live.kill();
+        } finally {
+            live.kill();
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    it("reclaims a records path whose holder died and whose lease expired", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-abandoned-lock-"));
+        try {
+            const path = join(root, "records.json");
+            // A crashed run cannot release its lock, and must not wedge the next.
+            mkdirSync(`${path}.lock`, { recursive: true });
+            writeFileSync(
+                join(`${path}.lock`, LOCK_OWNER_FILE),
+                `${JSON.stringify({
+                    pid: 2147483646,
+                    nonce: "dead-nonce",
+                    acquiredAt: Date.now() - 10 * 60_000,
+                })}\n`,
+            );
+
+            const store = new FileRolloutStore(path);
+            expect(() => store.list()).not.toThrow();
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    it("marks a coordinate incomplete when a ladder rung never ran", async () => {
+        const store = new MemoryStore();
+        // Seed a full ladder, then age R1's completed record so it is refused.
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+        const r1 = store.records.find(({ armId }) => armId === "r1");
+        if (!r1) throw new Error("missing r1 record");
+        r1.pinnedSnapshotId = "another-snapshot";
+
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+
+        // Only the primary arms feed the `incomplete` derivation, so a skipped
+        // rung would otherwise report a complete coordinate.
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.coordinates[0]?.incomplete).toBe(true);
+    });
+
+    it("rejects impossible stored cells the contract validator catches", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-cell-"));
+        try {
+            const path = join(root, "records.json");
+            const base = {
+                schema: "paired-delta-rollout/v1",
+                poolManifestFingerprint: "a".repeat(64),
+                scenarioId: "var-runner-smoke",
+                armId: "mc-on",
+                replicateIndex: 0,
+                repoCommit: "commit-a",
+                pinnedProviderId: "mock-live",
+                pinnedSnapshotId: "snapshot-2026-08-01",
+                echoedProviderId: "mock-live",
+                echoedModelId: "snapshot-2026-08-01",
+                baseScriptFingerprint: "b".repeat(64),
+                intervention: { kind: "none", value: null },
+                checks: [{ id: "check-ladder", passed: true }],
+                usage: { input: 1, output: 1, cacheCreation: 0, cacheRead: 0 },
+                costUsd: 0.01,
+                priorAttemptsCostUsd: 0,
+                maxAttemptCostUsd: 0.01,
+                costSource: "observed",
+                wallClockMs: 1,
+                turns: 1,
+                harnessDisposed: true,
+            };
+            const cell = {
+                armId: "mc-on",
+                checksPassed: 1,
+                checksTotal: 1,
+                criticalPassed: 1,
+                criticalTotal: 1,
+                invalidSuccess: false,
+                runHealth: "completed",
+                reasonCode: null,
+            };
+
+            // Shapes the contract's own validator rejects and a local copy missed.
+            for (const patch of [
+                { criticalTotal: 50, criticalPassed: 10, checksPassed: 1, checksTotal: 2 },
+                { runHealth: "crash", reasonCode: null },
+                { runHealth: "timeout", reasonCode: "provider-unavailable" },
+            ]) {
+                writeFileSync(path, JSON.stringify([{ ...base, cell: { ...cell, ...patch } }]));
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                    .toThrow(/cell-invalid/);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reserves the dearest attempt, not the sum of cheap ones", async () => {
+        const store = new MemoryStore();
+        const cheap = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        };
+        // Three cheap failures at one coordinate, each priced from the scenario's
+        // context limit at a nominal price.
+        for (let attempt = 0; attempt < 3; attempt++) {
+            await runPairedDelta(
+                {
+                    ...cheap,
+                    pricesPerMillionTokens: {
+                        input: 0.001,
+                        output: 0,
+                        cacheCreation: 0,
+                        cacheRead: 0,
+                    },
+                },
+                dependencies((armId) =>
+                    armId === "mc-off" ? new Error("still failing") : observation(armId)),
+            );
+        }
+        const failed = store.records.find(({ armId }) => armId === "mc-off");
+        if (!failed) throw new Error("missing failed record");
+
+        expect(failed.priorAttemptsCostUsd).toBeGreaterThan(failed.maxAttemptCostUsd);
+
+        const resumed = await runPairedDelta(
+            {
+                ...cheap,
+                pricesPerMillionTokens: { input: 0.001, output: 0, cacheCreation: 0, cacheRead: 0 },
+            },
+            dependencies(),
+        );
+
+        // The cumulative total would have inflated the reserve into a budget the
+        // next rollout cannot fit.
+        expect(resumed.reserveUsd).toBeCloseTo(failed.maxAttemptCostUsd, 12);
+        expect(resumed.reserveUsd).toBeLessThan(failed.priorAttemptsCostUsd);
+    });
+
+    it("counts a zero-cost stored attempt as a started matrix", async () => {
+        const store = new MemoryStore();
+        const free = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        };
+        const first = await runPairedDelta(free, dependencies());
+
+        expect(first.records.every(({ costUsd }) => costUsd === 0)).toBe(true);
+
+        // Drop one arm so the resumed run has work, and give it a reserve the cap
+        // cannot accommodate.
+        dropRecord(store, "compaction");
+        const events: string[] = [];
+        const resumed = await runPairedDelta(
+            { ...free, deskCostCeilingUsd: 5, maxCostUsd: 1 },
+            dependencies(undefined, events),
+        );
+
+        // A zero-cost history is still a started matrix, so the first-rollout
+        // exemption is spent.
+        expect(resumed.status).toBe("cost-cap-reached");
+        expect(events).not.toContain("create:compaction");
+    });
+
+    it("keeps the unusable-records warning over a later cap stop", async () => {
+        const store = new MemoryStore();
+        const first = await runPairedDelta(options(store), dependencies());
+        const stale = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stale || first.records.length !== 3) throw new Error("missing fixture records");
+        stale.echoedModelId = "another-snapshot";
+        // Two coordinates: the first is blocked by the stale record, the second
+        // must then hit the cap.
+        const spent = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
+
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                scenarios: [scenario, { ...scenario, scenarioId: "var-runner-second" }],
+                maxCostUsd: spent,
+            },
+            dependencies(),
+        );
+
+        // A cap stop invites a resume; unusable records forbid one until the file
+        // is inspected, so the stronger warning has to survive.
+        expect(result.invalidStoredCoordinates.length).toBeGreaterThan(0);
+        expect(result.status).toBe("invalid-stored-records");
+    });
+
+    it("releases the records path when the file cannot be parsed", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unparseable-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, JSON.stringify([{ schema: "other/v1" }]));
+
+            expect(() => new FileRolloutStore(path).list()).toThrow(/schema-mismatch/);
+            // The failed claim must not wedge the corrected retry.
+            expect(() => new FileRolloutStore(path).list()).toThrow(/schema-mismatch/);
+
+            writeFileSync(path, JSON.stringify([]));
+            const store = new FileRolloutStore(path);
+            expect(store.list()).toEqual([]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("pays for no ladder rung once the coordinate is blocked", async () => {
+        const store = new MemoryStore();
+        // mc-on completes with a failing critical check, so the ladder is due;
+        // mc-off's stored record is then aged so it blocks the coordinate.
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+        const blocked = store.records.find(({ armId }) => armId === "mc-off");
+        if (!blocked) throw new Error("missing mc-off record");
+        blocked.echoedModelId = "another-snapshot";
+        for (const armId of ["r1", "r2", "r3"] as const) {
+            const index = store.records.findIndex((record) => record.armId === armId);
+            if (index >= 0) store.records.splice(index, 1);
+        }
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on"), events),
+        );
+
+        // The ladder is entered from mc-on's own completed record, so the block has
+        // to be seen before a rung is created rather than after it has been paid.
+        expect(result.status).toBe("invalid-stored-records");
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual([]);
+        expect(result.coordinates[0]?.incomplete).toBe(true);
+    });
+
+    it("derives the summary counters from the records it reports", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+
+        const resumed = await runPairedDelta(options(store), dependencies());
+        const observed = resumed.records.filter(({ costSource }) => costSource === "observed");
+        const estimated = resumed.records.filter(({ costSource }) => costSource === "estimated");
+
+        // Counters that summarize `records` are read off `records`, so a resumed
+        // record and a freshly run one cannot be counted by different rules.
+        expect(resumed.observedCostRollouts).toBe(observed.length);
+        expect(resumed.estimatedCostRollouts).toBe(estimated.length);
+        expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
+            .toBe(resumed.records.length);
+        expect(resumed.exclusionCounts).toEqual(
+            resumed.records.reduce<Record<string, Record<string, number>>>((counts, record) => {
+                if (record.cell.reasonCode === null) return counts;
+                const byReason = counts[record.armId] ??= {};
+                byReason[record.cell.reasonCode] = (byReason[record.cell.reasonCode] ?? 0) + 1;
+                return counts;
+            }, {}),
+        );
+    });
+
+    it("keeps an overflowing price out of the persisted attempt maximum", async () => {
+        const store = new MemoryStore();
+        // Prices whose worst-case estimate is finite, so the run is admitted, but
+        // whose product with a safe counter is not.
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                // Large enough that the earlier arms' own costs do not trip the cap
+                // before mc-off runs.
+                maxCostUsd: 1e308,
+                pricesPerMillionTokens: {
+                    input: 1e300,
+                    output: 0,
+                    cacheCreation: 0,
+                    cacheRead: 0,
+                },
+            },
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") {
+                    value.usage = { ...value.usage, input: Number.MAX_SAFE_INTEGER };
+                }
+                return value;
+            }),
+        );
+        const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+        expect(malformed?.cell.reasonCode).toBe("invalid-result");
+        // `Infinity` here serializes as `null` and fails the next resume's parse.
+        expect(Number.isFinite(malformed?.maxAttemptCostUsd)).toBe(true);
+        expect(malformed?.maxAttemptCostUsd).toBe(malformed?.costUsd);
+        // The next resume has to be able to parse what this run wrote.
+        expect(JSON.stringify(store.records)).not.toContain("null,\"costSource\"");
+    });
+
+    it("honours a deadline beyond the timer limit", async () => {
+        const result = await runPairedDelta(
+            // Past the 32-bit millisecond limit, which `setTimeout` truncates to
+            // fire almost immediately.
+            { ...options(), deadlineEpochMs: Date.now() + 2_147_483_647 + 60_000 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            // Long enough that a truncated timer would win the race.
+                            await new Promise((resolve) => setTimeout(resolve, 50));
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("completed");
+        expect(result.records.map(({ armId }) => armId)).toEqual([
+            "mc-on",
+            "mc-off",
+            "compaction",
+        ]);
+    }, 20_000);
+
+    it("refuses to publish once its lock has been taken over", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.list();
+            // Another owner's record in place of ours, which is what a lost
+            // takeover race leaves behind.
+            writeFileSync(
+                join(`${path}.lock`, LOCK_OWNER_FILE),
+                `${JSON.stringify({ pid: process.pid, nonce: "foreign", acquiredAt: Date.now() })}\n`,
+            );
+
+            // Publishing a whole-file snapshot is what would erase the other
+            // runner's records, so it refuses rather than proceeding.
+            expect(() => store.put({} as unknown as RolloutRecord))
+                .toThrow(RolloutStoreBusyError);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("merges into the file rather than overwriting another owner's records", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-merge-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.list();
+
+            const mine = storedRecord("mc-on");
+            store.put(mine);
+
+            // Another owner writes a coordinate this instance has never seen,
+            // which its cached snapshot therefore cannot contain.
+            const theirs = storedRecord("mc-off");
+            writeFileSync(path, JSON.stringify([mine, theirs]));
+
+            store.put(storedRecord("compaction"));
+
+            const written = new FileRolloutStore(path, { readOnly: true }).list();
+            expect(written.map(({ armId }) => armId).sort()).toEqual([
+                "compaction",
+                "mc-off",
+                "mc-on",
+            ]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not cache evidence a failed publication never wrote", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-publish-fail-"));
+        const dir = join(root, "nested");
+        try {
+            const path = join(dir, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+            expect(store.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+
+            // The file stays readable so `reload()` succeeds; only the write fails.
+            chmodSync(dir, 0o500);
+            let blocked = false;
+            try {
+                writeFileSync(join(dir, ".probe"), "");
+                rmSync(join(dir, ".probe"), { force: true });
+            } catch {
+                blocked = true;
+            }
+            // A privileged runner ignores the mode, which leaves nothing to assert.
+            if (!blocked) return;
+
+            expect(() => store.put(storedRecord("mc-off"))).toThrow();
+            chmodSync(dir, 0o700);
+            // The cache must not report a record the file does not hold.
+            expect(store.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+            store.release();
+        } finally {
+            try {
+                chmodSync(dir, 0o700);
+            } catch { /* the directory may not exist */ }
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses duplicate coordinates from a store that does not validate", async () => {
+        // The map keeps the last record while the pre-scan bills every copy.
+        const completed = storedRecord("mc-on");
+        const store = new MemoryStore([completed, { ...completed, costUsd: 0.5 }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /duplicate rollouts for/,
+        );
+    });
+
+    it("refuses malformed measurement fields from a store that does not validate", async () => {
+        for (
+            const mutate of [
+                (record: RolloutRecord) => ({ ...record, usage: null as unknown as TokenUsage }),
+                (record: RolloutRecord) => ({ ...record, turns: -1 }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    wallClockMs: "soon" as unknown as number,
+                }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    usage: { ...record.usage, cacheRead: Number.NaN },
+                }),
+            ]
+        ) {
+            const store = new MemoryStore([mutate(storedRecord("mc-on"))]);
+            await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+                /is not a non-negative (finite number|safe integer)/,
+            );
+        }
+    });
+
+    it("refuses a cell whose arm contradicts its coordinate", async () => {
+        // `parseRolloutRecords` rejects this; a custom store bypasses it.
+        const record = storedRecord("mc-on");
+        const store = new MemoryStore([{ ...record, cell: { ...record.cell, armId: "mc-off" } }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /cell arm mc-off does not match coordinate/,
+        );
+    });
+
+    it("reports the records diagnostic when standing down from the store fails", async () => {
+        // A release failure while standing down must not replace the reason for standing down.
+        class ThrowingReleaseStore extends MemoryStore {
+            release(): void {
+                throw new Error("EACCES: permission denied, rmdir");
+            }
+        }
+        const store = new ThrowingReleaseStore([{
+            ...storedRecord("mc-on"),
+            replicateIndex: "0" as unknown as number,
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /replicate index 0 is not a non-negative safe integer/,
+        );
+    });
+
+    it("refuses an estimated failure priced below the arm bound", async () => {
+        // The live path charges a failure at least the arm's bound even with no usage back.
+        const firstStore = new MemoryStore();
+        const first = await runPairedDelta(options(firstStore), dependencies((armId) =>
+            armId === "mc-on" ? new Error("boom") : observation(armId, true)));
+        const stored = first.records.find(({ cell }) => cell.runHealth !== "completed");
+        if (!stored) throw new Error("missing failure fixture record");
+        expect(stored.costSource).toBe("estimated");
+        expect(stored.costUsd).toBeGreaterThan(0);
+        stored.costUsd = 0;
+
+        await expect(
+            runPairedDelta(options(new MemoryStore([stored])), dependencies()),
+        ).rejects.toThrow(/prices an estimated failure below the arm bound/);
+    });
+
+    it("charges an unavailable provider the full arm bound", async () => {
+        // Unavailability can be raised by a later turn, after earlier turns have billed, and
+        // this path keeps no usage to price. Priced so the arm bound clearly exceeds the
+        // desk reserve, which is all the discounted branch used to record.
+        const store = new MemoryStore();
+        const ceiling = 0.01;
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                deskCostCeilingUsd: ceiling,
+                maxCostUsd: 10_000,
+                pricesPerMillionTokens: {
+                    input: 100,
+                    output: 200,
+                    cacheCreation: 1,
+                    cacheRead: 1,
+                },
+            },
+            dependencies((armId) =>
+                armId === "mc-on"
+                    ? new ProviderUnavailableError("unavailable")
+                    : observation(armId, true)),
+        );
+        const unavailable = result.records.find(
+            ({ cell }) => cell.reasonCode === "provider-unavailable",
+        );
+        if (!unavailable) throw new Error("missing unavailable record");
+        expect(unavailable.costUsd).toBeGreaterThan(ceiling);
+        expect(unavailable.maxAttemptCostUsd).toBe(unavailable.costUsd);
+    });
+
+    it("refuses a wrong-binding record whose cell is absent without losing the claim", async () => {
+        // The pre-scan skips a record bound to another commit, so its cell arrives unchecked.
+        let released = 0;
+        const store: RolloutStore = {
+            list: () => [{
+                ...storedRecord("mc-on"),
+                repoCommit: "commit-other",
+                cell: null as unknown as RolloutRecord["cell"],
+            }],
+            put: () => {},
+            release: () => {
+                released += 1;
+            },
+        };
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /records file cell is invalid/,
+        );
+        expect(released).toBe(1);
+    });
+
+    it("refuses a non-object entry without losing the claim", async () => {
+        // `coordinateKey` dereferences the entry, so this used to raise a TypeError outside
+        // the release path.
+        let released = 0;
+        const store: RolloutStore = {
+            list: () => [null as unknown as RolloutRecord],
+            put: () => {},
+            release: () => {
+                released += 1;
+            },
+        };
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /entry that is not a rollout record/,
+        );
+        expect(released).toBe(1);
+    });
+
+    it("records a malformed check container as an invalid result", async () => {
+        // Mapping a null container raises a TypeError, which escapes as a non-contract error
+        // and loses the paid rollout instead of recording it.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                return { ...base, checks: null as unknown as typeof base.checks };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        expect(result.records[0]?.cell.reasonCode).toBe("invalid-result");
+    });
+
+    it("records the check value the validator actually read", async () => {
+        // An accessor can answer differently on a second read, so the value that was
+        // validated must be the value that is stored.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                const checks = base.checks.map((check) => {
+                    let reads = 0;
+                    return {
+                        id: check.id,
+                        get passed(): boolean {
+                            reads += 1;
+                            return reads === 1 ? check.passed : !check.passed;
+                        },
+                    };
+                });
+                return { ...base, checks };
+            }),
+        );
+
+        const stored = result.records[0];
+        if (!stored) throw new Error("missing record");
+        expect(stored.checks.map(({ passed }) => passed)).toEqual(
+            observation("mc-on", true).checks.map(({ passed }) => passed),
+        );
+    });
+
+    it("stores detached checks when the adapter returns a proxied vector", async () => {
+        // `validateCheckVector` reads the contents; `structuredClone` rejects the container.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                return { ...base, checks: new Proxy(base.checks, {}) };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        expect(() => structuredClone(result.records[0]?.checks)).not.toThrow();
+    });
+
+    it("refuses a record whose cell is absent without losing the claim", async () => {
+        // The dereference used to raise a TypeError outside the release path.
+        const store = new MemoryStore([
+            { ...storedRecord("mc-on"), cell: null as unknown as RolloutRecord["cell"] },
+        ]);
+        let released = 0;
+        const counting: RolloutStore = {
+            list: () => store.list(),
+            put: (record) => store.put(record),
+            release: () => {
+                released += 1;
+            },
+        };
+
+        await expect(runPairedDelta(options(counting), dependencies())).rejects.toThrow(
+            /records file cell is invalid/,
+        );
+        expect(released).toBe(1);
+    });
+
+    it("stores the validated intervention when a toJSON returns a different descriptor", async () => {
+        // A hook can return a supported but different descriptor without throwing.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                const swapped = { ...base.intervention };
+                Object.defineProperty(swapped, "toJSON", {
+                    value: () => ({ kind: "none" }),
+                    enumerable: false,
+                });
+                return { ...base, intervention: swapped };
+            }),
+        );
+
+        const stored = result.records[0];
+        if (!stored) throw new Error("missing record");
+        // The recorded intervention is the arm's own, not the hook's substitute.
+        expect(stored.intervention).toEqual(interventionFor(scenario, stored.armId));
+    });
+
+    it("stores a validated intervention when the adapter's toJSON throws", async () => {
+        // `JSON.stringify` calls `toJSON`; the canonicalizer reads enumerable fields and
+        // never sees it, so validation passes and the detach throws after the paid rollout.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                const hostile = { ...base.intervention };
+                Object.defineProperty(hostile, "toJSON", {
+                    value: () => {
+                        throw new Error("hostile toJSON");
+                    },
+                    enumerable: false,
+                });
+                return { ...base, intervention: hostile };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        expect(() => structuredClone(result.records[0]?.intervention)).not.toThrow();
+    });
+
+    it("stores a detached intervention when the adapter returns a proxy", async () => {
+        // `canonicalFingerprint` accepts a proxy; `structuredClone` inside `put` does not.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                return { ...base, intervention: new Proxy(base.intervention, {}) };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        // A proxy would have thrown DataCloneError before reaching here.
+        expect(() => structuredClone(result.records[0]?.intervention)).not.toThrow();
+    });
+
+    it("refuses a completed cell priced as an estimate", async () => {
+        // Unpriceable usage is what selects `estimated`, and it also marks the result
+        // invalid, so the live path cannot pair `estimated` with `completed`.
+        const firstStore = new MemoryStore();
+        const first = await runPairedDelta(options(firstStore), dependencies());
+        const stored = first.records.find(({ cell }) => cell.runHealth === "completed");
+        if (!stored) throw new Error("missing completed fixture record");
+        stored.costSource = "estimated";
+        stored.costUsd = 0;
+
+        await expect(
+            runPairedDelta(options(new MemoryStore([stored])), dependencies()),
+        ).rejects.toThrow(/prices a completed cell as an estimate/);
+    });
+
+    it("refuses an observed cost that does not price its own usage", async () => {
+        // Counters that price to a real amount, with the total falsified to zero: every
+        // field-by-field rule passes, and the total is what restores spend.
+        const firstStore = new MemoryStore();
+        const first = await runPairedDelta(options(firstStore), dependencies());
+        const stored = first.records.find(({ costSource }) => costSource === "observed");
+        if (!stored) throw new Error("missing observed fixture record");
+        expect(stored.costUsd).toBeGreaterThan(0);
+        stored.costUsd = 0;
+
+        await expect(
+            runPairedDelta(options(new MemoryStore([stored])), dependencies()),
+        ).rejects.toThrow(/observed cost does not price its usage/);
+    });
+
+    it("refuses a non-integer replicate index from a store that does not validate", async () => {
+        // `coordinateKey` renders "0" and 0 identically, so the record would key as replicate 0.
+        const store = new MemoryStore([{
+            ...storedRecord("mc-on"),
+            replicateIndex: "0" as unknown as number,
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /replicate index 0 is not a non-negative safe integer/,
+        );
+    });
+
+    it("can still release a claim that was displaced and then restored", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-restored-claim-"));
+        try {
+            const path = join(root, "records.json");
+            const lock = `${path}.lock`;
+            const owner = join(lock, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+            const ourOwnerRecord = readFileSync(owner, "utf8");
+
+            // A reclaimer displaces this owner's record, which is what the store detects.
+            writeFileSync(
+                owner,
+                JSON.stringify({ pid: process.pid, nonce: "f".repeat(32), acquiredAt: Date.now() }),
+            );
+            expect(() => store.put(storedRecord("mc-off"))).toThrow(RolloutStoreBusyError);
+
+            // `restoreOrRemoveSideline` can put this owner's record back, and it names a
+            // live pid that `lockAbandoned` will never reclaim.
+            writeFileSync(owner, ourOwnerRecord);
+            store.release();
+
+            expect(existsSync(lock)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not lose a coordinate published under it mid-write", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // Stand in for a new holder publishing between this call's reload and its
+            // rename: `reload` is what reads the file, so a write during it is that race.
+            const proto = Object.getPrototypeOf(store) as { reload: () => RolloutRecord[] };
+            const original = proto.reload;
+            let races = 0;
+            proto.reload = function patched(this: FileRolloutStore): RolloutRecord[] {
+                const records = original.call(this);
+                if (races === 0) {
+                    races += 1;
+                    writeFileSync(
+                        path,
+                        JSON.stringify([storedRecord("mc-on"), storedRecord("compaction")]),
+                    );
+                }
+                return records;
+            };
+            try {
+                store.put(storedRecord("mc-off"));
+            } finally {
+                proto.reload = original;
+            }
+
+            // The racing holder's coordinate survives alongside this call's own.
+            const onDisk = JSON.parse(readFileSync(path, "utf8")) as RolloutRecord[];
+            expect(onDisk.map(({ armId }) => armId).sort()).toEqual([
+                "compaction",
+                "mc-off",
+                "mc-on",
+            ]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not share one usage object across estimated records", async () => {
+        // The record is handed to the caller and to the store; a shared constant made every
+        // estimated record in the process alias the same counters.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies(() => new Error("boom")),
+        );
+        const estimated = result.records.filter(({ costSource }) => costSource === "estimated");
+        expect(estimated.length).toBeGreaterThan(1);
+
+        const first = estimated[0];
+        const second = estimated[1];
+        if (!first || !second) throw new Error("missing estimated records");
+        first.usage.input = 99;
+        expect(second.usage.input).toBe(0);
+    });
+
+    it("reports a lock lost during publication instead of returning success", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-clobber-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = join(`${path}.lock`, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // A reclaimer moves the lock after the pre-rename checks pass. Patching the
+            // publication is the only point that sits inside that window.
+            const proto = Object.getPrototypeOf(store) as {
+                recordsFingerprint: () => string;
+            };
+            const original = proto.recordsFingerprint;
+            let checks = 0;
+            proto.recordsFingerprint = function patched(this: FileRolloutStore): string {
+                const value = original.call(this);
+                checks += 1;
+                // The pre-rename check is the only call now that the merge supplies its own
+                // fingerprint; displace the lock just after it reads.
+                if (checks === 1) {
+                    writeFileSync(
+                        owner,
+                        JSON.stringify({
+                            pid: process.pid,
+                            nonce: "e".repeat(32),
+                            acquiredAt: Date.now(),
+                        }),
+                    );
+                }
+                return value;
+            };
+            try {
+                expect(() => store.put(storedRecord("mc-off"))).toThrow(
+                    /lost its lock during publication/,
+                );
+            } finally {
+                proto.recordsFingerprint = original;
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reports contention when the records path is rewritten continuously", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-loop-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            const proto = Object.getPrototypeOf(store) as { reload: () => RolloutRecord[] };
+            const original = proto.reload;
+            let writes = 0;
+            proto.reload = function patched(this: FileRolloutStore): RolloutRecord[] {
+                const records = original.call(this);
+                writes += 1;
+                writeFileSync(
+                    path,
+                    JSON.stringify([storedRecord("mc-on"), { ...storedRecord("compaction"), wallClockMs: writes }]),
+                );
+                return records;
+            };
+            try {
+                expect(() => store.put(storedRecord("mc-off"))).toThrow(
+                    /records changed under this owner while publishing/,
+                );
+            } finally {
+                proto.reload = original;
+            }
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps the path reserved while an invalidated store still holds its handle", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-reservation-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = join(`${path}.lock`, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // A reclaimer displaces the record, which invalidates the store while it keeps
+            // its handle. Every handle in this process shares one lock nonce, so a second
+            // store acquiring here would have its lock deleted by this store's release.
+            writeFileSync(
+                owner,
+                JSON.stringify({ pid: process.pid, nonce: "d".repeat(32), acquiredAt: Date.now() }),
+            );
+            expect(() => store.put(storedRecord("mc-off"))).toThrow(RolloutStoreBusyError);
+
+            expect(() => new FileRolloutStore(path).put(storedRecord("compaction"))).toThrow(
+                /already owned in this process/,
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps the claim when removing the lock directory fails", () => {
+        if (skipWhenPermissionsDoNotApply()) return;
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-release-throws-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // A read-execute parent makes removing the lock entry fail with EACCES.
+            chmodSync(root, 0o500);
+            expect(() => store.release()).toThrow();
+
+            // The claim is still recorded as ours, so another store for the same path
+            // says so at once instead of spinning against a lock this process
+            // orphaned and would never reclaim, its own pid being live.
+            chmodSync(root, 0o700);
+            expect(() => new FileRolloutStore(path).put(storedRecord("mc-off"))).toThrow(
+                /already owned in this process/,
+            );
+            store.release();
+        } finally {
+            chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps a claim releasable when the owner record cannot be read", () => {
+        if (skipWhenPermissionsDoNotApply()) return;
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unreadable-owner-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = join(`${path}.lock`, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // An unreadable record is not proof the claim became foreign.
+            chmodSync(owner, 0o000);
+            expect(() => store.release()).toThrow();
+
+            chmodSync(owner, 0o600);
+            store.release();
+            expect(existsSync(`${path}.lock`)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("retries removing the lock directory after a failure clears", () => {
+        if (skipWhenPermissionsDoNotApply()) return;
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-release-retry-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            chmodSync(root, 0o500);
+            expect(() => store.release()).toThrow();
+
+            // Once the cause clears, the second attempt has to do the work the first
+            // did not, rather than report success over a lock that is still there.
+            chmodSync(root, 0o700);
+            store.release();
+
+            const next = new FileRolloutStore(path);
+            expect(() => next.put(storedRecord("mc-off"))).not.toThrow();
+            next.release();
+        } finally {
+            chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not let an edited result reach the cache", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-alias-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            const record = storedRecord("mc-on");
+            store.put(record);
+
+            // The caller still holds the object it passed, and the run returns it.
+            record.costUsd = 0;
+            const listed = store.list();
+            expect(listed[0]?.costUsd).toBe(storedRecord("mc-on").costUsd);
+
+            // Editing what `list()` returned must not reach the cache either.
+            (listed[0] as { costUsd: number }).costUsd = 0;
+            expect(store.list()[0]?.costUsd).toBe(storedRecord("mc-on").costUsd);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reports truncated JSON as an unusable records file", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-truncated-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, '[{"schema":"paired-delta-rollout/v1"');
+
+            // A bare SyntaxError cannot be told from any other failure by a caller keyed
+            // on the exit code, and it means the same thing: inspect this path.
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(
+                RolloutRecordsInvalidError,
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("types every parse rejection as an unusable records file", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-parse-types-"));
+        try {
+            // Each of these means the same thing to a caller: inspect this path.
+            const cases: Array<[string, unknown]> = [
+                ["duplicate coordinate", [storedRecord("mc-on"), storedRecord("mc-on")]],
+                ["not an array", { schema: "paired-delta-rollout/v1" }],
+                ["spend total", [
+                    { ...storedRecord("mc-on"), costUsd: Number.MAX_VALUE },
+                    { ...storedRecord("mc-off"), costUsd: Number.MAX_VALUE },
+                ]],
+            ];
+            for (const [label, contents] of cases) {
+                const path = join(root, `${label.replace(/\s+/g, "-")}.json`);
+                writeFileSync(path, JSON.stringify(contents));
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(
+                    RolloutRecordsInvalidError,
+                );
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("re-reads the file on every list when the store is read-only", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-readonly-stale-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, JSON.stringify([storedRecord("mc-on")]));
+            const reader = new FileRolloutStore(path, { readOnly: true });
+            expect(reader.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+
+            // A reader never holds the lock, so nothing invalidates a cache for it.
+            writeFileSync(
+                path,
+                JSON.stringify([storedRecord("mc-on"), storedRecord("mc-off")]),
+            );
+
+            expect(reader.list().map(({ armId }) => armId).sort()).toEqual([
+                "mc-off",
+                "mc-on",
+            ]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("drops the cached snapshot when the store is released", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-release-cache-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+            expect(store.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+            store.release();
+
+            // Another owner advances the file while this instance holds nothing.
+            writeFileSync(
+                path,
+                JSON.stringify([storedRecord("mc-on"), storedRecord("mc-off")]),
+            );
+
+            expect(store.list().map(({ armId }) => armId).sort()).toEqual(["mc-off", "mc-on"]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses a record from another schema", async () => {
+        const store = new MemoryStore([{
+            ...storedRecord("mc-on"),
+            schema: "paired-delta-rollout/v0" as unknown as RolloutRecord["schema"],
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /schema paired-delta-rollout\/v0 is not paired-delta-rollout\/v1/,
+        );
+    });
+
+    it("reserves the oracle tool calls an R1 rollout adds to the script", async () => {
+        // `scriptedCtxSearchTurn` bills a `tool_use` response and its follow-up, neither of
+        // which appears in `turnScript`.
+        const store = new MemoryStore();
+        const events: string[] = [];
+        const perCall = (scenario.modelContextLimit * (1 + 2)) / 1_000_000;
+        const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
+
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                deskCostCeilingUsd: 0,
+                pricesPerMillionTokens: { input: 1, output: 2, cacheCreation: 0, cacheRead: 0 },
+                // Enough for a primary arm's script, short of R1's script plus its oracle calls.
+                maxCostUsd: perCall * (billableTurns + 1),
+            },
+            dependencies((armId) => observation(armId, armId !== "mc-on"), events),
+        );
+
+        expect(result.status).toBe("cost-cap-reached");
+        expect(events).not.toContain("create:r1");
+    });
+
+    it("refuses an impossible cell from a store that does not validate", async () => {
+        // Matching arm and counts still admit a reason code the health cannot carry.
+        const record = storedRecord("mc-on");
+        const store = new MemoryStore([{
+            ...record,
+            cell: { ...record.cell, runHealth: "completed", reasonCode: "provider-unavailable" },
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /records file cell is invalid at/,
+        );
+    });
+
+    it("refuses an unrecognized cost source from a store that does not validate", async () => {
+        // Neither observed nor estimated: the record would vanish from the provenance totals.
+        const store = new MemoryStore([{
+            ...storedRecord("mc-on"),
+            costSource: "free" as unknown as RolloutRecord["costSource"],
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /cost source free is not recognized/,
+        );
+    });
+
+    it("refuses fractional or unsafe persisted counters", async () => {
+        // `finiteUsage` admits a live observation only at non-negative safe integers.
+        for (
+            const mutate of [
+                (record: RolloutRecord) => ({ ...record, turns: 0.5 }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    usage: { ...record.usage, input: 0.5 },
+                }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    usage: { ...record.usage, input: Number.MAX_VALUE },
+                }),
+            ]
+        ) {
+            const store = new MemoryStore([mutate(storedRecord("mc-on"))]);
+            await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+                /is not a non-negative safe integer/,
+            );
+        }
+    });
+
+    it("refuses a negative attempt cost from a store that does not validate", async () => {
+        // A custom `RolloutStore` bypasses the file store's parser, and a negative balance
+        // keeps the cap comparison under budget.
+        for (
+            const field of ["costUsd", "priorAttemptsCostUsd", "maxAttemptCostUsd"] as const
+        ) {
+            const store = new MemoryStore([{ ...storedRecord("mc-on"), [field]: -1_000 }]);
+            await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+                /is not a non-negative finite number/,
+            );
+        }
+    });
+
+    it("refuses a records file whose spend total overflows across records", async () => {
+        // Each record's own attempt total is finite. The sum across records is what the
+        // pre-scan accumulates.
+        const half = Number.MAX_VALUE * 0.6;
+        const store = new MemoryStore([
+            { ...storedRecord("mc-on"), costUsd: half, maxAttemptCostUsd: half },
+            { ...storedRecord("mc-off"), costUsd: half, maxAttemptCostUsd: half },
+        ]);
+
+        expect(store.list().every(({ costUsd, priorAttemptsCostUsd }) =>
+            Number.isFinite(priorAttemptsCostUsd + costUsd)
+        )).toBe(true);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /spend total overflows the finite range/,
+        );
+    });
+
+    it("rejects a stored attempt total that cannot be summed", () => {        const root = mkdtempSync(join(tmpdir(), "paired-delta-total-"));
+        try {
+            const path = join(root, "records.json");
+            // Both figures are finite; their sum is what the pre-scan adds.
+            writeFileSync(
+                path,
+                JSON.stringify([{
+                    ...storedRecord("mc-on"),
+                    costUsd: Number.MAX_VALUE,
+                    priorAttemptsCostUsd: Number.MAX_VALUE,
+                }]),
+            );
+
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/attempt-cost-total-invalid/);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("frees the claim when a non-resume run finds the matrix occupied", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-occupied-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, JSON.stringify([storedRecord("mc-on")]));
+
+            const store = new FileRolloutStore(path);
+            await expect(
+                runPairedDelta({ ...options(), store, resume: false }, dependencies()),
+            ).rejects.toThrow(/already contains rollouts for this matrix/);
+
+            // A corrected call in the same process would otherwise hit `RolloutStoreBusyError`.
+            const resumed = new FileRolloutStore(path);
+            const result = await runPairedDelta(
+                { ...options(), store: resumed, resume: true },
+                dependencies(),
+            );
+            expect(result.status).toBe("completed");
+            resumed.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a records file total that cannot be summed and frees the claim", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-file-total-"));
+        try {
+            const path = join(root, "records.json");
+            const half = Number.MAX_VALUE * 0.6;
+            writeFileSync(
+                path,
+                JSON.stringify([
+                    { ...storedRecord("mc-on"), costUsd: half, maxAttemptCostUsd: half },
+                    { ...storedRecord("mc-off"), costUsd: half, maxAttemptCostUsd: half },
+                ]),
+            );
+
+            const store = new FileRolloutStore(path);
+            expect(() => store.list()).toThrow(/spend-total-invalid/);
+            // Parsing releases the claim, so a corrected path is usable in this process.
+            writeFileSync(path, JSON.stringify([storedRecord("mc-on")]));
+            const retried = new FileRolloutStore(path);
+            expect(retried.list()).toHaveLength(1);
+            retried.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reserves the failure estimate before starting an arm", async () => {
+        const store = new MemoryStore();
+        // A first arm priced far below the scenario's full-context fallback.
+        const cheap = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 1, output: 0, cacheCreation: 0, cacheRead: 0 },
+        };
+        const worstCase = (scenario.modelContextLimit * 1 *
+            scenario.turnScript.filter(({ role }) => role === "user").length) / 1_000_000;
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            // Room for the first arm's own cost but not for a second arm's
+            // failure charge.
+            { ...cheap, maxCostUsd: worstCase, store },
+            dependencies(undefined, events),
+        );
+
+        expect(result.status).toBe("cost-cap-reached");
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
+    });
+
+    it("reserves the failure estimate from cache pricing when it is the dearest rate", async () => {
+        const store = new MemoryStore();
+        // A build billed only for cached prompt tokens: the input and output rates are zero,
+        // so cache pricing is the whole charge.
+        const cached = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 3, cacheRead: 1 },
+        };
+        const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
+        const worstCase = (scenario.modelContextLimit * 3 * billableTurns) / 1_000_000;
+        expect(worstCase).toBeGreaterThan(0);
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            { ...cached, maxCostUsd: worstCase, store },
+            dependencies(undefined, events),
+        );
+
+        // Ignoring the cache counters priced this fallback at zero, which admitted every arm.
+        expect(result.status).toBe("cost-cap-reached");
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
+    });
+
+    it("records a rollout whose run throws synchronously without leaving the deadline armed", async () => {
+        const store = new MemoryStore();
+        const rejections: unknown[] = [];
+        const onRejection = (reason: unknown): void => {
+            rejections.push(reason);
+        };
+        process.on("unhandledRejection", onRejection);
+        try {
+            const result = await runPairedDelta(
+                { ...options(store), deadlineEpochMs: Date.now() + 30 },
+                {
+                    now: Date.now,
+                    async createRollout(): Promise<RolloutHandle> {
+                        return {
+                            // Throws before returning a promise at all.
+                            run: (() => {
+                                throw new Error("run exploded");
+                            }) as unknown as () => Promise<RolloutObservation>,
+                            async dispose() {},
+                        };
+                    },
+                },
+            );
+
+            expect(result.records[0]?.cell.runHealth).toBe("crash");
+            // An armed timer outliving the arm rejects later with no consumer.
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            expect(rejections).toEqual([]);
+        } finally {
+            process.off("unhandledRejection", onRejection);
+        }
+    });
+
+    it("records a rollout whose disposal throws synchronously", async () => {
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            {
+                now: () => 100,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return observation(coordinate.armId);
+                        },
+                        // Throws before returning a promise at all.
+                        dispose: (() => {
+                            throw new Error("harness disposal exploded");
+                        }) as unknown as () => Promise<void>,
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        // The paid rollout still reaches the store.
+        expect(store.records).toHaveLength(1);
+    });
+
+    it("classifies a malformed check vector as an exclusion and continues", async () => {
+        const result = await runPairedDelta(
+            options(),
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") {
+                    value.checks = [{ id: "check-unknown", passed: true }];
+                }
+                return value;
+            }),
+        );
+        const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+        expect(result.status).toBe("completed");
+        expect(result.records).toHaveLength(3);
+        expect(malformed?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+            checksTotal: 0,
+        });
+        expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+    });
+
+    it("refuses a rollout whose harness would not dispose and re-runs it on resume", async () => {
+        const store = new MemoryStore();
+        const events: string[] = [];
+        const first = await runPairedDelta(
+            options(store),
+            dependencies(undefined, events, (armId) =>
+                armId === "mc-on" ? new Error("harness still running") : undefined),
+        );
+        const undisposed = first.records.find(({ armId }) => armId === "mc-on");
+
+        expect(undisposed?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+            checksTotal: 0,
+            criticalTotal: 0,
+            invalidSuccess: false,
+        });
+        expect(undisposed?.harnessDisposed).toBe(false);
+        expect(first.coordinates[0]?.incomplete).toBe(true);
+        // The harness may still hold its workspace, so no later arm is measured
+        // against a possibly contaminated environment.
+        expect(first.status).toBe("harness-unreclaimed");
+        expect(first.records).toHaveLength(1);
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
+        // A rollout that may have contaminated the arm is not evidence, so the
+        // regret ladder never scores it.
+        expect(first.coordinates[0]?.regret).toBeNull();
+
+        const resumeEvents: string[] = [];
+        const resumed = await runPairedDelta(options(store), dependencies(undefined, resumeEvents));
+
+        expect(resumeEvents).toContain("create:mc-on");
+        expect(resumed.status).toBe("completed");
+        expect(resumed.records.find(({ armId }) => armId === "mc-on")?.cell.runHealth)
+            .toBe("completed");
+        expect(store.records.filter(({ armId }) => armId === "mc-on")).toHaveLength(1);
+    });
+
+    it("classifies a non-finite or missing usage counter as malformed and prices it", async () => {
+        for (const usage of [
+            { input: Number.NaN, output: 10, cacheCreation: 20, cacheRead: 30 },
+            { input: Number.POSITIVE_INFINITY, output: 10, cacheCreation: 20, cacheRead: 30 },
+            { input: 100, output: 10, cacheCreation: 20 } as unknown as RolloutObservation["usage"],
+            { input: -1, output: 10, cacheCreation: 20, cacheRead: 30 },
+        ]) {
+            const result = await runPairedDelta(
+                options(),
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") value.usage = usage;
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            expect(malformed?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+            expect(malformed?.usage).toEqual({
+                input: 0,
+                output: 0,
+                cacheCreation: 0,
+                cacheRead: 0,
+            });
+            expect(malformed?.costSource).toBe("estimated");
+            expect(Number.isFinite(malformed?.costUsd)).toBe(true);
+            // One NaN cost would make every later cap comparison false.
+            expect(Number.isFinite(result.spentUsd)).toBe(true);
+            expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+        }
+    });
+
+    it("applies the cost cap to the first rollout after a resume restores spend", async () => {
+        const store = new MemoryStore();
+        const first = await runPairedDelta(options(store), dependencies());
+        const restored = store.records.filter(({ cell }) => cell.runHealth === "completed");
+
+        expect(restored.length).toBeGreaterThan(0);
+        expect(first.records).toHaveLength(3);
+
+        // Drop one coordinate so the resumed run still has an arm to execute.
+        dropRecord(store, "compaction");
+        const spentBefore = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
+        const events: string[] = [];
+        const resumed = await runPairedDelta(
+            { ...options(store), maxCostUsd: spentBefore },
+            dependencies(undefined, events),
+        );
+
+        expect(resumed.status).toBe("cost-cap-reached");
+        expect(events).not.toContain("create:compaction");
+        expect(resumed.spentUsd).toBeCloseTo(spentBefore, 12);
+    });
+
+    it("bills every attempt at a retried coordinate exactly once", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+        const failedEstimate = store.records.find(({ armId }) => armId === "mc-off")?.costUsd;
+        if (failedEstimate === undefined) throw new Error("missing failed record");
+
+        const resumed = await runPairedDelta(options(store), dependencies());
+        const retried = resumed.records.find(({ armId }) => armId === "mc-off");
+
+        // Counters cover records reported by this run; a rerun counts once, not
+        // once per attempt.
+        expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
+            .toBe(resumed.records.length);
+        // Spend is lifetime, so the failed attempt is billed alongside the retry
+        // and the estimate it was priced at stays a reserve floor.
+        expect(retried?.priorAttemptsCostUsd).toBeCloseTo(failedEstimate, 12);
+        expect(resumed.spentUsd).toBeCloseTo(
+            resumed.records.reduce((sum, { costUsd }) => sum + costUsd, 0) + failedEstimate,
+            12,
+        );
+        expect(retried?.costUsd).toBeLessThan(failedEstimate);
+        expect(resumed.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
+
+        // A third run reconstructs the same lifetime spend.
+        const third = await runPairedDelta(options(store), dependencies());
+
+        expect(third.spentUsd).toBeCloseTo(resumed.spentUsd, 12);
+        expect(third.observedCostRollouts + third.estimatedCostRollouts)
+            .toBe(third.records.length);
+    });
+    it("floors failure cost estimates at one full-context request per billable turn", async () => {
+        const expensive = {
+            ...options(),
+            pricesPerMillionTokens: {
+                input: 100,
+                output: 200,
+                cacheCreation: 1,
+                cacheRead: 1,
+            },
+        };
+        const result = await runPairedDelta(
+            expensive,
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("mid-run crash") : observation(armId)),
+        );
+        const failed = result.records.find(({ armId }) => armId === "mc-off");
+
+        expect(failed?.costSource).toBe("estimated");
+        // Each user turn can bill its own request, and the observation reports all of them.
+        const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
+        expect(billableTurns).toBeGreaterThan(1);
+        expect(failed?.costUsd).toBeCloseTo(
+            (scenario.modelContextLimit * (100 + 200) * billableTurns) / 1_000_000,
+            12,
+        );
     });
 
     it("classifies absence and arm identity contradictions as exclusions", async () => {
@@ -312,6 +2595,34 @@ describe("paired-delta runner", () => {
         });
     });
 
+    it("blocks the triggered ladder before r1 pays when a later rung is stale", async () => {
+        // A full run whose `mc-on` fails a critical check, so the ladder is triggered.
+        const first = await runPairedDelta(
+            options(),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+        const staleR2 = structuredClone(first.records.find(({ armId }) => armId === "r2")!);
+        staleR2.echoedModelId = "different-snapshot";
+        // `r1` is absent, so without a ladder preflight it runs and pays first.
+        const store = new MemoryStore([staleR2]);
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on"), events),
+        );
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.invalidStoredCoordinates).toContainEqual({
+            poolManifestFingerprint: "a".repeat(64),
+            scenarioId: scenario.scenarioId,
+            armId: "r2",
+            replicateIndex: 0,
+        });
+        expect(events).not.toContain("create:r1");
+        expect(events).not.toContain("create:r3");
+    });
+
     it("schedules no oracle rollout for passing or incomplete MC-on", async () => {
         const passing = await runPairedDelta(options(), dependencies());
         expect(passing.records).toHaveLength(3);
@@ -324,23 +2635,47 @@ describe("paired-delta runner", () => {
         expect(incomplete.records).toHaveLength(3);
     });
 
-    it("leaves downstream rungs absent when R2 is unavailable", async () => {
+    it("stops the ladder when R2 is unavailable instead of paying for R3", async () => {
+        const events: string[] = [];
         const result = await runPairedDelta(
             options(),
             dependencies((armId) => {
                 if (armId === "r2") return new ProviderUnavailableError("unavailable");
                 return observation(armId, armId !== "mc-on");
-            }),
+            }, events),
         );
 
         expect(result.coordinates[0]?.regret).toEqual({ retrieval: 1 });
         expect(result.coordinates[0]?.cells.r2?.cell.reasonCode).toBe(
             "provider-unavailable",
         );
+        expect(result.coordinates[0]?.cells.r3).toBeUndefined();
+        expect(events).not.toContain("create:r3");
+        // The rungs below R2 never ran, and no regret arm feeds the primary-arm
+        // derivation, so the coordinate has to say so itself.
+        expect(result.coordinates[0]?.incomplete).toBe(true);
     });
 });
 
 describe("dual-mock resolution gate", () => {
+    it("does not let sendPrompt rewrite the expectation it is compared against", async () => {
+        // Handed the same object, an in-place normalization would rewrite both identities and
+        // the comparison could then agree about a route that resolved through the fixture.
+        await expect(
+            verifyDualMockResolution({
+                liveProviderId: "mock-live",
+                liveModelId: "snapshot-2026-08-01",
+                modelContextLimit: 4096,
+                async sendPrompt(route) {
+                    const mutable = route as { providerId: string };
+                    mutable.providerId = "mock-anthropic";
+                    return { ...route, contextLimit: 4096 };
+                },
+            }),
+        ).rejects.toThrow(/dual-mock/);
+    });
+
+
     it("routes each provider independently and resolves the declared live limit", async () => {
         const requests = new Map<string, number>();
         await verifyDualMockResolution({
@@ -377,7 +2712,7 @@ describe("dual-mock resolution gate", () => {
 });
 
 describe("regret decomposition", () => {
-    it("refuses mismatched base scripts while retaining raw records", async () => {
+    it("excludes a rollout whose base script diverges from the declaration", async () => {
         const result = await runPairedDelta(
             options(),
             dependencies((armId) => {
@@ -388,11 +2723,14 @@ describe("regret decomposition", () => {
         );
         const coordinate = result.coordinates[0];
 
-        expect(coordinate?.regret).toEqual({ refusedReason: "base-fingerprint-mismatch" });
-        expect(coordinate?.cells.r3).toBeDefined();
+        expect(coordinate?.cells.r3?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
+        expect(coordinate?.regret).toEqual({ retrieval: 1, formation: 0 });
     });
 
-    it("refuses an intervention that does not match its declaration", async () => {
+    it("excludes a rollout whose intervention diverges and stops the ladder", async () => {
         const result = await runPairedDelta(
             options(),
             dependencies((armId) => {
@@ -401,8 +2739,33 @@ describe("regret decomposition", () => {
                 return value;
             }),
         );
+        const coordinate = result.coordinates[0];
 
-        expect(result.coordinates[0]?.regret).toEqual({
+        expect(coordinate?.cells.r1?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
+        expect(coordinate?.cells.r2).toBeUndefined();
+        expect(coordinate?.regret).toEqual({});
+    });
+
+    it("refuses stored records that diverge from the declaration", async () => {
+        const result = await runPairedDelta(
+            options(),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+        const cells = result.coordinates[0]?.cells;
+        if (!cells) throw new Error("missing fixture cells");
+
+        const staleScript = structuredClone(cells);
+        staleScript.r3!.baseScriptFingerprint = "b".repeat(64);
+        expect(computeRegretRungs(scenario, staleScript)).toEqual({
+            refusedReason: "base-fingerprint-mismatch",
+        });
+
+        const staleIntervention = structuredClone(cells);
+        staleIntervention.r1!.intervention = { kind: "none", value: null };
+        expect(computeRegretRungs(scenario, staleIntervention)).toEqual({
             refusedReason: "intervention-mismatch",
         });
     });
@@ -417,5 +2780,113 @@ describe("regret decomposition", () => {
 
         expect((rungs.retrieval ?? 0) + (rungs.formation ?? 0) + (rungs.representation ?? 0))
             .toBe(1);
+    });
+});
+
+describe("file rollout store", () => {
+    async function fixtureRecords(): Promise<RolloutRecord[]> {
+        const { records } = await runPairedDelta(options(), dependencies());
+        return records;
+    }
+
+    it("round-trips records and refuses to replace a completed rollout", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-store-"));
+        try {
+            const path = join(root, "nested", "records.json");
+            const [record] = await fixtureRecords();
+            if (!record) throw new Error("missing fixture record");
+            const store = new FileRolloutStore(path);
+            store.put(record);
+
+            expect(new FileRolloutStore(path, { readOnly: true }).list()).toEqual([record]);
+            expect(() => store.put({ ...record })).toThrow(
+                /refusing to replace completed rollout/,
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects stored records that cannot back admission decisions", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-store-"));
+        try {
+            const path = join(root, "records.json");
+            const [record] = await fixtureRecords();
+            if (!record) throw new Error("missing fixture record");
+
+            writeFileSync(path, JSON.stringify([{ ...record, costUsd: "free" }]));
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/cost-invalid/);
+
+            writeFileSync(path, JSON.stringify([{ ...record, costUsd: -1 }]));
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/cost-invalid/);
+
+            writeFileSync(path, JSON.stringify([{ ...record, schema: "other/v1" }]));
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/schema-mismatch/);
+
+            writeFileSync(
+                path,
+                JSON.stringify([{
+                    ...record,
+                    cell: { ...record.cell, runHealth: "sideways" },
+                }]),
+            );
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/cell-invalid: cell\.runHealth/);
+
+            writeFileSync(path, JSON.stringify([{ ...record, priorAttemptsCostUsd: -1 }]));
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/prior-attempts-cost-invalid/);
+
+            // `put` protects completed evidence by coordinate index, which a
+            // duplicate would silently point away from.
+            writeFileSync(path, JSON.stringify([record, record]));
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/duplicate-coordinate/);
+
+            // A completed cell suppresses its live rollout, so an impossible one
+            // must not be accepted as evidence.
+            for (const cell of [
+                { armId: "r2" },
+                { invalidSuccess: "yes" },
+                { checksTotal: -1 },
+                { checksPassed: 99 },
+                { criticalPassed: 99 },
+            ]) {
+                writeFileSync(
+                    path,
+                    JSON.stringify([{ ...record, cell: { ...record.cell, ...cell } }]),
+                );
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                    .toThrow(/cell-invalid/);
+            }
+
+            writeFileSync(
+                path,
+                JSON.stringify([{ ...record, cell: { ...record.cell, reasonCode: "made-up" } }]),
+            );
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/cell-invalid: cell\.reasonCode/);
+
+            for (const checks of [
+                "none",
+                [{ id: "check-ladder" }],
+                [{ id: "check-ladder", passed: true }, { id: "check-ladder", passed: true }],
+            ]) {
+                writeFileSync(path, JSON.stringify([{ ...record, checks }]));
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/checks-invalid/);
+            }
+
+            for (const patch of [
+                { cell: { ...record.cell, reasonCode: "harness-failure" } },
+                { cell: { ...record.cell, invalidSuccess: true } },
+                { cell: { ...record.cell, checksTotal: 0, checksPassed: 0 } },
+                { checks: [] as typeof record.checks },
+            ]) {
+                writeFileSync(path, JSON.stringify([{ ...record, ...patch }]));
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                    .toThrow(/completed-cell-invalid|cell-invalid/);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 });

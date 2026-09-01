@@ -100,8 +100,6 @@ describe("FM-PI-1: external module loss at the Pi JSONL seam", () => {
 				{ timeoutMs: 60_000 },
 			);
 		} catch {
-			// A provider error may reject the RPC command before agent_end. The next
-			// turn is the observable continuation half of this drill.
 		}
 		expect(faultInjected).toBe(true);
 

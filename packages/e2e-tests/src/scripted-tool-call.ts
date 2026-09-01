@@ -1,7 +1,7 @@
 import type { TestHarness } from "./harness";
 import type { MockUsage } from "./mock-provider/server";
 
-/** Must stay below the lowest consumer execute threshold so scripted calls do not trigger compaction. */
+/* */
 export const DEFAULT_SCRIPTED_TOOL_USAGE: MockUsage = {
     input_tokens: 2_000,
     output_tokens: 20,
@@ -10,19 +10,19 @@ export const DEFAULT_SCRIPTED_TOOL_USAGE: MockUsage = {
 };
 
 export interface ScriptedToolCallOptions {
-    /** Exact published tool name, e.g. "ctx_memory". */
+    /** `tool` must exactly match the published tool name, such as "ctx_memory". */
     tool: string;
     input: Record<string, unknown>;
     prompt: string;
-    /** Usage for the tool_use response and the follow-up default. */
+    /** `usage` applies to the `tool_use` response and the follow-up default response. */
     usage?: MockUsage;
     followUpText?: string;
 }
 
 export interface ScriptedToolCall {
-    /** Tool name as published on the provider wire. */
+    /** `publishedToolName` is the tool name published on the provider wire. */
     publishedToolName: string;
-    /** Provider-visible tool result (the wire tool_result text). */
+    /** `resultText` contains the provider-visible `tool_result` text. */
     resultText: string;
 }
 
@@ -57,7 +57,7 @@ function toolResultTextOf(block: WireContentBlock): string {
     return "";
 }
 
-/** Find the provider-visible tool_result for one scripted call id. */
+/* */
 export function findToolResultText(harness: TestHarness, callId: string): string | null {
     for (const request of harness.mock.requests()) {
         const messages = request.body.messages;
@@ -78,18 +78,16 @@ export function findToolResultText(harness: TestHarness, callId: string): string
 let scriptedCallCounter = 0;
 
 /**
- * Drive one real tool loop and capture its provider-visible tool result.
- * Missing publication or result is an infrastructure failure, not a behavioral
+ * `runScriptedToolCall` drives one real tool loop and captures its provider-visible tool result.
+ * Missing publication or result is an infrastructure failure, not a behavioral verdict.
  * verdict.
  *
- * Starts from `mock.reset()`, which clears the captured request history as well
- * as the queue, default response, and matchers. A turn driven before this call
- * is therefore not observable after it: the caller keeps no wire baseline
- * across the boundary, and must reinstall its own matchers and default for the
- * next step. Chained calls see only the most recent turn's requests, which is
- * what makes `findToolResultText` a bounded scan and the `published === null`
- * diagnostic name only this turn's published tools. Observe a turn before
- * scripting the next one, or capture the observation first.
+ * `mock.reset()` clears captured request history.
+ * `mock.reset()` also clears the queue, default response, and matchers.
+ * A turn driven before `mock.reset()` is no longer observable.
+ * Callers must reinstall matchers and the default response after `mock.reset()`.
+ * The `published === null` diagnostic names only tools published in the current turn.
+ * Callers must observe each turn before scripting the next turn.
  */
 export async function runScriptedToolCall(
     harness: TestHarness,

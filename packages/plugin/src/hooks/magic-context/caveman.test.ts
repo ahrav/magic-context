@@ -70,7 +70,6 @@ describe("cavemanCompress", () => {
         test("U: lines preserved even when they contain filler words", () => {
             const input = "Some narrative.\nU: I just really think we should do this.\n";
             const out = cavemanCompress(input, "ultra");
-            // The U: line content must stay verbatim, filler-words-and-all.
             expect(out).toContain("U: I just really think we should do this.");
         });
     });
@@ -81,7 +80,6 @@ describe("cavemanCompress", () => {
             const out = cavemanCompress(input, "lite");
             expect(out).not.toContain("really");
             expect(out).not.toContain("just");
-            // Articles kept at lite.
             expect(out.toLowerCase()).toContain("the");
         });
 
@@ -152,7 +150,6 @@ describe("cavemanCompress", () => {
         test("replaces 'then' with arrow", () => {
             const input = "Committed and then pushed.";
             const out = cavemanCompress(input, "ultra");
-            // "and then" → "→"
             expect(out).toContain("→");
         });
 
@@ -160,7 +157,6 @@ describe("cavemanCompress", () => {
             const input =
                 "The historian ran. Then historian retried. Then historian succeeded. Historian finished.";
             const out = cavemanCompress(input, "ultra");
-            // historian appears 4 times → should be abbreviated to "hist"
             expect(out.toLowerCase()).toMatch(/\bhist\b/);
             expect(out.toLowerCase()).not.toMatch(/\bhistorian\b/);
         });
@@ -168,14 +164,12 @@ describe("cavemanCompress", () => {
         test("does NOT abbreviate if term appears fewer than 3 times", () => {
             const input = "The historian ran once.";
             const out = cavemanCompress(input, "ultra");
-            // historian appears only once → keeps original
             expect(out.toLowerCase()).toContain("historian");
         });
 
         test("preserves capitalization when abbreviating", () => {
             const input = "Historian started. Historian ran. Historian finished successfully.";
             const out = cavemanCompress(input, "ultra");
-            // All three are sentence-initial; abbreviation should be capitalized
             expect(out).toContain("Hist");
         });
     });
@@ -233,11 +227,9 @@ describe("cavemanCompress", () => {
             const input =
                 "Committed the live-notification-params fix on feat/context-management as ffa0997b, replayed it onto integrate/athena-context-management as bcd8816e, and rebuilt both branches successfully. The replay was clean; the only remaining integrate dirt was an unrelated pre-existing src/shared/context-limit-resolver.ts modification.";
             const out = cavemanCompress(input, "ultra");
-            // Technical identifiers preserved.
             expect(out).toContain("ffa0997b");
             expect(out).toContain("bcd8816e");
             expect(out).toContain("src/shared/context-limit-resolver.ts");
-            // Output shorter than input.
             expect(out.length).toBeLessThan(input.length);
         });
 

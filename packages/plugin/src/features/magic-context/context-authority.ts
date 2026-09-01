@@ -37,7 +37,7 @@ export interface AuthorityStatus {
     step_flip?: boolean;
     coordinator_lease?: string | null;
     lease_expires_at?: number | null;
-    /** Attempt-unique drain coordinator token minted at begin/takeover. */
+    /** Begin and takeover mint an attempt-unique drain coordinator token. */
     coordinator_token?: string | null;
     checksum_expected?: string | null;
     checksum_actual?: string | null;
@@ -170,13 +170,6 @@ export async function commitModuleClaimIntent(args: {
                 },
             });
         } else if (prior.state === "context-committed") {
-            // The context write already landed under the previous binding, so this
-            // intent cannot be terminally rejected — only acknowledged, and only
-            // under the binding that staged it. Its effects still reach the mirror
-            // through the outbox consumer, which drains independently of this
-            // coordinator. Leaving the row unresolved instead would block every
-            // later claim-store rebuild and mirror reset, because both count
-            // `staged` and `context-committed` as unresolved.
             await args.client.claimIntentAck({
                 sessionId: args.sessionId,
                 projectRoot: args.projectRoot,
@@ -206,11 +199,6 @@ export async function commitModuleClaimIntent(args: {
     try {
         commit = args.commitContext();
     } catch (error) {
-        // A caller-input rejection is deterministic: the same stable tool-call ID
-        // reproduces it on every retry, so the staged row would never resolve and
-        // would block claim-store rebuilds forever. Terminalize it and let the
-        // caller see the original error. Any other failure may be transient, so
-        // the row stays staged and a retry can still commit it.
         if (error instanceof ClaimOperationInputError && staged.intent.state === "staged") {
             await args.client.claimIntentAck({
                 sessionId: args.sessionId,
@@ -289,19 +277,19 @@ export interface ModuleNoteEvaluationBridge {
     drain(args: {
         deadline: number;
         signal?: AbortSignal;
-        /** Ask the authority for sandbox-only phases (due, liveness). */
+        /* */
         excludeBillable?: boolean;
-        /** Client-side bound on billable claims; absent = legacy per-run cap. */
+        /** An absent bound uses the legacy per-run cap. */
         maxCompilePerRun?: number;
         maxFallbackPerRun?: number;
     }): Promise<DrainResult>;
     available(): boolean;
-    /** Retry a failed or premature evaluator registration; no-op when live. */
+    /** The registration retries failed or premature evaluator registration and no-ops when live. */
     ensureRegistered?(): Promise<void>;
     dispose(): Promise<void>;
 }
 
-/** One registered bridge plus the number of plugin instances relying on it. */
+/** The reference count includes the registered bridge and each plugin instance that relies on it. */
 interface ModuleNoteEvaluationBridgeEntry {
     bridge: ModuleNoteEvaluationBridge;
     owners: number;
@@ -310,16 +298,12 @@ interface ModuleNoteEvaluationBridgeEntry {
 const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridgeEntry>();
 
 /**
- * Composite registry key. Worktrees of one repository share a project
- * identity but bind different checkout roots, and each root's bridge closes
- * over its own transport route and filesystem capabilities, so identity alone
- * cannot address a bridge. NUL cannot appear in a filesystem path.
  */
 export function moduleNoteEvaluationBridgeKey(projectPath: string, projectRoot: string): string {
     return `${projectPath}\u0000${projectRoot}`;
 }
 
-/** Registers the bridge (one owner) and returns its registry key for later disposal. */
+/** Each registration owns one bridge until disposal via the returned registry key. */
 export function registerModuleNoteEvaluationBridge(
     projectPath: string,
     projectRoot: string,
@@ -331,11 +315,6 @@ export function registerModuleNoteEvaluationBridge(
 }
 
 /**
- * Record another owner of an already-registered exact bridge and return its
- * registry key, or undefined when no such bridge exists. A second plugin
- * instance serving the same (identity, root) must retain rather than skip:
- * otherwise the first instance's disposal tears down the only registry entry
- * while the second instance still routes conditioned writes through it.
  */
 export function retainModuleNoteEvaluationBridge(
     projectPath: string,
@@ -349,9 +328,8 @@ export function retainModuleNoteEvaluationBridge(
 }
 
 /**
- * With `projectRoot`: the bridge bound to that exact checkout. Without it: any
- * bridge for the identity, for identity-scoped questions such as "does a live
- * evaluator exist" or "does the module own drains for this project".
+ * A `projectRoot` lookup returns only the bridge bound to that checkout.
+ * An omitted `projectRoot` lookup may return any bridge for the identity.
  */
 export function getModuleNoteEvaluationBridge(
     projectPath: string,
@@ -370,14 +348,9 @@ export function getModuleNoteEvaluationBridge(
 }
 
 /**
- * Bridge lookup for drain paths: exact (identity, root) first — worktrees of
- * one repository share an identity, and each bridge's filesystem capabilities
- * bind to one checkout — then any bridge for the identity, because an
- * undrained module queue is the worse failure: pending notes would sit
- * forever in a process whose exact-root bridge never registered. Claims carry
- * no originating root, so the cross-root exposure already exists in claim
- * selection itself; root-fenced selection is tracked as magic-context-c0c and
- * must land here, once, for every drain caller.
+ * Each bridge's filesystem capabilities bind to one checkout.
+ * An undrained module queue can leave pending notes forever when no exact-root bridge registers.
+ * Claims carry no originating root, so claim processing permits cross-root exposure.
  */
 export function findModuleNoteEvaluationBridgeForDrain(
     projectPath: string,
@@ -391,11 +364,10 @@ export function findModuleNoteEvaluationBridgeForDrain(
 }
 
 /**
- * Release the named owners' claims (registry keys returned by register or
- * retain). The registry is process-global while plugin instances are disposed
- * individually, so an instance passes the keys it owns; a bridge is removed
- * and disposed only when its last owner releases it, and sibling instances'
- * bridges stay live.
+ * The registry is process-global, but plugin instances are disposed individually.
+ * Each instance passes only the registry keys it owns.
+ * A bridge is removed and disposed only when its last owner releases it.
+ * Sibling instances' bridges remain live.
  */
 export async function disposeModuleNoteEvaluationBridges(
     bridgeKeys: Iterable<string>,
@@ -440,8 +412,8 @@ export function getContextStoreUuid(db: Database): string | null {
     return typeof row?.value === "string" && row.value.length > 0 ? row.value : null;
 }
 
-/** Mint the store identity once. Restoring a database restores this value too,
- * which is what lets the module recognize a regressed marker. */
+/** Restoring a database restores the store identity.
+ * Process-global tails keyed by store UUID and domain make plugin instances sharing a database join one chain. */
 export function ensureContextStoreUuid(db: Database): string {
     const existing = getContextStoreUuid(db);
     if (existing) return existing;
@@ -456,18 +428,16 @@ export function ensureContextStoreUuid(db: Database): string {
     return getContextStoreUuid(db) ?? minted;
 }
 
-/** Tails keyed by store uuid + domain; process-global so every plugin instance
- * sharing one database file joins the same chain. */
+/** Process-global tails keyed by store UUID and domain make plugin instances sharing a database join one chain.
+ * Plugin instances sharing one database file join the same chain. */
 const mirrorDomainSyncChains = new Map<string, Promise<void>>();
 
 /**
- * Serialize mirror pulls for one (database, domain) across every caller in
- * the process. Each pull reads the durable cursor before requesting a page,
- * so two concurrent pulls request the same page and the loser throws a
- * cursor mismatch in {@link applyMirrorPage}. Instance-local chains are not
- * enough: several plugin instances can share one database file (the shared
- * evaluator bridge holds one instance's sync while another instance's tool
- * backend syncs the same domain), so the chain is keyed by the store uuid.
+ * Serialize mirror pulls for one (database, domain) across every caller in the process.
+ * Concurrent pulls can request the same page; the loser throws a cursor mismatch in {@link applyMirrorPage}.
+ * Instance-local chains are insufficient because plugin instances can share one database file.
+ * Several plugin instances can share one database file.
+ * The chain is keyed by the store UUID because multiple plugin instances can sync the same database and domain.
  */
 export function chainMirrorDomainSync(
     db: Database,
@@ -547,9 +517,8 @@ function clearRepairPending(db: Database, projectPath: string): void {
 }
 
 /**
- * Repair a marker lost by restoring an older context.db snapshot. The write barrier
- * makes the repair atomic with the marker installation; callers keep application
- * writes closed until this function resolves.
+ * The write barrier atomically repairs a marker lost after restoring an older `context.db` snapshot.
+ * Callers keep application writes closed until reconcileAuthorityMarker resolves.
  */
 export async function reconcileAuthorityMarker(args: {
     db: Database;
@@ -574,11 +543,11 @@ export async function reconcileAuthorityMarker(args: {
         };
     }
 
-    // A missing marker is ambiguous until the module answers. Keep all writes closed
-    // during that round-trip so a restored store cannot accept a write before repair.
+    // A missing marker is ambiguous until the module answers.
+    // Callers keep application writes closed during the module request so a restored store cannot accept a write before repair.
     setRepairPending(args.db, args.projectPath);
-    // Keep the durable pending marker if the module request fails: this host is expected
-    // to reach the module, so an unknown result remains fail-closed until a later retry.
+    // Keep the durable pending marker if the module request fails so an unknown result remains fail-closed until retry.
+    // A failed module request leaves the repair pending until retry.
     const statuses: Array<{ authority: AuthorityStatus | null }> = await Promise.all(
         AUTHORITY_DOMAINS.map((domain) =>
             args.module.authorityStatus({
@@ -596,8 +565,8 @@ export async function reconcileAuthorityMarker(args: {
         return { status: "legacy", authority: null };
     }
 
-    // The module still owns this UUID, so a marker-less restore is regressed rather
-    // than a new store. Hold the SQLite writer lock while reinstalling the fence.
+    // A marker-less restore is a regression, not a new store, when the module still owns the UUID.
+    // The repair holds the SQLite writer lock while reinstalling the fence.
     withPrivilegedWriter(args.db, () => {
         installAuthorityManagedMarker(args.db, args.projectPath, contextStoreUuid);
         args.db
@@ -664,7 +633,7 @@ export interface PrepareAuthorityArgs {
     domains?: readonly AuthorityDomain[];
     module: AuthorityModuleClient;
     seedPages: (domain: AuthorityDomain) => Promise<readonly Record<string, unknown>[]>;
-    /** Test seam for alternate canonical encoders. Production uses the shared row digest. */
+    /** Tests can inject alternate canonical encoders; production uses the shared row digest. */
     checksum?: (domain: AuthorityDomain, rows: readonly Record<string, unknown>[]) => string;
 }
 
@@ -706,7 +675,7 @@ function maxDomainRowId(db: Database, domain: AuthorityDomain, projectPath: stri
     return typeof row?.max_rowid === "number" ? row.max_rowid : 0;
 }
 
-/** Read the transactionally maintained domain mutation epoch (0 when never bumped). */
+/** The epoch is transactionally maintained and remains 0 until its first bump. */
 export function readDomainMutationEpoch(
     db: Database,
     projectPath: string,
@@ -719,9 +688,9 @@ export function readDomainMutationEpoch(
 }
 
 /**
- * Bump the domain mutation epoch inside the current privileged write transaction.
- * Same-connection privileged UPDATEs do not advance PRAGMA data_version; this epoch
- * is the capture bound that detects those writes.
+ * Callers must invoke this function inside the current privileged write transaction.
+ * Same-connection privileged UPDATEs do not advance PRAGMA data_version.
+ * The mutation epoch detects same-connection privileged UPDATEs.
  */
 export function bumpDomainMutationEpoch(
     db: Database,
@@ -766,7 +735,7 @@ function installMarkerAndCaptureBounds(args: {
         try {
             args.db.exec("ROLLBACK");
         } catch {
-            // Preserve the capture failure.
+            // Rollback errors must not mask the capture failure.
         }
         throw error;
     }
@@ -798,7 +767,7 @@ function capturedBoundsUnchanged(
         try {
             db.exec("ROLLBACK");
         } catch {
-            // Preserve the verification failure.
+            // Rollback errors must not mask the verification failure.
         }
         throw error;
     }
@@ -849,15 +818,14 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 for (const [index, moduleRowId] of (seedResponse.module_row_ids ?? []).entries()) {
                     const sourceRowId = seedSourceRowId(page[index]);
                     if (sourceRowId === null) continue;
-                    // The module coalesces same-frame natural-key duplicates to the
-                    // last snapshot. Repeated module ids therefore choose the last
-                    // source id as the canonical mirror-back target as well.
+                    // The module coalesces same-frame natural-key duplicates to the last snapshot.
+                    // Repeated module IDs use the last snapshot's source ID as the canonical mirror-back target.
+                    // Repeated module IDs use the last snapshot's source ID as the canonical mirror-back target.
                     identityByModuleRowId.set(moduleRowId, { moduleRowId, sourceRowId });
                 }
                 const identities = [...identityByModuleRowId.values()];
                 if (identities.length > 0) {
-                    // Seed identities are one response batch: keeping the SELECT+insert
-                    // sequence in one local transaction prevents one SQLite write lock per row.
+                    // The local transaction prevents SQLite from taking one write lock per row.
                     args.db
                         .transaction(() => {
                             for (const identity of identities) {
@@ -1093,9 +1061,9 @@ export async function drainAuthority(args: {
         } catch (error) {
             if (authorityDrainErrorCode(error) === "authority_feed_head_advanced") {
                 if (recaptureAttempts >= MAX_DRAIN_RECAPTURE_ATTEMPTS) {
-                    // Historian publication and state sync legitimately remain writable while
-                    // DRAINING. They are bursty, so a later scheduled drain normally converges;
-                    // bounding this coordinator prevents a steady producer from livelocking it.
+                    // Historian publication and state sync remain writable during DRAINING.
+                    // A later scheduled drain converges after bursty publication and state sync stop.
+                    // The coordinator's bound prevents a steady producer from livelocking the coordinator.
                     return {
                         code: "authority_drain_contended",
                         retryable: true,
@@ -1105,8 +1073,8 @@ export async function drainAuthority(args: {
                     };
                 }
                 recaptureAttempts += 1;
-                // A non-facade writer may append after the prior bound. Beginning the next
-                // attempt captures a fresh head; replay remains bounded to that captured head.
+                // A non-facade writer may append after a replay bound is captured.
+                // Each later attempt captures a fresh head and replays only to that head.
                 continue;
             }
             throw error;
@@ -1114,8 +1082,8 @@ export async function drainAuthority(args: {
         if (finished.state !== "TS") {
             throw new Error("memory authority drain did not reactivate TypeScript ownership");
         }
-        // A project marker fences both authority domains. Remove it only after neither
-        // domain remains module-owned; a one-domain drain must not reopen the other domain.
+        // A project marker fences both authority domains.
+        // The project marker remains while either domain is module-owned; draining one domain does not reopen the other.
         const remaining = await Promise.all(
             AUTHORITY_DOMAINS.map((domain) =>
                 args.module.authorityStatus({
@@ -1281,8 +1249,7 @@ function rememberIdentity(
     const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
     if (existing) return;
     // A note can be re-minted with a new module row id when authority is prepared
-    // again. Replace its stale canonical identity so note evaluation joins the live
-    // revision instead of retaining an id that the module no longer recognizes.
+    // The mirror must replace the stale canonical identity so note evaluation joins the live revision.
     if (domain === "notes") {
         (
             statements?.deleteIdentityByContext ??
@@ -1357,9 +1324,9 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
     }
     const contextId = contextNoteId(db, feed, moduleProject, statements);
     const existing = statements.noteById.get(contextId) as Record<string, unknown> | undefined;
-    // Historical v23 feed rows contain only the small note surface. Preserve every
-    // rich TS-owned column that is absent from such a snapshot, while still honoring
-    // explicit nulls in current complete rows.
+    // Historical v23 feed rows contain only the small note surface.
+    // The mirror preserves every rich TS-owned column absent from a v23 snapshot.
+    // The mirror honors explicit nulls in complete current rows.
     const effectiveRow: Record<string, unknown> = { ...(existing ?? {}), ...row };
     if (!hasSnapshotField(row, "created_at_ms") && existing?.created_at !== undefined) {
         effectiveRow.created_at_ms = existing.created_at;
@@ -1367,8 +1334,8 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
     if (!hasSnapshotField(row, "updated_at_ms") && existing?.updated_at !== undefined) {
         effectiveRow.updated_at_ms = existing.updated_at;
     }
-    // Delivery-only module states are collapsed to the TS vocabulary. The ledger remains
-    // authoritative for at-least-once delivery; context.db must not invent a new status.
+    // Delivery-only module states are collapsed to the TS vocabulary.
+    // The module status is authoritative for at-least-once delivery; `context.db` must not create a new status.
     const moduleStatus = rowString(effectiveRow, "status", "active");
     const contextStatus =
         moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
@@ -1410,9 +1377,6 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
         typeof effectiveRow.anchor_ordinal === "number" ? effectiveRow.anchor_ordinal : null,
         rowNumber(effectiveRow, "created_at_ms"),
         rowNumber(effectiveRow, "updated_at_ms"),
-        // The evaluator fences claims and compile artifacts on these counters;
-        // dropping them from the mirror would rewind revisions on a drain back
-        // to TypeScript or a reseed into the module.
         rowNumber(effectiveRow, "source_revision"),
         rowNumber(effectiveRow, "state_version"),
         contextId,
@@ -1427,9 +1391,6 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
 
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {
     const { db, page } = args;
-    // Project memory is claims-native: the module consumes the claim mirror and
-    // no supported feed carries memory rows, so any non-notes page is refused
-    // without touching authoritative state.
     if (page.domain !== "notes") {
         throw new Error(
             `unsupported mirror domain ${page.domain}: only the notes changefeed is mirrored`,

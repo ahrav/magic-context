@@ -44,8 +44,7 @@ function parseErrorLocation(content: string, error: unknown): { line: number; co
 }
 
 /**
- * Keeps a missing file distinct from malformed user data. Callers may create a
- * missing config, but must never replace a parse failure with an empty object.
+ * Callers may create a missing config but must not replace parse failures with empty objects.
  */
 export function readJsoncConfig(path: string): JsoncReadResult {
     if (!existsSync(path)) return { kind: "missing" };

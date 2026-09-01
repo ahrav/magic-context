@@ -27,24 +27,24 @@ inbound channel.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/ring.rs:825-828` — the commit point for
+- `crates/mc-shm-transport/src/backend/ring.rs:1114-1117` — the commit point for
   acquisition. Inside one `unsafe` block, `try_receive` stores
-  `SLOT_RECEIVER_LEASED` (`:826`), stores `consumed = sequence` with `Release`
-  (`:827`), and increments `active_leases` (`:828`). All three happen before the
-  lease value is constructed at `:835-847` and returned.
-- `crates/mc-shm-transport/src/lease.rs:215-221` — `impl Drop for ReceiveLease`
+  `SLOT_RECEIVER_LEASED` (`:1115`), stores `consumed = sequence` with `Release`
+  (`:1116`), and increments `active_leases` (`:1117`). All three happen before the
+  lease value is constructed at `:1124-1136` and returned.
+- `crates/mc-shm-transport/src/lease.rs:201-207` — `impl Drop for ReceiveLease`
   calls `release_once()` if `!self.released`, discarding the result with
   `let _ =`. Dropping a lease is a full release, not an abandonment.
-- `crates/mc-shm-transport/src/backend/ring.rs:903-910` — `release` stores the
+- `crates/mc-shm-transport/src/backend/ring.rs:1229-1236` — `release` stores the
   `completion_sequence` and decrements `active_leases`, which makes the slot
   eligible for `reclaim_completed`. Nothing records that the body was never read.
-- `crates/mc-host/src/ring_transport.rs:464-470` — `receive_one` binds the lease.
+- `crates/mc-host/src/ring_transport.rs:496-502` — `receive_one` binds the lease.
   From here the lease is a local whose scope ends at every `return`.
-- `crates/mc-host/src/ring_transport.rs:487-518` — the ingress-charge loop, entered
-  with the lease still live. `:583-584` returns `Err(ReadClose::Cancelled)` when
-  `read_cancel.is_cancelled()`; `:588-590` returns `Err(ReadClose::Overloaded)`
+- `crates/mc-host/src/ring_transport.rs:519-542` — the ingress-charge loop, entered
+  with the lease still live. `:525` returns `Err(ReadClose::Cancelled)` when
+  `read_cancel.is_cancelled()`; `:528-531` returns `Err(ReadClose::Overloaded)`
   on the frame deadline. Both drop the lease.
-- `crates/mc-host/src/ring_transport.rs:519-524` — the only path that reads the
+- `crates/mc-host/src/ring_transport.rs:543-548` — the only path that reads the
   body: `lease.to_vec()` then an explicit `lease.release()`. Reaching it requires
   the charge loop to have broken with a charge.
 - former `crates/mc-host/src/shm_provider.rs:498` — `let clean = matches!(close,
@@ -74,8 +74,8 @@ indistinguishable from a cancellation that arrived before the frame existed.
 
 ## Timing windows and dependencies
 
-The window opens at `ring.rs:827` when `consumed` advances and closes at
-`ring_transport.rs:520` when `to_vec` runs. Its width is the duration of the
+The window opens at `ring.rs:1116` when `consumed` advances and closes at
+`ring_transport.rs:544` when `to_vec` runs. Its width is the duration of the
 ingress-charge loop, which is bounded above by `frame_deadline` but is not
 bounded below and is zero-width on an uncontended budget. That is why the window
 needs deterministic injection rather than load. `Overloaded` widens it to the

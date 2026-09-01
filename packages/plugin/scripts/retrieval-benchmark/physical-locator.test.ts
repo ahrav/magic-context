@@ -81,8 +81,6 @@ describe("parsePhysicalResultLocator", () => {
 describe("layering", () => {
     it("no production magic-context module imports the benchmark scripts", () => {
         const dir = join(import.meta.dir, "..", "..", "src", "features", "magic-context");
-        // Recursive: subdirectories (memory/, dreamer/, ...) are production
-        // modules too and must honor the same layering invariant.
         for (const name of readdirSync(dir, { recursive: true }) as string[]) {
             if (!name.endsWith(".ts") || name.endsWith(".test.ts")) continue;
             const source = readFileSync(join(dir, name), "utf8");

@@ -202,3 +202,7 @@ The documentation half of the finding survives the refactor and is now purely a
 doc defect: `docs/mc-host-shm-transport.md:79` still describes rejecting releases
 "carrying an old provider incarnation", a protocol that never existed and whose
 surrounding machinery has since been deleted.
+
+Status note, 2026-08-31: the catalog status for this record is now
+`invalidated` (vocabulary normalization); the `superseded-by-refactor` wording
+above is retained as history.

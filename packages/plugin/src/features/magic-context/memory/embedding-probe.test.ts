@@ -322,7 +322,6 @@ describe("probeEmbeddingEndpoint", () => {
 
         expect(result.kind).toBe("http_error");
         if (result.kind === "http_error") {
-            // 240 preview chars + trailing ellipsis.
             expect(result.preview.length).toBeLessThan(300);
             expect(result.preview.endsWith("…")).toBe(true);
         }

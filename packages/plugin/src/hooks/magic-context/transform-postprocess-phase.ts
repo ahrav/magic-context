@@ -124,8 +124,7 @@ import {
 import { logTransformTiming } from "./transform-stage-logger";
 
 const DEGRADE_CACHE_WARNING_THRESHOLD = 10;
-// Bounded (LRU, max 100) so a crashed/never-reset session can't leak an entry
-// forever in a long-running process — matches the other per-session caches.
+// The 100-entry LRU bounds entries for sessions that never reset.
 const degradedCacheCountBySession = new BoundedSessionMap<number>(100);
 
 export function resetDegradedCacheCount(sessionId: string): void {
@@ -138,15 +137,12 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-already-cleared";
 
 function isSyntheticHeadMessage(message: MessageLike): boolean {
-    // Structural shape only — an ID-less user message whose every part is
-    // marked synthetic. Persisted OpenCode rows always carry an id, so no
-    // persisted or foreign row can satisfy this regardless of its metadata;
-    // the shape is exactly what the TS lane's prependM0M1Messages and the
-    // Rust module's m0/m1 encode both produce. The TS lane additionally sets
-    // info.syntheticHead, but the Rust encode does not — requiring the flag
-    // here made the head walk stop at index 0 on rust-mode output and splice
-    // the compaction summary AHEAD of m0, failing the m0 wire invariant on
-    // every pass for sessions with persisted marker state.
+    // No persisted OpenCode row can satisfy this shape because persisted rows always have an id.
+    // Both `prependM0M1Messages` and Rust m0/m1 encoding produce this shape.
+    // The TypeScript lane additionally sets `info.syntheticHead`.
+    // Rust m0/m1 encodings omit `info.syntheticHead`, so requiring it would place the compaction summary before m0.
+    // Requiring `info.syntheticHead` would stop the Rust-mode head walk at index 0.
+    // Splicing at index 0 would place the compaction summary ahead of m0, violating the m0 wire invariant.
     if (message.info.id !== undefined) return false;
     if (message.info.role !== "user") return false;
     const parts = message.parts;
@@ -224,9 +220,8 @@ function removeSyntheticTodoParts(messages: MessageLike[]): void {
 }
 
 /**
- * Apply the synthetic todowrite pair with cache-safe live permission checks.
- * Permission is refreshed only on a cache-busting pass; defer passes replay
- * the cached verdict and frozen bytes without consulting the SDK.
+ * Permission refreshes only on a cache-busting pass.
+ * Defer passes replay the cached verdict and frozen bytes without consulting the SDK.
  */
 export async function applyTodoSynthesis(args: {
     db: ContextDatabase;
@@ -260,8 +255,8 @@ export async function applyTodoSynthesis(args: {
             setPersistedTodoPermissionDenied(args.db, args.sessionId, permissionDenied);
         } catch (error) {
             // A transient SDK read must not turn a previously denied tool back on.
-            // Keep the last in-memory or durable verdict until a later permission
-            // refresh successfully reads the live state.
+            // The cache retains the last in-memory or durable verdict until a permission refresh reads the live state successfully.
+            // A permission refresh must successfully read the live state.
             sessionLog(
                 args.sessionId,
                 "todowrite permission read failed; retaining the last successful verdict:",
@@ -273,9 +268,8 @@ export async function applyTodoSynthesis(args: {
     const todowriteUnavailable = toolsMapUnavailable || permissionDenied;
     if (args.isCacheBustingPass && todowriteUnavailable) {
         removeSyntheticTodoParts(args.messages);
-        // Clear the persisted synthetic anchor even if an older row contains only
-        // one synthetic field; otherwise stale partial data could keep part of the
-        // pair after the tool becomes unavailable.
+        // Cleanup clears the persisted synthetic anchor even when an older row contains only one synthetic field.
+        // Otherwise, stale partial data could retain one field after the tool becomes unavailable.
         clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
         if (persistedAnchor) {
             sessionLog(
@@ -333,8 +327,8 @@ export async function applyTodoSynthesis(args: {
         return injection.prependedMessageCount;
     }
 
-    // Defer pass: rebuild from the persisted snapshot, never from live
-    // last_todo_state, so a real todowrite between passes cannot change bytes.
+    // A defer pass rebuilds from the persisted snapshot, never from live `last_todo_state`.
+    // A real `todowrite` between passes cannot change the bytes.
     if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
         const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
         if (part !== null && part.callID === persistedAnchor.callId) {
@@ -350,9 +344,9 @@ export async function applyTodoSynthesis(args: {
 }
 
 /**
- * Rebuild host-owned canonical representation after native Rust serving.
- * The persisted compaction summary is restored with the same canonicalizer as the
- * TypeScript lane, then note and recall anchors are replayed onto the native result.
+ * Replay canonicalizes native Rust output before restoring host-owned anchors.
+ * The persisted compaction summary uses the TypeScript lane's canonicalizer.
+ * The TypeScript lane canonicalizes the summary before note and recall anchors are replayed onto the native result.
  */
 export function runRustModePostprocess(args: {
     db: ContextDatabase;
@@ -366,8 +360,8 @@ export function runRustModePostprocess(args: {
 }): void {
     if (!args.fullFeatureMode || args.compactionOff) return;
     // Test doubles and older integrations may return the legacy bare message shape.
-    // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
-    // those responses untouched instead of treating a missing `info` object as a failure.
+    // The host-side sticky phase applies only to OpenCode `MessageLike` objects.
+    // The sticky phase leaves legacy bare message responses unchanged.
     if (
         args.messages.some(
             (message) =>
@@ -392,8 +386,8 @@ export function runRustModePostprocess(args: {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        // Anti-memory warnings never replay from stored hint text; they require
-        // a fresh search. Decisions without warning fragments can replay.
+        // Anti-memory warnings require a fresh search; they never replay stored hint text.
+        // Anti-memory decisions without warning fragments can replay.
         if (
             decision.decision === "hint" &&
             autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
@@ -432,13 +426,11 @@ function dropMarkerSummaryTag(
 }
 
 /**
- * Replay the persisted marker representation on every pass.
+ * The transform replays the persisted marker on every pass so output does not depend on live marker state.
  *
  * OpenCode projects a completed summary immediately before the retained tail.
- * The transform prepends synthetic history slots later, so the canonical array
- * position is after the contiguous synthetic head and before every real tail
- * message, regardless of role. Rebuilding from persisted state also removes
- * stale loser-process arrays and duplicate summaries deterministically.
+ * The summary must follow the contiguous synthetic head to preserve OpenCode's retained-tail ordering.
+ * Rebuilding from persisted state removes stale summaries before inserting the persisted summary.
  */
 export function reconcileMarkerRepresentation(
     messages: MessageLike[],
@@ -562,26 +554,20 @@ interface RunPostTransformPhaseArgs {
     messageTagNumbers: Map<MessageLike, number>;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
-    /** Final-array counts of reclaimable tagged mass (U) and total eligible mass (T). */
+    /* */
     channel1StateBySession?: Map<string, Channel1State>;
-    /** Frozen-per-session verdict for the native `todowrite` tool. Gates the
-     *  synthetic todo-pair injection below: a session whose tools map filters
-     *  todowrite out must not get a synthetic pair for a tool it cannot call. */
+    /**
+     * */
     todowriteAvailability: ToolAvailabilityVerdict;
-    /** OpenCode SDK for live permission checks on cache-busting passes. */
+    /* */
     client?: PluginContext["client"];
-    /** Active agent selected by the latest user message or hook input. */
+    /* */
     activeAgent?: string;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
     schedulerDecision: "execute" | "defer";
     fullFeatureMode: boolean;
     /**
-     * Compaction-off mode (issue #266), boot-resolved. Every mutating gate in
-     * this phase becomes `existingGate && !compactionOff`; the m[0]/m[1]
-     * injection gate is re-expressed as identity-present AND (fullFeatureMode
-     * || compactionOff) so the mode keeps additive memory/docs delivery (and
-     * extends it to subagent sessions, which gain the knowledge surface).
      */
     compactionOff?: boolean;
     canRunCompartments: boolean;
@@ -611,9 +597,6 @@ interface RunPostTransformPhaseArgs {
     clearReasoningAge: number;
     protectedTags: number;
     /**
-     * Ceiling for the tiered emergency drop = contextLimit × executeThreshold%.
-     * Undefined when the context limit isn't resolved (cold start) — the
-     * emergency drop then skips (the 95% block stays the backstop).
      */
     emergencyCeilingTokens?: number;
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
@@ -623,8 +606,8 @@ interface RunPostTransformPhaseArgs {
     hasRecentReduceCall: boolean;
     projectPath?: string;
     sessionDirectory?: string;
-    /** Experimental auto-search: when enabled, runs ctx_search on the latest
-     *  user prompt and appends a compact fragment hint. */
+    /**
+     * */
     autoSearch?: {
         enabled: boolean;
         scoreThreshold: number;
@@ -633,26 +616,15 @@ interface RunPostTransformPhaseArgs {
         ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     };
     /**
-     * Age-tier caveman compression (experimental). Caller forwards this only
-     * for primary sessions because subagent context is curated by the parent.
-     * Passed through to `applyHeuristicCleanup`.
      */
     cavemanTextCompression?: {
         enabled: boolean;
         minChars: number;
     };
     /**
-     * Smart-drops (experimental, default off): content-aware reclaim of tool
-     * output that a later call supersedes. Runs alongside the age-based
-     * auto-drop, only inside an execute pass that is already mutating, so it
-     * never causes a cache bust on its own. Off → the messages sent to the model
-     * are byte-identical to the age-based-only behavior.
      */
     smartDrops?: boolean;
     /**
-     * Provider resolved once by the main transform for this pass. Used for every
-     * empty-sentinel gate and whole-message placeholder choice so postprocess
-     * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
     passOutcome?: PassOutcome;
@@ -665,8 +637,8 @@ interface RunPostTransformPhaseArgs {
         historyBudgetTokens?: number;
         temporalAwareness?: boolean;
         hardSignals?: M0HardSignals;
-        /** mural.enabled — drives the on-demand deterministic mural
-         *  render inside the HARD fold. */
+        /**
+         * */
         muralEnabled?: boolean;
     };
 }
@@ -675,7 +647,7 @@ export interface PostTransformPhaseResult {
     explicitMaterializedSuccessfully: boolean;
     deferredMaterializedSuccessfully: boolean;
     materialized: boolean;
-    /** True only when this pass consumed newly folded historian history. */
+    /* */
     historianFoldMaterializedThisPass: boolean;
     materializeReason: string | null;
     droppedTokens: number;
@@ -719,7 +691,7 @@ export interface EmergencyFailClosedDecision {
         | "provider-overflow-abort"
         | "proceed"
         | "trusted-final-wire-disarm";
-    /** Trusted current-pass wire evidence that lets the caller clear its durable latch. */
+    /** The caller may clear its durable latch only with trusted current-pass wire evidence. */
     disarm?: { finalWireTokens: number; provenLimitTokens: number };
 }
 
@@ -729,7 +701,7 @@ export function evaluateEmergencyFailClosed(input: {
     emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
     foldMaterializedThisPass: boolean;
     finalWireEstimate?: { tokens: number; trusted: boolean };
-    /** A current-model limit parsed from a provider overflow response, never a catalog fallback. */
+    /** providerProvenLimitTokens comes only from a provider overflow response, never a catalog fallback. */
     providerProvenLimitTokens?: number;
 }): EmergencyFailClosedDecision {
     const estimate = input.finalWireEstimate;
@@ -751,9 +723,8 @@ export function evaluateEmergencyFailClosed(input: {
     if (input.usagePercentage < 95) {
         return { shouldAbort: false, reason: "below-emergency-band" };
     }
-    // Inside messages.transform, only the provider's own rejection proves that
-    // this turn shape overflows. Local numeric estimates remain telemetry until
-    // module-side accounting can reproduce provider-accurate framing.
+    // Only the provider's own rejection proves that a messages.transform turn shape overflows.
+    // Local numeric estimates remain telemetry until module-side accounting reproduces provider-accurate framing.
     const shouldAbort =
         input.emergencyRecoveryArmed &&
         input.emergencyRecoveryOrigin === "provider_overflow" &&
@@ -826,9 +797,6 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
-    // Capture before todo/history synthesis can add assistant messages. Anthropic
-    // requires the signed reasoning blocks from the newest assistant to be replayed
-    // unchanged, and OpenCode serializes these same in-memory message objects.
     let reasoningMutationExemptMessage: MessageLike | undefined;
     for (let index = args.messages.length - 1; index >= 0; index -= 1) {
         const message = args.messages[index];
@@ -836,10 +804,6 @@ export async function runPostTransformPhase(
         reasoningMutationExemptMessage = message;
         break;
     }
-    // `isExplicitFlush` reads pendingMaterializationSessions — the persistent
-    // "user wants pending ops + heuristics to run" signal. Survives across
-    // blocked defer passes (compartmentRunning) so /ctx-flush intent is not
-    // lost when historian races the user's command.
     const pendingMaterializationAtPassStart = args.pendingMaterializationSessions.has(
         args.sessionId,
     );
@@ -855,13 +819,6 @@ export async function runPostTransformPhase(
         args.fullFeatureMode &&
         !compactionOff &&
         args.contextUsage.percentage >= args.forceMaterializationPercentage;
-    // Tiered emergency drop eligibility (Phase 2). Unlike `forceMaterialization`
-    // (primary-only — it also forces m[0] materialization), the emergency tool
-    // floor fires at the derived force band for BOTH primary AND subagent: it's the only tool
-    // floor subagents have now that routine age-drops are gone. It's still a
-    // cache-busting-pass operation (selection persisted, defer passes replay),
-    // so it only runs when heuristics run (see shouldRunHeuristics) AND usage is
-    // ≥ the force-materialize threshold.
     const emergencyDropEligible =
         !compactionOff && args.contextUsage.percentage >= args.forceMaterializationPercentage;
     const activeCompartmentRun = args.canRunCompartments
@@ -910,9 +867,6 @@ export async function runPostTransformPhase(
     let m0MaterializeReason: string | null = null;
     if (foldDueDecision.value && args.m0M1) {
         try {
-            // Persist the fold before opening mutation gates. Omitting messages
-            // keeps this pre-execution off the outgoing wire; the injection phase
-            // below replays the persisted pair into the real message array.
             const foldResult = injectM0M1({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -959,24 +913,6 @@ export async function runPostTransformPhase(
             `m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"} executed=${foldExecutedThisPass}`,
         );
     }
-    // Bypass the compartment-running veto when this pass is busting the Anthropic
-    // prefix REGARDLESS — so the pending-op drain + heuristics ride that one bust
-    // instead of being deferred into a SECOND bust ~a turn later. Two cases:
-    //   - forceMaterialization (the derived force band): overflow prevention trumps cache stability.
-    //   - foldExecutedThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
-    //     re-caching m[0] this pass; the prefix is already gone, so draining into
-    //     it is free. Without this, a hard fold landing while the historian runs
-    //     leaves the drop vetoed -> it spills to a later soft bust (observed: a
-    //     system-prompt change folded m[0], then the 1807-op backlog drained ~30s
-    //     later as a second bust). Pi already gates this way (context-handler.ts).
-    // Safe in both cases because the historian and the drain touch DISJOINT DBs:
-    //   - Historian reads RAW OpenCode messages from opencode.db (read-only); its
-    //     in-flight snapshot is validated by computeRawRangeFingerprint, which
-    //     hashes raw content only (ids/part-types/lengths), NOT tag/drop state.
-    //   - Drops mutate context.db (tags + pending_ops) + the in-memory wire only.
-    //   - The historian's post-publish queueDropsForCompartmentalizedMessages is
-    //     idempotent against already-dropped tags (status !== "active"), so any
-    //     drain/publish ordering is benign.
     const bypassCompartmentGate = forceMaterialization || foldExecutedThisPass;
     const shouldReadPendingOps =
         !compactionOff &&
@@ -987,9 +923,6 @@ export async function runPostTransformPhase(
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
-    // Keep pending-op materialization coupled to the force signal itself. This
-    // prevents an escalation-band change from letting emergency cleanup mutate
-    // the wire while queued operations remain deferred.
     const shouldApplyPendingOps =
         !compactionOff &&
         (args.schedulerDecision === "execute" ||
@@ -997,69 +930,22 @@ export async function runPostTransformPhase(
             forceMaterialization ||
             foldExecutedThisPass) &&
         (!compartmentRunning || bypassCompartmentGate);
-    // Heuristic cleanup runs for ALL sessions — primary and subagent. Subagents
-    // previously skipped heuristics entirely (via fullFeatureMode gate), which
-    // meant their context grew unchecked until overflow. With this change,
-    // subagents run tool drops and reasoning clearing at execute threshold just
-    // like primary sessions, giving them a cache-safe reduction path without
     // needing historian/compartments.
     //
-    // `forceMaterialization` remains gated by `fullFeatureMode` above (line ~125)
-    // so subagents do NOT get force-band drop-all-tools or the 95% block. Subagents
-    // rely on normal overflow detection + clean failure if they exhaust context.
     //
-    // Subagent once-per-turn bypass: a subagent's entire lifecycle is one user
-    // turn from the parent's POV. Heavy subagents (Oracle, Athena council, etc.)
-    // perform 100s of tool calls within that single turn. With the once-per-turn
-    // guard enforced, only ONE cleanup pass fires (typically when context first
-    // crosses the execute threshold ~50%), and subsequent tool calls accumulate
-    // unchecked until overflow. The guard exists for primary-session cache
-    // stability (mid-turn rewrites would bust Anthropic prompt cache across the
-    // user's tool-call sequence). Subagents have no provider-cache reuse to
-    // protect — they're short-lived, one-shot, and their tool-call bursts
-    // already invalidate cache constantly. So we let subagents re-run heuristics
-    // on every execute pass. The `schedulerDecision === "execute"` gate still
-    // prevents per-defer-pass thrash; only passes the scheduler explicitly
-    // approves for execution can fire heuristics.
     const shouldRunHeuristics =
         !compactionOff &&
         (!compartmentRunning || bypassCompartmentGate) &&
         (materializationRequested ||
             forceMaterialization ||
-            // The off-wire fold landed, so the prefix already busted. Heuristics
-            // may ride it and bypass the once-per-turn guard without creating an
-            // independent mid-turn rewrite.
             foldExecutedThisPass ||
-            // the derived force band emergency floor for BOTH primary and subagent. For a primary
-            // this coincides with forceMaterialization (fullFeatureMode && the derived force band);
-            // for a subagent (no forceMaterialization) it's the only path that
-            // fires the tiered drop, even if the scheduler deferred mid-turn.
             emergencyDropEligible ||
             (args.schedulerDecision === "execute" &&
                 (!alreadyRanThisTurn || !args.fullFeatureMode)));
-    // Central cache-busting gate used by all mutation paths below.
     //
-    // Definition: TRUE only when this pass actually mutates message state —
-    // either by applying pending ops or by running heuristic cleanup. This
-    // is the Oracle 2026-04-26 fix: the previous `isExplicitFlush ||
-    // shouldApplyPendingOps` definition was unsafe because `isExplicitFlush`
-    // could be true even on a defer pass where compartmentRunning blocked
-    // both materialization and heuristics, causing cache-busting-only
-    // cleanup (placeholder detection, sticky reminder retirement, nudge
-    // anchor retirement) to fire on a pass that produced no real mutations.
     //
-    // Both `shouldApplyPendingOps` and `shouldRunHeuristics` already gate on
-    // `(!compartmentRunning || bypassCompartmentGate)` so they're
-    // genuine "will-actually-mutate" booleans. ORing them is the precise
-    // "did we mutate this pass" signal.
     //
-    // Symmetry note: `system-prompt-hash.ts` and `inject-compartments.ts`
-    // remain narrow (each reads its own dedicated set) so adjunct refresh
-    // and history rebuild are decoupled from materialization timing.
     const isCacheBustingPass = shouldApplyPendingOps || shouldRunHeuristics;
-    // ctx_reduce stays frozen for prompt-hash stability, but observe the live
-    // permission signal on the same busts so an operator knows guidance may be
-    // stale until the session restarts. This log never changes the wire.
     if (
         isCacheBustingPass &&
         args.client &&
@@ -1108,8 +994,6 @@ export async function runPostTransformPhase(
             `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=${args.currentTurnId}`,
         );
     }
-    // Only show "skipping" log for primary sessions — subagents bypass the
-    // once-per-turn guard and DO re-run, so logging "skipping" would be wrong.
     if (
         alreadyRanThisTurn &&
         args.schedulerDecision === "execute" &&
@@ -1172,17 +1056,6 @@ export async function runPostTransformPhase(
                 `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
             );
             const tApply = performance.now();
-            // P0 perf: don't pass `args.tags` here. applyPendingOperations
-            // genuinely needs the full tag set (including dropped/compacted
-            // rows it uses to skip already-processed pending ops), but the
-            // upstream `args.tags` is now active-only. Letting the function
-            // lazy-load via its own getTagsBySession() call inside the
-            // pending-ops transaction is the right behavior:
-            //   - Most passes have 0 pending ops and never reach this
-            //     branch, so the full-tags load is avoided entirely.
-            //   - When pending ops do exist (rare execute/flush passes),
-            //     the load runs once inside the same transaction the
-            //     mutations need, which is unavoidable.
             pendingOpsDidMutate = applyPendingOperations(
                 args.sessionId,
                 args.db,
@@ -1203,10 +1076,6 @@ export async function runPostTransformPhase(
         }
         if (shouldRunHeuristics) {
             const t5 = performance.now();
-            // Caveman config is only passed through for primary sessions when
-            // the experimental flag is true. Caller (transform) wires both
-            // conditions so this postprocess path doesn't need to re-check them.
-            // Kept undefined otherwise so the heuristic pass skips entirely.
             const cavemanConfig = args.cavemanTextCompression?.enabled
                 ? {
                       enabled: true,
@@ -1216,9 +1085,7 @@ export async function runPostTransformPhase(
             const heuristicTags = shouldApplyPendingOps
                 ? getActiveTagsBySession(args.db, args.sessionId)
                 : args.tags;
-            // Pending ops run just before heuristics and can drop active tags.
-            // Emergency floor math must see that post-op active set; otherwise
-            // already-reclaimed tags stay in floorTags and the planner over-evicts.
+            // Emergency floor math must use the post-operation active tag set.
             const cleanup = applyHeuristicCleanup(
                 args.sessionId,
                 args.db,
@@ -1226,11 +1093,6 @@ export async function runPostTransformPhase(
                 args.messageTagNumbers,
                 {
                     protectedTags: args.protectedTags,
-                    // Tiered emergency drop fires only at the derived force band (both primary and
-                    // subagent) AND only when the ceiling is known. Undefined
-                    // ceiling (cold start) or below-threshold usage → no
-                    // emergency arg → routine pass does dedup/injection-strip
-                    // only (Phase 2 removed need-blind routine tool drops).
                     emergency:
                         emergencyDropEligible &&
                         args.emergencyCeilingTokens !== undefined &&
@@ -1263,19 +1125,6 @@ export async function runPostTransformPhase(
             emergency ||= cleanup.emergencyDroppedTools > 0;
             emergencyReclaimedTokens += cleanup.emergencyReclaimedTokens;
             const t7 = performance.now();
-            // Typed reasoning clearing is canonical-Anthropic-only. clearOldReasoning
-            // rewrites a reasoning part's `thinking`/`text` to "[cleared]"; only
-            // stripClearedReasoning (gated on canUseEmptySentinels) then converts
-            // those shells to empty sentinels that OpenCode drops before the
-            // Anthropic wire. For any provider that is NOT canonical Anthropic the
-            // "[cleared]" string would remain inside the reasoning block on the
-            // wire — wrong, and a real hazard for non-canonical Claude proxies
-            // (github-copilot/bedrock-claude under a non-"anthropic" providerID),
-            // which validate thinking blocks. So gate the WRITE on the same
-            // canonical-Anthropic predicate as the converter; non-Anthropic
-            // providers keep their reasoning intact. Inline-thinking stripping
-            // below stays provider-independent (it removes literal <thinking> tags
-            // from text, never touches typed reasoning parts).
             const clearedReasoning = canUseEmptySentinels
                 ? clearOldReasoning(
                       args.messages,
@@ -1293,8 +1142,6 @@ export async function runPostTransformPhase(
                 args.clearReasoningAge,
             );
             if (clearedReasoning > 0 || strippedInline > 0) {
-                // Compute and persist the reasoning watermark so future defer passes
-                // can replay the same clearing without re-computing the cutoff.
                 let maxTag = 0;
                 for (const tag of args.messageTagNumbers.values()) {
                     if (tag > maxTag) maxTag = tag;
@@ -1321,14 +1168,6 @@ export async function runPostTransformPhase(
             heuristicOrReasoningDidMutate =
                 heuristicMutationCount + clearedReasoning + strippedInline > 0;
             droppedCount += clearedReasoning + strippedInline;
-            // ── Drain pendingMaterializationSessions ──
-            // Heuristics + materialization successfully ran on this pass.
-            // We've fulfilled every reason the set was added (user
-            // /ctx-flush, variant change, system-prompt hash change,
-            // historian publish), so clear the persistent signal. If
-            // compartmentRunning had blocked us above, this drain is
-            // intentionally NOT reached — the flag survives so the next
-            // safe pass picks up the work.
             if (pendingMaterializationAtPassStart) {
                 args.pendingMaterializationSessions.delete(args.sessionId);
             }
@@ -1336,8 +1175,6 @@ export async function runPostTransformPhase(
                 args.lastHeuristicsTurnId.set(args.sessionId, args.currentTurnId);
             }
         }
-        // After a TTL-based scheduler execute, reset lastResponseTime so
-        // subsequent transforms defer instead of re-executing every pass.
         if (args.schedulerDecision === "execute" && !materializationRequested) {
             updateSessionMeta(args.db, args.sessionId, { lastResponseTime: Date.now() });
         }
@@ -1354,11 +1191,6 @@ export async function runPostTransformPhase(
                 watermark: args.sessionMeta.toolReclaimWatermark ?? 0,
                 pendingOps,
             });
-            // Smart-drops: reclaim spent control-plane outputs that a later
-            // call supersedes (older todowrite/ctx_reduce/meta), and compress
-            // superseded edits to an edit_marker (keep filePath + region hint).
-            // Merged into the same gated apply as the age-based sweep. Dedupe
-            // against those ops (a tag can qualify under more than one rule).
             const editMarkerTagIds = new Set<number>();
             if (args.smartDrops) {
                 const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
@@ -1381,8 +1213,6 @@ export async function runPostTransformPhase(
                     pendingOps,
                 });
                 for (const op of editReclaim.ops) {
-                    // A superseded edit only compresses if no earlier rule already
-                    // selected it for a full/skeleton drop (drop wins; it reclaims
                     // strictly more).
                     if (!selectedIds.has(op.tagId)) {
                         syntheticPendingOps.push(op);
@@ -1446,24 +1276,7 @@ export async function runPostTransformPhase(
         updateSessionMeta(args.db, args.sessionId, { lastTransformError: getErrorMessage(error) });
     }
 
-    // Stale ctx_reduce strip is a REPLAY-class transform driven by a FROZEN,
-    // id-keyed watermark (`stale_reduce_stripped_ids`), mirroring reasoning /
     // placeholder replay:
-    //   • REPLAY (every pass, incl. defer): sentinel-strip ctx_reduce parts in
-    //     messages whose id is already frozen — byte-identical regardless of how
-    //     the live array grew.
-    //   • DETECT (cache-busting passes only): additionally find aged ctx_reduce
-    //     calls past the protected window, strip them, and CAS-persist their ids
-    //     so future passes replay them.
-    // The earlier "run every pass with a live messages.length-protectedTags
-    // boundary" version busted the Anthropic cache: tail growth moved the
-    // boundary, so a DEFER pass newly stripped an older ctx_reduce call
-    // mid-prefix (empty sentinel filtered for Anthropic + dropped tool_result →
-    // adjacent assistants merge → the message vanishes and the array shifts).
-    // Freezing the id set on bust passes and replaying it everywhere removes the
-    // moving boundary entirely. Empty reduce sentinels are Anthropic-only: on
-    // other providers even a previously frozen id must stay native so no empty
-    // text block can reach the wire.
     if (canUseEmptySentinels && !compactionOff) {
         try {
             const t8 = performance.now();
@@ -1486,12 +1299,6 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Processed-image strip — same REPLAY/DETECT freeze as stale ctx_reduce.
-    // The empty image sentinel is filtered off the Anthropic wire, so the first
-    // strip of a message removes its image blocks (a real byte change). Keying
-    // that first strip on the live watermark let a DEFER pass cross an older
-    // image message and remove its images mid-prefix, busting the cache.
-    // Freeze the id set on cache-busting passes; replay it every pass.
     if (canUseEmptySentinels && !compactionOff) {
         try {
             const tImg = performance.now();
@@ -1511,7 +1318,6 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Same gate computed once at the top for the known-bust fold decision.
     const m0M1Enabled = m0M1EnabledForFold;
     if (m0M1Enabled && args.m0M1) {
         const tInjectM0M1 = performance.now();
@@ -1530,9 +1336,6 @@ export async function runPostTransformPhase(
                 isCacheBustingPass,
                 hardSignals: args.m0M1.hardSignals,
                 muralEnabled: args.m0M1.muralEnabled,
-                // Compaction-off materializes through the zero-compartment
-                // path: memory/docs/user-profile render, but historical
-                // compartment rows never reach <session-history>.
                 compactionOff,
             });
             if (result.injected) {
@@ -1552,14 +1355,6 @@ export async function runPostTransformPhase(
                 "transform: m[0]/m[1] injection failed:",
                 getErrorMessage(error),
             );
-            // Fail-closed: prepareCompartmentInjection already spliced the
-            // summarized raw history out of `messages` (transform.ts), so if
-            // m[0]/m[1] injection throws, the model would otherwise receive
-            // NEITHER the raw history NOR <session-history> — silent context
-            // loss. Re-inject the prepared legacy block as a degraded fallback
-            // so the compacted history is still present this pass. This pass
-            // already busted (it threw), so the non-m0/m1 shape costs nothing;
-            // the next pass re-materializes the proper m[0]/m[1] layout.
             if (args.pendingCompartmentInjection) {
                 try {
                     const fallbackResult = renderCompartmentInjection(
@@ -1581,24 +1376,6 @@ export async function runPostTransformPhase(
                     );
                 }
             }
-            // History-loss guard: on a cache-busting pass,
-            // prepareCompartmentInjection (transform.ts) already trimmed the raw
-            // tail to the LATEST compartment AND cached that new boundary, and the
-            // explicit history-refresh signal was already drained. Since m[0]/m[1]
-            // injection just threw, the cached m[1] still reflects the PRE-failure
-            // compartment set. If we left the in-memory injection cache holding the
-            // new boundary, a later same-process DEFER pass would reuse it
-            // (isCacheBusting=false hits the cached path), trim the raw tail to the
-            // new boundary, and replay the stale m[1] — so a compartment published
-            // this turn would be summarized in NEITHER m[1] NOR the raw tail =
-            // silent history loss persisting past this pass. Clearing the cache
-            // forces the next defer pass through the cold-rebuild path, which trims
-            // only to the persisted baseline boundary the cached m[1] actually
-            // covers (keeping the new compartment's raw messages visible until a
-            // later exec pass folds them). We intentionally do NOT re-arm the
-            // refresh signal: a persistent injection failure would then bust the
-            // cache every pass; the scheduler's next natural execute pass retries
-            // materialization on its own.
             clearInjectionCache(args.sessionId);
         }
         logTransformTiming(args.sessionId, "pp.injectM0M1", tInjectM0M1);
@@ -1626,28 +1403,13 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Neutralize messages that are nothing but [dropped §N§] placeholders,
-    // plus system-injected messages (notifications, reminders, internal markers).
-    // Both produce IDENTICAL empty-text-sentinel replacements that preserve array
-    // length between passes — cache-stable for both Anthropic-native (where
-    // OpenCode's upstream filter drops the empty parts at the wire) and proxy
-    // providers that hash the serialized message array.
     //
-    // MUST run AFTER compartment injection: renderCompartmentInjection checks whether
-    // messages[0] is a dropped placeholder to decide if it needs a synthetic carrier message.
     //
-    // Cache-safe: replay previously-neutralized IDs on every pass, only detect new
-    // matches on cache-busting passes. Persist the merged set (placeholder + system-
-    // injected) so defer passes produce the same message shape as the bust pass.
     //
-    // Compaction-off: placeholder/system-injected neutralization is strip
-    // machinery — gated off; the wire keeps its original shape.
     if (!compactionOff) {
         const tPlaceholder = performance.now();
         const persistedIds = getStrippedPlaceholderIds(args.db, args.sessionId);
 
-        // Step 1: Replay — re-apply sentinel to messages whose IDs were neutralized
-        // on a prior bust pass. Preserves array length — no splice.
         if (persistedIds.size > 0) {
             const { replayed, missingIds } = replaySentinelByMessageIds(
                 args.messages,
@@ -1660,19 +1422,12 @@ export async function runPostTransformPhase(
                     `sentinel replay: neutralized ${replayed} previously-stripped messages`,
                 );
             }
-            // Prune IDs that no longer appear in the live message set (e.g., after
-            // compaction trimmed them out entirely). Don't prune if they're present
-            // but already sentinel — those are working as intended.
             if (missingIds.length > 0) {
                 for (const id of missingIds) persistedIds.delete(id);
-                // CAS delta (remove) so a sibling process discovering new IDs in
-                // parallel isn't clobbered by this prune's whole-set overwrite.
                 applyStrippedPlaceholderDelta(args.db, args.sessionId, { remove: missingIds });
             }
         }
 
-        // Step 2: Detect — only on cache-busting passes, find NEW eligible messages
-        // and persist their IDs so future defer passes can replay.
         if (isCacheBustingPass) {
             const droppedResult = stripDroppedPlaceholderMessages(
                 args.messages,
@@ -1694,8 +1449,6 @@ export async function runPostTransformPhase(
                     ...systemInjectedResult.sentineledIds,
                 ];
                 for (const id of addedIds) persistedIds.add(id);
-                // CAS delta (add) so a concurrent prune in a sibling process
-                // doesn't clobber these newly-discovered IDs.
                 applyStrippedPlaceholderDelta(args.db, args.sessionId, { add: addedIds });
                 sessionLog(
                     args.sessionId,
@@ -1706,25 +1459,13 @@ export async function runPostTransformPhase(
         logTransformTiming(args.sessionId, "pp.placeholderNeutralize", tPlaceholder);
     }
 
-    // The in-turn ctx_reduce nudge (Channel 1) is injected into tool outputs in
-    // tool.execute.after and persisted by OpenCode, so it needs no transform-side
-    // replay. The old rolling/iteration assistant-anchored nudges and the
-    // tool-heavy sticky user-message reminder were removed (their buried-anchor
-    // first-append busted the Anthropic prompt-cache prefix). Their persisted
-    // state is zeroed by migration v31; no code reads it anymore.
-
     const tNudgeBlock = performance.now();
 
-    // Sticky-injection replay (§2.4): every pass replays every persisted anchor
-    // so cached user-message bytes remain identical until that message leaves
-    // the visible window. Prune happens later, only on cache-busting passes.
     if (args.fullFeatureMode && !compactionOff) {
         for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }
         for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-            // Anti-memory warnings require a fresh search; stored decisions
-            // replay only when they contain no warning fragments.
             if (
                 decision.decision === "hint" &&
                 autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
@@ -1734,11 +1475,6 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Visibility check: scan the post-drop messages array for a non-stripped
-    // ctx_note(action="read") tool call. This decides whether the suppression
-    // path inside `peekNoteNudgeText` should fire — see the comment block
-    // there for the full rationale. Only computed when nudges can actually
-    // fire (fullFeatureMode), so we skip the scan in subagent sessions.
     logTransformTiming(args.sessionId, "pp.nudgeAndSticky", tNudgeBlock);
 
     const explicitRebuildHappened =
@@ -1754,8 +1490,6 @@ export async function runPostTransformPhase(
             explicitRebuildHappened) &&
         materializationSatisfied;
 
-    // Drain the persisted marker before todo synthesis so the todo anchor sees
-    // the same summary representation that this pass will emit.
     let suppressV12HistoryDrain = false;
     if (historyWasConsumedThisPass && args.deferredHistoryWasPendingAtPassStart) {
         const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
@@ -1804,11 +1538,6 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Compaction-off: the marker reconciler and the deferred marker drain are
-    // compaction machinery — gated off. The off-transition deletes the MC
-    // marker rows and clears the persisted/pending marker state, so nothing
-    // here has state to replay; leaving it live would re-insert a synthetic
-    // summary into the wire of a mode that must stay additive-only.
     if (!compactionOff) {
         reconcileMarkerRepresentation(
             args.messages,
@@ -1866,8 +1595,6 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Todo state synthesis is deliberately isolated so its live permission
-    // refresh and cache-boundary behavior can be tested independently.
     if (args.fullFeatureMode && !compactionOff) {
         prependedMessageCount += await applyTodoSynthesis({
             db: args.db,
@@ -1885,17 +1612,7 @@ export async function runPostTransformPhase(
 
     logTransformTiming(args.sessionId, "pp.noteAndTodoSynthesis", tNoteAndTodo);
 
-    // Auto-search hint — append a vague-recall fragment hint to the latest
-    // user message when experimental.auto_search is enabled and search
-    // returns a high-confidence match. Gated behind fullFeatureMode: subagent
-    // sessions (historian, compressor, dreamer child tasks, council members,
-    // etc.) are driven by the main agent via prompt injection, not by the
-    // user. There is no user prompt to semantically ground against, and
-    // running embedding on subagent input wastes cycles + saturates the
-    // embedding endpoint when many subagents run in parallel (e.g. Athena
     // council).
-    // Degraded-cache counter: track consecutive null-boundary rebuilds.
-    // This bookkeeping is independent of marker reconciliation.
     if (args.compartmentInjectionRebuiltFromDb && args.pendingCompartmentInjection) {
         if (args.pendingCompartmentInjection.compartmentEndMessageId === null) {
             const nextCount = (degradedCacheCountBySession.get(args.sessionId) ?? 0) + 1;
@@ -1931,13 +1648,6 @@ export async function runPostTransformPhase(
         deferredMaterializedSuccessfully ||
         heuristicsRanSuccessfully ||
         pendingOpsRanSuccessfully;
-
-    // Work-metrics (TUI sidebar Stats) are NOT computed here. They are a
-    // display-only value read solely by the RPC sidebar handler, and the
-    // computation is O(session age) — it was the dominant transform cost on
-    // long sessions when run every pass. It now runs lazily and incrementally
-    // in buildSidebarSnapshot (rpc-handlers.ts) when the TUI actually polls,
-    // keeping the prompt path free of it.
 
     if (workExecutedSuccessfully) {
         try {
@@ -2017,9 +1727,6 @@ export async function runPostTransformPhase(
         (m0M1InjectedThisPass && historyWasConsumedThisPass) ||
         historyWasConsumedThisPass;
 
-    // Final representation strips run once, after all topology mutations; execute
-    // and defer must serialize identical prefixes. Do not add message, tool-target,
-    // or role-topology mutations below this phase.
     //
     if (reasoningMutationTargetUnknown) {
         const reasoningCandidates =
@@ -2035,20 +1742,6 @@ export async function runPostTransformPhase(
         }
     }
 
-    // The original corpus was already cleared in transform.ts. After that point,
-    // only explicit injection results add messages, while flushed/pending tool or
-    // text drops can rewrite an owning assistant's reasoning to `[cleared]`. Todo synthesis,
-    // notes, marker reconciliation, and auto-search add only tool/text parts, so
-    // they cannot create a cleared reasoning shell. Keeping the exact injected
-    // head count plus owning mutation targets preserves the old full-array result
-    // without repeating its O(session) walk. A legacy/custom target that omits its
-    // owner pays one mutation-pass discovery scan above; steady defer never does.
-    // Merged-assistant reasoning follows the same frozen WRITE/REPLAY split as
-    // stale ctx_reduce and processed images. Detection opens only on the shared
-    // cache-busting gate; replay applies the persisted id set on every pass.
-    // Persist before first mutation so a fresh defer rebuild can always reproduce
-    // any stripped bytes. The newest assistant is excluded from both detection
-    // and replay because Anthropic requires its signed blocks byte-identically.
     const mergedReasoningStrippedIds = new Set<string>();
     if (canUseEmptySentinels && !compactionOff) {
         try {
@@ -2120,19 +1813,11 @@ export async function runPostTransformPhase(
     );
 
     if (canUseEmptySentinels && !compactionOff) {
-        // Observe every served pass, including defers. A newly completed assistant is
-        // recorded while it is newest, before a provider can append a blank to the
-        // rebuilt historical message. If a late blank arrives while it is still newest,
-        // refresh its choice; the newest exemption leaves those live bytes untouched.
         const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
             { refreshMessageId: newestAssistantId },
         );
-        // A defer pass can safely establish only the newest assistant's shape: it
-        // has no cached continuation after it. Historical messages without a prior
-        // decision wait for an independent cache-busting pass rather than guessing
-        // from bytes that the provider may already have changed.
         const candidates = isCacheBustingPass
             ? detectedCandidates
             : detectedCandidates.filter(([id]) => id === newestAssistantId);
@@ -2150,9 +1835,6 @@ export async function runPostTransformPhase(
                         trailingBlankDecisions.set(id, decision);
                         newlyFrozen.set(id, decision);
                     }
-                    // Apply a new keep decision while the assistant is still newest
-                    // so whitespace becomes canonical without changing the recorded
-                    // suffix length. A strip decision remains exempt while it is live.
                     applyFrozenTrailingBlankDecisions(
                         args.messages,
                         newestAssistantId,
@@ -2267,8 +1949,6 @@ export async function runPostTransformPhase(
                 );
             }
         } catch (error) {
-            // This diagnostic must never interrupt a turn. The tail baseline still
-            // guides the nudge, and the next served pass can refresh it.
             sessionLog(
                 args.sessionId,
                 "ERROR [tail-hygiene-last-writer-check-failed]: structural production guard failed open:",

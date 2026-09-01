@@ -4,14 +4,7 @@ import { convertEntriesToRawMessages } from "../read-session-pi";
 import { loadDefaultPiSessionApi } from "./pi-session-api";
 
 /**
- * Pi `primerRawProviderFactory`: resolve a historical session id to a
- * `RawMessageProvider` over its JSONL, so refresh-primers can render the
- * orientation seed on Pi-only installs (no opencode.db).
  *
- * Discovery is async (listSessions / loadEntriesFromFile), so this returns a
- * Promise; the produced provider's `readMessages()` is synchronous (it wraps the
- * already-loaded RawMessage[]). Returns null when the session can't be resolved
- * or has no entries → refresh-primers falls back to closed-book for that primer.
  */
 export interface PiPrimerRawProviderDeps {
 	listSessions?: (sessionDir?: string) => unknown[] | Promise<unknown[]>;

@@ -2,18 +2,18 @@
 
 ## Discovery trigger
 
-`crates/mc-host/src/ring_transport.rs:279` wraps the whole of `run_endpoint` in
+`crates/mc-host/src/ring_transport.rs:264` wraps the whole of `run_endpoint` in
 `std::panic::catch_unwind` and discards the result with `let _ =`. Reading what
-runs after it — `admission.release()` at `:291` and `done_tx.send(())` at `:292`
+runs after it — `admission.release()` at `:276` and `done_tx.send(())` at `:277`
 — showed that the panic and the orderly exit produce identical observable
-effects. A second, narrower `catch_unwind` inside `publish_one` (`:560-563`)
+effects. A second, narrower `catch_unwind` inside `publish_one` (`:584-587`)
 then raised the question of what sits outside it.
 
 ## Evidence trail
 
 **Two nested `catch_unwind` scopes, with a gap between them.**
 
-Inner (`:560-563`): wraps only the reserve-fill-commit block.
+Inner (`:584-587`): wraps only the reserve-fill-commit block.
 
 ```
 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match direct {
@@ -28,51 +28,51 @@ if !matches!(result, Ok(Ok(()))) {
 So a panic in the serializer becomes `Err(())`, which routes into
 `ring-a-publish-failure-is-reported-as-a-clean-peer-close`. That is handled.
 
-The gap is `:567-576`, after the inner scope closes:
+The gap is `:591-600`, after the inner scope closes:
 
 ```
-completion.store(COMPLETE, Ordering::Release);   // :567
-if let Some(hook) = publish_hook {               // :568
+completion.store(COMPLETE, Ordering::Release);   // :591
+if let Some(hook) = publish_hook {               // :592
     if let Some(header) = wire_header.and_then(|header| decode_header(&header).ok()) {
-        hook(header.ty, header.channel);         // :570
+        hook(header.ty, header.channel);         // :594
     }
 }
-if let Some(written) = written {                 // :573
-    written(Instant::now());                     // :574
+if let Some(written) = written {                 // :597
+    written(Instant::now());                     // :598
 }
-drop(charge);                                    // :576
+drop(charge);                                    // :600
 ```
 
-`hook` is a `PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>` (`:39`).
+`hook` is a `PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>` (`:36`).
 `written` is `Option<Box<dyn FnOnce(Instant) + Send>>`
 (`frame_channel.rs:630`). Both are caller-supplied closures called with no
 boundary. `panic_boundary::redact_sync` wraps only the direct serializer
-(`:586-589`), inside the inner scope, not these.
+(`:610-613`), inside the inner scope, not these.
 
-Outer (`:279-290`): wraps `runtime.block_on(run_endpoint(..))`. Its result is
+Outer (`:264-275`): wraps `runtime.block_on(run_endpoint(..))`. Its result is
 discarded. Then:
 
 ```
-admission.release();     // :291
-let _ = done_tx.send(());// :292
+admission.release();     // :276
+let _ = done_tx.send(());// :277
 ```
 
 **What the connection engine observes on that path.** `done_tx` is the sender
-half of the oneshot created at `:248`; the `io` future is
-`async move { let _ = done_rx.await; }` (`:301-303`). `connection.rs:190`
+half of the oneshot created at `:233`; the `io` future is
+`async move { let _ = done_rx.await; }` (`:286-288`). `connection.rs:190`
 spawns it as `AbortOnDropHandle` and `connection.rs:347` awaits it. A completed
 oneshot means the `io` future resolves, so the join at `:347` succeeds exactly as
 it would after an orderly exit.
 
 **What is not cancelled.** On this path neither `queue.retired` nor `root` is
-cancelled. Contrast the two paths that do cancel: `:402-403` (inbound close) and
-`:448-449` (publish failure). So after the panic the `FrameSender` is still live:
+cancelled. Contrast the paths that do cancel: `:408-409` (inbound close) and
+`:480-481` (publish failure). So after the panic the `FrameSender` is still live:
 `FrameSender::is_retired` (`frame_channel.rs:755-757`) returns false, and
 `send_ticket_before` (`:727-753`) keeps admitting frames into the mpsc until
 either the channel fills or `timeout_at(deadline, ..)` expires at `:742-750`,
 at which point it cancels `retired` and `generation` itself.
 
-**The `COMPLETE` store ordering.** `:567` stores `COMPLETE` before the hooks
+**The `COMPLETE` store ordering.** `:591` stores `COMPLETE` before the hooks
 run. The constant is `pub(crate) const COMPLETE: u8 = 3`
 (`frame_channel.rs:636`). So a frame whose `written` hook panics is already
 recorded complete, and the panic then loses the thread. The frame did reach the
@@ -109,26 +109,27 @@ defect in the completion path.
 
 Sequence: frame published to the ring, peer can see it, `COMPLETE` stored, hook
 panics, unwind through `publish_one` and `run_endpoint`, `DuplexRing` dropped
-during unwind (it is owned by `run_endpoint`'s frame, `:365`), `catch_unwind`
+during unwind (it is owned by `run_endpoint`'s frame, `:359-368`), `catch_unwind`
 swallows, charge released, `done_tx` fired, thread gone.
 
 Now the connection has no transport thread and does not know it. Inbound: the
 `inbound` sender was dropped during unwind, so `ShmReceiver::recv` yields
-`Err(ReadClose::CleanEof)` (`:359`) and the read loop retires as
+`Err(ReadClose::CleanEof)` (`:354`) and the read loop retires as
 `ReadExit::Peer` — the same misattribution as
 `ring-a-publish-failure-is-reported-as-a-clean-peer-close`. Outbound: frames
 admitted between the panic and the read loop noticing sit in the mpsc and each
 eventually fails its own admission deadline.
 
-Diagnostics: `state: "healthy"`, all five counters unchanged. Nothing anywhere
+Diagnostics: `state: "healthy"`, all four counters unchanged (post-#131 the
+`attachment` counter is removed). Nothing anywhere
 records that a thread panicked.
 
 ## Timing windows and dependencies
 
 Two windows.
 
-- `:567` to `:576`, one publication wide. Entered on every published frame that
-  has a hook. The panic must originate in `hook` (`:570`) or `written` (`:574`).
+- `:591` to `:600`, one publication wide. Entered on every published frame that
+  has a hook. The panic must originate in `hook` (`:594`) or `written` (`:598`).
 - `frame_channel.rs:648` to `:655`, inside `begin_publication`. Entered on every
   frame that carries an `on_publish` callback.
 
@@ -137,14 +138,15 @@ which covers completion-hook panics on the *writer task*. This is a different
 owner — the endpoint OS thread — with a different boundary, namely none. The two
 records are complementary and neither subsumes the other. Part 2a also owns
 `a-cancelled-emission-releases-every-permit-it-held`; note that on this path the
-`charge` local of `publish_one` (`:550`) is dropped by the unwinding machinery, so
+`charge` local of `publish_one` (destructured at `:568-574`) is dropped by the
+unwinding machinery, so
 the byte charge does return, which is worth stating because it is the one thing
 the panic path gets right by accident.
 
 ## What a test must construct
 
 The publish hook is the injection point already in the tree, and it is honest
-about being test-only (`:225-231`, `#[doc(hidden)]`, doc comment "Test hook").
+about being test-only (`:209-215`, `#[doc(hidden)]`, doc comment "Test hook").
 
 1. Build a host through `runtime::run_with_publish_hook`
    (`runtime.rs:643-648`), which is how `tests/support/mod.rs:597` and `:614`
@@ -172,8 +174,8 @@ closure in the same position.
 
 ### Q: Should the `COMPLETE` store move after the hooks, or should the hooks move inside the inner `catch_unwind`?
 
-- Sources examined: `ring_transport.rs:560-577` (both scopes and the gap),
-  `:586-589` (`redact_sync` around the serializer only),
+- Sources examined: `ring_transport.rs:584-600` (both scopes and the gap),
+  `:610-613` (`redact_sync` around the serializer only),
   `frame_channel.rs:633-636` (the four state constants),
   `frame_channel.rs:645-657` (`begin_publication`),
   `frame_channel.rs:674-682` (`FrameSendTicket::cancel`).
@@ -188,7 +190,7 @@ closure in the same position.
   `ring-a-publish-failure-is-reported-as-a-clean-peer-close`.
 - Missing evidence: whether any host code waits on `COMPLETE` specifically
   rather than on the `written` hook. `COMPLETE` is `pub(crate)` and its only
-  writer is `:567`; I did not enumerate its readers outside this file.
+  writer is `:591`; I did not enumerate its readers outside this file.
 - Conclusion: unresolved on the fix, resolved on the analysis: wrapping the
   hooks is the coherent option and moving the store is not. The remaining gap is
   the `COMPLETE` reader enumeration, which sits in Part 2a's `dispatch.rs` and
@@ -196,9 +198,9 @@ closure in the same position.
 
 ### Q: Does the outer `catch_unwind` swallow a panic that `panic_boundary` would otherwise have reported?
 
-- Sources examined: `ring_transport.rs:279-290`; `lib.rs:30` (`mod
+- Sources examined: `ring_transport.rs:264-275`; `lib.rs:28` (`mod
   panic_boundary`, private); `runtime.rs` installs it via
-  `crate::panic_boundary::install()` at `runtime.rs:647`.
+  `crate::panic_boundary::install()` (`runtime.rs`; not re-swept post-#131).
 - Findings: `panic_boundary::install()` installs a process panic hook, and a
   panic hook runs *before* unwinding begins, so it fires even when the panic is
   later caught. So the panic is not entirely invisible: the hook sees it. What is

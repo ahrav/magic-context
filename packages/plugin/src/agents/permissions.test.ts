@@ -21,10 +21,7 @@ describe("buildAllowOnlyPermission", () => {
     });
 
     it("places named allows AFTER the wildcard deny so findLast-semantics make them win", () => {
-        // OpenCode's Permission.evaluate uses `findLast` over the ruleset
-        // built from this object's insertion order. If "*" appeared after a
-        // named tool, the deny would clobber it — guard against accidental
-        // regressions in the helper's ordering.
+        // Permission.evaluate uses insertion-order rules with `findLast`; a wildcard after a named tool denies that tool.
         const perm = buildAllowOnlyPermission(["read"]);
         const keys = Object.keys(perm);
         const wildcardIdx = keys.indexOf("*");
@@ -33,15 +30,13 @@ describe("buildAllowOnlyPermission", () => {
     });
 
     it("never accidentally allows `task`, `bash`, or `edit` unless explicitly listed", () => {
-        // The whole point of this helper is preventing historian / dreamer /
-        // sidekick from inheriting the primary-agent surface. Lock that in.
         const perm = buildAllowOnlyPermission(["read"]);
         expect(perm.task).toBeUndefined();
         expect(perm.bash).toBeUndefined();
         expect(perm.edit).toBeUndefined();
         expect(perm.webfetch).toBeUndefined();
         expect(perm.websearch).toBeUndefined();
-        // The wildcard deny covers them via findLast — verified above.
+        // The wildcard deny covers omitted tools through `findLast`.
     });
 
     it("returns an empty allow-list as just the wildcard deny", () => {
@@ -52,15 +47,10 @@ describe("buildAllowOnlyPermission", () => {
 
 describe("HISTORIAN_ALLOWED_TOOLS", () => {
     it("includes `read` (for state-file offload)", () => {
-        // Historian's primary tool need is reading the offloaded
-        // existing-state XML the runner writes to a temp file.
         expect(HISTORIAN_ALLOWED_TOOLS).toContain("read");
     });
 
     it("includes `aft_outline`, `aft_zoom`, `aft_search` for token-efficient repo navigation/search", () => {
-        // Read-only AFT navigation + search tools let historian/compressor
-        // find or verify a symbol or skim file structure when writing
-        // accurate compartment summaries without dragging in whole files.
         expect(HISTORIAN_ALLOWED_TOOLS).toContain("aft_outline");
         expect(HISTORIAN_ALLOWED_TOOLS).toContain("aft_zoom");
         expect(HISTORIAN_ALLOWED_TOOLS).toContain("aft_search");
@@ -77,8 +67,6 @@ describe("HISTORIAN_ALLOWED_TOOLS", () => {
     });
 
     it("does NOT include `grep` or `glob` (historian summarizes, not explores)", () => {
-        // Historian's job is summarizing the input it was given.
-        // Repo-wide exploration belongs to dreamer / primary agents.
         expect(HISTORIAN_ALLOWED_TOOLS).not.toContain("grep");
         expect(HISTORIAN_ALLOWED_TOOLS).not.toContain("glob");
     });
@@ -127,13 +115,6 @@ describe("applyDisallowedTools", () => {
 
 describe("DREAMER_CURATE_ALLOWED_TOOLS (base dreamer = curate only)", () => {
     it("is EMPTY — curate calls no tools; the host applies its manifest", () => {
-        // Curate emits one XML manifest and the host validates it and applies
-        // every claim write inside a single guarded transaction, which is
-        // curate's only write path. Granting ctx_memory would expose
-        // list/create/revise/archive/restore/merge to the model and let a run
-        // mutate claims outside that transaction. A separate verify task owns
-        // memory-vs-code correctness, so curate needs no read/grep/bash/
-        // write/edit surface either.
         expect([...DREAMER_CURATE_ALLOWED_TOOLS]).toEqual([]);
     });
 
@@ -182,23 +163,16 @@ describe("DREAMER_DOCS_ALLOWED_TOOLS (maintain-docs)", () => {
 
 describe("SIDEKICK_ALLOWED_TOOLS", () => {
     it("includes ctx_search but not ctx_memory for retrieval", () => {
-        // Sidekick is the /ctx-aug memory retriever. It searches memories without
-        // receiving the mutation-capable ctx_memory tool.
         expect(SIDEKICK_ALLOWED_TOOLS).toContain("ctx_search");
         expect(SIDEKICK_ALLOWED_TOOLS).not.toContain("ctx_memory");
     });
 
     it("includes `aft_outline` and `aft_zoom` for lightweight structural context", () => {
-        // Sidekick can pull file outline / symbol body when the user's
-        // prompt references a specific file or symbol, without dragging
-        // in whole files.
         expect(SIDEKICK_ALLOWED_TOOLS).toContain("aft_outline");
         expect(SIDEKICK_ALLOWED_TOOLS).toContain("aft_zoom");
     });
 
     it("does NOT include `read` (use aft_outline/aft_zoom for navigation instead)", () => {
-        // Sidekick should pull symbol-scoped views, not arbitrary file
-        // contents. If it needs full source it can use aft_zoom on a
         // specific symbol.
         expect(SIDEKICK_ALLOWED_TOOLS).not.toContain("read");
     });
@@ -223,9 +197,6 @@ describe("integration: full hidden-agent permission shape", () => {
     });
 
     it("base dreamer (curate) permission object: `*` denied with no allow entry at all", () => {
-        // An empty allow-list contributes no keys, so the object is the bare
-        // wildcard deny: the curate session inherits none of the primary-agent
-        // tool surface, ctx_memory included.
         const perm = buildAllowOnlyPermission(DREAMER_CURATE_ALLOWED_TOOLS);
         expect(perm).toEqual({ "*": "deny" });
         expect(Object.keys(perm)).toEqual(["*"]);

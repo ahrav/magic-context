@@ -33,7 +33,7 @@ pub(crate) fn segmented(
 
 **Caller enumeration.** `InboundFrame::segmented` has **zero** call sites in the
 tree, including tests. The only `InboundFrame` constructor call on the host
-inbound path is `ring_transport.rs:528`:
+inbound path is `ring_transport.rs:552`:
 
 ```
 inbound.send(Ok(InboundEvent::Frame(InboundFrame::owned(
@@ -77,16 +77,16 @@ through the explicit copying adapter first") describes a path that cannot be
 taken, because the flattening already happened one layer down.
 
 **Where the flattening actually happens.** `receive_one` collapses the span
-structure with `lease.to_vec()` at `ring_transport.rs:519-521`, before the host
+structure with `lease.to_vec()` at `ring_transport.rs:543-545`, before the host
 ever sees it. `ReceiveLease::to_vec`
-(`crates/mc-shm-transport/src/lease.rs:178-205`) walks
-`0..span_count` and copies each span into one contiguous `Vec`. The transport
+(`crates/mc-shm-transport/src/lease.rs`; not re-swept post-#131) walks
+the spans and copies each into one contiguous `Vec`. The transport
 does produce two spans when a body straddles the arena wrap
-(`ring.rs:816-823` sets `second` when `validated.span_count() == 2`), so the
+(`ring.rs:1105-1112` sets `second` when `validated.span_count() == 2`), so the
 segmented case is real at the transport layer and is erased at the host boundary.
 
 **The same erasure on the peer side.** `RingClientEndpoint::try_recv_with`
-(`ring_transport.rs:694-709`) also calls `lease.to_vec()` at `:706`. So neither
+(`ring_transport.rs:723-739`) also calls `lease.to_vec()` at `:735`. So neither
 end of the in-process pair ever observes span structure.
 
 **Three sibling abstractions in the same position.** All test-only, all with no
@@ -99,7 +99,7 @@ production caller:
 - `frame_channel::ProducerReservation` (`:117-226`). Referenced only at
   `contract_tests.rs:531`, `:564`, `:598`, `:607`, `:622`. `ring_transport.rs`
   imports `mc_shm_transport::backend::ring::ProducerReservation` instead
-  (`ring_transport.rs:14`).
+  (`ring_transport.rs:15`).
 - `ProducedBody` (`:231-288`), whose `into_charge` (`:283-287`) has no caller at
   all. Its doc at `:113-115` states the design intent that is now unexercised:
   the charge "moves into `ProducedBody` on success and drops immediately on
@@ -108,13 +108,13 @@ production caller:
 
 The ring path does not use that ownership property. It uses the transport's own
 reservation, whose charge return is the transport's `Drop`
-(`ring.rs:1399` onward), and the host's outbound `ByteCharge` is dropped
-explicitly at `ring_transport.rs:576`.
+(`ring.rs:1814` onward), and the host's outbound `ByteCharge` is dropped
+explicitly at `ring_transport.rs:600`.
 
 ## Failure scenario
 
 No runtime defect. Every inbound frame is copied exactly once, `CopyCounter`
-records exactly one (`ring_transport.rs:525-526`), and the accounting is
+records exactly one (`ring_transport.rs:549-550`), and the accounting is
 truthful.
 
 The consequences are about what is not tested and what a reader will believe.
@@ -127,7 +127,7 @@ bounds (enforced by the two compile-fail doctests at `:296-308`) protect against
 escaping a copy, not against escaping shared memory. The protection that matters,
 not holding a reference into peer-writable storage, is Part 1's
 `no-rust-reference-over-peer-writable-payload` and it is satisfied by the copy at
-`:519`, not by the lease type.
+`:544`, not by the lease type.
 
 Second, the wrap-around case is untested end to end at the host boundary. A body
 straddling the arena wrap produces two spans in the transport, and the host's
@@ -158,7 +158,7 @@ Dependencies:
   `Reaches production: yes` and covers the charge-versus-copy accounting; this
   record establishes that there is exactly one copy to account, always.
 - `ring-a-ingress-wait-holds-a-lease-while-servicing-egress` shares the same
-  window, since the copy at `:519` is what finally ends the lease's life.
+  window, since the copy at `:544` is what finally ends the lease's life.
 
 ## What a test must construct
 
@@ -168,15 +168,16 @@ two things the dead path was standing in for.
 1. **Wrap-around body, end to end.** Fill the arena so the next body straddles
    the wrap point, publish it peer-to-host, and assert the host delivers the
    exact bytes. This exercises `to_vec`'s two-span loop
-   (`lease.rs:178-205`) through the production path, which is the real
-   obligation. The arena is `mc_shm_transport::MIN_ARENA_BYTES`
-   (`ring_transport.rs:48`) and the descriptor depth is 8 (`:32`), so filling it
+   (`lease.rs`; not re-swept post-#131) through the production path, which is
+   the real
+   obligation. The arena is `mc_shm_transport::MIN_ARENA_BYTES` (asserted at
+   `ring_transport.rs:905`) and the descriptor depth is 8 (`:903`), so filling it
    is a matter of publishing and releasing enough frames to advance the write
    cursor near the end.
 2. **Copy count is exactly one.** Already covered by
    `copied_control_frame_records_one_host_adapter_copy`
-   (`ring_transport.rs:881-926`), which asserts
-   `frame.copy_counter().copies() == 1` at `:925`. That test does not run in CI.
+   (`ring_transport.rs:961-1005`), which asserts
+   `frame.copy_counter().copies() == 1` at `:1004`. That test does not run in CI.
 
 Then, separately, a decision on the three dormant abstractions. If they are to
 be kept, the honest marking is `#[expect(dead_code, reason = ...)]` with a true
@@ -194,8 +195,8 @@ contract-test blocks at `contract_tests.rs:527-700`.
   (`ProducerReservation`'s charge-ownership doc), `:395-397` (`LeaseTracker`'s
   "Testable close gate used by transport implementations"), `:446-490`
   (`ReceiveBody` and both constructors), `:506-534` (`with_lease`,
-  `into_owned`); `ring_transport.rs:14` (which reservation type the ring
-  actually imports), `:519-530` (the copy and the `owned` construction);
+  `into_owned`); `ring_transport.rs:15` (which reservation type the ring
+  actually imports), `:543-556` (the copy and the `owned` construction);
   `connection.rs:577-587`; `contract_tests.rs:527-700` (the
   `ownership_contract` module).
 - Findings: the three dormant abstractions form a coherent design that a
@@ -206,7 +207,7 @@ contract-test blocks at `contract_tests.rs:527-700`.
   that made it necessary: "U1 has no backend wait primitive, so active storage
   takes the allowed bounded-quarantine branch." The ring backend does have a wait
   primitive of a sort, the `try_receive` lease-saturation return
-  (`ring.rs:770-778`), so the constraint no longer applies.
+  (`ring.rs:1063-1068`), so the constraint no longer applies.
 - Missing evidence: whether a second backend is planned.
   `docs/mc-host-shm-transport.md:7` says there is no alternate shared-memory
   backend and the `mandatory-ring-architecture` gate enforces it, which argues
@@ -222,16 +223,16 @@ contract-test blocks at `contract_tests.rs:527-700`.
 ### Q: Does the host boundary satisfy the docs' scoped-lease obligation?
 
 - Sources examined: `docs/mc-host-shm-transport.md:19`;
-  `docs/mc-host-wire-protocol.md:294`; `ring.rs:803-845` (the transport's
-  validate-then-lease sequence); `ring_transport.rs:471-473` (the host's header
-  validation) and `:519-524` (copy then release);
+  `docs/mc-host-wire-protocol.md:294`; `ring.rs:1076-1134` (the transport's
+  validate-then-lease sequence); `ring_transport.rs:503-505` (the host's header
+  validation) and `:543-548` (copy then release);
   `frame_channel.rs:290-314` (the `ReceiveLease` type and its two compile-fail
   doctests).
 - Findings: the obligation is satisfied at the layer it names. The transport
   validates offsets, lengths, sequence metadata, header fields, and descriptor
-  identity (`ring.rs:803-812`) before constructing the lease at `:833-845`, which
+  identity (`ring.rs:1093-1100`) before constructing the lease at `:1119-1133`, which
   is exactly what `:294` requires. The host then adds its own header validation
-  at `:471-473`. What the docs do not say, and a reader would not infer, is that
+  at `:503-505`. What the docs do not say, and a reader would not infer, is that
   the host does not pass that lease along: it copies and releases, and the
   `ReceiveLease` the connection engine handles is a different type in a different
   crate (`frame_channel.rs:309` versus

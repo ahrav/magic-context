@@ -55,8 +55,6 @@ describe("fixture profiles", () => {
             expect(profile.expectedCaseCount).toBe(profile.cases.length);
             expect(profile.cases.length).toBeLessThanOrEqual(MAX_PROFILE_CASES);
         }
-        // The two reference profiles share one case set; the CI profile
-        // omits the heavy endpoint cases.
         const caseIds = (["arm-neon.json", "x86-avx2.json"] as const).map((name) =>
             loadFixtureProfile(name)
                 .cases.map((profileCase) => profileCase.id)
@@ -113,8 +111,7 @@ describe("fixture profiles", () => {
         try {
             const canonical = readFileSync(join(PROFILE_DIR, "ci.json"), "utf8");
             const path = join(dir, "profile.json");
-            // Same JSON value, one extra trailing newline: the loader's
-            // byte-for-byte canonical rule must reject it.
+            // The loader rejects profile bytes that differ from the canonical encoding.
             writeFileSync(path, `${canonical}\n`);
             expect(() => loadProfileFile(path)).toThrow(ContractError);
         } finally {
@@ -181,9 +178,6 @@ describe("parseProfile required cells", () => {
     });
 
     it("exempts the CI host class from heavy axis endpoints but not structural cells", () => {
-        // The checked-in CI profile has no 1M/1024/concurrency-8 cases and
-        // still parses; the SAME case set under a reference host class must
-        // reject for the missing heavy endpoints.
         const ci = fixtureProfileJson("ci.json");
         expect(() => parseProfile(ci)).not.toThrow();
         const promoted = fixtureProfileJson("ci.json");
@@ -197,7 +191,7 @@ describe("parseProfile required cells", () => {
         expect(diagnostics).toContain("profile.cases: missing scale endpoint 1000000");
         expect(diagnostics).toContain("profile.cases: missing 1M/1024/concurrency-8 corner");
 
-        // Structural cells stay mandatory for the CI class.
+        // Structural cells are mandatory for the CI class.
         const noAutomatic = fixtureProfileJson("ci.json");
         noAutomatic.cases = noAutomatic.cases.filter(
             (profileCase) => profileCase.mode !== "automatic",
@@ -313,8 +307,7 @@ describe("resource preflight", () => {
             expect(estimate.maxRequiredDiskBytes).toBeLessThanOrEqual(
                 profile.host.minAvailableDiskBytes,
             );
-            // All unique fixtures stay on disk for the whole run, so the
-            // host declaration must cover their sum, not just the max.
+            // The host declaration must cover the sum of all unique fixture sizes.
             expect(estimate.totalRequiredDiskBytes).toBeLessThanOrEqual(
                 profile.host.minAvailableDiskBytes,
             );

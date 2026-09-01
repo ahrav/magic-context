@@ -7,7 +7,7 @@ interface ProcessClientEntry {
 
 const clients = new Map<string, ProcessClientEntry>();
 
-/** The cache keys `credentialSource` by identity, so callers sharing a client must pass the same object. commentlint: allow(JUDGE) */
+/** The cache keys `credentialSource` by identity, so callers sharing a client must pass the same object. */
 const referenceIds = new WeakMap<object, number>();
 let nextReferenceId = 0;
 
@@ -22,7 +22,7 @@ function referenceKey(value: unknown): string {
     return `#${nextReferenceId}`;
 }
 
-/** Shared clients retain the first caller's configuration, so the cache key distinguishes construction-time behavior options: timeouts, route identity, and whether credential fingerprints are presented at all. commentlint: allow(JUDGE) */
+/** Shared clients retain the first caller's configuration, so the cache key distinguishes construction-time behavior options: timeouts, route identity, and whether credential fingerprints are presented at all. */
 function ownerKey(options: McHostClientOptions): string {
     const identity = options.identity;
     return JSON.stringify([
@@ -71,7 +71,7 @@ export function processMcHostClient(options: McHostClientOptions): Promise<McHos
     return created;
 }
 
-/** The cache retains resolved promises, so a caller that closes a shared client must first drop the entry or later callers receive the closed instance. Eviction is identity-scoped: a concurrently created replacement under the same key survives. commentlint: allow(JUDGE) */
+/** The cache retains resolved promises, so a caller that closes a shared client must first drop the entry or later callers receive the closed instance. Eviction is identity-scoped: a concurrently created replacement under the same key survives. */
 export async function evictProcessMcHostClient(
     options: McHostClientOptions,
     client: McHostClient,

@@ -1,18 +1,7 @@
 /**
- * Capture durable multi-representation Git anchors from a repository.
  *
- * One capture resolves a commitish to its full commit OID, tree OID, stable
- * patch ID, and changed-path list — the raw evidence forms persisted by
- * `storage-git-anchors.ts`. All git invocations run without a shell with
- * explicit argument arrays and timeouts, following the
- * `git-commits/git-log-reader.ts` process-safety conventions; metadata
- * commands buffer bounded output via `execFile`, and the patch-id derivation
- * pipes `diff-tree` into `patch-id` child-to-child so patch bytes never
- * enter this process.
  *
- * Merge commits deliberately get no patch ID: `git patch-id` over a merge
- * diff is not a stable equivalence class, so merge patch equivalence is
- * deferred by contract. Merge changed paths come from the first-parent diff.
+ * Merge commits have no patch ID because merge diffs lack a stable patch-id equivalence class; changed paths use the first-parent diff.
  */
 
 import { execFile, spawn } from "node:child_process";
@@ -21,12 +10,12 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 const GIT_TIMEOUT_MS = 10_000;
-// Bounded metadata output (OIDs, changed paths); patch bytes never buffer here.
+// GIT_MAX_BUFFER bounds OID and changed-path output; patch bytes stream directly between child processes.
 const GIT_MAX_BUFFER = 32 * 1024 * 1024;
 // `git patch-id` emits one "<patch-id> <commit-id>" line per patch.
 const PATCH_ID_OUTPUT_MAX_BYTES = 64 * 1024;
 
-/** Versioned protocol tag for `git patch-id --stable` derived identities. */
+/** GIT_PATCH_ID_STABLE_PROTOCOL versions identities derived by `git patch-id --stable`. */
 export const GIT_PATCH_ID_STABLE_PROTOCOL = "git-patch-id-stable-v1";
 
 const FULL_OID_PATTERN = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -35,7 +24,7 @@ export interface GitAnchorCapture {
     commitOid: string;
     objectFormat: "sha1" | "sha256";
     treeOid: string;
-    /** Null for merge commits (and empty diffs), never abbreviated. */
+    /** stablePatchId is null for merge commits and empty diffs and is never abbreviated. */
     stablePatchId: string | null;
     patchIdProtocol: string;
     changedPaths: string[];
@@ -57,11 +46,8 @@ async function runGit(repoRoot: string, args: string[]): Promise<string> {
 }
 
 /**
- * `git diff-tree -p --root <oid> | git patch-id --stable` with the patch
- * bytes piped child-to-child: the full patch never enters this process (no
- * O(patch-size) buffering and no lossy UTF-8 round-trip that could perturb
- * the derived identity); only the one-line patch-id output is collected.
- * Resolves to that output — empty when the commit has an empty diff.
+ * runPatchIdPipeline pipes `diff-tree` directly to `patch-id` so patch bytes neither buffer nor undergo UTF-8 conversion.
+ * runPatchIdPipeline resolves to an empty string when the commit has an empty diff.
  */
 function runPatchIdPipeline(repoRoot: string, commitOid: string): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -85,8 +71,7 @@ function runPatchIdPipeline(repoRoot: string, commitOid: string): Promise<string
             patchId.kill();
             reject(new Error(reason));
         };
-        // patch-id can exit before diff-tree finishes writing; EPIPE on the
-        // pipe must not crash the process.
+        // patchId.stdin ignores EPIPE because `patch-id` can exit before `diff-tree` finishes writing.
         patchId.stdin.on("error", () => {});
         diffTree.stdout.pipe(patchId.stdin);
         diffTree.on("error", (error) => fail(`git diff-tree failed to spawn: ${error.message}`));
@@ -99,8 +84,7 @@ function runPatchIdPipeline(repoRoot: string, commitOid: string): Promise<string
                 fail("git patch-id output exceeded bound");
             }
         });
-        // Success requires BOTH clean exits: patch-id output derived from a
-        // truncated diff-tree stream must not be trusted.
+        // runPatchIdPipeline succeeds only when both child processes exit cleanly; output from a truncated `diff-tree` stream is invalid.
         let pendingCloses = 2;
         const onClose =
             (name: string) =>
@@ -121,17 +105,13 @@ function runPatchIdPipeline(repoRoot: string, commitOid: string): Promise<string
 }
 
 /**
- * Capture anchor representations for `commitish` (default `HEAD`) in
- * `repoRoot`. Never throws for environmental failures: a missing git binary,
- * a non-repo directory, an invalid revision, a timeout, or malformed output
- * all return `{ status: "unavailable", reason }`.
+ * The capture returns `{ status: "unavailable", reason }` instead of throwing when Git is unavailable, the repository or revision is invalid, execution times out, or output is malformed.
  */
 export async function captureGitAnchor(
     repoRoot: string,
     commitish = "HEAD",
 ): Promise<GitAnchorCaptureResult> {
-    // A leading "-" would be parsed as a git OPTION, not a revision; refuse
-    // before spawning (same argument-injection guard as git-log-reader).
+    // A leading "-" is parsed as a Git option rather than a revision, so reject it before spawning.
     if (commitish.startsWith("-")) {
         return {
             status: "unavailable",
@@ -153,9 +133,8 @@ export async function captureGitAnchor(
         }
         const objectFormat = commitOid.length === 64 ? "sha256" : "sha1";
 
-        // --no-show-signature: `git log` is porcelain, and a repository or
-        // user `log.showSignature = true` would prepend signature text that
-        // breaks the \x1f metadata split.
+        // The code disables `log.showSignature` because signature text breaks the `\x1f` metadata split.
+        // The code disables `log.showSignature` because signature text breaks the `\x1f` metadata split.
         const metaOut = await runGit(repoRoot, [
             "log",
             "-1",
@@ -174,9 +153,9 @@ export async function captureGitAnchor(
         const parents = parentField.split(" ").filter((parent) => parent.length > 0);
         const isMerge = parents.length >= 2;
 
-        // NUL-delimited so paths containing spaces, tabs, or newlines
-        // round-trip without delimiter ambiguity. Merges diff against the
-        // first parent; diff-tree would otherwise print nothing for them.
+        // NUL delimiters preserve paths containing spaces, tabs, or newlines.
+        // NUL delimiters preserve paths containing spaces, tabs, or newlines.
+        // Merge commits use the first parent because `diff-tree` would otherwise print no paths.
         const diffTreeArgs = isMerge
             ? ["diff-tree", "-r", "--no-commit-id", "-z", "--name-only", parents[0], commitOid]
             : ["diff-tree", "-r", "--root", "--no-commit-id", "-z", "--name-only", commitOid];
@@ -186,7 +165,7 @@ export async function captureGitAnchor(
         let stablePatchId: string | null = null;
         if (!isMerge) {
             // An empty diff (e.g. an empty commit) produces no patch-id
-            // output; stablePatchId stays null by contract.
+            // stablePatchId stays null for empty diffs.
             const patchIdOut = await runPatchIdPipeline(repoRoot, commitOid);
             const firstField = patchIdOut.trim().split(/\s+/)[0] ?? "";
             if (firstField.length > 0) {

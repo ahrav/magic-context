@@ -93,9 +93,6 @@ describe("dreamer manifest mutation battery", () => {
     });
 
     test("the missing-anchor mutation omits an anchor the gold actually requires", () => {
-        // A fixed replacement sentence can contain the gold's anchors by
-        // accident: with `facts` required, the old sentence scored PASS, so the
-        // battery reported a red case while exercising nothing.
         const fixture = {
             ...dreamerScorerFixture,
             verifyGold: {
@@ -143,8 +140,7 @@ describe("dreamer manifest mutation battery", () => {
     });
 
     test("forbidden anchors naming many punctuation characters still yield evidence", () => {
-        // The filler domain must outlast a fixture that forbids the obvious
-        // separator characters one by one.
+        // The filler domain must exclude every separator character forbidden by the fixture.
         const fixture = {
             ...dreamerScorerFixture,
             verifyGold: {
@@ -289,9 +285,9 @@ describe("dreamer manifest mutation battery", () => {
             mapGold: {
                 kind: "map" as const,
                 claims: [
-                    // Exactly the stand-in path the mutation used to hard-code:
-                    // reusing it produces no textual change and throws instead
-                    // of producing the mutation.
+                    // Reusing the mutation's stand-in path produces no textual change, so mutation generation throws.
+                    // Reusing the mutation's stand-in path produces no textual change, so mutation generation throws.
+                    // Reusing the mutation's stand-in path produces no textual change, so mutation generation throws.
                     { claimId: "claim-true", files: ["mutation/other.ts"], independent: false },
                     { claimId: "claim-independent", files: [], independent: true },
                 ],
@@ -330,9 +326,9 @@ describe("dreamer mutation battery fixture tolerance", () => {
     });
 
     test("a parser-active forbidden anchor is embedded in a spelling that survives", () => {
-        // `</update>` would end the entry before the scorer saw it. The entry
-        // regexes are case-sensitive and the forbidden check is not, so a raised
-        // spelling stays matchable while the parser ignores it.
+        // `</update>` ends the entry before the scorer sees it. Uppercasing the forbidden phrase keeps the entry matchable because entry regexes are case-sensitive while the forbidden check is not.
+        // Uppercasing the forbidden phrase keeps the entry matchable because entry regexes are case-sensitive while the forbidden check is not.
+        // Uppercasing the forbidden phrase keeps the entry matchable because entry regexes are case-sensitive while the forbidden check is not.
         const fixture = {
             ...dreamerScorerFixture,
             verifyGold: {
@@ -366,7 +362,7 @@ describe("dreamer mutation battery baseline planning", () => {
             pool: {
                 ...dreamerScorerFixture.pool,
                 claims: dreamerScorerFixture.pool.claims.map((claim) =>
-                    // Same category as claim-update, so the two identities can collide.
+                    // The selected claim shares `claim-update`'s category, so their identities can collide.
                     claim.claimId === "claim-independent" ? { ...claim, category: "PROJECT_FACT" } : claim,
                 ),
             },
@@ -391,9 +387,7 @@ describe("dreamer mutation battery baseline planning", () => {
 
 describe("dreamer mutation battery classify baseline", () => {
     test("shareability is omitted when the stored value must be preserved", () => {
-        // Sensitive content already stored shareable: gold expects it to stay
-        // shareable, and reporting `true` is forced back to false, so the only
-        // passing baseline omits the attribute.
+        // A shareable claim coerces reported `true` to `false`, so its passing baseline omits the attribute.
         const fixture = {
             ...dreamerScorerFixture,
             pool: {
@@ -411,7 +405,7 @@ describe("dreamer mutation battery classify baseline", () => {
         };
         const evidence = runMutationBattery(fixture);
         expect(evidence.green).toBe(true);
-        // The wrong-shareable class still has a claim whose flip is observable.
+        // The `wrong-shareable` class has a claim whose flip is observable.
         expect(evidence.results.find((entry) => entry.mutationClass === "wrong-shareable")).toMatchObject({
             green: true,
             actualReason: "wrong-classification",
@@ -421,9 +415,7 @@ describe("dreamer mutation battery classify baseline", () => {
 
 describe("dreamer mutation battery preserved shareability", () => {
     test("a preserved sensitive claim is mutated by inserting the attribute", () => {
-        // Every classify claim is sensitive with `true` gold, so the baseline omits
-        // shareability everywhere and there is no attribute to flip — the mutation
-        // has to insert one.
+        // The baseline emits no sharing attribute when every claim is shareable, so the mutation must insert one.
         const sensitive = "The box answers on 127.0.0.1:8080 for local runs.";
         const fixture = {
             ...dreamerScorerFixture,
@@ -447,9 +439,6 @@ describe("dreamer mutation battery preserved shareability", () => {
 
 describe("dreamer mutation battery inert anchor spellings", () => {
     test("a required anchor holding a parser token is emitted case-raised", () => {
-        // `</update>` in a required anchor is satisfiable: the entry regex is
-        // case-sensitive while anchor scoring folds both sides, so the baseline
-        // emits `</UPDATE>` and the anchor still matches.
         const fixture = {
             ...dreamerScorerFixture,
             verifyGold: {

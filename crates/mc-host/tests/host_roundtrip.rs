@@ -1,7 +1,4 @@
-//! Whole-profile composition over real loopback: discovery, authentication,
-//! catalog, routes, unary and streamed requests, cancellation, Goodbye,
-//! restart, and graceful shutdown, driven by the independent raw client.
-//! Failure-path coverage lives in the focused suites; this file proves the
+//! The independent raw client verifies end-to-end composition over real loopback.
 //! pieces compose.
 
 mod support;
@@ -21,7 +18,6 @@ const ROOT: &str = "/workspace/project";
 async fn the_full_profile_composes_over_one_connection() {
     let host = TestHost::start().await;
 
-    // Discovery: the raw client validates the publication itself.
     let info = raw_client::discover(&host.publication_path()).expect("discovery");
     let mut client = raw_client::RawClient::connect(&info)
         .await
@@ -101,7 +97,6 @@ async fn the_full_profile_composes_over_one_connection() {
         .expect("cancel terminal");
     assert_eq!(frame.error_code(), "cancelled");
 
-    // Route Goodbye, then connection Goodbye.
     client
         .send_frame(TY_GOODBYE, FLAGS_PURE_HEADER, channel, epoch, 0, &[])
         .await
@@ -115,7 +110,6 @@ async fn the_full_profile_composes_over_one_connection() {
         "a connection Goodbye retires the generation"
     );
 
-    // The handler saw exactly one bind and one route-gone for the route.
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let gones = host.handler.route_gones();
@@ -132,7 +126,6 @@ async fn the_full_profile_composes_over_one_connection() {
     let handler = host.handler.clone();
     host.shutdown_gracefully().await;
 
-    // Post-lifecycle audit: no publication, no temp file, handler dropped.
     assert!(!publication.exists());
     let leftovers: Vec<_> = std::fs::read_dir(&runtime_dir)
         .map(|entries| {
@@ -160,7 +153,6 @@ async fn restart_rotates_credentials_and_invalidates_old_state() {
     .expect("first incarnation");
     let old_info = first.info.clone();
 
-    // Live state on the first incarnation.
     let mut old_client = first.client().await;
     let (old_channel, old_epoch) = old_client
         .route_open(LINKED_MODULE_ID, ROOT, "opencode", "old")
@@ -180,8 +172,6 @@ async fn restart_rotates_credentials_and_invalidates_old_state() {
     assert_ne!(second.info.key, old_info.key);
     assert_ne!(second.info.daemon_id, old_info.daemon_id);
 
-    // The old key cannot authenticate: the server proof is minted for a
-    // daemon ID the stale snapshot does not carry.
     let stale = raw_client::Discovered {
         setup_socket: second.info.setup_socket.clone(),
         ..old_info.clone()
@@ -191,7 +181,6 @@ async fn restart_rotates_credentials_and_invalidates_old_state() {
         "mixed-generation credentials must fail closed"
     );
 
-    // Old route handles and correlations are meaningless to the successor.
     let mut new_client = second.client().await;
     let corr = new_client.next_corr();
     new_client
@@ -303,7 +292,6 @@ async fn degraded_storage_is_an_application_error_not_a_disconnect() {
     let frame = client.frame_within(BUDGET).await.expect("terminal");
     assert_eq!(frame.error_code(), "store_unavailable");
 
-    // Same connection, later request: no reconnect was required.
     let corr = client.next_corr();
     client
         .send_frame(

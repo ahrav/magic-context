@@ -30,8 +30,7 @@ export async function clearPluginCache(
     options: { force?: boolean; latestVersion?: string | null } = {},
     deps: { remove?: (path: string) => void } = {},
 ): Promise<PluginCacheResult> {
-    // Injected remover keeps the per-root deletion failure path deterministically
-    // testable; defaults to a real recursive remove.
+    // Injected `remove` enables deterministic tests of per-root deletion failures.
     const remove =
         deps.remove ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
     const pluginCacheRoots = getOpenCodePluginCacheRoots();
@@ -73,9 +72,6 @@ export async function clearPluginCache(
         };
     }
 
-    // Clear each root independently so one root's failure neither aborts the
-    // others nor mislabels an already-deleted path as the one needing manual
-    // cleanup. The error result points at the root that actually failed.
     const cleared: typeof clearTargets = [];
     const failed: Array<{ path: string; error: string }> = [];
     for (const entry of clearTargets) {
