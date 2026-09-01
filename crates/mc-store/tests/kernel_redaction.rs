@@ -60,6 +60,34 @@ fn assert_absent_and_scan_is_live(root: &std::path::Path) {
         .any(|window| window == SECRET.as_bytes()));
 }
 
+#[test]
+fn commit_audit_text_too_large_to_inspect_is_rejected_rather_than_replaced() {
+    // Redaction replaces text it cannot inspect with one placeholder, so an oversized
+    // actor or cause would be committed as `<REDACTED:secret>` and the commit log
+    // would record a provenance it never received.
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let oversized = "x".repeat(mc_core::redaction::MAX_REDACTABLE_BYTES + 1);
+
+    for (label, mut intent) in [
+        ("actor", intent("oversized-actor", 'c')),
+        ("cause", intent("oversized-cause", 'd')),
+    ] {
+        if label == "actor" {
+            intent.actor = oversized.clone();
+        } else {
+            intent.cause = oversized.clone();
+        }
+        let error = store
+            .commit(intent, |envelope| {
+                envelope.insert_domain(domain())?;
+                Ok(String::new())
+            })
+            .unwrap_err();
+        assert_eq!(error, KernelError::InvalidInput, "{label}");
+    }
+}
+
 fn inspect_text(root: &std::path::Path, sql: &str) -> String {
     let connection =
         Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)

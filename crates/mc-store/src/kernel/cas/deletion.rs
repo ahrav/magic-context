@@ -11,7 +11,7 @@ use crate::kernel::durable_fs::{
 use crate::kernel::envelope::{
     check_fence, commit_with_writer, CommitIntent, ObjectRow, PendingChange, Sensitivity,
 };
-use crate::kernel::redaction::{identity, redact, RedactedField};
+use crate::kernel::redaction::{identity, redact_lossy, RedactedField};
 use crate::kernel::{KernelError, KernelStore};
 
 const PROPAGATION_TARGETS: [&str; 4] = [
@@ -127,9 +127,9 @@ struct PurgeAuditFields {
 impl PurgeAuditFields {
     fn new(request: &ArtifactDeletionRequest) -> Self {
         Self {
-            operator_id: redact(request.operator_id.as_deref().unwrap_or_default()),
-            target_locator: redact(request.target_locator.as_deref().unwrap_or_default()),
-            reason: redact(request.reason.as_deref().unwrap_or_default()),
+            operator_id: redact_lossy(request.operator_id.as_deref().unwrap_or_default()),
+            target_locator: redact_lossy(request.target_locator.as_deref().unwrap_or_default()),
+            reason: redact_lossy(request.reason.as_deref().unwrap_or_default()),
         }
     }
 }
@@ -637,7 +637,7 @@ fn load_artifact_state(
             if evidence_id.len() > MAX_TEXT_FIELD_BYTES {
                 return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
             }
-            let evidence_id = redact(evidence_id).text;
+            let evidence_id = redact_lossy(evidence_id).text;
             let stored: String = connection
                 .query_row(
                     "SELECT artifact_digest FROM evidence_meta WHERE evidence_id=?1",
@@ -754,8 +754,8 @@ fn receipt_digest_conflict_free(
             "SELECT request_digest FROM operation_receipts
              WHERE producer=?1 AND operation_key=?2",
             params![
-                redact(&intent.producer).text,
-                redact(&intent.operation_key).text
+                redact_lossy(&intent.producer).text,
+                redact_lossy(&intent.operation_key).text
             ],
             |row| row.get(0),
         )
@@ -779,8 +779,8 @@ fn receipt_describes_deletion(
             "SELECT request_digest,result_payload FROM operation_receipts
              WHERE producer=?1 AND operation_key=?2",
             params![
-                redact(&intent.producer).text,
-                redact(&intent.operation_key).text
+                redact_lossy(&intent.producer).text,
+                redact_lossy(&intent.operation_key).text
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

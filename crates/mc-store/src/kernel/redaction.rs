@@ -9,7 +9,9 @@ pub(super) struct RedactedField {
     pub detections: Vec<Detection>,
 }
 
-pub(super) fn redact(value: &str) -> RedactedField {
+/// Use [`redact`] when input may exceed `MAX_REDACTABLE_BYTES`; `redact_lossy`
+/// does not preserve oversized input.
+pub(super) fn redact_lossy(value: &str) -> RedactedField {
     let redaction = redact_durable_text(value);
     RedactedField {
         text: redaction.text,
@@ -17,11 +19,11 @@ pub(super) fn redact(value: &str) -> RedactedField {
     }
 }
 
-pub(super) fn redact_bounded(value: &str) -> Result<RedactedField, KernelError> {
+pub(super) fn redact(value: &str) -> Result<RedactedField, KernelError> {
     if value.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
         return Err(KernelError::InvalidInput);
     }
-    Ok(redact(value))
+    Ok(redact_lossy(value))
 }
 
 /// Lookup keys, primary keys, and dedup identities must not contain detected secrets because redaction can alias distinct values.
