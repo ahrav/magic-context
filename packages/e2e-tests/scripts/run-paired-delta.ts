@@ -243,20 +243,27 @@ function scopeDigest(): string {
             }
         }
     }
-    /**
-     * The bundle the harness loads, not just its source. `pluginEntryPath` prefers an existing
-     * `dist` build, which is ignored and therefore invisible to every git-based digest, so a
-     * calibration could run a stale bundle and a later dispatch a rebuilt one under the same
-     * binding.
-     */
+    parts.push(...loadedBundleParts(root));
+    return Bun.hash(Buffer.concat(parts)).toString(16);
+}
+
+/**
+ * The bytes of the plugin bundle the harness will load.
+ *
+ * `pluginEntryPath` prefers an existing `dist` build, which is ignored, so no git-based digest can
+ * see it — `--exclude-standard` skips ignored paths by design. Both bindings need it: the
+ * implementation digest so calibration cannot be reused across a rebuild, and the records binding
+ * so a resume cannot mix coordinates measured against two bundles.
+ */
+function loadedBundleParts(root: string): Uint8Array[] {
     const entry = pluginEntryPath();
-    parts.push(Buffer.from(`${relative(root, entry)}\0`, "utf8"));
+    const parts = [Buffer.from(`${relative(root, entry)}\0`, "utf8")];
     try {
         parts.push(readFileSync(entry));
     } catch {
         parts.push(Buffer.from("<unreadable>", "utf8"));
     }
-    return Bun.hash(Buffer.concat(parts)).toString(16);
+    return parts;
 }
 
 function worktreeRoot(): string {
@@ -306,13 +313,18 @@ function recordsRepoCommit(ownedPaths: readonly string[]): string {
         "--",
         ...scope,
     ]).trim();
-    if (status === "") return commit;
+    const bundle = loadedBundleParts(root);
+    /** A clean tree still has to account for the ignored bundle, so the digest is unconditional. */
+    if (status === "") {
+        return `${commit}-bundle-${Bun.hash(Buffer.concat(bundle)).toString(16)}`;
+    }
     /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. commentlint: allow(JUDGE) */
     const untracked = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope])
         .split("\0")
         .filter(Boolean);
     /** Untracked contents are hashed as raw bytes: decoding to UTF-8 first maps distinct binary payloads onto the same replacement character, and `git status` cannot tell them apart either while `git diff HEAD` omits untracked files entirely. commentlint: allow(JUDGE) */
     const parts: Uint8Array[] = [
+        ...bundle,
         Buffer.from(status, "utf8"),
         /** `--binary` because a plain diff reduces a modified binary file to a stable `Binary files … differ` line, so its bytes could change while the digest did not. commentlint: allow(JUDGE) */
         Buffer.from(git(["diff", "--binary", "HEAD", "--", ...scope]), "utf8"),
