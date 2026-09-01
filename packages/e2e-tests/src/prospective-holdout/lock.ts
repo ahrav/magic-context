@@ -45,6 +45,9 @@ function holderAlive(pid: number): boolean {
     }
 }
 
+/** Distinguishes "this path holds no parseable claim" from "this path could not be read at all". Release has to tell them apart: an unreadable record may still be this process's own claim, and treating a transient `EIO` or `EACCES` as a foreign owner let release report success over a directory it had not removed. commentlint: allow(JUDGE) */
+class LockOwnerUnreadableError extends Error {}
+
 function readLockOwner(lock: string): LockOwner | null {
     try {
         const value = JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8")) as unknown;
@@ -58,6 +61,21 @@ function readLockOwner(lock: string): LockOwner | null {
     } catch {
         return null;
     }
+}
+
+/** `readLockOwner` reports "no parseable claim" for both an absent record and an unreadable one, which is the right answer for judging abandonment or contention — neither can act on a record it cannot read. Release is the exception: it deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and a malformed one stay `null`; anything else raises. commentlint: allow(JUDGE) */
+function readLockOwnerForRelease(lock: string): LockOwner | null {
+    try {
+        readFileSync(join(lock, LOCK_OWNER_FILE));
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") {
+            throw new LockOwnerUnreadableError(
+                `lock owner record at ${lock} could not be read (${String(code)})`,
+            );
+        }
+    }
+    return readLockOwner(lock);
 }
 
 /**
@@ -221,7 +239,7 @@ function releaseLock(lock: string): void {
     sweepSidelines();
     // A lock reclaimed from this process belongs to the reclaimer.
     // Deleting a reclaimed lock would let another waiter acquire a lock the reclaimer still believes it holds.
-    if (readLockOwner(lock)?.nonce !== LOCK_NONCE) {
+    if (readLockOwnerForRelease(lock)?.nonce !== LOCK_NONCE) {
         /** A takeover between the sweep and the read above moves this record to a sideline neither observation covered, so the sweep runs again once the path is known not to carry it. Each pass narrows the interleaving rather than closing it: reclamation cannot be made atomic against a concurrent reclaimer, which is why a holder that intends to act reads the lock again instead of trusting acquisition. commentlint: allow(JUDGE) */
         sweepSidelines();
         return;
@@ -229,7 +247,7 @@ function releaseLock(lock: string): void {
     rmSync(lock, { recursive: true, force: true });
     /** `force` succeeds against an absent path, so the removal above cannot distinguish "deleted this claim" from "a reclaimer moved it first". A reclaimer that then restores the displaced directory would leave this process's record at `lock` with the handle already marked released. Sweeping again catches the record wherever it landed, and the ownership re-read catches a restoration to `lock` itself. commentlint: allow(JUDGE) */
     sweepSidelines();
-    if (readLockOwner(lock)?.nonce === LOCK_NONCE) {
+    if (readLockOwnerForRelease(lock)?.nonce === LOCK_NONCE) {
         rmSync(lock, { recursive: true, force: true });
     }
 }

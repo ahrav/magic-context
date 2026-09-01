@@ -856,6 +856,17 @@ export async function runPairedDelta(
                 };
                 const existing = storedByCoordinate.get(coordinateKey(coordinate));
                 if (existing === undefined) return null;
+                /** Validated here too, not only on the resume path: the pre-scan skips a record bound to another commit or model, so an in-matrix wrong-binding record reaches this dereference unchecked, and a null cell would raise a `TypeError` outside the release path — leaving a lock-owning store holding its claim through the rejected run. commentlint: allow(JUDGE) */
+                try {
+                    parseArmedCellResult(existing.cell);
+                } catch (error) {
+                    releaseBeforeThrowing(options.store);
+                    if (!(error instanceof PairedDeltaContractError)) throw error;
+                    throw new Error(
+                        `records file cell is invalid at ${coordinateKey(existing)} ` +
+                            `(${error.diagnostics.join(",")}); point at a fresh records path`,
+                    );
+                }
                 const boundToRun = bindingMatches(existing, options);
                 if (
                     (!boundToRun || !completedIdentityMatches(existing, options)) &&

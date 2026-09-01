@@ -10,6 +10,7 @@ import {
     redactSecretText,
     SECRET_QUALIFIERS,
     SECRET_WORDS,
+    urlCredentialFinding,
 } from "./redaction";
 
 describe("redaction vocabulary fixture", () => {
@@ -210,9 +211,37 @@ describe("isCredentialBearingConfigKey", () => {
             // Plural counts keep their exemption.
             "cachedTokens",
             "cacheTokens",
+            // A separated enumerator must not become the qualifier.
+            "public_key_value_2",
+            "primary_key_id_2",
+            "cached_tokens_value_2",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }
+    });
+});
+
+describe("urlCredentialFinding", () => {
+    test("reads a URL's own namespaces without echoing a secret key", () => {
+        // A bare parameter is parsed as a key with an empty value.
+        expect(urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key as a URL parameter name",
+        );
+        expect(urlCredentialFinding("https://host/#sk-ant-abcdefghijklmnopqrstuv&view=1")).toBe(
+            "Anthropic-style key as a URL parameter name",
+        );
+        // The label never contains the matched key.
+        expect(urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv")).not.toContain(
+            "sk-ant-",
+        );
+        expect(urlCredentialFinding("https://host/v1?trace=sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key value in query key trace",
+        );
+        expect(urlCredentialFinding("https://host/c?sv=2021-08-06&sig=Zm9vYmFyYmF6")).toBe(
+            "signed-URL credential parameter sig",
+        );
+        expect(urlCredentialFinding("https://host.internal/v1")).toBe(null);
+        expect(urlCredentialFinding("not a url")).toBe(null);
     });
 });
 

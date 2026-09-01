@@ -1480,6 +1480,27 @@ describe("paired-delta runner", () => {
         expect(unavailable.maxAttemptCostUsd).toBe(unavailable.costUsd);
     });
 
+    it("refuses a wrong-binding record whose cell is absent without losing the claim", async () => {
+        // The pre-scan skips a record bound to another commit, so its cell arrives unchecked.
+        let released = 0;
+        const store: RolloutStore = {
+            list: () => [{
+                ...storedRecord("mc-on"),
+                repoCommit: "commit-other",
+                cell: null as unknown as RolloutRecord["cell"],
+            }],
+            put: () => {},
+            release: () => {
+                released += 1;
+            },
+        };
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /records file cell is invalid/,
+        );
+        expect(released).toBe(1);
+    });
+
     it("refuses a non-object entry without losing the claim", async () => {
         // `coordinateKey` dereferences the entry, so this used to raise a TypeError outside
         // the release path.
@@ -1827,6 +1848,26 @@ describe("paired-delta runner", () => {
             store.release();
         } finally {
             chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps a claim releasable when the owner record cannot be read", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unreadable-owner-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = join(`${path}.lock`, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // An unreadable record is not proof the claim became foreign.
+            chmodSync(owner, 0o000);
+            expect(() => store.release()).toThrow();
+
+            chmodSync(owner, 0o600);
+            store.release();
+            expect(existsSync(`${path}.lock`)).toBe(false);
+        } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });

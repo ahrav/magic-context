@@ -226,7 +226,10 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         .filter(Boolean);
     /** A trailing descriptor names the field, not the thing: `dbPasswordValue` and `masterKeyId` are the credential their descriptor points at, and `primaryKeyId` is the structural key its descriptor points at. `isSecretKey` reads them the same way. commentlint: allow(JUDGE) */
     const segments = [...allSegments];
-    while (segments.length > 1 && TRAILING_DESCRIPTORS.has(segments.at(-1) as string)) {
+    /** Enumerator segments are dropped alongside descriptors so the qualifier is read from the same peeled form the terminal word is: `public_key_value_2` leaves `value` as the adjacent segment otherwise, and a qualifier the structural list does not know is treated as a credential — refusing a legitimate field. commentlint: allow(JUDGE) */
+    const peelable = (segment: string): boolean =>
+        TRAILING_DESCRIPTORS.has(segment) || /^[0-9]+$/.test(segment);
+    while (segments.length > 1 && peelable(segments.at(-1) as string)) {
         segments.pop();
     }
     // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
@@ -364,6 +367,11 @@ export function urlCredentialFinding(value: string): string | null {
         }
         if (key.length > 0 && isCredentialBearingConfigKey(key)) {
             return `credential-shaped query key ${key}`;
+        }
+        /** A bare parameter — `?sk-ant-…` or a structured fragment's first entry — is parsed as a key with an empty value, so the value rules would read nothing. The key is judged by shape as well as by name, and the label omits it because the key is the credential. commentlint: allow(JUDGE) */
+        if (key.length > 0) {
+            const keyFormat = credentialValueFormat(key);
+            if (keyFormat !== null) return `${keyFormat} as a URL parameter name`;
         }
         const format = credentialValueFormat(part);
         if (format !== null) {
