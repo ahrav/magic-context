@@ -244,6 +244,7 @@ function scopeDigest(): string {
         }
     }
     parts.push(...loadedBundleParts(root));
+    parts.push(...resolvedRuntimeParts());
     return Bun.hash(Buffer.concat(parts)).toString(16);
 }
 
@@ -255,6 +256,32 @@ function scopeDigest(): string {
  * implementation digest so calibration cannot be reused across a rebuild, and the records binding
  * so a resume cannot mix coordinates measured against two bundles.
  */
+/**
+ * The OpenCode executable the harness will launch.
+ *
+ * A direct invocation resolves a bare `opencode` from `PATH`, so the workflow's pinned version says
+ * nothing about it. Without this, a calibration on one binary and a weekly run on another share a
+ * binding, and native compaction and the session ledger — both of which the measurement reads — are
+ * that binary's behaviour.
+ */
+function resolvedRuntimeParts(): Uint8Array[] {
+    const entry = Bun.which("opencode");
+    if (entry === null) return [Buffer.from("<opencode-unresolved>", "utf8")];
+    const parts = [Buffer.from(`${entry}\0`, "utf8")];
+    const version = Bun.spawnSync([entry, "--version"]);
+    parts.push(Buffer.from(
+        version.exitCode === 0 ? version.stdout.toString().trim() : "<version-unavailable>",
+        "utf8",
+    ));
+    try {
+        /** The bytes, not only the reported version: a rebuilt binary can report the same string. */
+        parts.push(readFileSync(entry));
+    } catch {
+        parts.push(Buffer.from("<unreadable>", "utf8"));
+    }
+    return parts;
+}
+
 function loadedBundleParts(root: string): Uint8Array[] {
     const entry = pluginEntryPath();
     const parts = [Buffer.from(`${relative(root, entry)}\0`, "utf8")];
@@ -313,10 +340,10 @@ function recordsRepoCommit(ownedPaths: readonly string[]): string {
         "--",
         ...scope,
     ]).trim();
-    const bundle = loadedBundleParts(root);
+    const bundle = [...loadedBundleParts(root), ...resolvedRuntimeParts()];
     /** A clean tree still has to account for the ignored bundle, so the digest is unconditional. */
     if (status === "") {
-        return `${commit}-bundle-${Bun.hash(Buffer.concat(bundle)).toString(16)}`;
+        return `${commit}-runtime-${Bun.hash(Buffer.concat(bundle)).toString(16)}`;
     }
     /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. commentlint: allow(JUDGE) */
     const untracked = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope])

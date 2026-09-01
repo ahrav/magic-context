@@ -576,6 +576,19 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     }
     requireHex64(record.poolManifestFingerprint, "pool-manifest-fingerprint");
     requireHex64(record.policyFingerprint, "policy-fingerprint");
+    /**
+     * Recomputed rather than trusted: the flag is what the paid-run preflight gates on, and a
+     * self-consistently fingerprinted artifact can assert it while carrying a non-completed status,
+     * no established variance, or no measured series at all.
+     */
+    const measured = Array.isArray(record.familyNoise) ? record.familyNoise : [];
+    const consistent = record.runStatus === "completed" &&
+        record.varianceEstablished === true &&
+        measured.length > 0 &&
+        measured.every((noise) => noise.observationCount >= 2 && noise.variance > 0);
+    if (record.validForPoolSizing === true && !consistent) {
+        throw new Error("paired-delta-calibration: validity-inconsistent");
+    }
     if (
         typeof record.pinnedSnapshotId !== "string" ||
         typeof record.policyFingerprint !== "string" ||

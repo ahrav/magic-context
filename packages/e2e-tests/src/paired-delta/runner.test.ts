@@ -2520,7 +2520,7 @@ describe("paired-delta runner", () => {
         expect(third.observedCostRollouts + third.estimatedCostRollouts)
             .toBe(third.records.length);
     });
-    it("floors failure cost estimates at one full-context request per billable turn", async () => {
+    it("floors failure cost estimates at one full-context request per billable and internal call", async () => {
         const expensive = {
             ...options(),
             pricesPerMillionTokens: {
@@ -2541,8 +2541,13 @@ describe("paired-delta runner", () => {
         // Each user turn can bill its own request, and the observation reports all of them.
         const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
         expect(billableTurns).toBeGreaterThan(1);
+        /**
+         * Plus the internal calls a failing rollout may already have billed — OpenCode's compaction
+         * summary and the historian's attempts — which return no usage on the failure path.
+         */
+        const internalCalls = 4;
         expect(failed?.costUsd).toBeCloseTo(
-            (scenario.modelContextLimit * (100 + 200) * billableTurns) / 1_000_000,
+            (scenario.modelContextLimit * (100 + 200) * (billableTurns + internalCalls)) / 1_000_000,
             12,
         );
     });

@@ -1469,6 +1469,13 @@ function finiteUsage(usage: TokenUsage): TokenUsage | null {
  * until its call cost is declared instead of silently defaulting to zero.
  * commentlint: allow(JUDGE)
  */
+/**
+ * Model calls a rollout can make outside its authored turns: OpenCode's own compaction summary plus
+ * the historian's attempts. Bounded rather than measured, because the fallback charge exists for the
+ * path where no usage came back.
+ */
+const INTERNAL_CALL_BOUND = 4;
+
 const ORACLE_CALLS_BY_INTERVENTION: Readonly<
     Record<InterventionDescriptor["kind"], number>
 > = {
@@ -1497,7 +1504,13 @@ function worstCaseUsd(
     const oracleCalls = armId === undefined
         ? 0
         : ORACLE_CALLS_BY_INTERVENTION[interventionFor(scenario, armId).kind];
-    return perCallUsd * (billableTurns + oracleCalls);
+    /**
+     * Native compaction summarizes and the historian runs in a child session, and neither call is an
+     * authored turn. A rollout that fails after triggering them returns no usage, so the fallback
+     * charge is all the ledger the cap has for calls that were already billed; omitting them let an
+     * arm pass admission and then bill past the reserve.
+     */
+    return perCallUsd * (billableTurns + oracleCalls + INTERNAL_CALL_BOUND);
 }
 
 function exclusionCountsOf(
