@@ -6,24 +6,29 @@ use std::{
     },
 };
 
+#[path = "support/scan_audit.rs"]
+mod scan_audit;
+
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 use mc_core::claim_operation::{
     sha256_hex_utf8, ClaimCommandIdentity, ClaimIntentBinding, SnapshotVector,
 };
+use mc_core::redaction::RedactionErrorKind;
 use mc_store::claim_mirror::{
     ClaimMirrorError, ClaimMirrorLifecycle, ClaimMirrorSnapshot, CommittedClaimMirrorRow,
     CLAIM_MIRROR_VERSION,
 };
 use mc_store::{
-    AuthoritySeedRow, FacadeMutationOutcome, LineageAnchor, LineageConstituent,
-    LineageDescentDisposition, LineageDescentRequest, McStore, ModuleMeta, NoteEvaluationInput,
-    NoteInput, NoteTransitionInput, NoteWriteInput, StoredCompartment, TailHygieneBaseline,
-    DURABLE_WRITE_REGISTRY,
+    AuthoritySeedRow, DurableWriteFamily, FacadeMutationOutcome, LineageAnchor, LineageConstituent,
+    LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, ModuleMeta,
+    NoteEvaluationInput, NoteInput, NoteTransitionInput, NoteWriteInput, StoredCompartment,
+    TailHygieneBaseline, DURABLE_WRITE_REGISTRY,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
     Connection,
 };
+use scan_audit::{scan_audit_counts, ScanAuditCounts};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -44,22 +49,9 @@ fn fixture() -> Fixture {
     serde_json::from_str(include_str!("fixtures/durable-field-policy-v1.json")).unwrap()
 }
 
-fn audit_counts(path: &std::path::Path) -> (i64, i64, i64, i64) {
-    let connection = Connection::open(path.join("store.db")).unwrap();
-    connection
-        .query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM mc_scan_batches),
-                 (SELECT COUNT(*) FROM mc_field_scans),
-                 (SELECT COUNT(*) FROM mc_scan_owner_copies),
-                 (SELECT COUNT(*) FROM mc_scan_detections)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap()
-}
-
-fn store_family_bytes(root: &std::path::Path) -> Vec<u8> {
+/// `control` must occur in the stored bytes so an absence assertion cannot pass
+/// without scanning them.
+fn store_family_bytes(root: &std::path::Path, control: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
     for entry in std::fs::read_dir(root).unwrap() {
         let entry = entry.unwrap();
@@ -70,9 +62,12 @@ fn store_family_bytes(root: &std::path::Path) -> Vec<u8> {
         }
     }
     assert!(!bytes.is_empty());
-    assert!(bytes
-        .windows(b"SQLite format 3".len())
-        .any(|window| window == b"SQLite format 3"));
+    assert!(
+        bytes
+            .windows(control.len())
+            .any(|window| window == control.as_bytes()),
+        "scan did not observe stored text, so an absence check would be vacuous"
+    );
     bytes
 }
 
@@ -93,7 +88,15 @@ fn active_note_scan_audit_is_atomic_complete_and_opaque() {
         })
         .unwrap();
 
-    assert_eq!(audit_counts(temp.path()), (1, 3, 3, 1));
+    let note_audit = ScanAuditCounts {
+        batches: 1,
+        owner_scopes: 1,
+        domain_owners: 1,
+        field_scans: 3,
+        owner_copies: 3,
+        detections: 1,
+    };
+    assert_eq!(scan_audit_counts(temp.path()), note_audit);
     let connection = Connection::open(temp.path().join("store.db")).unwrap();
     let ids = connection
         .prepare(
@@ -151,7 +154,7 @@ fn active_note_scan_audit_is_atomic_complete_and_opaque() {
         ids.iter().map(|row| row.4).collect::<Vec<_>>(),
         vec![0, 0, 1]
     );
-    let family = store_family_bytes(temp.path());
+    let family = store_family_bytes(temp.path(), "plain content");
     for forbidden in ["surface-secret", "password=surface-secret"] {
         assert!(!family
             .windows(forbidden.len())
@@ -172,7 +175,7 @@ fn active_note_scan_audit_is_atomic_complete_and_opaque() {
     drop(connection);
     drop(store);
     let reopened = McStore::open(&descriptor).unwrap();
-    assert_eq!(audit_counts(temp.path()), (1, 3, 3, 1));
+    assert_eq!(scan_audit_counts(temp.path()), note_audit);
     drop(reopened);
 }
 
@@ -192,21 +195,22 @@ fn active_scan_audit_expires_with_its_session_note_owner() {
             now_ms: 1,
         })
         .unwrap();
-    assert_eq!(audit_counts(temp.path()), (1, 1, 1, 1));
+    assert_eq!(
+        scan_audit_counts(temp.path()),
+        ScanAuditCounts {
+            batches: 1,
+            owner_scopes: 1,
+            domain_owners: 1,
+            field_scans: 1,
+            owner_copies: 1,
+            detections: 1,
+        }
+    );
 
     store.delete_session("session", "project").unwrap();
 
-    assert_eq!(audit_counts(temp.path()), (0, 0, 0, 0));
-    let connection = Connection::open(temp.path().join("store.db")).unwrap();
-    let owner_counts = connection
-        .query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM mc_scan_owner_scopes),
-                 (SELECT COUNT(*) FROM mc_scan_domain_owners)",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .unwrap();
+    assert_eq!(scan_audit_counts(temp.path()), ScanAuditCounts::EMPTY);
+
     store
         .append_compartments(
             "source",
@@ -221,7 +225,19 @@ fn active_scan_audit_expires_with_its_session_note_owner() {
             }],
         )
         .unwrap();
-    assert_eq!(owner_counts, (0, 0));
+    // The compartment prepares session_id, start_message_id, end_message_id, title, and
+    // content; only content carries a detection.
+    assert_eq!(
+        scan_audit_counts(temp.path()),
+        ScanAuditCounts {
+            batches: 1,
+            owner_scopes: 1,
+            domain_owners: 1,
+            field_scans: 5,
+            owner_copies: 5,
+            detections: 1,
+        }
+    );
 }
 
 #[test]
@@ -434,7 +450,7 @@ fn sqlite_online_backup_preserves_active_scan_audit_rows() {
             now_ms: 1,
         })
         .unwrap();
-    let expected = audit_counts(source.path());
+    let expected = scan_audit_counts(source.path());
     drop(store);
 
     let restored = tempfile::tempdir().unwrap();
@@ -457,7 +473,7 @@ fn sqlite_online_backup_preserves_active_scan_audit_rows() {
 
     let restored_descriptor = McStore::test_descriptor(restored.path(), "production-scan-restore");
     let restored_store = McStore::open(&restored_descriptor).unwrap();
-    assert_eq!(audit_counts(restored.path()), expected);
+    assert_eq!(scan_audit_counts(restored.path()), expected);
     assert_eq!(
         restored_store
             .read_notes("project", "session", 10, 0)
@@ -511,7 +527,7 @@ fn concurrent_facade_duplicate_persists_one_active_scan_batch() {
             .count(),
         1
     );
-    assert_eq!(audit_counts(temp.path()).0, 1);
+    assert_eq!(scan_audit_counts(temp.path()).batches, 1);
 }
 
 #[test]
@@ -523,30 +539,47 @@ fn durable_write_registry_references_real_bindings_and_checked_tests() {
         .map(|entry| entry.family)
         .collect::<BTreeSet<_>>();
     assert_eq!(found.len(), DURABLE_WRITE_REGISTRY.len());
-    assert_eq!(found.len(), 25);
+    assert_eq!(found.len(), DurableWriteFamily::ALL.len());
     assert!(!store_source.contains("PreparedWrite::new(\""));
     assert!(!claim_mirror_source.contains("PreparedWrite::new(\""));
 
-    let test_sources = [
-        include_str!("production_redaction.rs"),
-        store_source,
-        include_str!("kernel_redaction.rs"),
-        include_str!("kernel_envelope.rs"),
-        include_str!("kernel_outbox.rs"),
-        include_str!("kernel_schema.rs"),
-    ]
-    .join("\n");
+    // The module half of `<module>::<fn>` must resolve to one of these sources, so a
+    // same-named function in an unrelated file cannot satisfy the entry.
+    let sources: BTreeMap<&str, &str> = BTreeMap::from([
+        (
+            "production_redaction",
+            include_str!("production_redaction.rs"),
+        ),
+        ("lib", store_source),
+        ("kernel_redaction", include_str!("kernel_redaction.rs")),
+        ("kernel_envelope", include_str!("kernel_envelope.rs")),
+        ("kernel_outbox", include_str!("kernel_outbox.rs")),
+        ("kernel_schema", include_str!("kernel_schema.rs")),
+    ]);
     for entry in DURABLE_WRITE_REGISTRY {
         assert!(!entry.preparation.trim().is_empty());
-        if entry.test.starts_with("kernel_") {
-            continue;
-        }
-        let test_name = entry.test.rsplit("::").next().unwrap();
-        let top_level_test = format!("#[test]\nfn {test_name}(");
-        let nested_test = format!("#[test]\n    fn {test_name}(");
+        let (module, test_name) = entry
+            .test
+            .rsplit_once("::")
+            .unwrap_or_else(|| panic!("{:?} test {} is not module::fn", entry.family, entry.test));
+        let source = sources.get(module).unwrap_or_else(|| {
+            panic!(
+                "{:?} references module {module}, which is not a checked test source",
+                entry.family
+            )
+        });
+        let signature = format!("fn {test_name}(");
+        let position = source.find(&signature).unwrap_or_else(|| {
+            panic!(
+                "{:?} references missing function {}",
+                entry.family, entry.test
+            )
+        });
+        // Attributes such as `#[ignore]` may sit between `#[test]` and the signature.
+        let preceding = &source[position.saturating_sub(256)..position];
         assert!(
-            test_sources.contains(&top_level_test) || test_sources.contains(&nested_test),
-            "{:?} references missing #[test] function {}",
+            preceding.contains("#[test]"),
+            "{:?} references {} which is not a #[test] function",
             entry.family,
             entry.test
         );
@@ -579,12 +612,27 @@ fn cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity() {
         "password=<REDACTED:password>"
     );
 
+    // Redacting a persisted boundary ID would collapse distinct legacy boundaries onto one
+    // placeholder, so an existing row's boundary must round-trip verbatim.
     let mut existing_identity = core;
     existing_identity.boundary_id = "password=legacy-boundary".to_string();
+    let connection = Connection::open(temp.path().join("store.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO mc_cache_state(session_id, row_version, core_state, meta)
+             VALUES (?1, 0, ?2, ?3)",
+            rusqlite::params![
+                "existing-identity",
+                serde_json::to_string(&existing_identity).unwrap(),
+                serde_json::to_string(&ModuleMeta::default()).unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
     store
         .commit(
             "existing-identity",
-            None,
+            Some(0),
             &existing_identity,
             &ModuleMeta::default(),
         )
@@ -937,7 +985,7 @@ fn transaction_produced_facade_text_is_redacted_and_bounded() {
         )
         .unwrap();
     assert_eq!(persisted_response, response);
-    let committed_audit = audit_counts(temp.path());
+    let committed_audit = scan_audit_counts(temp.path());
     let replay = store
         .with_facade_command(
             "route",
@@ -951,7 +999,7 @@ fn transaction_produced_facade_text_is_redacted_and_bounded() {
         )
         .unwrap();
     assert_eq!(replay, FacadeMutationOutcome::Duplicate(response));
-    assert_eq!(audit_counts(temp.path()), committed_audit);
+    assert_eq!(scan_audit_counts(temp.path()), committed_audit);
 
     let oversized = store.with_facade_command(
         "route",
@@ -969,7 +1017,7 @@ fn transaction_produced_facade_text_is_redacted_and_bounded() {
             mc_core::redaction::RedactionErrorKind::InputLimit
         ))
     ));
-    assert_eq!(audit_counts(temp.path()), committed_audit);
+    assert_eq!(scan_audit_counts(temp.path()), committed_audit);
 
     let mut invoked = false;
     let error = store
@@ -1224,13 +1272,25 @@ fn compartment_content_redacts_and_new_message_identities_reject() {
         Some("password=<REDACTED:password>")
     );
 
+    // A non-overlapping range exercises redaction validation instead of overlap validation.
     let rejected = StoredCompartment {
+        sequence: 2,
+        start_message: 3,
+        end_message: 4,
         start_message_id: "password=identity-secret".to_string(),
+        end_message_id: "message-4".to_string(),
         ..compartment
     };
     let error = store
         .append_compartments("session", &[rejected])
         .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+        ),
+        "{error:?}"
+    );
     assert!(!error.to_string().contains("identity-secret"));
     assert_eq!(store.load_compartments("session").unwrap().len(), 1);
 }

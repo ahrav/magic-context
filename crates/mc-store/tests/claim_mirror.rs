@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+#[path = "support/scan_audit.rs"]
+mod scan_audit;
+
 use cortexkit_store_types::StorageDescriptor;
 use mc_core::claim_operation::{
     canonical_json_encode, sha256_hex_utf8, ClaimCommandIdentity, ClaimIntentAckKind,
@@ -12,6 +15,7 @@ use mc_store::claim_mirror::{
 };
 use mc_store::McStore;
 use rusqlite::Connection;
+use scan_audit::{scan_audit_counts, ScanAuditCounts};
 use serde_json::{json, Value};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
@@ -134,21 +138,6 @@ fn result(outcome: &str) -> String {
     .unwrap()
 }
 
-fn active_audit_counts(root: &std::path::Path) -> (i64, i64, i64, i64) {
-    Connection::open(root.join("store.db"))
-        .unwrap()
-        .query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM mc_scan_batches),
-                 (SELECT COUNT(*) FROM mc_field_scans),
-                 (SELECT COUNT(*) FROM mc_scan_owner_copies),
-                 (SELECT COUNT(*) FROM mc_scan_detections)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap()
-}
-
 #[test]
 fn claim_json_fields_are_scanned_once_without_rewriting_escaped_quotes() {
     let dir = tempfile::tempdir().unwrap();
@@ -210,7 +199,7 @@ fn protected_claim_json_key_rejects_atomically_with_exact_error() {
             ClaimMirrorError::Redaction(mc_core::redaction::RedactionErrorKind::SecretDetected)
         ));
         assert!(store.claim_mirror_state().unwrap().is_none());
-        assert_eq!(active_audit_counts(dir.path()), (0, 0, 0, 0));
+        assert_eq!(scan_audit_counts(dir.path()), ScanAuditCounts::EMPTY);
     }
 
     let mut benign = claim(CLAIM_A, 41, 1, "plain content", 1);
