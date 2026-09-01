@@ -526,8 +526,14 @@ impl ApplicabilityEngine {
             PayloadDecode::Present(spec) => Some(spec),
         };
         if let Some(spec) = &spec {
-            match dirty_gate(snapshot, &spec.affected_paths) {
+            match dirty_gate(snapshot, &spec.affected_paths, budget) {
                 DirtyGate::Clear => {}
+                DirtyGate::BudgetExhausted => {
+                    return Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted during the dirty-tree gate",
+                    );
+                }
                 DirtyGate::Overlap(path) => {
                     return Classification::terminal(
                         ApplicabilityState::DirtyTreeUncertain,
@@ -799,6 +805,7 @@ enum DirtyGate {
     Overlap(String),
     /// A declared path this comparison cannot place inside the checkout. commentlint: allow(JUDGE)
     Unplaceable(String),
+    BudgetExhausted,
 }
 
 /// A dirty path overlaps an affected path when they are equal or one is a
@@ -809,13 +816,23 @@ enum DirtyGate {
 /// worktree is unobservable whatever the worktree currently holds, so leaving commentlint: allow(JUDGE)
 /// it to the scan would report it only while some unrelated entry happens to commentlint: allow(JUDGE)
 /// be dirty, and call the object current on a clean checkout. commentlint: allow(JUDGE)
-fn dirty_gate(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> DirtyGate {
+fn dirty_gate(
+    snapshot: &CheckoutSnapshot,
+    affected_paths: &[String],
+    budget: &EvalBudget,
+) -> DirtyGate {
     for affected in affected_paths {
         if let DeclaredPath::Unplaceable = declared_path(affected) {
             return DirtyGate::Unplaceable(affected.clone());
         }
     }
     for entry in snapshot.dirty_entries() {
+        // This scan is the product of the dirty set and the declared paths, so
+        // the deadline is polled per entry rather than once after the whole
+        // scan; the work between polls is then one entry's comparisons.
+        if budget.is_exhausted() {
+            return DirtyGate::BudgetExhausted;
+        }
         // An index bookkeeping entry is recorded for the fingerprint's sake and
         // is not an uncommitted edit; git reports both classes clean.
         if !entry.is_uncommitted_change() {
@@ -1014,6 +1031,10 @@ fn scoped_dirty_fingerprint(
     };
     let mut hash: Option<Sha256> = None;
     for entry in snapshot.dirty_entries() {
+        // Same product as the gate, polled at the same granularity.
+        if budget.is_exhausted() {
+            return None;
+        }
         let relevant = spec
             .affected_paths
             .iter()
