@@ -349,13 +349,14 @@ export class FileRolloutStore implements RolloutStore {
     release(): void {
         const held = this.held;
         if (held === null) return;
+        /** The on-disk claim goes first because removing it can fail, and disowning a claim this process still holds is worse than reporting the failure: a later `acquire` would find the directory carrying its own live pid, which `lockAbandoned` will never reclaim, and spin to `RolloutStoreBusyError` against a lock it orphaned itself. Keeping the handle on a throw leaves the two views agreeing that ownership was never given up. commentlint: allow(JUDGE) */
+        held.release();
         this.held = null;
         /** Ownership is what made the cached snapshot authoritative, so it is dropped with the claim: another owner can advance the file while this instance holds nothing, and a reacquisition serving the old array would pay for a coordinate that owner already completed and then be refused replacement by `put`. commentlint: allow(JUDGE) */
         this.records = null;
         this.indexByCoordinate = new Map();
         ownedRecordPaths.delete(this.claim);
         process.off("exit", this.releaseOnExit);
-        held.release();
     }
 
     private acquire(): void {
@@ -427,7 +428,8 @@ export class FileRolloutStore implements RolloutStore {
     }
 
     private load(): RolloutRecord[] {
-        if (this.records) return this.records;
+        /** The cache is only ever authoritative while the lock is held, and a read-only store never takes it: `acquire` is a no-op and neither `reload` nor `invalidate` is reachable without `put`. A reader that cached would answer every later `list` from its first snapshot while writers advance the file, so it re-reads instead. commentlint: allow(JUDGE) */
+        if (this.records && !this.readOnly) return this.records;
         let records: RolloutRecord[] = [];
         try {
             records = parseRolloutRecords(
@@ -955,9 +957,11 @@ export async function runPairedDelta(
                         coordinates.push(coordinateResult);
                         break outer;
                     }
-                    /** A rung that ran and failed stops the ladder as designed, but one that never ran — an invalid stored record — leaves the coordinate short of the evidence it claims, and only the primary arms feed the `incomplete` derivation below. commentlint: allow(JUDGE) */
-                    if (rung === null) coordinateResult.incomplete = true;
-                    if (rung?.cell.runHealth !== "completed") break;
+                    /** Stopping the ladder is by design, but the rungs below this one never ran either way, so the coordinate is short of the evidence it claims whether the rung failed or was never usable. The derivation below reads only the primary arms, and no regret arm is a member, so nothing downstream would notice. commentlint: allow(JUDGE) */
+                    if (rung?.cell.runHealth !== "completed") {
+                        coordinateResult.incomplete = true;
+                        break;
+                    }
                 }
                 coordinateResult.regret = computeRegretRungs(
                     scenario,

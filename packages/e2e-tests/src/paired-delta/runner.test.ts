@@ -1417,6 +1417,54 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("keeps the claim when removing the lock directory fails", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-release-throws-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // A read-execute parent makes removing the lock entry fail with EACCES.
+            chmodSync(root, 0o500);
+            expect(() => store.release()).toThrow();
+
+            // The claim is still recorded as ours, so another store for the same path
+            // says so at once instead of spinning against a lock this process
+            // orphaned and would never reclaim, its own pid being live.
+            chmodSync(root, 0o700);
+            expect(() => new FileRolloutStore(path).put(storedRecord("mc-off"))).toThrow(
+                /already owned in this process/,
+            );
+            store.release();
+        } finally {
+            chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("re-reads the file on every list when the store is read-only", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-readonly-stale-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, JSON.stringify([storedRecord("mc-on")]));
+            const reader = new FileRolloutStore(path, { readOnly: true });
+            expect(reader.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+
+            // A reader never holds the lock, so nothing invalidates a cache for it.
+            writeFileSync(
+                path,
+                JSON.stringify([storedRecord("mc-on"), storedRecord("mc-off")]),
+            );
+
+            expect(reader.list().map(({ armId }) => armId).sort()).toEqual([
+                "mc-off",
+                "mc-on",
+            ]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("drops the cached snapshot when the store is released", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-release-cache-"));
         try {
@@ -2012,6 +2060,9 @@ describe("paired-delta runner", () => {
         );
         expect(result.coordinates[0]?.cells.r3).toBeUndefined();
         expect(events).not.toContain("create:r3");
+        // The rungs below R2 never ran, and no regret arm feeds the primary-arm
+        // derivation, so the coordinate has to say so itself.
+        expect(result.coordinates[0]?.incomplete).toBe(true);
     });
 });
 
