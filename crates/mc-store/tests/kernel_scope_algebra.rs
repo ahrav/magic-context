@@ -313,6 +313,26 @@ fn missing_context_value_for_constrained_dimension_is_uncertain() {
 }
 
 #[test]
+fn definitive_mismatch_skips_later_graph_terms() {
+    struct UnreachableOracle;
+
+    impl GraphOracle for UnreachableOracle {
+        fn is_ancestor_or_equal(&self, _ancestor: &str, _descendant: &str) -> Option<bool> {
+            panic!("later graph term must not run after a definitive mismatch");
+        }
+    }
+
+    let scoped = scope(&[exact("domain", "code"), git_reachable("branch", &oid(1))]);
+    let ctx = ScopeMatchContext::new()
+        .with_value(Dimension::Domain, "documentation")
+        .with_head_commit(oid(2));
+    assert_eq!(
+        scope_matches(&scoped, &ctx, &UnreachableOracle),
+        MatchOutcome::DoesNotMatch
+    );
+}
+
+#[test]
 fn coerce_version_pads_and_demotes_suffixes() {
     assert_eq!(coerce_version("14.4"), Some(semver::Version::new(14, 4, 0)));
     assert_eq!(coerce_version("14"), Some(semver::Version::new(14, 0, 0)));

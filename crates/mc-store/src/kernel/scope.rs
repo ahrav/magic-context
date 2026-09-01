@@ -680,16 +680,6 @@ pub enum MatchOutcome {
     Uncertain,
 }
 
-impl MatchOutcome {
-    fn and(self, other: MatchOutcome) -> MatchOutcome {
-        match (self, other) {
-            (Self::DoesNotMatch, _) | (_, Self::DoesNotMatch) => Self::DoesNotMatch,
-            (Self::Uncertain, _) | (_, Self::Uncertain) => Self::Uncertain,
-            _ => Self::Matches,
-        }
-    }
-}
-
 /// Resolved query-side values the scope predicates compare against, one text
 /// value per dimension plus the checkout HEAD for git-reachability terms.
 /// Values are resolved before predicate evaluation (never ambient state).
@@ -1198,10 +1188,15 @@ pub fn scope_matches(
     ctx: &ScopeMatchContext,
     oracle: &dyn GraphOracle,
 ) -> MatchOutcome {
-    scope
-        .terms()
-        .map(|(dimension, term)| term_matches(term, dimension, ctx, oracle))
-        .fold(MatchOutcome::Matches, MatchOutcome::and)
+    let mut outcome = MatchOutcome::Matches;
+    for (dimension, term) in scope.terms() {
+        match term_matches(term, dimension, ctx, oracle) {
+            MatchOutcome::DoesNotMatch => return MatchOutcome::DoesNotMatch,
+            MatchOutcome::Uncertain => outcome = MatchOutcome::Uncertain,
+            MatchOutcome::Matches => {}
+        }
+    }
+    outcome
 }
 
 /// Sound, not complete: `true` guarantees every context matched by `b` is
