@@ -451,6 +451,11 @@ describe("opencode child lifecycle", () => {
                         "https://host.internal/v1/sk-ant-abcdefghijklmnopqrstuv",
                         /Anthropic-style key value in query key/,
                     ],
+                    // A capability-style endpoint can carry its token in the leftmost label.
+                    [
+                        "https://sk-ant-abcdefghijklmnopqrstuv.gateway.internal/v1",
+                        /Anthropic-style key value in query key/,
+                    ],
                     [
                         "https://host.internal/v1/sk-ant-abcdefghijklmnopqrstuv/chat",
                         /Anthropic-style key value in query key/,

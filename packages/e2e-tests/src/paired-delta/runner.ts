@@ -186,7 +186,8 @@ export async function verifyDualMockResolution(input: {
         fixtureRoute,
         { providerId: input.liveProviderId, modelId: input.liveModelId },
     ];
-    const resolved = await Promise.all(routes.map((route) => input.sendPrompt(route)));
+    /** The callback receives a copy: handed the same object, a `sendPrompt` that normalizes its argument in place would rewrite the expectation too, and the comparison below could then agree after both identities had been changed — certifying a live route that resolved through the fixture provider. commentlint: allow(JUDGE) */
+    const resolved = await Promise.all(routes.map((route) => input.sendPrompt({ ...route })));
     for (let index = 0; index < routes.length; index++) {
         const expected = routes[index];
         const actual = resolved[index];
@@ -213,13 +214,18 @@ const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
  * non-finite or negative cost would disable the cost cap: adding NaN to the
  * spent total makes every later cap comparison false.
  */
+/** Raised when a records file cannot be parsed. A distinct type because the exit code a caller keys off has to separate "this file needs inspection" from "the run stopped on budget"; matching diagnostic prose would couple the CLI to wording that is free to change. commentlint: allow(JUDGE) */
+export class RolloutRecordsInvalidError extends Error {}
+
 function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
     if (!Array.isArray(raw)) {
-        throw new Error(`rollout store ${path} must contain an array`);
+        throw new RolloutRecordsInvalidError(`rollout store ${path} must contain an array`);
     }
     raw.forEach((candidate, index) => {
         const fail = (why: string): never => {
-            throw new Error(`rollout store ${path} record ${index}: ${why}`);
+            throw new RolloutRecordsInvalidError(
+                `rollout store ${path} record ${index}: ${why}`,
+            );
         };
         if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
             fail("record-not-object");
@@ -704,23 +710,25 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
+        /** The contract's own validator runs before anything reads the cell, because a store that returns a null or absent cell would otherwise be diagnosed by a `TypeError` raised outside the release path — leaving a lock-owning store holding its claim through a rejected resume, so even a corrected retry stays blocked. It also rules out the combinations a matching arm and matching counts still admit: a reason code paired with a health it cannot carry, or a completed cell carrying one at all. commentlint: allow(JUDGE) */
+        const cell = ((): ArmedCellResult => {
+            try {
+                return parseArmedCellResult(record.cell);
+            } catch (error) {
+                releaseBeforeThrowing(options.store);
+                if (!(error instanceof PairedDeltaContractError)) throw error;
+                throw new Error(
+                    `records file cell is invalid at ${coordinateKey(record)} ` +
+                        `(${error.diagnostics.join(",")}); point at a fresh records path`,
+                );
+            }
+        })();
         /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. commentlint: allow(JUDGE) */
-        if (record.cell.armId !== record.armId) {
+        if (cell.armId !== record.armId) {
             releaseBeforeThrowing(options.store);
             throw new Error(
-                `records file cell arm ${record.cell.armId} does not match coordinate ` +
+                `records file cell arm ${cell.armId} does not match coordinate ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
-            );
-        }
-        /** The contract's own validator rather than a local subset, so a custom store cannot drift from it: it rules out the combinations a matching arm and matching counts still admit — a reason code paired with a health it cannot carry, or a completed cell carrying one at all — which a resume would otherwise return as evidence and fold into the exclusion counts. commentlint: allow(JUDGE) */
-        try {
-            parseArmedCellResult(record.cell);
-        } catch (error) {
-            releaseBeforeThrowing(options.store);
-            if (!(error instanceof PairedDeltaContractError)) throw error;
-            throw new Error(
-                `records file cell is invalid at ${coordinateKey(record)} ` +
-                    `(${error.diagnostics.join(",")}); point at a fresh records path`,
             );
         }
         /** A record counted as neither observed nor estimated disappears from the run's provenance totals while still suppressing its rollout. commentlint: allow(JUDGE) */
@@ -748,7 +756,7 @@ export async function runPairedDelta(
             }
         }
         /** A completed cell priced as an estimate is a combination the live path cannot produce: unpriceable usage is what selects `estimated`, and that same condition marks the result invalid rather than completed. Accepting it let a record suppress its rollout while restoring no spend, which is the one direction that spends money. commentlint: allow(JUDGE) */
-        if (record.costSource === "estimated" && record.cell.runHealth === "completed") {
+        if (record.costSource === "estimated" && cell.runHealth === "completed") {
             releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file prices a completed cell as an estimate at ` +
@@ -1408,8 +1416,12 @@ function detachedIntervention(
 ): InterventionDescriptor {
     try {
         const detached = JSON.parse(JSON.stringify(observed)) as unknown;
-        if (interventionFingerprint(detached as InterventionDescriptor) === null) return expected;
-        return detached as InterventionDescriptor;
+        /** The detached value has to be the same descriptor that was validated, not merely a valid one: a hook can return a supported but different descriptor without throwing, and retaining that would record an intervention the arm did not run — refused later as a mismatch, which discards the paid coordinate. Compared against the observed fingerprint rather than the expected one, so a genuine adapter disagreement is still recorded as itself. commentlint: allow(JUDGE) */
+        const before = interventionFingerprint(observed as InterventionDescriptor);
+        if (before === null) return expected;
+        return interventionFingerprint(detached as InterventionDescriptor) === before
+            ? (detached as InterventionDescriptor)
+            : expected;
     } catch {
         return expected;
     }

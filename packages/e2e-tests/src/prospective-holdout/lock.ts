@@ -227,6 +227,11 @@ function releaseLock(lock: string): void {
         return;
     }
     rmSync(lock, { recursive: true, force: true });
+    /** `force` succeeds against an absent path, so the removal above cannot distinguish "deleted this claim" from "a reclaimer moved it first". A reclaimer that then restores the displaced directory would leave this process's record at `lock` with the handle already marked released. Sweeping again catches the record wherever it landed, and the ownership re-read catches a restoration to `lock` itself. commentlint: allow(JUDGE) */
+    sweepSidelines();
+    if (readLockOwner(lock)?.nonce === LOCK_NONCE) {
+        rmSync(lock, { recursive: true, force: true });
+    }
 }
 
 export interface RecoverableLockOptions {

@@ -117,7 +117,7 @@ function dropRecord(store: MemoryStore, armId: ArmId): void {
     store.records.splice(index, 1);
 }
 
-function options(store = new MemoryStore()): RunPairedDeltaOptions {
+function options(store: RolloutStore = new MemoryStore()): RunPairedDeltaOptions {
     return {
         scenarios: [scenario],
         poolManifestFingerprint: "a".repeat(64),
@@ -1479,6 +1479,48 @@ describe("paired-delta runner", () => {
         expect(unavailable.maxAttemptCostUsd).toBe(unavailable.costUsd);
     });
 
+    it("refuses a record whose cell is absent without losing the claim", async () => {
+        // The dereference used to raise a TypeError outside the release path.
+        const store = new MemoryStore([
+            { ...storedRecord("mc-on"), cell: null as unknown as RolloutRecord["cell"] },
+        ]);
+        let released = 0;
+        const counting: RolloutStore = {
+            list: () => store.list(),
+            put: (record) => store.put(record),
+            release: () => {
+                released += 1;
+            },
+        };
+
+        await expect(runPairedDelta(options(counting), dependencies())).rejects.toThrow(
+            /records file cell is invalid/,
+        );
+        expect(released).toBe(1);
+    });
+
+    it("stores the validated intervention when a toJSON returns a different descriptor", async () => {
+        // A hook can return a supported but different descriptor without throwing.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                const swapped = { ...base.intervention };
+                Object.defineProperty(swapped, "toJSON", {
+                    value: () => ({ kind: "none" }),
+                    enumerable: false,
+                });
+                return { ...base, intervention: swapped };
+            }),
+        );
+
+        const stored = result.records[0];
+        if (!stored) throw new Error("missing record");
+        // The recorded intervention is the arm's own, not the hook's substitute.
+        expect(stored.intervention).toEqual(interventionFor(scenario, stored.armId));
+    });
+
     it("stores a validated intervention when the adapter's toJSON throws", async () => {
         // `JSON.stringify` calls `toJSON`; the canonicalizer reads enumerable fields and
         // never sees it, so validation passes and the detach throws after the paid rollout.
@@ -2426,6 +2468,24 @@ describe("paired-delta runner", () => {
 });
 
 describe("dual-mock resolution gate", () => {
+    it("does not let sendPrompt rewrite the expectation it is compared against", async () => {
+        // Handed the same object, an in-place normalization would rewrite both identities and
+        // the comparison could then agree about a route that resolved through the fixture.
+        await expect(
+            verifyDualMockResolution({
+                liveProviderId: "mock-live",
+                liveModelId: "snapshot-2026-08-01",
+                modelContextLimit: 4096,
+                async sendPrompt(route) {
+                    const mutable = route as { providerId: string };
+                    mutable.providerId = "mock-anthropic";
+                    return { ...route, contextLimit: 4096 };
+                },
+            }),
+        ).rejects.toThrow(/dual-mock/);
+    });
+
+
     it("routes each provider independently and resolves the declared live limit", async () => {
         const requests = new Map<string, number>();
         await verifyDualMockResolution({

@@ -6,6 +6,7 @@ import { isWithin } from "../../plugin/src/features/magic-context/memory/verific
 import {
     FileRolloutStore,
     ProviderUnavailableError,
+    RolloutRecordsInvalidError,
     runPairedDelta,
     verifyDualMockResolution,
     type PairedDeltaRunResult,
@@ -35,6 +36,20 @@ const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
     "invalid-stored-records": 2,
     "harness-unreclaimed": 3,
 };
+
+/** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. commentlint: allow(JUDGE) */
+async function runOrReportInvalidRecords(
+    run: () => Promise<PairedDeltaRunResult>,
+): Promise<PairedDeltaRunResult | null> {
+    try {
+        return await run();
+    } catch (error) {
+        if (!(error instanceof RolloutRecordsInvalidError)) throw error;
+        console.error(`paired-delta: ${error.message}`);
+        process.exitCode = EXIT_CODES["invalid-stored-records"];
+        return null;
+    }
+}
 
 function parseArgs(argv: string[]): CliArgs {
     let smoke = false;
@@ -264,7 +279,7 @@ async function main(): Promise<void> {
         },
     });
 
-    const result = await runPairedDelta(
+    const result = await runOrReportInvalidRecords(() => runPairedDelta(
         {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
@@ -318,7 +333,8 @@ async function main(): Promise<void> {
                 };
             },
         },
-    );
+    ));
+    if (result === null) return;
 
     const summary = {
         status: result.status,

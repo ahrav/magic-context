@@ -351,11 +351,13 @@ function parsedUrlPairs(value: string): Array<[string, string]> {
     } catch {
         return [];
     }
-    /** A path segment carries no key to judge and the value rules anchor at the start of the whole URL, so a credential parked in the path is read by neither. Each segment is offered whole under an empty key, decoded first so a percent-encoded credential is judged as itself. commentlint: allow(JUDGE) */
-    const pairs: Array<[string, string]> = url.pathname
-        .split("/")
-        .filter((segment) => segment.length > 0)
-        .map((segment) => ["", decodeSegment(segment)]);
+    /** A hostname label and a path segment both carry no key to judge, and the value rules anchor at the start of the whole URL, so a credential parked in either is read by neither. Each is offered whole under an empty key, decoded first so a percent-encoded credential is judged as itself. A capability-style endpoint that puts its token in the leftmost label is the hostname case. commentlint: allow(JUDGE) */
+    const pairs: Array<[string, string]> = [
+        ...url.hostname.split("."),
+        ...url.pathname.split("/"),
+    ]
+        .filter((part) => part.length > 0)
+        .map((part) => ["", decodeSegment(part)]);
     pairs.push(...url.searchParams.entries());
     const fragment = url.hash.replace(/^#/, "");
     if (fragment.length === 0) return pairs;
