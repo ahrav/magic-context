@@ -288,7 +288,12 @@ pub fn secret_shaped_json_key(key: &str) -> bool {
         return false;
     }
     if key_names_a_secret(key) {
-        return true;
+        // A name whose label reduces to the bare `key` carries no credential qualifier, so
+        // it names a structural row: `target_key` and `stream_key`, not `api_key`. Reading
+        // it as a credential refuses ordinary vocabulary, and disagreeing with
+        // `qualified_secret_key_label` would make one name structural to the identity gate
+        // and secret to this one.
+        return !matches!(redaction_type_for_key(key).as_str(), "key" | "keys");
     }
     let joined = separate_words(key)
         .to_lowercase()
@@ -351,17 +356,25 @@ fn redaction_type_for_key(key: &str) -> String {
 
 /// Splits camel case so `apiKey` yields the same segments as `api_key`.
 fn separate_words(key: &str) -> String {
+    let characters = key.chars().collect::<Vec<_>>();
     let mut separated = String::with_capacity(key.len() + 8);
-    let mut previous: Option<char> = None;
-    for character in key.chars() {
-        if character.is_ascii_uppercase()
+    for (index, character) in characters.iter().copied().enumerate() {
+        let previous = index.checked_sub(1).map(|earlier| characters[earlier]);
+        let lower_to_upper = character.is_ascii_uppercase()
             && previous
-                .is_some_and(|earlier| earlier.is_ascii_lowercase() || earlier.is_ascii_digit())
-        {
+                .is_some_and(|earlier| earlier.is_ascii_lowercase() || earlier.is_ascii_digit());
+        // `URLToken` ends an acronym at the last capital of the run, so the boundary sits
+        // before a capital whose successor is lowercase. Without it the key stays one
+        // segment, `urltoken`, and no label word matches.
+        let acronym_to_word = character.is_ascii_uppercase()
+            && previous.is_some_and(|earlier| earlier.is_ascii_uppercase())
+            && characters
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
+        if lower_to_upper || acronym_to_word {
             separated.push('_');
         }
         separated.push(character);
-        previous = Some(character);
     }
     separated
 }
@@ -492,6 +505,44 @@ mod tests {
             assert!(
                 qualified_secret_key_label(key).is_none(),
                 "expected {key} to name a structural row"
+            );
+        }
+    }
+
+    #[test]
+    fn an_acronym_boundary_still_separates_label_words() {
+        for key in ["URLToken", "SQLSecret", "APISecret", "AWSSecretKey"] {
+            assert!(
+                secret_shaped_json_key(key),
+                "expected {key} to be protected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_key_label_names_a_structural_row_everywhere() {
+        // Both gates must agree: a name reducing to the bare `key` label is structural.
+        for key in [
+            "target_key",
+            "stream_key",
+            "key_id",
+            "last_model_key",
+            "primary_key",
+        ] {
+            assert!(
+                !secret_shaped_json_key(key),
+                "expected {key} to stay writable"
+            );
+            assert!(
+                qualified_secret_key_label(key).is_none(),
+                "{key} disagrees between the two gates"
+            );
+        }
+        for key in ["api_key", "session_key", "private_key", "client_secret"] {
+            assert!(secret_shaped_json_key(key), "expected {key} protected");
+            assert!(
+                qualified_secret_key_label(key).is_some(),
+                "{key} disagrees between the two gates"
             );
         }
     }

@@ -4026,11 +4026,13 @@ fn prepare_json_content_collecting(
                 && !policy.reject_protected();
             if preserved_identity {
                 ensure_durable_text_bound(key)?;
-                // A nested object supplies its own field names, and those names carry the
-                // policy for their values. Exempting the whole subtree stores the secret in
-                // `{"id":{"message":"password=.."}}` verbatim. An array inherits this key,
-                // so it keeps the preserving policy through the structural walk below.
-                if !value.is_object() {
+                // Only a scalar is preserved. A container's members carry their own policy:
+                // an object supplies new field names, and an array's elements inherit this
+                // key through the walk below, so a scalar element stays verbatim while an
+                // object element is scanned under its own names. Exempting a whole subtree
+                // stores the secret in `{"id":{"message":"password=.."}}` and in
+                // `{"ids":[{"password":".."}]}` verbatim.
+                if !value.is_object() && !value.is_array() {
                     return validate_existing_value(value);
                 }
             } else if contains_nonempty_text(value) {
@@ -17382,6 +17384,18 @@ mod tests {
                 ),
             }
         }
+
+        // An array element that is an object supplies its own field names, so it is scanned
+        // even though the enclosing identity name preserves scalars.
+        let nested_in_array = prepare_json_content_preserving_identities(
+            r#"{"related_ids":[{"message":"password=array-secret"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            nested_in_array,
+            r#"{"related_ids":[{"message":"password=<REDACTED:password>"}]}"#
+        );
+        assert!(!nested_in_array.contains("array-secret"));
 
         // An array under an identity name inherits that name, so its elements stay verbatim.
         let inherited =
