@@ -12,6 +12,7 @@ import type {
     FamilyNoiseFloor,
     RawRegretRecord,
 } from "./estimator";
+import { PRIMARY_ENDPOINTS } from "./estimator";
 import { validSuccess } from "./scoring";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
@@ -554,6 +555,25 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         throw new Error("paired-delta-calibration: fingerprint-mismatch");
     }
     const record = raw as unknown as PairedDeltaCalibrationRecord;
+    /**
+     * The sizing decision is read by comparisons, not by arithmetic that would throw: a missing
+     * `poolSize` makes `cohort < undefined` false and a missing `familyCount` makes the per-family
+     * requirement `NaN`, so both cohort gates pass silently on a malformed record.
+     */
+    const decisions = record.decisions as CalibrationDecision | null | undefined;
+    if (
+        decisions === null ||
+        decisions === undefined ||
+        typeof decisions !== "object" ||
+        !Number.isSafeInteger(decisions.poolSize) ||
+        decisions.poolSize < 1 ||
+        !Number.isSafeInteger(decisions.familyCount) ||
+        decisions.familyCount < 1 ||
+        !Number.isSafeInteger(decisions.replicateCount) ||
+        decisions.replicateCount < 1
+    ) {
+        throw new Error("paired-delta-calibration: decisions-invalid");
+    }
     requireHex64(record.poolManifestFingerprint, "pool-manifest-fingerprint");
     requireHex64(record.policyFingerprint, "policy-fingerprint");
     if (
@@ -566,6 +586,9 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         !Array.isArray(record.familyNoise) ||
         record.familyNoise.some((noise) =>
             typeof noise.familyId !== "string" ||
+            /** An unrecognized endpoint keys a floor the estimator never looks up, and the absent-endpoint fallback does not cover it, so the floor is silently dropped. */
+            (noise.endpoint !== undefined &&
+                !(PRIMARY_ENDPOINTS as readonly string[]).includes(noise.endpoint)) ||
             !Number.isFinite(noise.spread) ||
             /** `familyFloorValue` divides by these, and a non-finite floor silently labels every family outside it, which disables the gate rather than failing. */
             !Number.isSafeInteger(noise.observationCount) ||

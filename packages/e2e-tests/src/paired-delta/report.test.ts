@@ -12,6 +12,7 @@ import {
     PAIRED_DELTA_REPORT_SCHEMA,
     buildCalibrationRecord,
     calibrationNoiseFloors,
+    readCalibrationRecord,
     buildPairedDeltaReport,
     publishPairedDeltaReport,
 } from "./report";
@@ -627,5 +628,68 @@ describe("paired-delta calibration record", () => {
             targetMinimumDetectableDelta: 0.15,
             decisions,
         })).toThrow(/policy-fingerprint-invalid/);
+    });
+});
+
+describe("paired-delta calibration record reader", () => {
+    const written = (overrides: Record<string, unknown>) => {
+        const built = buildCalibrationRecord({
+            records: [
+                ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: true }),
+                ...coordinate("var-a", 1, { "mc-on": true, "mc-off": true, compaction: false }),
+                ...coordinate("var-a", 2, { "mc-on": true, "mc-off": false, compaction: true }),
+            ],
+            scenarioFamilies: new Map([["var-a", "fam-one"]]),
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            policyFingerprint: H2,
+            implementationDigest: "abc123",
+            targetMinimumDetectableDelta: 0.15,
+            decisions: {
+                familyCount: 1,
+                replicateCount: 3,
+                cadence: "weekly-and-release",
+            },
+        });
+        const { recordFingerprint, ...body } = { ...built, ...overrides };
+        // Re-fingerprinted, so the reader cannot reject these on consistency alone.
+        return { ...body, recordFingerprint: canonicalFingerprint(body) };
+    };
+    const root = mkdtempSync(join(tmpdir(), "paired-delta-read-"));
+    const write = (record: unknown): string => {
+        const path = join(root, `record-${Math.random().toString(16).slice(2)}.json`);
+        require("node:fs").writeFileSync(path, JSON.stringify(record));
+        return path;
+    };
+
+    it("accepts a record it wrote itself", () => {
+        expect(readCalibrationRecord(write(written({}))).validForPoolSizing).toBe(true);
+    });
+
+    it("rejects sizing decisions the cohort gates would silently pass", () => {
+        // `cohort < undefined` is false, so an absent poolSize disables the gate rather than failing.
+        // `undefined` is not representable in JSON, so an absent object arrives as a fingerprint mismatch.
+        for (const decisions of [
+            null,
+            { familyCount: 1, replicateCount: 3, cadence: "weekly-and-release" },
+            { poolSize: 4, replicateCount: 3, cadence: "weekly-and-release" },
+            { poolSize: 0, familyCount: 1, replicateCount: 3, cadence: "weekly-and-release" },
+            { poolSize: 4, familyCount: 1, replicateCount: 0, cadence: "weekly-and-release" },
+        ]) {
+            expect(() => readCalibrationRecord(write(written({ decisions }))))
+                .toThrow(/decisions-invalid/);
+        }
+    });
+
+    it("rejects a floor keyed by an endpoint the estimator never looks up", () => {
+        const record = written({});
+        const familyNoise = (record.familyNoise as unknown[])
+            .map((noise, index) => (index === 0
+                ? { ...(noise as object), endpoint: "latency" }
+                : noise));
+
+        expect(() => readCalibrationRecord(write(written({ familyNoise }))))
+            .toThrow(/record-invalid/);
     });
 });
