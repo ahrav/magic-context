@@ -223,6 +223,9 @@ highest-risk mechanisms, not as a clean bill for the crate.
 | [core-pass-classifier-destructive-clear-guard](#core-pass-classifier-destructive-clear-guard) | safety | high |
 | [tokenizer-cross-process-determinism](#tokenizer-cross-process-determinism) | safety | high |
 | [tokenizer-golden-oracle-provenance](#tokenizer-golden-oracle-provenance) | safety | high |
+| [durable-identity-decision-is-made-inside-the-write-transaction](#durable-identity-decision-is-made-inside-the-write-transaction) | safety | high |
+| [preserved-identity-name-does-not-exempt-its-value](#preserved-identity-name-does-not-exempt-its-value) | safety | high |
+| [refused-durable-write-leaves-no-row-and-no-receipt](#refused-durable-write-leaves-no-row-and-no-receipt) | safety | medium |
 
 ---
 
@@ -2159,3 +2162,166 @@ executing check.
   copy of routing logic `mc-module` already implements, because a silent divergence between
   an unused reference implementation and the live router is worse than having no reference.
 
+---
+
+## Group H: the durable-write redaction contract
+
+This group is new with the durable-write preparation work. Every record here is
+anchored to `crates/mc-store/src/lib.rs` and `crates/mc-core/src/redaction.rs` at
+commit `c31aafbb1` plus the working-tree change described in each record.
+
+The contract has two halves that pull in opposite directions, which is why the
+records below are about the *decision* rather than about redaction itself. A field
+body is redacted, because substituting a placeholder keeps the write. A lookup
+identity is refused, because substituting would alias distinct values onto one
+placeholder. So a value's disposition depends on the role the write gives it, and
+`PreparedFieldPolicy` at `lib.rs:2956-2960` names the three roles: `Content`
+substitutes, `NewIdentity` rejects, `ExistingIdentity` preserves.
+
+`ExistingIdentity` exists for one reason: a release that predates the scanner could
+have stored an identity that the detector now matches. Refusing it retroactively
+would strand every row already keyed by it. That makes the new-versus-stored
+distinction load-bearing, and the records below are about who is allowed to make it.
+
+### durable-identity-decision-is-made-inside-the-write-transaction
+
+Type: safety
+Reachability: default-production
+Status: active
+Exercised: yes — `lib.rs:17309` `cache_state_identity_decision_comes_from_the_write_transaction`
+covers both branches at the `commit_transform` site. The facade site is unexercised.
+Guarantee: When a fenced write introduces a durable identity rather than replaying a
+row already stored under it, a scanner detection in that identity refuses the write.
+Whether the identity is new is determined by state the write transaction itself
+reads, not by an earlier read on another connection.
+Check: `always` — at each enumerated site, a detection in the identity plus an
+in-transaction observation that no row carries it implies the write returns
+`McStoreError::Redaction(SecretDetected)` and commits nothing; a detection plus an
+in-transaction observation that a row does carry it implies the write commits and
+the stored bytes are unchanged. Enumerated sites: `commit_transform`'s `session_id`
+(`lib.rs:9487`, gate at `:9670-9677`) and `with_facade_command`'s
+`(identity_scope, tool, action)` triple (`lib.rs:6765-6770`, gate at `:6820-6840`).
+`always` because each clause must hold at every evaluation of its site, not only
+under contention.
+
+The scope is deliberately enumerated rather than universal, matching
+[write-predicates-are-re-evaluated-inside-the-write-transaction](#write-predicates-are-re-evaluated-inside-the-write-transaction).
+"every classification shares a transaction handle with its write" is a property of
+source structure, which a workload cannot observe; the per-site consequences are
+what a test can assert.
+Fault/timing angle: the window is between an out-of-transaction existence read and
+the fenced write. Before the working-tree change, `commit_transform` read existence
+through `self.inner.with_conn` and classified before opening its transaction, and
+`with_facade_command` did the same for its triple. `with_conn` and
+`with_conn_fenced` each take and release `SqliteStore::conn`
+(`cortexkit-store:144-152, 170-176`), so the mutex serializes each call but not a
+read-then-write sequence.
+Required faults and enabling state: a second thread sharing the same `McStore` that
+removes the row between the classification and the write, plus a caller passing
+`expected: None`. Both conditions are needed at the `commit_transform` site: with
+`expected: Some(v)` the CAS at `lib.rs:9660-9666` already rejects a write whose row
+vanished, so the surviving hole was `expected: None` combined with a row that was
+present at classification time and absent at write time, which `delete_session`
+constructs. Cross-process interleaving is not available, because `open_sqlite` holds
+an exclusive single-writer lease for the store's lifetime
+(`cortexkit-store:100-106`) and `for_test` exists precisely because the OS lock
+prevents a second connection (`cortexkit-store:117-119`).
+Confidence: high — the mechanism is confirmed by reading both call sites and the
+`cortexkit-store` connection model. The reachability argument above is the
+discriminating evidence that the pre-check form was exploitable only under
+`expected: None`.
+Existing check: `lib.rs:17309`. Status `audited` — both a never-reject mutation and
+an always-strict mutation fail it at the intended assertion.
+Impact: the working-tree change deletes the classification decision rather than
+narrowing it, so the property now holds structurally at both sites and no longer
+rests on the `expected: None` reachability argument. That also removes one
+connection acquisition from `commit_transform`.
+Open questions: The deterministic test pins both branches of the contract but cannot
+construct the interleaving itself, so it would not fail if a future change
+reintroduced an out-of-transaction classification whose stale decision is only
+reachable under the race. A threaded stress oracle, or a review lint for a
+classification that does not share its write's transaction handle, would close that
+gap. `OQ-H1`.
+
+### preserved-identity-name-does-not-exempt-its-value
+
+Type: safety
+Reachability: default-production
+Status: active
+Exercised: yes — `lib.rs:17258`
+`preserved_json_identities_do_not_exempt_credential_names_or_nested_values`.
+Guarantee: Under the identity-preserving JSON policies, a field name reaches the
+byte-length-only path only when the name denotes a structural identifier and its
+value is a scalar. A credential-qualified name, or a nested object under an
+identity name, is scanned.
+Check: `always` — for a JSON field under `DurablePreserveIdentities` or
+`TransactionPreserveIdentities`, the length-only path at `lib.rs:4027-4036` is taken
+only when `identity_json_field(key)` holds, no `integrity_json_field(key)` marker
+matches, `qualified_secret_key_label(key)` is `None`, and the value is not an
+object. Otherwise the value is scanned and a detection refuses the write. `always`
+rather than `always-or-unreached` because the preserving policies are on the default
+facade-response and state-sync paths.
+Fault/timing angle: no fault needed; a single ordinary write with the right field
+name reaches it. Two shapes were live before the fix. `api_key`, `private_key`, and
+`access_key` end in `_key`, so `identity_json_field` accepted them
+(`lib.rs:3948-3956`) while no `integrity_json_field` marker matched
+(`:3958-3971`), and the length-only path stored the credential unscanned.
+Separately, an identity name exempted its whole subtree, so
+`{"id":{"message":"password=.."}}` stored the nested secret verbatim.
+Required faults and enabling state: none beyond a write carrying the field name.
+This is why the record is high confidence and was cheap to exercise.
+Confidence: high — both shapes were reproduced against the pre-fix code, and the
+distinction between a credential-qualified name and a structural one is pinned by
+`only_qualified_key_names_mark_a_credential` in `mc-core/src/redaction.rs`.
+`lineage_descent_target_key` and `last_model_key` reduce to the bare `key` label and
+must keep the preserving path; five lineage-descent tests failed when an earlier
+attempt used `protected_json_key_label` and caught them.
+Existing check: `lib.rs:17258`, plus
+`preserved_json_identities_do_not_exempt_integrity_fields` at `:17237`. Status
+`audited` — removing either the credential-name gate or the nested-object descent
+fails the first test.
+Impact: closes a path where a durable write persisted a credential with no scan
+receipt, which the audit tables would then report as clean.
+Open questions: `secret_shaped_json_key` still refuses a benign structural string
+under a secret-shaped name, so `{"stream_key": "main"}` is rejected in claim
+integrity JSON. Scanning the value instead of refusing on the name is a policy
+change that trades a fail-closed default for ergonomics and needs an owner
+decision. `OQ-H2`.
+
+### refused-durable-write-leaves-no-row-and-no-receipt
+
+Type: safety
+Reachability: default-production
+Status: active
+Exercised: partial — `lib.rs:17309` asserts the no-row half at the
+`commit_transform` site. No test asserts the no-receipt half.
+Guarantee: A write refused for a detected secret commits nothing: neither the
+domain row nor the scan-audit rows that would have recorded the refusal.
+Check: `always` — after a call returning `McStoreError::Redaction(SecretDetected)`,
+the target table has no row for the write's key and `mc_field_scans` has no row for
+its batch. `always` because a partially applied refusal is never acceptable.
+Fault/timing angle: two refusal points behave differently and that is the risk. A
+`NewIdentity` detection refuses inside `prepare_field` (`lib.rs:3174-3176`) before
+any transaction opens, so nothing can be written. A deferred refusal via
+`reject_recorded_identities` (`:3111-3119`) happens inside the fenced transaction and
+depends on the rollback to undo work the mutation callback may already have done.
+Required faults and enabling state: a detected secret in a field prepared under
+`NewIdentity`, or a deferred rejection reached after an in-transaction existence
+check. For the deferred form the enabling state includes a mutation callback that has
+already executed, which is the facade case.
+Confidence: medium — the no-row half is directly asserted at one site. The
+no-receipt half is inferred from the audit rows being written inside the same fenced
+transaction, and is not observed by a test. `mc_scan_detections.action` admits
+`'reject'` (`lib.rs:1401`) with the schema comment stating that rejected writes
+roll back with their receipts, so the intended behaviour is that no receipt survives
+a refusal; nothing checks it.
+Existing check: `lib.rs:17309` for the no-row half only. Status `unaudited` for the
+no-receipt half, which has no check.
+Impact: if a refusal ever left an audit row behind, the audit tables would describe a
+write that never happened, which is the mirror of the gap in
+[preserved-identity-name-does-not-exempt-its-value](#preserved-identity-name-does-not-exempt-its-value).
+Open questions: Is the `'reject'` action value reachable at all? Every refusal path
+found so far either predates the transaction or rolls it back, so no committed row
+should ever carry it. If it is genuinely unreachable, the property is
+`unreachable(action = 'reject')` and the schema comment should say so rather than
+admitting the value. `OQ-H3`.

@@ -6758,30 +6758,16 @@ impl McStore {
                 return Ok(FacadeMutationOutcome::Duplicate(response));
             }
         }
-        let existing_identity = self.inner.with_conn(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM mc_facade_mutation_ledger
-                      WHERE identity_scope = ?1 AND tool = ?2 AND action = ?3
-                 )",
-                params![identity_scope, tool, action],
-                |row| row.get::<_, i64>(0),
-            )
-        })? != 0;
-        let tool = if existing_identity {
-            write.existing_identity("tool", tool)?
-        } else {
-            write.identity("tool", tool)?
-        };
-        let action = if existing_identity {
-            write.existing_identity("action", action)?
-        } else {
-            write.identity("action", action)?
-        };
+        // Record the scans without deciding on them. The transaction below reads whether
+        // this `(identity_scope, tool, action)` triple is already stored, so a ledger row
+        // added or removed after an out-of-transaction read cannot leave a stale decision
+        // that preserves a detected secret on a genuinely new triple.
+        let tool = write.existing_identity("tool", tool)?;
+        let action = write.existing_identity("action", action)?;
         if let Some(command_id) = command_id {
             write.identity("command_id", command_id)?;
         }
-        write.identity("identity_scope", identity_scope)?;
+        write.existing_identity("identity_scope", identity_scope)?;
         let _mutation_guard = self
             .facade_mutation_lock
             .lock()
@@ -6829,6 +6815,26 @@ impl McStore {
                             FacadeMutationOutcome::Duplicate(response),
                         ));
                     }
+                }
+
+                let stored_triple: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM mc_facade_mutation_ledger
+                          WHERE identity_scope = ?1 AND tool = ?2 AND action = ?3
+                     )",
+                    params![identity_scope, tool, action],
+                    |row| row.get(0),
+                )?;
+                if !stored_triple {
+                    // No ledger row carries this triple, so the command introduces it rather
+                    // than adding another command under an identity already stored.
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["identity_scope", "tool", "action"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
                 }
 
                 let response = mutation(&FacadeMutationTxn {
@@ -9472,20 +9478,13 @@ impl McStore {
         request: TransformCommit<'_>,
     ) -> Result<u64, McStoreError> {
         ensure_durable_text_bound(session_id)?;
-        let existing_session = self.inner.with_conn(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
-                params![session_id],
-                |row| row.get::<_, i64>(0),
-            )
-        })? != 0;
         let mut write = PreparedWrite::new(DurableWriteFamily::CacheState);
         write.domain_owner("session", session_id, "cache_state");
-        if existing_session {
-            write.existing_identity("session_id", session_id)?;
-        } else {
-            write.identity("session_id", session_id)?;
-        }
+        // Record the scan without deciding on it. Whether this `session_id` is a new
+        // identity is settled by the row this transaction actually finds, because a
+        // `delete_session` landing after an out-of-transaction existence read would leave a
+        // stale decision to preserve a detected secret on a genuine first insert.
+        write.existing_identity("session_id", session_id)?;
         let TransformCommit {
             expected,
             core,
@@ -9667,6 +9666,15 @@ impl McStore {
                 return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
                     current.max(0) as u64,
                 )));
+            }
+            if current == NO_ROW {
+                // No row to key, so this write introduces the identity rather than
+                // replaying one already stored under it.
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["session_id"])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             }
             if let Some(expected_vector) = claim_snapshot_vector {
                 let current_vector = claim_mirror::snapshot_vector_from_connection(tx)?;
@@ -17293,6 +17301,72 @@ mod tests {
             prepare_json_content_preserving_identities(r#"{"block_ids":["password=legacy-id"]}"#)
                 .unwrap();
         assert_eq!(inherited, r#"{"block_ids":["password=legacy-id"]}"#);
+    }
+
+    /// The transaction, not an earlier read, decides whether `session_id` is a new identity.
+    /// A first insert refuses a detected secret; a replay of a stored row keeps its bytes.
+    #[test]
+    fn cache_state_identity_decision_comes_from_the_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let secret_session = "password=session-secret";
+
+        // No row keys this session, so the write introduces the identity and must refuse.
+        let error = store
+            .commit_transform(secret_session, base_commit(None, &core, &meta))
+            .expect_err("a new secret-bearing session_id must not reach storage");
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "unexpected error: {error:?}"
+        );
+        let rows: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_cache_state WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "a refused write must leave no row");
+
+        // A release that predates the scanner could store this identity. Rejecting it now
+        // would orphan the row, so a replay preserves the stored bytes.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, 1, '{}', '{}', 0)",
+                    params![secret_session],
+                )
+            })
+            .unwrap();
+        let version = store
+            .commit_transform(secret_session, base_commit(Some(1), &core, &meta))
+            .expect("a stored identity must replay rather than fail closed");
+        assert_eq!(version, 2);
+        let stored: String = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT session_id FROM mc_cache_state WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            stored, secret_session,
+            "the stored identity must stay verbatim"
+        );
     }
 
     /// A "nothing happened" commit: every optional effect empty. Tests
