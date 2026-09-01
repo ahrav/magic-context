@@ -609,26 +609,6 @@ function configMatchesArm(
     return Array.isArray(config.plugin) && config.plugin.length > 0;
 }
 
-function authoredEvidenceAbsentFromMemory(
-    harness: TestHarness,
-    scenario: ScenarioDeclaration,
-): boolean {
-    // Missing context database cannot prove evidence absent from memory.
-    if (!harness.hasContextDb()) return false;
-    try {
-        const evidence = scenario.turnScript.find(
-            ({ id }) => id === scenario.absencePrecondition.evidenceTurnId,
-        )?.content;
-        if (!evidence) return false;
-        const row = harness.contextDb()
-            .prepare("SELECT COUNT(*) AS count FROM claim_revisions WHERE content LIKE ?")
-            .get(`%${evidence}%`) as { count: number } | null;
-        return (row?.count ?? 0) === 0;
-    } catch {
-        return false;
-    }
-}
-
 export function createLiveDependencies(input: {
     apiKey: string;
     providerId: string;
@@ -781,12 +761,12 @@ export function createLiveDependencies(input: {
                         evidenceIndex < burialIndex &&
                         ballastBytes >= scenario.absencePrecondition.minimumBallastBytes &&
                         ballastTokens > scenario.modelContextLimit;
-                    const absencePreconditionHeld =
-                        structuralAbsence &&
-                        (
-                            coordinate.armId !== "mc-on" ||
-                            authoredEvidenceAbsentFromMemory(harness, scenario)
-                        );
+                    /**
+                     * The precondition establishes that the authored evidence was displaced from the model's ordinary context, which the ballast does for every arm alike.
+                     * It deliberately says nothing about the treatment's memory: persisting that evidence is the mechanism `mc-on` exists to measure, so requiring its absence excluded exactly the rollouts where the treatment worked.
+                     * Pre-run contamination is not reachable either, because every rollout builds a fresh harness and database, and only R1 and R2 seed one.
+                     */
+                    const absencePreconditionHeld = structuralAbsence;
                     /**
                      * An undelivered search turn leaves an arm that is not R1, and the observation carries no separate validity channel, so the gate folds into arm identity.
                      * `prepare` reseeds until the locator query is non-leaking, so the leak test here only catches a reseed loop that stopped honoring its own contract.
