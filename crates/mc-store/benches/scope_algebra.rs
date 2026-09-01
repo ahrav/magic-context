@@ -562,6 +562,19 @@ fn profile_kernel(kernel: &str) {
                 );
             }
         }
+        "cheap-config" => {
+            let (_dir, fixture, _base, tip) = applicability_fixture();
+            let snapshot = checkout(&fixture, tip);
+            write_worktree_file(&fixture.repo, "config.toml", "feature_flag = true\n");
+            let check = CheckSpec::ConfigKey {
+                path: "config.toml".to_string(),
+                key: "feature_flag".to_string(),
+            };
+            let budget = EvalBudget::unbounded();
+            while Instant::now() < until {
+                black_box(run_cheap_check(&snapshot, &check, &budget));
+            }
+        }
         other => panic!("unknown MC_SCOPE_PROFILE kernel {other}"),
     }
 }
