@@ -955,6 +955,8 @@ export function createLiveDependencies(input: {
             let harness = await TestHarness.create(harnessOptions);
             let seeded: ReturnType<typeof seedGoldMemories> = [];
             let scriptedTurnText: string | undefined;
+            /** Captured so the failure path can price the session the rollout was using. */
+            let activeSessionId: string | undefined;
             /** The declaration names the point the evidence must already be buried by, so the ballast is keyed to it rather than to a literal turn id. */
             const burialTurnId = scenario.interventions.r1.insertAfterTurnId;
             /** R2 supplies the gold as memory and R3 supplies the same content in the prompt, so the seeded row carries the declared claim alone; a second labelled copy of the evidence would make `R3 - R2` measure duplicated content as well as representation. */
@@ -1002,6 +1004,7 @@ export function createLiveDependencies(input: {
                 },
                 async run(): Promise<RolloutObservation> {
                     const sessionId = await harness.createSession();
+                    activeSessionId = sessionId;
                     const responses: PromptResult[] = [];
                     let ballastBytes = 0;
                     let ballastTokens = 0;
@@ -1144,6 +1147,21 @@ export function createLiveDependencies(input: {
                         baseScriptFingerprint: expectedFingerprint,
                         intervention,
                     };
+                },
+                /**
+                 * The ledger after a failure, so calls the rollout already billed are charged.
+                 *
+                 * `worstCaseUsd` bounds authored and oracle calls, but the historian's retry tree —
+                 * up to three provider attempts at each of several call sites, plus a fallback-model
+                 * chain whose length is configuration — cannot be bounded from constants in this
+                 * package. Measuring is the only sound answer, and the runner takes whichever of the
+                 * bound and the measurement is larger.
+                 */
+                async usageOnFailure() {
+                    return (await sessionUsage(harness, activeSessionId ?? "", {
+                        providerId: input.providerId,
+                        modelId: input.modelId,
+                    })).usage;
                 },
                 async dispose() {
                     await harness.dispose();
@@ -1301,6 +1319,15 @@ function secondaryMetrics(records: readonly RolloutRecord[]) {
     );
     return {
         /**
+         * The token, wall-clock, and turn totals are the surviving attempts only.
+         *
+         * `FileRolloutStore.put` replaces a retried coordinate's record, and the replacement keeps
+         * `priorAttemptsCostUsd` but no prior usage, duration, or turn count. So `spentUsd` includes
+         * every attempt while these do not, and an arm with retried failures would otherwise look
+         * cheaper and faster than it was. Recovering them needs prior-attempt counters in the record,
+         * which changes the file schema a resume reads.
+         */
+        /**
          * Denominated on completed cells only. An excluded record carries `invalidSuccess: false`
          * because no response was assessable, so counting it diluted the rate: one false claim
          * among ten attempts, nine of them provider-unavailable, published as 10% rather than 100%
@@ -1319,10 +1346,10 @@ function secondaryMetrics(records: readonly RolloutRecord[]) {
                     scorable.filter(({ cell }) => cell.invalidSuccess).length / scorable.length,
                 ]),
         ),
-        tokensByArm: metric(({ usage }) =>
+        finalAttemptTokensByArm: metric(({ usage }) =>
             usage.input + usage.output + usage.cacheCreation + usage.cacheRead),
-        wallClockMsByArm: metric(({ wallClockMs }) => wallClockMs),
-        turnsByArm: metric(({ turns }) => turns),
+        finalAttemptWallClockMsByArm: metric(({ wallClockMs }) => wallClockMs),
+        finalAttemptTurnsByArm: metric(({ turns }) => turns),
     };
 }
 

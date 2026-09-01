@@ -33,9 +33,10 @@ type ArmMetrics = Partial<Record<ArmId, number>>;
 
 export interface SecondaryMetrics {
     invalidSuccessRateByArm: ArmMetrics;
-    tokensByArm: ArmMetrics;
-    wallClockMsByArm: ArmMetrics;
-    turnsByArm: ArmMetrics;
+    /** Surviving attempts only: a replaced record keeps prior spend but not prior usage, duration, or turns. */
+    finalAttemptTokensByArm: ArmMetrics;
+    finalAttemptWallClockMsByArm: ArmMetrics;
+    finalAttemptTurnsByArm: ArmMetrics;
 }
 
 export interface RawRegretLadder {
@@ -238,9 +239,12 @@ export function buildPairedDeltaReport(input: {
         exclusions,
         secondaryMetrics: {
             invalidSuccessRateByArm: sortedMetrics(input.secondaryMetrics.invalidSuccessRateByArm),
-            tokensByArm: sortedMetrics(input.secondaryMetrics.tokensByArm),
-            wallClockMsByArm: sortedMetrics(input.secondaryMetrics.wallClockMsByArm),
-            turnsByArm: sortedMetrics(input.secondaryMetrics.turnsByArm),
+            finalAttemptTokensByArm:
+                sortedMetrics(input.secondaryMetrics.finalAttemptTokensByArm),
+            finalAttemptWallClockMsByArm:
+                sortedMetrics(input.secondaryMetrics.finalAttemptWallClockMsByArm),
+            finalAttemptTurnsByArm:
+                sortedMetrics(input.secondaryMetrics.finalAttemptTurnsByArm),
         },
         regret: {
             live: input.analysis.liveRegret,

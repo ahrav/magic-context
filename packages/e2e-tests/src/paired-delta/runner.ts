@@ -87,6 +87,15 @@ export interface RolloutRecord extends RolloutCoordinate {
 }
 
 export interface RolloutHandle {
+    /**
+     * Usage the rollout already billed, read after `run` threw.
+     *
+     * A rollout that fails partway has often already paid for authored turns and for internal calls
+     * the handle can still account for. The fallback charge is a bound, and a bound over a nested
+     * retry tree in another package cannot be derived from constants here, so an implementation that
+     * can measure what it spent reports it and the charge takes whichever is larger.
+     */
+    usageOnFailure?(): Promise<TokenUsage>;
     /** Oracle setup runs before the handle creates or uses a session in `run`. */
     prepare?(): Promise<void>;
     run(): Promise<RolloutObservation>;
@@ -952,6 +961,7 @@ export async function runPairedDelta(
                 let creation: Promise<RolloutHandle> | null = null;
                 let observation: RolloutObservation | null = null;
                 let failure: unknown;
+                let billedOnFailure: TokenUsage | null = null;
                 let disposed = false;
                 let disposalFailed = false;
                 try {
@@ -996,6 +1006,23 @@ export async function runPairedDelta(
                     observation = await withRolloutDeadline(() => started.run(), rolloutMs);
                 } catch (error) {
                     failure = error;
+                    /**
+                     * Read before disposal, while the harness is still up. Bounded like every other
+                     * step, and its own failure is swallowed: this only ever raises the charge, so
+                     * losing it falls back to the estimate rather than losing the record.
+                     */
+                    const billed = handle?.usageOnFailure?.bind(handle);
+                    if (billed) {
+                        const remaining = options.deadlineEpochMs - dependencies.now();
+                        try {
+                            billedOnFailure = await withRolloutDeadline(
+                                billed,
+                                Math.max(1, Math.min(remaining, LATE_DISPOSAL_GRACE_MS)),
+                            );
+                        } catch {
+                            billedOnFailure = null;
+                        }
+                    }
                 } finally {
                     if (handle) {
                         /** A `dispose()` that never settles would hold the run open with the paid record unwritten, so cleanup is bounded like a late handle's and a hang is reported as an unreclaimed harness rather than waited on. commentlint: allow(JUDGE) */
@@ -1040,6 +1067,7 @@ export async function runPairedDelta(
                         priorAttemptsCostUsd,
                         priorMaxAttemptCostUsd,
                         disposalFailed,
+                        billedOnFailure,
                     });
                 options.store.put(record);
                 records.push(record);
@@ -1334,7 +1362,9 @@ function completedRecord(
     };
 }
 
-function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecord {
+function failedRecord(
+    inputs: RecordInputs & { failure: unknown; billedOnFailure?: TokenUsage | null },
+): RolloutRecord {
     const {
         options,
         coordinate,
@@ -1348,6 +1378,7 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
         priorAttemptsCostUsd,
         priorMaxAttemptCostUsd,
         disposalFailed,
+        billedOnFailure,
     } = inputs;
     /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
     const providerUnavailable = !disposalFailed && failure instanceof ProviderUnavailableError;
@@ -1359,7 +1390,21 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
             : "harness-failure";
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId);
     /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. Unavailability no longer discounts the charge: it can be raised by a later turn's request, after earlier turns have already billed, and this path keeps no usage to price. Charging the full bound overstates a first-turn refusal rather than understating a mid-script failure, and only the understatement admits an arm the cap should have stopped. commentlint: allow(JUDGE) */
-    const attemptCostUsd = Math.max(reserveUsd, worstCase);
+    /** The measured charge when the handle could read it: a nested retry tree in the plugin can bill past any bound this module can derive, and only the understatement admits an arm the cap should have stopped. */
+    /** Untrusted like any observation: a non-finite counter would poison the cap it feeds. */
+    const measured = billedOnFailure === null || billedOnFailure === undefined ||
+            [
+                billedOnFailure.input,
+                billedOnFailure.output,
+                billedOnFailure.cacheCreation,
+                billedOnFailure.cacheRead,
+            ].some((count) => !Number.isSafeInteger(count) || count < 0)
+        ? null
+        : billedOnFailure;
+    const billed = measured === null
+        ? 0
+        : tokenCostUsd(measured, options.pricesPerMillionTokens);
+    const attemptCostUsd = Math.max(reserveUsd, worstCase, billed);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
@@ -1384,7 +1429,7 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
             reasonCode,
         },
         checks: [],
-        usage: zeroUsage(),
+        usage: measured ?? zeroUsage(),
         costUsd: attemptCostUsd,
         priorAttemptsCostUsd,
         maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, attemptCostUsd),

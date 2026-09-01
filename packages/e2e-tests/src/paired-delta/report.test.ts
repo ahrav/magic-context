@@ -99,9 +99,9 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         ],
         secondaryMetrics: {
             invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0 },
-            tokensByArm: { "mc-on": 1000, "mc-off": 800 },
-            wallClockMsByArm: { "mc-on": 4000, "mc-off": 3000 },
-            turnsByArm: { "mc-on": 8, "mc-off": 7 },
+            finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800 },
+            finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000 },
+            finalAttemptTurnsByArm: { "mc-on": 8, "mc-off": 7 },
         },
         ...overrides,
     });
@@ -163,7 +163,7 @@ describe("paired-delta report", () => {
     it("changes fingerprint when a lane fact changes and publishes atomically", () => {
         const built = report();
         const changed = report();
-        changed.body.secondaryMetrics.tokensByArm["mc-on"] = 1001;
+        changed.body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = 1001;
         expect(canonicalFingerprint(changed.body)).not.toBe(built.reportFingerprint);
         expect(() => publishPairedDeltaReport(changed, "/unused")).toThrow(
             /fingerprint-mismatch/,
@@ -197,9 +197,9 @@ describe("paired-delta report", () => {
             exclusions: [],
             secondaryMetrics: {
                 invalidSuccessRateByArm: {},
-                tokensByArm: {},
-                wallClockMsByArm: {},
-                turnsByArm: {},
+                finalAttemptTokensByArm: {},
+                finalAttemptWallClockMsByArm: {},
+                finalAttemptTurnsByArm: {},
             },
             runSummary: built.body.runSummary,
         })).toThrow(/analysis-lane-binding-mismatch/);
@@ -223,9 +223,9 @@ describe("paired-delta report", () => {
             exclusions: [],
             secondaryMetrics: {
                 invalidSuccessRateByArm: {},
-                tokensByArm: {},
-                wallClockMsByArm: {},
-                turnsByArm: {},
+                finalAttemptTokensByArm: {},
+                finalAttemptWallClockMsByArm: {},
+                finalAttemptTurnsByArm: {},
             },
             runSummary: built.body.runSummary,
         })).toThrow(/policy: identity-invalid/);
@@ -311,9 +311,9 @@ describe("paired-delta report", () => {
         expect(() => report({
             secondaryMetrics: {
                 invalidSuccessRateByArm: {},
-                tokensByArm: { "mc-onn": 1 } as never,
-                wallClockMsByArm: {},
-                turnsByArm: {},
+                finalAttemptTokensByArm: { "mc-onn": 1 } as never,
+                finalAttemptWallClockMsByArm: {},
+                finalAttemptTurnsByArm: {},
             },
         })).toThrow(/metric-arm-invalid-mc-onn/);
     });
