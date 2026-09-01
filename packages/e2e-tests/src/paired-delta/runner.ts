@@ -713,6 +713,14 @@ export async function runPairedDelta(
                 );
             }
         }
+        /** A completed cell priced as an estimate is a combination the live path cannot produce: unpriceable usage is what selects `estimated`, and that same condition marks the result invalid rather than completed. Accepting it let a record suppress its rollout while restoring no spend, which is the one direction that spends money. commentlint: allow(JUDGE) */
+        if (record.costSource === "estimated" && record.cell.runHealth === "completed") {
+            releaseBeforeThrowing(options.store);
+            throw new Error(
+                `records file prices a completed cell as an estimate at ` +
+                    `${coordinateKey(record)}; point at a fresh records path`,
+            );
+        }
         /** An observed cost claims to be `tokenCostUsd` of the counters beside it, so the two are checked against each other: every other rule here reads the fields in isolation, which a record with valid counters and a falsified total passes intact, and the total is what restores spend and admits later paid arms. A relative comparison rather than equality because the value survived a JSON round trip. commentlint: allow(JUDGE) */
         if (record.costSource === "observed") {
             /** The loop above refuses a missing or non-integer counter, so the four are numbers by the time this runs; `Partial` is the declared shape only because the record is untrusted on arrival. commentlint: allow(JUDGE) */

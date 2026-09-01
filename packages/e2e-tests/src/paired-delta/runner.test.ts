@@ -1424,6 +1424,21 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("refuses a completed cell priced as an estimate", async () => {
+        // Unpriceable usage is what selects `estimated`, and it also marks the result
+        // invalid, so the live path cannot pair `estimated` with `completed`.
+        const firstStore = new MemoryStore();
+        const first = await runPairedDelta(options(firstStore), dependencies());
+        const stored = first.records.find(({ cell }) => cell.runHealth === "completed");
+        if (!stored) throw new Error("missing completed fixture record");
+        stored.costSource = "estimated";
+        stored.costUsd = 0;
+
+        await expect(
+            runPairedDelta(options(new MemoryStore([stored])), dependencies()),
+        ).rejects.toThrow(/prices a completed cell as an estimate/);
+    });
+
     it("refuses an observed cost that does not price its own usage", async () => {
         // Counters that price to a real amount, with the total falsified to zero: every
         // field-by-field rule passes, and the total is what restores spend.

@@ -190,17 +190,19 @@ function writeConfigs(
         }
     }
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
+    /** Snapshotted before the hooks below run, for the same reason `canonicalizeSpawnConfigs` snapshots it. commentlint: allow(JUDGE) */
+    const scannedEnv = opts.extraEnv === undefined ? undefined : { ...opts.extraEnv };
     const extra =
-        canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra", opts.extraEnv) ?? {};
+        canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra", scannedEnv) ?? {};
     const magicContextConfig = canonicalConfig(
         opts.magicContextConfig,
         "magicContextConfig",
-        opts.extraEnv,
+        scannedEnv,
     );
     const projectMagicContextConfig = canonicalConfig(
         opts.projectMagicContextConfig,
         "projectMagicContextConfig",
-        opts.extraEnv,
+        scannedEnv,
     );
     const contributedProviders = extra.provider;
     const extraWithoutProvider = { ...extra };
@@ -300,22 +302,25 @@ function writeConfigs(
  * commentlint: allow(JUDGE)
  */
 function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
+    /** Copied before any `toJSON()` runs, and returned so the child is given the same map that was validated: a hook that replaces `extraEnv` rather than mutating it would otherwise have its replacement forwarded while validation read the map it displaced. commentlint: allow(JUDGE) */
+    const extraEnv = opts.extraEnv === undefined ? undefined : { ...opts.extraEnv };
     return {
         ...opts,
+        extraEnv,
         openCodeConfigExtra: canonicalConfig(
             opts.openCodeConfigExtra,
             "openCodeConfigExtra",
-            opts.extraEnv,
+            extraEnv,
         ),
         magicContextConfig: canonicalConfig(
             opts.magicContextConfig,
             "magicContextConfig",
-            opts.extraEnv,
+            extraEnv,
         ),
         projectMagicContextConfig: canonicalConfig(
             opts.projectMagicContextConfig,
             "projectMagicContextConfig",
-            opts.extraEnv,
+            extraEnv,
         ),
     };
 }
@@ -671,13 +676,13 @@ async function spawnOpencodeWithProvision(
     let stderrBuf = "";
     try {
         /** Canonicalized once here so the database decision below and `writeConfigs` cannot read different representations of the same config. commentlint: allow(JUDGE) */
-        const canonicalOpts: SpawnOptions = {
-            ...canonicalizeSpawnConfigs(opts),
-            /** Snapshotted so the map checked below is the map forwarded to the child: a `toJSON()` hook shares a reference with `opts.extraEnv` and can add a sensitive name while serializing. commentlint: allow(JUDGE) */
-            extraEnv: { ...(opts.extraEnv ?? {}) },
-        };
-        /** Re-checked after the hooks ran, because the check above read the environment as passed: a hook that adds a credential during serialization would otherwise reach a child whose unauthenticated server is off loopback. commentlint: allow(JUDGE) */
-        assertSecretsBoundToLoopback(canonicalOpts, hostname);
+        /** `canonicalizeSpawnConfigs` snapshots `extraEnv` before running any `toJSON()`, and returns that snapshot, so the map the credential scan read is the map the child is given. Re-reading `opts.extraEnv` for the child instead would forward whatever a hook left behind, and a hook that replaces the map rather than mutating it is never seen by the scan at all — so its placeholder targets go unread. A hook serializes config; it does not get a say in the child's environment. commentlint: allow(JUDGE) */
+        const canonicalOpts: SpawnOptions = canonicalizeSpawnConfigs(opts);
+        /** The gate reads both maps merged. A hook cannot reach the child, but adding a sensitive name is still an attempt worth refusing rather than silently dropping, and this gate is the one that reads the hostname. commentlint: allow(JUDGE) */
+        assertSecretsBoundToLoopback({
+            ...canonicalOpts,
+            extraEnv: { ...(canonicalOpts.extraEnv ?? {}), ...(opts.extraEnv ?? {}) },
+        }, hostname);
         const resolvedOpts: SpawnOptions = resources
             ? {
                   ...canonicalOpts,
