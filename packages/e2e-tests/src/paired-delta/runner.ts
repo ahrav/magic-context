@@ -350,6 +350,9 @@ export class FileRolloutStore implements RolloutStore {
         const held = this.held;
         if (held === null) return;
         this.held = null;
+        /** Ownership is what made the cached snapshot authoritative, so it is dropped with the claim: another owner can advance the file while this instance holds nothing, and a reacquisition serving the old array would pay for a coordinate that owner already completed and then be refused replacement by `put`. commentlint: allow(JUDGE) */
+        this.records = null;
+        this.indexByCoordinate = new Map();
         ownedRecordPaths.delete(this.claim);
         process.off("exit", this.releaseOnExit);
         held.release();
@@ -644,6 +647,15 @@ export async function runPairedDelta(
                         `${coordinateKey(record)}; point at a fresh records path`,
                 );
             }
+        }
+        /** `coordinateKey` renders a numeric `0` and the string `"0"` identically and the matrix comparisons coerce, so a non-integer index would key and resume as a replicate it is not. commentlint: allow(JUDGE) */
+        if (!Number.isSafeInteger(record.replicateIndex) || record.replicateIndex < 0) {
+            options.store.release?.();
+            throw new Error(
+                `records file replicate index ${String(record.replicateIndex)} is not a ` +
+                    `non-negative safe integer at ${coordinateKey(record)}; ` +
+                    "point at a fresh records path",
+            );
         }
         /** The envelope names the shape every later read assumes, so a record from another schema cannot stand in as completed evidence for this one. commentlint: allow(JUDGE) */
         if (record.schema !== ROLLOUT_RECORD_SCHEMA) {

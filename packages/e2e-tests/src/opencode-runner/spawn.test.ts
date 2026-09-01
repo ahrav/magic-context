@@ -397,6 +397,16 @@ describe("opencode child lifecycle", () => {
                         "https://host.internal/v1#sk-ant-abcdefghijklmnopqrstuv",
                         /Anthropic-style key value in query key/,
                     ],
+                    // A signed URL announces its credential by parameter name; the signature
+                    // itself matches no vendor prefix.
+                    [
+                        "https://host.internal/v1?sv=2021-08-06&sp=r&sig=Zm9vYmFyYmF6cXV4",
+                        /signed-URL credential parameter sig/,
+                    ],
+                    [
+                        "https://host.internal/v1?X-Amz-Signature=deadbeefcafe",
+                        /signed-URL credential parameter X-Amz-Signature/,
+                    ],
                 ] as const
             ) {
                 expect(() =>

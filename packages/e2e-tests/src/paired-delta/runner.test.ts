@@ -1405,6 +1405,40 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("refuses a non-integer replicate index from a store that does not validate", async () => {
+        // `coordinateKey` renders "0" and 0 identically, so the record would key as replicate 0.
+        const store = new MemoryStore([{
+            ...storedRecord("mc-on"),
+            replicateIndex: "0" as unknown as number,
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /replicate index 0 is not a non-negative safe integer/,
+        );
+    });
+
+    it("drops the cached snapshot when the store is released", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-release-cache-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+            expect(store.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+            store.release();
+
+            // Another owner advances the file while this instance holds nothing.
+            writeFileSync(
+                path,
+                JSON.stringify([storedRecord("mc-on"), storedRecord("mc-off")]),
+            );
+
+            expect(store.list().map(({ armId }) => armId).sort()).toEqual(["mc-off", "mc-on"]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("refuses a record from another schema", async () => {
         const store = new MemoryStore([{
             ...storedRecord("mc-on"),

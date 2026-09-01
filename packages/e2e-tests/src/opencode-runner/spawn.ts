@@ -168,6 +168,13 @@ function writeConfigs(
     }
     /** `credentialValueFormat` anchors its rules at the start of the whole value, so a credential parked in the query or fragment matches neither the userinfo rule nor a vendor prefix. Both are key-value namespaces of their own and are scanned with the same key and value rules the config channels use. commentlint: allow(JUDGE) */
     for (const [key, value] of parsedUrlPairs(mockProviderURL)) {
+        /** A signed URL's signature is the credential: it is bearer authority for the request, and it announces itself by parameter name rather than by value shape — a base64 signature matches no vendor prefix. Recognized here rather than in `isCredentialBearingConfigKey`, because `signature` names a legitimate config field elsewhere while in a URL query it grants access. commentlint: allow(JUDGE) */
+        if (SIGNED_URL_CREDENTIAL_PARAMS.has(key.toLowerCase())) {
+            throw new Error(
+                `mockProviderURL carries a signed-URL credential parameter ${key}; ` +
+                    "pass credentials through extraEnv",
+            );
+        }
         if (key.length > 0 && isCredentialBearingConfigKey(key)) {
             throw new Error(
                 `mockProviderURL carries a credential-shaped query key ${key}; ` +
@@ -295,6 +302,15 @@ function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
         ),
     };
 }
+
+/** Parameter names by which the major signed-URL schemes carry their bearer signature: Azure SAS `sig`, SigV4 `x-amz-signature`, Google `signature`, and the `token`-style forms `isCredentialBearingConfigKey` already rejects are omitted because it covers them. commentlint: allow(JUDGE) */
+const SIGNED_URL_CREDENTIAL_PARAMS: ReadonlySet<string> = new Set([
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-goog-signature",
+    "x-sap-signature",
+]);
 
 /** A value that does not parse as a URL carries no key namespace to scan, and the userinfo rule above has already read the whole string. The fragment is included because `searchParams` excludes it while an OAuth implicit-flow redirect puts its access token there, so `#access_token=…` would otherwise reach the file unread. A fragment that is not key-value shaped is offered whole under an empty key, which the value rules still judge. commentlint: allow(JUDGE) */
 function parsedUrlPairs(value: string): Array<[string, string]> {
