@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -133,12 +133,46 @@ struct AnchorCacheKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ObjectCacheKey {
-    checkout_identity: String,
+    snapshot: SnapshotCacheKey,
     object_id: String,
     object_revision: i64,
+    inputs_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+enum SnapshotCacheKey {
+    Owned(SnapshotCacheValues),
+    Shared(Arc<SnapshotCacheValues>),
+}
+
+impl SnapshotCacheKey {
+    fn values(&self) -> &SnapshotCacheValues {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl PartialEq for SnapshotCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.values() == other.values()
+    }
+}
+
+impl Eq for SnapshotCacheKey {}
+
+impl Hash for SnapshotCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.values().hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SnapshotCacheValues {
+    checkout_identity: String,
     head: String,
     dirty_fingerprint: String,
-    inputs_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +290,13 @@ impl ApplicabilityEngine {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
+        let cache_context = (candidates.len() > 1).then(|| {
+            Arc::new(SnapshotCacheValues {
+                checkout_identity: snapshot.identity().to_string(),
+                head: snapshot.head().to_string(),
+                dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+            })
+        });
         let mut digest_prefixes = InputDigestPrefixes::new(query, &scope_context);
         let mut batch_input_digests = (candidates.len() > 1).then(HashMap::new);
         let mut last_input_digest = None;
@@ -284,8 +325,12 @@ impl ApplicabilityEngine {
                 }
                 None => digest_prefixes.for_candidate(candidate),
             };
-            let token =
-                ClassificationToken(self.object_cache_key(snapshot, candidate, inputs_digest));
+            let token = ClassificationToken(self.object_cache_key(
+                snapshot,
+                cache_context.as_ref(),
+                candidate,
+                inputs_digest,
+            ));
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
                     candidate,
@@ -540,15 +585,22 @@ impl ApplicabilityEngine {
     fn object_cache_key(
         &self,
         snapshot: &CheckoutSnapshot,
+        context: Option<&Arc<SnapshotCacheValues>>,
         candidate: &ApplicabilityCandidate,
         inputs_digest: [u8; 32],
     ) -> ObjectCacheKey {
+        let snapshot = match context {
+            Some(context) => SnapshotCacheKey::Shared(Arc::clone(context)),
+            None => SnapshotCacheKey::Owned(SnapshotCacheValues {
+                checkout_identity: snapshot.identity().to_string(),
+                head: snapshot.head().to_string(),
+                dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+            }),
+        };
         ObjectCacheKey {
-            checkout_identity: snapshot.identity().to_string(),
+            snapshot,
             object_id: candidate.object_id.clone(),
             object_revision: candidate.object_revision,
-            head: snapshot.head().to_string(),
-            dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
             inputs_digest,
         }
     }
@@ -569,11 +621,13 @@ impl ObjectApplicability {
             failed_check: None,
             append_pending: false,
             token: ClassificationToken(ObjectCacheKey {
-                checkout_identity: String::new(),
+                snapshot: SnapshotCacheKey::Owned(SnapshotCacheValues {
+                    checkout_identity: String::new(),
+                    head: String::new(),
+                    dirty_fingerprint: String::new(),
+                }),
                 object_id: candidate.object_id.clone(),
                 object_revision: candidate.object_revision,
-                head: String::new(),
-                dirty_fingerprint: String::new(),
                 inputs_digest: [0; 32],
             }),
         }
