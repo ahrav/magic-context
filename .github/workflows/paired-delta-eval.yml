@@ -100,9 +100,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', '.github/workflows/paired-delta-eval.yml') }}-${{ github.run_id }}
+          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}-${{ github.run_id }}
           restore-keys: |
-            paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', '.github/workflows/paired-delta-eval.yml') }}-
+            paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}-
 
       - name: Run live paired-delta lane
         timeout-minutes: 300
@@ -133,7 +133,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', '.github/workflows/paired-delta-eval.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # `upload-artifact@v4` artifacts are immutable, so the attempt is part of the name: a rerun uploading under the prior attempt's name conflicts instead of replacing it.
       - name: Archive reports and rollout records

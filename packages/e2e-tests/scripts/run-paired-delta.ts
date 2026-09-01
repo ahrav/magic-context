@@ -576,6 +576,11 @@ const CALIBRATION_SCOPE = [
     "packages/e2e-tests/src",
     "packages/e2e-tests/scripts/run-paired-delta.ts",
     "packages/e2e-tests/pools",
+    /** A dependency or build-script change installs a different SDK or builds a different plugin without touching a source file. */
+    "bun.lock",
+    "package.json",
+    "packages/plugin/package.json",
+    "packages/e2e-tests/package.json",
     /** Pins the OpenCode version and its digest, and native compaction, prompt routing, and the session ledger are all part of the measured behaviour. */
     ".github/workflows/paired-delta-eval.yml",
 ] as const;
@@ -1310,6 +1315,13 @@ async function runLive(args: CliArgs): Promise<void> {
             `${policy.endpoint}`,
         );
     }
+    /** The report is fingerprinted to the policy, so an override above the preregistered budget would publish as though it executed a cap it exceeded. */
+    if (args.maxCostUsd !== null && args.maxCostUsd > policy.costBudgetUsd[mode]) {
+        throw new Error(
+            `--max-cost-usd ${args.maxCostUsd} exceeds the ${mode} policy budget ` +
+            `${policy.costBudgetUsd[mode]}; an override may only lower it`,
+        );
+    }
     /** The provider block is keyed by the declared id but backed by the Anthropic SDK and credential, so another id would echo a provider the run never used. */
     if (model.providerId !== SUPPORTED_PROVIDER) {
         throw new Error(
@@ -1461,6 +1473,14 @@ async function runLive(args: CliArgs): Promise<void> {
         model.modelId,
         noiseFloors,
     );
+    /**
+     * Decided before publication, because the workflow archives the report even when the step
+     * fails: an artifact claiming `evidenceSufficient` while the dispatch exited on a shortfall is
+     * the one output nobody re-reads the logs to correct.
+     */
+    const evidenceComplete = mode === "calibration"
+        ? calibrationValidForSizing
+        : analysis.evidenceSufficient && healthyCoordinates >= plannedCoordinates;
     const report = buildPairedDeltaReport({
         poolManifestFingerprint: manifestFingerprint,
         pinnedSnapshotId: model.modelId,
@@ -1476,6 +1496,9 @@ async function runLive(args: CliArgs): Promise<void> {
             observedCostRollouts: result.observedCostRollouts,
             estimatedCostRollouts: result.estimatedCostRollouts,
             refusedRegretLadders,
+            plannedCoordinates,
+            healthyCoordinates,
+            evidenceComplete,
         },
     });
     publishPairedDeltaReport(report, args.reportPath);
@@ -1498,7 +1521,7 @@ async function runLive(args: CliArgs): Promise<void> {
         process.exitCode = EXIT_CODES[result.status];
         return;
     }
-    if (!calibrationValidForSizing) {
+    if (!evidenceComplete && mode === "calibration") {
         console.error(
             "paired-delta calibration completed without evidence valid for pool sizing",
         );

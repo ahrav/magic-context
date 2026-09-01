@@ -88,6 +88,9 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
             observedCostRollouts: 6,
             estimatedCostRollouts: 1,
             refusedRegretLadders: { "intervention-mismatch": 2 },
+            plannedCoordinates: 12,
+            healthyCoordinates: 12,
+            evidenceComplete: true,
         },
         exclusions: [
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
@@ -427,6 +430,26 @@ describe("paired-delta calibration record", () => {
         ...coordinate("var-b", 2, { "mc-on": true, "mc-off": true, compaction: true }),
     ];
 
+    /** Every series varies, so the pilot establishes variance for each one. */
+    const varyingEverywhere = [
+        ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: true }),
+        ...coordinate("var-a", 1, { "mc-on": true, "mc-off": true, compaction: false }),
+        ...coordinate("var-a", 2, { "mc-on": true, "mc-off": false, compaction: true }),
+        ...coordinate("var-b", 0, { "mc-on": true, "mc-off": true, compaction: false }),
+        ...coordinate("var-b", 1, { "mc-on": true, "mc-off": false, compaction: true }),
+        ...coordinate("var-b", 2, { "mc-on": true, "mc-off": true, compaction: false }),
+    ];
+
+    it("refuses to size from a pilot that established no variance", () => {
+        const established = build(varyingEverywhere);
+
+        expect(established.varianceEstablished).toBe(true);
+        expect(established.validForPoolSizing).toBe(true);
+        // A constant series does not establish zero population variance, only too small a pilot.
+        expect(build(split).varianceEstablished).toBe(false);
+        expect(build(split).validForPoolSizing).toBe(false);
+    });
+
     it("scores the preregistered valid-success endpoint as binary", () => {
         // Every arm passes `check-file`, so a check average would report 0.5 rather than 0.
         const built = build(split);
@@ -454,7 +477,9 @@ describe("paired-delta calibration record", () => {
             .reduce((sum, value) => sum + (value - pooledMean) ** 2, 0) / (pooled.length - 1);
 
         expect(worst).toBeGreaterThan(pooledVariance);
-        expect(built.validForPoolSizing).toBe(true);
+        /** `fam-two` is constant on both endpoints, so this pilot establishes no variance for it. */
+        expect(built.varianceEstablished).toBe(false);
+        expect(built.validForPoolSizing).toBe(false);
         const { recordFingerprint, ...body } = built;
         expect(recordFingerprint).toBe(canonicalFingerprint(body));
     });

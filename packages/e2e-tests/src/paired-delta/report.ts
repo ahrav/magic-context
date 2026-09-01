@@ -66,6 +66,10 @@ export interface PairedDeltaReportBody {
         estimatedCostRollouts: number;
         /** A refused ladder leaves its cell `completed`, so it reaches no exclusion count; without this a systemic refusal reads as an unscheduled regret arm. */
         refusedRegretLadders: Record<string, number>;
+        plannedCoordinates: number;
+        healthyCoordinates: number;
+        /** The dispatch's own verdict, recorded because the workflow archives this report even when the step fails. */
+        evidenceComplete: boolean;
     };
 }
 
@@ -214,7 +218,12 @@ export function buildPairedDeltaReport(input: {
         !Number.isSafeInteger(input.runSummary.estimatedCostRollouts) ||
         input.runSummary.estimatedCostRollouts < 0 ||
         Object.values(input.runSummary.refusedRegretLadders).some((count) =>
-            !Number.isSafeInteger(count) || count < 1)
+            !Number.isSafeInteger(count) || count < 1) ||
+        !Number.isSafeInteger(input.runSummary.plannedCoordinates) ||
+        input.runSummary.plannedCoordinates < 0 ||
+        !Number.isSafeInteger(input.runSummary.healthyCoordinates) ||
+        input.runSummary.healthyCoordinates < 0 ||
+        input.runSummary.healthyCoordinates > input.runSummary.plannedCoordinates
     ) {
         throw new Error("paired-delta-report: run-summary-invalid");
     }
@@ -282,6 +291,8 @@ export interface PairedDeltaCalibrationRecord {
     pinnedSnapshotId: string;
     runStatus: PairedDeltaRunResult["status"];
     validForPoolSizing: boolean;
+    /** Whether any measured series established variance. A constant pilot cannot, and its zero variance would otherwise size the pool at its floor. */
+    varianceEstablished: boolean;
     measuredCostUsd: number;
     estimatedReserveUsd: number;
     /** Charges from superseded attempts of retried coordinates, which carry no cost source of their own on the surviving record. */
@@ -476,9 +487,20 @@ export function buildCalibrationRecord(input: {
         implementationDigest: input.implementationDigest,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
+        /**
+         * A series whose observations are identical does not establish zero population variance, it
+         * establishes that the pilot was too small to see any. Sizing from that zero would claim the
+         * cohort floor supports the preregistered detectable delta.
+         */
+        varianceEstablished: familyNoise.length > 0 &&
+            familyNoise.every(({ variance, observationCount }) =>
+                observationCount >= 2 && variance > 0),
         validForPoolSizing: input.runStatus === "completed" &&
             measuredFamilies.size === families.size &&
-            depthComplete,
+            depthComplete &&
+            familyNoise.length > 0 &&
+            familyNoise.every(({ variance, observationCount }) =>
+                observationCount >= 2 && variance > 0),
         /** A failed rollout is priced from its worst-case reserve, so those dollars are reported apart from provider-observed spend rather than inflating a measured total that later budgets read. */
         measuredCostUsd: observed.reduce((sum, record) => sum + record.costUsd, 0),
         estimatedReserveUsd: input.records
@@ -540,6 +562,7 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         typeof record.implementationDigest !== "string" ||
         record.implementationDigest.trim().length === 0 ||
         typeof record.validForPoolSizing !== "boolean" ||
+        typeof record.varianceEstablished !== "boolean" ||
         !Array.isArray(record.familyNoise) ||
         record.familyNoise.some((noise) =>
             typeof noise.familyId !== "string" ||
