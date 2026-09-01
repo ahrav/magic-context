@@ -723,15 +723,39 @@ fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Opti
     if affected_paths.is_empty() {
         return None;
     }
-    for entry in snapshot.dirty_entries() {
-        let dirty_path = entry.path.as_str();
-        for affected in affected_paths {
-            if paths_overlap(dirty_path, affected) {
-                return Some(dirty_path.to_string());
-            }
-        }
+    affected_paths
+        .iter()
+        .filter_map(|affected| first_dirty_overlap(snapshot, affected))
+        .min()
+        .map(str::to_string)
+}
+
+fn first_dirty_overlap<'a>(snapshot: &'a CheckoutSnapshot, affected_path: &str) -> Option<&'a str> {
+    let entries = snapshot.dirty_entries();
+    let affected_path = affected_path.trim_end_matches('/');
+    if let Some(first) = entries
+        .first()
+        .map(|entry| entry.path.as_str())
+        .filter(|dirty_path| paths_overlap(dirty_path, affected_path))
+    {
+        return Some(first);
     }
-    None
+    let start = entries.partition_point(|entry| entry.path.as_str() < affected_path);
+    let descendant = entries
+        .get(start)
+        .map(|entry| entry.path.as_str())
+        .filter(|dirty_path| paths_overlap(dirty_path, affected_path));
+    affected_path
+        .match_indices('/')
+        .filter_map(|(separator, _)| {
+            let ancestor = &affected_path[..separator];
+            entries
+                .binary_search_by(|entry| entry.path.as_str().cmp(ancestor))
+                .ok()
+                .map(|index| entries[index].path.as_str())
+        })
+        .chain(descendant)
+        .min()
 }
 
 fn paths_overlap(a: &str, b: &str) -> bool {

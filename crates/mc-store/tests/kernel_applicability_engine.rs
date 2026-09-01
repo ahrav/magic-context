@@ -972,6 +972,33 @@ fn dirty_overlap_respects_directory_boundaries() {
 }
 
 #[test]
+fn dirty_overlap_finds_ancestor_before_unrelated_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    write_worktree_file(&fixture.repo, "a", "dirty ancestor\n");
+    write_worktree_file(&fixture.repo, "a-b", "unrelated predecessor\n");
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let object = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec!["a/b/c".to_string()], vec![]).encode()),
+        ..candidate("object-ancestor")
+    };
+    let batch = ApplicabilityEngine::new().evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[object],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+    assert!(batch.objects[0].evidence.contains("uncommitted path a "));
+}
+
+#[test]
 fn traversal_and_absolute_check_paths_are_invalid_not_failures() {
     let dir = tempfile::tempdir().unwrap();
     let (fixture, _base, tip) = seeded_repo(dir.path());
