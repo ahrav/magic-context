@@ -233,16 +233,20 @@ export function isCredentialBearingConfigKey(key: string): boolean {
     let compact = segments.join("");
     /** An all-caps glued name gives the camel-case split nothing to break on, so `DBPASSWORDVALUE` arrives as one segment and the loop above cannot reach its descriptor. Peeling the descriptor off the compacted form reads it the same way `dbPasswordValue` is read. commentlint: allow(JUDGE) */
     for (;;) {
+        /** Descriptors and enumerators peel in one loop because either can be outermost: `apiKey2Value` ends in a descriptor while `apiKeyValue2` ends in a digit, and stripping only one kind first left the other stranded behind it — `apikeyvalue` matches no credential tail. An enumerator distinguishes a rotated pair, it does not change what the field holds. commentlint: allow(JUDGE) */
+        const trimmedEnumerator = compact.replace(/[0-9]+$/, "");
+        const candidate = trimmedEnumerator.length > 0 ? trimmedEnumerator : compact;
         const descriptor = [...TRAILING_DESCRIPTORS].find(
-            (word) => compact.length > word.length && compact.endsWith(word),
+            (word) => candidate.length > word.length && candidate.endsWith(word),
         );
-        if (descriptor === undefined) break;
-        compact = compact.slice(0, -descriptor.length);
+        const next = descriptor === undefined
+            ? candidate
+            : candidate.slice(0, -descriptor.length);
+        if (next === compact) break;
+        compact = next;
     }
     // The qualifier is read from the adjacent segment, not from any prefix of the compacted
     // key: `identityTokens` and `idleTokens` both begin with `id`.
-    /** A trailing enumerator distinguishes a rotated pair, it does not change what the field holds: `apiKey2` is the second API key. Stripped after the descriptors so `apiKey2Value` reduces the same way. commentlint: allow(JUDGE) */
-    compact = compact.replace(/[0-9]+$/, "");
     const qualifier = segments.length > 1 ? segments.at(-2) : undefined;
     const endsWith = (word: string): boolean =>
         // Plurals are derived rather than listed, so `dbPasswords` cannot slip past a

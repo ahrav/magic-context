@@ -384,6 +384,16 @@ function assertConfigHasNoCredentials(
                         "pass credentials through extraEnv",
                 );
             }
+            /** A property name can be the credential rather than describe one — `{ "sk-ant-…": true }` reaches the file through the key, where the semantic-word rule finds nothing and the value rules never look. The path is omitted from this diagnostic because it contains the key, and reporting it would put the secret in the log the guard exists to keep it out of. commentlint: allow(JUDGE) */
+            if (!Array.isArray(current)) {
+                const keyFormat = credentialValueFormat(key) ?? urlCredentialFinding(key);
+                if (keyFormat !== null) {
+                    throw new Error(
+                        `config contains a ${keyFormat} as a property name under ${path}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+            }
             if (typeof child === "string") {
                 /** A config value can be a URL as easily as the harness's own can, and a deep-merged live provider's `baseURL` is exactly that: a signed URL's signature is recognized by parameter name, which no value rule reads. Run first for the same reason as above — it names the component. commentlint: allow(JUDGE) */
                 const urlValueFinding = urlCredentialFinding(child);

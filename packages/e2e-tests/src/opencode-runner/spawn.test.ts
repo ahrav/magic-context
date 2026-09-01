@@ -331,6 +331,22 @@ describe("opencode child lifecycle", () => {
                 delete process.env.PAIRED_DELTA_BUILD_ID;
             }
 
+            // A property name can be the credential rather than describe one, and the
+            // diagnostic must not echo the key it refuses.
+            expect(() => {
+                try {
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        openCodeConfigExtra: {
+                            headers: { "sk-ant-abcdefghijklmnopqrstuv": true },
+                        },
+                    });
+                } catch (error) {
+                    expect(String(error)).not.toContain("sk-ant-abcdefghijklmnopqrstuv");
+                    throw error;
+                }
+            }).toThrow(/Anthropic-style key as a property name/);
+
             // A deep-merged live provider's baseURL is a config value like any other, and a
             // signed URL's signature passes every whole-value rule.
             expect(() =>

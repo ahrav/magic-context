@@ -163,6 +163,11 @@ describe("isCredentialBearingConfigKey", () => {
             "dbkey",
             "oauthkey",
             "jwtkey",
+            // An enumerator can sit outside the descriptor as easily as inside it.
+            "apiKeyValue2",
+            "passwordValue2",
+            "clientSecretHeader3",
+            "APIKEYVALUE2",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
