@@ -14,6 +14,7 @@ import type {
 } from "./estimator";
 import { PRIMARY_ENDPOINTS } from "./estimator";
 import { validSuccess } from "./scoring";
+import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
 export const PAIRED_DELTA_REPORT_SCHEMA = "paired-delta-report/v1";
@@ -364,9 +365,8 @@ function completePrimaryCoordinates(
     );
 }
 
-/** Both identifiers are free-form, so the key is JSON-encoded rather than `:`-joined. */
 function coordinateKey(record: RolloutRecord): string {
-    return JSON.stringify([record.scenarioId, record.replicateIndex]);
+    return tupleKey(record.scenarioId, String(record.replicateIndex));
 }
 
 const CALIBRATION_ENDPOINTS = [
@@ -428,7 +428,7 @@ export function buildCalibrationRecord(input: {
     const seriesKey = (
         familyId: string,
         endpoint: CalibrationFamilyNoise["endpoint"],
-    ): string => JSON.stringify([familyId, endpoint]);
+    ): string => tupleKey(familyId, endpoint);
     for (const familyId of families) {
         for (const [, endpoint] of CALIBRATION_ENDPOINTS) {
             bySeries.set(seriesKey(familyId, endpoint), []);
@@ -570,7 +570,8 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         !Number.isSafeInteger(decisions.familyCount) ||
         decisions.familyCount < 1 ||
         !Number.isSafeInteger(decisions.replicateCount) ||
-        decisions.replicateCount < 1
+        decisions.replicateCount < 1 ||
+        decisions.cadence !== "weekly-and-release"
     ) {
         throw new Error("paired-delta-calibration: decisions-invalid");
     }

@@ -51,6 +51,14 @@ jobs:
           esac
           echo "PAIRED_DELTA_MODE=$MODE" >> "$GITHUB_ENV"
 
+      # Hashed once and reused by all three calibration cache keys. Kept in one place because a
+      # restore key that drifts from the save key stops hitting the cache silently, with no error —
+      # `CALIBRATION_SCOPE` in run-paired-delta.ts is the matching declaration.
+      - name: Resolve the calibration scope digest
+        env:
+          SCOPE_DIGEST: ${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}
+        run: echo "PAIRED_DELTA_SCOPE=$SCOPE_DIGEST" >> "$GITHUB_ENV"
+
       # The smoke lane drives the same orchestration the live modes use — provider resolution, the
       # regret ladder, exclusion classification — against mocks, so a regression in it fails here
       # rather than after a scheduled dispatch has spent live budget.
@@ -100,9 +108,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}-${{ github.run_id }}
+          key: paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-${{ github.run_id }}
           restore-keys: |
-            paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}-
+            paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-
 
       - name: Run live paired-delta lane
         timeout-minutes: 300
@@ -133,7 +141,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # `upload-artifact@v4` artifacts are immutable, so the attempt is part of the name: a rerun uploading under the prior attempt's name conflicts instead of replacing it.
       - name: Archive reports and rollout records

@@ -1,5 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
+import { tupleKey } from "./tuple-key";
 import { compareCodeUnits } from "../code-unit-order";
 import { fnv1a32 } from "../fnv1a";
 import {
@@ -144,9 +145,8 @@ function bootstrapInterval(
     };
 }
 
-/** Both identifiers are free-form, so the key is JSON-encoded rather than joined. */
 function floorKey(familyId: string, endpoint: PrimaryEndpoint | undefined): string {
-    return JSON.stringify([familyId, endpoint ?? null]);
+    return tupleKey(familyId, endpoint);
 }
 
 function includesZero(interval: Interval): boolean {

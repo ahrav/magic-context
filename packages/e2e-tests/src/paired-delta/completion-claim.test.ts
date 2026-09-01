@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { claimsCompletion } from "../../scripts/run-paired-delta";
+import { claimsCompletion } from "./completion-claim";
 
 describe("paired-delta completion claims", () => {
     it("reads an affirmative completion claim", () => {
@@ -18,9 +18,10 @@ describe("paired-delta completion claims", () => {
         for (const text of [
             "not done",
             "I have not completed the task.",
-            "I could not finish because the evidence is missing.",
+            "I could not complete this because the evidence is missing.",
             "I am unable to complete this without the identifier.",
             "I never finished the task.",
+            "I have not finished the task.",
             "I failed to complete the request.",
         ]) {
             expect(claimsCompletion(text)).toBe(false);
@@ -30,6 +31,14 @@ describe("paired-delta completion claims", () => {
     it("still reads a claim that follows an unrelated denial", () => {
         expect(claimsCompletion("I could not find the ticket in context. Done — I read it from memory instead."))
             .toBe(true);
+    });
+
+    it("only treats the declared completion words as claims", () => {
+        /** `finish` is absent from the word list, so a case phrased with it would pass vacuously. */
+        for (const word of ["done", "completed", "finished", "complete"]) {
+            expect(claimsCompletion(`The task is ${word}.`)).toBe(true);
+        }
+        expect(claimsCompletion("Let me finish this later.")).toBe(false);
     });
 });
 
@@ -43,8 +52,8 @@ describe("paired-delta completion claims: negation scope", () => {
     it("still reads filler between the negation and the verb", () => {
         for (const text of [
             "I have not yet completed the task.",
-            "I was not able to finish.",
-            "I could not quite finish it.",
+            "I was not able to complete it.",
+            "I could not quite finish the task.",
             "I have not managed to complete this.",
         ]) {
             expect(claimsCompletion(text)).toBe(false);

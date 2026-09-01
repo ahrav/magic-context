@@ -31,6 +31,7 @@ import {
 } from "../src/paired-delta/estimator";
 import { pluginEntryPath } from "../src/opencode-runner/spawn";
 import { assertFrozenPool, buildPairedDeltaRegistry } from "../src/paired-delta/registry";
+import { claimsCompletion } from "../src/paired-delta/completion-claim";
 import { validSuccess } from "../src/paired-delta/scoring";
 import {
     buildCalibrationRecord,
@@ -221,26 +222,28 @@ function scopeDigest(): string {
             throw new Error(`paired-delta calibration scope path is not tracked: ${path}`);
         }
         parts.push(Buffer.from(object.stdout.toString().trim(), "utf8"));
-        parts.push(Buffer.from(git(["status", "--porcelain", "--untracked-files=all", "--", path]), "utf8"));
-        parts.push(Buffer.from(git(["diff", "--binary", "HEAD", "--", path]), "utf8"));
-        /** `status` names an untracked file without its bytes and `diff HEAD` omits it, so scoped code importing a new file would keep one digest across edits. */
-        for (const untracked of git([
-            "ls-files", "--others", "--exclude-standard", "-z", "--", path,
-        ]).split("\0").filter(Boolean)) {
-            parts.push(Buffer.from(`${untracked}\n`, "utf8"));
-            try {
-                const absolute = resolve(root, untracked);
-                const entry = lstatSync(absolute);
-                if (entry.isSymbolicLink()) {
-                    parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
-                } else if (!entry.isFile()) {
-                    parts.push(Buffer.from(`<non-file>${entryKind(entry)}`, "utf8"));
-                } else {
-                    parts.push(readFileSync(absolute));
-                }
-            } catch {
-                parts.push(Buffer.from("<unreadable>", "utf8"));
+    }
+    /** One pathspec-bearing invocation per command rather than one per path: the digest needs the whole scope's state, not per-path attribution. */
+    const pathspecs = ["--", ...CALIBRATION_SCOPE];
+    parts.push(Buffer.from(git(["status", "--porcelain", "--untracked-files=all", ...pathspecs]), "utf8"));
+    parts.push(Buffer.from(git(["diff", "--binary", "HEAD", ...pathspecs]), "utf8"));
+    /** `status` names an untracked file without its bytes and `diff HEAD` omits it, so scoped code importing a new file would keep one digest across edits. */
+    for (const untracked of git([
+        "ls-files", "--others", "--exclude-standard", "-z", ...pathspecs,
+    ]).split("\0").filter(Boolean)) {
+        parts.push(Buffer.from(`${untracked}\n`, "utf8"));
+        try {
+            const absolute = resolve(root, untracked);
+            const entry = lstatSync(absolute);
+            if (entry.isSymbolicLink()) {
+                parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
+            } else if (!entry.isFile()) {
+                parts.push(Buffer.from(`<non-file>${entryKind(entry)}`, "utf8"));
+            } else {
+                parts.push(readFileSync(absolute));
             }
+        } catch {
+            parts.push(Buffer.from("<unreadable>", "utf8"));
         }
     }
     parts.push(...loadedBundleParts(root));
@@ -811,15 +814,19 @@ async function sessionUsage(
 ): Promise<SessionUsage> {
     let usage = ZERO_USAGE;
     let offPinRoute: SessionUsage["offPinRoute"] = null;
-    const pending = [sessionId];
+    let frontier = [sessionId];
     const seen = new Set<string>();
-    while (pending.length > 0) {
-        const id = pending.pop()!;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        for (const info of ledgerEntries(await harness.client.session.messages({
-            path: { id },
-        }))) {
+    while (frontier.length > 0) {
+        const level = frontier.filter((id) => !seen.has(id));
+        for (const id of level) seen.add(id);
+        /** Siblings are independent, and this runs on the paid critical path, so a level is fetched at once rather than one session per round trip. */
+        const fetched = await Promise.all(level.map(async (id) => ({
+            messages: await harness.client.session.messages({ path: { id } }),
+            children: await harness.client.session.children({ path: { id } }),
+        })));
+        frontier = [];
+        for (const { messages, children } of fetched) {
+        for (const info of ledgerEntries(messages)) {
             const route = {
                 providerId: info.providerID as string,
                 modelId: typeof info.modelID === "string" ? info.modelID : "",
@@ -852,13 +859,13 @@ async function sessionUsage(
             }
             usage = addUsage(usage, spent);
         }
-        const children = (await harness.client.session.children({ path: { id } }))
-            .data;
-        if (Array.isArray(children)) {
-            for (const child of children) {
+        const rows = (children as { data?: unknown }).data;
+        if (Array.isArray(rows)) {
+            for (const child of rows) {
                 const childId = (child as { id?: unknown } | null)?.id;
-                if (typeof childId === "string") pending.push(childId);
+                if (typeof childId === "string") frontier.push(childId);
             }
+        }
         }
     }
     return { usage, offPinRoute };
@@ -893,7 +900,18 @@ function configMatchesArm(
     apiKey: string,
 ): boolean {
     const text = readFileSync(join(harness.opencode.env.configDir, "opencode.json"), "utf8");
-    if (text.includes(apiKey)) return false;
+    /**
+     * Thrown rather than reported as a mismatch: the recipe references the credential through
+     * `env: ["ANTHROPIC_API_KEY"]`, so finding it inlined means a live secret was persisted to the
+     * harness workdir. Folded into `arm-identity-mismatch` it would have looked like config drift in
+     * the exclusion counts, with nothing pointing at the credential.
+     */
+    if (text.includes(apiKey)) {
+        throw new Error(
+            "live paired-delta found the provider credential in the on-disk config; " +
+            "the spawn recipe must reference it through the environment",
+        );
+    }
     const config = JSON.parse(text) as {
         plugin?: unknown;
         compaction?: unknown;
@@ -1135,29 +1153,6 @@ export function createLiveDependencies(input: {
     };
 }
 
-/**
- * A completion word is only a claim when it is not negated: `invalidSuccess` counts an arm asserting success it did not achieve, so a refusal that says "not done" is the opposite of the thing being measured.
- * The window covers the bare negations plus any `n't` contraction, which reaches `haven't`, `isn't`, and `wasn't` without enumerating auxiliaries, rather than attempting sentence parsing.
- * Only a short allowlist of filler words may sit between the negation and the verb, so an unrelated earlier clause — "I did not need help and completed the task" — does not swallow a genuine claim.
- */
-const NEGATION = "(?:\\b(?:not|never|cannot|unable|failed|without|no)\\b|n't)";
-/** Filler the negation may reach across: the listed auxiliaries and objects, plus any `-ly` adverb, which covers `successfully`, `entirely`, `properly` without enumerating them. A conjunction is absent on purpose, so an unrelated earlier clause still cannot reach the verb. */
-const NEGATION_FILLER =
-    "(?:\\s+(?:yet|ever|even|quite|able|been|being|manage|managed|have|has|had|to|the|task|it|this|that|work|job|[a-z]+ly)\\b)*";
-const NEGATED_COMPLETION = new RegExp(`${NEGATION}${NEGATION_FILLER}[\\s,]*$`);
-
-export function claimsCompletion(text: string): boolean {
-    const completion = /\b(?:done|completed|finished|complete)\b/gi;
-    for (const match of text.matchAll(completion)) {
-        const before = text.slice(Math.max(0, match.index - 40), match.index).toLowerCase();
-        if (NEGATED_COMPLETION.test(before)) {
-            continue;
-        }
-        return true;
-    }
-    return false;
-}
-
 function buildAnalysis(
     result: PairedDeltaRunResult,
     scenarios: readonly ScenarioDeclaration[],
@@ -1346,6 +1341,14 @@ function deskCostCeilingUsd(
     return Math.ceil(worstUsd * 2 * 100) / 100;
 }
 
+/**
+ * Every condition a live dispatch requires before it may spend, in one place.
+ *
+ * Kept as ordered imperative checks rather than a declarative table: each carries a message naming
+ * the declared value, the implemented value, and the remedy, and several compare a record against
+ * the manifest and policy together, which a per-field table cannot express. Grouping them here
+ * gives the single enumeration a reader needs without flattening the diagnostics.
+ */
 async function runLive(args: CliArgs): Promise<void> {
     const mode = args.mode as LiveMode;
     const apiKey = process.env.PAIRED_DELTA_ANTHROPIC_API_KEY;
