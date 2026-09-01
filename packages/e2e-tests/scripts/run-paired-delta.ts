@@ -8,6 +8,7 @@ import { detectOverflow } from "../../plugin/src/features/magic-context/overflow
 import manifestJson from "../pools/paired-delta-manifest.json";
 import policyJson from "../pools/paired-delta-policy.json";
 import { ballastProse } from "../src/ballast";
+import { compareCodeUnits } from "../src/code-unit-order";
 import { TestHarness, type TestHarnessOptions } from "../src/harness";
 import { goldEvidencePrompt } from "../src/oracle-arms/gold-evidence";
 import {
@@ -43,6 +44,7 @@ import {
 } from "../src/paired-delta/report";
 import {
     FileRolloutStore,
+    LATE_DISPOSAL_GRACE_MS,
     ProviderUnavailableError,
     RolloutRecordsInvalidError,
     RolloutStorePublishConflictError,
@@ -248,6 +250,7 @@ function scopeDigest(): string {
     }
     parts.push(...loadedBundleParts(root));
     parts.push(...resolvedRuntimeParts());
+    parts.push(...installedDependencyParts());
     return Bun.hash(Buffer.concat(parts)).toString(16);
 }
 
@@ -284,6 +287,37 @@ function resolvedRuntimeParts(): Uint8Array[] {
     }
     return parts;
 }
+
+/**
+ * The installed bytes of the modules that execute rollouts and read the ledger.
+ *
+ * `bun.lock` and the manifests record what an install *should* produce; `node_modules` is ignored, so
+ * no git-based digest sees what it actually produced. The SDK here supplies the session, prompt, and
+ * message APIs the measurement is made of, so a calibration against a stale or locally patched
+ * install must not share a binding with a weekly run against a different one.
+ */
+function installedDependencyParts(): Uint8Array[] {
+    const parts: Uint8Array[] = [];
+    for (const specifier of MEASUREMENT_RUNTIME_MODULES) {
+        parts.push(Buffer.from(`${specifier}\0`, "utf8"));
+        try {
+            /** Resolved from this file so the digest names the installation this run will import, not a hoisted copy elsewhere. */
+            const entry = Bun.resolveSync(specifier, import.meta.dir);
+            parts.push(Buffer.from(`${entry}\0`, "utf8"));
+            /** The bytes, not the declared version: a locally patched install keeps its version string. */
+            parts.push(readFileSync(entry));
+        } catch (error) {
+            parts.push(Buffer.from(
+                `<unresolved>${error instanceof Error ? error.message : "unknown"}`,
+                "utf8",
+            ));
+        }
+    }
+    return parts;
+}
+
+/** The modules whose behaviour the measurement is made of, rather than every installed dependency. */
+const MEASUREMENT_RUNTIME_MODULES = ["@opencode-ai/sdk"] as const;
 
 function loadedBundleParts(root: string): Uint8Array[] {
     const entry = pluginEntryPath();
@@ -775,6 +809,18 @@ const HISTORIAN_ABANDONED_MARKER = "compartment await timed out";
 const LEDGER_SETTLE_ATTEMPTS = 12;
 const LEDGER_SETTLE_INTERVAL_MS = 500;
 
+/**
+ * The failure path's budget, sized to leave room inside `LATE_DISPOSAL_GRACE_MS` for the reads.
+ *
+ * Half the grace goes to sleeping and half to the API calls between sleeps. Exceeding the grace is
+ * safe — the runner falls back to the worst-case bound — but it would discard the measurement on
+ * every failure, and the historian's retry tree is exactly what the bound cannot cover.
+ */
+const LEDGER_SETTLE_ATTEMPTS_ON_FAILURE = Math.max(
+    2,
+    Math.floor(LATE_DISPOSAL_GRACE_MS / 2 / LEDGER_SETTLE_INTERVAL_MS),
+);
+
 function addUsage(
     left: RolloutObservation["usage"],
     right: RolloutObservation["usage"],
@@ -877,9 +923,11 @@ async function settledSessionUsage(
     pinned: { providerId: string; modelId: string },
     expectedMockEntries: number,
     logPath: string,
+    /** Smaller on the failure path, which runs inside `LATE_DISPOSAL_GRACE_MS`; a settle that outlasts the grace is cut off every time and measures nothing. */
+    attempts: number = LEDGER_SETTLE_ATTEMPTS,
 ): Promise<SessionUsage> {
     let previous: string | null = null;
-    for (let attempt = 0; attempt < LEDGER_SETTLE_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
         /** Checked every pass, not once: the plugin buffers its log for 500 ms, so the marker can appear after the first read. */
         if (historianAbandoned(logPath, sessionId)) {
             throw new Error(
@@ -895,7 +943,7 @@ async function settledSessionUsage(
     }
     throw new Error(
         `live paired-delta session ledger did not settle within ` +
-        `${LEDGER_SETTLE_ATTEMPTS} reads; a background call may still be running`,
+        `${attempts} reads; a background call may still be running`,
     );
 }
 
@@ -976,7 +1024,11 @@ async function sessionUsage(
         }
         for (const child of rows) {
             const childId = (child as { id?: unknown } | null)?.id;
-            if (typeof childId === "string") frontier.push(childId);
+            /** A child without a usable id may hold a billed historian call, so a partial session tree is a failure rather than a smaller walk. */
+            if (typeof childId !== "string" || childId === "") {
+                throw new Error("live paired-delta session tree has a child with no id");
+            }
+            frontier.push(childId);
         }
         }
     }
@@ -991,13 +1043,32 @@ async function sessionUsage(
  * by a session id generated at runtime and written by the tagger as the plugin processes the
  * session, so its presence is evidence the treatment actually ran.
  */
-function pluginProcessedSession(harness: TestHarness, sessionId: string): boolean {
+/**
+ * Whether the plugin ran for this session, and — when the arm's intervention is memory — delivered it.
+ *
+ * A `session_meta` row proves the plugin saw the session, not that anything reached the prompt.
+ * `inject-compartments` records `memory_block_count` when it materializes memory blocks, so for an
+ * arm whose intervention *is* the seeded gold, that count is the identity evidence: without it an R2
+ * rollout where preparation was disabled or failed mid-transform enters both the formation and
+ * representation deltas as though the intervention ran, and the delta absorbs the failure as an
+ * effect of Magic Context.
+ */
+function pluginProcessedSession(
+    harness: TestHarness,
+    sessionId: string,
+    /** Whether the arm's intervention is the seeded memory set, which must be materialized rather than merely seeded. */
+    requiresMaterializedMemory: boolean,
+): boolean {
     if (!harness.hasContextDb()) return false;
     try {
         const row = harness.contextDb()
-            .prepare("SELECT COUNT(*) AS count FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { count: number } | null;
-        return (row?.count ?? 0) > 0;
+            .prepare(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(memory_block_count), 0) AS blocks " +
+                "FROM session_meta WHERE session_id = ?",
+            )
+            .get(sessionId) as { count: number; blocks: number } | null;
+        if ((row?.count ?? 0) === 0) return false;
+        return requiresMaterializedMemory ? (row?.blocks ?? 0) > 0 : true;
     } catch {
         return false;
     }
@@ -1253,7 +1324,11 @@ export function createLiveDependencies(input: {
                         ) &&
                         (
                             !PLUGIN_BACKED_ARMS.includes(coordinate.armId) ||
-                            pluginProcessedSession(harness, sessionId)
+                            pluginProcessedSession(
+                                harness,
+                                sessionId,
+                                coordinate.armId === "r2",
+                            )
                         ) &&
                         r1Valid;
                     return {
@@ -1281,11 +1356,14 @@ export function createLiveDependencies(input: {
                  * bound and the measurement is larger.
                  */
                 async usageOnFailure() {
-                    return (await sessionUsage(
+                    /** The same settle-and-marker path as a successful rollout: a single snapshot here can miss an abandoned historian and its retries, and the four-call fallback would then undercharge the cap. */
+                    return (await settledSessionUsage(
                         harness,
                         activeSessionId ?? "",
                         { providerId: input.providerId, modelId: input.modelId },
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
+                        logPath,
+                        LEDGER_SETTLE_ATTEMPTS_ON_FAILURE,
                     )).usage;
                 },
                 async dispose() {
@@ -1659,6 +1737,32 @@ async function runLive(args: CliArgs): Promise<void> {
         ) {
             throw new Error(
                 "paired-delta calibration record does not cover the calibration pool's scenarios",
+            );
+        }
+        /**
+         * Each series has to hold exactly the observations its own declared depths imply.
+         *
+         * `arithmeticallyReachable` floors the variance at `1/n`, so an inflated `observationCount`
+         * buys a smaller admissible variance and a correspondingly smaller derived pool — a record can
+         * claim a hundred observations of a five-scenario pilot and size the lane down to whatever the
+         * live cohort clears. The depths are already checked per scenario, so their family sums are the
+         * count each family's series must report.
+         */
+        const observationsByFamily = new Map<string, number>();
+        for (const { scenarioId, familyId } of manifestFamilies) {
+            if (!calibrationScenarios.has(scenarioId)) continue;
+            const depth = calibration.scenarioDepth[scenarioId] ?? 0;
+            observationsByFamily.set(familyId, (observationsByFamily.get(familyId) ?? 0) + depth);
+        }
+        const miscounted = calibration.familyNoise
+            .filter(({ familyId, observationCount }) =>
+                observationCount !== observationsByFamily.get(familyId))
+            .map(({ familyId, endpoint }) => `${familyId}/${endpoint}`)
+            .sort(compareCodeUnits);
+        if (miscounted.length > 0) {
+            throw new Error(
+                "paired-delta calibration record series do not match their scenario depths: " +
+                miscounted.join(", "),
             );
         }
         /** The record's own family set, not only its declared count: a record binding this policy could still have measured a different selection. */

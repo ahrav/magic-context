@@ -169,7 +169,13 @@ export interface PairedDeltaRunResult {
 
 export class ProviderUnavailableError extends Error {}
 
-const LATE_DISPOSAL_GRACE_MS = 5_000;
+/**
+ * How long a late disposal, or a failure-path accounting read, may run past the rollout deadline.
+ *
+ * Exported so the live lane can size its ledger-settle budget to fit: a settle that outlasts this
+ * grace is cut off every time, and the accounting it exists to take is never available.
+ */
+export const LATE_DISPOSAL_GRACE_MS = 5_000;
 
 /** Thrown when an in-flight rollout outlives the run deadline. */
 export class RolloutDeadlineError extends Error {}
