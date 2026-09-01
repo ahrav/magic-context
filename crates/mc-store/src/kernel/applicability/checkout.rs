@@ -2,33 +2,81 @@
 //! content-addressed dirty fingerprint, taken once per request.
 
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use gix::bstr::{BStr, ByteSlice};
-use rustix::fs::{self as rfs, OFlags};
+use rustix::fs::{self as rfs, AtFlags, OFlags};
 use sha2::{Digest, Sha256};
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
-/// A path can be replaced after `symlink_metadata`; validate the opened
-/// descriptor instead. A swapped-in symlink would move the read outside the commentlint: allow(JUDGE)
-/// checkout, and a FIFO would block the request without reaching another commentlint: allow(JUDGE)
-/// budget poll, so `NOFOLLOW` and `NONBLOCK` refuse both at open time and commentlint: allow(JUDGE)
-/// the descriptor's own mode settles what was reached. commentlint: allow(JUDGE)
+/// A path re-resolved after containment validation can escape if an ancestor
+/// is replaced with a symlink before open, because `NOFOLLOW` only ever commentlint: allow(JUDGE)
+/// guards the final component. Walking one component at a time with commentlint: allow(JUDGE)
+/// `NOFOLLOW` refuses a symlink at every level, and each descriptor pins its commentlint: allow(JUDGE)
+/// directory's inode, so the returned parent cannot be moved out from under commentlint: allow(JUDGE)
+/// the caller. commentlint: allow(JUDGE)
+///
+/// `PATH` descriptors allow child resolution with directory search
+/// permission. Requiring read access would refuse a tracked file under an commentlint: allow(JUDGE)
+/// execute-only directory that git reads fine, and the resulting commentlint: allow(JUDGE)
+/// `out-of-worktree` token would then stop moving when its content changed. A commentlint: allow(JUDGE)
+/// `PATH` descriptor still serves as the base for `openat`, `statat`, and commentlint: allow(JUDGE)
+/// `readlinkat`. commentlint: allow(JUDGE)
+///
+/// `workdir` is trusted; its resolved directory is the containment root.
+fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> Option<(OwnedFd, OsString)> {
+    let mut names = Vec::new();
+    for component in rela_path.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            Component::CurDir => {}
+            // Absolute roots, prefixes, and `..` leave the worktree.
+            _ => return None,
+        }
+    }
+    let (final_name, ancestors) = names.split_last()?;
+    let mut dir = rfs::open(
+        workdir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        rfs::Mode::empty(),
+    )
+    .ok()?;
+    for ancestor in ancestors {
+        dir = rfs::openat(
+            &dir,
+            *ancestor,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rfs::Mode::empty(),
+        )
+        .ok()?;
+    }
+    Some((dir, (*final_name).to_os_string()))
+}
+
+/// A path can be replaced after a stat; validate the opened descriptor
+/// instead. A swapped-in symlink would move the read outside the checkout, commentlint: allow(JUDGE)
+/// and a FIFO would block the request without reaching another budget poll, commentlint: allow(JUDGE)
+/// so `NOFOLLOW` and `NONBLOCK` refuse both at open time and the commentlint: allow(JUDGE)
+/// descriptor's own mode settles what was reached. commentlint: allow(JUDGE)
 ///
 /// `Ok(None)` means no regular file is there — it vanished, or it is a
 /// symlink, FIFO, directory, or device. `Err` keeps genuine failures commentlint: allow(JUDGE)
 /// distinguishable, since those hide content that still governs the commentlint: allow(JUDGE)
 /// checkout. commentlint: allow(JUDGE)
-pub(super) fn open_regular_no_follow(
-    path: &Path,
+fn open_regular_no_follow_at<Fd: std::os::fd::AsFd>(
+    dir: Fd,
+    name: &OsStr,
 ) -> Result<Option<std::fs::File>, rustix::io::Errno> {
-    let file = match rfs::open(
-        path,
+    let file = match rfs::openat(
+        dir,
+        name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         rfs::Mode::empty(),
     ) {
@@ -50,6 +98,18 @@ pub(super) fn open_regular_no_follow(
         return Ok(None);
     }
     Ok(Some(file))
+}
+
+/// Opens `path` the way [`fold_file`] does, for a caller that holds a full path
+/// rather than a directory descriptor.
+///
+/// The cheap checks resolve a declared path through `worktree_path`, which commentlint: allow(JUDGE)
+/// clears the ancestors but leaves the final component unresolved, so the read commentlint: allow(JUDGE)
+/// still has to refuse a terminal symlink at open time. commentlint: allow(JUDGE)
+pub(super) fn open_regular_no_follow(
+    path: &Path,
+) -> Result<Option<std::fs::File>, rustix::io::Errno> {
+    open_regular_no_follow_at(rfs::CWD, path.as_os_str())
 }
 
 /// Worker-thread ceiling for the status scan. Spawn and coordination cost commentlint: allow(JUDGE)
@@ -271,8 +331,11 @@ impl PathEncoding {
     }
 }
 
-/// Frozen view of one checkout, taken once per request.
-/// Repository handles are request-scoped and not cached.
+/// Frozen view of one checkout, taken once per request: identity, HEAD,
+/// repository state, and the dirty state. Cache keys derive from `identity`,
+/// `head`, `repository_state`, and the dirty entries an object declares; the
+/// open repository handle serves the request's object-database work and is
+/// never cached.
 pub struct CheckoutSnapshot {
     repo: gix::Repository,
     identity: String,
@@ -280,6 +343,7 @@ pub struct CheckoutSnapshot {
     repository_state: String,
     dirty_fingerprint: String,
     dirty_entries: Vec<DirtyEntry>,
+    shallow: bool,
 }
 
 impl CheckoutSnapshot {
@@ -300,8 +364,23 @@ impl CheckoutSnapshot {
     /// Unshallowing or a sparse-pattern edit moves neither HEAD nor the commentlint: allow(JUDGE)
     /// worktree, so a cache key for a verdict that read history reach or path commentlint: allow(JUDGE)
     /// materialization has to carry this generation. commentlint: allow(JUDGE)
+    ///
+    /// Object availability is deliberately outside it: a fetch can supply a commentlint: allow(JUDGE)
+    /// missing object without moving HEAD, the worktree, sparse configuration, commentlint: allow(JUDGE)
+    /// or the shallow file, so a verdict that rested on an absent object must commentlint: allow(JUDGE)
+    /// not be retained against this generation at all. commentlint: allow(JUDGE)
     pub fn repository_state(&self) -> &str {
         &self.repository_state
+    }
+
+    /// Whether the repository was shallow when this snapshot was taken.
+    ///
+    /// A shallow boundary truncates every graph walk, so a negative ancestry commentlint: allow(JUDGE)
+    /// result cannot be trusted. Readers take it from here rather than from commentlint: allow(JUDGE)
+    /// the live repository, which can be deepened or re-truncated after the commentlint: allow(JUDGE)
+    /// fingerprint was fixed. commentlint: allow(JUDGE)
+    pub fn is_shallow(&self) -> bool {
+        self.shallow
     }
 
     /// Digest over the sorted set of (path, status, content hash) for
@@ -395,7 +474,7 @@ pub fn snapshot_checkout(
             "HEAD moved during the status scan".to_string(),
         ));
     }
-    let repository_state = repository_state(&repo, &ctx)?;
+    let (repository_state, shallow) = repository_state(&repo, &ctx)?;
     let dirty_fingerprint = fingerprint_entries(&dirty_entries, &repository_state);
     // Stop the watchdog before the last check, so neither the fingerprint nor commentlint: allow(JUDGE)
     // the watchdog's own teardown can carry a cacheable snapshot past the commentlint: allow(JUDGE)
@@ -409,6 +488,7 @@ pub fn snapshot_checkout(
         repository_state: hex_digest(&repository_state),
         dirty_fingerprint,
         dirty_entries,
+        shallow,
     })
 }
 
@@ -477,6 +557,11 @@ fn scan_dirty_entries(
         .map_err(|error| SnapshotError::Scan(error.to_string()))?;
     for entry in index.entries() {
         use gix::index::entry::Flags;
+        // `ctx.check()` precedes classification so every entry observes
+        // cancellation during large scans. Ordinary entries reach `continue` commentlint: allow(JUDGE)
+        // without per-entry work, so polling only on the rare classes would commentlint: allow(JUDGE)
+        // walk a whole index past an armed deadline. commentlint: allow(JUDGE)
+        ctx.check()?;
         let status = if entry.flags.contains(Flags::SKIP_WORKTREE) {
             "skip_worktree"
         } else if entry.flags.contains(Flags::ASSUME_VALID) {
@@ -484,7 +569,6 @@ fn scan_dirty_entries(
         } else {
             continue;
         };
-        ctx.check()?;
         let rela_path = entry.path(&index);
         let (path, path_encoding) = encode_path(rela_path);
         // A chmod moves the git entry mode while the bytes stay equal, so
@@ -532,14 +616,27 @@ fn index_worktree_entry(
                     status: "removed",
                     content_hash: "absent".to_string(),
                 }),
+                // The mode tag joins the content hash for the same reason it
+                // does on assume-valid and skip-worktree entries: a chmod commentlint: allow(JUDGE)
+                // moves git's worktree mode between 100644 and 100755 while commentlint: allow(JUDGE)
+                // the bytes stay equal, and a file that is already dirty by commentlint: allow(JUDGE)
+                // content would otherwise absorb that move unrecorded. commentlint: allow(JUDGE)
                 EntryStatus::Change(_) => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    content_hash: format!(
+                        "{}:{}",
+                        worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                        worktree_mode_tag(repo, rela_path.as_ref())
+                    ),
                     path,
                     path_encoding,
                     status: "modified",
                 }),
                 EntryStatus::IntentToAdd => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    content_hash: format!(
+                        "{}:{}",
+                        worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                        worktree_mode_tag(repo, rela_path.as_ref())
+                    ),
                     path,
                     path_encoding,
                     status: "intent_to_add",
@@ -654,45 +751,42 @@ fn worktree_content_hash(
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return Ok("unreadable".to_string());
     };
-    let Some(path) = contained_path(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
         return Ok("out-of-worktree".to_string());
     };
     // Inspection failures use `unreadable`, distinct from content hashes.
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let Ok(stat) = rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) else {
         return Ok("unreadable".to_string());
     };
-    let file_type = metadata.file_type();
+    let file_type = rfs::FileType::from_raw_mode(stat.st_mode);
     if file_type.is_symlink() {
-        let Ok(target) = std::fs::read_link(&path) else {
+        let Ok(target) = rfs::readlinkat(&dir, name.as_os_str(), Vec::new()) else {
             return Ok("unreadable".to_string());
         };
         let mut hash = Sha256::new();
         hash.update(b"symlink\0");
-        hash.update(target.as_os_str().as_encoded_bytes());
+        hash.update(target.as_bytes());
         return Ok(format!("symlink:{:x}", hash.finalize()));
     }
     if !file_type.is_file() {
         if file_type.is_dir() {
             // A dirty tracked gitlink resolves to a directory; its HEAD and commentlint: allow(JUDGE)
             // its own uncommitted state are the content that moved. commentlint: allow(JUDGE)
-            return submodule_hash(&path, ctx);
+            return submodule_hash_at(&dir, name.as_os_str(), ctx);
         }
         return Ok("not-a-regular-file".to_string());
     }
-    let Ok(Some(mut file)) = open_regular_no_follow(&path) else {
-        return Ok("unreadable".to_string());
+    let mut file = match open_regular_no_follow_at(&dir, name.as_os_str()) {
+        Ok(Some(file)) => file,
+        // The path changed kind under the classification above.
+        Ok(None) => return Ok("unreadable".to_string()),
+        // A failure to read hides content that still governs the checkout, so commentlint: allow(JUDGE)
+        // it must not collapse onto a fixed token that two different dirty commentlint: allow(JUDGE)
+        // states would share. commentlint: allow(JUDGE)
+        Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     let mut hash = Sha256::new();
-    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
-    loop {
-        ctx.check()?;
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => hash.update(&buffer[..read]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Ok("unreadable".to_string()),
-        }
-    }
+    fold_open_file(&mut hash, &mut file, ctx)?;
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -725,6 +819,11 @@ fn conflict_content_hash(
     }
     let worktree = worktree_content_hash(repo, rela_path, ctx)?;
     hash.update(worktree.as_bytes());
+    // A conflicted path stays conflicted through a chmod, so without the mode
+    // tag a 100644 and a 100755 worktree share this hash — the same aliasing commentlint: allow(JUDGE)
+    // the modified and index-keyed entries already record. commentlint: allow(JUDGE)
+    hash.update(b"mode\0");
+    hash.update(worktree_mode_tag(repo, rela_path).as_bytes());
     Ok(format!("conflict:{:x}", hash.finalize()))
 }
 
@@ -769,7 +868,7 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 
 fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v5\0");
+    hash.update(b"mc-dirty-fingerprint-v7\0");
     hash.update(repository_state);
     for entry in entries {
         // Length prefixes make adjacent fields unambiguous.
@@ -790,6 +889,51 @@ fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> S
 /// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
 /// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
 /// read them. commentlint: allow(JUDGE)
+/// The pinned parent descriptor prevents ancestor-path replacement from
+/// redirecting the nested scan.
+///
+/// `gix` opens a repository by path, so the pinned directory is named through
+/// `/proc/self/fd`, which resolves to the descriptor's inode however the commentlint: allow(JUDGE)
+/// original pathname is rewritten. The descriptor stays open for the whole commentlint: allow(JUDGE)
+/// nested scan, which is what keeps that name valid. commentlint: allow(JUDGE)
+#[cfg(target_os = "linux")]
+fn submodule_hash_at(
+    dir: &OwnedFd,
+    name: &OsStr,
+    ctx: &ScanCtx<'_>,
+) -> Result<String, SnapshotError> {
+    use std::os::fd::AsRawFd;
+
+    let Ok(gitlink) = rfs::openat(
+        dir,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rfs::Mode::empty(),
+    ) else {
+        return Ok("unreadable-gitlink".to_string());
+    };
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", gitlink.as_raw_fd()));
+    let hashed = submodule_hash(&pinned, ctx);
+    drop(gitlink);
+    hashed
+}
+
+/// Without `/proc`, the pinned directory cannot be named for `gix`, so the
+/// gitlink is refused rather than reached through a re-resolved pathname.
+#[cfg(not(target_os = "linux"))]
+fn submodule_hash_at(
+    dir: &OwnedFd,
+    name: &OsStr,
+    _ctx: &ScanCtx<'_>,
+) -> Result<String, SnapshotError> {
+    let _ = (dir, name);
+    Ok("unreadable-gitlink".to_string())
+}
+
+/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone commentlint: allow(JUDGE)
+/// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
+/// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
+/// read them. commentlint: allow(JUDGE)
 fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotError> {
     let Some(nested) = ctx.nested() else {
         return Err(SnapshotError::Scan(format!(
@@ -798,15 +942,30 @@ fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotErro
             path.display()
         )));
     };
-    let Ok(submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
-        return Ok("not-a-regular-file".to_string());
+    let Ok(mut submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
+        return Ok("unopenable-gitlink".to_string());
     };
+    // The nested scan walks trees exactly as the top-level one does, so it
+    // wants the same cache floor.
+    submodule.object_cache_size_if_unset(4 * 1024 * 1024);
     let head = match submodule.head_id() {
         Ok(head) => head.detach().to_string(),
         Err(_) => "unborn".to_string(),
     };
     let entries = scan_dirty_entries(&submodule, &nested)?;
-    let state = repository_state(&submodule, &nested)?;
+    let (state, _) = repository_state(&submodule, &nested)?;
+    // The nested scan needs the same HEAD-stability check the top-level one
+    // makes: a submodule that switches commits mid-scan would otherwise pair commentlint: allow(JUDGE)
+    // an old HEAD with a new worktree and key that tuple as a clean state. commentlint: allow(JUDGE)
+    let head_after = match submodule.head_id() {
+        Ok(head) => head.detach().to_string(),
+        Err(_) => "unborn".to_string(),
+    };
+    if head_after != head {
+        return Err(SnapshotError::Scan(
+            "submodule HEAD moved during the status scan".to_string(),
+        ));
+    }
     Ok(format!(
         "gitlink:{head}:{}",
         fingerprint_entries(&entries, &state)
@@ -823,27 +982,23 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return "absent";
     };
-    let Some(path) = contained_path(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
         return "absent";
     };
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let Ok(stat) = rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) else {
         return "absent";
     };
-    let file_type = metadata.file_type();
+    let file_type = rfs::FileType::from_raw_mode(stat.st_mode);
     if file_type.is_symlink() {
         return "symlink";
     }
     if file_type.is_dir() {
         return "dir";
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Git reads executability from the owner bit alone, so a file that is commentlint: allow(JUDGE)
-        // group-executable only is still mode 100644 to it. commentlint: allow(JUDGE)
-        if metadata.permissions().mode() & 0o100 != 0 {
-            return "exec";
-        }
+    // Git reads executability from the owner bit alone, so a
+    // group-executable-only file has mode 100644.
+    if stat.st_mode & 0o100 != 0 {
+        return "exec";
     }
     "file"
 }
@@ -851,31 +1006,47 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
 /// Folds `path`'s bytes into `hash` chunk by chunk, so a large file bounds commentlint: allow(JUDGE)
 /// neither the working set nor the digest. Anything other than a regular file commentlint: allow(JUDGE)
 /// counts as absent, since opening a FIFO can block indefinitely. commentlint: allow(JUDGE)
-fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), SnapshotError> {
+fn fold_file(
+    hash: &mut Sha256,
+    path: &Path,
+    ctx: &ScanCtx<'_>,
+) -> Result<Option<u64>, SnapshotError> {
     // The open is the sole authority on what is there: a stat first would commentlint: allow(JUDGE)
     // leave a window for the path to be swapped before the read. commentlint: allow(JUDGE)
-    let mut file = match open_regular_no_follow(path) {
+    let mut file = match open_regular_no_follow_at(rfs::CWD, path.as_os_str()) {
         Ok(Some(file)) => file,
         Ok(None) => {
             hash.update(b"absent\0");
-            return Ok(());
+            return Ok(None);
         }
         // Any other failure hides content that still governs the checkout. commentlint: allow(JUDGE)
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     hash.update(b"present\0");
+    Ok(Some(fold_open_file(hash, &mut file, ctx)?))
+}
+
+/// A read error propagates rather than truncating: a prefix would key as a
+/// genuinely shorter file. commentlint: allow(JUDGE)
+fn fold_open_file(
+    hash: &mut Sha256,
+    file: &mut std::fs::File,
+    ctx: &ScanCtx<'_>,
+) -> Result<u64, SnapshotError> {
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    let mut folded = 0u64;
     loop {
         ctx.check()?;
         match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => hash.update(&buffer[..read]),
+            Ok(0) => return Ok(folded),
+            Ok(read) => {
+                hash.update(&buffer[..read]);
+                folded = folded.saturating_add(read as u64);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // A prefix would key as a genuinely shorter file. commentlint: allow(JUDGE)
             Err(error) => return Err(SnapshotError::Scan(error.to_string())),
         }
     }
-    Ok(())
 }
 
 /// Repository state beyond HEAD and the dirty set that changes what the engine commentlint: allow(JUDGE)
@@ -884,10 +1055,20 @@ fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), Sn
 /// Sparse configuration and patterns decide materialization. The shallow commentlint: allow(JUDGE)
 /// boundary decides whether an ancestry walk can reach a conclusion at all, so commentlint: allow(JUDGE)
 /// unshallowing has to move the generation. commentlint: allow(JUDGE)
-fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
+///
+/// Object availability stays out of this digest: in a partial clone a fetch
+/// materializes a missing blob without touching HEAD, the worktree, sparse commentlint: allow(JUDGE)
+/// configuration, or the shallow file, and no cheap repository read separates commentlint: allow(JUDGE)
+/// "absent" from "absent so far". A cache keyed by this generation therefore commentlint: allow(JUDGE)
+/// must not retain an outcome that an unreadable object produced; such an commentlint: allow(JUDGE)
+/// outcome is transient exactly as a budget-driven one is. commentlint: allow(JUDGE)
+fn repository_state(
+    repo: &gix::Repository,
+    ctx: &ScanCtx<'_>,
+) -> Result<([u8; 32], bool), SnapshotError> {
     let config = repo.config_snapshot();
     let mut hash = Sha256::new();
-    hash.update(b"mc-repo-state-v2\0");
+    hash.update(b"mc-repo-state-v1\0");
     hash.update([
         config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
         config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
@@ -895,52 +1076,15 @@ fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32
     hash.update(b"sparse\0");
     fold_file(&mut hash, &repo.git_dir().join("info/sparse-checkout"), ctx)?;
     hash.update(b"shallow\0");
-    fold_file(&mut hash, &repo.shallow_file(), ctx)?;
-    hash.update(b"refs\0");
-    fold_references(&mut hash, repo, ctx)?;
-    Ok(hash.finalize().into())
-}
-
-/// Folds every reference name and target into `hash`.
-///
-/// An anchor condition can be uncertain because the commit it names is not in commentlint: allow(JUDGE)
-/// the object database. A later fetch that supplies it moves neither HEAD nor commentlint: allow(JUDGE)
-/// the shallow file, but it does move a remote-tracking ref, so the reference commentlint: allow(JUDGE)
-/// set is what lets a cached uncertainty expire. commentlint: allow(JUDGE)
-fn fold_references(
-    hash: &mut Sha256,
-    repo: &gix::Repository,
-    ctx: &ScanCtx<'_>,
-) -> Result<(), SnapshotError> {
-    let platform = repo
-        .references()
-        .map_err(|error| SnapshotError::Scan(error.to_string()))?;
-    let iter = platform
-        .all()
-        .map_err(|error| SnapshotError::Scan(error.to_string()))?;
-    // Sorted so the digest does not depend on loose-versus-packed storage.
-    let mut refs: Vec<(Vec<u8>, String)> = Vec::new();
-    for reference in iter {
-        ctx.check()?;
-        // A reference that cannot be read hides state that governs resolution.
-        let reference = reference.map_err(|error| SnapshotError::Scan(error.to_string()))?;
-        let name = reference.name().as_bstr().to_vec();
-        // A symbolic target names another reference; a peeled one names an
-        // object. Both change what resolution can reach.
-        let target = match reference.target() {
-            gix::refs::TargetRef::Object(id) => format!("object:{id}"),
-            gix::refs::TargetRef::Symbolic(name) => format!("symbolic:{}", name.as_bstr()),
-        };
-        refs.push((name, target));
-    }
-    refs.sort_unstable();
-    for (name, target) in refs {
-        for field in [name.as_slice(), target.as_bytes()] {
-            hash.update((field.len() as u64).to_le_bytes());
-            hash.update(field);
-        }
-    }
-    Ok(())
+    // The digest and the shallow verdict come from one read, so a shallow file
+    // removed between them cannot pair a shallow fingerprint with commentlint: allow(JUDGE)
+    // `shallow == false`. A present-but-empty file is not shallow, which is commentlint: allow(JUDGE)
+    // what gix reports too. commentlint: allow(JUDGE)
+    let shallow = fold_file(&mut hash, &repo.shallow_file(), ctx)?;
+    Ok((
+        hash.finalize().into(),
+        matches!(shallow, Some(bytes) if bytes > 0),
+    ))
 }
 
 #[cfg(test)]
@@ -953,44 +1097,129 @@ mod tests {
     fn open_regular_no_follow_admits_only_regular_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        let root_fd = rfs::open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            rfs::Mode::empty(),
+        )
+        .unwrap();
 
-        let regular = root.join("regular");
-        std::fs::write(&regular, b"payload").unwrap();
+        std::fs::write(root.join("regular"), b"payload").unwrap();
         assert!(
-            open_regular_no_follow(&regular)
+            open_regular_no_follow_at(&root_fd, OsStr::new("regular"))
                 .expect("a regular file is not a scan failure")
                 .is_some(),
             "a regular file stays readable"
         );
 
-        assert!(open_regular_no_follow(&root.join("missing"))
+        assert!(open_regular_no_follow_at(&root_fd, OsStr::new("missing"))
             .expect("a vanished path is not a scan failure")
             .is_none());
 
-        assert!(open_regular_no_follow(root)
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        assert!(open_regular_no_follow_at(&root_fd, OsStr::new("subdir"))
             .expect("a directory is not a scan failure")
             .is_none());
 
-        #[cfg(unix)]
-        {
-            let link = root.join("link");
-            std::os::unix::fs::symlink(&regular, &link).unwrap();
-            assert!(
-                open_regular_no_follow(&link)
-                    .expect("a symlink is not a scan failure")
-                    .is_none(),
-                "following the link would read whatever it points at"
-            );
+        std::os::unix::fs::symlink(root.join("regular"), root.join("link")).unwrap();
+        assert!(
+            open_regular_no_follow_at(&root_fd, OsStr::new("link"))
+                .expect("a symlink is not a scan failure")
+                .is_none(),
+            "following the link would read whatever it points at"
+        );
 
-            let fifo = root.join("fifo");
-            rfs::mkfifoat(rfs::CWD, &fifo, rfs::Mode::RUSR | rfs::Mode::WUSR)
-                .expect("mkfifo succeeds in a temp dir");
-            assert!(
-                open_regular_no_follow(&fifo)
-                    .expect("a FIFO is not a scan failure")
-                    .is_none(),
-                "a blocking open would run past the budget"
-            );
-        }
+        rfs::mkfifoat(&root_fd, "fifo", rfs::Mode::RUSR | rfs::Mode::WUSR)
+            .expect("mkfifo succeeds in a temp dir");
+        assert!(
+            open_regular_no_follow_at(&root_fd, OsStr::new("fifo"))
+                .expect("a FIFO is not a scan failure")
+                .is_none(),
+            "a blocking open would run past the budget"
+        );
+    }
+
+    /// `NOFOLLOW` guards only the final component, so ancestor containment has
+    /// to survive an ancestor being replaced after the path was validated.
+    ///
+    /// The swap here is the race made deterministic: resolve first, substitute
+    /// the ancestor, then read. A descriptor pins the directory it opened, so commentlint: allow(JUDGE)
+    /// the later read still lands on the originally contained file; a path commentlint: allow(JUDGE)
+    /// re-walked at open time would traverse the substituted link instead. commentlint: allow(JUDGE)
+    #[test]
+    fn a_swapped_ancestor_cannot_redirect_a_pinned_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workdir = root.join("workdir");
+        std::fs::create_dir(&workdir).unwrap();
+        std::fs::create_dir(workdir.join("real")).unwrap();
+        std::fs::write(workdir.join("real/inside"), b"contained").unwrap();
+
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("inside"), b"escaped").unwrap();
+
+        // Resolve while `real` is a genuine directory, as any check would.
+        let (dir_fd, name) =
+            open_parent_beneath(&workdir, Path::new("real/inside")).expect("a real ancestor opens");
+        assert_eq!(name, OsStr::new("inside"));
+
+        // The window a path-based open leaves: swap the validated ancestor.
+        std::fs::rename(workdir.join("real"), workdir.join("stashed")).unwrap();
+        std::os::unix::fs::symlink(&outside, workdir.join("real")).unwrap();
+
+        let mut file = open_regular_no_follow_at(&dir_fd, name.as_os_str())
+            .expect("the pinned parent is not a scan failure")
+            .expect("the original file is still a regular file");
+        let mut read = Vec::new();
+        file.read_to_end(&mut read).unwrap();
+        assert_eq!(
+            read, b"contained",
+            "the pinned parent must keep the read inside the checkout"
+        );
+
+        // A path re-walked now would traverse the link, which is the escape.
+        assert_eq!(
+            std::fs::read(workdir.join("real/inside")).unwrap(),
+            b"escaped",
+            "the swap really does redirect the pathname"
+        );
+
+        // A symlinked ancestor present up front is refused outright.
+        assert!(open_parent_beneath(&workdir, Path::new("real/inside")).is_none());
+        assert!(open_parent_beneath(&workdir, Path::new("../outside/inside")).is_none());
+        assert!(open_parent_beneath(&workdir, Path::new("")).is_none());
+    }
+
+    /// Resolving a known child needs search permission, not read permission,
+    /// so a traversal that demanded read access would lose track of a tracked commentlint: allow(JUDGE)
+    /// file that git still reads — and its content edits with it. commentlint: allow(JUDGE)
+    #[test]
+    fn an_execute_only_ancestor_still_resolves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+        std::fs::create_dir(workdir.join("closed")).unwrap();
+        std::fs::write(workdir.join("closed/tracked"), b"payload").unwrap();
+        // Traversable, not readable — 0o711 would still grant the owner read.
+        std::fs::set_permissions(
+            workdir.join("closed"),
+            std::fs::Permissions::from_mode(0o111),
+        )
+        .unwrap();
+
+        let resolved = open_parent_beneath(workdir, Path::new("closed/tracked"));
+        // Restore before asserting so a failure cannot leave an undeletable dir.
+        std::fs::set_permissions(
+            workdir.join("closed"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let (dir_fd, name) = resolved.expect("an execute-only ancestor is traversable");
+        assert!(open_regular_no_follow_at(&dir_fd, name.as_os_str())
+            .expect("the file is not a scan failure")
+            .is_some());
     }
 }

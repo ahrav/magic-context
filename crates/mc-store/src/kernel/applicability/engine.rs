@@ -377,6 +377,19 @@ impl ApplicabilityEngine {
         payload_decode: &PayloadDecode,
         budget: &EvalBudget,
     ) -> Classification {
+        // Uncertainty is transient when the deadline expired or a resolution
+        // needed an object the database does not hold. The cache key covers
+        // neither, so retaining such a verdict pins it until eviction even
+        // after a fetch or a longer budget would decide it.
+        let unreadable_before = ladder.unreadable_objects();
+        let uncertain = |evidence: String| {
+            let state = ApplicabilityState::Uncertain;
+            if budget.is_exhausted() || ladder.unreadable_objects() != unreadable_before {
+                Classification::uncacheable(state, evidence)
+            } else {
+                Classification::terminal(state, evidence)
+            }
+        };
         // Scope gate.
         if let Some(terms) = &candidate.scope_terms {
             let scope = match CanonicalScope::from_term_specs(terms) {
@@ -397,13 +410,7 @@ impl ApplicabilityEngine {
                     );
                 }
                 MatchOutcome::Uncertain => {
-                    let state = ApplicabilityState::Uncertain;
-                    let evidence = "scope match is unresolvable in this context";
-                    return if budget.is_exhausted() {
-                        Classification::uncacheable(state, evidence)
-                    } else {
-                        Classification::terminal(state, evidence)
-                    };
+                    return uncertain("scope match is unresolvable in this context".to_string());
                 }
             }
         }
@@ -426,14 +433,7 @@ impl ApplicabilityEngine {
                 AnchorVerdict::Historical(evidence) => {
                     return Classification::terminal(ApplicabilityState::Historical, evidence);
                 }
-                AnchorVerdict::Uncertain(evidence) => {
-                    let state = ApplicabilityState::Uncertain;
-                    return if budget.is_exhausted() {
-                        Classification::uncacheable(state, evidence)
-                    } else {
-                        Classification::terminal(state, evidence)
-                    };
-                }
+                AnchorVerdict::Uncertain(evidence) => return uncertain(evidence),
             }
         }
         // Dirty-tree gate and cheap checks read the object payload.
@@ -555,10 +555,16 @@ impl ApplicabilityEngine {
                 }
                 None => {
                     stats.anchor_cache_misses += 1;
+                    let unreadable_before = ladder.unreadable_objects();
                     let outcome = ladder.evaluate(git_condition);
-                    // Budget-driven uncertainty is transient; caching it
-                    // would pin a degraded verdict to this (HEAD, anchor).
-                    if outcome != GitConditionOutcome::Uncertain || !ladder.budget_was_exhausted() {
+                    // Uncertainty from an expired budget or from an object the
+                    // database does not hold is transient: a fetch supplies a
+                    // missing commit without moving anything this key covers,
+                    // so retaining either would pin a degraded verdict to this
+                    // (HEAD, anchor) until eviction.
+                    let transient = ladder.budget_was_exhausted()
+                        || ladder.unreadable_objects() != unreadable_before;
+                    if outcome != GitConditionOutcome::Uncertain || !transient {
                         let _evicted = lock(&self.anchor_cache).insert(key, outcome);
                     }
                     outcome

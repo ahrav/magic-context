@@ -1823,13 +1823,14 @@ fn a_real_uncommitted_edit_still_trips_the_dirty_gate() {
     );
 }
 
-/// An anchor whose commit is not in the object database is uncertain. A fetch
-/// that supplies it moves neither HEAD nor the shallow file, so the reference
-/// set is what expires the cached uncertainty.
+/// An anchor naming a commit the object database does not hold is uncertain,
+/// and a fetch can supply that commit without moving HEAD, the worktree, sparse
+/// configuration, or the shallow file. Object availability is deliberately
+/// outside the snapshot generation, so the outcome must not be retained at all.
 #[test]
-fn a_reference_change_expires_cached_anchor_uncertainty() {
+fn anchor_uncertainty_from_an_absent_object_is_not_cached() {
     let dir = tempfile::tempdir().unwrap();
-    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let (fixture, base, tip) = seeded_repo(dir.path());
     let snapshot = checkout(&fixture, tip);
 
     let engine = ApplicabilityEngine::new();
@@ -1842,30 +1843,55 @@ fn a_reference_change_expires_cached_anchor_uncertainty() {
         }),
         ..candidate("object-absent-anchor")
     };
+    for round in 0..2 {
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            std::slice::from_ref(&absent),
+            &EvalBudget::unbounded(),
+        );
+        assert_ne!(batch.objects[0].state, ApplicabilityState::Current);
+        // Neither cache may answer: the object-level verdict rests on the same
+        // absent object as the anchor verdict underneath it.
+        assert_eq!(
+            batch.stats.object_cache_hits, 0,
+            "round {round} served a classification resting on an absent object"
+        );
+        assert_eq!(batch.stats.anchor_cache_hits, 0);
+        assert!(
+            !batch.objects[0].append_pending,
+            "a transient uncertainty claimed a durable append"
+        );
+    }
+
+    // A resolvable anchor still caches, so the rule above did not disable
+    // anchor caching wholesale.
+    let resolvable = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-present", base)),
+        ..candidate("object-present-anchor")
+    };
+    engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&resolvable),
+        &EvalBudget::unbounded(),
+    );
     let batch = engine.evaluate_batch(
         &snapshot,
         &QueryContext::default(),
         &ScopeMatchContext::new(),
-        std::slice::from_ref(&absent),
+        &[ApplicabilityCandidate {
+            // A different object id, so the object cache misses and the anchor
+            // cache is the only thing that can answer.
+            object_id: "object-present-anchor-sibling".to_string(),
+            ..resolvable.clone()
+        }],
         &EvalBudget::unbounded(),
     );
-    assert_ne!(batch.objects[0].state, ApplicabilityState::Current);
-
-    // A new ref stands in for the fetch that would supply the missing commit.
-    let remote_ref = fixture.repo.git_dir().join("refs/remotes/origin");
-    std::fs::create_dir_all(&remote_ref).unwrap();
-    std::fs::write(remote_ref.join("main"), format!("{tip}\n")).unwrap();
-    let fetched = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
-    assert_ne!(fetched.repository_state(), snapshot.repository_state());
-    let batch = engine.evaluate_batch(
-        &fetched,
-        &QueryContext::default(),
-        &ScopeMatchContext::new(),
-        &[absent],
-        &EvalBudget::unbounded(),
-    );
-    assert_eq!(batch.stats.object_cache_hits, 0);
-    assert_eq!(batch.stats.anchor_cache_hits, 0);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(batch.stats.anchor_cache_hits, 1);
 }
 
 /// An expired request owes `Uncertain` even where a cached verdict exists, so a

@@ -60,6 +60,8 @@ pub struct ResolutionLadder<'s> {
     /// A candidate's patch identity depends only on its commit.
     patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
     graph_operations: Cell<u64>,
+    /// Resolutions that could not read an object they needed.
+    unreadable_objects: Cell<u64>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -67,11 +69,12 @@ impl<'s> ResolutionLadder<'s> {
         Self {
             snapshot,
             budget,
-            shallow: snapshot.repo().is_shallow(),
+            shallow: snapshot.is_shallow(),
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
             patch_id_cache: RefCell::new(HashMap::new()),
             graph_operations: Cell::new(0),
+            unreadable_objects: Cell::new(0),
         }
     }
 
@@ -84,6 +87,23 @@ impl<'s> ResolutionLadder<'s> {
 
     pub fn budget_was_exhausted(&self) -> bool {
         self.budget.is_exhausted()
+    }
+
+    /// Count of resolutions that needed an object the database did not hold.
+    ///
+    /// Object availability is deliberately outside the snapshot generation, commentlint: allow(JUDGE)
+    /// because a fetch can supply a missing commit without moving HEAD, the commentlint: allow(JUDGE)
+    /// worktree, sparse configuration, or the shallow file. An outcome that commentlint: allow(JUDGE)
+    /// rests on an absent object is therefore transient exactly as a commentlint: allow(JUDGE)
+    /// budget-driven one is, and a caller compares this across one evaluation commentlint: allow(JUDGE)
+    /// to decide whether the outcome may be retained. commentlint: allow(JUDGE)
+    pub fn unreadable_objects(&self) -> u64 {
+        self.unreadable_objects.get()
+    }
+
+    fn note_unreadable_object(&self) {
+        self.unreadable_objects
+            .set(self.unreadable_objects.get() + 1);
     }
 
     fn count_graph_operation(&self) {
@@ -147,6 +167,11 @@ impl<'s> ResolutionLadder<'s> {
         };
         let anchor = ObjectId::from_hex(oid_hex.as_bytes()).ok();
         let anchor_present = anchor.is_some_and(|oid| repo.find_commit(oid).is_ok());
+        // A parsed OID the database does not hold is the availability case: a
+        // fetch can supply it later without moving anything the key covers.
+        if anchor.is_some() && !anchor_present {
+            self.note_unreadable_object();
+        }
         // An undecided ancestry test still permits a positive fallback match. commentlint: allow(JUDGE)
         // Every window candidate is reachable from HEAD, so a match proves commentlint: allow(JUDGE)
         // reachability; it only bars the negative conclusion below. commentlint: allow(JUDGE)
@@ -284,7 +309,10 @@ impl<'s> ResolutionLadder<'s> {
                 }
                 Ok(false) => {}
                 Err(ResolveObstacle::BudgetExhausted) => return WindowMatch::Budget,
-                Err(ResolveObstacle::UnreadableObject) => return WindowMatch::Unreadable,
+                Err(ResolveObstacle::UnreadableObject) => {
+                    self.note_unreadable_object();
+                    return WindowMatch::Unreadable;
+                }
             }
         }
         match found {
@@ -422,6 +450,7 @@ impl<'s> ResolutionLadder<'s> {
         self.count_graph_operation();
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
+            self.note_unreadable_object();
             return None;
         }
         let bases = repo.merge_bases_many(ancestor, &[descendant]).ok()?;
@@ -472,17 +501,28 @@ pub fn compute_patch_id(
     budget: &EvalBudget,
 ) -> Result<Option<String>, ResolveObstacle> {
     budget_gate(budget)?;
-    let changes = match first_parent_blob_changes(repo, commit, budget)? {
+    let changes = first_parent_blob_changes(repo, commit, budget)?;
+    patch_id_from_changes(repo, changes.as_deref(), budget)
+}
+
+/// Computes the identity from an already-computed first-parent diff to avoid a
+/// second tree walk.
+fn patch_id_from_changes(
+    repo: &gix::Repository,
+    changes: Option<&[gix::object::tree::diff::ChangeDetached]>,
+    budget: &EvalBudget,
+) -> Result<Option<String>, ResolveObstacle> {
+    let changes = match changes {
         Some(changes) if !changes.is_empty() => changes,
         // A merge returns before the diff callback and an empty diff invokes commentlint: allow(JUDGE)
-        // none, so neither path has polled since the gate above. commentlint: allow(JUDGE)
+        // none, so neither path has polled since the caller's gate. commentlint: allow(JUDGE)
         _ => {
             budget_gate(budget)?;
             return Ok(None);
         }
     };
     let mut file_hashes = Vec::with_capacity(changes.len());
-    for change in &changes {
+    for change in changes {
         budget_gate(budget)?;
         let Some(file_hash) = file_change_hash(repo, change, budget)? else {
             return Ok(None);
@@ -734,25 +774,60 @@ pub fn capture_anchor_representation(
 ) -> Option<AnchorCapture> {
     let commit = repo.find_commit(commit_oid).ok()?;
     let tree_oid = commit.tree_id().ok()?.detach();
+    budget_gate(budget).ok()?;
+    // A tree a parent already carries cannot show this commit was replayed, so
+    // the tree rung would match that parent instead. Empty commits and merges commentlint: allow(JUDGE)
+    // whose result equals a side are the cases that produce one. commentlint: allow(JUDGE)
+    let tree_distinguishes = !parent_shares_tree(repo, &commit, tree_oid);
+    // An unreadable object costs the patch rung, not the capture: the commit
+    // and tree ids are already resolved, and the tree rung runs on those commentlint: allow(JUDGE)
+    // alone. An empty path list also disables the prefilter, which is the commentlint: allow(JUDGE)
+    // safe direction. Cancellation is different — a capture assembled after commentlint: allow(JUDGE)
+    // the budget expired would persist a partial view as if complete. commentlint: allow(JUDGE)
+    let changes = match first_parent_blob_changes(repo, commit_oid, budget) {
+        Ok(changes) => changes,
+        Err(ResolveObstacle::BudgetExhausted) => return None,
+        Err(ResolveObstacle::UnreadableObject) => None,
+    };
     // A lossily converted path would miss real tree entries in
     // `commit_touches_paths`, so non-UTF-8 locations are dropped.
-    let changed_paths = first_parent_blob_changes(repo, commit_oid, budget)
-        .ok()?
-        .unwrap_or_default()
+    let changed_paths = changes
         .iter()
+        .flatten()
         .filter_map(|change| std::str::from_utf8(change.location()).ok())
         .map(str::to_owned)
         .collect();
-    let patch_id = compute_patch_id(repo, commit_oid, budget)
-        .ok()?
-        .map(|value| super::super::anchor::PatchIdCapture {
-            algorithm: PATCH_ID_ALGORITHM.to_string(),
-            value,
-        });
+    let patch_id = match patch_id_from_changes(repo, changes.as_deref(), budget) {
+        Ok(value) => value,
+        Err(ResolveObstacle::BudgetExhausted) => return None,
+        Err(ResolveObstacle::UnreadableObject) => None,
+    }
+    .map(|value| super::super::anchor::PatchIdCapture {
+        algorithm: PATCH_ID_ALGORITHM.to_string(),
+        value,
+    });
     Some(AnchorCapture {
         commit_oid: commit_oid.to_string(),
-        tree_oid: Some(tree_oid.to_string()),
+        tree_oid: tree_distinguishes.then(|| tree_oid.to_string()),
         patch_id,
         changed_paths,
+    })
+}
+
+/// Whether any parent of `commit` already carries `tree_oid`.
+///
+/// An unreadable parent answers `true`: withholding a fallback costs a rung, commentlint: allow(JUDGE)
+/// while offering one that cannot distinguish the commit risks calling an commentlint: allow(JUDGE)
+/// anchor current on the strength of its parent. commentlint: allow(JUDGE)
+fn parent_shares_tree(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    tree_oid: ObjectId,
+) -> bool {
+    commit.parent_ids().any(|parent| {
+        repo.find_commit(parent.detach())
+            .ok()
+            .and_then(|parent| parent.tree_id().ok())
+            .is_none_or(|parent_tree| parent_tree.detach() == tree_oid)
     })
 }
