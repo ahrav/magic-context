@@ -1,6 +1,7 @@
 //! Bounded cheap checks against a checkout snapshot's worktree.
 
 use std::path::{Component, Path, PathBuf};
+use std::{fs::File, io::Read};
 
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::payloads::CheckSpec;
@@ -74,20 +75,26 @@ pub fn run_cheap_check(
             let Some(absolute) = confined_worktree_path(snapshot, path) else {
                 return invalid_path(path, snapshot);
             };
-            match std::fs::metadata(&absolute) {
+            let Ok(mut file) = File::open(absolute) else {
+                return CheckOutcome::Failed {
+                    evidence: format!("config file {path} is missing or unreadable"),
+                };
+            };
+            let metadata = match file.metadata() {
                 Ok(metadata) if metadata.len() > CONFIG_SCAN_CAP_BYTES => {
                     return CheckOutcome::Invalid {
                         evidence: format!("config file {path} exceeds the scan cap"),
                     };
                 }
-                Ok(_) => {}
+                Ok(metadata) => metadata,
                 Err(_) => {
                     return CheckOutcome::Failed {
                         evidence: format!("config file {path} is missing or unreadable"),
                     };
                 }
-            }
-            let Ok(content) = std::fs::read_to_string(&absolute) else {
+            };
+            let mut content = String::with_capacity(metadata.len() as usize);
+            let Ok(_) = file.read_to_string(&mut content) else {
                 return CheckOutcome::Failed {
                     evidence: format!("config file {path} is missing or unreadable"),
                 };
