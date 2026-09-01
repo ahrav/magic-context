@@ -31,6 +31,16 @@ const LABEL_WORDS: &[&str] = &[
 const LABEL_QUALIFIERS: &[&str] = &[
     "api",
     "access",
+    // A qualifier missing here is not a cosmetic gap: a compound name whose only label word
+    // is the bare `key` reduces to a structural label, and a structural label skips content
+    // scanning. `signing_key` must not be read the way `target_key` is.
+    "signing",
+    "signature",
+    "webhook",
+    "encryption",
+    "hmac",
+    "master",
+    "refresh",
     "private",
     "client",
     "auth",
@@ -303,11 +313,22 @@ pub fn secret_shaped_json_key(key: &str) -> bool {
     if names_a_label_word(&joined) {
         return true;
     }
-    LABEL_QUALIFIERS.iter().any(|qualifier| {
-        joined
-            .strip_prefix(qualifier)
-            .is_some_and(names_a_label_word)
-    })
+    // A qualifier can be chained: `awssecretaccesskey` carries three before its label word,
+    // so stripping only the first leaves a remainder that matches nothing.
+    let mut remainder = joined.as_str();
+    loop {
+        if names_a_label_word(remainder) {
+            return true;
+        }
+        let Some(shorter) = LABEL_QUALIFIERS
+            .iter()
+            .filter_map(|qualifier| remainder.strip_prefix(qualifier))
+            .max_by_key(|stripped| remainder.len() - stripped.len())
+        else {
+            return false;
+        };
+        remainder = shorter;
+    }
 }
 
 /// Whether `word` is a label word, tolerating a plural suffix as the segment test does.
@@ -544,6 +565,62 @@ mod tests {
                 qualified_secret_key_label(key).is_some(),
                 "{key} disagrees between the two gates"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod qualifier_chain_tests {
+    use super::*;
+
+    /// The bare-`key` carve-out must only exempt names with no credential qualifier. A
+    /// qualifier absent from `LABEL_QUALIFIERS` makes a credential name reduce to the
+    /// structural label `key`, and a structural label skips content scanning entirely.
+    #[test]
+    fn a_credential_qualifier_keeps_a_key_name_scanned() {
+        for key in [
+            "signing_key",
+            "signingKey",
+            "webhook_key",
+            "encryption_key",
+            "hmac_key",
+            "master_key",
+            "refresh_token",
+            "signature_key",
+        ] {
+            assert!(
+                secret_shaped_json_key(key),
+                "{key} carries a credential qualifier and must be scanned"
+            );
+            assert!(
+                qualified_secret_key_label(key).is_some(),
+                "{key} must resolve to a qualified label"
+            );
+        }
+
+        // The carve-out itself must survive: these carry no credential qualifier.
+        for key in [
+            "target_key",
+            "stream_key",
+            "primary_key",
+            "key_id",
+            "last_model_key",
+            "key",
+        ] {
+            assert!(
+                !secret_shaped_json_key(key),
+                "{key} names a structural row and must stay writable"
+            );
+            assert!(qualified_secret_key_label(key).is_none(), "{key}");
+        }
+    }
+
+    /// An undelimited name can chain several qualifiers before its label word, so stripping
+    /// only the first leaves a remainder that matches nothing.
+    #[test]
+    fn chained_qualifiers_still_reach_the_label_word() {
+        for key in ["awssecretaccesskey", "awsaccesskey", "clientsecretkey"] {
+            assert!(secret_shaped_json_key(key), "{key} must be scanned");
         }
     }
 }
