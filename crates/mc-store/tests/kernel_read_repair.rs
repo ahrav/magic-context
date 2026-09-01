@@ -2663,3 +2663,57 @@ fn a_foreign_source_id_is_not_a_repair_identity() {
     );
     assert_ne!(block.repair_identity, operation_key);
 }
+
+/// A clearing repair that does not land leaves the clear owed. A current
+/// classification carries `append_pending` false, so the demotion has to set it
+/// or the report says nothing is outstanding while the block still stands.
+#[test]
+fn an_unresolved_clearing_repair_reports_an_outstanding_append() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+
+    // The writer is held past the deadline, so the clearing append cannot land.
+    let held = std::sync::Barrier::new(2);
+    let report = std::thread::scope(|threads| {
+        hold_writer(
+            threads,
+            &store,
+            &held,
+            "pending-domain",
+            Duration::from_millis(1_500),
+        );
+        let budget = EvalBudget::new(
+            Some(Instant::now() + Duration::from_millis(200)),
+            Default::default(),
+        );
+        ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &budget,
+            )
+            .unwrap()
+    });
+    assert_eq!(
+        report.objects[0].append,
+        Some(AppendOutcome::DeadlineMissed)
+    );
+    assert!(
+        report.objects[0].append_pending,
+        "the clear is still owed, so an append is outstanding"
+    );
+    assert!(report.auto_injectable().next().is_none());
+}

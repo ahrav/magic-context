@@ -372,8 +372,15 @@ pub fn commit_read_repair(
             // A replay asserts the effect already landed, which retirement or
             // correction can have undone since. Verified before the verdict is
             // reported as durable.
-            if receipt.replayed && !store.repair_record_is_live(&intent.operation_key, budget)? {
-                return Ok(AppendOutcome::ReceiptWithoutRecord);
+            if receipt.replayed {
+                match store.replayed_repair_is_current(intent, budget) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(AppendOutcome::ReceiptWithoutRecord),
+                    // Cancellation stays a report outcome rather than becoming a
+                    // store error, as it does on the writer side.
+                    Err(KernelError::Deadline) => return Ok(AppendOutcome::DeadlineMissed),
+                    Err(error) => return Err(error),
+                }
             }
             // A dropped confirmation is safe: an evicted entry misses on the
             // next evaluation, which re-derives the verdict and re-appends.
@@ -521,28 +528,38 @@ fn scan_error(error: rusqlite::Error) -> KernelError {
 const BLOCK_SCAN_ID_CHUNK: usize = 512;
 
 impl KernelStore {
-    /// Whether a live observation still carries `operation_key` as its repair
-    /// identity, which is the `source_id` the repair wrote.
-    fn repair_record_is_live(
+    /// Whether the durable reduction for this repair's (object, checkout) is
+    /// still the record this repair would have written.
+    ///
+    /// A replay skips the commit closure, so none of its revalidation ran. An
+    /// existence check on `source_id` is not enough either: `correct_observation`
+    /// requires a successor to preserve the source identity, so a corrected row
+    /// with a different kind, payload, or dependency target satisfies it. Both
+    /// the identity and the kind are compared, and a successor whose payload or
+    /// dependency moved is not in this checkout's reduction at all.
+    ///
+    /// Defense in depth behind the generation: retiring or correcting a record
+    /// records an invalidation, which moves the generation and produces a fresh
+    /// identity, so a repair does not reach a replay at all through those routes.
+    /// This catches a record that disappears without one.
+    fn replayed_repair_is_current(
         &self,
-        operation_key: &str,
+        intent: &RepairIntent,
         budget: &EvalBudget,
     ) -> Result<bool, KernelError> {
-        // Bounded like the reducer's read: this runs after the repair already
-        // waited for the writer, so it is the worst place to start an
-        // unbounded wait.
-        let reader = self.lock_reader_within(&budget.acquire_limit())?;
-        reader
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM object_registry
-                     WHERE source_kind=?1 AND source_id=?2
-                       AND invalidated_commit_seq IS NULL
-                 )",
-                rusqlite::params![REPAIR_PRODUCER, operation_key],
-                |row| row.get(0),
-            )
-            .map_err(|_| KernelError::Io)
+        let (_, states) = self.reduce_digest_states(
+            &[intent.object_id.as_str()],
+            &intent.checkout_digest,
+            None,
+            budget,
+        )?;
+        Ok(match states.get(&intent.object_id) {
+            Some(BlockState::Recorded(block)) => {
+                block.repair_identity == intent.operation_key
+                    && block.observation_kind == intent.kind
+            }
+            Some(BlockState::Unreadable) | None => false,
+        })
     }
 
     /// Derives the injection block for `object_id` at `checkout_identity`

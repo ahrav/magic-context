@@ -262,7 +262,13 @@ impl ApplicabilityEngine {
                 }
             };
             match unresolved {
-                Some(reason) => demote_if_blocked(&mut objects[index], state.as_ref(), reason),
+                Some(reason) => {
+                    demote_if_blocked(&mut objects[index], state.as_ref(), reason);
+                    // The append is still owed. A current classification carries
+                    // `append_pending` false, so demoting it without setting this
+                    // would report no outstanding work while the clear is unwritten.
+                    objects[index].append_pending = true;
+                }
                 // `append_pending` marks an append still owed. This one landed,
                 // so a consumer reading the report has nothing to retry.
                 None => objects[index].append_pending = false,
