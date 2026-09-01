@@ -206,6 +206,46 @@ fn non_ascii_whitespace_around_a_separator_still_redacts() {
     }
 }
 
+#[test]
+fn a_value_ends_at_the_same_whitespace_that_separates_it() {
+    // A code point treated as a separator before the value must also end the value.
+    // Accepting it as content makes the span run past the credential and replace the
+    // text that follows, which is how an ASCII space and U+00A0 came to disagree.
+    for separator in [
+        '\u{a0}', '\u{1680}', '\u{2000}', '\u{2028}', '\u{202f}', '\u{3000}',
+    ] {
+        let input = format!("password=abc{separator}next");
+        let redaction = redact_durable_text(&input);
+        assert!(
+            redaction.text.ends_with("next"),
+            "U+{:04X} consumed the text after the value: {:?}",
+            separator as u32,
+            redaction.text
+        );
+        assert!(!redaction.text.contains("abc"), "{input}");
+    }
+    assert_eq!(
+        redact_durable_text("password=abc next").text,
+        "password=<REDACTED:password> next"
+    );
+}
+
+#[test]
+fn a_value_keeps_non_whitespace_characters_beyond_ascii() {
+    // Ending a value at every multi-byte code point would truncate any credential
+    // holding one, so only the whitespace set may end it.
+    for value in [
+        "abc\u{4e2d}\u{6587}",
+        "abc\u{e9}def",
+        "\u{5bc6}\u{7801}-1234",
+    ] {
+        let input = format!("password={value}");
+        let redaction = redact_durable_text(&input);
+        assert_eq!(redaction.text, "password=<REDACTED:password>", "{input}");
+        assert_eq!(redaction.detections[0].length, value.len(), "{input}");
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]

@@ -10,7 +10,7 @@ use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
 pub const UPSTREAM_CORPUS_SHA256: &str =
     "2f1292b50148d38afe3ebdb7c489449d103b75b7df464e06da0d5d7c89ac2820";
 pub const CONSERVATIVE_OVERLAY_SHA256: &str =
-    "f2df735ed14828e66cb1bd87bb033aad83078ed0e6d03366fe0dd07b237d979b";
+    "ba1a070ee8bdcbfc1ddb4d1f85bf2e154a9e2b32eaf358f3de418c83202b1b37";
 
 const UPSTREAM_BYTES: &[u8] = include_bytes!("../default_rules.yaml");
 const OVERLAY_BYTES: &[u8] = include_bytes!("../conservative_overlay.yaml");
@@ -92,6 +92,15 @@ pub(crate) struct RuleDeclaration {
     /// Runs the engine's context and value safelists for overlay rules that mirror corpus rules, producing one verdict when both match a credential.
     #[serde(default)]
     pub upstream_parity: bool,
+    /// Compiles this rule with Unicode mode on, so `\s` and negated classes span the
+    /// Unicode whitespace set rather than the ASCII subset the byte default matches.
+    ///
+    /// The corpus rules stay byte-oriented, which is how their upstream shapes were
+    /// adapted. A rule that separates a key from a value needs the wider set on both
+    /// sides of the separator: treating a code point as a separator while the value
+    /// class treats the same code point as content makes the value run past it.
+    #[serde(default)]
+    pub unicode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -359,7 +368,9 @@ fn compile_rule(
 ) -> Result<Rule, ConstructionError> {
     validate_policy(&declaration)?;
     let mut builder = RegexBuilder::new(&declaration.regex);
-    builder.unicode(false).size_limit(128 * 1024 * 1024);
+    builder
+        .unicode(declaration.unicode)
+        .size_limit(128 * 1024 * 1024);
     let regex = builder
         .build()
         .map_err(|_| ConstructionError::InvalidRulePattern)?;
