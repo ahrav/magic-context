@@ -514,6 +514,18 @@ fn profile_kernel(kernel: &str) {
                 );
             }
         }
+        "ancestry-near" => {
+            let history = linear_history(10_000);
+            let snapshot = checkout(&history.fixture, *history.commits.last().unwrap());
+            let ancestor = history.commits[history.commits.len() - 10].to_string();
+            let tip = history.commits.last().unwrap().to_string();
+            while Instant::now() < until {
+                let budget = EvalBudget::unbounded();
+                black_box(
+                    ResolutionLadder::new(&snapshot, &budget).is_ancestor_or_equal(&ancestor, &tip),
+                );
+            }
+        }
         "batch-warm-512" => {
             let (_dir, fixture, base, tip) = applicability_fixture();
             let snapshot = checkout(&fixture, tip);
