@@ -646,6 +646,26 @@ fn unreachable_start_dominates_an_uncertain_end() {
 }
 
 #[test]
+fn an_exhausted_budget_yields_no_capture_at_all() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let anchored = commit_snapshot(repo, "main", &[base], &[("f.txt", "two\n")], "anchored", 2);
+
+    let budget = EvalBudget::unbounded();
+    budget.interrupt_flag().store(true, Ordering::Relaxed);
+    // A capture assembled after cancellation would persist a tree-only view as
+    // though the patch rung had genuinely found nothing.
+    assert!(
+        capture_anchor_representation(repo, anchored, &budget).is_none(),
+        "cancellation must abort the capture, not degrade it"
+    );
+}
+
+#[test]
 fn an_empty_commit_does_not_resolve_from_its_parent_tree() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());

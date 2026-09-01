@@ -728,13 +728,16 @@ pub fn capture_anchor_representation(
     // the tree rung would match that parent instead. Empty commits and merges commentlint: allow(JUDGE)
     // whose result equals a side are the cases that produce one. commentlint: allow(JUDGE)
     let tree_distinguishes = !parent_shares_tree(repo, &commit, tree_oid);
-    // A transient obstacle costs the patch rung, not the capture: the commit
+    // An unreadable object costs the patch rung, not the capture: the commit
     // and tree ids are already resolved, and the tree rung runs on those commentlint: allow(JUDGE)
     // alone. An empty path list also disables the prefilter, which is the commentlint: allow(JUDGE)
-    // safe direction. commentlint: allow(JUDGE)
-    let changes = first_parent_blob_changes(repo, commit_oid, budget)
-        .ok()
-        .flatten();
+    // safe direction. Cancellation is different — a capture assembled after commentlint: allow(JUDGE)
+    // the budget expired would persist a partial view as if complete. commentlint: allow(JUDGE)
+    let changes = match first_parent_blob_changes(repo, commit_oid, budget) {
+        Ok(changes) => changes,
+        Err(ResolveObstacle::BudgetExhausted) => return None,
+        Err(ResolveObstacle::UnreadableObject) => None,
+    };
     // A lossily converted path would miss real tree entries in
     // `commit_touches_paths`, so non-UTF-8 locations are dropped.
     let changed_paths = changes
@@ -743,13 +746,15 @@ pub fn capture_anchor_representation(
         .filter_map(|change| std::str::from_utf8(change.location()).ok())
         .map(str::to_owned)
         .collect();
-    let patch_id = patch_id_from_changes(repo, changes.as_deref(), budget)
-        .ok()
-        .flatten()
-        .map(|value| super::super::anchor::PatchIdCapture {
-            algorithm: PATCH_ID_ALGORITHM.to_string(),
-            value,
-        });
+    let patch_id = match patch_id_from_changes(repo, changes.as_deref(), budget) {
+        Ok(value) => value,
+        Err(ResolveObstacle::BudgetExhausted) => return None,
+        Err(ResolveObstacle::UnreadableObject) => None,
+    }
+    .map(|value| super::super::anchor::PatchIdCapture {
+        algorithm: PATCH_ID_ALGORITHM.to_string(),
+        value,
+    });
     Some(AnchorCapture {
         commit_oid: commit_oid.to_string(),
         tree_oid: tree_distinguishes.then(|| tree_oid.to_string()),

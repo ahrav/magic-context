@@ -772,6 +772,11 @@ fn conflict_content_hash(
     }
     let worktree = worktree_content_hash(repo, rela_path, ctx)?;
     hash.update(worktree.as_bytes());
+    // A conflicted path stays conflicted through a chmod, so without the mode
+    // tag a 100644 and a 100755 worktree share this hash — the same aliasing commentlint: allow(JUDGE)
+    // the modified and index-keyed entries already record. commentlint: allow(JUDGE)
+    hash.update(b"mode\0");
+    hash.update(worktree_mode_tag(repo, rela_path).as_bytes());
     Ok(format!("conflict:{:x}", hash.finalize()))
 }
 
@@ -806,7 +811,7 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
 
 fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v6\0");
+    hash.update(b"mc-dirty-fingerprint-v7\0");
     hash.update(repository_state);
     for entry in entries {
         // Length prefixes make adjacent fields unambiguous.
