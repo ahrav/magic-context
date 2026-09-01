@@ -17,6 +17,13 @@ pub(super) fn redact(value: &str) -> RedactedField {
     }
 }
 
+pub(super) fn redact_bounded(value: &str) -> Result<RedactedField, KernelError> {
+    if value.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
+        return Err(KernelError::InvalidInput);
+    }
+    Ok(redact(value))
+}
+
 /// Lookup keys, primary keys, and dedup identities must not contain detected secrets because redaction can alias distinct values.
 pub(super) fn identity(value: &str) -> Result<String, KernelError> {
     let redaction = redact_durable_text(value);

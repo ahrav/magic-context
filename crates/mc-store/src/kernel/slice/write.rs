@@ -10,7 +10,7 @@ use crate::kernel::object_write::{
     insert_registry, invalidate, map_write_error, record_fields, record_registry_fields,
     set_successor,
 };
-use crate::kernel::redaction::{redact, RedactedField};
+use crate::kernel::redaction::{redact, redact_bounded, RedactedField};
 use crate::kernel::{KernelError, Sensitivity};
 
 struct RedactedDecision {
@@ -354,20 +354,28 @@ impl RedactedDecision {
             spec.source_revision,
         )?;
         Ok(Self {
-            decision_id: redact(&spec.decision_id),
-            object_id: redact(&spec.object_id),
-            domain_id: redact(&spec.domain_id),
-            proposition_id: spec.proposition_id.as_deref().map(redact),
-            scope_id: spec.scope_id.as_deref().map(redact),
-            anchor_id: spec.anchor_id.as_deref().map(redact),
-            evidence_id: spec.evidence_id.as_deref().map(redact),
-            decision_kind: redact(&spec.decision_kind),
+            decision_id: redact_bounded(&spec.decision_id)?,
+            object_id: redact_bounded(&spec.object_id)?,
+            domain_id: redact_bounded(&spec.domain_id)?,
+            proposition_id: spec
+                .proposition_id
+                .as_deref()
+                .map(redact_bounded)
+                .transpose()?,
+            scope_id: spec.scope_id.as_deref().map(redact_bounded).transpose()?,
+            anchor_id: spec.anchor_id.as_deref().map(redact_bounded).transpose()?,
+            evidence_id: spec
+                .evidence_id
+                .as_deref()
+                .map(redact_bounded)
+                .transpose()?,
+            decision_kind: redact_bounded(&spec.decision_kind)?,
             payload: RedactedDecisionPayload {
-                summary: redact(&spec.payload.summary),
-                rationale: redact(&spec.payload.rationale),
+                summary: redact_bounded(&spec.payload.summary)?,
+                rationale: redact_bounded(&spec.payload.rationale)?,
             },
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            source_kind: redact_bounded(&spec.source_kind)?,
+            source_id: redact_bounded(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
         })
@@ -442,22 +450,30 @@ impl RedactedObservation {
             .map(RedactedDependency::new)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            observation_id: redact(&spec.observation_id),
-            object_id: redact(&spec.object_id),
-            domain_id: redact(&spec.domain_id),
-            proposition_id: spec.proposition_id.as_deref().map(redact),
-            scope_id: spec.scope_id.as_deref().map(redact),
-            anchor_id: spec.anchor_id.as_deref().map(redact),
-            evidence_id: spec.evidence_id.as_deref().map(redact),
-            observation_kind: redact(&spec.observation_kind),
+            observation_id: redact_bounded(&spec.observation_id)?,
+            object_id: redact_bounded(&spec.object_id)?,
+            domain_id: redact_bounded(&spec.domain_id)?,
+            proposition_id: spec
+                .proposition_id
+                .as_deref()
+                .map(redact_bounded)
+                .transpose()?,
+            scope_id: spec.scope_id.as_deref().map(redact_bounded).transpose()?,
+            anchor_id: spec.anchor_id.as_deref().map(redact_bounded).transpose()?,
+            evidence_id: spec
+                .evidence_id
+                .as_deref()
+                .map(redact_bounded)
+                .transpose()?,
+            observation_kind: redact_bounded(&spec.observation_kind)?,
             payload: RedactedObservationPayload {
-                summary: redact(&spec.payload.summary),
-                classification: redact(&spec.payload.classification),
+                summary: redact_bounded(&spec.payload.summary)?,
+                classification: redact_bounded(&spec.payload.classification)?,
             },
             observed_at: spec.observed_at,
             dependencies,
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            source_kind: redact_bounded(&spec.source_kind)?,
+            source_id: redact_bounded(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
         })
@@ -534,9 +550,13 @@ impl RedactedDependency {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            object_id: redact(&spec.dependency_object_id),
-            kind: redact(&spec.dependency_kind),
-            payload: spec.dependency_payload.as_deref().map(redact),
+            object_id: redact_bounded(&spec.dependency_object_id)?,
+            kind: redact_bounded(&spec.dependency_kind)?,
+            payload: spec
+                .dependency_payload
+                .as_deref()
+                .map(redact_bounded)
+                .transpose()?,
         })
     }
 }
@@ -547,9 +567,13 @@ impl RedactedEvent {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            kind: redact(&spec.event_kind),
-            summary: redact(&spec.payload.summary),
-            evidence_id: spec.evidence_id.as_deref().map(redact),
+            kind: redact_bounded(&spec.event_kind)?,
+            summary: redact_bounded(&spec.payload.summary)?,
+            evidence_id: spec
+                .evidence_id
+                .as_deref()
+                .map(redact_bounded)
+                .transpose()?,
             recorded_at: spec.recorded_at,
         })
     }

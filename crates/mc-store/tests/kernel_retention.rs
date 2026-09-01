@@ -41,6 +41,37 @@ fn candidate(run: &str, candidate: &str, recorded_at: i64) -> StagingCandidateSp
     }
 }
 
+#[test]
+fn candidate_payload_too_large_to_inspect_is_rejected_rather_than_replaced() {
+    // Redaction cannot inspect text this long, so it replaces the whole value with one
+    // placeholder. Accepting that would store the placeholder as the candidate and
+    // classify a payload holding no secret as one that does, both without an error.
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let limit = mc_core::redaction::MAX_REDACTABLE_BYTES;
+
+    let mut oversized = candidate("run", "oversized", 0);
+    oversized.payload = "x".repeat(limit + 1);
+    assert_eq!(
+        store.stage_candidate(oversized).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let mut oversized_kind = candidate("run", "oversized-kind", 0);
+    oversized_kind.candidate_kind = "x".repeat(limit + 1);
+    assert_eq!(
+        store.stage_candidate(oversized_kind).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    // At the limit the payload is stored whole, so the rejections above are a size
+    // boundary rather than a placeholder standing in for the candidate.
+    let mut at_limit = candidate("run", "at-limit", 0);
+    at_limit.payload = "x".repeat(limit);
+    let row = store.stage_candidate(at_limit).unwrap();
+    assert_eq!(row.payload.len(), limit);
+}
+
 fn inspect(root: &std::path::Path) -> Connection {
     Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
 }
