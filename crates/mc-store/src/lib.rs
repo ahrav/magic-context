@@ -7955,8 +7955,29 @@ impl McStore {
         write.existing_identity("session_id", session_id)?;
         let error = write.content("last_reject_error", error)?;
         let error = capped_trace_error(&error);
+        let flagged = write.recorded_detections(&["session_id"]);
         write.execute(&self.inner, |coordinated| {
-            coordinated.tx().execute(
+            let tx = coordinated.tx();
+            // A rejected pass is still a pass: the diagnostic must not be the write that
+            // introduces a secret-bearing session. A clean identity skips the query, so
+            // the ordinary reject path keeps costing one UPSERT.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -17479,10 +17500,13 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let secret_session = "password=trace-secret";
 
-        for outcome in ["received", "completed"] {
+        for outcome in ["received", "completed", "rejected"] {
             let error = match outcome {
                 "received" => store.trace_pass_received(secret_session, 10),
-                _ => store.trace_pass_completed(secret_session, 10),
+                "completed" => store.trace_pass_completed(secret_session, 10),
+                // The reject breadcrumb runs after a transform has already failed, so it is
+                // the one trace write most likely to be reached by an unknown session.
+                _ => store.trace_pass_rejected(secret_session, "transform failed", 10),
             }
             .expect_err("a trace write must not introduce a secret-bearing session");
             assert!(
@@ -17520,6 +17544,9 @@ mod tests {
             .unwrap();
         store.trace_pass_received(secret_session, 20).unwrap();
         store.trace_pass_completed(secret_session, 21).unwrap();
+        store
+            .trace_pass_rejected(secret_session, "transform failed", 22)
+            .unwrap();
         let traced: i64 = store
             .inner
             .with_conn(|conn| {
