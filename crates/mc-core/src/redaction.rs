@@ -261,9 +261,12 @@ pub fn secret_key_label(key: &str) -> Option<String> {
 
 /// `key` and `keys` name JSON map entries rather than secrets. They are excluded
 /// case-insensitively; `api_key` remains protected.
+///
+/// Recognition matches [`secret_shaped_json_key`], so a separator-free compound such as
+/// `apikey` is protected too. A narrower test leaves that value neither substituted nor
+/// refused, because the leaf scanner sees only the value and gains no key context from it.
 pub fn protected_json_key_label(key: &str) -> Option<String> {
-    let bare_map_key = matches!(key.to_ascii_lowercase().as_str(), "key" | "keys");
-    secret_key_label(key).filter(|_| !bare_map_key)
+    secret_shaped_json_key(key).then(|| redaction_type_for_key(key))
 }
 
 /// Returns a label only when `key` has a credential qualifier.

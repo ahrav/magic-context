@@ -17296,6 +17296,24 @@ mod tests {
         );
         assert!(!nested.contains("nested-secret"));
 
+        // `apikey` names a credential without a separator, so the leaf scanner sees only the
+        // value and no key context. Substitution has to come from the key name.
+        // A compound name that also matches an integrity marker is refused; one that matches
+        // none is substituted. Either way the value must not survive verbatim.
+        for field in ["apikey", "authtoken", "passWord"] {
+            let input = format!(r#"{{"{field}":"fixture"}}"#);
+            match prepare_json_content_preserving_identities(&input) {
+                Ok(prepared) => assert!(
+                    !prepared.contains("fixture"),
+                    "{field} left its value unprotected: {prepared}"
+                ),
+                Err(error) => assert!(
+                    matches!(error, McStoreError::Redaction(_)),
+                    "{field} failed for the wrong reason: {error:?}"
+                ),
+            }
+        }
+
         // An array under an identity name inherits that name, so its elements stay verbatim.
         let inherited =
             prepare_json_content_preserving_identities(r#"{"block_ids":["password=legacy-id"]}"#)
