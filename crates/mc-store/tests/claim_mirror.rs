@@ -508,7 +508,6 @@ fn u10_scenario_8_reseed_reproduces_state_across_restart() {
     assert_eq!(state.projects[&42].acked_effect_id, 11);
 }
 
-///
 #[test]
 fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -565,7 +564,6 @@ fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches(
     );
 }
 
-///
 #[test]
 fn receipt_rejects_equal_revision_carrying_different_content() {
     let dir = tempfile::tempdir().unwrap();

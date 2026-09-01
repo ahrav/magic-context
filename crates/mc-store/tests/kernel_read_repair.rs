@@ -1308,6 +1308,40 @@ fn a_secret_shaped_check_path_leaves_the_stored_payload_decodable() {
     assert!(block.blocked);
 }
 
+#[test]
+fn an_empty_batch_does_not_wait_for_the_store() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+
+    let started = Instant::now();
+    let (report, elapsed) = std::thread::scope(|threads| {
+        threads.spawn(|| store.hold_readers_for_test(Duration::from_millis(1_500)));
+        std::thread::sleep(Duration::from_millis(50));
+        let budget = EvalBudget::new(
+            Some(Instant::now() + Duration::from_secs(1)),
+            Default::default(),
+        );
+        let report = ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &[]),
+                &budget,
+            )
+            .unwrap();
+        (report, started.elapsed())
+    });
+
+    assert!(report.objects.is_empty());
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "an empty batch waited for a store reader, took {elapsed:?}"
+    );
+}
+
 /// The reducer takes a reader connection, and `Mutex::lock` has no timeout, so
 /// a held pool could carry a bounded evaluation past its deadline before the
 /// scan reached its first poll.

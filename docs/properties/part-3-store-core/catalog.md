@@ -2158,4 +2158,3 @@ executing check.
   that matters more than the check: whether this is dead code awaiting adoption or a second
   copy of routing logic `mc-module` already implements, because a silent divergence between
   an unused reference implementation and the live router is worse than having no reference.
-

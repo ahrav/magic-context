@@ -799,6 +799,16 @@ fn unconstrained_objects_do_not_claim_an_anchor_held() {
     assert!(!batch.objects[0].evidence.contains("anchor holds"));
     assert_eq!(batch.objects[1].state, ApplicabilityState::Current);
     assert!(batch.objects[1].evidence.contains("anchor holds"));
+
+    let cached = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[candidate("object-bare")],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(cached.stats.object_cache_hits, 1);
+    assert!(!cached.objects[0].evidence.contains("anchor holds"));
 }
 
 #[test]
@@ -1361,6 +1371,57 @@ fn confirming_an_uncacheable_verdict_reports_the_drop() {
     assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
     assert!(!batch.objects[0].append_pending);
     assert!(!engine.confirm_durable_append(&batch.objects[0].token));
+}
+
+#[test]
+fn an_expired_verdict_cannot_confirm_an_existing_cache_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let stale = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "src/deleted.rs".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-stale")
+    };
+
+    let first = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&stale),
+        &EvalBudget::unbounded(),
+    );
+    assert!(first.objects[0].append_pending);
+
+    let expired = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&stale),
+        &EvalBudget::new(
+            Some(Instant::now() - Duration::from_millis(1)),
+            Default::default(),
+        ),
+    );
+    assert!(!engine.confirm_durable_append(&expired.objects[0].token));
+
+    let cached = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[stale],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(cached.stats.object_cache_hits, 1);
+    assert!(cached.objects[0].append_pending);
 }
 
 /// The shallow boundary decides how far an ancestry walk reaches, and

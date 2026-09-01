@@ -7,8 +7,9 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{hash_map::RandomState, HashMap};
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -17,7 +18,7 @@ use super::super::anchor::{
     ContextDependency,
 };
 use super::super::scope::{
-    scope_matches, CanonicalScope, MatchOutcome, ScopeMatchContext, ScopeTermSpec,
+    scope_matches, CanonicalScope, MatchOutcome, ScopeFormError, ScopeMatchContext, ScopeTermSpec,
 };
 use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
@@ -124,12 +125,9 @@ pub struct FailedCheck {
 }
 
 /// Opaque handle read repair passes back to confirm a durable append for a
-/// cached classification (KTD6 append-confirmed flag). commentlint: allow(JUDGE)
-///
-/// A verdict the engine declined to cache carries no key, so confirming it commentlint: allow(JUDGE)
-/// has nothing to record. commentlint: allow(JUDGE)
+/// cached classification (KTD6 append-confirmed flag).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClassificationToken(Option<ObjectCacheKey>);
+pub struct ClassificationToken(Option<Arc<ObjectCacheKey>>);
 
 /// Per-object verdict with evidence. `append_pending` marks a non-current
 /// classification whose durable observation has not been confirmed yet;
@@ -168,9 +166,6 @@ pub struct BatchEvaluation {
     pub stats: EvaluationStats,
 }
 
-/// `row_fingerprint` covers every `AnchorRowSpec` field, so two rows sharing an
-/// `anchor_id` and payload but differing in a condition column cannot collide.
-/// `anchor_id` alone omits the condition columns the verdict is derived from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AnchorCacheKey {
     checkout_identity: String,
@@ -180,26 +175,267 @@ struct AnchorCacheKey {
     patch_id_algorithm: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ObjectCacheKey {
-    checkout_identity: String,
-    object_id: String,
+    hash: u64,
+    snapshot: SnapshotCacheKey,
+    object_id: Box<str>,
     object_revision: i64,
+    inputs_digest: [u8; 32],
+    check_observations: [u8; 32],
+    scoped_dirty_fingerprint: [u8; 32],
+}
+
+impl Hash for ObjectCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PrehashedState;
+
+impl BuildHasher for PrehashedState {
+    type Hasher = PrehashedHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PrehashedHasher::default()
+    }
+}
+
+#[derive(Default)]
+struct PrehashedHasher(u64);
+
+impl Hasher for PrehashedHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SnapshotCacheKey {
+    Owned(SnapshotCacheValues),
+    Shared(Arc<SnapshotCacheValues>),
+}
+
+impl SnapshotCacheKey {
+    fn values(&self) -> &SnapshotCacheValues {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl PartialEq for SnapshotCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Self::Shared(left), Self::Shared(right)) = (self, other) {
+            if Arc::ptr_eq(left, right) {
+                return true;
+            }
+        }
+        self.values() == other.values()
+    }
+}
+
+impl Eq for SnapshotCacheKey {}
+
+impl Hash for SnapshotCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.values().hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotCacheValues {
+    hash: u64,
+    checkout_identity: String,
     head: String,
     repository_state: String,
-    scoped_dirty_fingerprint: String,
-    inputs_digest: String,
+}
+
+impl Hash for SnapshotCacheValues {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
 }
 
 #[derive(Debug, Clone)]
 struct CachedClassification {
-    state: ApplicabilityState,
-    evidence: String,
-    failed_check: Option<FailedCheck>,
-    /// Carried so a hit reaches the same append decision as the miss that
-    /// produced it; the key recurs on every repeat of the same query.
+    details: Option<Box<CachedClassificationDetails>>,
     query_local: bool,
     append_confirmed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedClassificationDetails {
+    state: ApplicabilityState,
+    evidence: Box<str>,
+    failed_check: Option<Box<FailedCheck>>,
+}
+
+const CURRENT_EVIDENCE: &str = "anchor holds at HEAD and all checks pass";
+
+struct LastMemo<T> {
+    last: Option<([u8; 32], T)>,
+}
+
+impl<T> Default for LastMemo<T> {
+    fn default() -> Self {
+        Self { last: None }
+    }
+}
+
+impl<T> LastMemo<T> {
+    fn get_or_insert_with(&mut self, key: [u8; 32], create: impl FnOnce() -> T) -> &T {
+        if self
+            .last
+            .as_ref()
+            .is_none_or(|(last_key, _)| *last_key != key)
+        {
+            self.last = Some((key, create()));
+        }
+        &self.last.as_ref().expect("batch memo initialized").1
+    }
+}
+
+type DecodedPayload = PayloadDecode;
+type ScopeVerdict = Result<MatchOutcome, ScopeFormError>;
+static ABSENT_PAYLOAD: PayloadDecode = PayloadDecode::Absent;
+
+#[derive(Default)]
+struct PayloadMemo<'c> {
+    last: Option<(&'c [u8], DecodedPayload)>,
+    general: Option<HashMap<&'c [u8], DecodedPayload>>,
+}
+
+impl<'c> PayloadMemo<'c> {
+    fn get_or_insert_with(
+        &mut self,
+        key: &'c [u8],
+        create: impl FnOnce() -> DecodedPayload,
+    ) -> &DecodedPayload {
+        if self.general.is_none() {
+            if self
+                .last
+                .as_ref()
+                .is_some_and(|(last_key, _)| *last_key == key)
+            {
+                return &self.last.as_ref().expect("payload memo initialized").1;
+            }
+            if let Some((last_key, last_value)) = self.last.take() {
+                self.general = Some(HashMap::from([(last_key, last_value), (key, create())]));
+                return self
+                    .general
+                    .as_ref()
+                    .expect("general payload memo initialized")
+                    .get(key)
+                    .expect("new payload inserted");
+            }
+            self.last = Some((key, create()));
+            return &self.last.as_ref().expect("payload memo initialized").1;
+        }
+        let Some(general) = self.general.as_mut() else {
+            unreachable!("general payload memo checked present");
+        };
+        general.entry(key).or_insert_with(create)
+    }
+}
+
+/// Per-batch memo state. Payload decode is pure. Check observations and
+/// verdicts share one cache so the key and classification use the same read.
+#[derive(Default)]
+struct BatchMemos {
+    key: [u8; 32],
+    anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
+    anchor_verdict: LastMemo<AnchorVerdict>,
+    check_cache: CheckCache,
+    check_digest: LastMemo<[u8; 32]>,
+    dirty_gate: LastMemo<DirtyGate>,
+    scoped_dirty: LastMemo<[u8; 32]>,
+    scope: LastMemo<ScopeVerdict>,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateInputs<'a> {
+    scope_terms: &'a Option<Vec<ScopeTermSpec>>,
+    anchor: &'a Option<AnchorRowSpec>,
+    payload: &'a Option<Vec<u8>>,
+}
+
+impl CandidateInputs<'_> {
+    fn new(candidate: &ApplicabilityCandidate) -> CandidateInputs<'_> {
+        CandidateInputs {
+            scope_terms: &candidate.scope_terms,
+            anchor: &candidate.anchor,
+            payload: &candidate.payload,
+        }
+    }
+}
+
+impl PartialEq for CandidateInputs<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope_terms == other.scope_terms
+            && self.anchor == other.anchor
+            && self.payload == other.payload
+    }
+}
+
+impl Eq for CandidateInputs<'_> {}
+
+impl Hash for CandidateInputs<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.scope_terms {
+            Some(terms) => {
+                true.hash(state);
+                terms.len().hash(state);
+                for term in terms {
+                    term.dimension.hash(state);
+                    term.operator.hash(state);
+                    term.exact_value.hash(state);
+                    term.set_values.hash(state);
+                    term.range_start.hash(state);
+                    term.range_end.hash(state);
+                    term.version_range.hash(state);
+                    term.git_oid.hash(state);
+                    term.git_start_oid.hash(state);
+                    term.git_end_oid.hash(state);
+                    term.payload.hash(state);
+                }
+            }
+            None => false.hash(state),
+        }
+        match self.anchor {
+            Some(anchor) => {
+                true.hash(state);
+                anchor.anchor_id.hash(state);
+                anchor.anchor_kind.hash(state);
+                anchor.exact_value.hash(state);
+                anchor.reachable_from_oid.hash(state);
+                anchor.reachable_between_start_oid.hash(state);
+                anchor.reachable_between_end_oid.hash(state);
+                anchor.deployment_revision.hash(state);
+                anchor.config_revision.hash(state);
+                anchor.platform_version_range.hash(state);
+                anchor.wall_clock_start.hash(state);
+                anchor.wall_clock_end.hash(state);
+                anchor.payload.hash(state);
+            }
+            None => false.hash(state),
+        }
+        self.payload.hash(state);
+    }
 }
 
 /// Single owner of engine state: the two generation caches (KTD6). Owned
@@ -207,7 +443,9 @@ struct CachedClassification {
 /// checkout snapshot.
 pub struct ApplicabilityEngine {
     anchor_cache: Mutex<TwoGenerationCache<AnchorCacheKey, GitConditionOutcome>>,
-    object_cache: Mutex<TwoGenerationCache<ObjectCacheKey, CachedClassification>>,
+    object_cache:
+        Mutex<TwoGenerationCache<Arc<ObjectCacheKey>, CachedClassification, PrehashedState>>,
+    cache_hasher: RandomState,
 }
 
 impl Default for ApplicabilityEngine {
@@ -218,9 +456,12 @@ impl Default for ApplicabilityEngine {
 
 impl ApplicabilityEngine {
     pub fn new() -> Self {
+        let cache_hasher = RandomState::new();
+        let object_cache = TwoGenerationCache::with_hasher(GENERATION_CAP, PrehashedState);
         Self {
             anchor_cache: Mutex::new(TwoGenerationCache::new(GENERATION_CAP)),
-            object_cache: Mutex::new(TwoGenerationCache::new(GENERATION_CAP)),
+            object_cache: Mutex::new(object_cache),
+            cache_hasher,
         }
     }
 
@@ -237,28 +478,32 @@ impl ApplicabilityEngine {
     ) -> BatchEvaluation {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
-        // Cloning the context and compressing its dimensions is work
-        // proportional to caller-supplied context size, and no candidate that
-        // exits on lifecycle invalidation or an expired budget needs either. A
-        // fully expired batch therefore pays for neither.
-        let batch_context = OnceCell::new();
-        let prepare = || {
-            let scope_context = scope_context.clone().with_head_commit(snapshot.head());
-            let prefix = batch_digest_prefix(&scope_context);
-            (scope_context, prefix)
-        };
-        // Distinct anchor rows resolve once per batch even on cache misses.
-        // Rows sharing an `anchor_id` can carry different conditions, so the
-        // row fingerprint keys the memo rather than the id.
-        let mut batch_anchor_memo: HashMap<[u8; 32], GitConditionOutcome> = HashMap::new();
-        let mut batch_decode_memo: DecodeMemo<'_> = HashMap::new();
-        let mut batch_fingerprint_memo: FingerprintMemo<'_> = HashMap::new();
-        let mut check_cache = CheckCache::new();
+        let resolved_scope_context = OnceCell::new();
+        let snapshot_hash = self.cache_hasher.hash_one((
+            snapshot.identity(),
+            snapshot.head(),
+            snapshot.repository_state(),
+        ));
+        let mut cache_context = (candidates.len() > 1).then(|| {
+            Arc::new(SnapshotCacheValues {
+                hash: snapshot_hash,
+                checkout_identity: snapshot.identity().to_string(),
+                head: snapshot.head().to_string(),
+                repository_state: snapshot.repository_state().to_string(),
+            })
+        });
+        let mut digest_prefixes = InputDigestPrefixes::new(query, scope_context);
+        let mut batch_input_digests: Option<HashMap<CandidateInputs<'_>, [u8; 32]>> = None;
+        let mut last_input_digest = None;
+        // Distinct anchors and repeated payloads resolve once per batch.
+        let mut batch_memos = BatchMemos::default();
+        let mut payload_memo = PayloadMemo::default();
         let mut objects = Vec::with_capacity(candidates.len());
+        self.object_cache
+            .lock()
+            .expect("cache lock")
+            .reserve(candidates.len());
         for candidate in candidates {
-            // Neither early exit is cacheable, so neither needs a cache key.
-            // Building one first would hash every payload byte in a batch
-            // this request never evaluates.
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
                     candidate,
@@ -283,52 +528,71 @@ impl ApplicabilityEngine {
                 ));
                 continue;
             }
-            let anchor_fingerprint = candidate.anchor.as_ref().map(|anchor| {
-                match batch_fingerprint_memo.get(anchor.anchor_id.as_str()) {
-                    Some((row, fingerprint)) if **row == *anchor => *fingerprint,
-                    _ => {
-                        let fingerprint = anchor_row_fingerprint(anchor);
-                        batch_fingerprint_memo
-                            .insert(anchor.anchor_id.as_str(), (anchor, fingerprint));
-                        fingerprint
-                    }
-                }
-            });
-            let (scope_context, batch_prefix) = batch_context.get_or_init(prepare);
-            let payload_decode = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
-            // A partial digest must not become a key, because a lookup would
-            // compare that digest against entries formed from the full input
-            // set. An expired deadline therefore exits before a key exists.
-            let Some(scoped_dirty) =
-                scoped_dirty_fingerprint(snapshot, &payload_decode, &mut check_cache, budget)
-            else {
-                objects.push(finished(
-                    candidate,
-                    ClassificationToken(None),
-                    Classification::uncacheable(
-                        ApplicabilityState::Uncertain,
-                        "evaluation budget exhausted while reading this object's declared inputs",
-                    ),
-                    false,
-                ));
-                continue;
+            let payload_decode = match candidate.payload.as_deref() {
+                Some(payload) => payload_memo
+                    .get_or_insert_with(payload, || ObjectApplicabilitySpec::decode(Some(payload))),
+                None => &ABSENT_PAYLOAD,
             };
+            let inputs_digest = if candidates.len() > 1 {
+                let candidate_inputs = CandidateInputs::new(candidate);
+                if let Some((_, digest)) =
+                    last_input_digest.filter(|(last, _)| *last == candidate_inputs)
+                {
+                    digest
+                } else {
+                    let digest = match (&mut batch_input_digests, last_input_digest) {
+                        (Some(digests), _) => {
+                            digests.get(&candidate_inputs).copied().unwrap_or_else(|| {
+                                let digest = digest_prefixes.for_candidate(candidate);
+                                digests.insert(candidate_inputs, digest);
+                                digest
+                            })
+                        }
+                        (None, Some((last, digest))) => {
+                            let mut digests = HashMap::from([(last, digest)]);
+                            let digest = digest_prefixes.for_candidate(candidate);
+                            digests.insert(candidate_inputs, digest);
+                            batch_input_digests = Some(digests);
+                            digest
+                        }
+                        (None, None) => digest_prefixes.for_candidate(candidate),
+                    };
+                    last_input_digest = Some((candidate_inputs, digest));
+                    digest
+                }
+            } else {
+                digest_prefixes.for_candidate(candidate)
+            };
+            batch_memos.key = inputs_digest;
+            let check_observations =
+                *batch_memos
+                    .check_digest
+                    .get_or_insert_with(inputs_digest, || {
+                        check_observations_digest(
+                            snapshot,
+                            payload_decode,
+                            &mut batch_memos.check_cache,
+                            budget,
+                        )
+                    });
+            let scoped_dirty_fingerprint = *batch_memos
+                .scoped_dirty
+                .get_or_insert_with(inputs_digest, || {
+                    scoped_dirty_fingerprint(snapshot, payload_decode, budget)
+                });
             let key = self.object_cache_key(
                 snapshot,
-                batch_prefix,
-                query,
+                snapshot_hash,
+                cache_context.as_ref(),
                 candidate,
-                anchor_fingerprint.as_ref(),
-                scoped_dirty,
+                inputs_digest,
+                check_observations,
+                scoped_dirty_fingerprint,
             );
-            let token = ClassificationToken(Some(key.clone()));
-            // Key construction reads the checked paths, so the deadline can
-            // lapse between the check above and here. A cached verdict is
-            // still a verdict, and an expired request owes `Uncertain`.
             if budget.is_exhausted() {
                 objects.push(finished(
                     candidate,
-                    token,
+                    ClassificationToken(None),
                     Classification::uncacheable(
                         ApplicabilityState::Uncertain,
                         "evaluation budget exhausted before this object",
@@ -337,50 +601,62 @@ impl ApplicabilityEngine {
                 ));
                 continue;
             }
-            if let Some(cached) = lock(&self.object_cache).get(&key) {
+            if let Some((key, cached)) = self
+                .object_cache
+                .lock()
+                .expect("cache lock")
+                .get_key_value(&key)
+            {
                 stats.object_cache_hits += 1;
+                if let SnapshotCacheKey::Shared(context) = &key.snapshot {
+                    if cache_context
+                        .as_ref()
+                        .is_none_or(|current| !Arc::ptr_eq(current, context))
+                    {
+                        cache_context = Some(Arc::clone(context));
+                    }
+                }
+                let (state, evidence, failed_check) = match cached.details {
+                    Some(details) => (
+                        details.state,
+                        details.evidence.into(),
+                        details.failed_check.map(|failed| *failed),
+                    ),
+                    None => (
+                        ApplicabilityState::Current,
+                        CURRENT_EVIDENCE.to_string(),
+                        None,
+                    ),
+                };
                 objects.push(ObjectApplicability {
                     object_id: candidate.object_id.clone(),
                     object_revision: candidate.object_revision,
-                    state: cached.state,
-                    evidence: cached.evidence,
-                    failed_check: cached.failed_check,
-                    append_pending: cached.state.blocks_auto_injection()
+                    state,
+                    evidence,
+                    failed_check,
+                    append_pending: state.blocks_auto_injection()
                         && !cached.query_local
                         && !cached.append_confirmed,
-                    token,
+                    token: ClassificationToken(Some(key)),
                     append: None,
                 });
                 continue;
             }
             stats.object_cache_misses += 1;
+            let key = Arc::new(key);
+            let token = ClassificationToken(Some(Arc::clone(&key)));
+            let scope_context = resolved_scope_context
+                .get_or_init(|| scope_context.clone().with_head_commit(snapshot.head()));
             let graph_ops_before = ladder.graph_operations();
             let classification = self.classify(
-                snapshot,
                 query,
                 scope_context,
                 &ladder,
-                &mut batch_anchor_memo,
-                &mut batch_decode_memo,
-                &mut check_cache,
+                &mut batch_memos,
                 &mut stats,
                 candidate,
-                anchor_fingerprint.as_ref(),
-                &payload_decode,
-                budget,
+                payload_decode,
             );
-            stats.graph_operations += ladder.graph_operations() - graph_ops_before;
-            // A candidate that walked the graph re-tests the boundary it ran
-            // under. One that did not can still have inherited a verdict from
-            // this request's earlier graph work, so it consults what has already
-            // been seen rather than paying another re-read.
-            let boundary_moved = if ladder.graph_operations() > graph_ops_before {
-                ladder.repository_state_moved()
-            } else {
-                ladder.repository_state_movement_seen()
-            };
-            // Re-reading that state consumes the budget, and an expired request
-            // owes `Uncertain` rather than a verdict it could auto-inject.
             if budget.is_exhausted() {
                 objects.push(finished(
                     candidate,
@@ -393,31 +669,49 @@ impl ApplicabilityEngine {
                 ));
                 continue;
             }
-            let cacheable = classification.cacheable && !boundary_moved;
-            // An uncacheable verdict has no cache entry, so its token could
-            // never be confirmed; claiming a pending append would make read
-            // repair re-append it on every request forever.
-            let mut append_pending = cacheable && !classification.query_local;
+            let boundary_moved = if ladder.graph_operations() > graph_ops_before {
+                ladder.repository_state_moved()
+            } else {
+                ladder.repository_state_movement_seen()
+            };
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted while validating this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
+            let cacheable = classification.cacheable
+                && !boundary_moved
+                && !(classification.state == ApplicabilityState::Uncertain
+                    && ladder.saw_unreadable_object());
             if cacheable {
-                // The guard is scoped so it releases before `evicted` drops:
-                // locals drop in reverse declaration order, so binding the
-                // displaced generation alongside the guard would free up to a
-                // full generation of entries while still holding the lock.
                 let evicted = {
-                    let mut cache = lock(&self.object_cache);
-                    // A concurrent request that missed this same key can have
-                    // landed and confirmed the append already. Overwriting the
-                    // entry with `false` sends repair back over confirmed work.
-                    let append_confirmed = cache
-                        .peek(&key)
-                        .is_some_and(|cached| cached.append_confirmed);
-                    append_pending = append_pending && !append_confirmed;
+                    let mut cache = self.object_cache.lock().expect("cache lock");
+                    let mut append_confirmed = false;
+                    cache.update(key.as_ref(), |cached| {
+                        append_confirmed = cached.append_confirmed;
+                    });
                     cache.insert(
                         key,
                         CachedClassification {
-                            state: classification.state,
-                            evidence: classification.evidence.clone(),
-                            failed_check: classification.failed_check.clone(),
+                            details: (classification.state != ApplicabilityState::Current
+                                || classification.evidence != CURRENT_EVIDENCE)
+                                .then(|| {
+                                    Box::new(CachedClassificationDetails {
+                                        state: classification.state,
+                                        evidence: classification.evidence.as_str().into(),
+                                        failed_check: classification
+                                            .failed_check
+                                            .clone()
+                                            .map(Box::new),
+                                    })
+                                }),
                             query_local: classification.query_local,
                             append_confirmed,
                         },
@@ -425,54 +719,49 @@ impl ApplicabilityEngine {
                 };
                 drop(evicted);
             }
+            let append_pending = cacheable && !classification.query_local;
             objects.push(finished(candidate, token, classification, append_pending));
         }
+        // Read the counter once for the whole batch so hit paths cannot hide
+        // graph work behind branch placement.
+        stats.graph_operations = ladder.graph_operations();
         BatchEvaluation { objects, stats }
     }
 
     /// Marks the durable applicability append for `token` as landed, so
-    /// later cache hits stop retrying it. Returns whether the entry was still
-    /// cached; a `false` return means the confirmation was dropped.
+    /// later cache hits stop retrying it.
     #[must_use]
     pub fn confirm_durable_append(&self, token: &ClassificationToken) -> bool {
-        let Some(key) = &token.0 else {
+        let Some(key) = token.0.as_deref() else {
             return false;
         };
-        lock(&self.object_cache).update(key, |cached| cached.append_confirmed = true)
+        self.object_cache
+            .lock()
+            .expect("cache lock")
+            .update(key, |cached| cached.append_confirmed = true)
     }
 
     #[expect(clippy::too_many_arguments, reason = "internal classify pipeline")]
-    fn classify<'batch>(
+    fn classify(
         &self,
-        snapshot: &CheckoutSnapshot,
         query: &QueryContext,
         scope_context: &ScopeMatchContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<[u8; 32], GitConditionOutcome>,
-        batch_decode_memo: &mut DecodeMemo<'batch>,
-        check_cache: &mut CheckCache,
+        memos: &mut BatchMemos,
         stats: &mut EvaluationStats,
-        candidate: &'batch ApplicabilityCandidate,
-        anchor_fingerprint: Option<&[u8; 32]>,
+        candidate: &ApplicabilityCandidate,
         payload_decode: &PayloadDecode,
-        budget: &EvalBudget,
     ) -> Classification {
-        // Uncertainty is transient when the deadline expired or a resolution
-        // needed an object the database does not hold. The cache key covers
-        // neither, so retaining such a verdict pins it until eviction even
-        // after a fetch or a longer budget would decide it.
-        let uncertain = |evidence: String| {
-            let state = ApplicabilityState::Uncertain;
-            if budget.is_exhausted() || ladder.saw_unreadable_object() {
-                Classification::uncacheable(state, evidence)
-            } else {
-                Classification::terminal(state, evidence)
-            }
-        };
+        let snapshot = ladder.snapshot();
+        let budget = ladder.budget();
+        let mut gates_ran = candidate.scope_terms.is_some() || candidate.anchor.is_some();
         // Scope gate.
         if let Some(terms) = &candidate.scope_terms {
-            let scope = match CanonicalScope::from_term_specs(terms) {
-                Ok(scope) => scope,
+            let outcome = match memos.scope.get_or_insert_with(memos.key, || {
+                CanonicalScope::from_term_specs(terms)
+                    .map(|scope| scope_matches(&scope, scope_context, ladder))
+            }) {
+                Ok(outcome) => *outcome,
                 Err(error) => {
                     return Classification::terminal(
                         ApplicabilityState::Uncertain,
@@ -480,7 +769,7 @@ impl ApplicabilityEngine {
                     );
                 }
             };
-            match scope_matches(&scope, scope_context, ladder) {
+            match outcome {
                 MatchOutcome::Matches => {}
                 MatchOutcome::DoesNotMatch => {
                     return Classification::terminal(
@@ -490,19 +779,18 @@ impl ApplicabilityEngine {
                     .query_local();
                 }
                 MatchOutcome::Uncertain => {
-                    return uncertain("scope match is unresolvable in this context".to_string())
-                        .query_local();
+                    return Classification::terminal(
+                        ApplicabilityState::Uncertain,
+                        "scope match is unresolvable in this context",
+                    )
+                    .query_local();
                 }
             }
         }
         // Anchor gate.
         if let Some(anchor) = &candidate.anchor {
-            // A git anchor resolves against the checkout graph; every other kind
-            // reads the query context, and a kind this build cannot map is
-            // covered conservatively.
             let anchor_reads_context = !matches!(
-                AnchorKind::from_stored(anchor.anchor_kind.as_str())
-                    .map(AnchorKind::context_dependency),
+                AnchorKind::from_stored(&anchor.anchor_kind).map(AnchorKind::context_dependency),
                 Some(ContextDependency::None)
             );
             let localize = |classification: Classification| {
@@ -512,67 +800,71 @@ impl ApplicabilityEngine {
                     classification
                 }
             };
-            let fingerprint = anchor_fingerprint
-                .copied()
-                .unwrap_or_else(|| anchor_row_fingerprint(anchor));
-            match self.evaluate_anchor(
-                snapshot,
-                query,
-                ladder,
-                batch_anchor_memo,
-                batch_decode_memo,
-                stats,
-                anchor,
-                fingerprint,
-            ) {
+            let BatchMemos {
+                key,
+                anchors,
+                anchor_verdict,
+                ..
+            } = memos;
+            match anchor_verdict.get_or_insert_with(*key, || {
+                self.evaluate_anchor(snapshot, query, ladder, anchors, stats, anchor)
+            }) {
                 AnchorVerdict::Holds => {}
                 AnchorVerdict::Historical(evidence) => {
                     return localize(Classification::terminal(
                         ApplicabilityState::Historical,
-                        evidence,
+                        evidence.clone(),
                     ));
                 }
-                AnchorVerdict::Uncertain(evidence) => return localize(uncertain(evidence)),
+                AnchorVerdict::Uncertain(evidence) => {
+                    let state = ApplicabilityState::Uncertain;
+                    return if budget.is_exhausted() {
+                        localize(Classification::uncacheable(state, evidence.clone()))
+                    } else {
+                        localize(Classification::terminal(state, evidence.clone()))
+                    };
+                }
             }
         }
-        // Dirty-tree gate and cheap checks read the object payload.
-        let mut gates_ran = candidate.scope_terms.is_some() || candidate.anchor.is_some();
+        // Dirty-tree gate and cheap checks read the object payload. A
+        // present-but-undecodable payload fails closed: the declared paths
+        // and checks are unknowable, so the object is uncertain, never
+        // silently current.
         let spec = match payload_decode {
-            // A payload that cannot be read leaves its declared paths and
-            // checks unknown, so staleness is unknown rather than absent.
+            PayloadDecode::Absent => None,
+            PayloadDecode::Present(spec) => Some(spec),
             PayloadDecode::Undecodable(evidence) => {
                 return Classification::terminal(ApplicabilityState::Uncertain, evidence.clone());
             }
-            PayloadDecode::Absent => None,
-            PayloadDecode::Present(spec) => Some(spec),
         };
-        if let Some(spec) = &spec {
-            match dirty_gate(snapshot, &spec.affected_paths, budget) {
+        if let Some(spec) = spec {
+            gates_ran |= !spec.affected_paths.is_empty() || !spec.checks.is_empty();
+            match memos.dirty_gate.get_or_insert_with(memos.key, || {
+                dirty_gate(snapshot, &spec.affected_paths, budget)
+            }) {
                 DirtyGate::Clear => {}
-                DirtyGate::BudgetExhausted => {
-                    return Classification::uncacheable(
-                        ApplicabilityState::Uncertain,
-                        "evaluation budget exhausted during the dirty-tree gate",
-                    );
-                }
                 DirtyGate::Overlap(path) => {
                     return Classification::terminal(
                         ApplicabilityState::DirtyTreeUncertain,
                         format!("uncommitted path {path} overlaps affected paths"),
                     );
                 }
-                // Unplaceable is a property of the declaration, which the key
-                // covers, so this verdict is as stable as the payload.
-                DirtyGate::Unplaceable(declared) => {
+                DirtyGate::Unplaceable(path) => {
                     return Classification::terminal(
                         ApplicabilityState::Uncertain,
-                        format!("affected path {declared} does not resolve inside this checkout"),
+                        format!("affected path {path} does not resolve inside this checkout"),
+                    );
+                }
+                DirtyGate::BudgetExhausted => {
+                    return Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted during the dirty-tree gate",
                     );
                 }
             }
-            gates_ran |= !spec.affected_paths.is_empty() || !spec.checks.is_empty();
             for check in &spec.checks {
-                match run_cheap_check(snapshot, check, budget, check_cache) {
+                let outcome = run_cheap_check(snapshot, check, budget, &mut memos.check_cache);
+                match outcome {
                     CheckOutcome::Passed => {}
                     CheckOutcome::Failed { evidence } => {
                         return Classification {
@@ -583,7 +875,6 @@ impl ApplicabilityEngine {
                             }),
                             evidence,
                             cacheable: true,
-                            // A cheap check reads the worktree, not the query.
                             query_local: false,
                         };
                     }
@@ -602,42 +893,27 @@ impl ApplicabilityEngine {
         Classification::terminal(
             ApplicabilityState::Current,
             match (candidate.anchor.is_some(), gates_ran) {
-                (true, _) => "anchor holds at HEAD and all checks pass",
+                (true, _) => CURRENT_EVIDENCE,
                 (false, true) => "scope and declared inputs match this checkout",
                 (false, false) => "no scope, anchor, or declared inputs constrain this object",
             },
         )
     }
 
-    #[expect(clippy::too_many_arguments, reason = "internal classify pipeline")]
-    fn evaluate_anchor<'batch>(
+    fn evaluate_anchor(
         &self,
         snapshot: &CheckoutSnapshot,
         query: &QueryContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<[u8; 32], GitConditionOutcome>,
-        batch_decode_memo: &mut DecodeMemo<'batch>,
+        batch_anchor_memo: &mut HashMap<AnchorCacheKey, GitConditionOutcome>,
         stats: &mut EvaluationStats,
-        anchor: &'batch AnchorRowSpec,
-        anchor_fingerprint: [u8; 32],
+        anchor: &AnchorRowSpec,
     ) -> AnchorVerdict {
-        let reusable = matches!(
-            batch_decode_memo.get(anchor.anchor_id.as_str()),
-            Some((row, _)) if **row == *anchor
-        );
-        if !reusable {
-            let result = AnchorCondition::decode(anchor)
-                .map_err(|error| format!("undecodable anchor: {error}"));
-            batch_decode_memo.insert(anchor.anchor_id.as_str(), (anchor, result));
-        }
-        let (_, decode_result) = batch_decode_memo
-            .get(anchor.anchor_id.as_str())
-            .expect("decode memo holds this anchor id");
-        let condition = match decode_result {
+        let condition = match AnchorCondition::decode(anchor) {
             Ok(condition) => condition,
-            Err(evidence) => return AnchorVerdict::Uncertain(evidence.clone()),
+            Err(error) => return AnchorVerdict::Uncertain(format!("undecodable anchor: {error}")),
         };
-        match evaluate_non_git(condition, query) {
+        match evaluate_non_git(&condition, query) {
             AnchorEvaluation::Holds => return AnchorVerdict::Holds,
             AnchorEvaluation::DoesNotHold { historical } => {
                 return AnchorVerdict::Historical(historical_evidence(historical));
@@ -649,57 +925,47 @@ impl ApplicabilityEngine {
             }
             AnchorEvaluation::NeedsGitResolution => {}
         }
-        let AnchorCondition::Git(git_condition) = condition else {
+        let AnchorCondition::Git(git_condition) = &condition else {
             unreachable!("NeedsGitResolution is only reported for git conditions");
         };
-        let outcome = if let Some(outcome) = batch_anchor_memo.get(&anchor_fingerprint) {
+        let key = AnchorCacheKey {
+            checkout_identity: snapshot.identity().to_string(),
+            row_fingerprint: anchor_row_fingerprint(anchor),
+            head: snapshot.head().to_string(),
+            repository_state: snapshot.repository_state().to_string(),
+            patch_id_algorithm: PATCH_ID_ALGORITHM,
+        };
+        let outcome = if let Some(outcome) = batch_anchor_memo.get(&key) {
             *outcome
         } else {
-            let key = AnchorCacheKey {
-                checkout_identity: snapshot.identity().to_string(),
-                row_fingerprint: anchor_fingerprint,
-                head: snapshot.head().to_string(),
-                // Sparse and shallow state decide how far an ancestry walk
-                // reaches, so unshallowing has to miss this key rather than
-                // reuse the verdict it produced under a truncated history.
-                repository_state: snapshot.repository_state().to_string(),
-                patch_id_algorithm: PATCH_ID_ALGORITHM,
-            };
-            let cached = lock(&self.anchor_cache).get(&key);
-            let (outcome, boundary_moved) = match cached {
+            let cached = self.anchor_cache.lock().expect("cache lock").get(&key);
+            let (outcome, memoizable) = match cached {
                 Some(outcome) => {
                     stats.anchor_cache_hits += 1;
-                    // A cached entry was gated at insert time, so the boundary
-                    // it was walked under is the one its key names.
-                    (outcome, false)
+                    (outcome, true)
                 }
                 None => {
                     stats.anchor_cache_misses += 1;
                     let outcome = ladder.evaluate(git_condition);
-                    // Uncertainty from an expired budget or from an object the
-                    // database does not hold is transient: a fetch supplies a
-                    // missing commit without moving anything this key covers,
-                    // so retaining either would pin a degraded verdict to this
-                    // (HEAD, anchor) until eviction.
-                    let transient = ladder.budget_was_exhausted() || ladder.saw_unreadable_object();
-                    // A moved boundary voids every outcome, uncertain or not: commentlint: allow(JUDGE)
-                    // the reachability this walk saw is not the reachability commentlint: allow(JUDGE)
-                    // the key names. commentlint: allow(JUDGE)
                     let boundary_moved = ladder.repository_state_moved();
-                    let retain = !boundary_moved
-                        && (outcome != GitConditionOutcome::Uncertain || !transient);
-                    if retain {
-                        let _evicted = lock(&self.anchor_cache).insert(key, outcome);
+                    // Budget-driven uncertainty is transient; caching it
+                    // would pin a degraded verdict to this (HEAD, anchor).
+                    if !boundary_moved
+                        && (outcome != GitConditionOutcome::Uncertain
+                            || (!ladder.budget_was_exhausted() && !ladder.saw_unreadable_object()))
+                    {
+                        let evicted = self
+                            .anchor_cache
+                            .lock()
+                            .expect("cache lock")
+                            .insert(key.clone(), outcome);
+                        drop(evicted);
                     }
-                    (outcome, boundary_moved)
+                    (outcome, !boundary_moved)
                 }
             };
-            // The memo carries no key, so a tainted outcome placed here would
-            // reach a later candidate that performs no graph work of its own
-            // and looks safe to cache. Such an outcome is not memoized; the
-            // next candidate walks again and re-tests the boundary it ran under.
-            if !boundary_moved {
-                batch_anchor_memo.insert(anchor_fingerprint, outcome);
+            if memoizable {
+                batch_anchor_memo.insert(key, outcome);
             }
             outcome
         };
@@ -714,34 +980,48 @@ impl ApplicabilityEngine {
         }
     }
 
+    #[expect(clippy::too_many_arguments, reason = "exact cache-key dimensions")]
     fn object_cache_key(
         &self,
         snapshot: &CheckoutSnapshot,
-        batch_prefix: &Sha256,
-        query: &QueryContext,
+        snapshot_hash: u64,
+        context: Option<&Arc<SnapshotCacheValues>>,
         candidate: &ApplicabilityCandidate,
-        anchor_fingerprint: Option<&[u8; 32]>,
-        scoped_dirty_fingerprint: String,
+        inputs_digest: [u8; 32],
+        check_observations: [u8; 32],
+        scoped_dirty_fingerprint: [u8; 32],
     ) -> ObjectCacheKey {
+        let snapshot = match context {
+            Some(context) => SnapshotCacheKey::Shared(Arc::clone(context)),
+            None => SnapshotCacheKey::Owned(SnapshotCacheValues {
+                hash: snapshot_hash,
+                checkout_identity: snapshot.identity().to_string(),
+                head: snapshot.head().to_string(),
+                repository_state: snapshot.repository_state().to_string(),
+            }),
+        };
         ObjectCacheKey {
-            checkout_identity: snapshot.identity().to_string(),
-            object_id: candidate.object_id.clone(),
+            hash: self.cache_hasher.hash_one((
+                snapshot_hash,
+                candidate.object_id.as_str(),
+                candidate.object_revision,
+                inputs_digest,
+                check_observations,
+                scoped_dirty_fingerprint,
+            )),
+            snapshot,
+            object_id: candidate.object_id.as_str().into(),
             object_revision: candidate.object_revision,
-            head: snapshot.head().to_string(),
-            // The scoped fingerprint covers only worktree entries. Sparse and
-            // shallow state decide which paths materialize and how far
-            // history reaches, and moves neither HEAD nor the worktree.
-            repository_state: snapshot.repository_state().to_string(),
+            inputs_digest,
+            check_observations,
             scoped_dirty_fingerprint,
-            inputs_digest: inputs_digest(batch_prefix, query, candidate, anchor_fingerprint),
         }
     }
 }
 
 impl ObjectApplicability {
     /// Uncertain verdict for a candidate whose checkout could not be
-    /// snapshotted. The verdict is never cached, so it carries no cache key
-    /// and a durable-append confirmation against it has nothing to record.
+    /// snapshotted; carries a degenerate token no cache entry ever matches.
     pub(super) fn uncertain_without_snapshot(
         candidate: &ApplicabilityCandidate,
         evidence: String,
@@ -765,13 +1045,6 @@ enum AnchorVerdict {
     Uncertain(String),
 }
 
-/// Reuse of a memoized decode requires the stored row to equal the caller's row.
-type DecodeMemo<'batch> =
-    HashMap<&'batch str, (&'batch AnchorRowSpec, Result<AnchorCondition, String>)>;
-
-/// Reuse of a memoized fingerprint requires the stored row to equal the caller's row.
-type FingerprintMemo<'batch> = HashMap<&'batch str, (&'batch AnchorRowSpec, [u8; 32])>;
-
 fn historical_evidence(historical: bool) -> String {
     if historical {
         "anchor validity window exited".to_string()
@@ -785,15 +1058,6 @@ struct Classification {
     evidence: String,
     failed_check: Option<FailedCheck>,
     cacheable: bool,
-    /// Whether this verdict read the query or scope context rather than the
-    /// checkout alone.
-    ///
-    /// `ApplicabilityObservationPayload` records checkout identity and state commentlint: allow(JUDGE)
-    /// with no scope or query context, so a durable observation cannot say commentlint: allow(JUDGE)
-    /// "excluded for this project" — only "excluded at this checkout". commentlint: allow(JUDGE)
-    /// Appending a query-local exclusion would read as an object-wide one and commentlint: allow(JUDGE)
-    /// keep blocking a later query the object does apply to. Such a verdict is commentlint: allow(JUDGE)
-    /// recomputed per query anyway, so it is not appended at all. commentlint: allow(JUDGE)
     query_local: bool,
 }
 
@@ -842,23 +1106,14 @@ fn finished(
     }
 }
 
+#[derive(Clone)]
 enum DirtyGate {
     Clear,
-    /// An uncommitted path overlaps a declared path.
     Overlap(String),
-    /// A declared path this comparison cannot place inside the checkout. commentlint: allow(JUDGE)
     Unplaceable(String),
     BudgetExhausted,
 }
 
-/// A dirty path overlaps an affected path when they are equal or one is a
-/// directory prefix of the other (untracked directories are recorded as a
-/// single collapsed entry).
-///
-/// Placement is decided before any entry is examined. A path leaving the commentlint: allow(JUDGE)
-/// worktree is unobservable whatever the worktree currently holds, so leaving commentlint: allow(JUDGE)
-/// it to the scan would report it only while some unrelated entry happens to commentlint: allow(JUDGE)
-/// be dirty, and call the object current on a clean checkout. commentlint: allow(JUDGE)
 fn dirty_gate(
     snapshot: &CheckoutSnapshot,
     affected_paths: &[String],
@@ -870,49 +1125,25 @@ fn dirty_gate(
         }
     }
     for entry in snapshot.dirty_entries() {
-        // This scan is the product of the dirty set and the declared paths, so
-        // the deadline is polled per entry rather than once after the whole
-        // scan; the work between polls is then one entry's comparisons.
         if budget.is_exhausted() {
             return DirtyGate::BudgetExhausted;
         }
-        // An index bookkeeping entry is recorded for the fingerprint's sake and
-        // is not an uncommitted edit; git reports both classes clean.
         if !entry.is_uncommitted_change() {
             continue;
         }
-        for affected in affected_paths {
-            if entry_overlaps(entry, affected) {
-                return DirtyGate::Overlap(entry.path.clone());
-            }
+        if affected_paths
+            .iter()
+            .any(|affected| entry_overlaps(entry, affected))
+        {
+            return DirtyGate::Overlap(entry.path.clone());
         }
     }
     DirtyGate::Clear
 }
 
-/// A poisoned cache mutex means some other request panicked, not that this
-/// cache's contents are unsound; the engine is process-wide and long-lived,
-/// so propagating the poison would wedge classification permanently.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Git reports dirty paths in one canonical spelling: slash-separated,
-/// relative to the worktree root, with no `.` or `..` component. A declared
-/// path is author-supplied and can arrive spelled otherwise.
-///
-/// `None` marks a spelling this comparison cannot interpret. Callers treat commentlint: allow(JUDGE)
-/// that as overlapping every dirty path, since a declaration the engine commentlint: allow(JUDGE)
-/// cannot read is no evidence that the entry is unrelated. commentlint: allow(JUDGE)
 enum DeclaredPath<'a> {
-    /// Canonical and comparable against a dirty path.
     Path(Cow<'a, str>),
-    /// The worktree root, which covers the whole checkout rather than nothing,
-    /// so it overlaps every dirty entry and none on a clean checkout.
     WorktreeRoot,
-    /// A spelling this comparison cannot place beneath the worktree. commentlint: allow(JUDGE)
     Unplaceable,
 }
 
@@ -921,7 +1152,6 @@ fn declared_path(path: &str) -> DeclaredPath<'_> {
     let mut needs_rewrite = trimmed.starts_with('/');
     for segment in trimmed.split('/') {
         match segment {
-            // Resolving `..` needs the real tree; refuse instead of guessing.
             ".." => return DeclaredPath::Unplaceable,
             "" | "." => needs_rewrite = true,
             _ => {}
@@ -940,8 +1170,6 @@ fn declared_path(path: &str) -> DeclaredPath<'_> {
     DeclaredPath::Path(Cow::Owned(segments.join("/")))
 }
 
-/// `dirty` arrives from the status scan already canonical; only the declared
-/// side needs rewriting.
 fn paths_overlap(dirty: &[u8], declared: &[u8]) -> bool {
     let dirty = trim_trailing_slashes(dirty);
     let declared = trim_trailing_slashes(declared);
@@ -960,271 +1188,270 @@ fn trim_trailing_slashes(mut path: &[u8]) -> &[u8] {
     path
 }
 
-/// Whether a dirty entry bears on a declared affected path.
-///
-/// Comparison runs on the bytes the repository holds, not on `DirtyEntry::path`. commentlint: allow(JUDGE)
-/// A rendering of non-UTF-8 bytes does not record where loss occurred, so no commentlint: allow(JUDGE)
-/// part of it identifies a path: a whole rendering can be spelled verbatim by commentlint: allow(JUDGE)
-/// a valid UTF-8 file, and a rendered ancestor component aliases every commentlint: allow(JUDGE)
-/// directory whose bytes render the same way. Raw bytes decide both commentlint: allow(JUDGE)
-/// directions exactly, so neither twin needs conservative treatment: a commentlint: allow(JUDGE)
-/// declared path — always valid UTF-8 — matches only the bytes it really is. commentlint: allow(JUDGE)
 fn entry_overlaps(entry: &DirtyEntry, declared: &str) -> bool {
     match declared_path(declared) {
         DeclaredPath::Path(declared) => {
             paths_overlap(&entry.raw_path, declared.as_ref().as_bytes())
         }
-        // The root contains every entry, and an unplaceable declaration is no
-        // evidence this entry is unrelated to it.
         DeclaredPath::WorktreeRoot | DeclaredPath::Unplaceable => true,
     }
+}
+
+fn scoped_dirty_fingerprint(
+    snapshot: &CheckoutSnapshot,
+    payload_decode: &PayloadDecode,
+    budget: &EvalBudget,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    let PayloadDecode::Present(spec) = payload_decode else {
+        return hash.finalize().into();
+    };
+    for affected in &spec.affected_paths {
+        if matches!(declared_path(affected), DeclaredPath::Unplaceable) {
+            hash.update(b"unplaceable\0");
+            hash.update(affected.as_bytes());
+        }
+    }
+    for entry in snapshot.dirty_entries() {
+        if budget.is_exhausted() {
+            break;
+        }
+        if entry.is_uncommitted_change()
+            && spec
+                .affected_paths
+                .iter()
+                .any(|affected| entry_overlaps(entry, affected))
+        {
+            hash.update((entry.raw_path.len() as u64).to_le_bytes());
+            hash.update(&entry.raw_path);
+            hash.update(entry.status.as_bytes());
+            hash.update(entry.content_hash.as_bytes());
+        }
+    }
+    hash.finalize().into()
+}
+
+fn anchor_row_fingerprint(anchor: &AnchorRowSpec) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    digest_field(&mut hash, Some(&anchor.anchor_id));
+    digest_field(&mut hash, Some(&anchor.anchor_kind));
+    digest_field(&mut hash, anchor.exact_value.as_deref());
+    digest_field(&mut hash, anchor.reachable_from_oid.as_deref());
+    digest_field(&mut hash, anchor.reachable_between_start_oid.as_deref());
+    digest_field(&mut hash, anchor.reachable_between_end_oid.as_deref());
+    digest_field(&mut hash, anchor.deployment_revision.as_deref());
+    digest_field(&mut hash, anchor.config_revision.as_deref());
+    digest_field(&mut hash, anchor.platform_version_range.as_deref());
+    digest_i64(&mut hash, anchor.wall_clock_start);
+    digest_i64(&mut hash, anchor.wall_clock_end);
+    match &anchor.payload {
+        Some(payload) => {
+            hash.update([1]);
+            hash.update((payload.len() as u64).to_le_bytes());
+            hash.update(payload);
+        }
+        None => hash.update([0]),
+    }
+    hash.finalize().into()
+}
+
+fn check_observations_digest(
+    snapshot: &CheckoutSnapshot,
+    payload_decode: &PayloadDecode,
+    cache: &mut CheckCache,
+    budget: &EvalBudget,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    let PayloadDecode::Present(spec) = payload_decode else {
+        return hash.finalize().into();
+    };
+    for check in &spec.checks {
+        if budget.is_exhausted() {
+            break;
+        }
+        if let Some(observation) = check_observation(cache, snapshot, check) {
+            hash.update((observation.len() as u64).to_le_bytes());
+            hash.update(observation.as_bytes());
+        }
+    }
+    hash.finalize().into()
+}
+
+#[derive(Clone, Copy)]
+enum InputPrefixKind {
+    Default = 0,
+    Exact,
+    Deployment,
+    Config,
+    Platform,
+    WallClock,
+    All,
+}
+
+struct InputDigestPrefixes<'a> {
+    query: &'a QueryContext,
+    scope_context: &'a ScopeMatchContext,
+    cached: [Option<Sha256>; 7],
+}
+
+impl<'a> InputDigestPrefixes<'a> {
+    fn new(query: &'a QueryContext, scope_context: &'a ScopeMatchContext) -> Self {
+        Self {
+            query,
+            scope_context,
+            cached: std::array::from_fn(|_| None),
+        }
+    }
+
+    fn for_candidate(&mut self, candidate: &ApplicabilityCandidate) -> [u8; 32] {
+        let kind = match candidate.anchor.as_ref().map(|anchor| {
+            AnchorKind::from_stored(&anchor.anchor_kind)
+                .map(AnchorKind::context_dependency)
+                .unwrap_or(ContextDependency::All)
+        }) {
+            None | Some(ContextDependency::None) => InputPrefixKind::Default,
+            Some(ContextDependency::ExactToken) => InputPrefixKind::Exact,
+            Some(ContextDependency::DeploymentRevision) => InputPrefixKind::Deployment,
+            Some(ContextDependency::ConfigRevision) => InputPrefixKind::Config,
+            Some(ContextDependency::PlatformVersion) => InputPrefixKind::Platform,
+            Some(ContextDependency::QueryInstant) => InputPrefixKind::WallClock,
+            Some(ContextDependency::All) => InputPrefixKind::All,
+        };
+        let slot = &mut self.cached[kind as usize];
+        if slot.is_none() {
+            *slot = Some(inputs_digest_prefix(self.query, self.scope_context, kind));
+        }
+        finish_inputs_digest(slot.clone().expect("digest prefix initialized"), candidate)
+    }
+}
+
+fn inputs_digest_prefix(
+    query: &QueryContext,
+    scope_context: &ScopeMatchContext,
+    kind: InputPrefixKind,
+) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"mc-applicability-inputs-v4\0");
+    // Only the context fields the candidate's anchor kind reads enter the
+    // digest, so an unrelated context change (a fresh query instant, say)
+    // cannot evict every cached classification.
+    let relevant: &[Option<&str>] = match kind {
+        InputPrefixKind::Exact => &[query.exact_token.as_deref()],
+        InputPrefixKind::Deployment => &[query.deployment_revision.as_deref()],
+        InputPrefixKind::Config => &[query.config_revision.as_deref()],
+        InputPrefixKind::Platform => &[query.platform_version.as_deref()],
+        InputPrefixKind::All => &[
+            query.exact_token.as_deref(),
+            query.deployment_revision.as_deref(),
+            query.config_revision.as_deref(),
+            query.platform_version.as_deref(),
+        ],
+        _ => &[],
+    };
+    for field in relevant {
+        digest_field(&mut hash, *field);
+    }
+    if matches!(kind, InputPrefixKind::WallClock | InputPrefixKind::All) {
+        match query.query_instant_ms {
+            Some(instant) => {
+                hash.update([1]);
+                hash.update(instant.to_le_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    for dimension in super::super::Dimension::ALL {
+        digest_field(&mut hash, scope_context.value(dimension));
+    }
+    hash
 }
 
 /// Digest over every non-snapshot input that can change the verdict, so a
 /// cache entry can never answer for a different query context, scope
 /// context, payload, or anchor row.
-fn inputs_digest(
-    batch_prefix: &Sha256,
-    query: &QueryContext,
-    candidate: &ApplicabilityCandidate,
-    anchor_fingerprint: Option<&[u8; 32]>,
-) -> String {
-    let mut hash = batch_prefix.clone();
-    // Only the context fields the candidate's anchor kind reads enter the
-    // digest, so an unrelated context change (a fresh query instant, say)
-    // cannot evict every cached classification.
-    let anchor_kind = candidate
-        .anchor
-        .as_ref()
-        .map(|anchor| anchor.anchor_kind.as_str())
-        .unwrap_or_default();
-    hash_bytes(&mut hash, anchor_kind.as_bytes());
-    // An unparseable kind covers every field: it decodes as uncertain, and a
-    // narrower key would be wrong if a later build recognizes the kind.
-    let dependency = match AnchorKind::from_stored(anchor_kind) {
-        Some(kind) => kind.context_dependency(),
-        None if candidate.anchor.is_some() => ContextDependency::All,
-        None => ContextDependency::None,
-    };
-    hash_context(&mut hash, query, dependency);
-    hash.update(b"\0");
+fn finish_inputs_digest(mut hash: Sha256, candidate: &ApplicabilityCandidate) -> [u8; 32] {
     if let Some(terms) = &candidate.scope_terms {
-        hash_usize(&mut hash, terms.len());
+        hash.update([1u8]);
+        hash.update((terms.len() as u64).to_le_bytes());
         for term in terms {
-            hash_scope_term(&mut hash, term);
+            digest_field(&mut hash, Some(&term.dimension));
+            digest_field(&mut hash, Some(&term.operator));
+            digest_field(&mut hash, term.exact_value.as_deref());
+            match &term.set_values {
+                Some(values) => {
+                    hash.update([1u8]);
+                    hash.update((values.len() as u64).to_le_bytes());
+                    for value in values {
+                        digest_field(&mut hash, Some(value));
+                    }
+                }
+                None => hash.update([0u8]),
+            }
+            digest_field(&mut hash, term.range_start.as_deref());
+            digest_field(&mut hash, term.range_end.as_deref());
+            digest_field(&mut hash, term.version_range.as_deref());
+            digest_field(&mut hash, term.git_oid.as_deref());
+            digest_field(&mut hash, term.git_start_oid.as_deref());
+            digest_field(&mut hash, term.git_end_oid.as_deref());
+            digest_field(&mut hash, term.payload.as_deref());
         }
-    }
-    hash.update(b"\0");
-    if let Some(fingerprint) = anchor_fingerprint {
-        hash.update([1]);
-        hash.update(fingerprint);
     } else {
-        hash.update([0]);
+        hash.update([0u8]);
     }
-    hash.update(b"\0");
-    // An absent payload declares nothing and can classify `Current`, while a
-    // zero-byte payload fails to decode and classifies `Uncertain`; an
-    // untagged hash would let the first verdict answer for the second.
+    if let Some(anchor) = &candidate.anchor {
+        hash.update([1u8]);
+        digest_field(&mut hash, Some(&anchor.anchor_id));
+        digest_field(&mut hash, Some(&anchor.anchor_kind));
+        digest_field(&mut hash, anchor.exact_value.as_deref());
+        digest_field(&mut hash, anchor.reachable_from_oid.as_deref());
+        digest_field(&mut hash, anchor.reachable_between_start_oid.as_deref());
+        digest_field(&mut hash, anchor.reachable_between_end_oid.as_deref());
+        digest_field(&mut hash, anchor.deployment_revision.as_deref());
+        digest_field(&mut hash, anchor.config_revision.as_deref());
+        digest_field(&mut hash, anchor.platform_version_range.as_deref());
+        digest_i64(&mut hash, anchor.wall_clock_start);
+        digest_i64(&mut hash, anchor.wall_clock_end);
+        match &anchor.payload {
+            Some(payload) => {
+                hash.update([1u8]);
+                hash.update((payload.len() as u64).to_le_bytes());
+                hash.update(payload);
+            }
+            None => hash.update([0u8]),
+        }
+    } else {
+        hash.update([0u8]);
+    }
     match &candidate.payload {
         Some(payload) => {
             hash.update([1]);
-            hash_bytes(&mut hash, payload);
+            hash.update((payload.len() as u64).to_le_bytes());
+            hash.update(payload);
         }
         None => hash.update([0]),
     }
-    format!("{:x}", hash.finalize())
-}
-
-/// Hash state over the batch-constant digest inputs, cloned per candidate
-/// so the domain tag and scope-context dimensions compress once per batch.
-fn batch_digest_prefix(scope_context: &ScopeMatchContext) -> Sha256 {
-    let mut hash = Sha256::new();
-    hash.update(b"mc-applicability-inputs-v4\0");
-    for dimension in super::super::Dimension::ALL {
-        hash_opt_str(&mut hash, scope_context.value(dimension));
-    }
-    hash
-}
-
-fn anchor_row_fingerprint(anchor: &AnchorRowSpec) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash_anchor_row(&mut hash, anchor);
     hash.finalize().into()
 }
 
-/// Digests the worktree state this candidate's verdict reads: the dirty
-/// entries overlapping its declared affected paths, and the state each cheap
-/// check observes.
-///
-/// The dirty gate consumes git status, so affected paths need the status commentlint: allow(JUDGE)
-/// entries. A cheap check reads the filesystem directly, and status alone commentlint: allow(JUDGE)
-/// cannot describe what it saw: a checked file can change after the scan, be commentlint: allow(JUDGE)
-/// read by the check, and revert, which would store the check's verdict under commentlint: allow(JUDGE)
-/// the pre-change fingerprint. Both the key and the check read through commentlint: allow(JUDGE)
-/// `check_cache`, so the key names the bytes the verdict actually used. commentlint: allow(JUDGE)
-fn scoped_dirty_fingerprint(
-    snapshot: &CheckoutSnapshot,
-    payload_decode: &PayloadDecode,
-    check_cache: &mut CheckCache,
-    budget: &EvalBudget,
-) -> Option<String> {
-    let spec = match payload_decode {
-        PayloadDecode::Present(spec) => spec,
-        PayloadDecode::Absent | PayloadDecode::Undecodable(_) => return Some(String::new()),
-    };
-    let mut hash: Option<Sha256> = None;
-    for entry in snapshot.dirty_entries() {
-        // Same product as the gate, polled at the same granularity.
-        if budget.is_exhausted() {
-            return None;
-        }
-        let relevant = spec
-            .affected_paths
-            .iter()
-            .any(|affected| entry_overlaps(entry, affected));
-        if relevant {
-            let hash = hash.get_or_insert_with(Sha256::new);
-            hash_bytes(hash, entry.path.as_bytes());
-            hash_bytes(hash, entry.status.as_bytes());
-            hash_bytes(hash, entry.content_hash.as_bytes());
-        }
-    }
-    for check in &spec.checks {
-        // Every observation can read a file up to `MAX_CONFIG_BYTES`, so a
-        // payload's check list is unbounded work and the deadline is polled per
-        // check rather than once after all of them.
-        if budget.is_exhausted() {
-            return None;
-        }
-        if let Some(observation) = check_observation(check_cache, snapshot, check) {
-            let hash = hash.get_or_insert_with(Sha256::new);
-            hash_bytes(hash, observation.as_bytes());
-        }
-    }
-    Some(match hash {
-        Some(hash) => format!("{:x}", hash.finalize()),
-        None => String::new(),
-    })
-}
-
-fn hash_context(hash: &mut Sha256, query: &QueryContext, dependency: ContextDependency) {
-    let mut field = |value: Option<&str>| hash_opt_str(hash, value);
-    match dependency {
-        ContextDependency::None => {}
-        ContextDependency::ExactToken => field(query.exact_token.as_deref()),
-        ContextDependency::DeploymentRevision => field(query.deployment_revision.as_deref()),
-        ContextDependency::ConfigRevision => field(query.config_revision.as_deref()),
-        ContextDependency::PlatformVersion => field(query.platform_version.as_deref()),
-        ContextDependency::QueryInstant => hash_opt_i64(hash, query.query_instant_ms),
-        ContextDependency::All => {
-            field(query.exact_token.as_deref());
-            field(query.deployment_revision.as_deref());
-            field(query.config_revision.as_deref());
-            field(query.platform_version.as_deref());
-            hash_opt_i64(hash, query.query_instant_ms);
-        }
-    }
-}
-
-/// Length prefixes keep the field framing injective.
-fn hash_usize(hash: &mut Sha256, value: usize) {
-    hash.update((value as u64).to_le_bytes());
-}
-
-fn hash_bytes(hash: &mut Sha256, bytes: &[u8]) {
-    hash_usize(hash, bytes.len());
-    hash.update(bytes);
-}
-
-fn hash_opt_str(hash: &mut Sha256, value: Option<&str>) {
-    match value {
+/// Presence-tagged, length-prefixed encoding distinguishes `None`,
+/// `Some("<none>")`, and adjacent fields.
+fn digest_field(hash: &mut Sha256, field: Option<&str>) {
+    match field {
         Some(value) => {
-            hash.update([1]);
-            hash_bytes(hash, value.as_bytes());
+            hash.update([1u8]);
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
         }
-        None => hash.update([0]),
+        None => hash.update([0u8]),
     }
 }
 
-fn hash_opt_i64(hash: &mut Sha256, value: Option<i64>) {
-    match value {
+fn digest_i64(hash: &mut Sha256, field: Option<i64>) {
+    match field {
         Some(value) => {
-            hash.update([1]);
+            hash.update([1u8]);
             hash.update(value.to_le_bytes());
         }
-        None => hash.update([0]),
-    }
-}
-
-// The exhaustive destructuring pattern keeps every `ScopeTermSpec` field in the digest.
-fn hash_scope_term(hash: &mut Sha256, term: &super::super::ScopeTermSpec) {
-    let super::super::ScopeTermSpec {
-        dimension,
-        operator,
-        exact_value,
-        set_values,
-        range_start,
-        range_end,
-        version_range,
-        git_oid,
-        git_start_oid,
-        git_end_oid,
-        payload,
-    } = term;
-    hash_bytes(hash, dimension.as_bytes());
-    hash_bytes(hash, operator.as_bytes());
-    hash_opt_str(hash, exact_value.as_deref());
-    match set_values {
-        Some(values) => {
-            hash.update([1]);
-            hash_usize(hash, values.len());
-            for value in values {
-                hash_bytes(hash, value.as_bytes());
-            }
-        }
-        None => hash.update([0]),
-    }
-    hash_opt_str(hash, range_start.as_deref());
-    hash_opt_str(hash, range_end.as_deref());
-    hash_opt_str(hash, version_range.as_deref());
-    hash_opt_str(hash, git_oid.as_deref());
-    hash_opt_str(hash, git_start_oid.as_deref());
-    hash_opt_str(hash, git_end_oid.as_deref());
-    hash_opt_str(hash, payload.as_deref());
-}
-
-// The exhaustive destructuring pattern keeps every `AnchorRowSpec` field in the digest.
-fn hash_anchor_row(hash: &mut Sha256, anchor: &AnchorRowSpec) {
-    let AnchorRowSpec {
-        anchor_id,
-        anchor_kind,
-        exact_value,
-        reachable_from_oid,
-        reachable_between_start_oid,
-        reachable_between_end_oid,
-        deployment_revision,
-        config_revision,
-        platform_version_range,
-        wall_clock_start,
-        wall_clock_end,
-        payload,
-    } = anchor;
-    hash_bytes(hash, anchor_id.as_bytes());
-    hash_bytes(hash, anchor_kind.as_bytes());
-    hash_opt_str(hash, exact_value.as_deref());
-    hash_opt_str(hash, reachable_from_oid.as_deref());
-    hash_opt_str(hash, reachable_between_start_oid.as_deref());
-    hash_opt_str(hash, reachable_between_end_oid.as_deref());
-    hash_opt_str(hash, deployment_revision.as_deref());
-    hash_opt_str(hash, config_revision.as_deref());
-    hash_opt_str(hash, platform_version_range.as_deref());
-    hash_opt_i64(hash, *wall_clock_start);
-    hash_opt_i64(hash, *wall_clock_end);
-    match payload {
-        Some(payload) => {
-            hash.update([1]);
-            hash_bytes(hash, payload);
-        }
-        None => hash.update([0]),
+        None => hash.update([0u8]),
     }
 }

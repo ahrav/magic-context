@@ -6856,7 +6856,6 @@ impl McStore {
         }
     }
 
-    ///
     pub fn commit(
         &self,
         session_id: &str,
@@ -10271,7 +10270,6 @@ impl McStore {
         Ok(())
     }
 
-    ///
     pub fn stage_claim_intent(
         &self,
         route_project_root: &str,
@@ -11179,7 +11177,6 @@ impl McStore {
         }
     }
 
-    ///
     pub fn seed_authority_rows(
         &self,
         context_store_uuid: &str,

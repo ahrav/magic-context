@@ -42,7 +42,7 @@ pub const DEPENDENCY_KIND_TARGET: &str = "applicability_target";
 /// version does not define, would otherwise decode as an object declaring commentlint: allow(JUDGE)
 /// nothing and classify `Current`. A shape change takes a new schema tag, commentlint: allow(JUDGE)
 /// which [`Self::decode`] already rejects. commentlint: allow(JUDGE)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectApplicabilitySpec {
     pub schema: String,
@@ -113,7 +113,7 @@ impl ObjectApplicabilitySpec {
 /// field there is a constraint this build would silently drop, so the payload commentlint: allow(JUDGE)
 /// fails closed rather than enforcing weaker semantics than its producer commentlint: allow(JUDGE)
 /// wrote. The two compose — an unknown `kind` still reaches `Unrecognized`. commentlint: allow(JUDGE)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckSpec {
     FileExists {

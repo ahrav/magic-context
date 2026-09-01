@@ -1554,4 +1554,3 @@ these records has an executing check.
   revert at `mc-store:9105-9111` is the only thing that ever reclaims a raw
   payload, and it does so as a side effect of undoing a fold rather than as a
   retention policy.
-

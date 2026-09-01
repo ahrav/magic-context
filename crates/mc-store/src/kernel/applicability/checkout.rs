@@ -1,6 +1,7 @@
 //! Checkout snapshots: worktree-aware open, HEAD resolution, and a
 //! content-addressed dirty fingerprint, taken once per request.
 
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -381,6 +382,7 @@ pub struct CheckoutSnapshot {
     dirty_fingerprint: String,
     dirty_entries: Vec<DirtyEntry>,
     shallow: bool,
+    commit_graph: OnceCell<Option<gix::commitgraph::Graph>>,
 }
 
 impl CheckoutSnapshot {
@@ -458,6 +460,15 @@ impl CheckoutSnapshot {
 
     pub(crate) fn repo(&self) -> &gix::Repository {
         &self.repo
+    }
+
+    pub(crate) fn revision_graph<T>(
+        &self,
+    ) -> gix::revwalk::Graph<'_, '_, gix::revwalk::graph::Commit<T>> {
+        let commit_graph = self
+            .commit_graph
+            .get_or_init(|| self.repo.commit_graph_if_enabled().ok().flatten());
+        self.repo.revision_graph(commit_graph.as_ref())
     }
 
     /// Joins `rela_path` onto the worktree, rejecting paths whose *ancestors*
@@ -629,6 +640,7 @@ pub fn snapshot_checkout(
         dirty_fingerprint,
         dirty_entries,
         shallow,
+        commit_graph: OnceCell::new(),
     })
 }
 
