@@ -366,8 +366,25 @@ impl<'s> ResolutionLadder<'s> {
                 }
             }
         }
+        // `is_some` cannot separate a real next commit from a walk that failed commentlint: allow(JUDGE)
+        // to reach one. Scanned commits stay candidates either way, since each commentlint: allow(JUDGE)
+        // is reachable from HEAD and a positive match resolves regardless of commentlint: allow(JUDGE)
+        // what lies beyond the window; truncation withholds only the negative commentlint: allow(JUDGE)
+        // conclusion, while the absent object keeps the uncertainty a miss commentlint: allow(JUDGE)
+        // produces out of both caches. commentlint: allow(JUDGE)
+        let mut truncated = false;
+        if commits.len() == CANDIDATE_WINDOW {
+            match walk.next() {
+                Some(Ok(_)) => truncated = true,
+                Some(Err(_)) => {
+                    self.note_unreadable_object();
+                    truncated = true;
+                }
+                None => {}
+            }
+        }
         let window = CandidateWindow {
-            truncated: commits.len() == CANDIDATE_WINDOW && walk.next().is_some(),
+            truncated,
             commits: commits.into(),
         };
         *self.window.borrow_mut() = Some(window.clone());

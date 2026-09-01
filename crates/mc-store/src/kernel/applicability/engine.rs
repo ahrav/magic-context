@@ -21,7 +21,7 @@ use super::super::scope::{
 };
 use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
-use super::checkout::{CheckoutSnapshot, DirtyEntry, EvalBudget, PathEncoding};
+use super::checkout::{CheckoutSnapshot, DirtyEntry, EvalBudget};
 use super::checks::{check_observation, run_cheap_check, CheckCache, CheckOutcome};
 use super::payloads::{
     CheckSpec, ObjectApplicabilitySpec, PayloadDecode, OBSERVATION_KIND_CURRENT,
@@ -793,42 +793,39 @@ fn canonical_declared_path(path: &str) -> Option<Cow<'_, str>> {
 
 /// `dirty` arrives from the status scan already canonical; only the declared
 /// side needs rewriting.
-fn paths_overlap(dirty: &str, declared: &str) -> bool {
-    let Some(declared) = canonical_declared_path(declared) else {
-        return true;
-    };
-    let dirty = dirty.trim_end_matches('/');
-    let declared = declared.as_ref();
+fn paths_overlap(dirty: &[u8], declared: &[u8]) -> bool {
+    let dirty = trim_trailing_slashes(dirty);
+    let declared = trim_trailing_slashes(declared);
     dirty == declared || is_under(dirty, declared) || is_under(declared, dirty)
 }
 
-fn is_under(path: &str, ancestor: &str) -> bool {
+fn is_under(path: &[u8], ancestor: &[u8]) -> bool {
     path.strip_prefix(ancestor)
-        .is_some_and(|rest| rest.starts_with('/'))
+        .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+fn trim_trailing_slashes(mut path: &[u8]) -> &[u8] {
+    while let Some(rest) = path.strip_suffix(b"/") {
+        path = rest;
+    }
+    path
 }
 
 /// Whether a dirty entry bears on a declared affected path.
 ///
-/// A `LossyWithDigest` entry's recorded string is a rendering of bytes that commentlint: allow(JUDGE)
-/// are not valid UTF-8, never the path itself, so a declared path — always commentlint: allow(JUDGE)
-/// valid UTF-8 — cannot be that file, nor live inside it. Only the remaining commentlint: allow(JUDGE)
-/// direction is real: the rendering preserves valid leading bytes verbatim commentlint: allow(JUDGE)
-/// and appends the digest to the final component alone, so a declared commentlint: allow(JUDGE)
-/// ancestor directory still matches by prefix. Comparing the rendering commentlint: allow(JUDGE)
-/// itself would let a file deliberately named like some byte path's commentlint: allow(JUDGE)
-/// rendering plus digest stand in for that path, and the snapshot records commentlint: allow(JUDGE)
-/// `path_encoding` precisely to keep those twins apart. commentlint: allow(JUDGE)
+/// Comparison runs on the bytes the repository holds, not on `DirtyEntry::path`. commentlint: allow(JUDGE)
+/// A rendering of non-UTF-8 bytes does not record where loss occurred, so no commentlint: allow(JUDGE)
+/// part of it identifies a path: a whole rendering can be spelled verbatim by commentlint: allow(JUDGE)
+/// a valid UTF-8 file, and a rendered ancestor component aliases every commentlint: allow(JUDGE)
+/// directory whose bytes render the same way. Raw bytes decide both commentlint: allow(JUDGE)
+/// directions exactly, so neither twin needs conservative treatment: a commentlint: allow(JUDGE)
+/// declared path — always valid UTF-8 — matches only the bytes it really is. commentlint: allow(JUDGE)
 fn entry_overlaps(entry: &DirtyEntry, declared: &str) -> bool {
-    match entry.path_encoding {
-        PathEncoding::Utf8 => paths_overlap(&entry.path, declared),
-        PathEncoding::LossyWithDigest => {
-            // An unreadable declaration is no evidence the entry is unrelated.
-            let Some(declared) = canonical_declared_path(declared) else {
-                return true;
-            };
-            is_under(entry.path.as_str(), declared.as_ref())
-        }
-    }
+    // An unreadable declaration is no evidence the entry is unrelated.
+    let Some(declared) = canonical_declared_path(declared) else {
+        return true;
+    };
+    paths_overlap(&entry.raw_path, declared.as_ref().as_bytes())
 }
 
 /// Digest over every non-snapshot input that can change the verdict, so a

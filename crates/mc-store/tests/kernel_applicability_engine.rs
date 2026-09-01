@@ -12,7 +12,7 @@ use git_fixtures::{
 use mc_store::kernel::applicability::{
     capture_anchor_representation, snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine,
     ApplicabilityState, BatchEvaluation, CheckSpec, CheckoutSnapshot, EvalBudget,
-    ObjectApplicabilitySpec,
+    ObjectApplicabilitySpec, CANDIDATE_WINDOW, MAX_CONFIG_BYTES,
 };
 use mc_store::kernel::{
     encode_anchor_captures, AnchorRowSpec, Dimension, QueryContext, ScopeMatchContext,
@@ -2286,4 +2286,198 @@ fn window_walk_uncertainty_from_an_absent_commit_is_not_cached() {
     );
     assert_eq!(batch.stats.object_cache_hits, 0);
     assert_ne!(batch.objects[0].state, ApplicabilityState::Uncertain);
+}
+
+/// A rendering cannot say where loss occurred, so a rendered ancestor
+/// component aliases every directory whose bytes render the same way. Overlap
+/// must compare the bytes the repository holds, not the rendering.
+#[cfg(unix)]
+#[test]
+fn a_rendered_ancestor_component_does_not_alias_a_utf8_directory() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+
+    // `src/<0xff>/file`: the invalid byte is an interior component, so the
+    // rendering carries a replacement character before its final component.
+    std::fs::create_dir(workdir.join(std::ffi::OsStr::from_bytes(b"src/\xff"))).unwrap();
+    std::fs::write(
+        workdir.join(std::ffi::OsStr::from_bytes(b"src/\xff/file")),
+        "bytes\n",
+    )
+    .unwrap();
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert!(
+        snapshot
+            .dirty_entries()
+            .iter()
+            .any(|entry| entry.raw_path == b"src/\xff/file"),
+        "the byte-named file must be the recorded dirty entry"
+    );
+
+    // A directory literally named with the replacement character can coexist
+    // with the byte-named one, so declaring it must not gate this object.
+    let declared = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(vec!["src/\u{fffd}".to_string()], vec![]).encode(),
+        ),
+        ..candidate("object-rendered-ancestor")
+    };
+    let batch = engine_batch(&snapshot, &declared);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::Current,
+        "a rendered ancestor component aliased a distinct UTF-8 directory"
+    );
+
+    // The genuine ancestor still gates it, so the rule above did not disable
+    // prefix overlap wholesale.
+    let real_ancestor = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec!["src".to_string()], vec![]).encode()),
+        ..candidate("object-real-ancestor")
+    };
+    let batch = engine_batch(&snapshot, &real_ancestor);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+}
+
+/// A config file whose size is exactly the cap is within it. Reading one byte
+/// past the cap to detect overflow must not reject the boundary itself.
+#[test]
+fn a_config_file_at_the_size_cap_is_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+
+    let key = "flag = true\n";
+    let padding = usize::try_from(MAX_CONFIG_BYTES).unwrap() - key.len();
+    let mut content = String::with_capacity(padding + key.len());
+    content.push_str(key);
+    content.push_str(&"#\n".repeat(padding / 2));
+    while (content.len() as u64) < MAX_CONFIG_BYTES {
+        content.push('\n');
+    }
+    assert_eq!(content.len() as u64, MAX_CONFIG_BYTES);
+    write_worktree_file(&fixture.repo, "config.toml", &content);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "config.toml".to_string(),
+                    key: "flag".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-config-at-cap")
+    };
+    let batch = engine_batch(&snapshot, &checked);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::Current,
+        "a config file exactly at the cap was rejected: {}",
+        batch.objects[0].evidence
+    );
+}
+
+/// The probe that detects truncation advances the walk once more, and that
+/// advance fails the same way the scan does. Recording only truncation leaves
+/// the resulting uncertainty cacheable under a key no input distinguishes.
+#[test]
+fn truncation_probe_failure_from_an_absent_commit_is_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    // One commit deeper than the window, so the scan reads CANDIDATE_WINDOW
+    // entries and only the probe advance reaches the commit removed below.
+    let mut chain = Vec::with_capacity(CANDIDATE_WINDOW + 2);
+    let mut parents: Vec<gix::ObjectId> = Vec::new();
+    for seq in 0..CANDIDATE_WINDOW + 2 {
+        let commit = commit_snapshot(
+            &fixture.repo,
+            "main",
+            &parents,
+            &[("src/lib.rs", &format!("pub fn a{seq}() {{}}\n"))],
+            "chain",
+            i64::try_from(seq).unwrap() + 1,
+        );
+        parents = vec![commit];
+        chain.push(commit);
+    }
+    let tip = *chain.last().unwrap();
+    let rewritten = commit_snapshot(
+        &fixture.repo,
+        "side",
+        &[tip],
+        &[("src/lib.rs", "pub fn rewritten() {}\n")],
+        "rewritten",
+        i64::try_from(CANDIDATE_WINDOW).unwrap() + 3,
+    );
+    // The patch rung diffs each candidate against its parent, which would read
+    // the very commit removed below; the tree rung reads candidates alone, so a
+    // tree-only capture leaves the probe advance as the sole reader of it.
+    let mut capture =
+        capture_anchor_representation(&fixture.repo, rewritten, &EvalBudget::unbounded())
+            .expect("capture builds");
+    capture.patch_id = None;
+    let anchored = ApplicabilityCandidate {
+        anchor: Some(AnchorRowSpec {
+            anchor_id: "anchor-rewritten".to_string(),
+            anchor_kind: "reachable_from".to_string(),
+            reachable_from_oid: Some(rewritten.to_string()),
+            payload: Some(encode_anchor_captures(&[capture])),
+            ..AnchorRowSpec::default()
+        }),
+        ..candidate("object-truncation-probe")
+    };
+    let snapshot = checkout(&fixture, tip);
+
+    // Depth CANDIDATE_WINDOW from HEAD: past the scan, exactly at the probe.
+    let probe_target = chain[chain.len() - 1 - CANDIDATE_WINDOW];
+    let hex = probe_target.to_string();
+    let loose = fixture
+        .repo
+        .git_dir()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    let saved = std::fs::read(&loose).expect("the probe target is a loose object");
+    std::fs::remove_file(&loose).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    for round in 0..2 {
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            std::slice::from_ref(&anchored),
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+        assert_eq!(
+            batch.stats.object_cache_hits, 0,
+            "round {round} served a verdict resting on an unreadable probe"
+        );
+        assert_eq!(batch.stats.anchor_cache_hits, 0);
+        assert!(!batch.objects[0].append_pending);
+    }
+
+    std::fs::write(&loose, saved).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&anchored),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
 }

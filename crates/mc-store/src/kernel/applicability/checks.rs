@@ -174,7 +174,12 @@ fn read_bounded(snapshot: &CheckoutSnapshot, path: &str) -> ConfigRead {
         Err(error) => return ConfigRead::Unevaluated(error.to_string()),
     }
     let mut content = String::new();
-    match file.take(MAX_CONFIG_BYTES).read_to_string(&mut content) {
+    // Metadata size can race file growth and does not always bound the stream,
+    // so `MAX_CONFIG_BYTES` is enforced on bytes read.
+    match file.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut content) {
+        Ok(_) if content.len() as u64 > MAX_CONFIG_BYTES => {
+            ConfigRead::Unevaluated(format!("file exceeds {MAX_CONFIG_BYTES} bytes"))
+        }
         Ok(_) => ConfigRead::Content(Arc::from(content)),
         Err(error) => ConfigRead::Unevaluated(error.to_string()),
     }
