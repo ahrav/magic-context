@@ -7,7 +7,7 @@ mod durable_fs;
 mod envelope;
 mod facts;
 mod object_write;
-mod open;
+pub(crate) mod open;
 mod outbox;
 mod redaction;
 mod retention;

@@ -30,7 +30,8 @@ use super::payloads::{
     OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
     OBSERVATION_KIND_UNCERTAIN,
 };
-use super::resolve::{GitConditionOutcome, ResolutionLadder};
+use super::repair::AppendOutcome;
+use super::resolve::{GitConditionOutcome, ResolutionLadder, PATCH_ID_ALGORITHM};
 
 /// Applicability state of one object at one checkout. Everything except
 /// `Current` is blocked from auto-injection and reachable only through an
@@ -69,6 +70,22 @@ impl ApplicabilityState {
 
     pub fn blocks_auto_injection(self) -> bool {
         self != Self::Current
+    }
+
+    /// The durable applicability append stores this observation kind.
+    /// Inverse of [`Self::label`], so a stored label and its observation kind
+    /// are checked against one mapping rather than a naming convention.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "current" => Some(Self::Current),
+            "historical" => Some(Self::Historical),
+            "out_of_scope" => Some(Self::OutOfScope),
+            "uncertain" => Some(Self::Uncertain),
+            "dirty_tree_uncertain" => Some(Self::DirtyTreeUncertain),
+            "stale" => Some(Self::Stale),
+            "lifecycle_invalidated" => Some(Self::LifecycleInvalidated),
+            _ => None,
+        }
     }
 
     pub fn observation_kind(self) -> &'static str {
@@ -124,6 +141,10 @@ pub struct ObjectApplicability {
     pub failed_check: Option<FailedCheck>,
     pub append_pending: bool,
     pub token: ClassificationToken,
+    /// Outcome of the durable append this request attempted, or `None` when
+    /// repair did not touch the object. Carried here rather than in a parallel
+    /// collection keyed by object id, which callers had to re-correlate.
+    pub append: Option<AppendOutcome>,
 }
 
 /// Cache and repo-access counters for one batch; the zero-IO-on-hit
@@ -605,6 +626,7 @@ impl ApplicabilityEngine {
                         && !cached.query_local
                         && !cached.append_confirmed,
                     token: ClassificationToken(key),
+                    append: None,
                 });
                 continue;
             }
@@ -860,7 +882,7 @@ impl ApplicabilityEngine {
             row_fingerprint: anchor_row_fingerprint(anchor),
             head: snapshot.head().to_string(),
             repository_state: snapshot.repository_state().to_string(),
-            patch_id_algorithm: super::resolve::PATCH_ID_ALGORITHM,
+            patch_id_algorithm: PATCH_ID_ALGORITHM,
         };
         let outcome = if let Some(outcome) = batch_anchor_memo.get(&key) {
             *outcome
@@ -972,6 +994,7 @@ impl ObjectApplicability {
                 check_observations: [0; 32],
                 scoped_dirty_fingerprint: [0; 32],
             })),
+            append: None,
         }
     }
 }
@@ -1039,6 +1062,7 @@ fn finished(
         failed_check: classification.failed_check,
         append_pending: append_pending && classification.state.blocks_auto_injection(),
         token,
+        append: None,
     }
 }
 

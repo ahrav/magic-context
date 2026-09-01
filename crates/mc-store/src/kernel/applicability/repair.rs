@@ -10,8 +10,6 @@
 //! auto-inject again.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -23,7 +21,7 @@ use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::engine::{ApplicabilityEngine, ApplicabilityState, ObjectApplicability};
 use super::payloads::{
     checkout_identity_digest, ApplicabilityObservationPayload, DEPENDENCY_KIND_TARGET,
-    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
+    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT,
 };
 use super::resolve::PATCH_ID_ALGORITHM;
 
@@ -64,6 +62,10 @@ pub enum AppendOutcome {
     Discarded,
     /// The evaluation deadline expired before the writer could commit.
     DeadlineMissed,
+    /// The receipt for this repair replayed, but no live record carries its
+    /// identity. Receipts are immutable while observations can be retired or
+    /// corrected, so a replay is not by itself proof the record exists.
+    ReceiptWithoutRecord,
 }
 
 /// Repair intent built outside any transaction from snapshot evidence.
@@ -79,6 +81,11 @@ pub struct RepairIntent {
     observed_at: i64,
     actor: String,
     head: String,
+    checkout_digest: String,
+    /// Repair generation the identity was derived from. Revalidated inside the
+    /// commit, so a repair built against an older reduction cannot overwrite a
+    /// newer one that landed while this one waited for the writer.
+    generation: i64,
 }
 
 impl RepairIntent {
@@ -94,9 +101,13 @@ impl RepairIntent {
         actor: &str,
         observed_at: i64,
     ) -> Option<Self> {
+        // Which states append is a policy decision; what kind each one carries
+        // is not. A state added later defaults to not appending, which is the
+        // safe side, and its kind still comes from the one mapping.
         let kind = match object.state {
-            ApplicabilityState::Stale => OBSERVATION_KIND_STALE,
-            ApplicabilityState::Current => OBSERVATION_KIND_CURRENT,
+            ApplicabilityState::Stale | ApplicabilityState::Current => {
+                object.state.observation_kind()
+            }
             _ => return None,
         };
         // Canonical JSON, not `Debug`: the digest is hashed into a durably
@@ -129,9 +140,11 @@ impl RepairIntent {
         // repeat when a checkout returns to a state it already failed at, and
         // the generation is what distinguishes that re-failure from the
         // pre-clear one.
+        let generation = generation_for(block, kind);
         let mut key = Sha256::new();
         key.update(b"mc-applicability-repair-v1\0");
         for part in [
+            &generation.to_string(),
             object.object_id.as_str(),
             &object.object_revision.to_string(),
             snapshot.identity(),
@@ -140,7 +153,6 @@ impl RepairIntent {
             kind,
             &check_digest,
             PATCH_ID_ALGORITHM,
-            &generation_for(block, kind).to_string(),
         ] {
             key.update(part.as_bytes());
             key.update(b"\0");
@@ -162,6 +174,8 @@ impl RepairIntent {
             observed_at,
             actor: actor.to_string(),
             head: snapshot.head().to_string(),
+            checkout_digest: payload.checkout_identity_digest.clone(),
+            generation,
         })
     }
 
@@ -205,6 +219,47 @@ impl RepairIntent {
             sensitivity: target.sensitivity,
         }
     }
+}
+
+/// Re-derives the repair generation from inside the commit transaction, so it
+/// reflects every observation committed since the intent was built.
+fn reduced_generation(
+    tx: &rusqlite::Transaction<'_>,
+    intent: &RepairIntent,
+    budget: &EvalBudget,
+) -> Result<i64, KernelError> {
+    let tip: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(scan_error)?;
+    // This scan runs while the writer is held, so it carries the request's
+    // budget and the same interrupt the reader path installs: its `ORDER BY`
+    // sorts before yielding a row, and the row poll cannot reach that sort.
+    let limit = budget.acquire_limit();
+    tx.progress_handler(BLOCK_SCAN_PROGRESS_STEPS, Some(move || limit.should_stop()))
+        .map_err(|_| KernelError::Io)?;
+    let mut states = HashMap::new();
+    let scanned = reduce_chunk(
+        tx,
+        &[intent.object_id.as_str()],
+        &intent.checkout_digest,
+        tip,
+        budget,
+        &mut states,
+    );
+    // Cleared before the commit continues on this connection.
+    let _ = tx.progress_handler(0, None::<fn() -> bool>);
+    scanned?;
+    Ok(match states.get(&intent.object_id) {
+        Some(BlockState::Recorded(block)) => block.generation_for(intent.kind),
+        // An unreadable record leaves the generation underivable, which cannot
+        // match the one this repair was built from.
+        Some(BlockState::Unreadable) => -1,
+        None => 0,
+    })
 }
 
 /// The classified object's domain and sensitivity, read from the registry
@@ -297,19 +352,36 @@ pub fn commit_read_repair(
         if target.source_revision != intent.object_revision {
             return Err(KernelError::Conflict);
         }
+        // A concurrent repair for a newer snapshot can land while this one waits
+        // for the writer. Inserting anyway would make the older evidence the
+        // latest record and lift the newer block.
+        if reduced_generation(envelope.tx, intent, budget)? != intent.generation {
+            return Err(KernelError::Conflict);
+        }
         Ok(envelope
             .insert_observation(intent.observation_spec(&target))?
             .result_json())
     };
     // `commit` blocks for the writer without a timeout, which would let a
-    // near-deadline retrieval wait out its own bound and only then report
-    // `DeadlineMissed`.
-    let result = match budget.deadline() {
-        Some(deadline) => store.commit_before(deadline, commit_intent, operation),
-        None => store.commit(commit_intent, operation),
-    };
+    // bounded retrieval wait out its own bound and only then report
+    // `DeadlineMissed`. An interrupt-only budget needs the same treatment: its
+    // flag is the whole cancellation mechanism.
+    let result = store.commit_within(&budget.acquire_limit(), commit_intent, operation);
     match result {
         Ok(receipt) => {
+            // A replay asserts the effect already landed, which retirement or
+            // correction can have undone since. Verified before the verdict is
+            // reported as durable.
+            if receipt.replayed {
+                match store.replayed_repair_is_current(intent, budget) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(AppendOutcome::ReceiptWithoutRecord),
+                    // Cancellation stays a report outcome rather than becoming a
+                    // store error, as it does on the writer side.
+                    Err(KernelError::Deadline) => return Ok(AppendOutcome::DeadlineMissed),
+                    Err(error) => return Err(error),
+                }
+            }
             // A dropped confirmation is safe: an evicted entry misses on the
             // next evaluation, which re-derives the verdict and re-appends.
             let _ = engine.confirm_durable_append(&object.token);
@@ -335,6 +407,14 @@ pub struct InjectionBlock {
     /// Commit sequence of the newest observation whose kind differs from
     /// `observation_kind`, or 0 when this kind is the only one recorded.
     pub prior_kind_commit_seq: i64,
+    /// Newest commit sequence at which an applicability observation for this
+    /// (object, checkout) was invalidated, or 0 when none was.
+    ///
+    /// Retiring or correcting a record removes it from the reduction while its
+    /// commit receipt stays, so without this a replacement repair would derive
+    /// the retired record's identity and replay that receipt instead of
+    /// inserting anything.
+    pub invalidated_commit_seq: i64,
     /// Dedup identity of the repair that wrote the latest observation, which is
     /// its `source_id`. A repair whose identity equals this one is already
     /// recorded; one that differs describes a checkout state this record does
@@ -350,17 +430,46 @@ impl InjectionBlock {
     /// the receipt replays. Failing again after a clearing observation crosses commentlint: allow(JUDGE)
     /// a kind change, which advances the generation, so the dedup key differs commentlint: allow(JUDGE)
     /// from the pre-clear repair rather than replaying it. commentlint: allow(JUDGE)
+    /// A reduction whose records were all invalidated: nothing blocks, but the
+    /// generation has moved past the identity those records carried.
+    fn invalidated(invalidated_commit_seq: i64) -> Self {
+        Self {
+            observation_kind: String::new(),
+            commit_seq: 0,
+            blocked: false,
+            prior_kind_commit_seq: 0,
+            invalidated_commit_seq,
+            repair_identity: String::new(),
+        }
+    }
+
     pub fn generation_for(&self, kind: &str) -> i64 {
-        if self.observation_kind == kind {
+        let transition = if self.observation_kind == kind {
             self.prior_kind_commit_seq
         } else {
             self.commit_seq
-        }
+        };
+        transition.max(self.invalidated_commit_seq)
     }
 }
 
 fn generation_for(block: Option<&InjectionBlock>, kind: &str) -> i64 {
     block.map_or(0, |block| block.generation_for(kind))
+}
+
+/// What the reducer could establish for one object at one checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockState {
+    /// Latest applicability observation for this (object, checkout).
+    Recorded(InjectionBlock),
+    /// A row this build cannot read: an undecodable payload, an absent detail,
+    /// an unexpected schema tag, or a payload state disagreeing with its kind.
+    ///
+    /// An unreadable row cannot be attributed to a checkout, so it may be this
+    /// object's newest record and skipping it would lift a block. The object
+    /// therefore fails closed on its own, rather than the read failing for
+    /// every object sharing the batch.
+    Unreadable,
 }
 
 /// One object's reduction while the DESC scan walks its rows.
@@ -370,15 +479,24 @@ enum Reduction {
     /// Latest found; waiting for the newest row of a differing kind.
     PriorKind(InjectionBlock),
     Done(InjectionBlock),
+    Unreadable,
 }
 
 impl Reduction {
-    fn finish(self) -> Option<InjectionBlock> {
+    fn finish(self) -> Option<BlockState> {
         match self {
             Self::Latest => None,
-            Self::PriorKind(block) | Self::Done(block) => Some(block),
+            Self::PriorKind(block) | Self::Done(block) => Some(BlockState::Recorded(block)),
+            Self::Unreadable => Some(BlockState::Unreadable),
         }
     }
+}
+
+/// Whether one scanned row describes the checkout under reduction.
+enum RowMatch {
+    Matches,
+    OtherCheckout,
+    Unreadable,
 }
 
 /// Rows scanned between budget polls. The scan is index-driven and stops at
@@ -410,6 +528,40 @@ fn scan_error(error: rusqlite::Error) -> KernelError {
 const BLOCK_SCAN_ID_CHUNK: usize = 512;
 
 impl KernelStore {
+    /// Whether the durable reduction for this repair's (object, checkout) is
+    /// still the record this repair would have written.
+    ///
+    /// A replay skips the commit closure, so none of its revalidation ran. An
+    /// existence check on `source_id` is not enough either: `correct_observation`
+    /// requires a successor to preserve the source identity, so a corrected row
+    /// with a different kind, payload, or dependency target satisfies it. Both
+    /// the identity and the kind are compared, and a successor whose payload or
+    /// dependency moved is not in this checkout's reduction at all.
+    ///
+    /// Defense in depth behind the generation: retiring or correcting a record
+    /// records an invalidation, which moves the generation and produces a fresh
+    /// identity, so a repair does not reach a replay at all through those routes.
+    /// This catches a record that disappears without one.
+    fn replayed_repair_is_current(
+        &self,
+        intent: &RepairIntent,
+        budget: &EvalBudget,
+    ) -> Result<bool, KernelError> {
+        let (_, states) = self.reduce_digest_states(
+            &[intent.object_id.as_str()],
+            &intent.checkout_digest,
+            None,
+            budget,
+        )?;
+        Ok(match states.get(&intent.object_id) {
+            Some(BlockState::Recorded(block)) => {
+                block.repair_identity == intent.operation_key
+                    && block.observation_kind == intent.kind
+            }
+            Some(BlockState::Unreadable) | None => false,
+        })
+    }
+
     /// Derives the injection block for `object_id` at `checkout_identity`
     /// from durable observations: latest applicability observation wins;
     /// no observation means no recorded block. `known_as_of` beyond the
@@ -423,13 +575,19 @@ impl KernelStore {
         if known_as_of < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let mut states = self.reduce_block_states(
+        let (_, mut states) = self.reduce_block_states(
             &[object_id],
             checkout_identity,
             Some(known_as_of),
             &EvalBudget::unbounded(),
         )?;
-        Ok(states.remove(object_id))
+        match states.remove(object_id) {
+            Some(BlockState::Recorded(block)) => Ok(Some(block)),
+            // One object is the whole scope here, so an unreadable row is this
+            // caller's failure to report.
+            Some(BlockState::Unreadable) => Err(KernelError::CorruptCanonicalRow),
+            None => Ok(None),
+        }
     }
 
     /// Batched reducer over `object_ids` at the committed tip, for the repair
@@ -443,8 +601,41 @@ impl KernelStore {
         object_ids: &[&str],
         checkout_identity: &str,
         budget: &EvalBudget,
-    ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+    ) -> Result<HashMap<String, BlockState>, KernelError> {
+        Ok(self
+            .applicability_block_states_as_of_tip(object_ids, checkout_identity, budget)?
+            .1)
+    }
+
+    /// The reduction plus the commit sequence it read at.
+    ///
+    /// A caller that decides something from the reduction and then acts without
+    /// a transaction can compare that sequence against the tip: an unchanged tip
+    /// proves no commit landed in between, so the reduction is still current.
+    pub fn applicability_block_states_as_of_tip(
+        &self,
+        object_ids: &[&str],
+        checkout_identity: &str,
+        budget: &EvalBudget,
+    ) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
         self.reduce_block_states(object_ids, checkout_identity, None, budget)
+    }
+
+    /// The committed tip, for fencing a decision taken from a reduction.
+    pub fn applicability_tip(&self, budget: &EvalBudget) -> Result<i64, KernelError> {
+        // Bounded like every other read on this path: an occupied pool must not
+        // outlast the caller's own bound.
+        if budget.is_exhausted() {
+            return Err(KernelError::Deadline);
+        }
+        let reader = self.lock_reader_within(&budget.acquire_limit())?;
+        reader
+            .query_row(
+                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| KernelError::Io)
     }
 
     /// `known_as_of` of `None` reads the committed tip inside the same
@@ -455,40 +646,54 @@ impl KernelStore {
         checkout_identity: &str,
         known_as_of: Option<i64>,
         budget: &EvalBudget,
-    ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+    ) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
+        // Hashed once for the whole scan: the payload stores the digest, not the
+        // identity, so the redactor cannot rewrite one side of the comparison.
+        self.reduce_digest_states(
+            object_ids,
+            &checkout_identity_digest(checkout_identity),
+            known_as_of,
+            budget,
+        )
+    }
+
+    /// `reduce_block_states` for a caller that already holds the digest.
+    fn reduce_digest_states(
+        &self,
+        object_ids: &[&str],
+        checkout_digest: &str,
+        known_as_of: Option<i64>,
+        budget: &EvalBudget,
+    ) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
         if object_ids.is_empty() {
-            return Ok(HashMap::new());
+            return Ok((0, HashMap::new()));
+        }
+        // Cancellation already raised: the progress handler below fires on a
+        // virtual-machine step boundary, which a small scan can finish without
+        // reaching, so work the budget has cancelled does not start.
+        if budget.is_exhausted() {
+            return Err(KernelError::Deadline);
         }
         // `lock_reader` blocks on `Mutex::lock`, which would let a concurrent
-        // reader hold this evaluation past its deadline before the scan reaches
-        // its first poll.
-        let mut reader = match budget.deadline() {
-            Some(deadline) => self.lock_reader_before(deadline)?,
-            None => self.lock_reader()?,
-        };
-        let deadline = budget.deadline();
-        if deadline.is_some() || budget.is_exhausted() {
-            let interrupt = budget.interrupt_flag();
-            reader
-                .progress_handler(
-                    BLOCK_SCAN_PROGRESS_STEPS,
-                    Some(move || {
-                        if interrupt.load(Ordering::Relaxed) {
-                            return true;
-                        }
-                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                            interrupt.store(true, Ordering::Relaxed);
-                            return true;
-                        }
-                        false
-                    }),
-                )
-                .map_err(|_| KernelError::Io)?;
-        }
+        // reader hold this evaluation past its own bound before the scan reaches
+        // its first poll. A budget with no deadline still cancels through its
+        // interrupt, so both travel in the limit.
+        let limit = budget.acquire_limit();
+        let mut reader = self.lock_reader_within(&limit)?;
+        // Installed for every budget, not only for a deadline: an interrupt
+        // raised after the scan starts has to stop it too, and the sort runs
+        // before the first row reaches the row-loop poll.
+        let scan_limit = limit.clone();
+        reader
+            .progress_handler(
+                BLOCK_SCAN_PROGRESS_STEPS,
+                Some(move || scan_limit.should_stop()),
+            )
+            .map_err(|_| KernelError::Io)?;
         let scanned = reduce_with_reader(
             &mut reader,
             object_ids,
-            checkout_identity,
+            checkout_digest,
             known_as_of,
             budget,
         );
@@ -504,10 +709,10 @@ impl KernelStore {
 fn reduce_with_reader(
     reader: &mut rusqlite::Connection,
     object_ids: &[&str],
-    checkout_identity: &str,
+    checkout_digest: &str,
     known_as_of: Option<i64>,
     budget: &EvalBudget,
-) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
     let mut states = HashMap::new();
     let tx = reader
         .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -524,18 +729,33 @@ fn reduce_with_reader(
         Some(requested) => requested,
         None => tip,
     };
-    // Hashed once for the whole scan: the payload stores the digest, not the
-    // identity, so the redactor cannot rewrite one side of the comparison.
-    let digest = checkout_identity_digest(checkout_identity);
     for chunk in object_ids.chunks(BLOCK_SCAN_ID_CHUNK) {
-        reduce_chunk(&tx, chunk, &digest, known_as_of, budget, &mut states)?;
+        reduce_chunk(
+            &tx,
+            chunk,
+            checkout_digest,
+            known_as_of,
+            budget,
+            &mut states,
+        )?;
     }
     tx.commit().map_err(scan_error)?;
-    Ok(states)
+    Ok((known_as_of, states))
 }
 
 /// Scans one chunk newest-first, stopping each object at its newest kind
-/// change. Rows decode as the scan streams them. Collecting the chunk first
+/// change.
+///
+/// Rows sharing a commit sequence order by their change-event ordinal, which is
+/// insertion order. Ordering them by identifier would let one commit that writes
+/// both a clearing and a stale observation for the same target resolve to
+/// whichever identifier sorts higher rather than to the one written last.
+///
+/// The verdict settles at an object's newest kind change, but the scan walks the
+/// rest of that object's applicability history, because an older row can carry a
+/// newer invalidation. The budget poll and the progress handler bound that walk,
+/// and the dedup identity keeps the history proportional to distinct failing
+/// checkout states rather than to evaluation count. Rows decode as the scan streams them. Collecting the chunk first
 /// would materialize every historical payload for every identifier before a
 /// single one is inspected.
 fn reduce_chunk(
@@ -544,24 +764,34 @@ fn reduce_chunk(
     checkout_digest: &str,
     known_as_of: i64,
     budget: &EvalBudget,
-    states: &mut HashMap<String, InjectionBlock>,
+    states: &mut HashMap<String, BlockState>,
 ) -> Result<(), KernelError> {
-    let placeholders = std::iter::repeat_n("?", object_ids.len())
+    // Numbered, not bare `?`: SQLite assigns a bare placeholder one more than
+    // the largest index seen so far, so an explicitly numbered parameter earlier
+    // in the statement would renumber this list.
+    let placeholders = (1..=object_ids.len())
+        .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(",");
     let mut statement = tx
         .prepare(&format!(
             "SELECT d.dependency_object_id, o.observation_kind, o.observation_payload,
-                    o.created_commit_seq, r.source_id
+                    o.created_commit_seq, r.source_kind, r.source_id,
+                    CASE
+                        WHEN o.invalidated_commit_seq <= ?{as_of}
+                        THEN o.invalidated_commit_seq
+                    END
              FROM observation_dependencies d
              JOIN observations o ON o.observation_id = d.observation_id
              JOIN object_registry r ON r.object_id = o.object_id
+             LEFT JOIN change_event e
+                 ON e.object_id = o.object_id AND e.commit_seq = o.created_commit_seq
              WHERE d.dependency_object_id IN ({placeholders})
                AND d.dependency_kind = ?{kind}
                AND o.observation_kind LIKE 'applicability.%'
                AND o.created_commit_seq <= ?{as_of}
-               AND (o.invalidated_commit_seq IS NULL OR ?{as_of} < o.invalidated_commit_seq)
-             ORDER BY d.dependency_object_id, o.created_commit_seq DESC, o.observation_id DESC",
+             ORDER BY d.dependency_object_id, o.created_commit_seq DESC,
+                      COALESCE(e.ordinal, 0) DESC, o.observation_id DESC",
             kind = object_ids.len() + 1,
             as_of = object_ids.len() + 2,
         ))
@@ -572,10 +802,14 @@ fn reduce_chunk(
     }
     bound.push(&DEPENDENCY_KIND_TARGET);
     bound.push(&known_as_of);
+    if budget.is_exhausted() {
+        return Err(KernelError::Deadline);
+    }
     let mut rows = statement
         .query(rusqlite::params_from_iter(bound))
         .map_err(scan_error)?;
     let mut pending: HashMap<String, Reduction> = HashMap::new();
+    let mut invalidations: HashMap<String, i64> = HashMap::new();
     let mut scanned = 0usize;
     while let Some(row) = rows.next().map_err(scan_error)? {
         scanned += 1;
@@ -583,14 +817,66 @@ fn reduce_chunk(
             return Err(KernelError::Deadline);
         }
         let object_id: String = row.get(0).map_err(scan_error)?;
-        if matches!(pending.get(&object_id), Some(Reduction::Done(_))) {
-            continue;
-        }
         let kind: String = row.get(1).map_err(|_| KernelError::Io)?;
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
-        let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
-        if !matches_checkout(&payload, &kind, checkout_digest)? {
+        // Only the engine's own repairs carry a repair identity. A row inserted
+        // through the generic API can hold any `source_id`, including one equal
+        // to a deterministic operation key, and treating that as a completed
+        // repair would skip the receipt and the deep-verification job.
+        let source_kind: String = row.get(4).map_err(|_| KernelError::Io)?;
+        let repair_identity: String = if source_kind == REPAIR_PRODUCER {
+            row.get(5).map_err(|_| KernelError::Io)?
+        } else {
+            String::new()
+        };
+        let invalidated: Option<i64> = row.get(6).map_err(|_| KernelError::Io)?;
+        let matched = classify_row(&payload, &kind, checkout_digest);
+        // An invalidated row is out of the reduction but still moves the
+        // generation, so a replacement repair cannot reuse its identity. Folded
+        // before the settled check below: a row older than the newest kind
+        // change can carry a newer invalidation than that change, and skipping
+        // it would understate the generation. A retired row is folded even when
+        // it cannot be decoded — it is no longer live, so it cannot be this
+        // checkout's authoritative record.
+        if let Some(invalidated) = invalidated {
+            if !matches!(matched, RowMatch::OtherCheckout) {
+                invalidations
+                    .entry(object_id)
+                    .and_modify(|newest| *newest = (*newest).max(invalidated))
+                    .or_insert(invalidated);
+            }
+            continue;
+        }
+        match matched {
+            RowMatch::Matches => {}
+            RowMatch::OtherCheckout => continue,
+            RowMatch::Unreadable => {
+                // Newest-first: once a matching row is found, an older
+                // unreadable one cannot be this checkout's latest record, so the
+                // verdict stands. Its kind is unknown, so it ends the search for
+                // the transition and bounds the generation from above — the
+                // identity a later repair derives cannot collide with one from
+                // before this row.
+                let settled = match pending.remove(&object_id) {
+                    Some(Reduction::PriorKind(block)) => Reduction::Done(InjectionBlock {
+                        prior_kind_commit_seq: commit_seq,
+                        ..block
+                    }),
+                    Some(settled @ (Reduction::Done(_) | Reduction::Unreadable)) => settled,
+                    // No matching row yet, so this may be the latest one.
+                    Some(Reduction::Latest) | None => Reduction::Unreadable,
+                };
+                pending.insert(object_id, settled);
+                continue;
+            }
+        }
+        // The verdict stops at the newest kind change; the scan continues so
+        // older invalidations still reach the generation.
+        if matches!(
+            pending.get(&object_id),
+            Some(Reduction::Done(_) | Reduction::Unreadable)
+        ) {
             continue;
         }
         let entry = pending.entry(object_id).or_insert(Reduction::Latest);
@@ -600,6 +886,7 @@ fn reduce_chunk(
                 observation_kind: kind,
                 commit_seq,
                 prior_kind_commit_seq: 0,
+                invalidated_commit_seq: 0,
                 repair_identity,
             }),
             Reduction::PriorKind(block) if block.observation_kind == kind => {
@@ -609,49 +896,64 @@ fn reduce_chunk(
                 prior_kind_commit_seq: commit_seq,
                 ..block
             }),
-            done @ Reduction::Done(_) => done,
+            settled @ (Reduction::Done(_) | Reduction::Unreadable) => settled,
         };
     }
     for (object_id, reduction) in pending {
-        if let Some(block) = reduction.finish() {
-            states.insert(object_id, block);
+        let Some(mut state) = reduction.finish() else {
+            continue;
+        };
+        if let BlockState::Recorded(block) = &mut state {
+            block.invalidated_commit_seq =
+                invalidations.get(&object_id).copied().unwrap_or_default();
         }
+        states.insert(object_id, state);
+    }
+    // An object whose only records were invalidated still carries a generation,
+    // so a replacement repair does not reuse a retired identity.
+    for (object_id, invalidated) in invalidations {
+        states
+            .entry(object_id)
+            .or_insert_with(|| BlockState::Recorded(InjectionBlock::invalidated(invalidated)));
     }
     Ok(())
 }
 
-/// A payload that does not decode fails the read. Skipping to an older row
-/// would reduce a corrupt latest record to an older `applicability.current`,
-/// or to no block at all, and let a failing object auto-inject.
+/// An unreadable row is not skipped to an older one: doing so would reduce a
+/// corrupt latest record to an older `applicability.current`, or to no block at
+/// all, and let a failing object auto-inject.
 ///
 /// `blocked` comes from the outer observation kind, so a row whose payload
-/// records a different state than that kind is rejected rather than trusted.
-/// The generic `insert_observation` API accepts any kind with any payload, and
-/// such a row would otherwise clear a real block.
-fn matches_checkout(
+/// records a different state than that kind counts as unreadable rather than
+/// trusted. The generic `insert_observation` API accepts any kind with any
+/// payload, and such a row would otherwise clear a real block.
+fn classify_row(
     payload: &[u8],
     observation_kind: &str,
     checkout_identity_digest: &str,
-) -> Result<bool, KernelError> {
-    let payload = serde_json::from_slice::<ObservationPayload>(payload)
-        .map_err(|_| KernelError::CorruptCanonicalRow)?;
-    let Some(detail) = payload.detail.as_deref() else {
-        return Err(KernelError::CorruptCanonicalRow);
+) -> RowMatch {
+    let Ok(payload) = serde_json::from_slice::<ObservationPayload>(payload) else {
+        return RowMatch::Unreadable;
     };
-    let detail = serde_json::from_str::<ApplicabilityObservationPayload>(detail)
-        .map_err(|_| KernelError::CorruptCanonicalRow)?;
+    let Some(detail) = payload.detail.as_deref() else {
+        return RowMatch::Unreadable;
+    };
+    let Ok(detail) = serde_json::from_str::<ApplicabilityObservationPayload>(detail) else {
+        return RowMatch::Unreadable;
+    };
+    let Some(state) = ApplicabilityState::from_label(&detail.state) else {
+        return RowMatch::Unreadable;
+    };
     if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA
-        || observation_kind != observation_kind_for_state(&detail.state)
+        || observation_kind != state.observation_kind()
     {
-        return Err(KernelError::CorruptCanonicalRow);
+        return RowMatch::Unreadable;
     }
-    Ok(detail.checkout_identity_digest == checkout_identity_digest)
-}
-
-/// The observation kind that carries `state`, which is the vocabulary
-/// `payloads.rs` defines: one kind per state label.
-fn observation_kind_for_state(state: &str) -> String {
-    format!("applicability.{state}")
+    if detail.checkout_identity_digest == checkout_identity_digest {
+        RowMatch::Matches
+    } else {
+        RowMatch::OtherCheckout
+    }
 }
 
 #[cfg(test)]

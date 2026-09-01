@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::admission::{AdmissionKey, StoredAdmission};
+use super::open::AcquireLimit;
 use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
@@ -395,7 +396,7 @@ impl KernelStore {
         intent: CommitIntent,
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
     ) -> Result<CommitReceipt, KernelError> {
-        self.commit_inner(intent, operation, || Ok(()))
+        self.commit_inner(intent, operation, || Ok(()), None)
     }
 
     #[cfg(feature = "test-support")]
@@ -404,7 +405,7 @@ impl KernelStore {
         intent: CommitIntent,
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
     ) -> Result<CommitReceipt, KernelError> {
-        self.commit_inner(intent, operation, || Err(KernelError::Fault))
+        self.commit_inner(intent, operation, || Err(KernelError::Fault), None)
     }
 
     /// `commit` takes the writer with `Mutex::lock`, which has no timeout.
@@ -415,28 +416,34 @@ impl KernelStore {
         intent: CommitIntent,
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
     ) -> Result<CommitReceipt, KernelError> {
-        let intent = RedactedIntent::new(intent)?;
-        let transaction_id = operation_identity(&intent);
-        let mut writer = self.lock_writer_before(deadline)?;
-        commit_prepared_with_writer(
-            &mut writer,
-            self.lease_epoch(),
-            intent,
-            transaction_id,
-            operation,
-            || Ok(()),
-        )
+        self.commit_within(&AcquireLimit::until(deadline), intent, operation)
     }
 
+    /// `commit_before` for a caller carrying a cooperative interrupt as well as,
+    /// or instead of, a deadline.
+    pub(crate) fn commit_within(
+        &self,
+        limit: &AcquireLimit,
+        intent: CommitIntent,
+        operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
+    ) -> Result<CommitReceipt, KernelError> {
+        self.commit_inner(intent, operation, || Ok(()), Some(limit.clone()))
+    }
+
+    /// `limit` of `None` waits for the writer without a bound.
     fn commit_inner(
         &self,
         intent: CommitIntent,
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
         after_events: impl FnOnce() -> Result<(), KernelError>,
+        limit: Option<AcquireLimit>,
     ) -> Result<CommitReceipt, KernelError> {
         let intent = RedactedIntent::new(intent)?;
         let transaction_id = operation_identity(&intent);
-        let mut writer = self.lock_writer()?;
+        let mut writer = match &limit {
+            Some(limit) => self.lock_writer_within(limit)?,
+            None => self.lock_writer()?,
+        };
         commit_prepared_with_writer(
             &mut writer,
             self.lease_epoch(),
@@ -861,6 +868,14 @@ fn commit_prepared_with_writer(
     if let Some(error) = envelope.poisoned {
         return Err(error);
     }
+    let unconditional_changes = envelope
+        .changes
+        .iter()
+        .any(|change| ALIGNMENT_CHANGE_KINDS.contains(&change.kind));
+    let observation_inserted = envelope
+        .changes
+        .iter()
+        .any(|change| change.kind == OBSERVATION_INSERT_KIND);
     let result = redact(&result)?;
 
     let payloads = envelope
@@ -962,7 +977,11 @@ fn commit_prepared_with_writer(
         &result,
         Some(commit_seq),
     )?;
-    if commit_affects_alignment(&tx, commit_seq)? {
+    // The unconditional kinds are already decided in memory, so only a commit
+    // whose sole candidate is an observation insert pays a query.
+    let rebuild_alignment = unconditional_changes
+        || (observation_inserted && commit_affects_alignment(&tx, commit_seq)?);
+    if rebuild_alignment {
         super::slice::rebuild_alignment_tx(&tx)?;
     }
     tx.commit().map_err(map_sqlite)?;
@@ -993,7 +1012,6 @@ const ALIGNMENT_CHANGE_KINDS: &[&str] = &[
 /// Corrections and retirements stay unconditional: the superseded observation
 /// may have carried an `implements` dependency that the projection still holds.
 const OBSERVATION_INSERT_KIND: &str = "observation_insert";
-const ALIGNMENT_DEPENDENCY_KIND: &str = "implements";
 
 /// Derived from committed rows rather than from the pending changes, so the
 /// live path and the replay path in `commit_prepared_with_writer` reach the
@@ -1021,7 +1039,7 @@ fn commit_affects_alignment(tx: &Transaction<'_>, commit_seq: i64) -> Result<boo
             commit_seq,
             kinds,
             OBSERVATION_INSERT_KIND,
-            ALIGNMENT_DEPENDENCY_KIND
+            super::slice::ALIGNMENT_DEPENDENCY_KIND
         ],
         |row| row.get(0),
     )
