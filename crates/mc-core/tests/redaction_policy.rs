@@ -260,6 +260,31 @@ fn a_value_ends_at_the_same_whitespace_that_separates_it() {
         redact_durable_text("password=abc next").text,
         "password=<REDACTED:password> next"
     );
+
+    // U+0085 is Unicode `White_Space` but not whitespace to JavaScript, so it is content
+    // here. Reading the Unicode set instead of the declared one would end the value at it
+    // and publish the rest of the credential.
+    assert_eq!(
+        redact_durable_text("password=alpha\u{85}bravo").text,
+        "password=<REDACTED:password>"
+    );
+}
+
+#[test]
+fn a_key_preceded_by_a_non_ascii_word_character_keeps_its_label() {
+    // The leading word boundary is ASCII-only. A Unicode boundary does not hold between
+    // a non-ASCII word character and the key name, so the key would go unrecognised and
+    // the value would fall back to whatever less specific rule also matched it.
+    for prefix in ['\u{3c0}', '\u{4e2d}', '\u{43f}', '\u{e9}'] {
+        let input = format!("{prefix}password=production-value");
+        let redaction = redact_durable_text(&input);
+        assert_eq!(
+            redaction.detections.first().map(|d| d.secret_type.as_str()),
+            Some("password"),
+            "{input} produced {:?}",
+            redaction.text
+        );
+    }
 }
 
 #[test]
