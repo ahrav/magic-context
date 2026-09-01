@@ -895,6 +895,13 @@ fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), Sn
 /// Sparse configuration and patterns decide materialization. The shallow commentlint: allow(JUDGE)
 /// boundary decides whether an ancestry walk can reach a conclusion at all, so commentlint: allow(JUDGE)
 /// unshallowing has to move the generation. commentlint: allow(JUDGE)
+///
+/// Object availability stays out of this digest: in a partial clone a fetch
+/// materializes a missing blob without touching HEAD, the worktree, sparse commentlint: allow(JUDGE)
+/// configuration, or the shallow file, and no cheap repository read separates commentlint: allow(JUDGE)
+/// "absent" from "absent so far". A cache keyed by this generation therefore commentlint: allow(JUDGE)
+/// must not retain an outcome that an unreadable object produced; such an commentlint: allow(JUDGE)
+/// outcome is transient exactly as a budget-driven one is. commentlint: allow(JUDGE)
 fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
     let config = repo.config_snapshot();
     let mut hash = Sha256::new();
