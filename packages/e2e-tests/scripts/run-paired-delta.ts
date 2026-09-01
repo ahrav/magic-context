@@ -591,7 +591,13 @@ function armOptions(
         ? mcOffOptions()
         : armId === "compaction"
             ? naiveCompactionOptions()
-            : {};
+            /**
+             * The historian deletes its child session on success, which erases the only record of a
+             * model call the cap has to charge and the identity gate has to route-check. Retaining
+             * the child keeps it in the session tree the rollout prices from; it changes cleanup,
+             * not compaction behaviour.
+             */
+            : { magicContextConfig: { keep_subagents: true } };
     return mergeHarnessOptions(live, arm, scenario.modelContextLimit);
 }
 
