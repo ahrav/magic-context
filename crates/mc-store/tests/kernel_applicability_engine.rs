@@ -808,3 +808,186 @@ fn every_state_maps_to_a_distinct_observation_kind() {
     assert_eq!(kinds.len(), total, "observation kinds collide");
     assert!(kinds.iter().all(|kind| kind.starts_with("applicability.")));
 }
+
+#[test]
+fn unrelated_edit_preserves_cached_classifications() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let scoped_to_docs = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        payload: Some(
+            ObjectApplicabilitySpec::new(vec!["docs/README.md".to_string()], vec![]).encode(),
+        ),
+        ..candidate("object-docs")
+    };
+    let no_payload = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        ..candidate("object-no-payload")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[scoped_to_docs.clone(), no_payload.clone()],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_misses, 2);
+
+    // An edit outside both objects' declared paths must not evict either
+    // classification, even though the checkout-wide dirty state changed.
+    write_worktree_file(&fixture.repo, "notes.txt", "scratch\n");
+    let edited = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert_ne!(edited.dirty_fingerprint(), snapshot.dirty_fingerprint());
+    let batch = engine.evaluate_batch(
+        &edited,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[scoped_to_docs, no_payload],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 2);
+    assert_eq!(batch.stats.object_cache_misses, 0);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Current);
+}
+
+#[test]
+fn overlapping_edit_invalidates_the_cached_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let scoped_to_src = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        payload: Some(
+            ObjectApplicabilitySpec::new(vec!["src/lib.rs".to_string()], vec![]).encode(),
+        ),
+        ..candidate("object-src")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&scoped_to_src),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let edited = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &edited,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[scoped_to_src],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+}
+
+#[test]
+fn dirty_edit_to_a_checked_file_invalidates_the_check_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let checked = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "config.toml".to_string(),
+                    key: "flag".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-checked")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&checked),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    // Removing the key as an uncommitted edit must re-run the check rather
+    // than serve the cached Current verdict.
+    write_worktree_file(&fixture.repo, "config.toml", "other = 1\n");
+    let edited = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &edited,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+}
+
+#[test]
+fn reverting_an_overlapping_edit_restores_the_original_cache_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let original = "pub fn a() {}\npub fn b() {}\n";
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let scoped_to_src = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        payload: Some(
+            ObjectApplicabilitySpec::new(vec!["src/lib.rs".to_string()], vec![]).encode(),
+        ),
+        ..candidate("object-src")
+    };
+    engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&scoped_to_src),
+        &EvalBudget::unbounded(),
+    );
+
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let edited = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    engine.evaluate_batch(
+        &edited,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&scoped_to_src),
+        &EvalBudget::unbounded(),
+    );
+
+    write_worktree_file(&fixture.repo, "src/lib.rs", original);
+    let reverted = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &reverted,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[scoped_to_src],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 1);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+}

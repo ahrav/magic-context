@@ -158,7 +158,7 @@ struct ObjectCacheKey {
     object_id: String,
     object_revision: i64,
     head: String,
-    dirty_fingerprint: String,
+    scoped_dirty_fingerprint: String,
     inputs_digest: String,
 }
 
@@ -226,12 +226,15 @@ impl ApplicabilityEngine {
                     }
                 }
             });
+            let payload_decode = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
+            let scoped_dirty = scoped_dirty_fingerprint(snapshot, &payload_decode);
             let token = ClassificationToken(self.object_cache_key(
                 snapshot,
                 &batch_prefix,
                 query,
                 candidate,
                 anchor_fingerprint.as_ref(),
+                scoped_dirty,
             ));
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
@@ -283,11 +286,14 @@ impl ApplicabilityEngine {
                 &mut check_cache,
                 &mut stats,
                 candidate,
+                &payload_decode,
                 budget,
             );
             stats.graph_operations += ladder.graph_operations() - graph_ops_before;
             if classification.cacheable {
-                self.object_cache.lock().expect("cache lock").insert(
+                // Binding the evicted generation frees its entries after the
+                // lock guard drops, keeping the critical section bounded.
+                let _evicted = self.object_cache.lock().expect("cache lock").insert(
                     token.0.clone(),
                     CachedClassification {
                         state: classification.state,
@@ -329,6 +335,7 @@ impl ApplicabilityEngine {
         check_cache: &mut CheckCache,
         stats: &mut EvaluationStats,
         candidate: &'batch ApplicabilityCandidate,
+        payload_decode: &PayloadDecode,
         budget: &EvalBudget,
     ) -> Classification {
         // Scope gate.
@@ -388,11 +395,11 @@ impl ApplicabilityEngine {
         }
         // Dirty-tree gate and cheap checks read the object payload.
         let mut gates_ran = candidate.scope_terms.is_some() || candidate.anchor.is_some();
-        let spec = match ObjectApplicabilitySpec::decode(candidate.payload.as_deref()) {
+        let spec = match payload_decode {
             // A payload that cannot be read leaves its declared paths and
             // checks unknown, so staleness is unknown rather than absent.
             PayloadDecode::Undecodable(evidence) => {
-                return Classification::terminal(ApplicabilityState::Uncertain, evidence);
+                return Classification::terminal(ApplicabilityState::Uncertain, evidence.clone());
             }
             PayloadDecode::Absent => None,
             PayloadDecode::Present(spec) => Some(spec),
@@ -505,7 +512,8 @@ impl ApplicabilityEngine {
                     // Budget-driven uncertainty is transient; caching it
                     // would pin a degraded verdict to this (HEAD, anchor).
                     if outcome != GitConditionOutcome::Uncertain || !ladder.budget_was_exhausted() {
-                        self.anchor_cache
+                        let _evicted = self
+                            .anchor_cache
                             .lock()
                             .expect("cache lock")
                             .insert(key, outcome);
@@ -534,13 +542,14 @@ impl ApplicabilityEngine {
         query: &QueryContext,
         candidate: &ApplicabilityCandidate,
         anchor_fingerprint: Option<&[u8; 32]>,
+        scoped_dirty_fingerprint: String,
     ) -> ObjectCacheKey {
         ObjectCacheKey {
             checkout_identity: snapshot.identity().to_string(),
             object_id: candidate.object_id.clone(),
             object_revision: candidate.object_revision,
             head: snapshot.head().to_string(),
-            dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+            scoped_dirty_fingerprint,
             inputs_digest: inputs_digest(batch_prefix, query, candidate, anchor_fingerprint),
         }
     }
@@ -704,6 +713,44 @@ fn anchor_row_fingerprint(anchor: &AnchorRowSpec) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash_anchor_row(&mut hash, anchor);
     hash.finalize().into()
+}
+
+/// Hashes dirty entries overlapping declared affected or check paths.
+fn scoped_dirty_fingerprint(snapshot: &CheckoutSnapshot, payload_decode: &PayloadDecode) -> String {
+    let spec = match payload_decode {
+        PayloadDecode::Present(spec) => spec,
+        PayloadDecode::Absent | PayloadDecode::Undecodable(_) => return String::new(),
+    };
+    fn check_path(check: &CheckSpec) -> Option<&str> {
+        match check {
+            CheckSpec::FileExists { path }
+            | CheckSpec::ConfigKey { path, .. }
+            | CheckSpec::Symbol { path, .. } => Some(path.as_str()),
+            CheckSpec::Unrecognized => None,
+        }
+    }
+    let mut hash: Option<Sha256> = None;
+    for entry in snapshot.dirty_entries() {
+        let relevant = spec
+            .affected_paths
+            .iter()
+            .any(|affected| paths_overlap(&entry.path, affected))
+            || spec
+                .checks
+                .iter()
+                .filter_map(check_path)
+                .any(|path| paths_overlap(&entry.path, path));
+        if relevant {
+            let hash = hash.get_or_insert_with(Sha256::new);
+            hash_bytes(hash, entry.path.as_bytes());
+            hash_bytes(hash, entry.status.as_bytes());
+            hash_bytes(hash, entry.content_hash.as_bytes());
+        }
+    }
+    match hash {
+        Some(hash) => format!("{:x}", hash.finalize()),
+        None => String::new(),
+    }
 }
 
 fn hash_context(hash: &mut Sha256, query: &QueryContext, dependency: ContextDependency) {

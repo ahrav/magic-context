@@ -255,10 +255,8 @@ impl PathEncoding {
     }
 }
 
-/// Frozen view of one checkout, taken once per request: identity, HEAD, and
-/// the dirty state. Cache keys derive from `identity`, `head`, and
-/// `dirty_fingerprint`; the open repository handle serves the request's
-/// object-database work and is never cached.
+/// Frozen view of one checkout, taken once per request.
+/// Repository handles are request-scoped and not cached.
 pub struct CheckoutSnapshot {
     repo: gix::Repository,
     identity: String,

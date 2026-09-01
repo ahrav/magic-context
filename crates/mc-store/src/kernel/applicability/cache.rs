@@ -39,11 +39,18 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
         Some(value)
     }
 
-    pub(super) fn insert(&mut self, key: K, value: V) {
+    /// Returns the generation displaced by a rotation so the caller can
+    /// drop its entries after releasing any lock guarding the cache.
+    pub(super) fn insert(&mut self, key: K, value: V) -> Option<HashMap<K, V>> {
+        let mut evicted = None;
         if self.current.len() >= self.cap && !self.current.contains_key(&key) {
-            self.previous = std::mem::take(&mut self.current);
+            evicted = Some(std::mem::replace(
+                &mut self.previous,
+                std::mem::take(&mut self.current),
+            ));
         }
         self.current.insert(key, value);
+        evicted
     }
 
     /// Returns whether the key was present, so a caller cannot mistake a
@@ -112,5 +119,21 @@ mod tests {
         assert!(cache.update(&1, |value| *value = 2));
         assert_eq!(cache.get(&1), Some(2));
         assert!(!cache.update(&9, |value| *value = 3));
+    }
+
+    #[test]
+    fn rotation_hands_the_displaced_generation_to_the_caller() {
+        let mut cache: TwoGenerationCache<u32, u32> = TwoGenerationCache::new(2);
+        assert!(cache.insert(0, 0).is_none());
+        assert!(cache.insert(1, 1).is_none());
+        // First rotation displaces an empty previous generation.
+        assert_eq!(cache.insert(2, 2).map(|evicted| evicted.len()), Some(0));
+        assert!(cache.insert(3, 3).is_none());
+        // Second rotation hands back the {0, 1} generation.
+        let evicted = cache.insert(4, 4).expect("rotation displaces a generation");
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains_key(&0) && evicted.contains_key(&1));
+        assert_eq!(cache.get(&0), None);
+        assert_eq!(cache.get(&1), None);
     }
 }
