@@ -29,6 +29,7 @@ import {
     type FamilyDeltaObservation,
     type FamilyNoiseFloor,
 } from "../src/paired-delta/estimator";
+import { pluginEntryPath } from "../src/opencode-runner/spawn";
 import { assertFrozenPool, buildPairedDeltaRegistry } from "../src/paired-delta/registry";
 import { validSuccess } from "../src/paired-delta/scoring";
 import {
@@ -241,6 +242,19 @@ function scopeDigest(): string {
                 parts.push(Buffer.from("<unreadable>", "utf8"));
             }
         }
+    }
+    /**
+     * The bundle the harness loads, not just its source. `pluginEntryPath` prefers an existing
+     * `dist` build, which is ignored and therefore invisible to every git-based digest, so a
+     * calibration could run a stale bundle and a later dispatch a rebuilt one under the same
+     * binding.
+     */
+    const entry = pluginEntryPath();
+    parts.push(Buffer.from(`${relative(root, entry)}\0`, "utf8"));
+    try {
+        parts.push(readFileSync(entry));
+    } catch {
+        parts.push(Buffer.from("<unreadable>", "utf8"));
     }
     return Bun.hash(Buffer.concat(parts)).toString(16);
 }
@@ -1055,7 +1069,7 @@ export function createLiveDependencies(input: {
                             !harness.hasContextDb()
                         ) &&
                         (
-                            coordinate.armId !== "mc-on" ||
+                            !PLUGIN_BACKED_ARMS.includes(coordinate.armId) ||
                             pluginProcessedSession(harness, sessionId)
                         ) &&
                         r1Valid;
@@ -1206,6 +1220,15 @@ const SUPPORTED_ENDPOINT = "paired-valid-success-delta";
 /** `armOptions` keys the provider block dynamically but always supplies the Anthropic adapter and `ANTHROPIC_API_KEY`. */
 const SUPPORTED_PROVIDER = "anthropic";
 
+/**
+ * Arms `armOptions` runs with the plugin enabled, so each needs runtime evidence that it ran.
+ *
+ * R2 is the sharp case: the harness precreates the database, so seeding succeeds whether or not a
+ * plugin is there to inject the memory, and the resulting failure would have entered the formation
+ * and representation deltas as completed evidence.
+ */
+const PLUGIN_BACKED_ARMS: readonly ArmId[] = ["mc-on", "r1", "r2", "r3"];
+
 /** Bound on R1 database reseeds. Each attempt draws fresh 32-hex ids, so exhausting the bound is a contract failure rather than bad luck, and it is reported as one. */
 const R1_RESEED_ATTEMPTS = 8;
 
@@ -1345,6 +1368,12 @@ async function runLive(args: CliArgs): Promise<void> {
      * A weekly or release dispatch with a missing or unbound record would otherwise spend its whole budget and then discard the result.
      */
     const implementationDigest = scopeDigest();
+    /** Built before the calibration block, which needs family membership to check the per-family cohort. */
+    const manifestFamilies = [...buildPairedDeltaRegistry().values()]
+        .map(({ declaration }) => ({
+            scenarioId: declaration.scenarioId,
+            familyId: declaration.familyId,
+        }));
     let noiseFloors: FamilyNoiseFloor[] = [];
     if (mode !== "calibration") {
         if (!existsSync(args.calibrationRecordPath)) {
@@ -1370,11 +1399,32 @@ async function runLive(args: CliArgs): Promise<void> {
          * underpowered directional verdict. Widening the cohort means re-authoring the frozen pool
          * or the policy's replicate count, neither of which the runner may do at dispatch time.
          */
-        const cohort = scenarioIdsForMode(manifest, mode).size * policy.replicateCount;
-        if (cohort < calibration.decisions.poolSize) {
-            const perFamily = Math.ceil(
-                calibration.decisions.poolSize / calibration.decisions.familyCount,
+        const selected = scenarioIdsForMode(manifest, mode);
+        const cohort = selected.size * policy.replicateCount;
+        const perFamily = Math.ceil(
+            calibration.decisions.poolSize / calibration.decisions.familyCount,
+        );
+        /**
+         * Per family, not only in total: `derivePoolSize` derives a per-family requirement from the
+         * worst variance, so an overrepresented family would otherwise cover an underpowered one.
+         */
+        const byFamily = new Map<string, number>();
+        for (const { scenarioId, familyId } of manifestFamilies) {
+            if (!selected.has(scenarioId)) continue;
+            byFamily.set(familyId, (byFamily.get(familyId) ?? 0) + policy.replicateCount);
+        }
+        const short = [...byFamily]
+            .filter(([, coordinates]) => coordinates < perFamily)
+            .sort(([left], [right]) => left.localeCompare(right));
+        if (short.length > 0) {
+            throw new Error(
+                `paired-delta ${mode} families below the calibrated ${perFamily} coordinates ` +
+                `each: ${short.map(([familyId, n]) => `${familyId}=${n}`).join(", ")}; the ` +
+                `calibrated pool size is ${calibration.decisions.poolSize} for a ` +
+                `${policy.targetMinimumDetectableDelta} detectable delta at the measured variance`,
             );
+        }
+        if (cohort < calibration.decisions.poolSize) {
             throw new Error(
                 `paired-delta ${mode} cohort of ${cohort} coordinates is below the calibrated ` +
                 `${calibration.decisions.poolSize} (${perFamily} per family for a ` +
