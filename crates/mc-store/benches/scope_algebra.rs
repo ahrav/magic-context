@@ -13,8 +13,8 @@ use git_fixtures::{
     write_worktree_file, FixtureRepo,
 };
 use mc_store::kernel::applicability::{
-    snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine, EvalBudget,
-    ObjectApplicabilitySpec, ResolutionLadder,
+    run_cheap_check, snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine, CheckSpec,
+    EvalBudget, ObjectApplicabilitySpec, ResolutionLadder,
 };
 use mc_store::kernel::{
     scope_matches, scope_overlaps, scope_subsumes, CanonicalScope, Dimension, GraphOracle,
@@ -280,6 +280,63 @@ fn snapshot_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn payload_decode_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("payload_decode");
+    for size in [0usize, 4, 16, 64] {
+        let affected = (0..size).map(|i| format!("src/mod{i}/file.rs")).collect();
+        let checks = (0..size)
+            .map(|i| CheckSpec::ConfigKey {
+                path: format!("configs/app{i}.toml"),
+                key: format!("key_{i}"),
+            })
+            .collect();
+        let payload = ObjectApplicabilitySpec::new(affected, checks).encode();
+        group.bench_with_input(BenchmarkId::new("decode", size), &payload, |b, payload| {
+            b.iter(|| ObjectApplicabilitySpec::decode(Some(black_box(payload))).unwrap());
+        });
+    }
+    group.finish();
+}
+
+fn cheap_check_benches(c: &mut Criterion) {
+    let (_dir, fixture, _base, tip) = applicability_fixture();
+    let snapshot = checkout(&fixture, tip);
+    write_worktree_file(
+        &fixture.repo,
+        "config.toml",
+        "feature_flag = true\nother = 1\n",
+    );
+    let budget = EvalBudget::unbounded();
+    let checks = [
+        (
+            "file-hit",
+            CheckSpec::FileExists {
+                path: "src/lib.rs".to_string(),
+            },
+        ),
+        (
+            "file-miss",
+            CheckSpec::FileExists {
+                path: "absent.txt".to_string(),
+            },
+        ),
+        (
+            "config-key",
+            CheckSpec::ConfigKey {
+                path: "config.toml".to_string(),
+                key: "feature_flag".to_string(),
+            },
+        ),
+    ];
+    let mut group = c.benchmark_group("cheap_checks");
+    for (name, check) in &checks {
+        group.bench_function(BenchmarkId::new("run_cheap_check", name), |b| {
+            b.iter(|| run_cheap_check(&snapshot, black_box(check), &budget));
+        });
+    }
+    group.finish();
+}
+
 fn applicability_fixture() -> (tempfile::TempDir, FixtureRepo, gix::ObjectId, gix::ObjectId) {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());
@@ -439,7 +496,7 @@ fn configure() -> Criterion {
 criterion_group! {
     name = benches;
     config = configure();
-    targets = algebra_benches, ancestry_benches, snapshot_benches, batch_benches
+    targets = algebra_benches, ancestry_benches, snapshot_benches, payload_decode_benches, cheap_check_benches, batch_benches
 }
 
 fn profile_kernel(kernel: &str) {
