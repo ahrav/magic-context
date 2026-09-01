@@ -191,21 +191,28 @@ function releaseLock(lock: string): void {
     /** A release has to reach this process's record wherever a reclaimer has moved it: a takeover that sidelined the directory can still restore it, and a record restored after its owner released would hold the path until that owner's process exits, because `lockAbandoned` will not reclaim a live holder's pid. The reclaimer's nonce names the sideline, so the sidelines are matched by this process's own owner record rather than by path. commentlint: allow(JUDGE) */
     const parent = dirname(lock);
     const prefix = `${basename(lock)}.reclaimed-`;
-    let siblings: string[] = [];
-    try {
-        siblings = readdirSync(parent);
-    } catch {
-        siblings = [];
-    }
-    for (const entry of siblings) {
-        if (!entry.startsWith(prefix)) continue;
-        const sideline = join(parent, entry);
-        if (readLockOwner(sideline)?.nonce !== LOCK_NONCE) continue;
-        rmSync(sideline, { recursive: true, force: true });
-    }
+    const sweepSidelines = (): void => {
+        let siblings: string[] = [];
+        try {
+            siblings = readdirSync(parent);
+        } catch {
+            siblings = [];
+        }
+        for (const entry of siblings) {
+            if (!entry.startsWith(prefix)) continue;
+            const sideline = join(parent, entry);
+            if (readLockOwner(sideline)?.nonce !== LOCK_NONCE) continue;
+            rmSync(sideline, { recursive: true, force: true });
+        }
+    };
+    sweepSidelines();
     // A lock reclaimed from this process belongs to the reclaimer.
     // Deleting a reclaimed lock would let another waiter acquire a lock the reclaimer still believes it holds.
-    if (readLockOwner(lock)?.nonce !== LOCK_NONCE) return;
+    if (readLockOwner(lock)?.nonce !== LOCK_NONCE) {
+        /** A takeover between the sweep and the read above moves this record to a sideline neither observation covered, so the sweep runs again once the path is known not to carry it. Each pass narrows the interleaving rather than closing it: reclamation cannot be made atomic against a concurrent reclaimer, which is why a holder that intends to act reads the lock again instead of trusting acquisition. commentlint: allow(JUDGE) */
+        sweepSidelines();
+        return;
+    }
     rmSync(lock, { recursive: true, force: true });
 }
 

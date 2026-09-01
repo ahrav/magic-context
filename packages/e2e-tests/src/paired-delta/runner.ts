@@ -645,6 +645,14 @@ export async function runPairedDelta(
                 );
             }
         }
+        /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. commentlint: allow(JUDGE) */
+        if (record.cell.armId !== record.armId) {
+            options.store.release?.();
+            throw new Error(
+                `records file cell arm ${record.cell.armId} does not match coordinate ` +
+                    `${coordinateKey(record)}; point at a fresh records path`,
+            );
+        }
         /** `finiteUsage` admits a live observation only at non-negative safe integers, because a counter near `Number.MAX_VALUE` prices to `Infinity` and a fractional token or turn count is not a measurement any harness can produce. A persisted record has to clear the same bar or a resume reports counts the live path would have refused. commentlint: allow(JUDGE) */
         for (const [label, value] of [
             ["turns", record.turns],
@@ -1227,10 +1235,16 @@ function finiteUsage(usage: TokenUsage): TokenUsage | null {
 function worstCaseUsd(scenario: ScenarioDeclaration, prices: TokenPrices): number {
     /** Each prompt token is billed in exactly one category and the prompt cannot exceed the context limit, so the dearest prompt category bounds the whole prompt: hard-coding the cache counters to zero priced a cached-prefix call at nothing when cache pricing is the only material rate, and summing all three categories at full context would triple-count one prompt instead. commentlint: allow(JUDGE) */
     const promptPricePerMillion = Math.max(prices.input, prices.cacheCreation, prices.cacheRead);
-    return (
+    const perCallUsd = (
         scenario.modelContextLimit * promptPricePerMillion +
         scenario.modelContextLimit * prices.output
     ) / 1_000_000;
+    /** A rollout drives the whole authored script and each user turn can bill its own request, while an observation reports the usage of every one of them: pricing a single call left the fallback charge and the admission floor short by the turn count, so an arm could pass admission and then bill several times the reserve. A script with no user turn still bills at least one call. commentlint: allow(JUDGE) */
+    const billableTurns = Math.max(
+        1,
+        scenario.turnScript.filter(({ role }) => role === "user").length,
+    );
+    return perCallUsd * billableTurns;
 }
 
 function exclusionCountsOf(
@@ -1265,15 +1279,21 @@ async function settleDisposal(
             LATE_DISPOSAL_GRACE_MS,
         );
     });
+    const startedAt = Date.now();
     try {
         /** `dispose()` is invoked inside the promise chain, so a handler that throws synchronously — before it ever returns a promise — becomes this outcome instead of escaping `runArm`'s `finally` and losing the paid rollout. commentlint: allow(JUDGE) */
-        return await Promise.race([
+        const outcome = await Promise.race([
             (async () => handle.dispose())().then(
                 () => "reclaimed" as const,
                 (error: unknown) => ({ error }),
             ),
             grace,
         ]);
+        /** A cleanup that holds the event loop past the grace keeps the timer from firing and then wins the race as a microtask, so the elapsed time decides the outcome rather than the ordering: a harness that will not let go inside its bound is unreclaimed whether it eventually returns or not. commentlint: allow(JUDGE) */
+        if (outcome === "reclaimed" && Date.now() - startedAt >= LATE_DISPOSAL_GRACE_MS) {
+            return { error: new Error("harness disposal did not settle") };
+        }
+        return outcome;
     } finally {
         clearTimeout(timer);
     }
@@ -1333,15 +1353,27 @@ async function withRolloutDeadline<T>(
     const startedAt = Date.now();
     /** `work()` runs inside the guard because a `run()` or `prepare()` that throws synchronously — a valid implementation, since the contract only promises a returned promise — would otherwise escape before the timer could be cleared, leaving `expiry` armed to hold the process open and then reject with no consumer. commentlint: allow(JUDGE) */
     let pending: Promise<T> | undefined;
+    /** Stamped from the promise's own settlement callback rather than after the race resumes, so the bound reads when the work finished instead of when this frame got the CPU back: blocking the event loop delays the expiry macrotask and lets a fulfilled promise win the race however late it resolved, while an in-time result whose continuation is merely descheduled must not be failed for it. commentlint: allow(JUDGE) */
+    let settledAt: number | undefined;
+    const stamp = (): void => {
+        settledAt ??= Date.now();
+    };
     try {
         pending = work();
-        /** Arming the timer first bounds nothing while `work()` holds the event loop: the expiry callback is a macrotask, so a factory that blocks past its allowance and returns an already-resolved promise wins the race below on a microtask before the overdue timer can run. The elapsed check is taken here rather than after the race so async work settling near the boundary is not failed by scheduling delay. commentlint: allow(JUDGE) */
+        /** A factory that blocks past its allowance and returns an already-resolved promise has already overrun by the time it returns, and no timer could have fired while it held the loop. commentlint: allow(JUDGE) */
         if (Date.now() - startedAt >= remainingMs) {
             throw new RolloutDeadlineError(
                 `rollout still in flight after the ${remainingMs}ms deadline budget`,
             );
         }
-        return await Promise.race([pending, expiry]);
+        pending.then(stamp, stamp);
+        const settled = await Promise.race([pending, expiry]);
+        if ((settledAt ?? Date.now()) - startedAt >= remainingMs) {
+            throw new RolloutDeadlineError(
+                `rollout still in flight after the ${remainingMs}ms deadline budget`,
+            );
+        }
+        return settled;
     } finally {
         clearTimeout(timer);
         // On timeout the losing promise settles later with no consumer;

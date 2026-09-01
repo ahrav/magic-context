@@ -159,6 +159,13 @@ function writeConfigs(
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
         : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
+    /** The URL is written verbatim as the generated provider's `baseURL`, so it reaches the same file the object channels are scanned for: URI userinfo — `https://token@host` — is a credential the guard refuses anywhere else. Checked here rather than at the spawn path so a direct caller cannot write one either. commentlint: allow(JUDGE) */
+    const urlFormat = credentialValueFormat(mockProviderURL);
+    if (urlFormat !== null) {
+        throw new Error(
+            `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
+        );
+    }
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
     const extra = canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra") ?? {};
     const magicContextConfig = canonicalConfig(opts.magicContextConfig, "magicContextConfig");

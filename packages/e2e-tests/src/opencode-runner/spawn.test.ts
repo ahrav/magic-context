@@ -364,6 +364,20 @@ describe("opencode child lifecycle", () => {
                 __spawnOpencodeTest.assertSecretsBoundToLoopback(postHook, "0.0.0.0")
             ).toThrow(/refusing to bind the unauthenticated serve API/);
 
+            // The URL is written verbatim as the generated provider's `baseURL`.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(
+                    env,
+                    "https://long-api-token@host.internal",
+                    { mockProviderURL: "https://long-api-token@host.internal" },
+                )
+            ).toThrow(/mockProviderURL is a credential-bearing URI value/);
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                })
+            ).not.toThrow();
+
             for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {                expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
                         mockProviderURL: "http://127.0.0.1:4321",

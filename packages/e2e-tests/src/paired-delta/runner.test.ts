@@ -442,6 +442,34 @@ describe("paired-delta runner", () => {
         });
     });
 
+    it("refuses evidence whose async continuation blocked past the deadline", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run(): Promise<RolloutObservation> {
+                            // Yields first, so the invocation-time check cannot see the overrun,
+                            // then holds the event loop past the deadline.
+                            await new Promise((resolve) => setTimeout(resolve, 1));
+                            const until = Date.now() + 60;
+                            while (Date.now() < until) { /* spin */ }
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
     it("bounds rollout creation with the run deadline and disposes a late handle", async () => {        const disposedArms: string[] = [];
         const lateHandle = (disposeFails: boolean) =>
             async (armId: string): Promise<RolloutHandle> => {
@@ -1340,6 +1368,16 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("refuses a cell whose arm contradicts its coordinate", async () => {
+        // `parseRolloutRecords` rejects this; a custom store bypasses it.
+        const record = storedRecord("mc-on");
+        const store = new MemoryStore([{ ...record, cell: { ...record.cell, armId: "mc-off" } }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /cell arm mc-off does not match coordinate/,
+        );
+    });
+
     it("refuses fractional or unsafe persisted counters", async () => {
         // `finiteUsage` admits a live observation only at non-negative safe integers.
         for (
@@ -1470,7 +1508,8 @@ describe("paired-delta runner", () => {
             deskCostCeilingUsd: 0,
             pricesPerMillionTokens: { input: 1, output: 0, cacheCreation: 0, cacheRead: 0 },
         };
-        const worstCase = (scenario.modelContextLimit * 1) / 1_000_000;
+        const worstCase = (scenario.modelContextLimit * 1 *
+            scenario.turnScript.filter(({ role }) => role === "user").length) / 1_000_000;
         const events: string[] = [];
 
         const result = await runPairedDelta(
@@ -1493,7 +1532,8 @@ describe("paired-delta runner", () => {
             deskCostCeilingUsd: 0,
             pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 3, cacheRead: 1 },
         };
-        const worstCase = (scenario.modelContextLimit * 3) / 1_000_000;
+        const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
+        const worstCase = (scenario.modelContextLimit * 3 * billableTurns) / 1_000_000;
         expect(worstCase).toBeGreaterThan(0);
         const events: string[] = [];
 
@@ -1721,7 +1761,7 @@ describe("paired-delta runner", () => {
         expect(third.observedCostRollouts + third.estimatedCostRollouts)
             .toBe(third.records.length);
     });
-    it("floors failure cost estimates at one full-context request", async () => {
+    it("floors failure cost estimates at one full-context request per billable turn", async () => {
         const expensive = {
             ...options(),
             pricesPerMillionTokens: {
@@ -1739,8 +1779,11 @@ describe("paired-delta runner", () => {
         const failed = result.records.find(({ armId }) => armId === "mc-off");
 
         expect(failed?.costSource).toBe("estimated");
+        // Each user turn can bill its own request, and the observation reports all of them.
+        const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
+        expect(billableTurns).toBeGreaterThan(1);
         expect(failed?.costUsd).toBeCloseTo(
-            (scenario.modelContextLimit * (100 + 200)) / 1_000_000,
+            (scenario.modelContextLimit * (100 + 200) * billableTurns) / 1_000_000,
             12,
         );
     });
