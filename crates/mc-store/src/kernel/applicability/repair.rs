@@ -226,6 +226,7 @@ impl RepairIntent {
 fn reduced_generation(
     tx: &rusqlite::Transaction<'_>,
     intent: &RepairIntent,
+    budget: &EvalBudget,
 ) -> Result<i64, KernelError> {
     let tip: i64 = tx
         .query_row(
@@ -233,16 +234,25 @@ fn reduced_generation(
             [],
             |row| row.get(0),
         )
+        .map_err(scan_error)?;
+    // This scan runs while the writer is held, so it carries the request's
+    // budget and the same interrupt the reader path installs: its `ORDER BY`
+    // sorts before yielding a row, and the row poll cannot reach that sort.
+    let limit = budget.acquire_limit();
+    tx.progress_handler(BLOCK_SCAN_PROGRESS_STEPS, Some(move || limit.should_stop()))
         .map_err(|_| KernelError::Io)?;
     let mut states = HashMap::new();
-    reduce_chunk(
+    let scanned = reduce_chunk(
         tx,
         &[intent.object_id.as_str()],
         &intent.checkout_digest,
         tip,
-        &EvalBudget::unbounded(),
+        budget,
         &mut states,
-    )?;
+    );
+    // Cleared before the commit continues on this connection.
+    let _ = tx.progress_handler(0, None::<fn() -> bool>);
+    scanned?;
     Ok(match states.get(&intent.object_id) {
         Some(BlockState::Recorded(block)) => block.generation_for(intent.kind),
         // An unreadable record leaves the generation underivable, which cannot
@@ -345,7 +355,7 @@ pub fn commit_read_repair(
         // A concurrent repair for a newer snapshot can land while this one waits
         // for the writer. Inserting anyway would make the older evidence the
         // latest record and lift the newer block.
-        if reduced_generation(envelope.tx, intent)? != intent.generation {
+        if reduced_generation(envelope.tx, intent, budget)? != intent.generation {
             return Err(KernelError::Conflict);
         }
         Ok(envelope
@@ -587,6 +597,24 @@ impl KernelStore {
         known_as_of: Option<i64>,
         budget: &EvalBudget,
     ) -> Result<HashMap<String, BlockState>, KernelError> {
+        // Hashed once for the whole scan: the payload stores the digest, not the
+        // identity, so the redactor cannot rewrite one side of the comparison.
+        self.reduce_digest_states(
+            object_ids,
+            &checkout_identity_digest(checkout_identity),
+            known_as_of,
+            budget,
+        )
+    }
+
+    /// `reduce_block_states` for a caller that already holds the digest.
+    fn reduce_digest_states(
+        &self,
+        object_ids: &[&str],
+        checkout_digest: &str,
+        known_as_of: Option<i64>,
+        budget: &EvalBudget,
+    ) -> Result<HashMap<String, BlockState>, KernelError> {
         if object_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -609,7 +637,7 @@ impl KernelStore {
         let scanned = reduce_with_reader(
             &mut reader,
             object_ids,
-            checkout_identity,
+            checkout_digest,
             known_as_of,
             budget,
         );
@@ -625,7 +653,7 @@ impl KernelStore {
 fn reduce_with_reader(
     reader: &mut rusqlite::Connection,
     object_ids: &[&str],
-    checkout_identity: &str,
+    checkout_digest: &str,
     known_as_of: Option<i64>,
     budget: &EvalBudget,
 ) -> Result<HashMap<String, BlockState>, KernelError> {
@@ -645,11 +673,15 @@ fn reduce_with_reader(
         Some(requested) => requested,
         None => tip,
     };
-    // Hashed once for the whole scan: the payload stores the digest, not the
-    // identity, so the redactor cannot rewrite one side of the comparison.
-    let digest = checkout_identity_digest(checkout_identity);
     for chunk in object_ids.chunks(BLOCK_SCAN_ID_CHUNK) {
-        reduce_chunk(&tx, chunk, &digest, known_as_of, budget, &mut states)?;
+        reduce_chunk(
+            &tx,
+            chunk,
+            checkout_digest,
+            known_as_of,
+            budget,
+            &mut states,
+        )?;
     }
     tx.commit().map_err(scan_error)?;
     Ok(states)
@@ -731,7 +763,24 @@ fn reduce_chunk(
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
         let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
         let invalidated: Option<i64> = row.get(5).map_err(|_| KernelError::Io)?;
-        match classify_row(&payload, &kind, checkout_digest) {
+        let matched = classify_row(&payload, &kind, checkout_digest);
+        // An invalidated row is out of the reduction but still moves the
+        // generation, so a replacement repair cannot reuse its identity. Folded
+        // before the settled check below: a row older than the newest kind
+        // change can carry a newer invalidation than that change, and skipping
+        // it would understate the generation. A retired row is folded even when
+        // it cannot be decoded — it is no longer live, so it cannot be this
+        // checkout's authoritative record.
+        if let Some(invalidated) = invalidated {
+            if !matches!(matched, RowMatch::OtherCheckout) {
+                invalidations
+                    .entry(object_id)
+                    .and_modify(|newest| *newest = (*newest).max(invalidated))
+                    .or_insert(invalidated);
+            }
+            continue;
+        }
+        match matched {
             RowMatch::Matches => {}
             RowMatch::OtherCheckout => continue,
             RowMatch::Unreadable => {
@@ -753,18 +802,6 @@ fn reduce_chunk(
                 pending.insert(object_id, settled);
                 continue;
             }
-        }
-        // An invalidated row is out of the reduction but still moves the
-        // generation, so a replacement repair cannot reuse its identity. Folded
-        // before the settled check below: a row older than the newest kind
-        // change can carry a newer invalidation than that change, and skipping
-        // it would understate the generation.
-        if let Some(invalidated) = invalidated {
-            invalidations
-                .entry(object_id)
-                .and_modify(|newest| *newest = (*newest).max(invalidated))
-                .or_insert(invalidated);
-            continue;
         }
         // The verdict stops at the newest kind change; the scan continues so
         // older invalidations still reach the generation.

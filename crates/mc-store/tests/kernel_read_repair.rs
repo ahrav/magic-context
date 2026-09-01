@@ -2452,3 +2452,66 @@ fn an_invalidation_older_than_the_kind_change_still_moves_the_generation() {
         "a stale repair derives an identity past the retirement"
     );
 }
+
+/// A retired record cannot be authoritative even when this build cannot decode
+/// it, or the object stays uncertain forever behind a row that is no longer live.
+#[test]
+fn a_retired_unreadable_row_is_not_authoritative() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let stale_object = text(
+        store_dir.path(),
+        &format!(
+            "SELECT object_id FROM observations
+             WHERE observation_kind='{OBSERVATION_KIND_STALE}'"
+        ),
+    );
+
+    // The only record becomes undecodable and is then retired.
+    let connection = Connection::open(store_dir.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00' WHERE object_id=?1",
+            [stale_object.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+    store
+        .commit(intent("retire-unreadable", '3'), |envelope| {
+            envelope.retire_observation(&stale_object)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let retired_at = store.known_as_of(0).unwrap().tip;
+
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let states = store
+        .applicability_block_states_at_tip(
+            &[TARGET_OBJECT],
+            snapshot.identity(),
+            &EvalBudget::unbounded(),
+        )
+        .expect("the reduction still reads");
+    match states.get(TARGET_OBJECT) {
+        Some(BlockState::Recorded(block)) => {
+            assert!(!block.blocked, "a retired record blocks nothing");
+            assert_eq!(
+                block.invalidated_commit_seq, retired_at,
+                "its invalidation still moves the generation"
+            );
+        }
+        other => panic!("expected a recorded reduction, got {other:?}"),
+    }
+}
