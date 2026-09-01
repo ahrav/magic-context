@@ -10,7 +10,10 @@ impl Lcg {
     }
 
     pub fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as u32
     }
 
@@ -20,10 +23,9 @@ impl Lcg {
 }
 
 const PROSE_WORDS: &[&str] = &[
-    "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "while",
-    "reading", "logs", "from", "deploy", "pipeline", "stage", "output",
-    "compile", "finished", "warning", "unused", "variable", "shadow",
-    "request", "handler", "returned", "status", "duration", "millis",
+    "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "while", "reading", "logs",
+    "from", "deploy", "pipeline", "stage", "output", "compile", "finished", "warning", "unused",
+    "variable", "shadow", "request", "handler", "returned", "status", "duration", "millis",
 ];
 
 /// Prose, code, and log shaped filler with no rule anchors.
@@ -108,7 +110,12 @@ pub fn finding_dense(bytes: usize, seed: u64) -> String {
             3 => {
                 out.push_str("aws=AKIA");
                 out.push_str("ABCDEFGHIJKLMN");
-                out.push_str(match n % 4 { 0 => "OP", 1 => "QR", 2 => "ST", _ => "UV" });
+                out.push_str(match n % 4 {
+                    0 => "OP",
+                    1 => "QR",
+                    2 => "ST",
+                    _ => "UV",
+                });
             }
             _ => {
                 out.push_str("slack: xox");

@@ -45,7 +45,8 @@ fn base64_encode(bytes: &[u8], url: bool) -> String {
     for chunk in bytes.chunks(3) {
         let mut buffer = [0u8; 3];
         buffer[..chunk.len()].copy_from_slice(chunk);
-        let packed = (u32::from(buffer[0]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[2]);
+        let packed =
+            (u32::from(buffer[0]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[2]);
         let symbols = chunk.len() + 1;
         for index in 0..symbols {
             let shift = 18 - 6 * index;

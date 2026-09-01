@@ -233,7 +233,10 @@ fn product_is_empty(rule: &Rule, budget: usize) -> Result<bool, String> {
         for state in &gate_states {
             signature.push(gate.next_state(AcAnchored::No, *state, byte).as_usize());
         }
-        if signatures.insert(signature, representatives.len()).is_none() {
+        if signatures
+            .insert(signature, representatives.len())
+            .is_none()
+        {
             representatives.push(byte);
         }
     }
@@ -317,7 +320,10 @@ fn preselection_cannot_drop_a_finding() {
 /// The proof's copy of the evaluator's secret key words must not drift.
 #[test]
 fn secret_key_words_match_the_evaluator() {
-    let mirrored: Vec<&[u8]> = SECRET_KEY_WORDS.iter().map(|word| word.as_bytes()).collect();
+    let mirrored: Vec<&[u8]> = SECRET_KEY_WORDS
+        .iter()
+        .map(|word| word.as_bytes())
+        .collect();
     assert_eq!(mirrored, crate::evaluator::secret_key_words_for_test());
 }
 
