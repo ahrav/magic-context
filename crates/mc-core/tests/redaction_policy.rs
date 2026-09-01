@@ -157,6 +157,28 @@ fn only_the_value_span_is_replaced_around_an_assignment() {
     assert_eq!(redaction.detections[0].length, "spaced-value".len());
 }
 
+#[test]
+fn punctuation_inside_an_unquoted_value_does_not_end_the_redaction() {
+    // The replaced region is the reported value span, so a value class that stopped at
+    // shell metacharacters would leave the rest of the credential in the durable text.
+    // A backtick is excluded from the value class here and in the TypeScript engine,
+    // so it still ends the span. That gap predates the scanner and closing it on one
+    // side only would widen the divergence between the two engines.
+    for separator in ['$', ';', '&', '|', '<', '>', '(', ')'] {
+        let input = format!("password=alpha{separator}bravo");
+        let redaction = redact_durable_text(&input);
+        assert!(
+            !redaction.text.contains("bravo"),
+            "{input} left credential bytes in {:?}",
+            redaction.text
+        );
+    }
+    assert_eq!(
+        redact_durable_text("password=alpha$bravo").text,
+        "password=<REDACTED:password>"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]

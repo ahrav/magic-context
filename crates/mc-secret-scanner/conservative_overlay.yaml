@@ -137,8 +137,12 @@ rules:
   value_suppressors_any: *overlay_value_suppressors
 # Rust regex has no backreference, so one rule cannot pair its own quotes; a shared
 # optional quote instead truncates a quoted value at its first space.
+# The unquoted value class stops only at whitespace and quotes. Excluding shell
+# metacharacters such as `$`, `;`, and `|` would end the span inside a credential
+# that contains one, and the reported span is what gets replaced, so the remainder
+# would stay in the redacted text.
 - name: magic-keyed-assignment
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>(?:[^\s''"`;&|<>()$\\]|\\.)+)'
+  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>(?:[^\s''"`]|\\.)+)'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key

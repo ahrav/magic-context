@@ -225,9 +225,15 @@ impl ArtifactError {
 impl fmt::Display for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ArtifactErrorKind::PayloadTooLarge => {
-                formatter.write_str("artifact payload exceeds 64 MiB")
-            }
+            // Two limits produce this error: what may be stored, and the shorter length
+            // redaction can inspect. Naming only the first tells a caller it broke a
+            // limit it is far below, with no way to find the one it actually broke.
+            ArtifactErrorKind::PayloadTooLarge => write!(
+                formatter,
+                "artifact payload exceeds an ingest limit ({MAX_PAYLOAD_BYTES} bytes stored, \
+                 {} bytes inspectable for secrets)",
+                mc_core::redaction::MAX_REDACTABLE_BYTES
+            ),
             ArtifactErrorKind::Capacity => write!(
                 formatter,
                 "artifact capacity exceeded (usage={}, cap={})",
