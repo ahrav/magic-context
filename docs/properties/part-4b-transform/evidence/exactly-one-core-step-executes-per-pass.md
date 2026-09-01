@@ -2,141 +2,146 @@
 
 ## Discovery trigger
 
-Mapping the cache-state transition required knowing how many transitions one
-pass applies. `grep`ing `core.step` in `transform.rs` returned five call sites,
-which raised the question of whether two could fire on one pass.
+The current transform source contains seven `core.step` call sites. The relevant
+property is at-most-one execution per pass: accepted Defer paths can execute no
+step, while every stepping path reaches only one site.
+
+## Provenance
+
+Magic citations were verified against source commit
+`af5e153c12750354a82f91bc796367031ac5c658` plus the current companion U6 diff
+on 2026-09-01. Cache-core citations use the exact source at commons U6 commit
+`cb5a5c01a5a98df8d80fd41f16c4de5a5cc16d`.
 
 ## Evidence trail
 
-Every reference read back at `HEAD` `76cd6f41`.
+### Seven current call sites
 
-The five call sites and their guards:
-
-| Line | Action | Guard |
+| Site | Action | Guard and control-flow owner |
 | --- | --- | --- |
-| `4541` | `Soft` | inside `if req.is_subagent {` at `:4539`, and `if !matches!(scheduler_outcome.pass, PassDecision::Defer)` at `:4540` |
-| `4794` | `Hard` | `match plan` arm `PassPlan::Hard \| PassPlan::MigrateHard` at `:4556` |
-| `5002` | `Hard` | the `if` half of the `PassPlan::Soft` arm's refold branch |
-| `5098` | `Soft` | the `else` half of the same branch |
-| `5151` | `SoftPlus` | `match plan` arm `PassPlan::Defer` |
+| `crates/mc-module/src/transform.rs:2785-2792` | `Hard` | `apply_additive_only`'s `match plan` arm `Hard | MigrateHard`, opened at `:2748-2749` |
+| `crates/mc-module/src/transform.rs:2852-2859` | `Soft` | `apply_additive_only`'s `PassPlan::Soft` arm, opened at `:2832` |
+| `crates/mc-module/src/transform.rs:4236-4249` | `Soft` | main path, `req.is_subagent` and scheduler decision is not `Defer`, at `:4234-4236` |
+| `crates/mc-module/src/transform.rs:4453-4460` | `Hard` | non-subagent `match plan` arm `Hard | MigrateHard`, opened at `:4251-4254` |
+| `crates/mc-module/src/transform.rs:4649-4656` | `Hard` | non-subagent `PassPlan::Soft` arm when `pressure_refold` is true; condition at `:4543-4550` |
+| `crates/mc-module/src/transform.rs:4737-4744` | `Soft` | `else` of the same `pressure_refold` branch, opened at `:4691` |
+| `crates/mc-module/src/transform.rs:4782` | `SoftPlus` | non-subagent `PassPlan::Defer` arm, opened at `:4774` |
 
-The structure is `if req.is_subagent { .. } else { match plan { .. } }`, with
-the `else` opening at `:4553` and the `match plan` at `:4554`. `PassPlan::Reject`
-at `:4555` returns `Err` before any step. So the five sites are mutually
-exclusive by control flow.
+The two groups cannot mix. `apply_once` returns directly into
+`apply_additive_only` when compaction is disabled
+(`crates/mc-module/src/transform.rs:3043-3056`). The first two sites live inside
+that returned function. The remaining five live in the compaction-enabled body.
 
-The compiler also enforces it. `boundary_token` is a `String`:
+Inside `apply_additive_only`, one `match plan` owns both sites
+(`transform.rs:2748-2889`). `Hard | MigrateHard` and `Soft` are distinct arms;
+`Defer` executes no step (`:2883-2887`), and `Reject` was returned before
+composition (`:2710-2712`).
 
-- `transform.rs:3540-3544` — `let boundary_token = if boundary_present {
-  loaded.core.boundary_id.clone() } else { "-".to_string() };`
+Inside the main path, the subagent branch and the non-subagent `match plan` are
+the two halves of one `if/else` (`transform.rs:4234-4252`). A subagent scheduler
+Defer executes no step. In the non-subagent branch, `Reject` returns before a
+step (`:4252-4254`), the Hard and Defer arms each contain one site, and the Soft
+arm selects exactly one of its Hard/Soft sites through the `pressure_refold`
+`if/else` (`:4543-4550`, `:4691`).
 
-Every `PassInput` construction takes it by value:
+### Move argument
 
-- `transform.rs:4543` — `boundary_present: boundary_token,`
-- `transform.rs:4796` — `boundary_present: boundary_token,`
-- `transform.rs:5004` — `boundary_present: boundary_token,`
-- `transform.rs:5100` — `boundary_present: boundary_token,`
-- `transform.rs:5153` — `boundary_present: boundary_token,`
+The main path constructs one owned `String` named `boundary_token` at
+`crates/mc-module/src/transform.rs:3329-3338`. Each of the five main-path step
+sites moves that same value into `PassInput.boundary_present`:
 
-`PassInput.boundary_present` is `String`
-(`../commons/crates/cortexkit-cache-core/src/lib.rs:105`), so each of these
-moves the token. Two of them on one path would not compile.
+- subagent Soft: `:4236-4239`
+- plan Hard: `:4453-4456`
+- pressure-refold Hard: `:4649-4652`
+- non-refold Soft: `:4737-4740`
+- Defer SoftPlus: `:4782`
 
-The transitions themselves, for reference on what a second step would do:
+`PassInput.boundary_present` is an owned `String`
+(`commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:100-118`), and
+`PassInput::new` consumes an `Into<String>` at
+`commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:120-132`. Without a clone or
+other replacement value, two main-path sites on one control-flow path would
+attempt to use `boundary_token` after move and fail to compile.
 
-- cache-core `:154-165` — `step` dispatches on the proposed action
-- cache-core `:172-203` — `step_defer`: drains `input.queued` into
-  `pending_changes` (`:173-175`), retains only `Lineage` units on `run_started`
-  (`:181-183`), and assigns `reconcile_pending` at `:197`. Does not bump
-  `version`.
-- cache-core `:225-237` — `step_soft`: `apply_units` then a guarded boundary
-  advance (`:227`), `version += 1` at `:232`
-- cache-core `:243-256` — `step_hard`: `units.append(&mut
-  self.pending_changes)` at `:245`, `apply_units` at `:246`, unconditional
-  boundary mint at `:247-249`, `reconcile_pending = false` at `:250`,
-  `version += 1` at `:251`
-- cache-core `:261-270` — `apply_units` replaces a unit with an existing key in
-  place and appends a new key, "the cached-prefix byte order is load-bearing"
-  (`:259-261`)
+This compiler argument does not cover the two additive-only sites: each creates
+its own `"-".to_string()` (`transform.rs:2785-2788`, `:2852-2855`). Their
+exclusivity comes from the single `match plan` and the early return from
+`apply_once`.
 
-Every call site discards the returned `StepResult`; none of the five assigns it.
+### What each action changes
+
+`CoreState::step` dispatches the proposed action at
+`commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:164-173`.
+
+- `SoftPlus` queues pending units, optionally retains only lineage units, and
+  recomputes `reconcile_pending` without incrementing `version`
+  (`:181-212`).
+- `Soft` applies rendered units, conditionally advances the boundary, and
+  increments `version` once (`:234-246`).
+- `Hard` drains pending changes into rendered units, applies them, updates the
+  boundary, clears reconciliation, and increments `version` once (`:252-265`).
+- `apply_units` replaces existing keys in place and appends new keys in input
+  order (`:271-279`).
+
+All seven module call sites discard the returned `StepResult`. Its fields are
+defined at `commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:134-139`.
 
 ## Failure scenario
 
-A second `Hard` step on one pass would call `units.append(&mut
-self.pending_changes)` twice. The first drain empties `pending_changes`, so the
-second append is a no-op on that field, but `apply_units` would run again with
-the same rendered set (replacing by key, so bytes survive) and `version` would
-advance by two. A committed `core.version` that advanced by two for one accepted
-pass makes the version useless as a pass counter for anything comparing it, and
-the module's byte-stability reasoning is stated in terms of one render per bust.
+A second Soft or Hard step in one pass would increment `core.version` twice.
+A second Hard would also re-run `apply_units` after `pending_changes` had already
+been drained. A Soft after Hard would evaluate the Soft boundary guard against
+state already changed by the same pass. Current control flow prevents these
+sequences.
 
-A second `Soft` after a `Hard` would be worse: `step_soft`'s boundary advance is
-guarded on `boundary_match && !reconcile_pending` (cache-core `:227`), and
-`step_hard` has just set `reconcile_pending = false` (`:250`), so the guard the
-core added deliberately to prevent stranding a stale m0 under a fresh anchor
-would evaluate against state the same pass mutated.
+The move check is intentionally described as supporting evidence, not the whole
+proof. Cloning `boundary_token` at every main-path site would remove that compiler
+backstop while leaving the present branches mutually exclusive.
 
 ## Timing windows and dependencies
 
-None. This is a structural property.
+None. This is a structural, single-pass property.
 
-The dependency worth recording is fragile: the compiler's help comes entirely
-from `boundary_token` being moved rather than cloned. A refactor that changes
-`:3540` to produce a value used by reference, or that clones at each call site
-for convenience, removes the check with no other visible change. The control-flow
-exclusivity would still hold at that moment but nothing would keep it holding.
+The property depends on three source shapes:
+
+1. compaction-disabled execution returns into `apply_additive_only`;
+2. additive-only planning uses one `match`;
+3. the main path keeps subagent and non-subagent work in one `if/else`, with the
+   Soft refold decision in one nested `if/else`.
 
 ## What a test must construct
 
-An assertion rather than a test case. Options, cheapest first:
+Instrument a wrapper around `CoreState::step` and count calls per `apply_once`
+attempt. Assert:
 
-1. A `#[cfg(test)]` thread-local counter incremented in a wrapper around
-   `core.step`, asserted to be at most one at the end of `apply_once`. This
-   needs a module-side wrapper because `CoreState::step` lives out of repo.
-2. A compile-time proof by leaving `boundary_token` a moved `String` and adding
-   a comment at `:3540` recording that the move is load-bearing. This is a
-   guard-placement question, so it belongs to
-   `/low-level-systems:defensive-assertions-and-invariant-guards`, not here.
-3. A behavioural proxy: on every accepted pass, assert `committed_core.version -
-   loaded_core.version` is exactly zero for a Defer and exactly one for a Soft or
-   Hard. This is constructible today with no new instrumentation and it catches a
-   double step indirectly.
+- zero or one call for every accepted pass;
+- zero on additive-only Defer and subagent scheduler Defer;
+- one Hard on additive-only Hard/MigrateHard;
+- one Soft on additive-only Soft;
+- one Soft on non-Defer subagent;
+- one Hard on non-subagent Hard/MigrateHard;
+- one Hard or one Soft, never both, across the two `pressure_refold` outcomes;
+- one SoftPlus on non-subagent Defer.
 
-Option 3 is the one to catalog, because it is expressible against the public
-`row_version`/`core.version` pair the response already returns
-(`transform.rs:5674` — `version: core.version`).
+As a behavior proxy, assert the core-version delta is zero when no step or a
+SoftPlus step executes, and one when Soft or Hard executes. The response exposes
+`core.version` at `crates/mc-module/src/transform.rs:5263-5275`.
 
 ## Investigation log
 
-### Q: Is there any path that reaches two `core.step` calls?
+### Q: Are there still five call sites?
 
-- Sources examined: `transform.rs:4539-4553` (the subagent `if` and its
-  `else`), `:4554-5170` (the `match plan` and all arms), `:4541`, `:4794`,
-  `:5002`, `:5098`, `:5151`, `:3540-3544`;
-  `../commons/crates/cortexkit-cache-core/src/lib.rs:102-117` for `PassInput`
-  field types.
-- Findings: the subagent branch and the `match plan` are the two halves of one
-  `if/else`. Within the `match`, `Hard | MigrateHard`, `Soft` and `Defer` are
-  distinct arms and `Reject` returns early. Within the `Soft` arm the two step
-  calls are the two halves of one `if/else` on the refold condition. Plus the
-  move of `boundary_token` makes a second call a borrow error.
+- Sources examined: every `core.step` occurrence in
+  `crates/mc-module/src/transform.rs`.
+- Finding: no. There are seven, at lines 2785, 2852, 4236, 4453, 4649, 4737,
+  and 4782.
 - Missing evidence: none.
-- Conclusion: resolved with answer — no path reaches two steps at `HEAD`.
 
-### Q: Does discarding `StepResult` hide a disagreement?
+### Q: Can one pass reach two sites?
 
-- Sources examined: all five call sites; cache-core `:199-202`, `:233-236`,
-  `:252-255` for what `StepResult` carries.
-- Findings: `StepResult` carries `action` and `reconcile_pending`. `action` is
-  always the proposed action, so it is near-tautological, which cache-core's own
-  test module notes at `:277-281`. `reconcile_pending` is the useful field: after
-  `step_defer` it is the freshly computed latch. The engine does read
-  `core.reconcile_pending` afterwards through the struct, for example when
-  building the response (`transform.rs:5673` — `reconcile_pending:
-  core.reconcile_pending`), so the value is not lost, only the opportunity to
-  cross-check it against the engine's expectation.
-- Missing evidence: none.
-- Conclusion: resolved with answer — nothing is lost, but nothing is verified
-  either. Whether to add a cross-check is a guard decision, recorded as a lens
-  open question needing human input.
+- Sources examined: `transform.rs:2710-2889`, `:3043-3056`, `:4234-4254`,
+  `:4543-4550`, `:4691-4788`;
+  `commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:100-132`.
+- Finding: no current path reaches two. Some accepted paths reach zero, so the
+  precise invariant is at-most-one rather than exactly one.
+- Missing evidence: no runtime counter exists; the conclusion is structural.

@@ -2,185 +2,167 @@
 
 ## Discovery trigger
 
-Reading `commit_transform`'s CAS predicate showed three independent checks:
-row version, claim snapshot vector, compartment max sequence. Tracing what the
-transform actually passes for the third one showed it is conditional on the pass
-being a bust, while a Defer still writes a compartment-derived watermark.
+`commit_transform` can fence a cache-state commit against the current maximum
+compartment sequence. The transform supplies that fence only for a non-subagent
+provider-prefix mutation pass, while a Defer can still write a
+compartment-derived watermark. This record checks whether that asymmetry creates
+a reachable production race.
+
+## Provenance
+
+All citations were verified on 2026-09-01 against Magic source commit
+`af5e153c12750354a82f91bc796367031ac5c658` plus the current companion U6 diff.
+This record does not depend on the sibling commons worktree.
 
 ## Evidence trail
 
-Every reference read back at `HEAD` `76cd6f41`.
+### The store predicate
 
-The store's three-part predicate, all inside one fenced transaction
-(`mc-store/src/lib.rs:7260`):
+`McStore::commit_transform` starts at
+`crates/mc-store/src/lib.rs:6903-6907`. Inside one fenced transaction it checks:
 
-- `:7352-7358` — read `current` row version
-- `:7360-7367` — row-version CAS; conflict returns from an empty transaction
-- `:7368-7377` — claim-vector predicate, active only when
-  `claim_snapshot_vector` is `Some`
-- `:7378-7387` — compartment predicate, active only when `compartment_max_seq`
-  is `Some`:
+1. the current cache-state row version at `:6992-6998`;
+2. the expected row version at `:7000-7007`;
+3. the optional claim snapshot vector at `:7008-7017`; and
+4. the optional compartment maximum sequence at `:7018-7027`.
 
-```
-if let Some(expected_seq) = compartment_max_seq {
-    let current_seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
-        params![session_id],
-        |row| row.get(0),
-    )?;
-    if current_seq != expected_seq {
-        return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
-    }
-}
+The compartment check queries `MAX(sequence)` from `mc_compartments` and returns
+a CAS conflict when it differs from the supplied value (`:7018-7026`).
+
+### Which passes supply the compartment fence
+
+The module defines a provider-prefix mutation pass as `Hard`, `MigrateHard`, or
+`Soft`, then restricts a bust to non-subagents
+(`crates/mc-module/src/transform.rs:4134-4138`). At commit it passes
+
+```rust
+compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
 ```
 
-What the transform passes:
+at `crates/mc-module/src/transform.rs:5164-5174`. A `PassPlan::Defer` therefore
+passes `None`. A subagent also passes `None`, including a subagent Soft step.
+This asymmetry is verified.
 
-- `transform.rs:5574` — `compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),`
-- `transform.rs:4435-4438` — `let is_provider_prefix_mutation_pass = matches!(plan,
-  PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft);`
-- `transform.rs:4439` — `let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;`
+### What Defer can write
 
-So a `PassPlan::Defer` passes `None` and the compartment predicate is skipped
-entirely. Subagent passes also pass `None`.
+The first `m1_signal` read is
+`crates/mc-module/src/transform.rs:3619-3634`. Boundary-divergence handling may
+replace it with a revalidated read at `:3664-3680`. The module computes
+`compartment_seq_changed_since_meta` from the selected signal at `:3714-3716`.
 
-What a Defer nonetheless writes:
+The Defer arm is `crates/mc-module/src/transform.rs:4774-4787`. After its
+SoftPlus step, it writes
+`meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq)` when the
+compartment sequence changed and the combined m1 digest still matches the loaded
+revision (`:4782-4786`). That metadata change contributes to `state_changed` and
+`commit_required` at `:5154-5159`.
 
-- `transform.rs:5151-5158` — the `PassPlan::Defer` arm:
+### Production historian publication also bumps the row version
 
-```
-core.step(PassInput {
-    proposed: Some(mc_core::Action::SoftPlus),
-    boundary_present: boundary_token,
-    ..Default::default()
-});
-if compartment_seq_changed_since_meta
-    && current_m1_digest == loaded.meta.m1_revision
-{
-    meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
-}
-```
+The production publication chain reaches `publish_historian_chunk` through
+`publish_output_from_awaiting` and `publish_validated_chunk`:
 
-`m1_signal` is read at `transform.rs:3846-3856`
-(`revision_signal_for_context`), possibly replaced by the revalidation at
-`:3892-3902`, and both are ordinary reads outside any commit predicate.
-`compartment_seq_changed_since_meta` is computed at `:3950-3951`:
+- `publish_output_from_awaiting` persists the `Publishing` state, captures its
+  returned row version, and calls `publish_validated_chunk` at
+  `crates/mc-module/src/historian.rs:1624-1647`;
+- `publish_validated_chunk` builds `HistorianPublishRequest` and dispatches
+  through an optional `HistorianPublicationFence`, otherwise directly to
+  `McStore::publish_historian_chunk`, at `historian.rs:431-434` and `:500-517`;
+- both production fence implementations call the same store method at
+  `crates/mc-module/src/lib.rs:3245-3268` and `:3280-3305`.
 
-```
-let compartment_seq_changed_since_meta = loaded.meta.initialized
-    && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
-```
+`McStore::publish_historian_chunk` runs one fenced transaction
+(`crates/mc-store/src/lib.rs:8783-8798`). In that transaction it:
 
-A Defer commits whenever `state_changed` (`:5555`) is true, and writing
-`meta.coverage_compartment_seq` makes `meta != loaded.meta`, so this write does
-reach the store.
+1. checks the expected cache-state row version (`:8798-8819`);
+2. checks the historian and compartment-set predicates (`:8821-8890`);
+3. appends compartments through `append_compartments_tx` (`:8892-8906`); and
+4. updates `mc_cache_state.row_version` from `current` to `current + 1`
+   (`:8919-8939`).
 
-Why the row-version CAS does not cover it: compartments are appended by
-`append_compartments` (`mc-store/src/lib.rs:9167`), which runs
-`append_compartments_tx` (`:9174`) and does not touch `mc_cache_state`. Nothing
-in that path bumps `row_version`. So a compartment append is invisible to the
-row-version predicate.
+The compartment append and row-version increment therefore commit atomically.
+If publication lands after a transform reads its state but before that transform
+commits, `commit_transform` observes the newer row version and rejects the stale
+transform CAS. The optional compartment predicate is not needed for this
+historian interleaving.
 
-What the watermark is used for on later passes:
+### Search for an unfenced production append path
 
-- `transform.rs:3912-3918` — `compartment_revision_matches`, which falls back to
-  the combined digest when `m1_compartment_seq` is absent and otherwise compares
-  `applied == m1_signal.max_compartment_seq`
-- `transform.rs:3950-3951` — `compartment_seq_changed_since_meta`, the input to
-  the Defer write itself and to the SOFT arm's `else if` at `:5136-5138`
-- `transform.rs:3941-3946` — `boundary_divergence_recut`, which admits a recut
-  when `compartment_revision_matches` holds
+`append_compartments_tx` is defined at
+`crates/mc-store/src/lib.rs:11815-11862`. Its standalone public wrapper at
+`:8612-8635` does not update `mc_cache_state`; this is the verified mechanism
+behind the original concern. However, every workspace caller of that standalone
+wrapper is test-only: store tests begin at `mc-store/src/lib.rs:13301-13302`,
+historian tests at `mc-module/src/historian.rs:1731-1732`, transform tests at
+`mc-module/src/transform.rs:11924-11925`, and module tests at
+`mc-module/src/lib.rs:15516-15517`.
 
-## Failure scenario
+The other direct compartment insertion sites are state import
+(`mc-store/src/lib.rs:6799-6843`) and whole-set replacement (`:8345-8365`), not
+historian append callers. No production call path was found that publishes a
+historian compartment through the standalone append wrapper.
 
-A historian publish appends compartments. A transform request for the same
-session is in flight and classifies to Defer. Its `m1_signal` was read before
-the append, so `m1_signal.max_compartment_seq` is the pre-append maximum and
-`compartment_seq_changed_since_meta` is true for some earlier reason. The Defer
-commits `meta.coverage_compartment_seq = pre_append_max`. The row-version CAS
-passes, because the publish did not touch `mc_cache_state`, and the compartment
-predicate is skipped because this is not a bust.
+### Later consumers of the watermark
 
-The next pass computes `compartment_seq_changed_since_meta` as
-`post_append_max != pre_append_max`, which is true, so this particular staleness
-is self-correcting for that predicate. The sharper consequence is
-`compartment_revision_matches` at `:3915-3917`: it compares `applied ==
-m1_signal.max_compartment_seq`, and an `applied` value that names a sequence the
-session has already moved past makes the comparison false, which suppresses the
-recut admission at `:3941-3946` for up to
-`BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT` passes (`:85`, value 3) rather than
-admitting it immediately.
+`compartment_revision_matches` compares the applied sequence with the current
+signal at `crates/mc-module/src/transform.rs:3682-3687`.
+`boundary_divergence_recut` uses that result at `:3705-3710`. The pending-pass
+limit is three (`:78-82`). The next pass recomputes
+`compartment_seq_changed_since_meta` at `:3714-3716`.
 
-The honest summary: this is a stale-watermark write on a path with no fence,
-whose downstream effect is a delayed repair rather than a permanent wedge. It is
-recorded because the absence of the fence is asymmetric with the bust path and
-nothing documents why.
+These are real mechanisms, but production historian publication cannot create
+the stale committed watermark proposed by the original scenario because its row
+version bump rejects the stale transform first.
+
+## Failure classification
+
+The proposed defer-versus-historian race is unreachable in the production call
+graph and is therefore vacuous. The earlier failure sequence incorrectly treated
+production historian publication as the standalone `append_compartments` path.
+It has been removed.
+
+This conclusion is limited to the verified production callers. A future
+production caller of standalone `append_compartments` would reopen the question
+because that wrapper does not bump the cache-state row version.
 
 ## Timing windows and dependencies
 
-Window: `transform.rs:3846` (the `m1_signal` read) to `:5565` (the commit). A
-compartment append committing anywhere in that window is undetected on a Defer.
-
-Dependency: whether a historian publish can commit concurrently with a live
-transform for the same session. The publish path has its own fences, which
-Part 4a owns. If those fences serialise publishes against transforms, this
-window closes and the property becomes vacuous but still worth stating.
+The transform still has a source-level interval between its selected signal read
+(`transform.rs:3619-3680`) and `commit_transform` (`:5164-5174`). A production
+historian publish may commit during that interval, but its atomic row-version
+increment turns the interval into an ordinary stale-CAS retry, not a stale
+watermark commit.
 
 ## What a test must construct
 
-1. Seed a session with `meta.initialized` true, compartments present, and
-   `meta.coverage_compartment_seq` set to a value below the current maximum so
-   `compartment_seq_changed_since_meta` is true.
-2. Arrange `current_m1_digest == loaded.meta.m1_revision` so the Defer arm's
-   inner condition at `:5155-5156` holds.
-3. Register the `#[cfg(test)]` attempt hook (`:5563-5564`,
-   `run_transform_attempt_hook`) to append a compartment just before the commit,
-   simulating the interleaved publish. Note the hook fires before
-   `commit_transform`, which is exactly the window.
-4. Drive a pass that classifies to Defer.
-5. Assert the commit succeeded, then assert
-   `meta.coverage_compartment_seq == MAX(sequence)` of `mc_compartments`. That
-   assertion fails, showing the watermark records a superseded value.
-6. Repeat with a Soft pass and show the commit instead returns `CasConflict`,
-   demonstrating the asymmetry.
+No test should assert that a production historian publish lets the stale Defer
+commit succeed. That expected result is false.
 
-As a coverage check, assert the independent preconditions rather than the
-mismatch: a Defer pass observed to write `meta.coverage_compartment_seq`, and a
-compartment append observed to commit inside the window. Never pair `always(!X)`
-with `sometimes(X)`.
+No failure construction remains for this proposed race. Verification belongs in
+the source call-graph and transaction evidence above; using the test-only
+standalone `append_compartments` wrapper would model a different path.
 
 ## Investigation log
 
-### Q: Does any writer append compartments concurrently with a live transform for the same session?
+### Q: Is the compartment predicate present on Defer?
 
-- Sources examined: `mc-store/src/lib.rs:9167-9185` (`append_compartments`),
-  `:9174` (`append_compartments_tx`); `transform.rs:5574`, `:4435-4439`;
-  `mc-module/src/lib.rs:8322` (the only production caller of the engine) and its
-  surrounding `async fn`.
-- Findings: `append_compartments` does not write `mc_cache_state`, so it cannot
-  be caught by the row-version CAS. The transform runs inline in an `async fn`
-  (`lib.rs:8322`), not under `spawn_blocking`, and nothing visible in
-  `lib.rs:8007-8615` takes a per-session lock, so two requests for one session
-  can be in flight on different tokio workers. Whether the historian's publish
-  path serialises against a live transform is a Part 4a question.
-- Missing evidence: the historian publication fence semantics, and whether any
-  route-level serialisation exists in the dispatch layer that this lens's scope
-  does not cover.
-- Conclusion: unresolved, needs the 4a publish-fence result and the 4c dispatch
-  result. Recorded as a dependency rather than assumed either way.
+- Sources examined: `transform.rs:4134-4138`, `:4774-4787`, `:5164-5174`;
+  `mc-store/src/lib.rs:6992-7027`.
+- Finding: no. Defer supplies `None` for `compartment_max_seq`.
+- Missing evidence: none.
 
-### Q: Is the omission of the compartment fence on Defer deliberate?
+### Q: Does production historian publication evade the row-version CAS?
 
-- Sources examined: `transform.rs:5574` and the surrounding `TransformCommit`
-  literal `:5567-5600`; every comment in `:5540-5600`; the comment on
-  `compartment_revision_matches` at `:3908-3912`.
-- Findings: no comment explains the `is_bust_pass` gate on
-  `compartment_max_seq`. The plausible reading is cost: the predicate adds a
-  `MAX(sequence)` query to every commit, and a Defer that writes nothing
-  compartment-derived would not need it. But a Defer *can* write a
-  compartment-derived value, at `:5157`, which is what makes the gate
-  questionable.
-- Missing evidence: no transform specification exists outside the source; the
-  scope map established that.
-- Conclusion: needs human input. Whether the gate is a deliberate cost trade or
-  an oversight is a design question the code does not answer.
+- Sources examined: `historian.rs:431-517`, `:1624-1647`;
+  `mc-module/src/lib.rs:3245-3305`; `mc-store/src/lib.rs:8783-8940`.
+- Finding: no. Compartment append and row-version increment share one fenced
+  transaction, so a stale transform CAS rejects.
+- Missing evidence: none.
+
+### Q: Is there another production append caller that omits the row-version bump?
+
+- Sources examined: every workspace call to `append_compartments`, all
+  `insert_compartment_tx` sites, and the production historian publication chain.
+- Finding: no. Standalone append callers are tests; import and replacement are
+  different operations.
+- Missing evidence: external callers outside this workspace are not visible.
