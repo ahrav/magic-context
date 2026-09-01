@@ -179,6 +179,33 @@ fn punctuation_inside_an_unquoted_value_does_not_end_the_redaction() {
     );
 }
 
+#[test]
+fn non_ascii_whitespace_around_a_separator_still_redacts() {
+    // The scanner matches bytes with Unicode mode off, so `\s` covers only ASCII. A key
+    // separated from its value by one of these would not match any rule, and an input
+    // that matches nothing is returned unchanged, so the credential would survive.
+    for separator in [
+        '\u{a0}', '\u{1680}', '\u{2000}', '\u{2005}', '\u{200a}', '\u{2028}', '\u{2029}',
+        '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
+    ] {
+        for input in [
+            format!("password{separator}={separator}production-value"),
+            format!("password{separator}=production-value"),
+            format!(r#"{{"api_key"{separator}:{separator}"production-value"}}"#),
+            format!("Authorization{separator}:{separator}Bearer{separator}abc123def456ghi789"),
+        ] {
+            let redaction = redact_durable_text(&input);
+            assert!(
+                !redaction.text.contains("production-value")
+                    && !redaction.text.contains("abc123def456ghi789"),
+                "U+{:04X} left the credential in {:?}",
+                separator as u32,
+                redaction.text
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
