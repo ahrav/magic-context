@@ -151,15 +151,19 @@ pub struct ScanLimits {
 
 impl Default for ScanLimits {
     fn default() -> Self {
-        Self {
-            max_input_bytes: MAX_INPUT_BYTES,
-            max_candidates: 262_144,
-            max_work_bytes: 512 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 
 impl ScanLimits {
+    /// Exposed as a `const` so callers deriving their own limits can compare against it
+    /// in a `const` assertion rather than at run time.
+    pub const DEFAULT: Self = Self {
+        max_input_bytes: MAX_INPUT_BYTES,
+        max_candidates: 262_144,
+        max_work_bytes: 512 * 1024 * 1024,
+    };
+
     pub(crate) fn validate(self) -> Result<(), ConstructionError> {
         if self.max_input_bytes == 0 || self.max_input_bytes > MAX_INPUT_BYTES {
             return Err(ConstructionError::InvalidLimits);

@@ -9,6 +9,7 @@ use mc_store::claim_mirror::{
     ClaimMirrorChangeKind, ClaimMirrorEffect, ClaimMirrorError, ClaimMirrorLifecycle,
     ClaimMirrorReceiptGroup, ClaimMirrorSnapshot, CommittedClaimMirrorRow, CLAIM_MIRROR_VERSION,
 };
+use mc_core::redaction::RedactionErrorKind;
 use mc_store::McStore;
 use serde_json::{json, Value};
 
@@ -602,4 +603,45 @@ fn receipt_rejects_equal_revision_carrying_different_content() {
         store.list_claim_mirror(INCARNATION, Some(41)).unwrap(),
         vec![stored]
     );
+}
+
+/// The integrity scan must catch a secret-shaped field name that no whole-segment test
+/// matches, and must not invent one by joining two clean fields.
+#[test]
+fn integrity_json_rejects_secret_shaped_keys_without_fabricating_cross_field_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+    for attributes in [
+        json!({"apikey": "Ax7Ke9QpZr2mLw8T"}),
+        json!({"authtoken": "Ax7Ke9QpZr2mLw8T"}),
+        json!({"nested": [{"accessToken": "Ax7Ke9QpZr2mLw8T"}]}),
+    ] {
+        let mut row = claim(CLAIM_A, 41, 3, "content", 7);
+        row.attributes = attributes.clone();
+        let error = store
+            .replace_claim_mirror_snapshot(
+                &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+                100,
+            )
+            .expect_err("a secret-shaped field name must be refused");
+        assert!(
+            matches!(
+                error,
+                ClaimMirrorError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "unexpected error for {attributes}: {error}"
+        );
+    }
+
+    // Neither field carries a secret on its own; a separator the scanner does not break on
+    // would splice them into `password=<value>` and refuse a legitimate write.
+    let mut row = claim(CLAIM_A, 41, 3, "content", 7);
+    row.attributes = json!({"note": "rotate the password=", "value": "Ax7Ke9QpZr2mLw8T"});
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+            100,
+        )
+        .expect("two individually clean fields must not combine into a detection");
 }

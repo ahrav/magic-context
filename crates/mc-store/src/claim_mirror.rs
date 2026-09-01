@@ -11,13 +11,16 @@ use mc_core::claim_operation::{
     canonical_json_encode, canonical_snapshot_vector, is_lower_hex, is_valid_public_claim_id,
     parse_revision_locator, sha256_hex_utf8, SnapshotVector, MAX_SAFE_INTEGER,
 };
-use mc_core::redaction::{secret_key_label, RedactionErrorKind};
+use mc_core::redaction::{
+    redact_durable_text, secret_shaped_json_key, Detection, RedactionErrorKind,
+};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    retire_active_scan_owner_kind, DurableWriteFamily, McStore, PreparedWrite, WriteDisposition,
+    ensure_durable_text_bound, retire_active_scan_owner_kind, DurableWriteFamily, McStore,
+    PreparedWrite, WriteDisposition,
 };
 
 /// Version of full-snapshot and receipt-group inputs accepted by this mirror.
@@ -263,52 +266,67 @@ fn prepare_integrity_json(
     field_id: &'static str,
     value: &Value,
 ) -> Result<(), ClaimMirrorError> {
-    fn collect_scan_text(value: &Value, scan_text: &mut String) -> Result<(), ClaimMirrorError> {
+    fn reject_secret_shaped_keys(value: &Value) -> Result<(), ClaimMirrorError> {
         match value {
-            Value::String(value) => {
-                scan_text.push_str(value);
-                scan_text.push('\0');
-                Ok(())
-            }
-            Value::Array(values) => values
-                .iter()
-                .try_for_each(|value| collect_scan_text(value, scan_text)),
+            Value::Array(values) => values.iter().try_for_each(reject_secret_shaped_keys),
             Value::Object(fields) => fields.iter().try_for_each(|(key, value)| {
-                // A field named exactly `key` or `keys` is a map key rather
-                // than a credential name; every other secret-named key is
-                // protected, including one qualified into the same label.
-                let protected = secret_key_label(key).is_some_and(|label| {
-                    !(matches!(label.as_str(), "key" | "keys")
-                        && matches!(key.to_ascii_lowercase().as_str(), "key" | "keys"))
-                });
-                if protected {
+                if secret_shaped_json_key(key) {
                     return Err(ClaimMirrorError::Redaction(
                         RedactionErrorKind::SecretDetected,
                     ));
                 }
-                scan_text.push_str(key);
-                scan_text.push('\0');
-                collect_scan_text(value, scan_text)
+                reject_secret_shaped_keys(value)
             }),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
+        }
+    }
+
+    /// Scans each leaf on its own rather than a concatenation of them.
+    ///
+    /// No separator is safe to join on: the keyed rules skip whitespace between `=` and the
+    /// value, so a field ending in `password=` swallows the next field's text and reports a
+    /// secret that neither field contains.
+    fn scan_leaves(value: &Value, detections: &mut Vec<Detection>) -> Result<(), ClaimMirrorError> {
+        match value {
+            Value::String(text) => {
+                ensure_durable_text_bound(text)?;
+                detections.extend(redact_durable_text(text).detections);
+                Ok(())
+            }
+            Value::Array(values) => values
+                .iter()
+                .try_for_each(|value| scan_leaves(value, detections)),
+            Value::Object(fields) => fields
+                .values()
+                .try_for_each(|value| scan_leaves(value, detections)),
             Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
         }
     }
 
-    let mut scan_text = String::new();
-    collect_scan_text(value, &mut scan_text)?;
-    write.identity(field_id, &scan_text)?;
+    reject_secret_shaped_keys(value)?;
+    let mut detections = Vec::new();
+    scan_leaves(value, &mut detections)?;
+    if !detections.is_empty() {
+        return Err(ClaimMirrorError::Redaction(
+            RedactionErrorKind::SecretDetected,
+        ));
+    }
+    write.record_observed_scan(field_id, detections);
     Ok(())
 }
 
-fn read_claims_for_preparation(
-    store: &McStore,
+fn existing_claim_ids_tx(
+    tx: &rusqlite::Transaction<'_>,
     incarnation: &str,
-) -> Result<BTreeSet<String>, ClaimMirrorError> {
-    Ok(store
-        .list_claim_mirror(incarnation, None)?
-        .into_iter()
-        .map(|claim| claim.public_claim_id)
-        .collect())
+) -> rusqlite::Result<BTreeSet<String>> {
+    let mut statement = tx.prepare(
+        "SELECT public_claim_id FROM mc_claim_mirror_claims
+          WHERE database_incarnation_id = ?1",
+    )?;
+    let ids = statement
+        .query_map(params![incarnation], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(ids)
 }
 
 fn valid_project_id(project_id: i64) -> bool {
@@ -840,22 +858,6 @@ impl McStore {
         now_ms: i64,
     ) -> Result<(), ClaimMirrorError> {
         validate_snapshot(snapshot)?;
-        let (unresolved, control) = self
-            .inner
-            .with_conn(|conn| Ok((unresolved_claim_intents(conn)?, claim_intent_control(conn)?)))?;
-        if unresolved > 0 {
-            return Err(ClaimMirrorError::ResetBlocked {
-                unresolved: unresolved as usize,
-            });
-        }
-        if let Some((control_incarnation, _)) = control {
-            if control_incarnation != snapshot.vector.database_incarnation_id {
-                return Err(ClaimMirrorError::IncarnationMismatch {
-                    expected: control_incarnation,
-                    found: snapshot.vector.database_incarnation_id.clone(),
-                });
-            }
-        }
         let mut write = PreparedWrite::new(DurableWriteFamily::ClaimMirror);
         write.domain_owner(
             "database",
@@ -867,22 +869,24 @@ impl McStore {
             "database_incarnation_id",
             &snapshot.vector.database_incarnation_id,
         )?;
-        let existing_ids = self
-            .claim_mirror_state()?
-            .map(|state| read_claims_for_preparation(self, &state.database_incarnation_id))
-            .transpose()?
-            .unwrap_or_default();
         for claim in &snapshot.claims {
             prepare_claim_text(&mut write, claim)?;
-            if !existing_ids.contains(&claim.public_claim_id) {
-                write.identity("public_claim_id", &claim.public_claim_id)?;
-            } else {
-                write.existing_identity("public_claim_id", &claim.public_claim_id)?;
-            }
         }
         let incarnation = &snapshot.vector.database_incarnation_id;
         let outcome = write.execute(&self.inner, |coordinated| {
             let tx = coordinated.tx();
+            let existing_ids = existing_claim_ids_tx(tx, incarnation)?;
+            for claim in &snapshot.claims {
+                let prepared = &mut coordinated.prepared.borrow_mut();
+                let recorded = if existing_ids.contains(&claim.public_claim_id) {
+                    prepared.existing_identity("public_claim_id", &claim.public_claim_id)
+                } else {
+                    prepared.identity("public_claim_id", &claim.public_claim_id)
+                };
+                recorded.map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                })?;
+            }
             let unresolved = unresolved_claim_intents(tx)?;
             if unresolved > 0 {
                 return Ok(WriteDisposition::Replay(Err(
@@ -1004,11 +1008,6 @@ impl McStore {
         now_ms: i64,
     ) -> Result<ClaimMirrorApplyResult, ClaimMirrorError> {
         let group_digest = validate_group(group)?;
-        let existing_ids = self
-            .claim_mirror_state()?
-            .map(|state| read_claims_for_preparation(self, &state.database_incarnation_id))
-            .transpose()?
-            .unwrap_or_default();
         let mut write = PreparedWrite::new(DurableWriteFamily::ClaimMirror);
         write.domain_owner(
             "database",
@@ -1021,11 +1020,6 @@ impl McStore {
         )?;
         write.existing_identity("workspace_epoch", &group.vector.workspace_epoch)?;
         for effect in &group.effects {
-            if !existing_ids.contains(&effect.public_claim_id) {
-                write.identity("public_claim_id", &effect.public_claim_id)?;
-            } else {
-                write.existing_identity("public_claim_id", &effect.public_claim_id)?;
-            }
             if let Some(claim) = &effect.claim {
                 prepare_claim_text(&mut write, claim)?;
             }
@@ -1049,6 +1043,18 @@ impl McStore {
             .effect_id;
         let outcome = write.execute(&self.inner, |coordinated| {
             let tx = coordinated.tx();
+            let existing_ids = existing_claim_ids_tx(tx, incarnation)?;
+            for effect in &group.effects {
+                let prepared = &mut coordinated.prepared.borrow_mut();
+                let recorded = if existing_ids.contains(&effect.public_claim_id) {
+                    prepared.existing_identity("public_claim_id", &effect.public_claim_id)
+                } else {
+                    prepared.identity("public_claim_id", &effect.public_claim_id)
+                };
+                recorded.map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                })?;
+            }
             let outcome =
                 (|| -> rusqlite::Result<Result<ClaimMirrorApplyResult, ClaimMirrorError>> {
                     let state: Option<(String, String)> = tx

@@ -160,8 +160,15 @@ static REDACTOR: LazyLock<Result<Redactor, RedactionError>> = LazyLock::new(Reda
 /// large transaction would exhaust the default budget and be replaced whole.
 const TRANSACTION_SCAN_LIMITS: ScanLimits = ScanLimits {
     max_input_bytes: mc_secret_scanner::MAX_INPUT_BYTES,
-    max_candidates: 131_072,
+    max_candidates: 524_288,
     max_work_bytes: 1024 * 1024 * 1024,
+};
+
+const _: () = {
+    let default = ScanLimits::DEFAULT;
+    assert!(TRANSACTION_SCAN_LIMITS.max_candidates >= default.max_candidates);
+    assert!(TRANSACTION_SCAN_LIMITS.max_work_bytes >= default.max_work_bytes);
+    assert!(TRANSACTION_SCAN_LIMITS.max_input_bytes >= default.max_input_bytes);
 };
 
 static TRANSACTION_REDACTOR: LazyLock<Result<Redactor, RedactionError>> =
@@ -252,6 +259,29 @@ pub fn secret_key_label(key: &str) -> Option<String> {
     key_names_a_secret(key).then(|| redaction_type_for_key(key))
 }
 
+/// `key` and `keys` name JSON map entries rather than secrets. They are excluded
+/// case-insensitively; `api_key` remains protected.
+pub fn protected_json_key_label(key: &str) -> Option<String> {
+    let bare_map_key = matches!(key.to_ascii_lowercase().as_str(), "key" | "keys");
+    secret_key_label(key).filter(|_| !bare_map_key)
+}
+
+/// Whether a JSON field name has the shape the keyed scanner rules anchor on.
+///
+/// The keyed rules match a label word anywhere inside the key (`apikey`, `authtoken`), while
+/// [`secret_key_label`] only matches a whole `_`-separated segment. A caller that refuses
+/// secret-named fields outright needs the wider test, or `{"apikey": ..}` passes the field
+/// name gate and the flattened value carries no key context for the rules to fire on.
+///
+/// `key` and `keys` are excluded case-insensitively, as in [`protected_json_key_label`].
+pub fn secret_shaped_json_key(key: &str) -> bool {
+    if matches!(key.to_ascii_lowercase().as_str(), "key" | "keys") {
+        return false;
+    }
+    let lowered = separate_words(key).to_ascii_lowercase();
+    LABEL_WORDS.iter().any(|word| lowered.contains(word))
+}
+
 fn key_names_a_secret(key: &str) -> bool {
     separate_words(key)
         .to_lowercase()
@@ -267,6 +297,8 @@ pub fn contains_redaction_token(text: &str) -> bool {
     text.contains("_REDACTED>") || text.contains("<REDACTED:")
 }
 
+pub const MAX_REDACTION_LABEL_BYTES: usize = 64;
+
 fn redaction_type_for_key(key: &str) -> String {
     let label = separate_words(key)
         .to_lowercase()
@@ -275,9 +307,16 @@ fn redaction_type_for_key(key: &str) -> String {
         .collect::<Vec<_>>()
         .join("_");
     if label.is_empty() {
-        "secret".to_owned()
-    } else {
-        label
+        return "secret".to_owned();
+    }
+    if label.len() <= MAX_REDACTION_LABEL_BYTES {
+        return label;
+    }
+    // Truncate on a segment boundary so the label stays a `_`-joined run of whole label
+    // words. Cutting mid-segment would invent a word that no key contained.
+    match label[..=MAX_REDACTION_LABEL_BYTES].rfind('_') {
+        Some(boundary) if boundary > 0 => label[..boundary].to_owned(),
+        _ => "secret".to_owned(),
     }
 }
 

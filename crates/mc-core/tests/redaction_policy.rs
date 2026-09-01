@@ -1,6 +1,8 @@
 use std::sync::OnceLock;
 
-use mc_core::redaction::{redact_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID};
+use mc_core::redaction::{
+    redact_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID, MAX_REDACTION_LABEL_BYTES,
+};
 use proptest::prelude::*;
 
 fn redactor() -> &'static Redactor {
@@ -372,6 +374,41 @@ proptest! {
             prop_assert!(input.is_char_boundary(detection.offset));
             prop_assert!(input.is_char_boundary(end));
             prop_assert!(!detection.secret_type.is_empty());
+        }
+    }
+}
+
+/// A key name is captured out of untrusted text and has no length bound, so the label
+/// derived from it must stay inside the ceiling a store's label column enforces.
+#[test]
+fn labels_stay_bounded_for_key_names_built_from_many_label_words() {
+    for key in [
+        "x_api_access_private_client_session_refresh_service_openai_anthropic_key",
+        "secret_secret_secret_secret_secret_secret_secret_secret_secret_secret_secret",
+        "authorization_authorization_authorization_authorization_authorization",
+        "aws_secret_access_key",
+    ] {
+        let redaction = redact_durable_text(&format!("{key}=Ax7Ke9QpZr2mLw8T"));
+        assert!(
+            !redaction.detections.is_empty(),
+            "expected a keyed detection for {key}"
+        );
+        for detection in &redaction.detections {
+            assert!(
+                !detection.secret_type.is_empty()
+                    && detection.secret_type.len() <= MAX_REDACTION_LABEL_BYTES,
+                "label {:?} for {key} is {} bytes, outside 1..={MAX_REDACTION_LABEL_BYTES}",
+                detection.secret_type,
+                detection.secret_type.len()
+            );
+            assert!(
+                detection
+                    .secret_type
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+                "label {:?} for {key} leaves the bounded shape",
+                detection.secret_type
+            );
         }
     }
 }

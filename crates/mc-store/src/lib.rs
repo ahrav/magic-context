@@ -28,10 +28,9 @@ use mc_core::claim_operation::{
     CLAIM_REQUEST_ENCODING_VERSION,
 };
 use mc_core::redaction::{
-    detector_revision, detector_semantic_digest, redact_durable_text,
-    redact_transaction_durable_text, reject_secret_text, reject_transaction_secret_text,
-    secret_key_label, DETECTOR_ID,
-    Redaction, RedactionErrorKind,
+    detector_revision, detector_semantic_digest, protected_json_key_label, redact_durable_text,
+    redact_transaction_durable_text, reject_secret_text, reject_transaction_secret_text, Detection,
+    Redaction, RedactionErrorKind, DETECTOR_ID,
 };
 use rusqlite::{
     functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension, Transaction,
@@ -439,9 +438,13 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 57,
-    statements: r#"
+/// Migration 57 initializes an empty `main` database; add later schema changes as new
+/// migrations. The runner skips `version <= current`, so extending 57's statements is a
+/// silent no-op on every store that already recorded 57.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 57,
+        statements: r#"
 CREATE TABLE mc_cache_state (
             session_id   TEXT PRIMARY KEY,
             row_version  INTEGER NOT NULL,
@@ -1318,7 +1321,11 @@ CREATE TABLE mc_claim_mirror_receipts (
             applied_at_ms INTEGER NOT NULL,
             PRIMARY KEY (database_incarnation_id, receipt_id)
         ) WITHOUT ROWID;
-
+    "#,
+    },
+    Migration {
+        version: 58,
+        statements: r#"
 CREATE TABLE mc_scan_batches (
             scan_batch_id TEXT PRIMARY KEY CHECK (length(scan_batch_id) = 32),
             owner_kind TEXT NOT NULL,
@@ -1387,7 +1394,8 @@ CREATE TABLE mc_scan_detections (
             PRIMARY KEY (scan_id, detection_ordinal)
         ) WITHOUT ROWID;
     "#,
-}];
+    },
+];
 
 /// The highest `mc_cache` schema migration this binary ships.
 ///
@@ -1411,13 +1419,17 @@ pub const LATEST_MIGRATION_VERSION: u32 = {
 /// Lowest `mc_cache` version this binary can adopt without reinterpreting an
 /// older schema.
 ///
-/// [`MIGRATIONS`] is a single consolidated bootstrap, not an incremental chain:
-/// its statements compose the whole schema from an empty `main`. The runner in
-/// `cortexkit-store` applies any bundled version above the highest recorded one,
-/// so a store carrying pre-cutover history would run that bootstrap against a
-/// populated schema and fail on the first `CREATE TABLE`. Such a store is
-/// classified and refused before the runner sees it.
-const OLDEST_ADOPTABLE_MIGRATION_VERSION: u32 = LATEST_MIGRATION_VERSION;
+/// `OLDEST_ADOPTABLE_MIGRATION_VERSION` tracks the bootstrap entry in [`MIGRATIONS`],
+/// not the newest one. A store at the bootstrap version has the complete schema;
+/// incremental migrations upgrade it. A store below the bootstrap version predates that
+/// schema, so the runner would replay the bootstrap over a populated `main` and fail on
+/// the first `CREATE TABLE`; such a store is classified and refused before the runner
+/// sees it. Deriving this bound from the newest version instead would refuse exactly the
+/// stores an incremental migration exists to upgrade.
+const OLDEST_ADOPTABLE_MIGRATION_VERSION: u32 = BOOTSTRAP_MIGRATION_VERSION;
+
+/// Version of the [`MIGRATIONS`] entry that composes the schema from an empty `main`.
+const BOOTSTRAP_MIGRATION_VERSION: u32 = 57;
 
 /// Highest `mc_cache` migration recorded in `store.db`, or `None` when the
 /// namespace has no history: a fresh file, or one predating the version table.
@@ -2949,7 +2961,7 @@ struct ActiveWriteTransaction<'tx> {
 impl PreparedWrite {
     fn new(family: DurableWriteFamily) -> Self {
         Self {
-            owner_kind: family.owner_kind(),
+            owner_kind: family.registration().family.owner_kind(),
             scans: Vec::new(),
             domain_owners: Vec::new(),
             existing_scan_links: Vec::new(),
@@ -3065,6 +3077,21 @@ impl PreparedWrite {
             PreparedScanLayer::Durable,
             PreparedFieldPolicy::ExistingIdentity,
         )
+    }
+
+    /// Records a scan from detections an earlier preparation already produced.
+    ///
+    /// Lets a caller that prepared its text through a JSON-aware path attach the audit
+    /// receipt without running the scanner over the same bytes a second time.
+    fn record_observed_scan(&mut self, field_id: &'static str, detections: Vec<Detection>) {
+        self.scans.push(PreparedFieldScan {
+            field_id,
+            redaction: Redaction {
+                text: String::new(),
+                detections,
+            },
+            owners: self.domain_owners.clone(),
+        });
     }
 
     fn reject_recorded_identities(&self, field_ids: &[&str]) -> Result<(), McStoreError> {
@@ -3344,32 +3371,105 @@ fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
     tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
 }
 
-fn prune_orphan_active_scan_audit(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    tx.execute(
-        "DELETE FROM mc_field_scans
-          WHERE NOT EXISTS (
-              SELECT 1 FROM mc_scan_owner_copies
-               WHERE mc_scan_owner_copies.scan_id = mc_field_scans.scan_id
-          )",
-        [],
-    )?;
-    tx.execute(
-        "DELETE FROM mc_scan_batches
-          WHERE NOT EXISTS (
-              SELECT 1 FROM mc_field_scans
-               WHERE mc_field_scans.scan_batch_id = mc_scan_batches.scan_batch_id
-          )",
-        [],
-    )?;
+/// Deletes the audit rows that lost their last owner, restricted to `scan_ids`.
+///
+/// An unrestricted sweep would scan `mc_field_scans` and `mc_scan_batches` in full, and
+/// callers retire owners one row at a time inside loops, so the cost per retirement would
+/// grow with every scan the store has ever recorded.
+fn prune_retired_active_scan_audit(
+    tx: &Transaction<'_>,
+    retired_scans: &[(String, String)],
+    owner_scope_id: &str,
+) -> rusqlite::Result<()> {
+    for (scan_id, _) in retired_scans {
+        tx.execute(
+            "DELETE FROM mc_field_scans
+              WHERE scan_id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM mc_scan_owner_copies
+                     WHERE mc_scan_owner_copies.scan_id = mc_field_scans.scan_id
+                )",
+            params![scan_id],
+        )?;
+    }
+    let mut pruned_batches = BTreeSet::new();
+    for (_, batch_id) in retired_scans {
+        if !pruned_batches.insert(batch_id) {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM mc_scan_batches
+              WHERE scan_batch_id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM mc_field_scans
+                     WHERE mc_field_scans.scan_batch_id = mc_scan_batches.scan_batch_id
+                )",
+            params![batch_id],
+        )?;
+    }
     tx.execute(
         "DELETE FROM mc_scan_owner_scopes
-          WHERE NOT EXISTS (
-              SELECT 1 FROM mc_scan_domain_owners
-               WHERE mc_scan_domain_owners.owner_scope_id = mc_scan_owner_scopes.owner_scope_id
-          )",
-        [],
+          WHERE owner_scope_id = ?1
+            AND NOT EXISTS (
+                SELECT 1 FROM mc_scan_domain_owners
+                 WHERE mc_scan_domain_owners.owner_scope_id = mc_scan_owner_scopes.owner_scope_id
+            )",
+        params![owner_scope_id],
     )?;
     Ok(())
+}
+
+/// Retires the domain owners in one scope, optionally narrowed to an owner kind and key,
+/// then prunes only the audit rows those owners held.
+fn retire_active_scan_domain_owners(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+    owner_kind: Option<&str>,
+    owner_key: Option<&str>,
+) -> rusqlite::Result<()> {
+    let private_scope_key = active_scan_private_key(scope_kind, scope_key);
+    let owner_scope_id: Option<String> = tx
+        .query_row(
+            "SELECT owner_scope_id FROM mc_scan_owner_scopes
+              WHERE scope_kind = ?1 AND scope_key = ?2",
+            params![scope_kind, private_scope_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(owner_scope_id) = owner_scope_id else {
+        return Ok(());
+    };
+    let private_owner_key =
+        owner_key.map(|key| active_scan_private_key(owner_kind.unwrap_or(scope_kind), key));
+
+    let retired_scans = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT copies.scan_id, scans.scan_batch_id
+               FROM mc_scan_owner_copies copies
+               JOIN mc_scan_domain_owners owners USING(domain_owner_id)
+               JOIN mc_field_scans scans ON scans.scan_id = copies.scan_id
+              WHERE owners.owner_scope_id = ?1
+                AND (?2 IS NULL OR owners.owner_kind = ?2)
+                AND (?3 IS NULL OR owners.owner_key = ?3)",
+        )?;
+        let rows = statement
+            .query_map(
+                params![owner_scope_id, owner_kind, private_owner_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    tx.execute(
+        "DELETE FROM mc_scan_domain_owners
+          WHERE owner_scope_id = ?1
+            AND (?2 IS NULL OR owner_kind = ?2)
+            AND (?3 IS NULL OR owner_key = ?3)",
+        params![owner_scope_id, owner_kind, private_owner_key],
+    )?;
+    prune_retired_active_scan_audit(tx, &retired_scans, &owner_scope_id)
 }
 
 fn retire_active_scan_domain_owner(
@@ -3379,17 +3479,13 @@ fn retire_active_scan_domain_owner(
     owner_kind: &str,
     owner_key: &str,
 ) -> rusqlite::Result<()> {
-    let scope_key = active_scan_private_key(scope_kind, scope_key);
-    let owner_key = active_scan_private_key(owner_kind, owner_key);
-    tx.execute(
-        "DELETE FROM mc_scan_domain_owners
-          WHERE owner_scope_id IN (
-              SELECT owner_scope_id FROM mc_scan_owner_scopes
-               WHERE scope_kind = ?1 AND scope_key = ?2
-          ) AND owner_kind = ?3 AND owner_key = ?4",
-        params![scope_kind, scope_key, owner_kind, owner_key],
-    )?;
-    prune_orphan_active_scan_audit(tx)
+    retire_active_scan_domain_owners(
+        tx,
+        scope_kind,
+        scope_key,
+        Some(owner_kind),
+        Some(owner_key),
+    )
 }
 
 fn retire_active_scan_owner_kind(
@@ -3398,16 +3494,7 @@ fn retire_active_scan_owner_kind(
     scope_key: &str,
     owner_kind: &str,
 ) -> rusqlite::Result<()> {
-    let scope_key = active_scan_private_key(scope_kind, scope_key);
-    tx.execute(
-        "DELETE FROM mc_scan_domain_owners
-          WHERE owner_scope_id IN (
-              SELECT owner_scope_id FROM mc_scan_owner_scopes
-               WHERE scope_kind = ?1 AND scope_key = ?2
-          ) AND owner_kind = ?3",
-        params![scope_kind, scope_key, owner_kind],
-    )?;
-    prune_orphan_active_scan_audit(tx)
+    retire_active_scan_domain_owners(tx, scope_kind, scope_key, Some(owner_kind), None)
 }
 
 fn retire_active_scan_scope(
@@ -3415,12 +3502,7 @@ fn retire_active_scan_scope(
     scope_kind: &str,
     scope_key: &str,
 ) -> rusqlite::Result<()> {
-    let scope_key = active_scan_private_key(scope_kind, scope_key);
-    tx.execute(
-        "DELETE FROM mc_scan_owner_scopes WHERE scope_kind = ?1 AND scope_key = ?2",
-        params![scope_kind, scope_key],
-    )?;
-    prune_orphan_active_scan_audit(tx)
+    retire_active_scan_domain_owners(tx, scope_kind, scope_key, None, None)
 }
 
 fn active_scan_owner_key(parts: &[&str]) -> String {
@@ -3639,6 +3721,46 @@ pub enum DurableWriteFamily {
 }
 
 impl DurableWriteFamily {
+    /// Every variant, so a test can enumerate the families instead of restating the list.
+    pub const ALL: &'static [Self] = &[
+        Self::CacheState,
+        Self::TransformDiagnostics,
+        Self::TransformOverlays,
+        Self::CommandLedgers,
+        Self::Notes,
+        Self::NoteEvaluationLedgers,
+        Self::Compartments,
+        Self::ChunkTranscripts,
+        Self::Tags,
+        Self::HistorianSideChannels,
+        Self::WorkspaceProfileMemory,
+        Self::AuthorityRoutes,
+        Self::AuthorityControl,
+        Self::AuthoritySeedRows,
+        Self::ProjectMuralArtifacts,
+        Self::ClaimIntents,
+        Self::ClaimMirror,
+        Self::FacadeMutationLedger,
+        Self::LineageCopies,
+        Self::KernelCommitEnvelope,
+        Self::KernelDomainsRegistry,
+        Self::KernelStaging,
+        Self::KernelAlignmentProjection,
+        Self::KernelConsumerControl,
+        Self::RedactionReceipts,
+    ];
+
+    /// Panics when the family is absent from [`DURABLE_WRITE_REGISTRY`].
+    ///
+    /// `PreparedWrite::new` resolves this, so a family cannot reach storage without
+    /// declaring the policy it follows and the test that proves it.
+    fn registration(self) -> &'static DurableWriteRegistration {
+        DURABLE_WRITE_REGISTRY
+            .iter()
+            .find(|entry| entry.family == self)
+            .expect("durable-write family is declared in DURABLE_WRITE_REGISTRY")
+    }
+
     pub const fn owner_kind(self) -> &'static str {
         match self {
             Self::CacheState => "cache_state",
@@ -3737,11 +3859,21 @@ fn prepare_transaction_json_preserving_identities(input: &str) -> Result<String,
     prepare_json_content_with(input, JsonScanPolicy::TransactionPreserveIdentities)
 }
 
-fn prepare_transaction_response(input: &str) -> Result<String, McStoreError> {
+fn prepare_transaction_response_collecting(
+    input: &str,
+    detections: &mut Vec<Detection>,
+) -> Result<String, McStoreError> {
     if serde_json::from_str::<Value>(input).is_ok() {
-        prepare_json_content_with(input, JsonScanPolicy::TransactionPreserveIdentities)
+        prepare_json_content_collecting(
+            input,
+            JsonScanPolicy::TransactionPreserveIdentities,
+            detections,
+        )
     } else {
-        prepare_transaction_content(input)
+        ensure_durable_text_bound(input)?;
+        let redaction = redact_transaction_durable_text(input);
+        detections.extend(redaction.detections);
+        Ok(redaction.text)
     }
 }
 
@@ -3770,6 +3902,16 @@ impl JsonScanPolicy {
 }
 
 fn prepare_json_content_with(input: &str, policy: JsonScanPolicy) -> Result<String, McStoreError> {
+    prepare_json_content_collecting(input, policy, &mut Vec::new())
+}
+
+/// Appends every detection the preparation observed to `detections`, so an audit receipt can
+/// be recorded without scanning the same text a second time.
+fn prepare_json_content_collecting(
+    input: &str,
+    policy: JsonScanPolicy,
+    detections: &mut Vec<Detection>,
+) -> Result<String, McStoreError> {
     ensure_durable_text_bound(input)?;
     fn identity_json_field(key: &str) -> bool {
         matches!(key, "id" | "key" | "locator" | "revision")
@@ -3841,6 +3983,7 @@ fn prepare_json_content_with(input: &str, policy: JsonScanPolicy) -> Result<Stri
         value: &mut Value,
         key: Option<&str>,
         policy: JsonScanPolicy,
+        detections: &mut Vec<Detection>,
     ) -> Result<(), McStoreError> {
         if let Some(key) = key.filter(|key| identity_json_field(key) || integrity_json_field(key)) {
             if identity_json_field(key) && !integrity_json_field(key) && !policy.reject_protected()
@@ -3855,34 +3998,36 @@ fn prepare_json_content_with(input: &str, policy: JsonScanPolicy) -> Result<Stri
                 } else {
                     redact_durable_text(&encoded)
                 };
-                if !redaction.detections.is_empty() || secret_key_label(key).is_some() {
+                if !redaction.detections.is_empty() || protected_json_key_label(key).is_some() {
                     return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
                 }
+                detections.extend(redaction.detections);
             }
             return Ok(());
         }
         match value {
             Value::String(text) => {
                 let redaction = if policy.transaction() {
-                    redact_transaction_durable_text(text).text
+                    redact_transaction_durable_text(text)
                 } else {
-                    redact_durable_text(text).text
+                    redact_durable_text(text)
                 };
-                *text = match key.and_then(secret_key_label) {
+                detections.extend(redaction.detections);
+                *text = match key.and_then(protected_json_key_label) {
                     Some(label) if !text.is_empty() => format!("<REDACTED:{label}>"),
-                    _ => redaction,
+                    _ => redaction.text,
                 };
             }
             Value::Array(values) => {
                 for value in values {
-                    prepare_value(value, key, policy)?;
+                    prepare_value(value, key, policy, detections)?;
                 }
             }
             Value::Object(fields) => {
                 for (field, value) in fields {
                     ensure_durable_text_bound(field)?;
                     reject_secret_text(field)?;
-                    prepare_value(value, Some(field), policy)?;
+                    prepare_value(value, Some(field), policy, detections)?;
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -3894,7 +4039,7 @@ fn prepare_json_content_with(input: &str, policy: JsonScanPolicy) -> Result<Stri
         serde_json::from_str(input).map_err(|error| McStoreError::Serde(error.to_string()))?;
     validate_json_keys(&value)?;
     let original = value.clone();
-    prepare_value(&mut value, None, policy)?;
+    prepare_value(&mut value, None, policy, detections)?;
     if value == original {
         Ok(input.to_string())
     } else {
@@ -3946,14 +4091,34 @@ fn prepare_core_state_for_write(
     write: &mut PreparedWrite,
     core: &CoreState,
 ) -> Result<CoreState, McStoreError> {
-    write.existing_identity("boundary_id", &core.boundary_id)?;
-    for unit in core.frozen_units.iter().chain(&core.pending_changes) {
-        write.existing_identity("unit_key", &unit.key)?;
-        write.existing_identity("unit_kind", &unit.kind)?;
-        write.existing_identity("reset_rule", &unit.reset_rule)?;
-        write.record_content("frozen_payload", &unit.frozen_payload)?;
+    fn prepare_unit(
+        write: &mut PreparedWrite,
+        unit: &FrozenUnit,
+    ) -> Result<FrozenUnit, McStoreError> {
+        Ok(FrozenUnit {
+            key: write.existing_identity("unit_key", &unit.key)?,
+            kind: write.existing_identity("unit_kind", &unit.kind)?,
+            frozen_payload: write.content("frozen_payload", &unit.frozen_payload)?,
+            durability_class: unit.durability_class,
+            reset_rule: write.existing_identity("reset_rule", &unit.reset_rule)?,
+        })
     }
-    prepare_core_state(core)
+
+    Ok(CoreState {
+        version: core.version,
+        boundary_id: write.existing_identity("boundary_id", &core.boundary_id)?,
+        frozen_units: core
+            .frozen_units
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        pending_changes: core
+            .pending_changes
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        reconcile_pending: core.reconcile_pending,
+    })
 }
 
 fn prepare_transaction_core_state_for_write(
@@ -6636,28 +6801,25 @@ impl McStore {
                         "facade response is not UTF-8",
                     )))
                 })?;
-                let response = prepare_transaction_response(response_text)
-                    .map_err(|error| {
-                        if let McStoreError::Redaction(kind) = error {
-                            redaction_failure.set(Some(kind));
-                        }
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                            "facade response failed secret scanning",
-                        )))
-                    })?
-                    .into_bytes();
+                let mut response_detections = Vec::new();
+                let response =
+                    prepare_transaction_response_collecting(response_text, &mut response_detections)
+                        .map_err(|error| {
+                            if let McStoreError::Redaction(kind) = error {
+                                redaction_failure.set(Some(kind));
+                            }
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other("facade response failed secret scanning"),
+                            ))
+                        })?
+                        .into_bytes();
+                // The receipt reuses the detections from the preparation above; scanning
+                // `response_text` again would run the scanner over the whole payload twice on
+                // every command.
                 coordinated
                     .prepared
                     .borrow_mut()
-                    .transaction_content("response_json", response_text)
-                    .map_err(|error| {
-                        if let McStoreError::Redaction(kind) = error {
-                            redaction_failure.set(Some(kind));
-                        }
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                            "facade response audit failed secret scanning",
-                        )))
-                    })?;
+                    .record_observed_scan("response_json", response_detections);
                 if let Some(command_id) = command_id {
                     let created_at_ms = current_time_ms();
                     tx.execute(
@@ -11104,10 +11266,8 @@ impl McStore {
         let compartments = prepare_compartments(&mut write, compartments)?;
         write.execute(&self.inner, |coordinated| {
             let tx = coordinated.tx();
+            // Retire only the owner whose rows the deletes below remove.
             retire_active_scan_owner_kind(tx, "session", session_id, "compartments")?;
-            retire_active_scan_owner_kind(tx, "session", session_id, "historian_side_channels")?;
-            retire_active_scan_owner_kind(tx, "session", session_id, "authority_seed_rows")?;
-            retire_active_scan_owner_kind(tx, "session", session_id, "lineage_copies")?;
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
                 params![session_id],
@@ -11797,24 +11957,13 @@ impl McStore {
                 Ok(json) => json,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
             };
-            if coordinated
+            coordinated
                 .prepared
                 .borrow_mut()
                 .transaction_content("meta", &meta_json)
-                .is_err()
-            {
-                return Ok(PublishTxnOutcome::Serde(
-                    "historian metadata failed secret scanning".to_string(),
-                ));
-            }
-            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
-                Ok(json) => json,
-                Err(_) => {
-                    return Ok(PublishTxnOutcome::Serde(
-                        "historian metadata failed secret scanning".to_string(),
-                    ))
-                }
-            };
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let meta_json = prepare_transaction_json_preserving_identities(&meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
                  WHERE session_id = ?1 AND row_version = ?4",
@@ -16644,6 +16793,7 @@ impl McStore {
                     .transpose()
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 for (field_id, value) in [
+                    ("check_status", reduced.check_status.as_deref()),
                     ("compiled_check", reduced.compiled_check.as_deref()),
                     ("check_hash", reduced.check_hash.as_deref()),
                     ("check_cron", reduced.check_cron.as_deref()),
@@ -16719,7 +16869,7 @@ impl McStore {
                     "check_status": reduced.check_status,
                 })
                 .to_string();
-                coordinated
+                let response_json = coordinated
                     .prepared
                     .borrow_mut()
                     .transaction_content("terminal_response", &response_json)
@@ -19170,6 +19320,131 @@ mod tests {
             }
             other => panic!("expected a pre-cutover family refusal, got {other}"),
         }
+    }
+
+    #[test]
+    fn every_durable_write_family_is_declared_once_with_a_distinct_owner_kind() {
+        let mut seen_families = BTreeSet::new();
+        let mut seen_owner_kinds = BTreeSet::new();
+        for entry in DURABLE_WRITE_REGISTRY {
+            assert!(
+                seen_families.insert(entry.family),
+                "{:?} is declared more than once",
+                entry.family
+            );
+            let owner_kind = entry.family.owner_kind();
+            assert!(
+                !owner_kind.is_empty(),
+                "{:?} has an empty owner kind",
+                entry.family
+            );
+            assert!(
+                seen_owner_kinds.insert(owner_kind),
+                "owner kind {owner_kind} is claimed by more than one family"
+            );
+            assert!(
+                !entry.preparation.is_empty(),
+                "{:?} does not name its preparation path",
+                entry.family
+            );
+            assert!(
+                !entry.test.is_empty(),
+                "{:?} does not name a proving test",
+                entry.family
+            );
+        }
+        // `PreparedWrite::new` resolves the registration, so an undeclared family panics on
+        // first use rather than writing without a declared policy.
+        for family in DurableWriteFamily::ALL {
+            assert!(
+                seen_families.contains(family),
+                "{family:?} is missing from DURABLE_WRITE_REGISTRY"
+            );
+        }
+        assert_eq!(seen_families.len(), DurableWriteFamily::ALL.len());
+    }
+
+    #[test]
+    fn store_recorded_at_the_bootstrap_adopts_later_migrations_and_can_still_audit_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let bootstrap = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == BOOTSTRAP_MIGRATION_VERSION)
+            .expect("the bootstrap migration is bundled");
+        // Schema created by the bootstrap cannot reach stores already recorded at the
+        // bootstrap version, so the audit tables have to come from a later migration.
+        // Otherwise the fixture below would seed them itself and prove nothing.
+        for table in [
+            "mc_scan_batches",
+            "mc_scan_owner_scopes",
+            "mc_scan_domain_owners",
+            "mc_field_scans",
+            "mc_scan_owner_copies",
+            "mc_scan_detections",
+        ] {
+            assert!(
+                !bootstrap.statements.contains(table),
+                "{table} must be created by a migration above v{BOOTSTRAP_MIGRATION_VERSION}, \
+                 not folded into the frozen bootstrap"
+            );
+        }
+        // Migration runners skip versions at or below the recorded version, so
+        // later-added bootstrap tables do not reach existing stores.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 );",
+            )
+            .unwrap();
+            conn.execute_batch(bootstrap.statements).unwrap();
+            conn.execute(
+                "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                 VALUES (?1, ?2, 0)",
+                params![NS, BOOTSTRAP_MIGRATION_VERSION],
+            )
+            .unwrap();
+        }
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        assert_eq!(
+            store.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION,
+            "a store at the bootstrap version must be carried to the newest migration, not refused"
+        );
+
+        // `replace_compartments` records a scan receipt in `mc_field_scans`; an
+        // unmigrated store lacks that table.
+        let compartment = StoredCompartment {
+            sequence: 1,
+            start_message: 0,
+            end_message: 10,
+            start_message_id: "a#0".to_string(),
+            end_message_id: "m10".to_string(),
+            title: "c".to_string(),
+            content: "p1".to_string(),
+            p1: Some("p1".to_string()),
+            importance: 50,
+            ..Default::default()
+        };
+        store
+            .replace_compartments("ses_upgrade", &[compartment])
+            .unwrap();
+        let receipts: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_field_scans", [], |row| row.get(0))
+            })
+            .unwrap();
+        assert!(
+            receipts > 0,
+            "the upgraded store must persist scan receipts for the write it just accepted"
+        );
     }
 
     #[test]
