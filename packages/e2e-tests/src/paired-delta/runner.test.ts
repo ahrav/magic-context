@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    mkdirSync,
+    mkdtempSync,
+    existsSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1464,6 +1472,108 @@ describe("paired-delta runner", () => {
         await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
             /replicate index 0 is not a non-negative safe integer/,
         );
+    });
+
+    it("can still release a claim that was displaced and then restored", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-restored-claim-"));
+        try {
+            const path = join(root, "records.json");
+            const lock = `${path}.lock`;
+            const owner = join(lock, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+            const ourOwnerRecord = readFileSync(owner, "utf8");
+
+            // A reclaimer displaces this owner's record, which is what the store detects.
+            writeFileSync(
+                owner,
+                JSON.stringify({ pid: process.pid, nonce: "f".repeat(32), acquiredAt: Date.now() }),
+            );
+            expect(() => store.put(storedRecord("mc-off"))).toThrow(RolloutStoreBusyError);
+
+            // `restoreOrRemoveSideline` can put this owner's record back, and it names a
+            // live pid that `lockAbandoned` will never reclaim.
+            writeFileSync(owner, ourOwnerRecord);
+            store.release();
+
+            expect(existsSync(lock)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not lose a coordinate published under it mid-write", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // Stand in for a new holder publishing between this call's reload and its
+            // rename: `reload` is what reads the file, so a write during it is that race.
+            const proto = Object.getPrototypeOf(store) as { reload: () => RolloutRecord[] };
+            const original = proto.reload;
+            let races = 0;
+            proto.reload = function patched(this: FileRolloutStore): RolloutRecord[] {
+                const records = original.call(this);
+                if (races === 0) {
+                    races += 1;
+                    writeFileSync(
+                        path,
+                        JSON.stringify([storedRecord("mc-on"), storedRecord("compaction")]),
+                    );
+                }
+                return records;
+            };
+            try {
+                store.put(storedRecord("mc-off"));
+            } finally {
+                proto.reload = original;
+            }
+
+            // The racing holder's coordinate survives alongside this call's own.
+            const onDisk = JSON.parse(readFileSync(path, "utf8")) as RolloutRecord[];
+            expect(onDisk.map(({ armId }) => armId).sort()).toEqual([
+                "compaction",
+                "mc-off",
+                "mc-on",
+            ]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reports contention when the records path is rewritten continuously", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-loop-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            const proto = Object.getPrototypeOf(store) as { reload: () => RolloutRecord[] };
+            const original = proto.reload;
+            let writes = 0;
+            proto.reload = function patched(this: FileRolloutStore): RolloutRecord[] {
+                const records = original.call(this);
+                writes += 1;
+                writeFileSync(
+                    path,
+                    JSON.stringify([storedRecord("mc-on"), { ...storedRecord("compaction"), wallClockMs: writes }]),
+                );
+                return records;
+            };
+            try {
+                expect(() => store.put(storedRecord("mc-off"))).toThrow(
+                    /records changed under this owner while publishing/,
+                );
+            } finally {
+                proto.reload = original;
+            }
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it("keeps the claim when removing the lock directory fails", () => {

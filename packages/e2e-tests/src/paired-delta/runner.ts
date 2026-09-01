@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -390,38 +391,63 @@ export class FileRolloutStore implements RolloutStore {
             throw new Error(`rollout store ${this.path} was opened read-only`);
         }
         this.acquire();
-        /** Ownership is re-proved here, but a check cannot stay true through the write that follows it, so it is a fast failure rather than the safety property. What makes a lost lock harmless is the merge below. commentlint: allow(JUDGE) */
-        if (!lockHeldByThisProcess(this.lockPath)) {
-            this.invalidate();
-            throw new RolloutStoreBusyError(
-                `rollout store ${this.path} lock was taken over by another owner`,
+        /** Ownership is checked before the work and again immediately before the rename, and the file is fingerprinted across the same span: merging into current contents is not by itself enough, because the merge reads a snapshot that a new holder can supersede before this rename lands, and the rename would then drop the coordinate that holder published. The pair of checks does not make the window zero — no check can stay true through the syscall after it — but a publication that loses the race is now detected and retried instead of silently overwriting paid evidence. commentlint: allow(JUDGE) */
+        for (let attempt = 0;; attempt += 1) {
+            if (!lockHeldByThisProcess(this.lockPath)) {
+                this.invalidate();
+                throw new RolloutStoreBusyError(
+                    `rollout store ${this.path} lock was taken over by another owner`,
+                );
+            }
+            const fingerprint = this.recordsFingerprint();
+            /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so a coordinate this process never knew about survives the merge. commentlint: allow(JUDGE) */
+            const merged = [...this.reload()];
+            const key = coordinateKey(record);
+            const index = this.indexByCoordinate.get(key);
+            if (index !== undefined && merged[index]?.cell.runHealth === "completed") {
+                throw new Error(`refusing to replace completed rollout ${key}`);
+            }
+            /** The caller keeps a reference to the record it passed and the run returns the same object in its result, so installing it directly made the cache an alias of caller-owned state: an edited result — a `costUsd` set to zero — would then be served by `list()` in place of the correct file, understating restored spend and letting further paid arms pass the cap. commentlint: allow(JUDGE) */
+            const stored = structuredClone(record);
+            if (index !== undefined) merged[index] = stored;
+            else merged.push(stored);
+            /** Re-read rather than trusted: between the fingerprint above and here this call did its own reload, and a new holder publishing in that span means the merge is already stale. Retried a bounded number of times, because a path under continuous rewriting is contention to report rather than a race to keep losing. commentlint: allow(JUDGE) */
+            if (
+                !lockHeldByThisProcess(this.lockPath) ||
+                this.recordsFingerprint() !== fingerprint
+            ) {
+                this.invalidate();
+                if (attempt < PUBLISH_FENCE_ATTEMPTS - 1) continue;
+                throw new RolloutStoreBusyError(
+                    `rollout store ${this.path} records changed under this owner while publishing`,
+                );
+            }
+            // The records file feeds spend and resume decisions for later runs, so
+            // it stays owner-only even though report artifacts are world-readable.
+            /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. commentlint: allow(JUDGE) */
+            publishJsonAtomically(merged, this.path, { mode: 0o600 });
+            this.records = merged;
+            this.indexByCoordinate = new Map(
+                merged.map((published, position) => [coordinateKey(published), position]),
             );
+            return;
         }
-        /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so no interleaving of lock takeover and publication can erase a coordinate this process never knew about. The cached snapshot is replaced by the merged state, which also means a stale cache cannot survive a lost lock. commentlint: allow(JUDGE) */
-        const merged = [...this.reload()];
-        const key = coordinateKey(record);
-        const index = this.indexByCoordinate.get(key);
-        if (index !== undefined && merged[index]?.cell.runHealth === "completed") {
-            throw new Error(`refusing to replace completed rollout ${key}`);
-        }
-        /** The caller keeps a reference to the record it passed and the run returns the same object in its result, so installing it directly made the cache an alias of caller-owned state: an edited result — a `costUsd` set to zero — would then be served by `list()` in place of the correct file, understating restored spend and letting further paid arms pass the cap. commentlint: allow(JUDGE) */
-        const stored = structuredClone(record);
-        if (index !== undefined) merged[index] = stored;
-        else merged.push(stored);
-        // The records file feeds spend and resume decisions for later runs, so
-        // it stays owner-only even though report artifacts are world-readable.
-        /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. commentlint: allow(JUDGE) */
-        publishJsonAtomically(merged, this.path, { mode: 0o600 });
-        this.records = merged;
-        this.indexByCoordinate = new Map(
-            merged.map((stored, position) => [coordinateKey(stored), position]),
-        );
     }
 
+    /** Identifies the exact contents the merge was built from. A hash rather than a timestamp because two writes inside one filesystem timestamp tick are exactly the interleaving being fenced, and an absent file is a state to distinguish rather than an error. commentlint: allow(JUDGE) */
+    private recordsFingerprint(): string {
+        try {
+            return createHash("sha256").update(readFileSync(this.path)).digest("hex");
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            return "absent";
+        }
+    }
+
+    /** The handle is deliberately kept. A reclaimer that sidelined this lock can still restore the owner record, and a restored record names this live process, which `lockAbandoned` will never reclaim — so discarding the handle here left the path blocked until the process exited. Retaining it is safe because `releaseLock` re-reads before deleting anything and removes only a record carrying this process's nonce, sweeping sidelines otherwise. commentlint: allow(JUDGE) */
     private invalidate(): void {
         this.records = null;
         this.indexByCoordinate = new Map();
-        this.held = null;
         ownedRecordPaths.delete(this.claim);
     }
 
@@ -1348,6 +1374,9 @@ function releaseBeforeThrowing(store: RolloutStore): void {
         store.release?.();
     } catch {}
 }
+
+/** Bounded so a records path under continuous rewriting reports contention instead of retrying forever. commentlint: allow(JUDGE) */
+const PUBLISH_FENCE_ATTEMPTS = 3;
 
 function coordinateKey(coordinate: RolloutCoordinate): string {
     return [
