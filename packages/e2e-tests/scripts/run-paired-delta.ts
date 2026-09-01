@@ -30,6 +30,7 @@ import {
     type FamilyNoiseFloor,
 } from "../src/paired-delta/estimator";
 import { buildPairedDeltaRegistry } from "../src/paired-delta/registry";
+import { validSuccess } from "../src/paired-delta/scoring";
 import {
     buildCalibrationRecord,
     buildPairedDeltaReport,
@@ -978,17 +979,6 @@ export function claimsCompletion(text: string): boolean {
     return false;
 }
 
-/**
- * The policy declares `paired-valid-success-delta`, so an arm scores 1 only when every applicable critical check passed.
- * Averaging the whole check vector estimated a different quantity: an arm that wrote the answer file with the wrong contents scored 0.5 with zero valid successes.
- */
-function validSuccess(record: RolloutRecord): number {
-    if (record.cell.criticalTotal === 0) {
-        throw new Error("paired delta cell declares no critical checks");
-    }
-    return record.cell.criticalPassed === record.cell.criticalTotal ? 1 : 0;
-}
-
 function buildAnalysis(
     result: PairedDeltaRunResult,
     scenarios: readonly ScenarioDeclaration[],
@@ -1208,6 +1198,16 @@ async function runLive(args: CliArgs): Promise<void> {
             );
         }
         const calibration = readCalibrationRecord(args.calibrationRecordPath);
+        /** Binding is checked first: a stale record's `poolSize` could otherwise raise a cohort complaint that points at re-authoring the pool when the record simply does not describe this run. */
+        if (
+            calibration.poolManifestFingerprint !== manifestFingerprint ||
+            calibration.pinnedSnapshotId !== model.modelId ||
+            calibration.policyFingerprint !== policyDocument.policyFingerprint ||
+            calibration.implementationCommit !== implementationCommit ||
+            !calibration.validForPoolSizing
+        ) {
+            throw new Error("paired-delta calibration record does not bind this run");
+        }
         /**
          * The calibrated size is a decision, and a cohort below it cannot support the preregistered
          * detectable delta, so the dispatch refuses before spending rather than publishing an
@@ -1221,15 +1221,6 @@ async function runLive(args: CliArgs): Promise<void> {
                 `${calibration.decisions.poolSize}; re-author the pool or the replicate count, ` +
                 "or re-calibrate",
             );
-        }
-        if (
-            calibration.poolManifestFingerprint !== manifestFingerprint ||
-            calibration.pinnedSnapshotId !== model.modelId ||
-            calibration.policyFingerprint !== policyDocument.policyFingerprint ||
-            calibration.implementationCommit !== implementationCommit ||
-            !calibration.validForPoolSizing
-        ) {
-            throw new Error("paired-delta calibration record does not bind this run");
         }
         noiseFloors = calibrationNoiseFloors(calibration);
     }

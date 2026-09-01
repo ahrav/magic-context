@@ -12,6 +12,7 @@ import type {
     FamilyNoiseFloor,
     RawRegretRecord,
 } from "./estimator";
+import { validSuccess } from "./scoring";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
 export const PAIRED_DELTA_REPORT_SCHEMA = "paired-delta-report/v1";
@@ -354,17 +355,6 @@ function completePrimaryCoordinates(
 /** Both identifiers are free-form, so the key is JSON-encoded rather than `:`-joined. */
 function coordinateKey(record: RolloutRecord): string {
     return JSON.stringify([record.scenarioId, record.replicateIndex]);
-}
-
-/**
- * The preregistered endpoint is a valid-success delta, so a cell scores 1 only when every applicable critical check passed.
- * Averaging the whole check vector let an arm that wrote the file with the wrong answer score 0.5 despite zero valid successes.
- */
-function validSuccess(record: RolloutRecord): number {
-    if (record.cell.criticalTotal === 0) {
-        throw new Error(`paired-delta-calibration: empty-critical-vector-${record.scenarioId}`);
-    }
-    return record.cell.criticalPassed === record.cell.criticalTotal ? 1 : 0;
 }
 
 const CALIBRATION_ENDPOINTS = [
