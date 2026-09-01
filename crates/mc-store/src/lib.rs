@@ -10201,10 +10201,11 @@ impl McStore {
                 &core,
             ) {
                 Ok(core) => core,
-                Err(_) => {
-                    return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(
-                        "cache core state failed secret scanning".to_string(),
-                    )))
+                // Fail the transaction rather than reporting a refusal through a successful
+                // disposition. Pending drops, hint seeds, compartments, the workspace, and the
+                // user profile are already written by this point, and `Replay` commits them.
+                Err(error) => {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
                 }
             };
             let core_json = match serde_json::to_string(&core) {
@@ -10215,22 +10216,17 @@ impl McStore {
                 Ok(json) => json,
                 Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
             };
-            if coordinated
+            if let Err(error) = coordinated
                 .prepared
                 .borrow_mut()
                 .transaction_content("meta", &meta_json)
-                .is_err()
             {
-                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(
-                    "cache metadata failed secret scanning".to_string(),
-                )));
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
             }
             let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
                 Ok(json) => json,
-                Err(_) => {
-                    return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(
-                        "cache metadata failed secret scanning".to_string(),
-                    )))
+                Err(error) => {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
                 }
             };
             tx.execute(
@@ -23135,6 +23131,97 @@ mod shadow_tests {
             importance: 50,
             ..Default::default()
         }
+    }
+
+    /// A state sync whose metadata fails preparation must roll back. Pending drops, hint
+    /// seeds, compartments, the workspace, and the profile are written before that scan runs,
+    /// so reporting the refusal through a successful disposition commits them.
+    #[test]
+    fn state_sync_metadata_scan_failure_rolls_back_earlier_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "rollback-session";
+        let drop = PendingAgentDropSeedRow {
+            block_id: "ccm-0#7".to_string(),
+            queued_at_ms: 5,
+        };
+        // The request's own fields are bounded before the transaction opens, so the in-transaction
+        // metadata scan is reached through state a previous release already stored. A grandfathered
+        // `last_model_key` past the durable bound makes the assembled metadata fail that scan.
+        let legacy = ModuleMeta {
+            last_model_key: "x".repeat(MAX_DURABLE_TEXT_BYTES + 1),
+            ..Default::default()
+        };
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, 1, ?2, ?3, 0)",
+                    params![
+                        session,
+                        serde_json::to_string(&CoreState::default()).unwrap(),
+                        serde_json::to_string(&legacy).unwrap(),
+                    ],
+                )
+            })
+            .unwrap();
+
+        let error = store
+            .apply_authority_state_sync(ModuleStateSyncRequest {
+                session_id: session,
+                project_path: "project",
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
+                pending_agent_drops: &[drop],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
+                compartments: &[],
+                user_profile: &[],
+                user_profile_present: false,
+                workspace: None,
+                workspace_present: false,
+                last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
+                acked_watermarks: serde_json::json!({"section_seq": 0}),
+            })
+            .expect_err("oversized metadata must not be accepted");
+        assert!(
+            !matches!(error, ModuleStateSyncError::GenerationMismatch { .. }),
+            "the sync must fail on its metadata, not on a fence: {error:?}"
+        );
+
+        let seeded: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_agent_drops WHERE session_id = ?1",
+                    params![session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            seeded, 0,
+            "a refused state sync committed its pending-drop seed"
+        );
     }
 
     fn apply_state_sync_sections(
