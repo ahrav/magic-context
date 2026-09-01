@@ -200,9 +200,12 @@ impl ApplicabilityEngine {
             ) else {
                 continue;
             };
-            // The durable record already states this verdict for this checkout,
-            // so appending again would only duplicate it.
-            if block.is_some_and(|block| block.observation_kind == intent.observation_kind()) {
+            // Matching the kind is not enough: a stale record from an earlier
+            // HEAD or dirty fingerprint describes a checkout state this repair
+            // does not, and deep verification needs evidence for the current
+            // one. The dedup identity covers the whole snapshot, so comparing
+            // it skips only a repair the record already is.
+            if block.is_some_and(|block| block.repair_identity == intent.operation_key()) {
                 continue;
             }
             // Nothing recorded means nothing to clear.

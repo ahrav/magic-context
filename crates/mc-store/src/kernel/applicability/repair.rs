@@ -20,8 +20,8 @@ use super::super::{CommitIntent, Envelope, KernelError, KernelStore, Sensitivity
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::engine::{ApplicabilityEngine, ApplicabilityState, ObjectApplicability};
 use super::payloads::{
-    ApplicabilityObservationPayload, DEPENDENCY_KIND_TARGET, OBSERVATION_APPLICABILITY_SCHEMA,
-    OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
+    checkout_identity_digest, ApplicabilityObservationPayload, DEPENDENCY_KIND_TARGET,
+    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
 };
 use super::resolve::PATCH_ID_ALGORITHM;
 
@@ -113,7 +113,7 @@ impl RepairIntent {
         // result.
         let payload = ApplicabilityObservationPayload {
             schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
-            checkout_identity: snapshot.identity().to_string(),
+            checkout_identity_digest: checkout_identity_digest(snapshot.identity()),
             head: snapshot.head().to_string(),
             dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
             patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
@@ -150,7 +150,10 @@ impl RepairIntent {
             object_id: object.object_id.clone(),
             object_revision: object.object_revision,
             kind,
-            summary: object.evidence.clone(),
+            // The slice rejects an oversized field, which would turn the stale
+            // veto this repair records into a failed evaluation. The payload
+            // already carries the bounded form.
+            summary: payload.evidence.clone(),
             detail,
             operation_key,
             request_digest: format!("{:x}", digest.finalize()),
@@ -162,10 +165,15 @@ impl RepairIntent {
 
     /// `target` carries the classified object's own domain and sensitivity,
     /// read inside the repair transaction.
-    /// The observation kind this repair would append, for reconciling against
-    /// the durable record before committing.
+    /// The observation kind this repair would append.
     pub fn observation_kind(&self) -> &'static str {
         self.kind
+    }
+
+    /// Dedup identity of this repair, for reconciling against the durable
+    /// record before committing.
+    pub fn operation_key(&self) -> &str {
+        &self.operation_key
     }
 
     fn observation_spec(&self, target: &RepairTarget) -> ObservationSpec {
@@ -320,6 +328,11 @@ pub struct InjectionBlock {
     /// Commit sequence of the newest observation whose kind differs from
     /// `observation_kind`, or 0 when this kind is the only one recorded.
     pub prior_kind_commit_seq: i64,
+    /// Dedup identity of the repair that wrote the latest observation, which is
+    /// its `source_id`. A repair whose identity equals this one is already
+    /// recorded; one that differs describes a checkout state this record does
+    /// not, even at the same kind.
+    pub repair_identity: String,
 }
 
 impl InjectionBlock {
@@ -442,15 +455,11 @@ impl KernelStore {
             Some(requested) => requested,
             None => tip,
         };
+        // Hashed once for the whole scan: the payload stores the digest, not the
+        // identity, so the redactor cannot rewrite one side of the comparison.
+        let digest = checkout_identity_digest(checkout_identity);
         for chunk in object_ids.chunks(BLOCK_SCAN_ID_CHUNK) {
-            reduce_chunk(
-                &tx,
-                chunk,
-                checkout_identity,
-                known_as_of,
-                budget,
-                &mut states,
-            )?;
+            reduce_chunk(&tx, chunk, &digest, known_as_of, budget, &mut states)?;
         }
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(states)
@@ -464,7 +473,7 @@ impl KernelStore {
 fn reduce_chunk(
     tx: &rusqlite::Transaction<'_>,
     object_ids: &[&str],
-    checkout_identity: &str,
+    checkout_digest: &str,
     known_as_of: i64,
     budget: &EvalBudget,
     states: &mut HashMap<String, InjectionBlock>,
@@ -475,9 +484,10 @@ fn reduce_chunk(
     let mut statement = tx
         .prepare(&format!(
             "SELECT d.dependency_object_id, o.observation_kind, o.observation_payload,
-                    o.created_commit_seq
+                    o.created_commit_seq, r.source_id
              FROM observation_dependencies d
              JOIN observations o ON o.observation_id = d.observation_id
+             JOIN object_registry r ON r.object_id = o.object_id
              WHERE d.dependency_object_id IN ({placeholders})
                AND d.dependency_kind = ?{kind}
                AND o.observation_kind LIKE 'applicability.%'
@@ -511,7 +521,8 @@ fn reduce_chunk(
         let kind: String = row.get(1).map_err(|_| KernelError::Io)?;
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
-        if !matches_checkout(&payload, checkout_identity)? {
+        let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
+        if !matches_checkout(&payload, checkout_digest)? {
             continue;
         }
         let entry = pending.entry(object_id).or_insert(Reduction::Latest);
@@ -521,6 +532,7 @@ fn reduce_chunk(
                 observation_kind: kind,
                 commit_seq,
                 prior_kind_commit_seq: 0,
+                repair_identity,
             }),
             Reduction::PriorKind(block) if block.observation_kind == kind => {
                 Reduction::PriorKind(block)
@@ -543,7 +555,7 @@ fn reduce_chunk(
 /// A payload that does not decode fails the read. Skipping to an older row
 /// would reduce a corrupt latest record to an older `applicability.current`,
 /// or to no block at all, and let a failing object auto-inject.
-fn matches_checkout(payload: &[u8], checkout_identity: &str) -> Result<bool, KernelError> {
+fn matches_checkout(payload: &[u8], checkout_identity_digest: &str) -> Result<bool, KernelError> {
     let payload = serde_json::from_slice::<ObservationPayload>(payload)
         .map_err(|_| KernelError::CorruptCanonicalRow)?;
     let Some(detail) = payload.detail.as_deref() else {
@@ -554,7 +566,7 @@ fn matches_checkout(payload: &[u8], checkout_identity: &str) -> Result<bool, Ker
     if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA {
         return Err(KernelError::CorruptCanonicalRow);
     }
-    Ok(detail.checkout_identity == checkout_identity)
+    Ok(detail.checkout_identity_digest == checkout_identity_digest)
 }
 
 #[cfg(test)]
@@ -569,7 +581,7 @@ mod tests {
     fn a_detected_secret_never_reaches_the_payload_document() {
         let payload = ApplicabilityObservationPayload {
             schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
-            checkout_identity: "checkout".to_string(),
+            checkout_identity_digest: checkout_identity_digest("checkout"),
             head: "head".to_string(),
             dirty_fingerprint: "fingerprint".to_string(),
             patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
@@ -585,7 +597,10 @@ mod tests {
         let stored = redact_lossy(&detail).text;
         let decoded = serde_json::from_str::<ApplicabilityObservationPayload>(&stored)
             .expect("the stored document still decodes");
-        assert_eq!(decoded.checkout_identity, "checkout");
+        assert_eq!(
+            decoded.checkout_identity_digest,
+            checkout_identity_digest("checkout")
+        );
         assert_eq!(decoded.schema, OBSERVATION_APPLICABILITY_SCHEMA);
     }
 
@@ -601,7 +616,7 @@ mod tests {
         // A serialized document built from it round-trips through redaction.
         let detail = serde_json::to_string(&ApplicabilityObservationPayload {
             schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
-            checkout_identity: "checkout".to_string(),
+            checkout_identity_digest: checkout_identity_digest("checkout"),
             head: "head".to_string(),
             dirty_fingerprint: "fingerprint".to_string(),
             patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),

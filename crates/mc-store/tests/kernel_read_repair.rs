@@ -1410,3 +1410,170 @@ fn an_implements_observation_still_rebuilds_the_alignment_projection() {
     );
     assert!(receipt.commit_seq > before);
 }
+
+/// The checkout identity is a filesystem path. The slice redacts the payload
+/// document as one text field, so a path segment shaped like a secret would be
+/// rewritten inside the stored payload while the reducer compared against the
+/// caller's original path — and the block would never match its own checkout.
+#[test]
+fn a_secret_shaped_checkout_path_still_matches_its_own_block() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_root = tempfile::tempdir().unwrap();
+    // The identity is the resolved `.git` directory, so the secret-shaped
+    // segment has to be in the path itself.
+    let repo_dir = repo_root.path().join("password=hunter-two");
+    std::fs::create_dir(&repo_dir).unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(&repo_dir);
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(&repo_dir, &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert!(matches!(report.appends[0].1, AppendOutcome::Landed { .. }));
+
+    let snapshot = snapshot_checkout(&repo_dir, &EvalBudget::unbounded()).unwrap();
+    assert!(
+        snapshot.identity().contains("password="),
+        "the fixture identity carries the secret-shaped segment: {}",
+        snapshot.identity()
+    );
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap()
+        .expect("the block matches the checkout that recorded it");
+    assert!(block.blocked);
+}
+
+/// A checkout that moves while the same check keeps failing is new evidence for
+/// deep verification, so the repair still appends. Matching only the observation
+/// kind would suppress it and leave the outbox job describing the old state.
+#[test]
+fn a_moved_head_with_the_same_failure_still_appends() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    let evaluate = || {
+        ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &EvalBudget::unbounded(),
+            )
+            .unwrap()
+    };
+
+    let first = evaluate();
+    assert!(matches!(
+        first.appends[0].1,
+        AppendOutcome::Landed {
+            replayed: false,
+            ..
+        }
+    ));
+
+    // HEAD advances; the checked file is still absent, so the verdict is stale
+    // again — at a checkout state the recorded observation does not describe.
+    let moved = commit_snapshot(
+        &fixture.repo,
+        "moved",
+        &[tip],
+        &[
+            ("src/lib.rs", "pub fn a() {}\n"),
+            ("src/other.rs", "moved\n"),
+        ],
+        "moved",
+        2,
+    );
+    set_head_detached(&fixture.repo, moved);
+    materialize(&fixture.repo, moved);
+
+    let second = evaluate();
+    assert_eq!(second.objects[0].state, ApplicabilityState::Stale);
+    assert!(
+        matches!(
+            second.appends.first(),
+            Some((
+                _,
+                AppendOutcome::Landed {
+                    replayed: false,
+                    ..
+                }
+            ))
+        ),
+        "the moved checkout appends its own evidence, got {:?}",
+        second.appends
+    );
+    assert_eq!(
+        count(
+            store_dir.path(),
+            "SELECT COUNT(*) FROM observations WHERE observation_kind LIKE 'applicability.%'"
+        ),
+        2,
+        "one record per failing checkout state"
+    );
+    assert_eq!(
+        count(
+            store_dir.path(),
+            "SELECT COUNT(*) FROM outbox o JOIN observations obs ON obs.object_id = o.object_id"
+        ),
+        2,
+        "deep verification is scheduled for each"
+    );
+}
+
+/// A check path past the redactor's input limit does not resolve, so the verdict
+/// is uncertain and no append is attempted. The veto still holds and the
+/// evaluation still returns a report rather than a store error.
+#[test]
+fn an_unresolvable_oversized_check_path_still_vetoes() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [ApplicabilityCandidate {
+        object_id: TARGET_OBJECT.to_string(),
+        object_revision: 1,
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    // Past mc_secret_scanner::MAX_INPUT_BYTES.
+                    path: format!("src/{}.rs", "a".repeat(600 * 1024)),
+                }],
+            )
+            .encode(),
+        ),
+        ..ApplicabilityCandidate::default()
+    }];
+
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert!(
+        report.objects[0].state.blocks_auto_injection(),
+        "the veto still holds, got {:?}",
+        report.objects[0].state
+    );
+    assert!(report.auto_injectable().next().is_none());
+}
