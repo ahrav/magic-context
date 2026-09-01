@@ -124,8 +124,10 @@ impl<'s> ResolutionLadder<'s> {
     /// an uncertain one: a walk that ran under a deepened boundary can report commentlint: allow(JUDGE)
     /// `Holds` where the boundary the key names would truncate it, and commentlint: allow(JUDGE)
     /// re-truncating to that same boundary makes the key match again. Callers commentlint: allow(JUDGE)
-    /// therefore ask before retaining any graph-derived verdict, and the commentlint: allow(JUDGE)
-    /// re-read happens once per request. commentlint: allow(JUDGE)
+    /// therefore ask before retaining any graph-derived verdict. Only commentlint: allow(JUDGE)
+    /// movement is memoized, so an unchanged boundary is re-read on every commentlint: allow(JUDGE)
+    /// call: a match established before one walk says nothing about the commentlint: allow(JUDGE)
+    /// boundary a later walk ran under. commentlint: allow(JUDGE)
     pub fn repository_state_moved(&self) -> bool {
         if self.repository_state_moved.get() {
             return true;
