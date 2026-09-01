@@ -4059,6 +4059,15 @@ fn prepare_json_content_collecting(
                 return Ok(());
             }
         }
+        // Protected-key containers with nested text can expose it under unprotected member keys.
+        // `{"credential":{"value":".."}}` reads its text under `value`.
+        // `claim_mirror::prepare_integrity_json` refuses the same shape.
+        if key.is_some_and(|key| protected_json_key_label(key).is_some())
+            && (value.is_object() || value.is_array())
+            && contains_nonempty_text(value)
+        {
+            return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+        }
         match value {
             Value::String(text) => {
                 let redaction = if policy.transaction() {
@@ -4089,8 +4098,7 @@ fn prepare_json_content_collecting(
         Ok(())
     }
 
-    let mut value: Value =
-        serde_json::from_str(input).map_err(|error| McStoreError::Serde(error.to_string()))?;
+    let mut value: Value = parse_json_with_unique_names(input)?;
     validate_json_keys(&value)?;
     let original = value.clone();
     prepare_value(&mut value, None, policy, detections)?;
@@ -4099,6 +4107,91 @@ fn prepare_json_content_collecting(
     } else {
         serde_json::to_string(&value).map_err(|error| McStoreError::Serde(error.to_string()))
     }
+}
+
+/// `serde_json::Value` retains only the last duplicate object name, allowing earlier
+/// secret-bearing values to bypass `prepare_value` and persist when unchanged input is returned.
+fn parse_json_with_unique_names(input: &str) -> Result<Value, McStoreError> {
+    struct UniqueNames(Value);
+
+    struct UniqueNamesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueNamesVisitor {
+        type Value = Value;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("JSON whose object names are unique")
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+            Ok(Value::Bool(value))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+            Ok(Value::from(value))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+            Ok(Value::from(value))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+            Ok(Value::from(value))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+            Ok(Value::String(value.to_owned()))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Value, A::Error> {
+            let mut items = Vec::new();
+            while let Some(UniqueNames(item)) = sequence.next_element()? {
+                items.push(item);
+            }
+            Ok(Value::Array(items))
+        }
+
+        // Error messages omit object names because validation scans them for credentials only
+        // after parsing.
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut fields = serde_json::Map::new();
+            while let Some(name) = map.next_key::<String>()? {
+                let UniqueNames(value) = map.next_value()?;
+                if fields.insert(name, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate JSON object name"));
+                }
+            }
+            Ok(Value::Object(fields))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for UniqueNames {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(UniqueNamesVisitor).map(Self)
+        }
+    }
+
+    serde_json::from_str::<UniqueNames>(input)
+        .map(|UniqueNames(value)| value)
+        .map_err(|error| McStoreError::Serde(error.to_string()))
 }
 
 fn ensure_durable_text_bound(input: &str) -> Result<(), McStoreError> {
@@ -4401,6 +4494,22 @@ pub struct NoteDelivery {
 pub enum NoteCasOutcome {
     Applied(StoredNote),
     Conflict { current: Option<StoredNote> },
+}
+
+/// Mutation-neutral updates return `Applied` without executing a statement.
+/// An active-write disposition uses `wrote` rather than the outcome variant.
+struct NoteCasApplication {
+    outcome: NoteCasOutcome,
+    wrote: bool,
+}
+
+impl NoteCasApplication {
+    fn unwritten(outcome: NoteCasOutcome) -> Self {
+        Self {
+            outcome,
+            wrote: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6204,6 +6313,7 @@ impl<'a> FacadeMutationTxn<'a> {
             &prepared,
             now_ms,
         )
+        .map(|application| application.outcome)
         .map_err(|error| error.to_string())
     }
 
@@ -8407,7 +8517,7 @@ impl McStore {
             let mut insert_refusal = write.scans[first_scan..]
                 .iter()
                 .any(|scan| !scan.redaction.detections.is_empty())
-                .then(|| McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+                .then_some(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
             let source_bytes = match write.bytes("source_bytes", &input.source_bytes) {
                 Ok(prepared) => prepared,
                 Err(error) if existed => {
@@ -10095,6 +10205,7 @@ impl McStore {
             strip_seeds,
             last_todo_state,
         } = prepare_state_sync(&mut write, &request)?;
+        let session_id_flagged = write.recorded_detections(&["session_id"]);
         let outcome = write.execute(&self.inner, |coordinated| {
             let tx = coordinated.tx;
             let row = tx
@@ -10125,6 +10236,15 @@ impl McStore {
                 }
                 None => (NO_ROW, CoreState::default(), ModuleMeta::default()),
             };
+            if session_id_flagged && current == NO_ROW {
+                // No `mc_cache_state` row means this sync creates the session, so its ID is a
+                // new identity rather than one already keying durable rows.
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["session_id"])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
             let initialized_before_sync = meta.initialized;
 
             if !request.compartments.is_empty()
@@ -13082,7 +13202,7 @@ impl McStore {
         let prepared =
             prepare_note_update(&mut write, content, surface_condition, condition_compile)?;
         let result = self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
-            let outcome = update_note_cas_tx(
+            let application = update_note_cas_tx(
                 coordinated.tx(),
                 project_path,
                 note_id,
@@ -13091,9 +13211,12 @@ impl McStore {
                 &prepared,
                 now_ms,
             )?;
-            Ok(match outcome {
-                NoteCasOutcome::Applied(_) => WriteDisposition::Applied(outcome),
-                NoteCasOutcome::Conflict { .. } => WriteDisposition::Replay(outcome),
+            // A mutation-neutral update stores none of the prepared `condition_compile` bytes,
+            // so committing its scans would describe a compile the note never took.
+            Ok(if application.wrote {
+                WriteDisposition::Applied(application.outcome)
+            } else {
+                WriteDisposition::Replay(application.outcome)
             })
         })?;
         Ok(result)
@@ -16003,18 +16126,20 @@ fn update_note_cas_tx(
     expected_version: i64,
     prepared: &PreparedNoteUpdate<'_>,
     now_ms: i64,
-) -> rusqlite::Result<NoteCasOutcome> {
+) -> rusqlite::Result<NoteCasApplication> {
     let current = load_note_tx(tx, note_id).optional()?;
     let Some(current) = current else {
-        return Ok(NoteCasOutcome::Conflict { current: None });
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
+            current: None,
+        }));
     };
     if current.project_path != project_path
         || current.status != expected_status
         || current.status_version != expected_version
     {
-        return Ok(NoteCasOutcome::Conflict {
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
             current: Some(current),
-        });
+        }));
     }
     let next_content = prepared
         .content
@@ -16022,9 +16147,9 @@ fn update_note_cas_tx(
         .map(str::trim)
         .unwrap_or(&current.content);
     if next_content.is_empty() {
-        return Ok(NoteCasOutcome::Conflict {
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
             current: Some(current),
-        });
+        }));
     }
     let next_condition = prepared
         .surface_condition
@@ -16048,7 +16173,9 @@ fn update_note_cas_tx(
         // A fully unchanged update is mutation-neutral: bumping the
         // versions would fence an active evaluation claim and re-run
         // billable work for compiler inputs that did not change.
-        return Ok(NoteCasOutcome::Applied(current));
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Applied(
+            current,
+        )));
     }
     let remaining_condition = if condition_changed {
         next_condition
@@ -16081,14 +16208,17 @@ fn update_note_cas_tx(
         ],
     )?;
     if changed == 0 {
-        return Ok(NoteCasOutcome::Conflict {
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
             current: load_note_tx(tx, note_id).optional()?,
-        });
+        }));
     }
     if compiler_edit {
         fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
     }
-    Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+    Ok(NoteCasApplication {
+        outcome: NoteCasOutcome::Applied(load_note_tx(tx, note_id)?),
+        wrote: true,
+    })
 }
 
 /// Single definition of the note dismissal executed by both the `McStore`
@@ -17374,6 +17504,59 @@ mod tests {
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         McStore::test_descriptor(dir, "magic-context-test")
+    }
+
+    /// `serde_json::Value` keeps only the last member of a repeated name, so the scan never
+    /// reads the earlier one while the unchanged-input path returns the original text.
+    #[test]
+    fn duplicate_json_object_names_are_refused() {
+        let error = prepare_json_content(r#"{"x":"password=secret","x":"ok"}"#).unwrap_err();
+        assert!(matches!(error, McStoreError::Serde(_)), "{error:?}");
+        assert!(!error.to_string().contains("secret"), "{error:?}");
+        // A nested repeat is refused on the same grounds as a top-level one.
+        let nested = prepare_json_content(r#"{"a":{"x":"password=secret","x":"ok"}}"#).unwrap_err();
+        assert!(matches!(nested, McStoreError::Serde(_)), "{nested:?}");
+        // Unique names across sibling objects are ordinary JSON.
+        assert_eq!(
+            prepare_json_content(r#"{"a":{"x":"ok"},"b":{"x":"ok"}}"#).unwrap(),
+            r#"{"a":{"x":"ok"},"b":{"x":"ok"}}"#
+        );
+    }
+
+    /// A protected name substitutes its scalar, so a container under the same name must not
+    /// hand its members to their own field names and escape that policy.
+    #[test]
+    fn a_protected_key_holding_a_container_is_refused() {
+        for input in [
+            r#"{"credential":{"value":"fixture"}}"#,
+            r#"{"credential":["fixture"]}"#,
+            r#"{"credential":{"nested":{"value":"fixture"}}}"#,
+            r#"{"apikey":{"value":"fixture"}}"#,
+        ] {
+            let error = prepare_json_content(input).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+                ),
+                "{input} -> {error:?}"
+            );
+        }
+        // The scalar form still substitutes rather than refusing.
+        assert_eq!(
+            prepare_json_content(r#"{"credential":"fixture"}"#).unwrap(),
+            r#"{"credential":"<REDACTED:credential>"}"#
+        );
+        // A container carrying no text has nothing to conceal.
+        assert_eq!(
+            prepare_json_content(r#"{"credential":{"count":3}}"#).unwrap(),
+            r#"{"credential":{"count":3}}"#
+        );
+        // An unprotected name keeps its nested walk.
+        assert_eq!(
+            prepare_json_content(r#"{"payload":{"value":"fixture"}}"#).unwrap(),
+            r#"{"payload":{"value":"fixture"}}"#
+        );
     }
 
     #[test]
