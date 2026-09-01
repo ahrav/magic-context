@@ -39,9 +39,8 @@ fn version_range(dimension: &str, value: &str) -> ScopeTermSpec {
     }
 }
 
-fn algebra_benches(c: &mut Criterion) {
-    let one = CanonicalScope::from_term_specs(&[exact("branch", "main")]).unwrap();
-    let eight_specs = [
+fn eight_term_specs() -> [ScopeTermSpec; 8] {
+    [
         exact("domain", "code"),
         exact("project", "magic-context"),
         exact("entity", "store"),
@@ -50,7 +49,12 @@ fn algebra_benches(c: &mut Criterion) {
         exact("region", "local"),
         version_range("deployment", ">=1.0.0, <3.0.0"),
         version_range("platform", ">=1.70.0, <2.0.0"),
-    ];
+    ]
+}
+
+fn algebra_benches(c: &mut Criterion) {
+    let one = CanonicalScope::from_term_specs(&[exact("branch", "main")]).unwrap();
+    let eight_specs = eight_term_specs();
     let eight = CanonicalScope::from_term_specs(&eight_specs).unwrap();
     let mut context = ScopeMatchContext::new();
     for (dimension, value) in [
@@ -391,6 +395,37 @@ fn batch_benches(c: &mut Criterion) {
             );
         });
     }
+
+    let scoped_context = ScopeMatchContext::new()
+        .with_value(Dimension::Domain, "code")
+        .with_value(Dimension::Project, "magic-context")
+        .with_value(Dimension::Entity, "store")
+        .with_value(Dimension::Branch, "main")
+        .with_value(Dimension::Environment, "test")
+        .with_value(Dimension::Region, "local")
+        .with_value(Dimension::Deployment, "2.0.0")
+        .with_value(Dimension::Platform, "1.98.0");
+    let scoped_candidates: Vec<_> = (0..512)
+        .map(|index| ApplicabilityCandidate {
+            scope_terms: Some(eight_term_specs().to_vec()),
+            ..candidate(&format!("scoped-object-{index}"))
+        })
+        .collect();
+    group.bench_function(BenchmarkId::new("cold-scoped", 512), |b| {
+        b.iter_batched(
+            ApplicabilityEngine::new,
+            |engine| {
+                engine.evaluate_batch(
+                    black_box(&snapshot),
+                    black_box(&query),
+                    black_box(&scoped_context),
+                    black_box(&scoped_candidates),
+                    &EvalBudget::unbounded(),
+                )
+            },
+            BatchSize::SmallInput,
+        );
+    });
     group.finish();
 }
 
