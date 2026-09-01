@@ -31,3 +31,5 @@ regex = "1"
 sha2 = "0.10"
 serde_norway = "0.9.42"
 semver = "1"
+# `default-features = false` excludes network transports, credential helpers, and filter-driver command execution from the dependency graph.
+gix = { version = "0.87", default-features = false, features = ["revision", "status", "sha1", "parallel"] }
