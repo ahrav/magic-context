@@ -9609,7 +9609,14 @@ impl McStore {
             channel1_append,
             created_at_ms,
         } = overlays;
-        if let Some(project_root) = project_root {
+        // Canonicalize before scanning, because the canonical form is what the row stores.
+        // A symlink whose own spelling is clean can resolve to a detectable target, and
+        // scanning the caller's spelling would clear bytes that are never persisted while
+        // the bytes that are persisted go unscanned.
+        let canonical_project_root = project_root
+            .filter(|root| !root.is_empty())
+            .map(|root| canonical_root(root).to_string_lossy().into_owned());
+        if let Some(project_root) = canonical_project_root.as_deref() {
             write.identity("project_root", project_root)?;
         }
         if let Some(fingerprint) = scheduler_full_array_fingerprint {
@@ -9731,9 +9738,6 @@ impl McStore {
                 prepare_json_content(&value)
             })
             .transpose()?;
-        let canonical_project_root = project_root
-            .filter(|root| !root.is_empty())
-            .map(|root| canonical_root(root).to_string_lossy().into_owned());
         // The accepted cache row version is a stable identity for the pass that produced the
         // divergence. Overlay timestamps are the request clock when available; direct callers
         // that omit one still receive a real commit timestamp.
@@ -17923,6 +17927,60 @@ mod tests {
             .knows_transform_session_root("deleted", "/root-a")
             .unwrap());
         assert!(!reopened.has_cache_state("deleted").unwrap());
+    }
+
+    /// The row stores the canonical root, so the canonical form is what must be scanned. A
+    /// symlink whose own spelling is clean can resolve to a detectable target, and scanning
+    /// the caller's spelling would clear bytes that are never persisted while the bytes that
+    /// are persisted reach storage unscanned.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_root_is_scanned_as_the_canonical_path_it_stores() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The link spelling carries nothing detectable; its target does.
+        let target = dir.path().join("password=root-secret");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("clean-link");
+        symlink(&target, &link).unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let link_text = link.to_str().unwrap();
+        assert!(
+            mc_core::redaction::reject_secret_text(link_text).is_ok(),
+            "the link spelling must be clean for this test to mean anything"
+        );
+
+        let initial = store.load("symlinked-root").unwrap();
+        let error = store
+            .commit_transform(
+                "symlinked-root",
+                TransformCommit {
+                    project_root: Some(link_text),
+                    ..base_commit(initial.row_version, &initial.core, &initial.meta)
+                },
+            )
+            .expect_err("the canonical root carries a secret and must be refused");
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "unexpected error {error:?}"
+        );
+
+        let stored: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_transform_session_roots
+                      WHERE session_id = 'symlinked-root'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stored, 0, "a refused root must leave no row");
     }
 
     #[cfg(unix)]
