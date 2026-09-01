@@ -396,7 +396,7 @@ impl ApplicabilityEngine {
             })
         });
         let mut digest_prefixes = InputDigestPrefixes::new(query, scope_context);
-        let mut batch_input_digests = (candidates.len() > 1).then(HashMap::new);
+        let mut batch_input_digests: Option<HashMap<CandidateInputs<'_>, [u8; 32]>> = None;
         let mut last_input_digest = None;
         // Distinct anchors and repeated payloads resolve once per batch.
         let mut batch_memos = BatchMemos::default();
@@ -406,24 +406,35 @@ impl ApplicabilityEngine {
             .expect("cache lock")
             .reserve(candidates.len());
         for candidate in candidates {
-            let inputs_digest = match &mut batch_input_digests {
-                Some(digests) => {
-                    let candidate_inputs = CandidateInputs::new(candidate);
-                    if let Some((_, digest)) =
-                        last_input_digest.filter(|(last, _)| *last == candidate_inputs)
-                    {
-                        digest
-                    } else {
-                        let digest = digests.get(&candidate_inputs).copied().unwrap_or_else(|| {
+            let inputs_digest = if candidates.len() > 1 {
+                let candidate_inputs = CandidateInputs::new(candidate);
+                if let Some((_, digest)) =
+                    last_input_digest.filter(|(last, _)| *last == candidate_inputs)
+                {
+                    digest
+                } else {
+                    let digest = match (&mut batch_input_digests, last_input_digest) {
+                        (Some(digests), _) => {
+                            digests.get(&candidate_inputs).copied().unwrap_or_else(|| {
+                                let digest = digest_prefixes.for_candidate(candidate);
+                                digests.insert(candidate_inputs, digest);
+                                digest
+                            })
+                        }
+                        (None, Some((last, digest))) => {
+                            let mut digests = HashMap::from([(last, digest)]);
                             let digest = digest_prefixes.for_candidate(candidate);
                             digests.insert(candidate_inputs, digest);
+                            batch_input_digests = Some(digests);
                             digest
-                        });
-                        last_input_digest = Some((candidate_inputs, digest));
-                        digest
-                    }
+                        }
+                        (None, None) => digest_prefixes.for_candidate(candidate),
+                    };
+                    last_input_digest = Some((candidate_inputs, digest));
+                    digest
                 }
-                None => digest_prefixes.for_candidate(candidate),
+            } else {
+                digest_prefixes.for_candidate(candidate)
             };
             let key = self.object_cache_key(
                 snapshot,
