@@ -708,3 +708,46 @@ describe("paired-delta calibration record reader", () => {
         })))).toThrow(/record-invalid/);
     });
 });
+
+describe("paired-delta calibration reader: series integrity", () => {
+    const build3 = () => buildCalibrationRecord({
+        records: [
+            ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: true }),
+            ...coordinate("var-a", 1, { "mc-on": true, "mc-off": true, compaction: false }),
+            ...coordinate("var-a", 2, { "mc-on": true, "mc-off": false, compaction: true }),
+        ],
+        scenarioFamilies: new Map([["var-a", "fam-one"]]),
+        runStatus: "completed",
+        poolManifestFingerprint: H1,
+        pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+        policyFingerprint: H2,
+        implementationDigest: "abc123",
+        targetMinimumDetectableDelta: 0.15,
+        decisions: { familyCount: 1, replicateCount: 3, cadence: "weekly-and-release" },
+    });
+    const root = mkdtempSync(join(tmpdir(), "paired-delta-series-"));
+    const rewrite = (overrides: Record<string, unknown>): string => {
+        const { recordFingerprint, ...body } = { ...build3(), ...overrides };
+        const path = join(root, `record-${Math.random().toString(16).slice(2)}.json`);
+        require("node:fs").writeFileSync(
+            path,
+            JSON.stringify({ ...body, recordFingerprint: canonicalFingerprint(body) }),
+        );
+        return path;
+    };
+
+    it("rejects a duplicated family and endpoint series before any spend", () => {
+        const rows = build3().familyNoise;
+
+        // A repeat satisfies a `some`-based coverage test, then the estimator rejects it after the run.
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: [...rows, rows[0]] })))
+            .toThrow(/validity-inconsistent/);
+    });
+
+    it("requires the observed depth to reach the declared replicate count", () => {
+        const shallow = build3().familyNoise.map((noise) => ({ ...noise, observationCount: 2 }));
+
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: shallow })))
+            .toThrow(/validity-inconsistent/);
+    });
+});

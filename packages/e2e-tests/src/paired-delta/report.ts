@@ -591,11 +591,17 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
      */
     const measured = Array.isArray(record.familyNoise) ? record.familyNoise : [];
     const families = new Set(measured.map(({ familyId }) => familyId));
-    /** Every family carries a series for both primary endpoints, so a partial record cannot claim a floor for a comparison it never measured. */
+    /**
+     * Exactly one series per family and endpoint.
+     *
+     * A repeated row satisfies a coverage test written with `some`, and `calibrationNoiseFloors`
+     * emits one floor per row, so the duplicate reaches `estimateFamilyDeltas` — which rejects a
+     * repeated key. That rejection lands after the rollouts, leaving a paid run with no report.
+     */
     const covered = families.size > 0 && [...families].every((familyId) =>
         PRIMARY_ENDPOINTS.every((endpoint) =>
-            measured.some((noise) =>
-                noise.familyId === familyId && noise.endpoint === endpoint)));
+            measured.filter((noise) =>
+                noise.familyId === familyId && noise.endpoint === endpoint).length === 1));
     /** Recomputed from the recorded variance and target delta, so the published decision cannot disagree with the evidence beside it. */
     const derived = typeof record.targetMinimumDetectableDelta === "number" &&
             Number.isFinite(record.targetMinimumDetectableDelta) &&
@@ -608,10 +614,14 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
             record.decisions.familyCount,
         )
         : null;
+    /** The declared depth, not a hard-coded two: `buildCalibrationRecord` requires every scenario to reach `replicateCount`, and a reader accepting less would admit the undersampled pilot the writer refused. */
+    const depth = Number.isSafeInteger(record.decisions?.replicateCount)
+        ? Math.max(2, record.decisions.replicateCount)
+        : 2;
     const consistent = record.runStatus === "completed" &&
         record.varianceEstablished === true &&
         measured.length > 0 &&
-        measured.every((noise) => noise.observationCount >= 2 && noise.variance > 0) &&
+        measured.every((noise) => noise.observationCount >= depth && noise.variance > 0) &&
         covered &&
         derived !== null &&
         record.decisions?.poolSize === derived;
