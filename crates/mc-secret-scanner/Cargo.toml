@@ -20,6 +20,7 @@ sha2 = { workspace = true }
 criterion = "=0.8.2"
 proptest = "1.7"
 regex-automata = "0.4"
+regex-syntax = "0.8"
 
 [[bench]]
 name = "scanner"

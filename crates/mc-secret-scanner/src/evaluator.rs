@@ -390,6 +390,11 @@ fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+#[cfg(test)]
+pub(crate) fn secret_key_words_for_test() -> &'static [&'static [u8]] {
+    SECRET_KEY_WORDS
+}
+
 const SECRET_KEY_WORDS: &[&[u8]] = &[
     b"key",
     b"keys",

@@ -1,6 +1,10 @@
+//! Age-based paraphrase tiering.
 //!
-//!
-//!
+//! A compartment's tier follows its exponential decay position `z`, the age
+//! measured in half-lives, where the half-life grows with importance and
+//! shrinks with budget pressure. Tier boundaries are fixed so the same
+//! compartment renders identically for a given index, importance, and
+//! pressure.
 
 /// Half-life (in compartments) for importance 50 at pressure 1.
 pub const H50: f64 = 24.0;
@@ -49,7 +53,6 @@ fn z_value(compartment_index: u32, importance: i32, budget_pressure: f64) -> f64
     a / h
 }
 
-///
 /// `compartment_index` is 1-based from newest (1 = newest); `importance` clamps to 1 through 100.
 /// `budget_pressure` is clamped to at least 0.10.
 pub fn tier(compartment_index: u32, importance: i32, budget_pressure: f64) -> Tier {

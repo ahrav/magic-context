@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod api;
+#[cfg(test)]
+mod anchor_proof;
 mod evaluator;
 mod rules;
 
