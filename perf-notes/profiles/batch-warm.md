@@ -72,3 +72,14 @@ the next representation treatment; public result strings remain owned.
 
 Raw profile: `/tmp/mc-scope-perf/batch-cold-kernel-iter24-199.data`; report:
 `/tmp/mc-scope-perf/batch-cold-kernel-iter24.report`.
+
+## Dirty snapshot after iteration 26
+
+An isolated 1,000-untracked-file snapshot profile captured 1,923 samples with zero loss. File
+open/read/close/stat work dominates; SHA-256 blocks own 8.5%, memory movement 8.2%, allocator
+functions about 13%, and BTree search/insert about 3.6%. Replacing the tree with collect-sort
+did not move the 1,000-file cell and regressed small sets, so the tournament's full-walk decision
+remains binding.
+
+Raw profile: `/tmp/mc-scope-perf/snapshot-1000-iter26-199.data`; report:
+`/tmp/mc-scope-perf/snapshot-1000-iter26.report`.
