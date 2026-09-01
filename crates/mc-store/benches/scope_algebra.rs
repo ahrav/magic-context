@@ -551,6 +551,193 @@ fn batch_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn anchor_density_benches(c: &mut Criterion) {
+    let (_dir, fixture, base, tip) = applicability_fixture();
+    let snapshot = checkout(&fixture, tip);
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let anchor = reachable_anchor(&fixture, "shared", base);
+    let mut group = c.benchmark_group("anchor_density");
+    for density in ["none", "sparse", "every"] {
+        let candidates: Vec<_> = (0..64)
+            .map(|index| ApplicabilityCandidate {
+                anchor: match density {
+                    "every" => Some(anchor.clone()),
+                    "sparse" if index % 8 == 0 => Some(anchor.clone()),
+                    _ => None,
+                },
+                ..candidate(&format!("density-{index}"))
+            })
+            .collect();
+        group.bench_function(BenchmarkId::new("cold", density), |b| {
+            b.iter_batched(
+                ApplicabilityEngine::new,
+                |engine| {
+                    engine.evaluate_batch(
+                        &snapshot,
+                        &query,
+                        &scope,
+                        &candidates,
+                        &EvalBudget::unbounded(),
+                    )
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        let engine = ApplicabilityEngine::new();
+        let _ = engine.evaluate_batch(
+            &snapshot,
+            &query,
+            &scope,
+            &candidates,
+            &EvalBudget::unbounded(),
+        );
+        group.bench_function(BenchmarkId::new("warm", density), |b| {
+            b.iter(|| {
+                engine.evaluate_batch(
+                    &snapshot,
+                    &query,
+                    &scope,
+                    &candidates,
+                    &EvalBudget::unbounded(),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+fn payload_check_benches(c: &mut Criterion) {
+    let (_dir, fixture, _base, tip) = applicability_fixture();
+    let snapshot = checkout(&fixture, tip);
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let mut group = c.benchmark_group("payload_checks");
+    for count in [0usize, 4, 16] {
+        let checks = (0..count)
+            .map(|_| CheckSpec::FileExists {
+                path: "src/lib.rs".to_string(),
+            })
+            .collect();
+        let payload = ObjectApplicabilitySpec::new(vec![], checks).encode();
+        let candidates: Vec<_> = (0..64)
+            .map(|index| ApplicabilityCandidate {
+                payload: Some(payload.clone()),
+                ..candidate(&format!("checked-{index}"))
+            })
+            .collect();
+        group.bench_function(BenchmarkId::new("cold64", count), |b| {
+            b.iter_batched(
+                ApplicabilityEngine::new,
+                |engine| {
+                    engine.evaluate_batch(
+                        &snapshot,
+                        &query,
+                        &scope,
+                        &candidates,
+                        &EvalBudget::unbounded(),
+                    )
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn staleness_benches(c: &mut Criterion) {
+    let (_dir, fixture, _base, tip) = applicability_fixture();
+    let first = checkout(&fixture, tip);
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = candidates(&fixture, tip, 64, false);
+    let engine = ApplicabilityEngine::new();
+    let _ = engine.evaluate_batch(
+        &first,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    let mut edit = 0u64;
+    let mut group = c.benchmark_group("staleness");
+    group.bench_function("warm-new-snapshot/64", |b| {
+        b.iter_batched(
+            || {
+                edit += 1;
+                write_worktree_file(&fixture.repo, "moving.txt", &format!("snapshot {edit}\n"));
+                snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap()
+            },
+            |snapshot| {
+                engine.evaluate_batch(
+                    &snapshot,
+                    &query,
+                    &scope,
+                    &candidates,
+                    &EvalBudget::unbounded(),
+                )
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+fn adversarial_benches(c: &mut Criterion) {
+    let (_dir, fixture, base, tip) = applicability_fixture();
+    let snapshot = checkout(&fixture, tip);
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let anchor = reachable_anchor(&fixture, "template", base);
+    let distinct_anchors: Vec<_> = (0..512)
+        .map(|index| {
+            let mut anchor = anchor.clone();
+            anchor.anchor_id = format!("anchor-{index}");
+            ApplicabilityCandidate {
+                anchor: Some(anchor),
+                ..candidate(&format!("anchored-{index}"))
+            }
+        })
+        .collect();
+    let affected = (0..64).map(|i| format!("generated/{i}")).collect();
+    let payload = ObjectApplicabilitySpec::new(affected, vec![]).encode();
+    let huge_paths: Vec<_> = (0..512)
+        .map(|index| ApplicabilityCandidate {
+            payload: Some(payload.clone()),
+            ..candidate(&format!("paths-{index}"))
+        })
+        .collect();
+    let malformed_versions: Vec<_> = (0..512)
+        .map(|index| ApplicabilityCandidate {
+            scope_terms: Some(vec![version_range("platform", ">=not-a-version")]),
+            ..candidate(&format!("malformed-{index}"))
+        })
+        .collect();
+    let mut group = c.benchmark_group("adversarial");
+    for (name, candidates) in [
+        ("distinct-anchors", &distinct_anchors),
+        ("affected-paths-64", &huge_paths),
+        ("malformed-version", &malformed_versions),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                ApplicabilityEngine::new,
+                |engine| {
+                    engine.evaluate_batch(
+                        &snapshot,
+                        &query,
+                        &scope,
+                        candidates,
+                        &EvalBudget::unbounded(),
+                    )
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn configure() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
@@ -561,7 +748,7 @@ fn configure() -> Criterion {
 criterion_group! {
     name = benches;
     config = configure();
-    targets = algebra_benches, ancestry_benches, snapshot_benches, payload_decode_benches, cheap_check_benches, batch_benches
+    targets = algebra_benches, ancestry_benches, snapshot_benches, payload_decode_benches, cheap_check_benches, batch_benches, anchor_density_benches, payload_check_benches, staleness_benches, adversarial_benches
 }
 
 fn profile_kernel(kernel: &str) {
