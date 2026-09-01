@@ -157,7 +157,12 @@ impl CheckoutSnapshot {
 
     /// Absolute path of a repo-relative worktree file.
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
-        self.repo.workdir().map(|workdir| workdir.join(rela_path))
+        self.repo.workdir().map(|workdir| {
+            let mut path = PathBuf::with_capacity(workdir.as_os_str().len() + rela_path.len() + 1);
+            path.push(workdir);
+            path.push(rela_path);
+            path
+        })
     }
 }
 
