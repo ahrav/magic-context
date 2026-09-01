@@ -1405,6 +1405,40 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("refuses a record from another schema", async () => {
+        const store = new MemoryStore([{
+            ...storedRecord("mc-on"),
+            schema: "paired-delta-rollout/v0" as unknown as RolloutRecord["schema"],
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /schema paired-delta-rollout\/v0 is not paired-delta-rollout\/v1/,
+        );
+    });
+
+    it("reserves the oracle tool calls an R1 rollout adds to the script", async () => {
+        // `scriptedCtxSearchTurn` bills a `tool_use` response and its follow-up, neither of
+        // which appears in `turnScript`.
+        const store = new MemoryStore();
+        const events: string[] = [];
+        const perCall = (scenario.modelContextLimit * (1 + 2)) / 1_000_000;
+        const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
+
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                deskCostCeilingUsd: 0,
+                pricesPerMillionTokens: { input: 1, output: 2, cacheCreation: 0, cacheRead: 0 },
+                // Enough for a primary arm's script, short of R1's script plus its oracle calls.
+                maxCostUsd: perCall * (billableTurns + 1),
+            },
+            dependencies((armId) => observation(armId, armId !== "mc-on"), events),
+        );
+
+        expect(result.status).toBe("cost-cap-reached");
+        expect(events).not.toContain("create:r1");
+    });
+
     it("refuses an impossible cell from a store that does not validate", async () => {
         // Matching arm and counts still admit a reason code the health cannot carry.
         const record = storedRecord("mc-on");

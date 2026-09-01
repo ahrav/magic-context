@@ -372,6 +372,35 @@ describe("opencode child lifecycle", () => {
                     { mockProviderURL: "https://long-api-token@host.internal" },
                 )
             ).toThrow(/mockProviderURL is a credential-bearing URI value/);
+            // The query string is its own namespace; the anchored value rules never reach it.
+            for (
+                const [url, pattern] of [
+                    [
+                        "https://host.internal/v1?api_key=supersecret",
+                        /credential-shaped query key api_key/,
+                    ],
+                    [
+                        "https://host.internal/v1?token=supersecret",
+                        /credential-shaped query key token/,
+                    ],
+                    [
+                        "https://host.internal/v1?trace=sk-ant-abcdefghijklmnopqrstuv",
+                        /Anthropic-style key value in query key trace/,
+                    ],
+                ] as const
+            ) {
+                expect(() =>
+                    __spawnOpencodeTest.writeConfigs(env, url, { mockProviderURL: url })
+                ).toThrow(pattern);
+            }
+            // An ordinary query still passes.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(
+                    env,
+                    "http://127.0.0.1:4321/v1?maxTokens=4096",
+                    { mockProviderURL: "http://127.0.0.1:4321/v1?maxTokens=4096" },
+                )
+            ).not.toThrow();
             expect(() =>
                 __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
                     mockProviderURL: "http://127.0.0.1:4321",

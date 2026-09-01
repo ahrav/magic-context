@@ -645,6 +645,14 @@ export async function runPairedDelta(
                 );
             }
         }
+        /** The envelope names the shape every later read assumes, so a record from another schema cannot stand in as completed evidence for this one. commentlint: allow(JUDGE) */
+        if (record.schema !== ROLLOUT_RECORD_SCHEMA) {
+            options.store.release?.();
+            throw new Error(
+                `records file schema ${String(record.schema)} is not ${ROLLOUT_RECORD_SCHEMA} at ` +
+                    `${coordinateKey(record)}; point at a fresh records path`,
+            );
+        }
         /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. commentlint: allow(JUDGE) */
         if (record.cell.armId !== record.armId) {
             options.store.release?.();
@@ -783,7 +791,7 @@ export async function runPairedDelta(
                 /** A failure at this arm is charged `max(reserve, worstCase)`, so admission has to hold that floor: a cheap first arm otherwise leaves the reserve below the fallback and admits a call whose own failure charge passes the cap. commentlint: allow(JUDGE) */
                 const admissionReserveUsd = Math.max(
                     reserveUsd,
-                    worstCaseUsd(scenario, options.pricesPerMillionTokens),
+                    worstCaseUsd(scenario, options.pricesPerMillionTokens, armId),
                 );
                 if (startedAny && spentUsd + admissionReserveUsd > options.maxCostUsd) {
                     status = "cost-cap-reached";
@@ -1086,7 +1094,7 @@ function completedRecord(
     }
     /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. commentlint: allow(JUDGE) */
     const costUsd = usage === null || observedCostUsd === null
-        ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
+        ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId))
         : observedCostUsd;
     const applicableCritical = new Set(scenario.criticalCheckIds);
     const checksPassed = checks.filter(({ passed }) => passed).length;
@@ -1158,7 +1166,7 @@ function failedRecord(
         : deadlineExceeded
             ? "deadline-exceeded"
             : "harness-failure";
-    const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens);
+    const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId);
     /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. commentlint: allow(JUDGE) */
     const attemptCostUsd = providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase);
     return {
@@ -1251,7 +1259,14 @@ function finiteUsage(usage: TokenUsage): TokenUsage | null {
 }
 
 /** Prices a rollout whose real usage is unknown at the scenario's context limit in and out. commentlint: allow(JUDGE) */
-function worstCaseUsd(scenario: ScenarioDeclaration, prices: TokenPrices): number {
+/** `scriptedCtxSearchTurn` is required of an R1 runner by the declaration contract, and it drives `runScriptedToolCall`, whose one extra prompt is billed as a `tool_use` response and its follow-up. Those two calls appear nowhere in `turnScript`, so an arm that inserts the oracle turn bills past a bound derived from the script alone. The other arms add none: R2 seeds before the session and R3 rewrites a declared turn rather than adding one. commentlint: allow(JUDGE) */
+const ORACLE_CALLS_BY_ARM: Readonly<Partial<Record<ArmId, number>>> = { r1: 2 };
+
+function worstCaseUsd(
+    scenario: ScenarioDeclaration,
+    prices: TokenPrices,
+    armId?: ArmId,
+): number {
     /** Each prompt token is billed in exactly one category and the prompt cannot exceed the context limit, so the dearest prompt category bounds the whole prompt: hard-coding the cache counters to zero priced a cached-prefix call at nothing when cache pricing is the only material rate, and summing all three categories at full context would triple-count one prompt instead. commentlint: allow(JUDGE) */
     const promptPricePerMillion = Math.max(prices.input, prices.cacheCreation, prices.cacheRead);
     const perCallUsd = (
@@ -1263,7 +1278,8 @@ function worstCaseUsd(scenario: ScenarioDeclaration, prices: TokenPrices): numbe
         1,
         scenario.turnScript.filter(({ role }) => role === "user").length,
     );
-    return perCallUsd * billableTurns;
+    const oracleCalls = armId === undefined ? 0 : ORACLE_CALLS_BY_ARM[armId] ?? 0;
+    return perCallUsd * (billableTurns + oracleCalls);
 }
 
 function exclusionCountsOf(

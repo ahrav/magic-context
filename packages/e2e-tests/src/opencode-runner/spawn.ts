@@ -166,6 +166,22 @@ function writeConfigs(
             `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
         );
     }
+    /** `credentialValueFormat` anchors its rules at the start of the whole value, so a credential parked in the query string matches neither the userinfo rule nor a vendor prefix. The query is its own key-value namespace and is scanned with the same key and value rules the config channels use. commentlint: allow(JUDGE) */
+    for (const [key, value] of parsedQuery(mockProviderURL)) {
+        if (isCredentialBearingConfigKey(key)) {
+            throw new Error(
+                `mockProviderURL carries a credential-shaped query key ${key}; ` +
+                    "pass credentials through extraEnv",
+            );
+        }
+        const queryFormat = credentialValueFormat(value);
+        if (queryFormat !== null) {
+            throw new Error(
+                `mockProviderURL carries a ${queryFormat} value in query key ${key}; ` +
+                    "pass credentials through extraEnv",
+            );
+        }
+    }
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
     const extra = canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra") ?? {};
     const magicContextConfig = canonicalConfig(opts.magicContextConfig, "magicContextConfig");
@@ -278,6 +294,15 @@ function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
             "projectMagicContextConfig",
         ),
     };
+}
+
+/** A value that does not parse as a URL carries no query namespace to scan, and the userinfo rule above has already read the whole string. commentlint: allow(JUDGE) */
+function parsedQuery(value: string): Array<[string, string]> {
+    try {
+        return [...new URL(value).searchParams.entries()];
+    } catch {
+        return [];
+    }
 }
 
 /**
