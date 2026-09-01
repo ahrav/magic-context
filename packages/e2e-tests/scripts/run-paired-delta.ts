@@ -1,0 +1,393 @@
+#!/usr/bin/env bun
+
+import { lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
+import { relative, resolve, sep } from "node:path";
+import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
+import {
+    FileRolloutStore,
+    ProviderUnavailableError,
+    RolloutRecordsInvalidError,
+    RolloutStorePublishConflictError,
+    runPairedDelta,
+    verifyDualMockResolution,
+    type PairedDeltaRunResult,
+    type RolloutObservation,
+} from "../src/paired-delta/runner";
+import {
+    parseScenarioDeclaration,
+    type ArmId,
+    type ScenarioDeclaration,
+} from "../src/paired-delta/contract";
+import { stableStringify } from "../../plugin/src/shared/stable-json";
+
+interface CliArgs {
+    recordsPath: string;
+    resume: boolean;
+    maxCostUsd: number;
+    deadlineMinutes: number;
+}
+
+/** A caller keyed off the exit code has to be able to tell a budget stop from a state that forbids the obvious retry: `harness-unreclaimed` means a live harness may still be running, and `invalid-stored-records` means the records file needs inspection before any `--resume` can be trusted. commentlint: allow(JUDGE) */
+const SMOKE_EXPECTED_ROLLOUTS = 11;
+
+const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
+    completed: 0,
+    "cost-cap-reached": 1,
+    "deadline-reached": 1,
+    "invalid-stored-records": 2,
+    "harness-unreclaimed": 3,
+};
+
+/** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. commentlint: allow(JUDGE) */
+async function runOrReportInvalidRecords(
+    run: () => Promise<PairedDeltaRunResult>,
+): Promise<PairedDeltaRunResult | null> {
+    try {
+        return await run();
+    } catch (error) {
+        /** A publication that lost its lock is classified with a malformed file, not with a budget stop: both mean the records path has to be inspected before any resume, and the generic code is the one automation is entitled to retry. commentlint: allow(JUDGE) */
+        const inspectable = error instanceof RolloutRecordsInvalidError ||
+            error instanceof RolloutStorePublishConflictError;
+        if (!inspectable) throw error;
+        console.error(`paired-delta: ${(error as Error).message}`);
+        process.exitCode = EXIT_CODES["invalid-stored-records"];
+        return null;
+    }
+}
+
+/** Names the filesystem type so two different non-regular entries at one path do not hash alike. commentlint: allow(JUDGE) */
+function entryKind(entry: Stats): string {
+    if (entry.isDirectory()) return "directory";
+    if (entry.isFIFO()) return "fifo";
+    if (entry.isSocket()) return "socket";
+    if (entry.isBlockDevice()) return "block-device";
+    if (entry.isCharacterDevice()) return "character-device";
+    return "unknown";
+}
+
+function parseArgs(argv: string[]): CliArgs {
+    let smoke = false;
+    let recordsPath = "artifacts/paired-delta-smoke-records.json";
+    let resume = false;
+    let maxCostUsd = 100;
+    let deadlineMinutes = 5;
+    const value = (flag: string, index: number): string => {
+        const candidate = argv[index];
+        if (!candidate || candidate.startsWith("-")) throw new Error(`${flag} requires a value`);
+        return candidate;
+    };
+    for (let index = 0; index < argv.length; index++) {
+        const arg = argv[index];
+        if (arg === "--smoke") smoke = true;
+        else if (arg === "--resume") resume = true;
+        else if (arg === "--records") recordsPath = value(arg, ++index);
+        else if (arg === "--max-cost-usd") maxCostUsd = Number(value(arg, ++index));
+        else if (arg === "--deadline-minutes") deadlineMinutes = Number(value(arg, ++index));
+        else throw new Error(`unknown argument: ${arg}`);
+    }
+    if (!smoke) throw new Error("U2/U3 runner currently requires --smoke; live modes are not enabled");
+    if (!Number.isFinite(maxCostUsd) || maxCostUsd < 0) {
+        throw new Error("--max-cost-usd expects a non-negative number");
+    }
+    if (!Number.isFinite(deadlineMinutes) || deadlineMinutes <= 0) {
+        throw new Error("--deadline-minutes expects a positive number");
+    }
+    return { recordsPath: resolve(recordsPath), resume, maxCostUsd, deadlineMinutes };
+}
+
+/** Returns the worktree-relative POSIX path, or null when the target sits outside the worktree and cannot appear in its status. `isWithin` owns the boundary test, which several e2e modules already share. commentlint: allow(JUDGE) */
+function relativeTo(root: string, target: string): string | null {
+    const rooted = resolve(root);
+    const path = resolve(target);
+    if (path === rooted || !isWithin(rooted, path)) return null;
+    /** `relative` returns the platform separator, while a git pathspec always takes `/`. commentlint: allow(JUDGE) */
+    return relative(rooted, path).split(sep).join("/");
+}
+
+/** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change smoke report success without executing the changed code. commentlint: allow(JUDGE) */
+function smokeRepoCommit(recordsPath: string): string {
+    const started = resolve(import.meta.dir, "..");
+    const at = (cwd: string) => (args: string[]): string => {
+        const run = Bun.spawnSync(["git", ...args], { cwd });
+        if (run.exitCode !== 0) {
+            throw new Error(`cannot resolve the smoke records binding: git ${args.join(" ")}`);
+        }
+        return run.stdout.toString();
+    };
+    /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. commentlint: allow(JUDGE) */
+    const root = at(started)(["rev-parse", "--show-toplevel"]).trim();
+    const git = at(root);
+    const commit = git(["rev-parse", "HEAD"]).trim();
+    /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
+    /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. commentlint: allow(JUDGE) */
+    /** `publishJsonAtomically` writes through `${path}.tmp-<hex>` before renaming, so a run killed mid-write leaves one behind; the lock is a directory the next run reclaims. Both are runner-owned output, and hashing either would reject every stored coordinate. commentlint: allow(JUDGE) */
+    /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
+    const relative = (path: string): string | null => relativeTo(root, path);
+    /** The exact paths are excluded as literals because they come from `--records`: a value carrying pathspec metacharacters — `artifacts/run[1].json` — would otherwise exclude unrelated matching paths, dropping their changes from the status, the diff, and the untracked hash, so a resume could reuse records produced against different working code. commentlint: allow(JUDGE) */
+    const exact = [recordsPath, `${recordsPath}.lock`]
+        .map(relative)
+        .filter((path): path is string => path !== null)
+        .map((path) => `:(exclude,literal)${path}`);
+    /** The suffix families need pattern meaning, so they cannot be literal; the caller-supplied prefix is escaped instead, leaving only the trailing `*` as a wildcard. commentlint: allow(JUDGE) */
+    const escapeGlob = (path: string): string => path.replace(/[\\[\]*?]/g, "\\$&");
+    const globbed = [".lock.reclaimed-", ".tmp-"]
+        .map((suffix) => {
+            const prefix = relative(`${recordsPath}${suffix}`);
+            return prefix === null ? null : `:(exclude)${escapeGlob(prefix)}*`;
+        })
+        .filter((path): path is string => path !== null);
+    const scope = [".", ...exact, ...globbed];
+    const status = git([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        ...scope,
+    ]).trim();
+    if (status === "") return commit;
+    /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. commentlint: allow(JUDGE) */
+    const untracked = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope])
+        .split("\0")
+        .filter(Boolean);
+    /** Untracked contents are hashed as raw bytes: decoding to UTF-8 first maps distinct binary payloads onto the same replacement character, and `git status` cannot tell them apart either while `git diff HEAD` omits untracked files entirely. commentlint: allow(JUDGE) */
+    const parts: Uint8Array[] = [
+        Buffer.from(status, "utf8"),
+        /** `--binary` because a plain diff reduces a modified binary file to a stable `Binary files … differ` line, so its bytes could change while the digest did not. commentlint: allow(JUDGE) */
+        Buffer.from(git(["diff", "--binary", "HEAD", "--", ...scope]), "utf8"),
+    ];
+    for (const path of untracked) {
+        parts.push(Buffer.from(`${path}\n`, "utf8"));
+        try {
+            const absolute = resolve(root, path);
+            /** A symlink's worktree identity is the text it points at, not the bytes it resolves to: following it left the digest unchanged when the same path was retargeted at another module with identical contents, so a resume could reuse records produced against different working code. `lstat` because `readFileSync` and `statSync` both dereference. commentlint: allow(JUDGE) */
+            const entry = lstatSync(absolute);
+            if (entry.isSymbolicLink()) {
+                parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
+            } else if (!entry.isFile()) {
+                /** Only a regular file has contents to hash. Opening anything else can block indefinitely — a named pipe waits for a writer — and this runs before the experiment starts, so its deadline cannot interrupt it. The type is recorded so the entry still changes the digest. commentlint: allow(JUDGE) */
+                parts.push(Buffer.from(`<non-file>${entryKind(entry)}`, "utf8"));
+            } else {
+                parts.push(readFileSync(absolute));
+            }
+        } catch {
+            /** An unreadable path still changes the digest through its own name. commentlint: allow(JUDGE) */
+            parts.push(Buffer.from("<unreadable>", "utf8"));
+        }
+    }
+    return `${commit}-dirty-${Bun.hash(Buffer.concat(parts)).toString(16)}`;
+}
+
+function fixtureScenario(
+    scenarioId: string,
+    title: string,
+): ScenarioDeclaration {
+    /** The declaration goes through `parseScenarioDeclaration` so the smoke exercises a scenario the paired-delta contract accepts: the evidence turn precedes the R1 insertion point, no turn from that point on repeats the answer, and one R2 claim carries it. commentlint: allow(JUDGE) */
+    return parseScenarioDeclaration({
+        scenarioId,
+        familyId: "fam-smoke",
+        title,
+        expectedAnswer: "smoke-id-17",
+        answerMatch: "case-insensitive",
+        checks: ["check-smoke-outcome"],
+        criticalCheckIds: ["check-smoke-outcome"],
+        turnScript: [
+            { id: "turn-smoke-evidence", role: "user", content: "Remember smoke-id-17." },
+            { id: "turn-smoke-filler", role: "user", content: "Acknowledge the note." },
+            { id: "turn-smoke-probe", role: "user", content: "Return the smoke identifier." },
+        ],
+        interventions: {
+            r1: {
+                insertAfterTurnId: "turn-smoke-filler",
+                locatorIds: ["mem-smoke"],
+            },
+            r2: {
+                memories: [{
+                    claim: "The smoke identifier is smoke-id-17",
+                    evidence: "turn-smoke-evidence",
+                }],
+            },
+        },
+        absencePrecondition: {
+            evidenceTurnId: "turn-smoke-evidence",
+            minimumBallastBytes: 4096 * 4,
+        },
+        modelContextLimit: 4096,
+        restartArms: [],
+        verifier: () => [],
+    });
+}
+
+const SCENARIOS = [
+    fixtureScenario("var-smoke-provider-error", "Provider error classification"),
+    fixtureScenario("var-smoke-failing-verifier", "Failure-gated oracle replay"),
+];
+
+function smokeObservation(
+    scenario: ScenarioDeclaration,
+    armId: ArmId,
+    baseScriptFingerprint: string,
+    intervention: RolloutObservation["intervention"],
+): RolloutObservation {
+    const passed = armId !== "mc-on";
+    return {
+        checks: [{ id: "check-smoke-outcome", passed }],
+        claimedDone: true,
+        absencePreconditionHeld: true,
+        armIdentityMatches: true,
+        echoedProviderId: "mock-live",
+        echoedModelId: "mock-snapshot-2026-08-31",
+        usage: { input: 1000, output: 100, cacheCreation: 100, cacheRead: 100 },
+        turns: scenario.turnScript.length,
+        baseScriptFingerprint,
+        intervention,
+    };
+}
+
+/**
+ * The runner's status stays `completed` through a provider-unavailable cell, a malformed
+ * classification, and a ladder that never fired, because none of those are run failures. A
+ * smoke gate has to assert the classifications themselves, or a regression that stops
+ * scheduling the regret arms — or misreads either scripted error — still exits zero.
+ *
+ * A resumed run rehydrates instead of re-executing, so only the counts that survive a resume
+ * are asserted then.
+ */
+function smokeExpectationDrift(
+    summary: {
+        rolloutCount: number;
+        providerCalls: Record<string, number>;
+        completeRegretLadders: number;
+        partialRegretLadders: number;
+        exclusionCounts: PairedDeltaRunResult["exclusionCounts"];
+        invalidStoredCoordinates: readonly unknown[];
+    },
+    args: CliArgs,
+): string[] {
+    const drift: string[] = [];
+    /** Keys are sorted before comparing: `exclusionCounts` and `providerCalls` are built in iteration order, so a change in arm scheduling or route resolution would otherwise report drift for identical content. `stableStringify` is the shared implementation of that ordering, so a fix to its edge cases reaches this comparison too. commentlint: allow(JUDGE) */
+    const canonical = stableStringify;
+    const expect = (label: string, actual: unknown, expected: unknown): void => {
+        const shown = canonical(actual);
+        const wanted = canonical(expected);
+        if (shown !== wanted) drift.push(`${label}: expected ${wanted}, observed ${shown}`);
+    };
+    expect("rolloutCount", summary.rolloutCount, SMOKE_EXPECTED_ROLLOUTS);
+    expect("invalidStoredCoordinates", summary.invalidStoredCoordinates.length, 0);
+    /** `smokeObservation` fails mc-on's critical check in both scenarios, so both fire the ladder. `var-smoke-provider-error` loses only mc-off, leaving r1/r2/r3 to complete one full ladder; `var-smoke-failing-verifier` loses r2, so its ladder carries retrieval and stops. commentlint: allow(JUDGE) */
+    expect("completeRegretLadders", summary.completeRegretLadders, 1);
+    expect("partialRegretLadders", summary.partialRegretLadders, 1);
+    expect("exclusionCounts", summary.exclusionCounts, {
+        "mc-off": { "provider-unavailable": 1 },
+        r2: { "provider-unavailable": 1 },
+    });
+    if (!args.resume) {
+        /** Both routes must resolve independently, so each is prompted exactly once. commentlint: allow(JUDGE) */
+        expect("providerCalls", summary.providerCalls, { "mock-anthropic": 1, "mock-live": 1 });
+    }
+    return drift;
+}
+
+async function main(): Promise<void> {
+    const args = parseArgs(process.argv.slice(2));
+    const providerCalls = new Map<string, number>();
+    await verifyDualMockResolution({
+        liveProviderId: "mock-live",
+        liveModelId: "mock-snapshot-2026-08-31",
+        modelContextLimit: 4096,
+        async sendPrompt(route) {
+            providerCalls.set(route.providerId, (providerCalls.get(route.providerId) ?? 0) + 1);
+            return {
+                ...route,
+                contextLimit: route.providerId === "mock-live" ? 4096 : 200_000,
+            };
+        },
+    });
+
+    const result = await runOrReportInvalidRecords(() => runPairedDelta(
+        {
+            scenarios: SCENARIOS,
+            poolManifestFingerprint: "smoke-pool-v1",
+            repoCommit: smokeRepoCommit(args.recordsPath),
+            pinnedProviderId: "mock-live",
+            pinnedSnapshotId: "mock-snapshot-2026-08-31",
+            replicateCount: 1,
+            deskCostCeilingUsd: 0.01,
+            maxCostUsd: args.maxCostUsd,
+            deadlineEpochMs: Date.now() + args.deadlineMinutes * 60_000,
+            pricesPerMillionTokens: {
+                input: 3,
+                output: 15,
+                cacheCreation: 3.75,
+                cacheRead: 0.3,
+            },
+            resume: args.resume,
+            store: new FileRolloutStore(args.recordsPath),
+        },
+        {
+            now: Date.now,
+            async createRollout({
+                scenario,
+                coordinate,
+                baseScriptFingerprint,
+                intervention,
+            }) {
+                return {
+                    async prepare() {},
+                    async run() {
+                        if (
+                            scenario.scenarioId === "var-smoke-provider-error" &&
+                            coordinate.armId === "mc-off"
+                        ) {
+                            throw new ProviderUnavailableError("scripted mock provider error");
+                        }
+                        if (
+                            scenario.scenarioId === "var-smoke-failing-verifier" &&
+                            coordinate.armId === "r2"
+                        ) {
+                            throw new ProviderUnavailableError("scripted mock R2 error");
+                        }
+                        return smokeObservation(
+                            scenario,
+                            coordinate.armId,
+                            baseScriptFingerprint,
+                            intervention,
+                        );
+                    },
+                    async dispose() {},
+                };
+            },
+        },
+    ));
+    if (result === null) return;
+
+    const summary = {
+        status: result.status,
+        recordsPath: args.recordsPath,
+        rolloutCount: result.records.length,
+        providerCalls: Object.fromEntries(providerCalls),
+        invalidStoredCoordinates: result.invalidStoredCoordinates,
+        completeRegretLadders: result.coordinates.filter(({ regret }) =>
+            regret?.retrieval !== undefined &&
+            regret.formation !== undefined &&
+            regret.representation !== undefined).length,
+        partialRegretLadders: result.coordinates.filter(({ regret }) =>
+            regret !== null &&
+            (regret.formation === undefined || regret.representation === undefined)).length,
+        exclusionCounts: result.exclusionCounts,
+    };
+    console.log(JSON.stringify(summary, null, 2));
+    const drift = smokeExpectationDrift(summary, args);
+    for (const line of drift) console.error(`smoke expectation: ${line}`);
+    /** A non-completed status outranks drift, because `harness-unreclaimed` means a live harness may still be running and a caller keyed on that code must not lose it: drift gets its own code only when the status itself reports success. commentlint: allow(JUDGE) */
+    if (result.status !== "completed") {
+        process.exitCode = EXIT_CODES[result.status];
+        return;
+    }
+    if (drift.length > 0) {
+        process.exitCode = 4;
+        return;
+    }
+    process.exitCode = EXIT_CODES[result.status];
+}
+
+await main();

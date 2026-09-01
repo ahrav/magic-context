@@ -61,6 +61,12 @@ afterEach(async () => {
 });
 
 describe("oracle arm presets", () => {
+    it("enables the complete native compaction block", () => {
+        expect(naiveCompactionOptions()).toEqual({
+            openCodeConfigExtra: { compaction: { auto: true, prune: false } },
+        });
+    });
+
     it("writes an empty plugin list for MC-off", async () => {
         const harness = await createHarness(mcOffOptions());
         const config = JSON.parse(
@@ -99,9 +105,8 @@ describe("oracle arm presets", () => {
 
         expect(recipe.extraEnv).toEqual({ ANTHROPIC_API_KEY: "live-test-key" });
         expect(recipe.hostname).toBe("127.0.0.1");
-        // 127.0.0.1-bound server. The override needs the explicit waiver: the
-        // spawn guard refuses a secret-shaped extraEnv key off loopback, and
-        // "live-test-key" is a fixture value that reaches no real provider.
+        // "live-test-key" reaches no real provider, so the waiver bypasses the
+        // guard that rejects secret-shaped extraEnv keys off loopback.
         const opencode = await spawnOpencode({
             mockProviderURL: baseURL,
             ...recipe,
@@ -111,9 +116,12 @@ describe("oracle arm presets", () => {
         spawned.push(opencode);
         const config = JSON.parse(
             readFileSync(join(opencode.env.configDir, "opencode.json"), "utf8"),
-        ) as { provider?: unknown };
+        ) as { provider?: Record<string, unknown> };
 
-        expect(config.provider).toEqual(providerBlock);
+        // The exact key set, not just two lookups: the contributed provider is
+        // merged beside the generated mock, and a stray third entry is a leak.
+        expect(Object.keys(config.provider ?? {}).sort()).toEqual(["anthropic", "mock-anthropic"]);
+        expect(config.provider?.anthropic).toEqual(providerBlock.anthropic);
         expect(mock.requests()).toHaveLength(0);
     }, 120_000);
 
