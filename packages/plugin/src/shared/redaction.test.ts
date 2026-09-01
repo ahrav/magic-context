@@ -178,6 +178,14 @@ describe("isCredentialBearingConfigKey", () => {
             "FOREIGNKEYVALUE",
             "HOTKEY",
             "PARTITIONKEY",
+            // An ordinary word ending in these letters names no key at all, and this
+            // predicate aborts a spawn when it matches.
+            "monkey",
+            "turkey",
+            "hockey",
+            "monkeys",
+            "MONKEY",
+            "donkeyCount",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }

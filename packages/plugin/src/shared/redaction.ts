@@ -165,6 +165,28 @@ const TOKEN_COUNTING_QUALIFIERS = [
 ];
 
 /** `key` names a position in a data structure as often as a credential, and these qualifiers only ever mean the former. Kept closed and structural: anything not named here is treated as a credential, because a refused spawn is visible and a written credential is not. */
+/** Words that name a credential when glued directly to `key`. Listed positively because the suffix alone carries no signal: an unrecognized glued word is left alone rather than treated as a secret, and a bare `key` remains a credential on its own. commentlint: allow(JUDGE) */
+const CREDENTIAL_KEY_PREFIXES: readonly string[] = [
+    "api",
+    "access",
+    "admin",
+    "auth",
+    "client",
+    "consumer",
+    "encryption",
+    "license",
+    "master",
+    "private",
+    "root",
+    "secret",
+    "service",
+    "session",
+    "shared",
+    "signing",
+    "ssh",
+    "subscription",
+];
+
 const STRUCTURAL_KEY_QUALIFIERS = [
     "foreign",
     "primary",
@@ -213,9 +235,11 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         compact.endsWith(word) || compact.endsWith(`${word}s`);
     if (endsWith("key")) {
         if (qualifier !== undefined) return !STRUCTURAL_KEY_QUALIFIERS.includes(qualifier);
-        // A glued name has no segment to read, so the qualifier is matched against the whole
-        // word: `hotkey` is a keystroke, `apikey` is a credential.
-        return !STRUCTURAL_KEY_QUALIFIERS.some(
+        // A glued name has no segment to read, so the whole word decides. `monkey` and
+        // `turkey` end in these letters without naming a key at all, so a glued credential
+        // has to be recognized positively rather than by ruling out structural words:
+        // `apikey` is a credential, `hotkey` is a keystroke, `monkey` is neither.
+        return CREDENTIAL_KEY_PREFIXES.some(
             (word) => compact === `${word}key` || compact === `${word}keys`,
         );
     }

@@ -1432,6 +1432,69 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("refuses an estimated failure priced below the arm bound", async () => {
+        // The live path charges a failure at least the arm's bound even with no usage back.
+        const firstStore = new MemoryStore();
+        const first = await runPairedDelta(options(firstStore), dependencies((armId) =>
+            armId === "mc-on" ? new Error("boom") : observation(armId, true)));
+        const stored = first.records.find(({ cell }) => cell.runHealth !== "completed");
+        if (!stored) throw new Error("missing failure fixture record");
+        expect(stored.costSource).toBe("estimated");
+        expect(stored.costUsd).toBeGreaterThan(0);
+        stored.costUsd = 0;
+
+        await expect(
+            runPairedDelta(options(new MemoryStore([stored])), dependencies()),
+        ).rejects.toThrow(/prices an estimated failure below the arm bound/);
+    });
+
+    it("charges an unavailable provider the full arm bound", async () => {
+        // Unavailability can be raised by a later turn, after earlier turns have billed, and
+        // this path keeps no usage to price. Priced so the arm bound clearly exceeds the
+        // desk reserve, which is all the discounted branch used to record.
+        const store = new MemoryStore();
+        const ceiling = 0.01;
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                deskCostCeilingUsd: ceiling,
+                maxCostUsd: 10_000,
+                pricesPerMillionTokens: {
+                    input: 100,
+                    output: 200,
+                    cacheCreation: 1,
+                    cacheRead: 1,
+                },
+            },
+            dependencies((armId) =>
+                armId === "mc-on"
+                    ? new ProviderUnavailableError("unavailable")
+                    : observation(armId, true)),
+        );
+        const unavailable = result.records.find(
+            ({ cell }) => cell.reasonCode === "provider-unavailable",
+        );
+        if (!unavailable) throw new Error("missing unavailable record");
+        expect(unavailable.costUsd).toBeGreaterThan(ceiling);
+        expect(unavailable.maxAttemptCostUsd).toBe(unavailable.costUsd);
+    });
+
+    it("stores a detached intervention when the adapter returns a proxy", async () => {
+        // `canonicalFingerprint` accepts a proxy; `structuredClone` inside `put` does not.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                return { ...base, intervention: new Proxy(base.intervention, {}) };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        // A proxy would have thrown DataCloneError before reaching here.
+        expect(() => structuredClone(result.records[0]?.intervention)).not.toThrow();
+    });
+
     it("refuses a completed cell priced as an estimate", async () => {
         // Unpriceable usage is what selects `estimated`, and it also marks the result
         // invalid, so the live path cannot pair `estimated` with `completed`.

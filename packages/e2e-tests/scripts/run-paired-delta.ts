@@ -92,7 +92,13 @@ function smokeRepoCommit(recordsPath: string): string {
     /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
     /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. commentlint: allow(JUDGE) */
     /** `publishJsonAtomically` writes through `${path}.tmp-<hex>` before renaming, so a run killed mid-write leaves one behind; the lock is a directory the next run reclaims. Both are runner-owned output, and hashing either would reject every stored coordinate. commentlint: allow(JUDGE) */
-    const owned = [recordsPath, `${recordsPath}.lock`, `${recordsPath}.tmp-*`]
+    /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
+    const owned = [
+        recordsPath,
+        `${recordsPath}.lock`,
+        `${recordsPath}.lock.reclaimed-*`,
+        `${recordsPath}.tmp-*`,
+    ]
         .map((path) => relativeTo(root, path))
         .filter((path): path is string => path !== null);
     const scope = [".", ...owned.map((path) => `:(exclude)${path}`)];

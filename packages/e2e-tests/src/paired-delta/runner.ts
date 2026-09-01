@@ -747,6 +747,23 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
+        /** A failure the live path records is charged at least the arm's own bound, because the attempt is presumed to have billed even when no usage came back. An estimated failure priced below that bound is therefore a record the runner cannot have written, and accepting it restored a ledger missing the first attempt — letting two full-price attempts run under a cap sized for one. commentlint: allow(JUDGE) */
+        if (record.costSource === "estimated") {
+            const declared = options.scenarios.find(
+                ({ scenarioId }) => scenarioId === record.scenarioId,
+            );
+            /** `inMatrix` already rejected a record naming no selected scenario, so an absent declaration here would be a contradiction rather than untrusted input. commentlint: allow(JUDGE) */
+            const bound = declared === undefined
+                ? 0
+                : worstCaseUsd(declared, options.pricesPerMillionTokens, record.armId);
+            if (record.costUsd < bound) {
+                releaseBeforeThrowing(options.store);
+                throw new Error(
+                    `records file prices an estimated failure below the arm bound at ` +
+                        `${coordinateKey(record)}; point at a fresh records path`,
+                );
+            }
+        }
         /** An observed cost claims to be `tokenCostUsd` of the counters beside it, so the two are checked against each other: every other rule here reads the fields in isolation, which a record with valid counters and a falsified total passes intact, and the total is what restores spend and admits later paid arms. A relative comparison rather than equality because the value survived a JSON round trip. commentlint: allow(JUDGE) */
         if (record.costSource === "observed") {
             /** The loop above refuses a missing or non-integer counter, so the four are numbers by the time this runs; `Partial` is the declared shape only because the record is untrusted on arrival. commentlint: allow(JUDGE) */
@@ -1186,10 +1203,10 @@ function completedRecord(
         baseScriptFingerprint: typeof observation.baseScriptFingerprint === "string"
             ? observation.baseScriptFingerprint
             : expectedFingerprint,
-        /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. It is never read as evidence, because only completed records reach the regret comparison. commentlint: allow(JUDGE) */
+        /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. Detached through JSON rather than retained, because fingerprinting proves the shape is serializable and not that the object itself is cloneable — an adapter-owned `Proxy` passes the canonicalizer and then fails `structuredClone` inside `put`, after the rollout is paid for and with nothing persisted. commentlint: allow(JUDGE) */
         intervention: observedInterventionFingerprint === null
             ? expectedIntervention
-            : observation.intervention,
+            : (JSON.parse(JSON.stringify(observation.intervention)) as InterventionDescriptor),
         cell: {
             armId: coordinate.armId,
             checksPassed,
@@ -1241,8 +1258,8 @@ function failedRecord(
             ? "deadline-exceeded"
             : "harness-failure";
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId);
-    /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. commentlint: allow(JUDGE) */
-    const attemptCostUsd = providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase);
+    /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. Unavailability no longer discounts the charge: it can be raised by a later turn's request, after earlier turns have already billed, and this path keeps no usage to price. Charging the full bound overstates a first-turn refusal rather than understating a mid-script failure, and only the understatement admits an arm the cap should have stopped. commentlint: allow(JUDGE) */
+    const attemptCostUsd = Math.max(reserveUsd, worstCase);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
