@@ -161,6 +161,16 @@ function estimateEndpoint(
         byFamily.set(observation.familyId, values);
     }
     const enoughFamilies = byFamily.size >= minimumAnalyzableFamilyCount;
+    /**
+     * Calibration samples the primary arms and scores them on the binary valid-success endpoint, so
+     * its floors describe those series alone. Applying them to a regret rung compares a fraction over
+     * the whole check vector against a threshold measured from a different quantity on arms the
+     * calibration never sampled, which can both resolve noisy representation evidence and suppress a
+     * stable one.
+     */
+    const applicable = PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint)
+        ? noiseFloors
+        : new Map<string, FamilyNoiseFloor>();
     const families = [...byFamily].sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([familyId, values]): FamilyEstimate => {
             const pointEstimate = mean(values);
@@ -169,7 +179,7 @@ function estimateEndpoint(
                 bootstrapResamples,
                 bootstrapSeed ^ fnv1a32(`${endpoint}:${familyId}`),
             );
-            const floor = noiseFloors.get(familyId) ?? null;
+            const floor = applicable.get(familyId) ?? null;
             const label: NoiseComparison = floor === null
                 ? "no-noise-floor"
                 : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";

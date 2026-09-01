@@ -167,13 +167,24 @@ function parseArgs(argv: string[]): CliArgs {
         throw new Error("--deadline-minutes expects a positive number");
     }
     const stem = selected === "smoke" ? "paired-delta-smoke" : `paired-delta-${selected}`;
-    return {
-        mode: selected,
-        recordsPath: resolve(recordsPath ?? join(artifacts, `${stem}-records.json`)),
-        reportPath: resolve(reportPath ?? join(artifacts, `${stem}-report.json`)),
-        calibrationRecordPath: resolve(
+    const destinations = {
+        records: resolve(recordsPath ?? join(artifacts, `${stem}-records.json`)),
+        report: resolve(reportPath ?? join(artifacts, `${stem}-report.json`)),
+        calibration: resolve(
             calibrationRecordPath ?? join(artifacts, "paired-delta-calibration.json"),
         ),
+    };
+    /** Publishing is atomic per path, so a shared destination silently replaces one artifact with another and the loss surfaces only on the next resume or weekly run. */
+    if (new Set(Object.values(destinations)).size !== 3) {
+        throw new Error(
+            "paired-delta records, report, and calibration destinations must be distinct",
+        );
+    }
+    return {
+        mode: selected,
+        recordsPath: destinations.records,
+        reportPath: destinations.report,
+        calibrationRecordPath: destinations.calibration,
         resume,
         maxCostUsd: selected === "smoke" ? maxCostUsd ?? 100 : maxCostUsd,
         deadlineMinutes: deadline,
@@ -211,6 +222,25 @@ function scopeDigest(): string {
         parts.push(Buffer.from(object.stdout.toString().trim(), "utf8"));
         parts.push(Buffer.from(git(["status", "--porcelain", "--untracked-files=all", "--", path]), "utf8"));
         parts.push(Buffer.from(git(["diff", "--binary", "HEAD", "--", path]), "utf8"));
+        /** `status` names an untracked file without its bytes and `diff HEAD` omits it, so scoped code importing a new file would keep one digest across edits. */
+        for (const untracked of git([
+            "ls-files", "--others", "--exclude-standard", "-z", "--", path,
+        ]).split("\0").filter(Boolean)) {
+            parts.push(Buffer.from(`${untracked}\n`, "utf8"));
+            try {
+                const absolute = resolve(root, untracked);
+                const entry = lstatSync(absolute);
+                if (entry.isSymbolicLink()) {
+                    parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
+                } else if (!entry.isFile()) {
+                    parts.push(Buffer.from(`<non-file>${entryKind(entry)}`, "utf8"));
+                } else {
+                    parts.push(readFileSync(absolute));
+                }
+            } catch {
+                parts.push(Buffer.from("<unreadable>", "utf8"));
+            }
+        }
     }
     return Bun.hash(Buffer.concat(parts)).toString(16);
 }
@@ -548,6 +578,8 @@ const CALIBRATION_SCOPE = [
     "packages/e2e-tests/src/ballast.ts",
     "packages/e2e-tests/scripts/run-paired-delta.ts",
     "packages/e2e-tests/pools",
+    /** Pins the OpenCode version and its digest, and native compaction, prompt routing, and the session ledger are all part of the measured behaviour. */
+    ".github/workflows/paired-delta-eval.yml",
 ] as const;
 
 function lanePolicy(document: ReturnType<typeof parsePolicyOwnerDocument>): PairedDeltaPolicy {
@@ -1165,6 +1197,9 @@ const BOOTSTRAP_SEED = 20260831;
 /** The one endpoint `buildAnalysis` estimates. A policy naming another is rejected rather than silently estimating this one. */
 const SUPPORTED_ENDPOINT = "paired-valid-success-delta";
 
+/** `armOptions` keys the provider block dynamically but always supplies the Anthropic adapter and `ANTHROPIC_API_KEY`. */
+const SUPPORTED_PROVIDER = "anthropic";
+
 /** Bound on R1 database reseeds. Each attempt draws fresh 32-hex ids, so exhausting the bound is a contract failure rather than bad luck, and it is reported as one. */
 const R1_RESEED_ATTEMPTS = 8;
 
@@ -1277,6 +1312,13 @@ async function runLive(args: CliArgs): Promise<void> {
             `${policy.endpoint}`,
         );
     }
+    /** The provider block is keyed by the declared id but backed by the Anthropic SDK and credential, so another id would echo a provider the run never used. */
+    if (model.providerId !== SUPPORTED_PROVIDER) {
+        throw new Error(
+            `paired-delta live lane serves ${SUPPORTED_PROVIDER} only; the policy declares ` +
+            `${model.providerId}`,
+        );
+    }
     /** The estimator runs only after the experiment, so its own floor is checked before the budget is spent. */
     if (policy.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES) {
         throw new Error(
@@ -1330,6 +1372,14 @@ async function runLive(args: CliArgs): Promise<void> {
     const scenarios = [...registry.values()]
         .map(({ declaration }) => declaration)
         .filter(({ scenarioId }) => selectedIds.has(scenarioId));
+    /** `evidenceSufficient` counts distinct families, so a mode selecting fewer than the minimum can never satisfy it however well the run goes. */
+    const selectedFamilies = new Set(scenarios.map(({ familyId }) => familyId));
+    if (selectedFamilies.size < policy.minimumAnalyzableFamilyCount) {
+        throw new Error(
+            `paired-delta ${mode} selects ${selectedFamilies.size} families but the policy ` +
+            `requires ${policy.minimumAnalyzableFamilyCount}`,
+        );
+    }
     // The fingerprinted policy documents the executed configuration, so the
     // context limit it pins must match what the scenarios actually request.
     for (const scenario of scenarios) {
