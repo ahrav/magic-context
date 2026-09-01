@@ -14,9 +14,10 @@ use git_fixtures::{
 };
 use mc_store::kernel::applicability::{
     snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityState, CheckSpec,
-    EvalBudget, ObjectApplicabilitySpec,
+    EvalBudget, FailedCheck, ObjectApplicabilitySpec,
 };
 use mc_store::kernel::{AnchorRowSpec, Dimension, QueryContext, ScopeMatchContext, ScopeTermSpec};
+use proptest::prelude::*;
 
 fn seeded_repo(dir: &std::path::Path) -> (FixtureRepo, gix::ObjectId, gix::ObjectId) {
     let fixture = init_repo(dir);
@@ -43,6 +44,286 @@ fn seeded_repo(dir: &std::path::Path) -> (FixtureRepo, gix::ObjectId, gix::Objec
         2,
     );
     (fixture, base, tip)
+}
+
+#[derive(Debug)]
+struct ExpectedClassification {
+    state: ApplicabilityState,
+    evidence: &'static str,
+    failed_check: Option<FailedCheck>,
+    append_pending: bool,
+}
+
+fn generated_candidate(kind: u8, index: usize) -> ApplicabilityCandidate {
+    let mut candidate = candidate(&format!("generated-{index}"));
+    candidate.object_revision = i64::try_from(index + 1).unwrap();
+    match kind % 13 {
+        0 => {}
+        1 => candidate.lifecycle_invalidated = true,
+        2 => {
+            candidate.scope_terms = Some(vec![ScopeTermSpec {
+                dimension: "environment".to_string(),
+                operator: "exact".to_string(),
+                exact_value: Some("production".to_string()),
+                ..ScopeTermSpec::default()
+            }]);
+        }
+        3 => {
+            candidate.scope_terms = Some(vec![ScopeTermSpec {
+                dimension: "environment".to_string(),
+                operator: "exact".to_string(),
+                exact_value: Some("staging".to_string()),
+                ..ScopeTermSpec::default()
+            }]);
+        }
+        4 => {
+            candidate.scope_terms = Some(vec![ScopeTermSpec {
+                dimension: "region".to_string(),
+                operator: "exact".to_string(),
+                exact_value: Some("us-east-1".to_string()),
+                ..ScopeTermSpec::default()
+            }]);
+        }
+        5 => candidate.payload = Some(b"not json".to_vec()),
+        6 => {
+            candidate.payload = Some(
+                ObjectApplicabilitySpec::new(
+                    vec![],
+                    vec![CheckSpec::FileExists {
+                        path: "src/lib.rs".to_string(),
+                    }],
+                )
+                .encode(),
+            );
+        }
+        7 => {
+            candidate.payload = Some(
+                ObjectApplicabilitySpec::new(
+                    vec![],
+                    vec![CheckSpec::FileExists {
+                        path: "missing.rs".to_string(),
+                    }],
+                )
+                .encode(),
+            );
+        }
+        8 | 9 => {
+            candidate.anchor = Some(AnchorRowSpec {
+                anchor_id: format!("generated-anchor-{index}"),
+                anchor_kind: "exact".to_string(),
+                exact_value: Some(if kind % 13 == 8 { "token" } else { "other" }.to_string()),
+                ..AnchorRowSpec::default()
+            });
+        }
+        10 => {
+            candidate.payload = Some(
+                ObjectApplicabilitySpec::new(
+                    vec![],
+                    vec![CheckSpec::Symbol {
+                        path: "src/lib.rs".to_string(),
+                        symbol: "a".to_string(),
+                    }],
+                )
+                .encode(),
+            );
+        }
+        11 | 12 => {
+            candidate.payload = Some(
+                ObjectApplicabilitySpec::new(
+                    vec![],
+                    vec![CheckSpec::ConfigKey {
+                        path: "config.toml".to_string(),
+                        key: if kind % 13 == 11 { "flag" } else { "missing" }.to_string(),
+                    }],
+                )
+                .encode(),
+            );
+        }
+        _ => unreachable!(),
+    }
+    candidate
+}
+
+fn expected_classification(kind: u8) -> ExpectedClassification {
+    let terminal = |state, evidence| ExpectedClassification {
+        state,
+        evidence,
+        failed_check: None,
+        append_pending: state.blocks_auto_injection(),
+    };
+    match kind % 13 {
+        0 | 2 | 6 | 8 | 11 => terminal(
+            ApplicabilityState::Current,
+            "anchor holds at HEAD and all checks pass",
+        ),
+        1 => ExpectedClassification {
+            state: ApplicabilityState::LifecycleInvalidated,
+            evidence: "object lifecycle-invalidated before applicability evaluation",
+            failed_check: None,
+            append_pending: false,
+        },
+        3 => terminal(
+            ApplicabilityState::OutOfScope,
+            "scope does not match the query context",
+        ),
+        4 => terminal(
+            ApplicabilityState::Uncertain,
+            "scope match is unresolvable in this context",
+        ),
+        5 => terminal(
+            ApplicabilityState::Uncertain,
+            "object applicability payload is undecodable",
+        ),
+        7 => {
+            let evidence = "file missing.rs does not exist in the checkout";
+            ExpectedClassification {
+                state: ApplicabilityState::Stale,
+                evidence,
+                failed_check: Some(FailedCheck {
+                    check: CheckSpec::FileExists {
+                        path: "missing.rs".to_string(),
+                    },
+                    evidence: evidence.to_string(),
+                }),
+                append_pending: true,
+            }
+        }
+        9 => terminal(
+            ApplicabilityState::Historical,
+            "anchor condition does not hold at this checkout",
+        ),
+        10 => terminal(
+            ApplicabilityState::Uncertain,
+            "symbol check for a in src/lib.rs is not supported yet",
+        ),
+        12 => {
+            let evidence = "config file config.toml does not define key missing";
+            ExpectedClassification {
+                state: ApplicabilityState::Stale,
+                evidence,
+                failed_check: Some(FailedCheck {
+                    check: CheckSpec::ConfigKey {
+                        path: "config.toml".to_string(),
+                        key: "missing".to_string(),
+                    },
+                    evidence: evidence.to_string(),
+                }),
+                append_pending: true,
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 48,
+        rng_algorithm: prop::test_runner::RngAlgorithm::ChaCha,
+        rng_seed: prop::test_runner::RngSeed::Fixed(0xBA7C4E11),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn generated_batches_match_the_reference_model(kinds in prop::collection::vec(any::<u8>(), 1..24)) {
+        let dir = tempfile::tempdir().unwrap();
+        let (fixture, _base, tip) = seeded_repo(dir.path());
+        let snapshot = checkout(&fixture, tip);
+        let engine = ApplicabilityEngine::new();
+        let candidates: Vec<_> = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| generated_candidate(*kind, index))
+            .collect();
+        let query = QueryContext {
+            exact_token: Some("token".to_string()),
+            ..QueryContext::default()
+        };
+        let scope = ScopeMatchContext::new().with_value(Dimension::Environment, "production");
+        let cold = engine.evaluate_batch(
+            &snapshot,
+            &query,
+            &scope,
+            &candidates,
+            &EvalBudget::unbounded(),
+        );
+        for (index, ((kind, candidate), actual)) in kinds
+            .iter()
+            .zip(&candidates)
+            .zip(&cold.objects)
+            .enumerate()
+        {
+            let expected = expected_classification(*kind);
+            prop_assert_eq!(&actual.object_id, &candidate.object_id, "object {}", index);
+            prop_assert_eq!(actual.object_revision, candidate.object_revision, "object {}", index);
+            prop_assert_eq!(actual.state, expected.state, "object {}", index);
+            prop_assert_eq!(&actual.evidence, expected.evidence, "object {}", index);
+            prop_assert_eq!(&actual.failed_check, &expected.failed_check, "object {}", index);
+            prop_assert_eq!(actual.append_pending, expected.append_pending, "object {}", index);
+        }
+        let cacheable = kinds.iter().filter(|kind| **kind % 13 != 1).count() as u64;
+        prop_assert_eq!(cold.stats.object_cache_hits, 0);
+        prop_assert_eq!(cold.stats.object_cache_misses, cacheable);
+        prop_assert_eq!(cold.stats.anchor_cache_hits, 0);
+        prop_assert_eq!(cold.stats.anchor_cache_misses, 0);
+        prop_assert_eq!(cold.stats.graph_operations, 0);
+
+        let warm = engine.evaluate_batch(
+            &snapshot,
+            &query,
+            &scope,
+            &candidates,
+            &EvalBudget::unbounded(),
+        );
+        prop_assert_eq!(warm.stats.object_cache_hits, cacheable);
+        prop_assert_eq!(warm.stats.object_cache_misses, 0);
+        prop_assert_eq!(warm.stats.anchor_cache_hits, 0);
+        prop_assert_eq!(warm.stats.anchor_cache_misses, 0);
+        prop_assert_eq!(warm.stats.graph_operations, 0);
+        for (before, after) in cold.objects.iter().zip(&warm.objects) {
+            prop_assert_eq!(&before.object_id, &after.object_id);
+            prop_assert_eq!(before.object_revision, after.object_revision);
+            prop_assert_eq!(before.state, after.state);
+            prop_assert_eq!(&before.evidence, &after.evidence);
+            prop_assert_eq!(&before.failed_check, &after.failed_check);
+            prop_assert_eq!(before.append_pending, after.append_pending);
+            prop_assert_eq!(&before.token, &after.token);
+        }
+
+        let moved = commit_snapshot(
+            &fixture.repo,
+            "main",
+            &[tip],
+            &[
+                ("src/lib.rs", "pub fn a() {}\npub fn b() {}\n"),
+                ("config.toml", "flag = true\n"),
+                ("moved.txt", "moved\n"),
+            ],
+            "moved",
+            3,
+        );
+        let moved_snapshot = checkout(&fixture, moved);
+        let after_move = engine.evaluate_batch(
+            &moved_snapshot,
+            &query,
+            &scope,
+            &candidates,
+            &EvalBudget::unbounded(),
+        );
+        prop_assert_eq!(after_move.stats.object_cache_hits, 0);
+        prop_assert_eq!(after_move.stats.object_cache_misses, cacheable);
+        prop_assert_eq!(after_move.stats.anchor_cache_hits, 0);
+        prop_assert_eq!(after_move.stats.anchor_cache_misses, 0);
+        prop_assert_eq!(after_move.stats.graph_operations, 0);
+        for (before, after) in cold.objects.iter().zip(&after_move.objects) {
+            prop_assert_eq!(&before.object_id, &after.object_id);
+            prop_assert_eq!(before.object_revision, after.object_revision);
+            prop_assert_eq!(before.state, after.state);
+            prop_assert_eq!(&before.evidence, &after.evidence);
+            prop_assert_eq!(&before.failed_check, &after.failed_check);
+            prop_assert_eq!(before.append_pending, after.append_pending);
+            prop_assert_ne!(&before.token, &after.token);
+        }
+    }
 }
 
 #[test]
