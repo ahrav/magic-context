@@ -633,7 +633,29 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
             record.decisions.familyCount,
         )
         : null;
-    /** The declared depth, not a hard-coded two: `buildCalibrationRecord` requires every scenario to reach `replicateCount`, and a reader accepting less would admit the undersampled pilot the writer refused. */
+    /**
+ * Whether a noise row could have come from real observations.
+ *
+ * A primary endpoint delta is one of `{-1, 0, 1}`, so a family whose observations are not all equal
+ * has a range of at least 1, and its minimum sample variance is `1/n` — reached by `n-1` equal
+ * observations and one differing by 1. Without this, a self-consistently fingerprinted record can
+ * pair `spread: 0` with a token `variance: 1e-12`, satisfy the `variance > 0` gate, and shrink the
+ * derived pool to something the live cohort happens to clear. The relationship is checked rather
+ * than the discrete observations retained, since the record is a summary by design.
+ */
+function arithmeticallyReachable(noise: CalibrationFamilyNoise): boolean {
+    if (noise.observationCount < 2) return false;
+    if (!Number.isInteger(noise.spread) || noise.spread < 0 || noise.spread > MAX_ENDPOINT_SPREAD) {
+        return false;
+    }
+    if (noise.spread === 0) return noise.variance === 0;
+    return noise.variance >= 1 / noise.observationCount;
+}
+
+/** `{-1, 0, 1}` deltas cannot range wider than 2. */
+const MAX_ENDPOINT_SPREAD = 2;
+
+/** The declared depth, not a hard-coded two: `buildCalibrationRecord` requires every scenario to reach `replicateCount`, and a reader accepting less would admit the undersampled pilot the writer refused. */
     const depth = Number.isSafeInteger(record.decisions?.replicateCount)
         ? Math.max(2, record.decisions.replicateCount)
         : 2;
@@ -649,6 +671,7 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         depthPerScenario &&
         measured.length > 0 &&
         measured.every((noise) => noise.observationCount >= depth && noise.variance > 0) &&
+        measured.every(arithmeticallyReachable) &&
         covered &&
         derived !== null &&
         record.decisions?.poolSize === derived;

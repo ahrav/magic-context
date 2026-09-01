@@ -754,4 +754,28 @@ describe("paired-delta calibration reader: series integrity", () => {
         expect(() => readCalibrationRecord(rewrite({ familyNoise: shallow })))
             .toThrow(/validity-inconsistent/);
     });
+
+    it("rejects a noise summary no observations could have produced", () => {
+        // A token variance clears `variance > 0` and shrinks the derived pool to whatever the cohort clears.
+        const impossible = build3().familyNoise.map((noise) => ({
+            ...noise,
+            spread: 0,
+            variance: 1e-12,
+        }));
+
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: impossible })))
+            .toThrow(/validity-inconsistent/);
+    });
+
+    it("rejects a variance below the discrete minimum for its observation count", () => {
+        // Deltas are `{-1, 0, 1}`, so three nonconstant observations cannot vary by less than 1/3.
+        const belowFloor = build3().familyNoise.map((noise) => ({
+            ...noise,
+            spread: 1,
+            variance: 0.1,
+        }));
+
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: belowFloor })))
+            .toThrow(/validity-inconsistent/);
+    });
 });

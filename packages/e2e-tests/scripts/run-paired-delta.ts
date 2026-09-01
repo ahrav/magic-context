@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
-import { existsSync, lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, type Stats } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import { canonicalFingerprint } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { detectOverflow } from "../../plugin/src/features/magic-context/overflow-detection";
@@ -722,6 +722,8 @@ function armOptions(
     modelId: string,
     scenario: ScenarioDeclaration,
     armId: ArmId,
+    /** Pinned per rollout so `historianAbandoned` reads this rollout's diagnostics and no other's. */
+    logPath: string,
 ): TestHarnessOptions {
     const live = liveModelSpawnOptions({
         apiKey,
@@ -741,6 +743,7 @@ function armOptions(
             },
         },
     });
+    live.extraEnv = { ...live.extraEnv, MAGIC_CONTEXT_LOG_PATH: logPath };
     const arm = armId === "mc-off"
         ? mcOffOptions()
         : armId === "compaction"
@@ -764,6 +767,9 @@ const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
 
 /** `scriptedCtxSearchTurn` drives one tool-use response and one follow-up, both served by the fixture provider. */
 const SCRIPTED_ORACLE_MOCK_ENTRIES = 2;
+
+/** `awaitCompartmentRun` logs this when its timeout race elapses and it proceeds without the historian. */
+const HISTORIAN_ABANDONED_MARKER = "compartment await timed out";
 
 /** Bounds the quiescence wait. Generous enough for a historian retry to land, short enough that a stuck session fails rather than holding the run. */
 const LEDGER_SETTLE_ATTEMPTS = 12;
@@ -805,8 +811,14 @@ function ledgerEntries(payload: unknown): LedgerMessage[] {
         throw new Error("live paired-delta received no session ledger to price the rollout from");
     }
     return rows
-        .map((row) => (row as { info?: LedgerMessage } | null)?.info)
-        .filter((info): info is LedgerMessage => info !== null && info !== undefined)
+        .map((row) => {
+            const info = (row as { info?: LedgerMessage } | null)?.info;
+            /** A row with no `info` object is a malformed ledger, not a message to skip: dropped, it takes a billed call and its route with it. */
+            if (info === null || info === undefined || typeof info !== "object") {
+                throw new Error("live paired-delta session ledger has a row with no message");
+            }
+            return info;
+        })
         /** A user turn carries no route and nothing to price; an assistant turn missing its route is an incomplete ledger, so it is rejected rather than filtered away with the user rows. */
         .filter((info) => info.role !== "user")
         .map((info) => {
@@ -834,6 +846,23 @@ function ledgerEntries(payload: unknown): LedgerMessage[] {
  * runner's identity comparison still excludes the cell.
  */
 /**
+ * Whether the plugin gave up waiting for a historian and resumed the parent with it still running.
+ *
+ * `awaitCompartmentRun` logs this exact line when its `historianTimeoutMs` race elapses, which is the
+ * one moment a background call can outlive the response. Quiescence cannot be inferred from the
+ * ledger in that case: an in-flight request adds no row while it runs, so any finite stable interval
+ * can elapse mid-call. This is the explicit signal, so the cell is rejected rather than priced from a
+ * ledger that is still being written.
+ */
+function historianAbandoned(logPath: string, sessionId: string): boolean {
+    if (!existsSync(logPath)) return false;
+    return readFileSync(logPath, "utf8")
+        .split("\n")
+        .filter((line) => line.includes(`[${sessionId}]`))
+        .some((line) => line.includes(HISTORIAN_ABANDONED_MARKER));
+}
+
+/**
  * Read the ledger until two consecutive passes agree, so a call still running is not missed.
  *
  * The plugin resumes the parent prompt when the historian exceeds its pressure wait, so a child call
@@ -847,9 +876,17 @@ async function settledSessionUsage(
     sessionId: string,
     pinned: { providerId: string; modelId: string },
     expectedMockEntries: number,
+    logPath: string,
 ): Promise<SessionUsage> {
     let previous: string | null = null;
     for (let attempt = 0; attempt < LEDGER_SETTLE_ATTEMPTS; attempt++) {
+        /** Checked every pass, not once: the plugin buffers its log for 500 ms, so the marker can appear after the first read. */
+        if (historianAbandoned(logPath, sessionId)) {
+            throw new Error(
+                "live paired-delta cannot price this rollout: the plugin resumed the parent with " +
+                "a historian still running, so the ledger is incomplete by construction",
+            );
+        }
         const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
         const signature = JSON.stringify(reading);
         if (signature === previous) return reading;
@@ -1020,12 +1057,20 @@ export function createLiveDependencies(input: {
             baseScriptFingerprint: expectedFingerprint,
             intervention,
         }) {
+            /** Resolved from this file, matching `resolvePaths`, so the log never lands in the repository root where it would enter the implementation digest. */
+            const logPath = resolve(
+                import.meta.dir,
+                "../artifacts/live-logs",
+                `${coordinate.scenarioId}-${coordinate.armId}-${coordinate.replicateIndex}.log`,
+            );
+            mkdirSync(dirname(logPath), { recursive: true });
             const harnessOptions = armOptions(
                 input.apiKey,
                 input.providerId,
                 input.modelId,
                 scenario,
                 coordinate.armId,
+                logPath,
             );
             let harness = await TestHarness.create(harnessOptions);
             let seeded: ReturnType<typeof seedGoldMemories> = [];
@@ -1145,6 +1190,7 @@ export function createLiveDependencies(input: {
                         sessionId,
                         { providerId: input.providerId, modelId: input.modelId },
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
+                        logPath,
                     );
                     /**
                      * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
