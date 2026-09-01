@@ -131,12 +131,19 @@ struct AnchorCacheKey {
     head: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ObjectCacheKey {
+    hash: u64,
     snapshot: SnapshotCacheKey,
     object_id: String,
     object_revision: i64,
     inputs_digest: [u8; 32],
+}
+
+impl Hash for ObjectCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +310,7 @@ impl Hash for CandidateInputs<'_> {
 pub struct ApplicabilityEngine {
     anchor_cache: Mutex<TwoGenerationCache<AnchorCacheKey, GitConditionOutcome>>,
     object_cache: Mutex<TwoGenerationCache<ObjectCacheKey, CachedClassification>>,
-    snapshot_hasher: RandomState,
+    cache_hasher: RandomState,
 }
 
 impl Default for ApplicabilityEngine {
@@ -315,11 +322,11 @@ impl Default for ApplicabilityEngine {
 impl ApplicabilityEngine {
     pub fn new() -> Self {
         let object_cache = TwoGenerationCache::new(GENERATION_CAP);
-        let snapshot_hasher = object_cache.hasher().clone();
+        let cache_hasher = object_cache.hasher().clone();
         Self {
             anchor_cache: Mutex::new(TwoGenerationCache::new(GENERATION_CAP)),
             object_cache: Mutex::new(object_cache),
-            snapshot_hasher,
+            cache_hasher,
         }
     }
 
@@ -337,7 +344,7 @@ impl ApplicabilityEngine {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
-        let snapshot_hash = self.snapshot_hasher.hash_one((
+        let snapshot_hash = self.cache_hasher.hash_one((
             snapshot.identity(),
             snapshot.head(),
             snapshot.dirty_fingerprint(),
@@ -676,6 +683,12 @@ impl ApplicabilityEngine {
             }),
         };
         ObjectCacheKey {
+            hash: self.cache_hasher.hash_one((
+                snapshot_hash,
+                candidate.object_id.as_str(),
+                candidate.object_revision,
+                inputs_digest,
+            )),
             snapshot,
             object_id: candidate.object_id.clone(),
             object_revision: candidate.object_revision,
@@ -699,6 +712,7 @@ impl ObjectApplicability {
             failed_check: None,
             append_pending: false,
             token: ClassificationToken(ObjectCacheKey {
+                hash: 0,
                 snapshot: SnapshotCacheKey::Owned(SnapshotCacheValues {
                     hash: 0,
                     checkout_identity: String::new(),

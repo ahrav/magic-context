@@ -56,3 +56,11 @@ and owned public output/token strings remain the larger representation problem.
 
 Raw profile: `/tmp/mc-scope-perf/batch-cold-kernel-iter22-199.data`; report:
 `/tmp/mc-scope-perf/batch-cold-kernel-iter22.report`.
+
+After iteration 23 removed incremental table growth, the same profile held 2,001 samples with zero
+loss: allocator internals own about 26%, SipHash writes 13.8%, full object-key `hash_one` 5.7%,
+object-key clone 3.0%, and cache insertion 2.3%. The next treatment prehashes the full exact key
+once with the cache's `RandomState`; equality still compares every field on collisions.
+
+Raw profile: `/tmp/mc-scope-perf/batch-cold-kernel-iter23-199.data`; report:
+`/tmp/mc-scope-perf/batch-cold-kernel-iter23.report`.
