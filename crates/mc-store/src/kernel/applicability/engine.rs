@@ -29,6 +29,7 @@ use super::payloads::{
     OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
     OBSERVATION_KIND_UNCERTAIN,
 };
+use super::repair::AppendOutcome;
 use super::resolve::{GitConditionOutcome, ResolutionLadder, PATCH_ID_ALGORITHM};
 
 /// Applicability state of one object at one checkout. Everything except
@@ -71,6 +72,21 @@ impl ApplicabilityState {
     }
 
     /// The durable applicability append stores this observation kind.
+    /// Inverse of [`Self::label`], so a stored label and its observation kind
+    /// are checked against one mapping rather than a naming convention.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "current" => Some(Self::Current),
+            "historical" => Some(Self::Historical),
+            "out_of_scope" => Some(Self::OutOfScope),
+            "uncertain" => Some(Self::Uncertain),
+            "dirty_tree_uncertain" => Some(Self::DirtyTreeUncertain),
+            "stale" => Some(Self::Stale),
+            "lifecycle_invalidated" => Some(Self::LifecycleInvalidated),
+            _ => None,
+        }
+    }
+
     pub fn observation_kind(self) -> &'static str {
         match self {
             Self::Current => OBSERVATION_KIND_CURRENT,
@@ -127,6 +143,10 @@ pub struct ObjectApplicability {
     pub failed_check: Option<FailedCheck>,
     pub append_pending: bool,
     pub token: ClassificationToken,
+    /// Outcome of the durable append this request attempted, or `None` when
+    /// repair did not touch the object. Carried here rather than in a parallel
+    /// collection keyed by object id, which callers had to re-correlate.
+    pub append: Option<AppendOutcome>,
 }
 
 /// Cache and repo-access counters for one batch; the zero-IO-on-hit
@@ -329,6 +349,7 @@ impl ApplicabilityEngine {
                         && !cached.query_local
                         && !cached.append_confirmed,
                     token,
+                    append: None,
                 });
                 continue;
             }
@@ -717,6 +738,27 @@ impl ApplicabilityEngine {
     }
 }
 
+impl ObjectApplicability {
+    /// Uncertain verdict for a candidate whose checkout could not be
+    /// snapshotted. The verdict is never cached, so it carries no cache key
+    /// and a durable-append confirmation against it has nothing to record.
+    pub(super) fn uncertain_without_snapshot(
+        candidate: &ApplicabilityCandidate,
+        evidence: String,
+    ) -> Self {
+        Self {
+            object_id: candidate.object_id.clone(),
+            object_revision: candidate.object_revision,
+            state: ApplicabilityState::Uncertain,
+            evidence,
+            failed_check: None,
+            append_pending: false,
+            token: ClassificationToken(None),
+            append: None,
+        }
+    }
+}
+
 enum AnchorVerdict {
     Holds,
     Historical(String),
@@ -796,6 +838,7 @@ fn finished(
         failed_check: classification.failed_check,
         append_pending: append_pending && classification.state.blocks_auto_injection(),
         token,
+        append: None,
     }
 }
 

@@ -6,13 +6,19 @@
 //! tag inside each payload versions the shape.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Schema tag for the object-side applicability payload carrying affected
 /// paths and cheap-check specifications.
 pub const OBJECT_APPLICABILITY_SCHEMA: &str = "mc.applicability.object.v1";
 
 /// Schema tag for applicability observation payloads.
-pub const OBSERVATION_APPLICABILITY_SCHEMA: &str = "mc.applicability.observation.v1";
+///
+/// v2 stores a digest of the checkout identity where v1 stored the identity
+/// itself. The identity is a filesystem path, and the durable-text redactor
+/// rewrites a path carrying a secret-shaped segment, which left the stored
+/// value unable to match the caller's.
+pub const OBSERVATION_APPLICABILITY_SCHEMA: &str = "mc.applicability.observation.v2";
 
 /// Observation kind vocabulary for applicability read repair. The reducer
 /// treats the latest of these per (object, checkout) as authoritative.
@@ -127,13 +133,37 @@ pub enum CheckSpec {
 
 /// Durable payload of one applicability observation: enough to identify the
 /// checkout, the evidence, and the algorithm versions that produced it.
+///
+/// The repair commit revalidates `head` and the object revision, both single commentlint: allow(JUDGE)
+/// indexed reads. It leaves `dirty_fingerprint` unchecked: revalidating that commentlint: allow(JUDGE)
+/// would put a whole worktree walk inside the single-writer window and still commentlint: allow(JUDGE)
+/// leave the worktree free to change immediately afterwards. A worktree that commentlint: allow(JUDGE)
+/// does change yields a different fingerprint on the next evaluation, which is commentlint: allow(JUDGE)
+/// both a classification-cache miss and a different repair generation, so that commentlint: allow(JUDGE)
+/// evaluation appends a superseding record. commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicabilityObservationPayload {
     pub schema: String,
-    pub checkout_identity: String,
+    /// [`checkout_identity_digest`] of the checkout this verdict describes.
+    pub checkout_identity_digest: String,
     pub head: String,
     pub dirty_fingerprint: String,
     pub patch_id_algorithm: String,
     pub state: String,
     pub evidence: String,
+}
+
+/// Digest of a checkout identity, for the durable payload and the reducer that
+/// matches against it.
+///
+/// The identity is a filesystem path, so a segment shaped like a secret makes
+/// the durable-text redactor rewrite it and the stored value stop matching the
+/// caller's. Hex has nothing for the redactor to detect, and a durable payload
+/// carries no path.
+#[must_use]
+pub fn checkout_identity_digest(identity: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"mc-applicability-checkout-v1\0");
+    digest.update(identity.as_bytes());
+    format!("{:x}", digest.finalize())
 }
