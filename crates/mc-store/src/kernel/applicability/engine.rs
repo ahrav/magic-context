@@ -136,7 +136,7 @@ struct AnchorCacheKey {
 struct ObjectCacheKey {
     hash: u64,
     snapshot: SnapshotCacheKey,
-    object_id: String,
+    object_id: Box<str>,
     object_revision: i64,
     inputs_digest: [u8; 32],
 }
@@ -756,7 +756,7 @@ impl ApplicabilityEngine {
                 inputs_digest,
             )),
             snapshot,
-            object_id: candidate.object_id.clone(),
+            object_id: candidate.object_id.as_str().into(),
             object_revision: candidate.object_revision,
             inputs_digest,
         }
@@ -785,7 +785,7 @@ impl ObjectApplicability {
                     head: String::new(),
                     dirty_fingerprint: String::new(),
                 }),
-                object_id: candidate.object_id.clone(),
+                object_id: candidate.object_id.as_str().into(),
                 object_revision: candidate.object_revision,
                 inputs_digest: [0; 32],
             })),
