@@ -1607,6 +1607,49 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("reports a lock lost during publication instead of returning success", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-clobber-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = join(`${path}.lock`, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // A reclaimer moves the lock after the pre-rename checks pass. Patching the
+            // publication is the only point that sits inside that window.
+            const proto = Object.getPrototypeOf(store) as {
+                recordsFingerprint: () => string;
+            };
+            const original = proto.recordsFingerprint;
+            let checks = 0;
+            proto.recordsFingerprint = function patched(this: FileRolloutStore): string {
+                const value = original.call(this);
+                checks += 1;
+                // The second call is the pre-rename check; displace the lock just after it.
+                if (checks === 2) {
+                    writeFileSync(
+                        owner,
+                        JSON.stringify({
+                            pid: process.pid,
+                            nonce: "e".repeat(32),
+                            acquiredAt: Date.now(),
+                        }),
+                    );
+                }
+                return value;
+            };
+            try {
+                expect(() => store.put(storedRecord("mc-off"))).toThrow(
+                    /lost its lock during publication/,
+                );
+            } finally {
+                proto.recordsFingerprint = original;
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("reports contention when the records path is rewritten continuously", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-loop-"));
         try {

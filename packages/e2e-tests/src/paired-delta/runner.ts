@@ -426,6 +426,15 @@ export class FileRolloutStore implements RolloutStore {
             // it stays owner-only even though report artifacts are world-readable.
             /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. commentlint: allow(JUDGE) */
             publishJsonAtomically(merged, this.path, { mode: 0o600 });
+            /** Checked again after the rename, because the checks before it cannot span the syscall. A clobber requires the lock to have moved, so observing it still held here is what licenses treating the publication as sound; observing it lost means this rename may have replaced a coordinate a new holder published, and that snapshot was never read, so it cannot be merged back. The loss is therefore reported rather than repaired — the file is left as written and the caller is told not to trust it as a complete ledger. commentlint: allow(JUDGE) */
+            if (!lockHeldByThisProcess(this.lockPath)) {
+                this.invalidate();
+                throw new RolloutStoreBusyError(
+                    `rollout store ${this.path} lost its lock during publication; the file ` +
+                        "may have replaced a concurrent owner's coordinate; inspect it before " +
+                        "resuming",
+                );
+            }
             this.records = merged;
             this.indexByCoordinate = new Map(
                 merged.map((published, position) => [coordinateKey(published), position]),
