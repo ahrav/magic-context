@@ -16,8 +16,8 @@ use mc_store::kernel::applicability::{
     ObjectApplicabilitySpec, RepairIntent, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
 };
 use mc_store::kernel::{
-    CommitFault, CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelErrorKind,
-    KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec, QueryContext,
+    CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelError, KernelStore,
+    ObservationDependencySpec, ObservationPayload, ObservationSpec, QueryContext,
     ScopeMatchContext, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
@@ -251,12 +251,14 @@ fn partial_commit_rolls_back_completely_under_fault_injection() {
         sensitivity: Sensitivity::Normal,
     };
     let error = store
-        .commit_with_fault_for_test(intent("faulted-repair", '2'), CommitFault::AfterEvents, {
+        .commit_with_fault_after_events_for_test(intent("faulted-repair", '2'), {
             let spec = spec.clone();
-            move |envelope| Ok(envelope.insert_observation(spec)?.result_json())
+            move |envelope: &mut mc_store::kernel::Envelope<'_>| {
+                Ok(envelope.insert_observation(spec)?.result_json())
+            }
         })
         .unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::Fault);
+    assert_eq!(error, KernelError::Fault);
     // No observation without its event and job: everything rolled back.
     for table in ["observations", "observation_dependencies"] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE observation_id LIKE 'obs-fault%'");
@@ -517,5 +519,5 @@ fn future_known_as_of_is_a_typed_error() {
     let error = store
         .applicability_block_state(TARGET_OBJECT, "checkout", i64::MAX)
         .unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::FutureSnapshot);
+    assert_eq!(error, KernelError::FutureSnapshot);
 }

@@ -1,55 +1,63 @@
-# Historian structural eval lane: live scenario runs (task magic-context-x4l.11).
 #
-# Scheduled or operator-dispatched ONLY (R14): each scenario costs up to four
-# live historian invocations plus one cheap probe-answer call per probe. The
-# deterministic parts (contract lint, scorer tests, mutation battery) run
-# per-PR inside ci.yml with no credentials.
 #
-# Flake triage on a red scheduled run = re-dispatch; each run is an
-# independent report (no repeat-count machinery).
 name: historian-eval
 
 on:
   workflow_dispatch:
     inputs:
       scenarios:
-        # Only committed corpora are offered. A frozen release adds its own
-        # choice here and a matching case arm below; advertising a release
-        # directory that does not exist yet just fails the corpus gate.
         description: Corpus to run (dev split, or a frozen release once one exists)
         type: choice
         options:
           - dev
         default: dev
+      metamorphic_scenario:
+        description: Scenario for the bounded live metamorphic pair
+        type: string
+        default: hse-webhook-docs-injection
+      metamorphic_transform:
+        description: Transform for the bounded live metamorphic pair
+        type: choice
+        options:
+          - reorder-independent-turns
+          - paraphrase-irrelevant
+          - move-accepted-decision
+          - duplicate-rejected-proposal
+          - rename-unrelated-symbols
+        default: paraphrase-irrelevant
   schedule:
-    # Weekly, offset from the retrieval-benchmark schedule.
     - cron: "41 4 * * 2"
 
 permissions:
   contents: read
 
+# Workflow-level, NOT per-job, and the placement is load-bearing. Both live lanes
+# previously declared this same group per-job: within one run that made one lane
+# run while the other sat PENDING, and GitHub keeps only one running plus one
+# pending member per concurrency group — a newly queued member evicts the
+# existing pending one even under `cancel-in-progress: false`. Any schedule tick
+# or operator dispatch overlapping a run in flight (the live step alone is
+# bounded at 300 minutes) therefore cancelled the queued lane, and the run
+# published one report instead of two with nothing marking the loss. Grouping the
+# RUN makes the unit of exclusion the whole run, so a run already in flight is
+# never partially discarded; the lanes serialize inside the run through `needs`.
+concurrency:
+  group: historian-eval-live
+  cancel-in-progress: false
+
 jobs:
   live-lane:
-    # Manual dispatch is restricted to the default branch: `actions/checkout`
-    # takes the selected ref, and a later step puts the Anthropic key in the
-    # environment. Any pushed branch could otherwise rewrite the runner script
-    # or a package lifecycle script and exfiltrate the secret without review.
+    # The condition restricts manual dispatch to the default branch because a pushed branch can modify scripts before the Anthropic key is exposed.
+    # A pushed branch could modify the runner or package lifecycle script and exfiltrate the Anthropic key.
     if: >-
       github.event_name == 'schedule' ||
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    # GitHub's ceiling for a hosted job, and the lane needs the room: the release
-    # size budget allows 30 scenarios declaring two historian runs each, and the
-    # runner's live per-wait budget is 10 minutes, so the worst-case waits alone
-    # exceed any timeout GitHub permits. The job timeout is therefore not the
-    # bound that protects the report — `--deadline-minutes` is, with the live
-    # step's own timeout behind it. This is the outer backstop; it must stay
-    # ABOVE the step bound plus worst-case setup, or it fires first and cancels
-    # the job before the archive step can upload anything.
+    # GitHub-hosted jobs are limited to 360 minutes.
+    # `--deadline-minutes` reserves time before the live-step timeout for report completion.
+    # The job timeout must leave time for setup and archival after the live step.
+    # Otherwise GitHub cancels the job before the archive step can upload the report.
     timeout-minutes: 360
-    concurrency:
-      group: historian-eval-live
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
@@ -58,14 +66,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # Pinned, not `latest`, because Bun both builds the plugin bundle and
-          # runs the lane: two scheduled runs resolving different `latest`
-          # releases would carry identical system tuples while executing
-          # different harness and bundle bytes, which is the drift
-          # `opencodeVersion` was added to make visible. Pinning makes the
-          # toolchain a function of the recorded commit instead. Matches
-          # retrieval-benchmark.yml, the sibling measurement lane; the per-PR
-          # gates in ci.yml deliberately stay on `latest` so they catch
+          # Pinning Bun prevents identical system tuples from representing different harness and bundle bytes.
           # new-Bun breakage.
           bun-version: "1.4.0"
 
@@ -77,9 +78,6 @@ jobs:
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
-      # The installer serves the current release, so the resolved version is
-      # part of this run's system identity. The lane records it in the report's
-      # system tuple; this step surfaces it in the log too.
       - name: Record the resolved opencode version
         run: opencode --version
 
@@ -88,17 +86,10 @@ jobs:
 
       - name: Resolve the corpus selection
         env:
-          # Input flows through env, never template interpolation, and is
-          # validated against the closed corpus set below: interpolating
-          # `inputs.*` into shell source would let a crafted dispatch value
-          # execute with the API key in scope.
+          # Template interpolation would let a crafted dispatch value become shell source.
           CORPUS_INPUT: ${{ inputs.scenarios }}
-        # Schedule runs carry no inputs and take the dev split. Freezing a
-        # release adds its `--release` arm here, its choice in the dispatch
-        # input above, and flips this default — the arms and the offered
-        # choices stay one-to-one, which is what makes validating against the
-        # closed set meaningful. The resolved values are literals from those
-        # arms, so exporting them through GITHUB_ENV is safe.
+        # Schedule runs default to dev when inputs.scenarios is absent.
+        # Only literal case-arm values reach `GITHUB_ENV`.
         run: |
           case "${CORPUS_INPUT:-dev}" in
             dev) SELECT_FLAG=--scenarios; SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
@@ -107,25 +98,16 @@ jobs:
           echo "SELECT_FLAG=$SELECT_FLAG" >> "$GITHUB_ENV"
           echo "SELECT_PATH=$SELECT_PATH" >> "$GITHUB_ENV"
 
-      # Free deterministic gates first: a corpus regression that `--lint` or
-      # the mutation battery would catch must fail the run before any live
-      # API spend, and before a report is published over a corpus the lane
-      # itself would reject. No credentials in scope.
+      # The workflow runs lint and mutations before live API calls to avoid spending tokens on rejected corpora.
+      # The gate step does not receive ANTHROPIC_API_KEY.
       - name: Gate the corpus (freeze lint + mutation battery)
         run: |
           bun packages/e2e-tests/scripts/run-historian-eval.ts --lint "$SELECT_FLAG" "$SELECT_PATH"
           bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations "$SELECT_FLAG" "$SELECT_PATH"
 
       - name: Run the live lane
-        # The three bounds nest with room for the preamble between them:
-        #   script --deadline-minutes 290  <  this step 300  <  job 360
-        # The step clock starts when the step starts; the JOB clock started before
-        # checkout, two dependency installs, the plugin build, and the corpus gates.
-        # So the step bound cannot be job_timeout minus a token margin — sized that
-        # way, a slow preamble lets the job timeout fire first, which cancels the job
-        # outright and skips the `if: always()` upload below, losing the very partial
-        # evidence this bound exists to preserve. 60 minutes is left for setup that
-        # normally takes a few.
+        # The 290-minute script deadline leaves 10 minutes before the 300-minute step timeout; the 360-minute job timeout leaves 60 minutes outside the live step for setup and archival.
+        # The job timeout includes setup before the live step; the step timeout does not.
         timeout-minutes: 300
         env:
           NODE_ENV: ""
@@ -133,10 +115,6 @@ jobs:
           HISTORIAN_EVAL_MODEL: anthropic/claude-sonnet-4-5
           HISTORIAN_EVAL_PROBE_MODEL: anthropic/claude-haiku-4-5
         run: |
-          # Stops between scenarios and publishes what it has rather than being
-          # killed mid-scenario with no artifact after spending the tokens. Sized
-          # below the step's own timeout, which is itself sized below the job clock
-          # minus worst-case setup — see the two comments above.
           bun packages/e2e-tests/scripts/run-historian-eval.ts --live "$SELECT_FLAG" "$SELECT_PATH" \
             --deadline-minutes 290 \
             --report packages/e2e-tests/artifacts/historian-eval-report.json
@@ -146,5 +124,91 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: historian-eval-report
+          path: packages/e2e-tests/artifacts/
+          if-no-files-found: warn
+
+  live-metamorphic:
+    # Sequential after `live-lane`, not parallel with it: both lanes spend the
+    # same Anthropic key on the same model, and the runner treats a rate-limited
+    # slow response as `run-never-fired` — an invalidated experiment rather than a
+    # retry. `!cancelled()` rather than a bare `needs` or `always()`: a red
+    # `live-lane` must not skip this independent lane (the short-circuit ci.yml
+    # documents at length), but an operator cancelling the run must not leave this
+    # lane starting up to spend tokens anyway.
+    needs: live-lane
+    if: >-
+      ${{ !cancelled() &&
+      (github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve the corpus selection
+        env:
+          CORPUS_INPUT: ${{ inputs.scenarios }}
+        run: |
+          case "${CORPUS_INPUT:-dev}" in
+            dev) SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
+            *) echo "unknown corpus: $CORPUS_INPUT" >&2; exit 1 ;;
+          esac
+          echo "SELECT_PATH=$SELECT_PATH" >> "$GITHUB_ENV"
+
+      - name: Gate the base corpus without credentials
+        run: |
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --lint --scenarios "$SELECT_PATH"
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations --scenarios "$SELECT_PATH"
+
+      - name: Run the live metamorphic pair
+        # Same nesting as the historian lane above:
+        #   script --deadline-minutes 290  <  this step 300  <  job 360
+        # Two properties make 290 sufficient rather than merely smaller than 300.
+        # The script anchors its deadline at process START, so its own preamble
+        # (corpus load, selection, `opencode --version`, commit resolution) is
+        # inside the 290 rather than pushing it past the step bound. And it
+        # RESERVES one role's full wall clock before admitting a role, where a
+        # role's cost is every prompt it sends — transcript, per-run triggers and
+        # probes, each bounded only by the harness prompt timeout — plus the run
+        # completion and quiescence waits. A bare `now >= deadline` check would
+        # admit a role at minute 289 that legitimately needs two hours, and this
+        # step's timeout would then kill the process before it wrote the final
+        # report, losing the artifact the deadline exists to protect.
+        timeout-minutes: 300
+        env:
+          NODE_ENV: ""
+          ANTHROPIC_API_KEY: ${{ secrets.HISTORIAN_EVAL_ANTHROPIC_API_KEY }}
+          HISTORIAN_EVAL_MODEL: anthropic/claude-sonnet-4-5
+          HISTORIAN_EVAL_PROBE_MODEL: anthropic/claude-haiku-4-5
+          METAMORPHIC_SCENARIO: ${{ inputs.metamorphic_scenario }}
+          METAMORPHIC_TRANSFORM: ${{ inputs.metamorphic_transform }}
+        run: |
+          bun packages/e2e-tests/scripts/run-metamorphic-eval.ts --live \
+            --scenarios "$SELECT_PATH" \
+            --scenario "${METAMORPHIC_SCENARIO:-hse-webhook-docs-injection}" \
+            --transform "${METAMORPHIC_TRANSFORM:-paraphrase-irrelevant}" \
+            --deadline-minutes 290 \
+            --report packages/e2e-tests/artifacts/metamorphic-eval-live-report.json
+
+      - name: Archive the metamorphic report and run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historian-eval-metamorphic-report
           path: packages/e2e-tests/artifacts/
           if-no-files-found: warn

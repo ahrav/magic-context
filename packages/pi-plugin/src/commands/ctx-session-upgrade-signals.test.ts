@@ -3,20 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Contract coverage for `/ctx-session-upgrade`'s detached, background-safe
  * execution.
  *
- * The upgrade (multi-pass recomp + memory migration) runs DETACHED via
- * spawnPiRecompRun so the single-process Pi REPL stays responsive — parity with
- * OpenCode's `void runManagedUpgrade`. A previous build awaited the recomp
- * inline in the command handler, which froze ALL input (prompts and even
- * /ctx-status) for the whole upgrade (dogfood 2026-06-01: a 1105-message
- * upgrade locked the REPL across several ~4-min historian passes).
  *
- * Because it runs in the background, the post-publish signals MUST be the
- * DEFERRED variants (staged for the next cache-busting pass at a turn boundary),
- * and the native compaction marker MUST be staged (not applied eagerly, which
- * mutates getBranch immediately and could land mid-turn).
  */
 
 const PATH = join(import.meta.dir, "ctx-session-upgrade.ts");
@@ -47,8 +36,7 @@ describe("/ctx-session-upgrade detached execution contract", () => {
 	});
 
 	test("still gates migration + Complete on a published full recomp", () => {
-		// Background execution must not weaken the published/Complete gate that
-		// prevents migrating + declaring Complete on a skipped/partial recomp.
+		// Migration and `Complete` require a published full recomp.
 		expect(codeOnly).toContain("isRecompComplete(recompResult.message)");
 		expect(codeOnly).toContain("!recompResult.published");
 	});

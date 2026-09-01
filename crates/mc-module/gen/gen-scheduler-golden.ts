@@ -1,7 +1,5 @@
 /**
- * Generate the differential scheduler golden for the Rust mc-module port.
  *
- * Run: bun crates/mc-module/gen/gen-scheduler-golden.ts
  */
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";

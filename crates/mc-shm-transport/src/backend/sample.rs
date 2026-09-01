@@ -1,14 +1,12 @@
-//! Pure exact-consumption decoding of complete-frame sample metadata.
+//! This module passes only each declared body to the wire decoder.
 //!
-//! Every field is snapshotted into bounded local immutable values before any
-//! validation, and validation never returns a view outside the declared body
-//! range. A provider allocation may carry documented capacity slack beyond
-//! the declared body; that slack is excluded from the validated body range
-//! and must never reach the wire decoder.
+//! `validate` returns only the declared body range.
+//! Allocation capacity beyond the declared body is slack.
+//! Validation excludes capacity slack from the body range.
+//! Capacity slack must not reach the wire decoder.
 //!
-//! Post-publication concurrent mutation of already-published payload bytes
-//! by the authenticated same-user peer is a peer-contract violation (R4);
-//! these decoders do not claim protection against it.
+//! Payload bytes must remain unchanged after publication and through decoding.
+//! Decoders do not prevent payload mutation.
 
 use std::ops::Range;
 
@@ -17,13 +15,9 @@ use crate::descriptor::{
     DescriptorError, Incarnation, ReleaseIdentity, DESCRIPTOR_SCHEMA_VERSION, WIRE_V2_HEADER_BYTES,
 };
 
-/// Fixed metadata prefix length before each sample body.
 ///
-/// Layout: schema `u16` | wire-v2 header | incarnation `[u8; 16]` |
-/// lane `u32` | sequence `u64` | body length `u64`, all little endian.
 pub const SAMPLE_PREFIX_BYTES: usize = 2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8;
 
-/// Bounded immutable snapshot of one untrusted sample prefix.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SamplePrefix {
     schema: u16,
@@ -33,11 +27,8 @@ pub struct SamplePrefix {
 }
 
 impl SamplePrefix {
-    /// Snapshots the fixed prefix from one untrusted sample payload.
     ///
-    /// Reads only the fixed prefix range and rejects truncated payloads.
-    /// Bytes beyond the prefix are not inspected here; `validate` bounds
-    /// the declared body against the full allocation length.
+    /// `validate` checks the declared body against the full allocation length.
     pub fn snapshot(payload: &[u8]) -> Result<Self, DescriptorError> {
         let prefix: &[u8; SAMPLE_PREFIX_BYTES] = payload
             .get(..SAMPLE_PREFIX_BYTES)
@@ -70,16 +61,14 @@ impl SamplePrefix {
         })
     }
 
-    /// Snapshotted release identity. Never include it in diagnostics.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
 
-    /// Validates the snapshot and returns the exact declared body range.
     ///
-    /// `allocation_len` is the full sample allocation length. The declared
-    /// body must fit inside it; remaining allocation bytes are documented
-    /// capacity slack and stay outside the returned range.
+    /// `allocation_len` includes both the declared body and any capacity slack.
+    /// The declared body must fit within `allocation_len`.
+    /// Capacity slack stays outside the returned range.
     pub fn validate(
         &self,
         allocation_len: usize,
@@ -132,7 +121,6 @@ impl std::fmt::Debug for SamplePrefix {
     }
 }
 
-/// Validated sample metadata with the exact declared body range.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedSample {
     identity: ReleaseIdentity,
@@ -140,18 +128,17 @@ pub struct ValidatedSample {
 }
 
 impl ValidatedSample {
-    /// Qualified release identity.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
 
-    /// Exact declared body length.
+    /// `body_len` equals the declared body length.
     pub const fn body_len(&self) -> usize {
         self.body_len
     }
 
-    /// Exact declared body range within the allocation. Capacity slack past
-    /// the end of this range must never reach the wire decoder.
+    /// `body_range` contains exactly the declared body within the allocation.
+    /// Capacity slack past `body_range.end` must not reach the wire decoder.
     pub const fn body_range(&self) -> Range<usize> {
         SAMPLE_PREFIX_BYTES..SAMPLE_PREFIX_BYTES + self.body_len
     }

@@ -72,10 +72,7 @@ export interface RunSetupOptions {
     env?: SetupEnvironment;
     host?: PiCompatibleSetupHost;
     /**
-     * When true, run the full interactive wizard (detection, model fetch,
-     * type-ahead picker, all prompts) but write NO files and register NO
-     * package — print what WOULD be written. Lets the flow be exercised end to
-     * end without mutating the user's real Pi config.
+     * When true, run the interactive wizard without writing files or registering plugins; print planned changes instead.
      */
     dryRun?: boolean;
 }
@@ -155,8 +152,8 @@ function compactObject<T extends Record<string, unknown>>(obj: T): T {
 }
 
 /**
- * Compare two semver-ish strings (X.Y.Z, ignores any pre-release or build
- * suffix). Returns -1 if `a < b`, 0 if equal, 1 if `a > b`. Returns 0 when
+ * The comparison parses X.Y.Z versions and ignores pre-release and build suffixes.
+ * Returns -1 if `a < b`, 0 if equal, and 1 if `a > b`.
  * either string can't be parsed (we conservatively assume "good enough" so
  * a parse failure doesn't block the user with a phantom upgrade prompt).
  */
@@ -182,8 +179,7 @@ export function writePiSettingsPackage(
     const settings = readJsoncConfigForUpdate(settingsPath);
     ensureDir(dirname(settingsPath));
     if (settings.packages !== undefined && !Array.isArray(settings.packages)) {
-        // Overwriting a non-array value would silently discard whatever the user
-        // put there; refuse instead so setup never destroys host configuration.
+        // Refuse to replace a non-array `packages` value; overwriting it would discard user configuration.
         throw new Error(
             `Refusing to rewrite ${settingsPath}: "packages" is ${typeof settings.packages}, expected an array. Fix it by hand, then rerun setup.`,
         );
@@ -378,7 +374,7 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
     const configPath = env.paths.getPiUserConfigPath();
     if (!dryRun) {
         try {
-            // Validate every target before the wizard performs its first write.
+            // Validate all targets before writing to prevent partial setup when a later target is invalid.
             assertJsoncConfigsParseable([settingsPath, configPath]);
         } catch (error) {
             prompts.log.error(error instanceof Error ? error.message : String(error));
@@ -429,8 +425,6 @@ export async function runSetup(options: RunSetupOptions = {}): Promise<number> {
         "Enable dreamer for overnight memory maintenance?",
         true,
     );
-    // Only run the dreamer flow when enabled — asking after the user declined
-    // (the prior behavior) was the #144 "still wanted a model after I said no"
     // complaint.
     let dreamerModel: string | undefined;
     let dreamerTasks: Record<string, { schedule: string }> | undefined;

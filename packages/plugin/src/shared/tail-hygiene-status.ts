@@ -15,7 +15,7 @@ function finiteNumber(value: unknown, fallback = 0): number {
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-/** Normalize either renderer authority's persisted baseline without dropping valid zeros. */
+/** resolveTailHygieneStatus preserves zero-valued baselines. */
 export function resolveTailHygieneStatus(
     tsBaseline: Channel1State | undefined,
     rustBaseline?: WireTailHygieneBaseline | null,

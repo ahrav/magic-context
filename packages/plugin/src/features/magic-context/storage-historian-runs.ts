@@ -1,25 +1,18 @@
 import type { Database } from "../../shared/sqlite";
 
 /**
- * Per historian-invocation telemetry.
  *
- * One row per attempted historian run (incremental publish, recomp pass, or
- * session-upgrade), recording the INPUT (chunk range) and OUTPUT shape
- * (compartments / facts / events / importance) plus success/failure. Tokens and
- * the model used live on the FK-linked `subagent_invocations` row
- * (`subagentInvocationId`) — join to get cost/model.
+ * `subagent_invocations` stores the model and token usage.
  *
- * Purpose: debugging (which range produced what), quality analysis (facts per
- * output token, importance distribution by model), and the productization /
  * training-data roadmap.
  */
 
 export type HistorianRunStatus =
-    /** Compartments were validated + published. */
+    /** `success` means the historian validated and published the compartments. */
     | "success"
-    /** A real failure (validation / coverage / no-progress / exception). */
+    /** `failed` covers validation, coverage, no-progress, and exception failures. */
     | "failed"
-    /** A successful no-op (nothing eligible to compact, empty chunk). */
+    /** `noop` means the historian found no eligible compartments or received an empty chunk. */
     | "noop";
 
 export type HistorianRunKind = "incremental" | "recomp" | "partial-recomp" | "upgrade";
@@ -27,41 +20,40 @@ export type HistorianRunKind = "incremental" | "recomp" | "partial-recomp" | "up
 export interface HistorianRunInput {
     sessionId: string;
     harness: string;
-    /** FK to subagent_invocations.id (tokens/model/timing). NULL if no invocation. */
+    /** `subagentInvocationId` is null when no invocation exists and otherwise references `subagent_invocations.id`. */
     subagentInvocationId?: number | null;
     runKind: HistorianRunKind;
     status: HistorianRunStatus;
-    /** Failure reason for `failed` (and optionally a no-op explanation). */
+    /** `failureReason` records reasons for `failed` runs and may explain `noop` runs. */
     failureReason?: string | null;
-    /** Raw-ordinal range of the input chunk. */
+    /** `chunkStartOrdinal` and `chunkEndOrdinal` bound the input chunk's raw-ordinal range. */
     chunkStartOrdinal?: number | null;
     chunkEndOrdinal?: number | null;
-    /** Historian's reported next-start (its `<unprocessed_from>`). */
+    /** `unprocessedFrom` records the historian's `<unprocessed_from>` next-start. */
     unprocessedFrom?: number | null;
-    /** Compartments actually persisted (post discard-last). */
+    /** `compartmentsProduced` counts compartments persisted after discarding the last compartment. */
     compartmentsProduced?: number;
-    /** Durable id range of the persisted compartments. */
+    /** `compartmentIdMin` and `compartmentIdMax` bound the persisted compartments' durable ID range. */
     compartmentIdMin?: number | null;
     compartmentIdMax?: number | null;
-    /** Facts emitted in the `<facts>` block. */
+    /** `factsEmitted` counts facts emitted in the `<facts>` block. */
     factsEmitted?: number;
-    /** `{ [category]: count }` of emitted facts. */
+    /* */
     factsByCategory?: Record<string, number> | null;
-    /** Events emitted (causal_incident / trajectory_correction). */
+    /** `eventsEmitted` counts emitted `causal_incident` and `trajectory_correction` events. */
     eventsEmitted?: number;
-    /** Importance distribution across persisted compartments. */
+    /** `importanceMin`, `importanceMax`, and `importanceAvg` summarize persisted-compartment importance. */
     importanceMin?: number | null;
     importanceMax?: number | null;
     importanceAvg?: number | null;
-    /** Whether the lookahead-free last compartment was discarded (boundary healing). */
+    /** `discardedLast` is true when boundary healing discards the lookahead-free last compartment. */
     discardedLast?: boolean;
-    /** Whether the run produced/processed legacy (pre-v2) compartments. */
+    /** `legacy` is true when the run produces or processes pre-v2 compartments. */
     legacy?: boolean;
 }
 
 /**
- * Record one historian run. Best-effort: never throws into the historian path —
- * telemetry must not break compaction. Returns the new row id, or null on
+ * Telemetry failures never interrupt compaction.
  * failure.
  */
 export function recordHistorianRun(db: Database, input: HistorianRunInput): number | null {
@@ -106,7 +98,7 @@ export function recordHistorianRun(db: Database, input: HistorianRunInput): numb
     }
 }
 
-/** Summarize a list of importance values into min/max/avg (null on empty). */
+/* */
 export function summarizeImportance(values: readonly number[]): {
     min: number | null;
     max: number | null;
@@ -125,7 +117,7 @@ export function summarizeImportance(values: readonly number[]): {
     return { min, max, avg: sum / nums.length };
 }
 
-/** Tally facts by their category for `factsByCategory`. */
+/* */
 export function tallyFactsByCategory(
     facts: ReadonlyArray<{ category?: string | null }>,
 ): Record<string, number> {

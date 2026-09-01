@@ -12,8 +12,8 @@ export interface CachedM0UpgradeIdentity {
 }
 
 /**
- * Store renderer and render-config identity in the existing cached upgrade-state marker.
- * Provider-visible byte changes must change this identity so each cached m[0] folds exactly once.
+ * The cached upgrade-state marker stores renderer and render-config identity.
+ * Provider-visible byte changes must change the cached upgrade-state identity so each cached m[0] folds exactly once.
  */
 export function encodeCachedM0UpgradeIdentity(
     upgradeState: string | null,

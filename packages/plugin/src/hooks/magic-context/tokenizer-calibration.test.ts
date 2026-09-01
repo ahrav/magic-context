@@ -56,16 +56,14 @@ describe("resolveModelCalibration", () => {
     });
 
     it("uses longest prefix match", () => {
-        // claude-opus-4-7 should win over a generic anthropic/claude prefix.
+        // `claude-opus-4-7` takes precedence over the generic `anthropic/claude` prefix.
         const opus47 = resolveModelCalibration("anthropic", "claude-opus-4-7");
         const opus45 = resolveModelCalibration("anthropic", "claude-opus-4-5");
         expect(opus47.systemRatio).not.toBe(opus45.systemRatio);
     });
 
     it("matches Opus 4.7 routed via OpenRouter and GitHub Copilot (regression: A2)", () => {
-        // Without explicit prefixes for these routes, the longest-prefix
-        // matcher fell through to NEUTRAL and the sidebar misattributed
-        // ~30K tokens from System+ToolDefs into Conversation/ToolCalls.
+        // Without `openrouter/anthropic` and `github-copilot` prefixes, the matcher falls through to `NEUTRAL`.
         const cases = [
             ["openrouter/anthropic", "claude-opus-4-7"],
             ["openrouter/anthropic", "claude-opus-4.7"],
@@ -128,10 +126,7 @@ describe("calibrateBuckets", () => {
     });
 
     it("applies system_ratio and tools_ratio to calibrated buckets", () => {
-        // 2x system multiplier doubles the system bucket; verbatim and residual
-        // buckets are untouched. Local 10K system + 0 tools + 0 verbatim + 30K
-        // conversation = 40K total raw. After 2x system: stable=20K, residual
-        // target = 50K - 20K = 30K → conversation = 30K.
+        // Only calibrated buckets use calibration ratios; verbatim buckets retain local counts and residual buckets receive the remainder.
         const out = calibrateBuckets({
             inputTokens: 50_000,
             systemLocal: 10_000,
@@ -151,10 +146,6 @@ describe("calibrateBuckets", () => {
     });
 
     it("keeps verbatim buckets at local count and absorbs residual into conversation/tool calls", () => {
-        // System=1000, tools=500 (calibrated, neutral so no scaling).
-        // Verbatim: compartments=1000, facts=500, memories=0 → all stay at local count.
-        // Stable + verbatim = 3000. Residual target = 10000 - 3000 = 7000.
-        // Residual local = 2000 conv + 500 tool = 2500. Scale = 7000/2500 = 2.8x.
         const out = calibrateBuckets({
             inputTokens: 10_000,
             systemLocal: 1_000,
@@ -168,21 +159,18 @@ describe("calibrateBuckets", () => {
             toolCallsLocal: 500,
             calibration: NEUTRAL,
         });
-        // Calibrated stays at local raw count (neutral).
+        // Neutral calibration leaves calibrated buckets at local counts.
         expect(out.systemTokens).toBe(1_000);
         expect(out.toolDefinitionTokens).toBe(500);
-        // Verbatim must equal local input exactly. THIS is the property the
-        // user asked for: compartments, facts, memories should not drift.
+        // Verbatim buckets equal local input exactly.
         expect(out.compartmentTokens).toBe(1_000);
         expect(out.factTokens).toBe(500);
         expect(out.memoryTokens).toBe(0);
-        // Residual buckets absorb the remainder proportionally.
-        // Conv: 2000 * 2.8 = 5600, ToolCalls: 500 * 2.8 = 1400.
+        // Residual buckets absorb the remainder in proportion to their local counts.
         expect(out.conversationTokens).toBeGreaterThanOrEqual(5_590);
         expect(out.conversationTokens).toBeLessThanOrEqual(5_610);
         expect(out.toolCallTokens).toBeGreaterThanOrEqual(1_390);
         expect(out.toolCallTokens).toBeLessThanOrEqual(1_410);
-        // Sum still exactly equals inputTokens.
         const sum =
             out.systemTokens +
             out.toolDefinitionTokens +
@@ -195,8 +183,7 @@ describe("calibrateBuckets", () => {
     });
 
     it("parks the full remainder in conversation when residual local sum is 0", () => {
-        // Brand-new session: only system+tools have local content.
-        // Conversation has nothing yet, so it absorbs the entire remainder.
+        // With no conversation content, conversationTokens absorbs the full remainder.
         const out = calibrateBuckets({
             inputTokens: 50_000,
             systemLocal: 16_000,
@@ -220,9 +207,8 @@ describe("calibrateBuckets", () => {
     });
 
     it("clamps non-residual buckets when calibrated + verbatim exceeds inputTokens", () => {
-        // Pathological: large system+tools+compartments locally but tiny
-        // inputTokens. System*5 + Tools*5 + Compartments(verbatim) far exceed
-        // 1000 inputTokens, so they all scale down proportionally and residuals
+        // When scaled stable and verbatim buckets exceed `inputTokens`, all nonzero buckets scale down proportionally.
+        // When stable and verbatim totals exceed `inputTokens`, all nonzero buckets scale down proportionally.
         // stay 0.
         const out = calibrateBuckets({
             inputTokens: 1_000,
@@ -246,15 +232,11 @@ describe("calibrateBuckets", () => {
             out.conversationTokens +
             out.toolCallTokens;
         expect(sum).toBeLessThanOrEqual(1_000);
-        // After rounding correction, sum equals exactly 1000.
         expect(sum).toBe(1_000);
     });
 
     it("tiny inputTokens with clamp path: still sums exactly (regression: Oracle final review)", () => {
-        // Oracle final-review reproducer: with very small inputTokens, the
-        // single-bucket fix from the original A1 patch couldn't absorb a
-        // residual overshoot that exceeded that bucket's value. The fix
-        // loops through non-residual buckets descending until delta=0.
+        // When a rounding overshoot exceeds one residual bucket, correction decrements non-residual buckets in descending token-count order until `delta` is zero.
         const out = calibrateBuckets({
             inputTokens: 2,
             systemLocal: 1,
@@ -292,13 +274,8 @@ describe("calibrateBuckets", () => {
     });
 
     it("clamp + zero residuals: rounding overshoot does NOT exceed inputTokens (regression: A1)", () => {
-        // Council A1: with heavy calibration ratios AND zero conversation/tool-call
-        // locals, the clamp path's `Math.round(x * ratio)` overshoots and the
-        // residual buckets can't absorb the negative delta (Math.max clamps to 0).
-        // Pre-fix, this produced sum=inputTokens+1 in pathological cases.
-        // Reproducer from the audit:
-        //   inputTokens=1000, system=500, toolDefs=500, compartments=500,
-        //   conversation=0, toolCalls=0, ratio 5x → all rounded up by ~0.45 → 1001.
+        // When calibrated stable totals exceed `inputTokens` and residual local counts are zero, residual buckets cannot absorb a negative delta.
+        // Rounding calibrated buckets can overshoot `inputTokens`.
         const out = calibrateBuckets({
             inputTokens: 1_000,
             systemLocal: 500,
@@ -320,30 +297,17 @@ describe("calibrateBuckets", () => {
             out.memoryTokens +
             out.conversationTokens +
             out.toolCallTokens;
-        // Final sum must be EXACTLY inputTokens — never +1.
+        // Final sum equals inputTokens.
         expect(sum).toBe(1_000);
-        // Residuals stay zero — they have no local content to scale from.
+        // Residual buckets with zero local counts stay zero.
         expect(out.conversationTokens).toBe(0);
         expect(out.toolCallTokens).toBe(0);
-        // No bucket goes negative.
         expect(out.systemTokens).toBeGreaterThanOrEqual(0);
         expect(out.toolDefinitionTokens).toBeGreaterThanOrEqual(0);
         expect(out.compartmentTokens).toBeGreaterThanOrEqual(0);
     });
 
     it("real-world Opus 4.7 example: verbatim history matches /ctx-status, residual absorbs drift", () => {
-        // Live session symptom: System=16500 local, Tools=21400 local,
-        // Compartments=89000 local, Conversation=40000 local, ToolCalls=68000
-        // local. inputTokens=378000 (Anthropic's billed count). After fix:
-        //   System (calibrated)         = 16500 * 1.51 ≈ 24915
-        //   Tool Defs (calibrated)      = 21400 * 1.57 ≈ 33598
-        //   Compartments (verbatim)     = 89000          ← unchanged
-        //   Facts (verbatim)            = 50             ← unchanged
-        //   Memories (verbatim)         = 8000           ← unchanged
-        //   Residual target             = 378000 - 24915 - 33598 - 89000 - 50 - 8000 ≈ 222437
-        //   Residual local              = 40000 + 68000 = 108000
-        //   Conv = 40000 * (222437/108000) ≈ 82384
-        //   Tool calls = 68000 * (222437/108000) ≈ 140053
         const out = calibrateBuckets({
             inputTokens: 378_000,
             systemLocal: 16_500,
@@ -360,15 +324,13 @@ describe("calibrateBuckets", () => {
         // Calibrated buckets.
         expect(out.systemTokens).toBe(Math.round(16_500 * 1.51));
         expect(out.toolDefinitionTokens).toBe(Math.round(21_400 * 1.57));
-        // Verbatim buckets — exact local count, NO scaling. This is the
-        // property that fixes the sidebar-vs-/ctx-status mismatch.
+        // Verbatim buckets retain exact local counts without scaling.
         expect(out.compartmentTokens).toBe(89_000);
         expect(out.factTokens).toBe(50);
         expect(out.memoryTokens).toBe(8_000);
-        // Residual absorbed by conversation + tool calls.
+        // conversationTokens and toolCallTokens absorb the residual.
         expect(out.conversationTokens).toBeGreaterThan(70_000);
         expect(out.toolCallTokens).toBeGreaterThan(120_000);
-        // Sum equals inputTokens.
         const sum =
             out.systemTokens +
             out.toolDefinitionTokens +
@@ -381,8 +343,7 @@ describe("calibrateBuckets", () => {
     });
 
     it("docs + profile are verbatim buckets that come OUT of the residual (not Conversation)", () => {
-        // v2: <project-docs> and <user-profile> live in m[0]. They must surface
-        // as their own buckets, not silently inflate Conversation.
+        // `<project-docs>` and `<user-profile>` use separate buckets instead of Conversation.
         const base = {
             inputTokens: 200_000,
             systemLocal: 5_000,
@@ -397,13 +358,12 @@ describe("calibrateBuckets", () => {
         const without = calibrateBuckets({ ...base, docsLocal: 0, profileLocal: 0 });
         const withDocs = calibrateBuckets({ ...base, docsLocal: 20_000, profileLocal: 2_000 });
 
-        // Verbatim — exact local counts, no scaling.
+        // Verbatim buckets retain exact local counts without scaling.
         expect(withDocs.docsTokens).toBe(20_000);
         expect(withDocs.profileTokens).toBe(2_000);
-        // The 22K of docs+profile is carved out of the residual, so Conversation
-        // SHRINKS vs the run that attributed them to nothing.
+        // docsLocal and profileLocal reduce the residual available to conversationTokens and toolCallTokens.
         expect(withDocs.conversationTokens).toBeLessThan(without.conversationTokens);
-        // Sum (including the two new buckets) is still EXACTLY inputTokens.
+        // All buckets sum exactly to inputTokens.
         const sum =
             withDocs.systemTokens +
             withDocs.toolDefinitionTokens +

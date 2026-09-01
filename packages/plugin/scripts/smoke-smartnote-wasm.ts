@@ -1,16 +1,12 @@
-// Bundle-path smoke test for the smart-note QuickJS sandbox.
+// This smoke test verifies that the bundled smart-note sandbox loads QuickJS.
 //
-// `bun test` runs sandbox-runner.ts from SRC, where Bun resolves the QuickJS
-// wasm through the real node_modules package path — so it CANNOT catch the
-// bundling failure that actually shipped: the default wasmfile variant loads a
-// sibling `emscripten-module.wasm` via `new URL(..., import.meta.url)`, which in
-// the bundled dist/index.js resolves to a `dist/emscripten-module.wasm` the
-// build never emits → every real sandbox run failed with ENOENT.
+// `bun test` cannot detect a missing `emscripten-module.wasm` beside the bundle because it resolves QuickJS from `node_modules`.
+// The `wasmfile` variant loads sibling `emscripten-module.wasm` through `new URL(..., import.meta.url)`.
+// `new URL(..., import.meta.url)` in `dist/index.js` resolves to `dist/emscripten-module.wasm`.
+// The missing file causes sandbox runs to fail with ENOENT.
 //
-// This script BUNDLES sandbox-runner.ts exactly like the production build
-// (esm, node target) into a temp file, then imports that bundle and runs a real
-// check. If the wasm isn't embedded in the bundle (singlefile variant), the
-// import/run throws — failing the smoke. Run: bun packages/plugin/scripts/smoke-smartnote-wasm.ts
+// The smoke fails when the bundle omits the QuickJS wasm.
+// An import or execution error fails the smoke.
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -31,8 +27,7 @@ function check(name: string, cond: boolean, detail?: string): void {
 }
 
 try {
-    // Bundle with the SAME flags the package build uses (esm, node target), so
-    // the QuickJS variant goes through the identical bundling transform.
+    // The production ESM/Node build settings make QuickJS use the production bundling transform.
     const result = await Bun.build({
         entrypoints: [entry],
         outdir: outDir,
@@ -46,8 +41,8 @@ try {
     check("bundle emitted a js file", Boolean(bundlePath));
     if (!bundlePath) throw new Error("no bundle output");
 
-    // The whole point: importing + running the BUNDLE must not ENOENT on a
-    // sibling .wasm. A singlefile (inlined) variant loads from the bundle itself.
+    // The bundle must not require a sibling `.wasm` file at runtime.
+    // The `singlefile` variant inlines the WASM in the bundle.
     const mod = (await import(bundlePath)) as {
         runCompiledSmartNoteCheck: (opts: unknown) => Promise<{ ok: boolean; result?: unknown }>;
     };

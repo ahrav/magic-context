@@ -21,16 +21,11 @@ function isStructuralNoisePart(part: unknown): boolean {
 }
 
 /**
- * Replace structural/cleared parts with empty-text sentinels instead of removing
- * them. Preserves message.parts length between passes so Anthropic prompt-cache
- * prefixes stay byte-stable while OpenCode filters the empty text parts before
+ * `message.parts.length` remains unchanged between passes.
  * the wire.
  *
- * Caller contract: run only when `modelAcceptsEmptyContent(providerID)` is true.
- * Non-Anthropic adapters can forward empty text parts as real wire content.
  *
- * Idempotent: sentinels are themselves recognized on subsequent passes and
- * skipped (not re-mutated, not re-counted).
+ * Subsequent passes recognize sentinels and skip them without incrementing `strippedParts`.
  */
 export function stripStructuralNoise(messages: MessageLike[]): number {
     let strippedParts = 0;

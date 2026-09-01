@@ -1,4 +1,4 @@
-//! Process panic-hook boundary for untrusted handler callbacks.
+//! This module redacts panic diagnostics while handler callbacks execute.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -33,8 +33,6 @@ fn callback_is_polling() -> bool {
         .unwrap_or(false)
 }
 
-/// Installs the host-owned hook once and preserves the prior hook for every
-/// panic outside a handler callback poll.
 pub fn install() {
     INSTALL_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
@@ -48,14 +46,12 @@ pub fn install() {
     });
 }
 
-/// Marks only the synchronous execution of one handler method.
 pub fn redact_sync<T>(callback: impl FnOnce() -> T) -> T {
     let _guard = CallbackPollGuard::enter();
     callback()
 }
 
-/// Marks each individual future poll, not the whole await. A yielded callback
-/// therefore cannot suppress an unrelated task's panic on the same worker.
+/// A callback future that returns `Poll::Pending` cannot suppress an unrelated task's panic on the same worker.
 pub async fn redact<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {

@@ -57,7 +57,7 @@ describe("prepareExplicitQuery", () => {
     });
 
     it("measures bytes of UTF-8, not characters", () => {
-        // 4 bytes per emoji: a quarter of the cap in characters still overflows.
+        // Each 🎉 uses 4 UTF-8 bytes, so MAX_QUERY_BYTES / 4 + 1 emojis exceed the cap.
         const outcome = rejection("🎉".repeat(MAX_QUERY_BYTES / 4 + 1));
         expect(outcome.violation).toBe("bytes");
     });
@@ -84,7 +84,6 @@ describe("prepareExplicitQuery", () => {
     });
 
     it("rejects a token-cap overflow for a query under the byte and atom caps", () => {
-        // Pseudo-random chars resist BPE run-collapsing, unlike "x".repeat().
         const raw = Array.from({ length: 8000 }, (_, index) =>
             ((index * 2654435761) % 36).toString(36),
         ).join("");
@@ -153,7 +152,7 @@ describe("prepareAutomaticQuery", () => {
         const kept = query.split(/\s+/);
         expect(kept.length).toBeLessThan(atoms.length);
         expect(kept.length).toBeGreaterThan(0);
-        // Every retained atom is complete — no atom was split mid-way.
+        // No retained atom is split.
         kept.forEach((atom, index) => {
             expect(atom).toBe(atoms[index]);
         });
@@ -170,7 +169,7 @@ describe("prepareAutomaticQuery", () => {
     });
 
     it("never splits a surrogate pair at the byte boundary", () => {
-        // 4-byte emoji misaligned with the 16 KiB boundary.
+        // The 4-byte emoji crosses the 16 KiB boundary.
         const query = prepareAutomaticQuery(`abc${"🎉".repeat(8000)}`);
         expect(isValidUnicode(query)).toBe(true);
         expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(MAX_QUERY_BYTES);

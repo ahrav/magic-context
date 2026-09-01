@@ -1,48 +1,29 @@
 /**
- * SQLite chokepoint — runtime-detected backend selection.
  *
  * The same shipped plugin artifact must run under two different runtimes:
- *   - Bun (current OpenCode releases) → uses `bun:sqlite` (built-in, fast)
+ * Bun uses the built-in `bun:sqlite` backend.
  *   - Node / Electron (Pi plugin, OpenCode Desktop) → uses `node:sqlite`
- *     (`DatabaseSync`, built into Node 22.5+ / Electron 41+, stable-enough and
- *     flag-free since Node 22.13/23.4).
+ * `DatabaseSync` is built into Node 22.5+ and Electron 41+.
+ * `node:sqlite` is flag-free in Node 22.13+ and 23.4+.
  *
- * Bun has no `node:sqlite`, and Node/Electron have no `bun:sqlite`. Static
- * imports of either would crash at parse time in the wrong runtime, so we use
- * dynamic imports gated by runtime detection.
+ * Bun lacks `node:sqlite`, and Node/Electron lack `bun:sqlite`; static imports would fail in the wrong runtime, so runtime detection gates dynamic imports.
  *
- * Why `node:sqlite` instead of `better-sqlite3`: better-sqlite3 is a native
- * module requiring per-ABI prebuilds, and Electron's ABI never matches the npm
- * Node prebuild — which forced a runtime download of an Electron-matched
- * `.node` binary (a supply-chain + maintenance liability). `node:sqlite` is
- * built into the runtime, so there is NOTHING to download or rebuild. Both Pi
- * (plain Node 24) and OpenCode Desktop (Electron 41 → Node 24.14.1) ship it.
+ * `better-sqlite3` requires an Electron ABI-matched native binary; `node:sqlite` is built into the runtime.
+ * Built-in `node:sqlite` requires no downloaded or rebuilt native binary.
+ * Pi runs Node 24, and OpenCode Desktop runs Electron 41 with Node 24.14.1.
  *
- * API surface we use (common across both backends, modulo the shims below):
- *   - new Database(path, { readonly?: boolean })   ← we map readonly→readOnly
+ * `readonly` maps to `node:sqlite`'s `readOnly` option.
  *   - db.prepare(sql).run/get/all
  *   - db.exec(multistatement)
- *   - db.transaction(fn) → wrapped function        ← shimmed for node:sqlite
  *   - db.close()
  *
- * The three backend differences we bridge for node:sqlite:
- *   1. node:sqlite has no `db.transaction(fn)` helper — we add a savepoint-aware
- *      shim (below) that matches better-sqlite3/bun semantics.
- *   2. node:sqlite's constructor option is `readOnly` (camel-case), not
- *      better-sqlite3/bun's `readonly` — we translate it so call sites are
+ * `node:sqlite` lacks `db.transaction(fn)`, so the adapter adds a savepoint-aware shim matching better-sqlite3 and Bun semantics.
  *      unchanged.
- *   3. node:sqlite reads a lone array bind arg (`.run([a,b])`) as NAMED params
- *      and throws `Unknown named parameter '0'`; bun binds it positionally. We
- *      normalize it in the `prepare()` override (below) so the bind surface is
- *      identical (issue #151 / Pi /ctx-dream).
- * Everything else (named params with bare keys, ATTACH under defensive mode,
- * `run()` → {changes,lastInsertRowid}) is identical and was verified directly.
+ * `node:sqlite` treats a lone array bind argument such as `.run([a, b])` as named parameters and rejects it; the `prepare()` override converts it to positional binding to match Bun.
+ * Both backends support bare-key named parameters, `ATTACH` under defensive mode, and `run()` results of `{changes,lastInsertRowid}`.
  */
 
-// Type import only — runtime is loaded dynamically below. @types/better-sqlite3
-// has the richest definitions and is a structural superset of the API surface
-// we use, so calls typed against BetterSqlite3 work under bun:sqlite and
-// node:sqlite at runtime (both expose prepare/run/get/all/exec/close).
+// `@types/better-sqlite3` structurally covers the API used by both runtime backends.
 import type BetterSqlite3 from "better-sqlite3";
 
 export type SqliteRuntime = "Bun" | "Node.js";
@@ -53,10 +34,8 @@ type SqliteModule = {
 };
 
 export function detectSqliteRuntime(): SqliteRuntime {
-    // process.versions.bun is the least ambiguous marker, but some launchers
-    // proxy or partially sandbox process. Keep globalThis.Bun as a fallback so
-    // a Bun process does not accidentally select node:sqlite just because its
-    // process compatibility surface was trimmed.
+    // Some launchers
+    // Some launchers proxy or sandbox `process`; `globalThis.Bun` prevents Bun from selecting `node:sqlite` when `process.versions.bun` is unavailable.
     const hasBunVersion =
         typeof process !== "undefined" && typeof process.versions?.bun === "string";
     const hasBunGlobal =
@@ -65,28 +44,22 @@ export function detectSqliteRuntime(): SqliteRuntime {
     return hasBunVersion || hasBunGlobal ? "Bun" : "Node.js";
 }
 
-// IMPORTANT: bundler-evading dynamic imports.
 //
-// We can't write `await import("node:sqlite")` directly because esbuild/bun
-// would try to resolve both modules at build time, and one of them won't exist
-// in the build runtime (bun:sqlite is missing in Node, node:sqlite is missing
-// in Bun). Earlier versions used `new Function("p", "return import(p)")(...)`
-// to defeat static analysis, but that breaks Pi's vm-based extension loader: a
-// Function constructed at runtime has no module record, so `import()` inside it
-// has no referrer module and Node throws "A dynamic import callback was not
+// Static imports would make esbuild and Bun resolve both backends at build time.
+// The build runtime lacks one backend: Node lacks `bun:sqlite`, and Bun lacks `node:sqlite`.
+// `new Function("p", "return import(p)")(...)` breaks Pi's vm-based extension loader:
+// A runtime-constructed `Function` has no module record, so its `import()` has no referrer module.
+// Without a referrer module, Node throws "A dynamic import callback was not specified".
 // specified".
 //
-// The /* @vite-ignore */ + variable indirection pattern hides the specifier
-// from static analyzers while keeping a real referrer module for the
-// dynamic import — Pi's loader, esbuild, and bun build all accept it.
+// Concatenated specifiers hide the backend names from static analyzers while preserving a referrer module for `import()`.
 const bunSpec = "bun:" + "sqlite";
 const nodeSpec = "node:" + "sqlite";
 
 async function importSqliteModule(specifier: string): Promise<SqliteModule> {
-    // The runtime chooses this specifier; Vite must not resolve it as a
-    // build-time dependency because the other runtime's backend is absent.
+    // Vite must not resolve the runtime-selected specifier as a build-time dependency.
     return (await import(
-        /* @vite-ignore -- keep the runtime-selected backend unresolved */ specifier
+        /* `@vite-ignore` keeps the runtime-selected backend unresolved. */ specifier
     )) as SqliteModule;
 }
 
@@ -149,29 +122,21 @@ const detectedRuntime = detectSqliteRuntime();
 const isBun = detectedRuntime === "Bun";
 const sqliteModule = await loadSqliteModule(detectedRuntime);
 
-// Different export shapes between the two backends:
-//   - bun:sqlite  → named export `Database` (has its own .transaction, accepts
-//     `{ readonly }`) — usable as-is.
-//   - node:sqlite → named export `DatabaseSync` (no .transaction, option is
-//     `readOnly`) — wrapped below.
+// `bun:sqlite` exports `Database`, accepts `{ readonly }`, and provides `transaction`.
+// `node:sqlite` exports `DatabaseSync`, which lacks `transaction` and uses `readOnly`.
 const DatabaseImpl: typeof BetterSqlite3 = isBun
     ? (sqliteModule.Database as typeof BetterSqlite3)
     : buildNodeSqliteDatabaseClass(sqliteModule.DatabaseSync);
 
 /**
- * Wrap node:sqlite's `DatabaseSync` so it presents the better-sqlite3/bun
- * surface the rest of the codebase calls:
- *   - translate the `{ readonly }` constructor option → node:sqlite's `readOnly`
- *   - add a `transaction(fn)` helper that matches better-sqlite3 semantics,
- *     using `db.isTransaction` to pick BEGIN (top-level) vs SAVEPOINT (nested),
- *     so it composes correctly with manual `BEGIN IMMEDIATE` blocks too.
+ * The wrapper presents `DatabaseSync` through the better-sqlite3/Bun API.
+ * The wrapper adds `transaction(fn)` with better-sqlite3 transaction semantics.
+ * The savepoint path composes with manual `BEGIN IMMEDIATE` blocks.
  */
 // biome-ignore lint/suspicious/noExplicitAny: node:sqlite has no shipped types here; the public export is cast to the better-sqlite3 shape.
 function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
-    // Single constant savepoint name is correct for arbitrary nesting depth:
-    // SQLite savepoints with the same name stack LIFO — RELEASE / ROLLBACK TO
-    // always target the most recent. node:sqlite is synchronous + single-process
-    // per connection, so there is no concurrent-savepoint hazard.
+    // SQLite savepoints with the same name are LIFO; RELEASE and ROLLBACK TO target the most recent.
+    // node:sqlite runs synchronously per connection, so concurrent savepoint operations cannot occur.
     const SAVEPOINT = "mc_tx_sp";
 
     class NodeSqliteDatabase extends DatabaseSync {
@@ -184,18 +149,8 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
             super(typeof filename === "string" ? filename : ":memory:", translated);
         }
 
-        // Normalize a single ARRAY bind arg to spread positional, matching
-        // bun:sqlite. bun's `.run([a,b])` binds positionally; node:sqlite instead
-        // reads a lone array as NAMED params with keys "0","1" and throws
-        // `Unknown named parameter '0'`. That divergence let an array-form bind
-        // (e.g. `.run([x, y])`) silently work on OpenCode/Bun yet break Pi and
-        // OpenCode Desktop (both node:sqlite) — issue #151 (/ctx-dream). Wrapping
-        // every prepared statement here keeps the two backends' bind surface
-        // truly identical so this whole class is impossible regardless of how a
-        // call site writes its bind. Named-object binds (`.run({k:v})`), no-arg
-        // calls, and already-spread positional args are passed through unchanged;
-        // the normalization only triggers on the exact 1-array shape. Overhead
-        // measured at ~12ns/call against real node:sqlite (negligible).
+        // Bun binds `.run([a, b])` positionally, but node:sqlite treats a lone array as named parameters.
+        // node:sqlite treats a lone array as named parameters with keys `"0"`, `"1"`, and so on.
         // biome-ignore lint/suspicious/noExplicitAny: node:sqlite StatementSync has no shipped types here.
         prepare(sql: string): any {
             const stmt = super.prepare(sql);
@@ -209,9 +164,8 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
             return stmt;
         }
 
-        // biome-ignore lint/suspicious/noExplicitAny: mirrors better-sqlite3's generic transaction(fn) signature.
+        // The `any` parameters match better-sqlite3's generic `transaction(fn)` signature.
         transaction<F extends (...args: any[]) => any>(fn: F): F {
-            // biome-ignore lint/suspicious/noExplicitAny: faithful pass-through of this/args to fn.
             const self = this as any;
             const execute = (
                 mode: "" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE",
@@ -226,8 +180,7 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
                     self.exec(nested ? `RELEASE ${SAVEPOINT}` : "COMMIT");
                     return result;
                 } catch (error) {
-                    // RAISE(ROLLBACK) can end the transaction before control
-                    // returns here. Cleanup errors must not replace `error`.
+                    // `RAISE(ROLLBACK)` can end the transaction before control returns; cleanup errors must not replace `error`.
                     if (self.isTransaction === true) {
                         if (nested) {
                             try {
@@ -288,26 +241,19 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
 
 export const Database: typeof BetterSqlite3 = DatabaseImpl;
 
-/** Instance type alias used by helpers and storage modules. */
+/* */
 export type Database = BetterSqlite3.Database;
 
 /**
- * Statement instance type used for WeakMap caches throughout the codebase.
  *
- * We deliberately use the variadic Statement<unknown[], unknown> shape rather
- * than `ReturnType<Database["prepare"]>` because the latter resolves through
- * a conditional return type in @types/better-sqlite3 that confuses TypeScript
- * about how many arguments .run/.get/.all accept. With this explicit type,
- * cached statements accept any number of bind args (matching bun:sqlite's
- * historical behavior in this codebase).
+ * Use `Statement<unknown[], unknown>` instead of `ReturnType<Database["prepare"]>` because the latter's conditional return type rejects valid bind arities.
+ * Cached statements accept any number of bind arguments, matching bun:sqlite.
  */
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
 
 /**
- * True while the connection holds an open transaction. bun:sqlite and
- * better-sqlite3 expose `inTransaction`; node:sqlite exposes `isTransaction`.
  */
 export function isInTransaction(db: Database): boolean {
     // SAFETY: this assertion permits probing transaction-state properties absent from Database.
@@ -347,13 +293,10 @@ export function runImmediate<T>(db: Database, body: () => T): T {
 /**
  * Run a storage operation with the managed-write privilege enabled.
  *
- * The privilege is recorded in the durable `context_privilege_state` table (row
- * id=1, enabled=1) so the guard triggers — which reference that table, never a
- * connection-local UDF — stand down for this connection's writes. The write happens
- * inside a BEGIN IMMEDIATE transaction (single writer), and enabled is cleared back
- * to 0 before commit, so no second connection can ever observe enabled=1. Nesting is
- * tracked by privilegeDepth (outside SQLite): only the outermost scope clears the
- * flag, so an inner scope releasing does not drop permission out from under its caller.
+ * The write occurs in the caller's transaction or a BEGIN IMMEDIATE transaction.
+ * The outermost scope resets `enabled` to 0 before commit, so no other connection can observe `enabled=1`.
+ * Only the outermost `privilegeDepth` scope clears the privilege flag.
+ * Only the outermost scope clears the privilege flag, so releasing an inner scope preserves its caller's permission.
  */
 export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     const previousDepth = privilegeDepth.get(db) ?? 0;
@@ -398,9 +341,6 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
 }
 
 // ---------------------------------------------------------------------------
-// U1 direct-cutover groundwork (KTD2, R17): off-path SQLite source probe and
-// connection-contract verification. Pure helpers plus one off-path opener —
-// nothing here is wired into the production open path yet (U8 activates it).
 // ---------------------------------------------------------------------------
 
 /**
@@ -410,13 +350,13 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
  */
 export const MIN_SUPPORTED_SQLITE_VERSION = "3.51.3";
 
-/** Node floor whose node:sqlite ships a WAL-reset-safe SQLite (KTD2). */
+/** Require a Node version whose node:sqlite ships a WAL-reset-safe SQLite. */
 export const MIN_SUPPORTED_NODE_VERSION = "24.15.0";
 
-/** Bun floor whose bun:sqlite ships a WAL-reset-safe SQLite (KTD2). */
+/** Require a Bun version whose bun:sqlite ships a WAL-reset-safe SQLite. */
 export const MIN_SUPPORTED_BUN_VERSION = "1.3.14";
 
-/** `sqlite_source_id()` shape: `YYYY-MM-DD HH:MM:SS <commit hash>`. */
+/* */
 const SQLITE_SOURCE_ID_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [0-9a-f]{40,64}$/;
 
 export interface SqliteEngineIdentity {
@@ -424,7 +364,7 @@ export interface SqliteEngineIdentity {
     readonly sqliteSourceId: string;
 }
 
-/** Read `sqlite_version()` / `sqlite_source_id()` from an open connection. */
+/* */
 export function readSqliteEngineIdentity(db: Database): SqliteEngineIdentity {
     const row = db
         .prepare("SELECT sqlite_version() AS version, sqlite_source_id() AS source_id")
@@ -433,9 +373,8 @@ export function readSqliteEngineIdentity(db: Database): SqliteEngineIdentity {
 }
 
 /**
- * Probe the runtime's SQLite engine off-path: a throwaway in-memory
- * connection, never the real database file, so an unsafe engine is detected
- * before it can touch a shared WAL family.
+ * Probe SQLite with a throwaway in-memory connection so an unsafe engine is detected without opening the real database file.
+ * The probe detects an unsafe engine before the engine can open a shared WAL database.
  */
 export function probeSqliteEngineIdentityOffPath(): SqliteEngineIdentity {
     const probe = new Database(":memory:");
@@ -446,7 +385,7 @@ export function probeSqliteEngineIdentityOffPath(): SqliteEngineIdentity {
     }
 }
 
-/** Parse a dotted version into numeric parts; null when not parseable. */
+/* */
 function parseDottedVersion(version: string): number[] | null {
     const match = version.trim().match(/^(\d+)\.(\d+)(?:\.(\d+))?/);
     if (!match) return null;
@@ -465,7 +404,7 @@ export function isVersionAtLeast(candidate: string, floor: string): boolean {
 
 export interface SqliteRuntimeGateInput extends SqliteEngineIdentity {
     readonly runtime: SqliteRuntime;
-    /** `process.versions.bun` or `process.versions.node`. */
+    /* */
     readonly runtimeVersion: string;
 }
 
@@ -475,9 +414,7 @@ export interface SqliteRuntimeGateResult {
 }
 
 /**
- * Pure WAL-reset-safety gate (KTD2). The engine identity is authoritative:
- * a wrapper or runtime version alone never passes, and an unknown
- * `sqlite_source_id()` fails closed because the source cannot be proven safe.
+ * The source-ID check rejects sources that cannot be proven safe.
  */
 export function evaluateSqliteRuntimeGate(input: SqliteRuntimeGateInput): SqliteRuntimeGateResult {
     const reasons: string[] = [];
@@ -501,7 +438,7 @@ export function evaluateSqliteRuntimeGate(input: SqliteRuntimeGateInput): Sqlite
     return { ok: reasons.length === 0, reasons };
 }
 
-/** Gather the live gate input for the current runtime (off-path probe). */
+/* */
 export function collectSqliteRuntimeGateInput(): SqliteRuntimeGateInput {
     const runtime = detectSqliteRuntime();
     const runtimeVersion =
@@ -510,18 +447,14 @@ export function collectSqliteRuntimeGateInput(): SqliteRuntimeGateInput {
 }
 
 export interface SqliteConnectionContractExpectations {
-    /** Require `journal_mode=wal`; false for in-memory or non-WAL scratch databases. */
+    /* */
     readonly expectWal: boolean;
     readonly minBusyTimeoutMs?: number;
-    /** Allowed `PRAGMA synchronous` levels; OFF (0) is never acceptable for writers. */
+    /* */
     readonly allowedSynchronous?: readonly number[];
 }
 
 /**
- * Verify the per-connection contract (R17) after PRAGMAs are applied and
- * before application writes: foreign keys enforced, WAL actually activated,
- * a busy timeout installed, and a declared synchronous mode. Returns every
- * violation; callers fail closed on a nonempty list.
  */
 export function verifySqliteConnectionContract(
     db: Database,
@@ -550,7 +483,6 @@ export function verifySqliteConnectionContract(
     const synchronous = Number(
         (db.prepare("PRAGMA synchronous").get() as { synchronous: number }).synchronous,
     );
-    // 1=NORMAL, 2=FULL, 3=EXTRA; 0=OFF forfeits WAL durability guarantees.
     const allowedSynchronous = expectations.allowedSynchronous ?? [1, 2, 3];
     if (!allowedSynchronous.includes(synchronous)) {
         violations.push(

@@ -14,9 +14,6 @@ describe("pruneNestedConfigLeaf", () => {
     });
 
     it("prunes the DEEPEST leaf of a 3-level path, preserving a disabled sibling", () => {
-        // The regression: an invalid memory.git_commit_indexing.since_days must
-        // drop only `since_days`, NOT the whole git_commit_indexing block (which
-        // would lose `enabled: false` and let the default restore enabled: true).
         const block = {
             enabled: true,
             git_commit_indexing: { enabled: false, since_days: 99999 },
@@ -28,15 +25,10 @@ describe("pruneNestedConfigLeaf", () => {
             git_commit_indexing: { enabled: false },
         });
         expect(result?.removed).toBe("git_commit_indexing.since_days");
-        // original deeply untouched (no mutation of nested object)
         expect(block.git_commit_indexing).toEqual({ enabled: false, since_days: 99999 });
     });
 
     it("prunes the owning field when an intermediate segment is not an object", () => {
-        // The path descends into a non-object (here `git_commit_indexing` is a
-        // bare bool, not a block). We can't reach `since_days`, but we prune the
-        // owning field so it falls back to its default — NOT collapse to all
-        // defaults (which dropping to null upstream would cause).
         const block = { git_commit_indexing: true, keep_me: { enabled: false } };
         const result = pruneNestedConfigLeaf(block, ["git_commit_indexing", "since_days"]);
         expect(result).not.toBeNull();
@@ -45,8 +37,6 @@ describe("pruneNestedConfigLeaf", () => {
     });
 
     it("prunes an invalid array-element leaf to its owning field", () => {
-        // system_prompt_injection.skip_signatures[0] invalid → Zod path descends
-        // into the array. Prune skip_signatures (→ default), keep siblings.
         const block = {
             system_prompt_injection: { enabled: true, skip_signatures: [123] },
         };

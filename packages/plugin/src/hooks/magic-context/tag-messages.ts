@@ -102,19 +102,8 @@ function invalidateCachedCandidateToolOwnersIfNewOwner(
 }
 
 /**
- * v3.3.1 Layer C: derive `tool_owner_message_id` for a tool observation.
  *
- * - invocation parts: owner = current message id (the assistant message
- *   hosting the invocation)
- * - result parts: pop the FIFO queue for this callId; if empty, attempt
- *   the persisted-nearest-prior fallback (covers result-only windows
- *   where the invocation has been compacted away); if that fails too,
- *   fall back to the result's own message id (last-resort: ensures owner
- *   is always non-null and tag identity stays stable).
  *
- * The FIFO queue is keyed by callId so two invocations of the same callId
- * across two assistant messages produce two distinct owner ids — that's
- * the whole point of composite identity.
  */
 function deriveToolOwnerMessageId(
     sessionId: string,
@@ -134,15 +123,9 @@ function deriveToolOwnerMessageId(
             unpaired.set(obs.callId, queue);
             return messageId;
         }
-        // Synthetic message id missing — degrade gracefully. Use the
-        // callId itself as owner so the composite key is unique. This
-        // is rare (transcripts where assistant message has no id at
-        // all); the alternative is to drop the tool entirely, which
-        // would break aggregation.
         return obs.callId;
     }
 
-    // Result part — pop FIFO
     const queue = unpaired.get(obs.callId);
     if (queue && queue.length > 0) {
         const popped = queue.shift();
@@ -150,23 +133,8 @@ function deriveToolOwnerMessageId(
         if (popped !== undefined) return popped;
     }
 
-    // Result-only window: invocation was compacted away. Look up the
-    // persisted nearest-prior owner whose time_created precedes the
-    // current result's message.
     //
-    // Two-phase lookup that splits the MC and OC reads:
-    //   1. `getCandidateToolOwners` queries the MC tags table for every
-    //      tag with a non-NULL owner under (sessionId, callId).
-    //   2. `getMessageTimesFromOpenCodeDb` resolves wall-clock times for
-    //      the candidates and the current message via the shared OC
-    //      read-only handle. Returns an empty map when the OC DB can't
-    //      be opened (Pi-only install, missing file).
-    //   3. `pickNearestPriorOwner` selects the most recent candidate
-    //      strictly preceding `messageId` in OC time.
     //
-    // All three steps are fail-soft: any of them returning empty/null
-    // collapses to the `messageId` fallback below, which keeps the
-    // composite key stable even when the OC DB is unavailable.
     if (messageId) {
         const candidates = getCachedCandidateToolOwners(
             db,
@@ -196,7 +164,7 @@ export type MessageInfo = {
     role?: string;
     sessionID?: string;
     summary?: boolean;
-    /** Marks one of the two m[0]/m[1] messages prepended by compartment injection. */
+    /** syntheticHead marks one of the two m[0]/m[1] messages prepended by compartment injection. */
     syntheticHead?: boolean;
     finish?: string;
     error?: unknown;
@@ -222,16 +190,14 @@ export type TagTarget = {
     getContent?: () => string | null;
     drop?: () => ToolDropResult;
     truncate?: () => ToolDropResult;
-    /** Edit-marker compression for an edit/write superseded by a later edit to
-     * the same file: keep the call + filePath + a region hint of the diff,
-     * output → [dropped §N§]. Used by smart-drops. */
+    /** `editMarker` retains a superseded edit/write call, its `filePath`, and a diff-region hint while replacing its output with `[dropped §N§]`.
+     * */
     editMarker?: () => ToolDropResult;
-    /** Non-mutating: would drop()/truncate() actually reclaim bytes? Tool
-     * targets only; absent on message/file targets. */
+    /** `canDrop` reports whether `drop()` or `truncate()` would reclaim bytes without mutating content.
+     * `canDrop` is absent on message and file targets. */
     canDrop?: () => boolean;
-    /** Non-mutating read of the tool invocation's input object (e.g. to read
-     * `ctx_note`'s action or an edit's filePath for supersession selection).
-     * Tool targets only; null when no invocation part is present. */
+    /** `readInput` returns the tool invocation input object without mutating it.
+     * `readInput` returns `null` when no invocation part exists. */
     readInput?: () => Record<string, unknown> | null;
     message?: MessageLike;
 };
@@ -243,9 +209,9 @@ export interface TagMessagesResult {
     toolCallIndex: ToolCallIndex;
     batch: ToolMutationBatch;
     hasRecentReduceCall: boolean;
-    /** Whether recent assistant messages contain git commit hash patterns */
+    /* */
     hasRecentCommit: boolean;
-    /** Exact part references that received a Magic Context tag prefix while tagMessages processed them. */
+    /** The field stores exact part references tagged by tagMessages. */
     normalizationTargets: TagNormalizationTarget[];
 }
 
@@ -284,9 +250,6 @@ function getReasoningByteSize(parts: ThinkingLikePart[]): number {
 }
 
 /**
- * Real-tokenizer mirror of {@link getReasoningByteSize}. Computed once per tag
- * (lazy thunk on fresh insert) and stored on the tag row so token-budget
- * consumers SUM stored counts instead of re-tokenizing raw history every pass.
  */
 function getReasoningTokenCount(parts: ThinkingLikePart[]): number {
     let tokens = 0;
@@ -311,7 +274,7 @@ function estimateInputByteSize(serializedInput: string | null): number {
     return serializedInput?.length ?? 0;
 }
 
-/** Real-tokenizer count for a tool input payload (string or JSON-serializable). */
+/** The field stores the real-tokenizer count for a string or JSON-serializable tool input payload. */
 function estimateInputTokenCount(input: unknown, serializedInput: string | null): number {
     if (input === undefined || input === null) return 0;
     const tokenText = typeof input === "string" ? input : serializedInput;
@@ -319,10 +282,7 @@ function estimateInputTokenCount(input: unknown, serializedInput: string | null)
 }
 
 /**
- * Real-tokenizer count for a text/file part's tag content. Images bill by
- * visual tokens (same heuristic as the sidebar breakdown); plain text tokenizes
- * directly. Mirrors the per-part logic so a tag's token_count matches what the
- * content actually costs on the wire.
+ * Tag token counts use the visual-token heuristic for images and tokenize plain text directly.
  */
 function estimateTextTagTokenCount(text: string): number {
     if (!text) return 0;
@@ -360,15 +320,11 @@ function extractToolTagMetadata(part: unknown): {
 
 export interface TagMessagesOptions {
     /**
-     * When true, skip injecting §N§ prefix into message text/tool output parts.
-     * DB-level tag records are still created normally — this flag only affects
-     * whether the agent-visible part content gets the tag prefix. Used when
-     * the session's tool allow-list denies ctx_reduce so agents don't see tag
-     * markers they can't act on. Cache-safe: the availability verdict is frozen
-     * per session, so message shape stays stable.
+     * Denying `ctx_reduce` suppresses agent-visible tag prefixes because agents cannot act on them.
+     * The session freezes the availability verdict so message shape remains stable.
      */
     skipPrefixInjection?: boolean;
-    /** @internal diagnostic hook used by cache-stability/perf tests. */
+    /* */
     onToolOwnerFallbackLookup?: (lookup: ToolOwnerFallbackLookup) => void;
 }
 
@@ -385,24 +341,17 @@ export function tagMessages(
     const normalizationTargets: TagNormalizationTarget[] = [];
     const reasoningByMessage = new Map<MessageLike, ThinkingLikePart[]>();
     const messageTagNumbers = new Map<MessageLike, number>();
-    // v3.3.1 Layer C: keys are composite `<ownerMsgId>\x00<callId>`,
-    // not bare callId. Two assistant turns reusing the same callId
-    // produce distinct keys → distinct tags → distinct drops.
+    // Keys are composite `<ownerMsgId>\x00<callId>`, not bare `callId`.
+    // Two assistant turns that reuse a callId produce distinct keys when their ownerMsgId values differ.
     const toolTagByCallId = new Map<string, number>();
     const toolThinkingByCallId = new Map<string, ThinkingLikePart[]>();
     const toolCallIndex: ToolCallIndex = new Map();
-    // FIFO queue per callId of unpaired invocations. Result parts pop
-    // from this to find their invocation owner. Cleared at the end of
-    // each pass (function-scoped).
     const unpairedInvocations = new Map<string, string[]>();
     const ownerDerivationCache: ToolOwnerDerivationCache = {
         candidateOwnersByCallId: new Map(),
         messageTimesById: new Map(),
     };
-    // Memo: for each part observed, what owner did we derive? Used by
-    // the second tool-block (isToolPartWithOutput) so it doesn't re-run
-    // FIFO logic and double-pop the queue. Parts are object references
-    // (the same `unknown` instance walked twice in the loop).
+    // The isToolPartWithOutput block reads the cache so it does not run FIFO pairing again.
     const ownerByPartKey = new Map<unknown, { ownerMsgId: string; callId: string }>();
     const batch = new ToolMutationBatch(messages);
     const assignments = tagger.getAssignments(sessionId);
@@ -420,22 +369,15 @@ export function tagMessages(
     const COMMIT_LOOKBACK = 5;
     let commitDetected = false;
 
-    // Intentional: we deliberately do NOT wrap this walk in db.transaction(...).
-    // Each tagger.assignTag() owns its own atomic SAVEPOINT (insert + counter
-    // upsert). Wrapping the whole walk in an outer transaction was an old
-    // cache-bust amplifier — one UNIQUE collision near the end of the walk
-    // would roll back EVERY tag insert + saveSourceContent in this pass,
-    // leaving the in-memory message mutations and §N§ prefixes already
-    // applied while the DB had no record of them. The transform's catch
-    // block then fell through with `targets={}` (empty), and the pass
-    // emitted a message[0] whose stripped/dropped/cavemaned replays were
-    // all skipped, resurfacing ~110k tokens of bulky content.
+    // The tagging pass must not run inside db.transaction(...).
+    // tagger.assignTag() uses a SAVEPOINT to atomically insert the tag and update its counter.
+    // An outer transaction would roll back earlier writes when a later UNIQUE collision occurs.
+    // A late UNIQUE collision would roll back all tag inserts and saveSourceContent calls in the pass.
+    // A rollback would leave in-memory message mutations and §N§ prefixes applied.
     //
-    // Per-call SAVEPOINTs already give us the atomicity we actually need:
-    // each (tag insert, counter upsert, source_contents save) succeeds or
-    // fails independently. A single tag failing no longer corrupts the
-    // surrounding work in the same pass.
-    // Diagnostic accumulators (summed across the whole walk, logged once below).
+    // Each tagger.assignTag() SAVEPOINT isolates that call's database operations.
+    // Each tag insert and counter upsert succeeds or fails independently.
+    // A failed tag operation does not roll back other operations in the pass.
     let accDerive = 0;
     let accGetToolTag = 0;
     let accAssignTag = 0;
@@ -467,11 +409,10 @@ export function tagMessages(
 
             const toolObservation = extractToolCallObservation(part);
             if (toolObservation) {
-                // v3.3.1 Layer C: derive composite owner via FIFO pairing.
-                // - invocation parts: ownerMsgId = message hosting the part.
-                // - result parts: pop the FIFO queue for this callId; if
-                //   empty, fall back to nearest-prior persisted owner;
-                //   ultimate fallback: result's own message id.
+                // Invocation parts use their hosting message ID when it is nonempty; otherwise they use callId.
+                // Result parts pop the FIFO queue for callId when that queue is nonempty.
+                // When the FIFO queue is empty and the result has a message ID, result parts use the nearest prior persisted owner.
+                // When no persisted owner exists and the result has a message ID, result parts use that message ID.
                 const _tDerive = performance.now();
                 const ownerMsgId = deriveToolOwnerMessageId(
                     sessionId,
@@ -489,10 +430,10 @@ export function tagMessages(
                     hasResult: false,
                 };
                 entry.occurrences.push({ message, part, kind: toolObservation.kind });
-                // An OpenCode `{ type: "tool" }` part is observed as a "result" by
-                // its TYPE even while the call is still pending/running, so gate
-                // hasResult on an ACTUAL completed result (state.output present).
-                // This keeps open arcs out of every drop/clamp selector — a live
+                // OpenCode `{ type: "tool" }` parts have type `"tool"` even while their calls are pending or running.
+                // Pending and running OpenCode tool parts are not completed results.
+                // hasResult requires state.output to be present.
+                // Reclaim selectors exclude open arcs so live task inputs cannot become reclaim targets.
                 // task part's input must never become a reclaim target.
                 if (toolObservation.kind === "result" && partHasCompletedResult(part))
                     entry.hasResult = true;
@@ -506,17 +447,7 @@ export function tagMessages(
                 );
                 accGetToolTag += performance.now() - _tGetTool;
 
-                // v3.3.1 Layer C: legacy NULL-owner adoption for the
-                // invocation-only path. The second tool block
-                // (isToolPartWithOutput) calls assignToolTag which
-                // adopts NULL-owner rows automatically — but invocation
-                // observations don't pass through that block. Without
-                // this lazy adoption, an invocation-only message with a
-                // pre-existing NULL-owner tag would never bind into
-                // `targets`, so a queued drop op against that tag could
-                // not be detected as "incomplete" (no result) and would
-                // fall through to the "absent" branch in
-                // applyPendingOperations, marking the tag dropped
+                // The invocation-only path adopts legacy NULL owners.
                 // prematurely.
                 if (existingTagId === undefined) {
                     const orphan = getNullOwnerToolTag(db, sessionId, toolObservation.callId);
@@ -537,7 +468,6 @@ export function tagMessages(
                             );
                             existingTagId = orphan.tagNumber;
                         } else {
-                            // Race lost — re-check composite path.
                             existingTagId = tagger.getToolTag(
                                 sessionId,
                                 toolObservation.callId,
@@ -547,17 +477,6 @@ export function tagMessages(
                     }
                 }
 
-                // Scoped-load self-heal for the invocation-only path: a tool tag
-                // can exist in the DB under its exact composite (owner, callId)
-                // key yet be absent from the in-memory map when the tagger load
-                // was scoped to the live-wire floor and this tag's number is below
-                // it (a tool RESULT in the wire whose invocation was compacted away
-                // resolves to a persisted owner below the floor — tag-messages
-                // pickNearestPriorOwner). The output-bearing path (assignToolTag)
-                // already does this composite DB lookup; the invocation/native
-                // tool_result observation path did not. Without it, the existing
-                // tag would be missed and a queued drop mis-detected. Rebind the
-                // EXACT persisted number so §N§ stays byte-identical.
                 if (existingTagId === undefined) {
                     const persisted = getToolTagNumberByOwner(
                         db,
@@ -597,9 +516,6 @@ export function tagMessages(
                 const textPart = part;
                 const thinkingParts = messageThinkingParts;
                 const contentId = `${messageId}:p${partIndex}`;
-                // Resolver pre-warms any tag-id-fallback bindings (e.g. when
-                // OpenCode re-assigns part IDs); the assigned tag below uses
-                // those bindings if the resolver populated them.
                 resolver.resolve(messageId, "message", contentId, textOrdinal);
                 const reasoningBytes = textOrdinal === 0 ? getReasoningByteSize(thinkingParts) : 0;
                 const reasoningTokens =
@@ -615,8 +531,6 @@ export function tagMessages(
                     null,
                     0,
                     null,
-                    // Lazy: only fires on fresh insert. textPart.text is still the
-                    // pre-prefix source here (prependTag runs after assign).
                     () => ({
                         tokenCount: estimateTextTagTokenCount(stripTagPrefix(textPart.text)),
                         inputTokenCount: null,
@@ -624,13 +538,6 @@ export function tagMessages(
                     }),
                 );
                 accAssignTag += performance.now() - _tAssignText;
-                // Prefer persisted source_contents over the existingTagId
-                // signal: even if we just allocated a fresh tag (because in-
-                // memory state was lost), the DB may still have the original
-                // pre-tag content from a previous pass. Restoring from source
-                // is the only way to keep message content stable across passes
-                // when assignTag's recovery rebound a different tag number
-                // than what the resolver expected.
                 const persistedSource = sourceContents.get(tagId);
                 if (persistedSource !== undefined) {
                     textPart.text = persistedSource;
@@ -680,28 +587,14 @@ export function tagMessages(
                 const { toolName, inputByteSize, inputTokenCount } =
                     extractToolTagMetadata(toolPart);
 
-                // v3.3.1 Layer C: derive owner from the FIFO memo set
-                // earlier in this same loop iteration. The first tool
-                // block (extractToolCallObservation) already paired this
-                // part — reuse that owner so we don't double-pop the
-                // queue (which would shift result-pairing for later
-                // result parts of the same callId).
+                // The memoized owner prevents a second dequeue for the same part.
+                // extractToolCallObservation already assigned an owner for this part.
+                // Reusing the memoized owner prevents a second dequeue and preserves later result pairing for the same callId.
                 const memo = ownerByPartKey.get(part);
                 const ownerMsgId = memo?.ownerMsgId ?? messageId ?? toolPart.callID;
                 const compositeKey = makeToolCompositeKey(ownerMsgId, toolPart.callID);
 
                 const _tAssignTool = performance.now();
-                // No growth-bump on the existing-tag path here (unlike Pi's
-                // tag-transcript, which bumps byte_size/token_count when a later
-                // occurrence is larger). The asymmetry is structural: OpenCode
-                // only tags once `state.output` is a string — i.e. after the tool
-                // completed — and OpenCode writes tool output exactly once, so a
-                // tagged output never grows afterwards. Pi tags the INVOCATION
-                // occurrence first (byte_size=0) and must bump when the result
-                // lands. Verified empirically: 100,670 tool tags across the two
-                // largest live sessions show zero byte_size drift vs the current
-                // opencode.db output. Adding a per-part size compare here would
-                // cost every hot pass to defend an unreachable case.
                 const tagId = tagger.assignToolTag(
                     sessionId,
                     toolPart.callID,
@@ -711,8 +604,6 @@ export function tagMessages(
                     reasoningBytes,
                     toolName,
                     inputByteSize,
-                    // Lazy: fires only on fresh insert. token_count = output tokens
-                    // (mirrors byte_size=output); input/reasoning stored separately.
                     () => ({
                         tokenCount: estimateTextTagTokenCount(
                             stripTagPrefix(toolPart.state.output),
@@ -806,7 +697,6 @@ export function tagMessages(
             precedingThinkingParts = messageThinkingParts;
         }
 
-        // Detect commit hashes in recent assistant text (last COMMIT_LOOKBACK messages)
         if (
             !commitDetected &&
             message.info.role === "assistant" &&

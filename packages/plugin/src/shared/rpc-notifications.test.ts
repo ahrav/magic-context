@@ -25,7 +25,6 @@ describe("rpc notifications", () => {
     });
 
     test("scopes drain to the requesting session; other sessions' items survive", () => {
-        // drain everything left from prior tests
         drainNotifications(Number.MAX_SAFE_INTEGER);
 
         pushNotification("for-a", { action: "show-upgrade-dialog" }, "ses_A");
@@ -52,19 +51,17 @@ describe("rpc notifications", () => {
     });
 
     test("isTuiConnected reflects live WS sinks per-session", () => {
-        // No sinks → nothing connected.
+        // isTuiConnected returns false for every session and globally when no sinks are registered.
         expect(isTuiConnected("ses_anything")).toBe(false);
         expect(isTuiConnected()).toBe(false);
 
-        // A live sink scoped to session A marks ONLY A connected (so B's producers
-        // don't misroute B's /ctx-status / upgrade reminder to the dialog path and
-        // lose it in an unrelated TUI), and the global query is also "connected".
+        // A live sink for session A makes isTuiConnected true only for session A and globally.
         const unregister = registerNotificationSink({ sessionId: "ses_A", send: () => {} });
         expect(isTuiConnected("ses_A")).toBe(true);
         expect(isTuiConnected("ses_B")).toBe(false);
         expect(isTuiConnected()).toBe(true);
 
-        // Closing the socket removes the sink → disconnected again.
+        // Unregistering the sink makes isTuiConnected return false for session A and globally.
         unregister();
         expect(isTuiConnected("ses_A")).toBe(false);
         expect(isTuiConnected()).toBe(false);
@@ -123,7 +120,7 @@ describe("rpc notifications", () => {
             sessionId: undefined,
             send: (n) => live.push(n.type),
         });
-        // Must not throw, and the live sink still receives it.
+        // pushNotification must not throw, and the live sink must receive the notification.
         expect(() => pushNotification("resilient", { ok: true })).not.toThrow();
         expect(live).toEqual(["resilient"]);
         unregDead();

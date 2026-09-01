@@ -150,8 +150,8 @@ async function waitForExistingIncrementalRun(
     if (active.kind === "recomp" || active.kind === "wrapup") return "busy";
     const outcome = await waitForActiveRunWithin(active.promise, maxWaitMs);
     if (outcome === "timeout") return "timeout";
-    // The active runner records its own failure state; wrapup just resumes from
-    // the durable compartment boundary after it settles.
+    // The active runner records its own failure state.
+    // Wrapup resumes from the durable compartment boundary after the active runner settles.
     return "ok";
 }
 
@@ -208,7 +208,7 @@ async function runOneWrapupIteration(args: {
                 sessionLog(sessionId, "wrapup: compartment lease renewal failed");
             }
         } catch (err) {
-            // A missed renewal is safe because the compartment lease has a five-minute TTL.
+            // The lease remains valid for five minutes after its last renewal.
             sessionLog(
                 sessionId,
                 `wrapup: compartment lease renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
@@ -231,18 +231,13 @@ async function runOneWrapupIteration(args: {
         historianTwoPass: ctx.historianTwoPass,
         memoryEnabled: ctx.memoryEnabled,
         autoPromote: ctx.autoPromote,
-        // User-memory collection is forwarded on the same gate as every other
-        // historian surface: wrapup chunks persist user observations exactly when
-        // the scheduled review-user-memories task enables collection. Dropping the
-        // flag here silently suppressed observations that the module lane persists.
         experimentalUserMemories: ctx.userMemoriesEnabled,
         ensureProjectRegistered: ctx.ensureProjectRegistered,
         getNotificationParams: () => ctx.getNotificationParams(sessionId),
         preserveInjectionCacheUntilConsumed: true,
         compartmentLeaseHolderId: leaseHolderId,
         forceDrainQuota: true,
-        // Wrapup wants coverage on the actual final chunk. The runner downgrades
-        // this hint whenever readSessionChunk reports more raw history remains.
+        // Wrapup requests coverage for the final chunk.
         forceKeepLastCompartment: true,
         refreshBoundarySnapshot: () =>
             buildPlan(ctx, sessionId, messagesToKeep, anchorRawMessageCount).snapshot,
@@ -340,7 +335,7 @@ export async function runManagedWrapup(
                 chunkIndex,
             });
         } catch (err) {
-            // A missed renewal is safe because the wrapup marker has a five-minute TTL.
+            // The wrapup marker remains valid for five minutes after its last renewal.
             sessionLog(
                 sessionId,
                 `wrapup: marker renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
@@ -365,13 +360,12 @@ export async function runManagedWrapup(
             stoppedReason = "Timed out waiting for the active historian run.";
         }
 
-        // The command blocks until the drain finishes and fires no message events,
-        // so nothing would indicate the run until completion. Two best-effort
-        // surfaces, neither may affect the drain:
-        //  - sendIgnoredMessage: TUI gets a toast; Desktop/headless gets a
-        //    persisted ignored chat message (its only progress surface).
-        //  - wrapup-progress-kick: starts the TUI sidebar's fast progress poll
-        //    (the toast above cannot do that).
+        // The command blocks until the drain finishes and emits no message events.
+        // Neither notification surface may affect the drain.
+        // Neither notification surface may affect the drain.
+        // `sendIgnoredMessage` gives TUI a toast and Desktop/headless a persisted ignored chat message.
+        // `sendIgnoredMessage` gives Desktop/headless a persisted ignored chat message.
+        // `wrapup-progress-kick` starts the TUI sidebar's fast progress poll; `sendIgnoredMessage` does not.
         if (!stoppedForFailure) {
             try {
                 void sendIgnoredMessage(
@@ -385,9 +379,7 @@ export async function runManagedWrapup(
             }
             try {
                 pushNotification("action", { action: "wrapup-progress-kick" }, sessionId);
-            } catch {
-                // Notification delivery must never affect the drain.
-            }
+            } catch {}
         }
 
         if (!stoppedForFailure && ownershipLost) {
@@ -516,9 +508,7 @@ export async function runManagedWrapup(
 
     try {
         clearEmergencyRecovery(ctx.db, sessionId);
-    } catch {
-        // Best-effort: normal historian recovery disarm remains the backstop.
-    }
+    } catch {}
     const base = `Wrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
     const message = appendFlushHint(ctx, sessionId, base);
     setRecompTerminal(ctx.liveSessionState, sessionId, "done", message);

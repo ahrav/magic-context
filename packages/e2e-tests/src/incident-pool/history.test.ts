@@ -451,8 +451,6 @@ describe("incident history cross-checks", () => {
 
     it("rejects a variant claim that is not linked to its own family", () => {
         const data = fixture();
-        // claim-red-one still exists, but no longer belongs to the family that
-        // encloses the variant claiming it.
         (
             data.catalog.families as Record<string, unknown>[]
         )[0]!.source_claims = ["claim-green-one"];
@@ -521,8 +519,6 @@ describe("repository-baseline comparison", () => {
     });
 
     it("rejects deleting accepted inventory and catalog rows", () => {
-        // Event-free rows isolate the row-deletion guards; deleting an
-        // executable variant would trip the ledger-prefix guard first.
         const acceptedData = fixture();
         claims(acceptedData).push({
             id: "claim-info-one",

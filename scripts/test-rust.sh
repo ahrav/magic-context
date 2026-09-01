@@ -1,8 +1,6 @@
 #!/usr/bin/env sh
-# Rust suite entry point. nextest is preferred for execution speed but is not
-# part of the standard toolchain, so a clean checkout falls back to cargo
-# test. nextest does not run doctests; its branch runs them separately, while
-# plain cargo test already includes them.
+# cargo nextest run does not run doctests, so run cargo test --doc after it.
+# cargo test --workspace runs doctests.
 set -e
 
 if cargo nextest --version >/dev/null 2>&1; then

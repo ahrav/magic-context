@@ -26,9 +26,7 @@ afterEach(() => {
     for (const dir of tempDirs) {
         try {
             chmodSync(dir, 0o755);
-        } catch {
-            // Ignore cleanup permission restoration failures.
-        }
+        } catch {}
         rmSync(dir, { recursive: true, force: true });
     }
     tempDirs.length = 0;
@@ -47,9 +45,7 @@ function makeRepoWithGitMetadata(prefix: string): string {
 }
 
 function returningRootCommit(rootCommit: string): typeof execFileSync {
-    // Keep the real `.git` walk on disk, but route git output through the test
-    // seam. Under heavy machine load, launching git can stall while the
-    // operating system assesses the binary, which makes direct calls flaky.
+    // The test hook supplies deterministic git output while `.git` remains on disk.
     return (() => `${rootCommit}\n`) as typeof execFileSync;
 }
 
@@ -303,13 +299,10 @@ describe("project identity", () => {
     });
 
     it("storedPathBelongsToIdentity matches on exact identity and on normalized raw path", () => {
-        // Exact stored-identity match.
         expect(storedPathBelongsToIdentity("git:abc123", "git:abc123")).toBe(true);
         expect(storedPathBelongsToIdentity("dir:deadbeef", "dir:deadbeef")).toBe(true);
         // Mismatched identity.
         expect(storedPathBelongsToIdentity("git:abc123", "git:other")).toBe(false);
-        // Raw filesystem paths stored before normalization must still match the
-        // identity they normalize to.
         const directory = makeTempDir("project-identity-belongs-");
         const identity = expectedDirIdentity(directory);
         expect(storedPathBelongsToIdentity(directory, identity)).toBe(true);

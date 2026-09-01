@@ -1,24 +1,20 @@
 /**
- * Verbose / by-id rendering for ctx_expand.
+ * `renderVerboseRange` and `renderMessageById` provide ctx_expand's verbose and by-id views.
  *
- * The default ctx_expand range view returns a CONDENSED digest (turns merged,
- * tool calls collapsed to `TC: name(arg)`). These two renderers add the recovery
+ * `ctx_expand`'s default range view merges turns and renders tool calls as `TC: name(arg)`.
  * modes:
  *
- *   - `renderVerboseRange`: every message shown SEPARATELY with its message id
- *     and a per-part preview, so the agent can see exactly what's in a range and
- *     pick the id of a specific message/tool call to recover in full.
- *   - `renderMessageById`: the FULL untruncated content of one message (any
- *     role) — every text part, and every tool call's complete input + output —
- *     read straight from the harness's stored history (opencode.db / Pi JSONL).
- *     This is the cheap way back from a `ctx_reduce` drop: the wire placeholder
- *     is `[dropped §N§]`, but the original output still lives in storage until
- *     the row is genuinely deleted (session prune/revert), in which case we say
- *     so rather than re-running the tool (which could now give a different
+ * `renderVerboseRange` renders each message separately with its id and a per-part preview.
+ * `renderMessageById` uses a message or tool-call id to recover the matching message in full.
+ * `renderMessageById` returns every text part and complete tool input and output for one message.
+ * `renderMessageById` reads the message from stored OpenCode or Pi history.
+ * `renderMessageById` recovers output dropped by `ctx_reduce` from stored history.
+ * `ctx_reduce` represents dropped output as `[dropped §N§]`.
+ * `renderMessageById` cannot recover content after session prune or revert deletes its stored row.
+ * `renderMessageById` does not rerun missing tool calls because rerunning can change their output.
  *     answer).
  *
- * Both read through the shared provider-aware helpers, so Pi works by registering
- * its `RawMessageProvider` for the call exactly like the range view does.
+ * Pi supplies raw messages through `RawMessageProvider`.
  */
 
 import { readRawSessionMessages } from "../../hooks/magic-context/read-session-chunk";
@@ -40,7 +36,7 @@ function truncate(value: string, max: number): string {
     return t.length <= max ? t : `${t.slice(0, max)}…`;
 }
 
-/** Best-effort one-line argument descriptor for a tool input, harness-agnostic. */
+/* */
 function keyArg(input: Record<string, unknown> | null | undefined): string {
     if (!input) return "";
     for (const k of ["filePath", "path", "pattern", "query", "symbol", "module", "action"]) {
@@ -52,10 +48,8 @@ function keyArg(input: Record<string, unknown> | null | undefined): string {
 }
 
 /**
- * Normalize the several tool-part shapes into { name, callId, input, output }.
- * Handles OpenCode (`{type:"tool", tool, callID, state:{input,output}}`), the
- * Anthropic invocation/result split (`tool_use` / `tool_result`), and Pi's
- * tool parts. Returns null for non-tool parts.
+ * `asToolPart` handles OpenCode's merged `tool` parts.
+ * `asToolPart` handles Anthropic `tool_use` and `tool_result` parts and Pi tool parts.
  */
 function asToolPart(part: Record<string, unknown>): {
     name: string;
@@ -66,7 +60,6 @@ function asToolPart(part: Record<string, unknown>): {
 } | null {
     const type = typeof part.type === "string" ? part.type : "";
 
-    // OpenCode merged tool part: { type:"tool", tool, callID, state:{input,output,title} }
     if (type === "tool") {
         const state = isRecord(part.state) ? part.state : null;
         const output =
@@ -89,7 +82,6 @@ function asToolPart(part: Record<string, unknown>): {
         };
     }
 
-    // Anthropic invocation half: { type:"tool_use", name, id, input }
     if (type === "tool_use") {
         return {
             name: typeof part.name === "string" ? part.name : "tool",
@@ -100,7 +92,6 @@ function asToolPart(part: Record<string, unknown>): {
         };
     }
 
-    // Anthropic / Pi result half: { type:"tool_result", tool_use_id, content }
     if (type === "tool_result") {
         const content = part.content;
         const output =
@@ -133,7 +124,7 @@ function reasoningOf(part: Record<string, unknown>): string | null {
     return null;
 }
 
-/** One per-part PREVIEW line for the verbose range view (bounded). */
+/* */
 function renderPartPreview(part: unknown): string | null {
     if (!isRecord(part)) return null;
     const text = textOf(part);
@@ -158,11 +149,7 @@ function renderPartPreview(part: unknown): string | null {
 }
 
 /**
- * One per-part FULL render for by-ordinal recovery (untruncated). Returns null
- * for NOISE parts — `step-start` / `step-finish` (and their token/cost metadata
- * blob), reasoning, and unknown structural shapes carry nothing worth recovering.
- * The recovery view is the data: tool input + output (+ a description line when
- * the tool carries one), and the text of non-tool messages.
+ * `renderPartFull` includes tool input, tool output, optional descriptions, and non-tool text.
  */
 function renderPartFull(part: unknown): string | null {
     if (!isRecord(part)) return null;
@@ -194,16 +181,12 @@ function renderPartFull(part: unknown): string | null {
         return `  [file]${name ? ` ${name}` : ""}`;
     }
 
-    // step-start, step-finish (token/cost metadata), reasoning, and any other
-    // structural part: noise for recovery — skip.
+    // `renderPartFull` skips `step-start`, `step-finish`, and reasoning parts; it returns `null` for other unsupported part types.
     return null;
 }
 
 /**
- * Full untruncated recovery of one message by its ORDINAL — the same `[N]`
- * identifier the agent already uses everywhere (compartment start/end, ctx_search
- * hits, the verbose range view). Returns a "deleted" message when no message sits
- * at that ordinal (pruned/reverted or wrong ordinal).
+ * `renderMessageById` returns the untruncated message selected by its `[N]` ordinal.
  */
 export function renderMessageByOrdinal(sessionId: string, ordinal: number): string {
     const msg = readRawSessionMessages(sessionId).find((m: RawMessage) => m.ordinal === ordinal);
@@ -227,16 +210,13 @@ export function renderMessageByOrdinal(sessionId: string, ordinal: number): stri
 
 export interface VerboseRangeResult {
     text: string;
-    /** Last ordinal actually rendered (for the continuation hint). */
+    /* */
     lastOrdinal: number;
-    /** True when the budget cut the range short. */
+    /* */
     truncated: boolean;
 }
 
 /**
- * Verbose range view: every message in [start, end] shown separately, with its
- * id and a per-part preview, bounded by `tokenBudget`. The agent reads the ids
- * here and recovers any one message in full with ctx_expand(id=...).
  */
 export function renderVerboseRange(
     sessionId: string,

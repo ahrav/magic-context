@@ -1,10 +1,6 @@
-//! Host-owned three-message authentication handshake.
-
 use std::{error::Error, fmt, future::Future, io, time::Duration};
 
-use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -13,14 +9,11 @@ use tokio::{
 
 use crate::connection_file::{ConnectionInfo, DAEMON_ID_LEN, MIN_KEY_LEN};
 
-pub const NONCE_LEN: usize = 32;
-pub const PROOF_LEN: usize = 32;
-pub const MAX_AUTH_MESSAGE_LEN: u32 = 4096;
-pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
-pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
-pub const DEFAULT_CLIENT_ROLE: &str = "client";
+pub use mc_shm_transport::setup_auth::{
+    CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+};
 
-type HmacSha256 = Hmac<Sha256>;
+pub const MAX_AUTH_MESSAGE_LEN: u32 = mc_shm_transport::setup_auth::MAX_AUTH_MESSAGE_LEN as u32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -36,10 +29,7 @@ pub struct ServerProof {
     pub server_proof: [u8; PROOF_LEN],
 }
 
-// V24 classifies proof bytes as sensitive diagnostics. A derived `Debug` prints
-// the whole HMAC, so one routine `{:?}` in an error path or panic message
-// persists a live authentication transcript secret. The nonces and daemon ID stay
-// visible: both travel in the clear and are what makes a transcript identifiable
+// A derived `Debug` exposes the HMAC in error and panic output.
 // while debugging.
 impl fmt::Debug for ServerProof {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,8 +47,7 @@ pub struct ClientAuth {
     pub client_auth: [u8; PROOF_LEN],
 }
 
-/// Redacted for the same reason as [`ServerProof`]; this struct is nothing but
-/// the proof, so there is no non-secret field to keep.
+/// `Debug` redacts the proof to keep it out of error and panic output.
 impl fmt::Debug for ClientAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientAuth")
@@ -67,18 +56,12 @@ impl fmt::Debug for ClientAuth {
     }
 }
 
-/// The outcome of a successful handshake.
 ///
-/// WHAT THIS PROVES: the peer possesses the connection key, and (client side)
-/// that the daemon does too. Nothing more.
 ///
-/// Deliberately empty: everything else in the handshake transcript is
-/// client-asserted and unverified. `ClientHello.role` in particular is parsed
-/// and then discarded — any peer holding the key can claim any role, so it
-/// must never decide admission, capacity, or privilege. A type called
-/// `Authenticated` invites reading its fields as attested, and only key
-/// possession is. Module identity, which IS attested, travels a different
-/// path entirely (spawn nonces validated at route.open).
+/// `ClientHello.role` is client-asserted and unverified.
+/// `ClientHello.role` is discarded because any peer holding the key can claim any role.
+/// `ClientHello.role` must not decide admission, capacity, or privilege.
+/// `Authenticated` attests only connection-key possession.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated;
 
@@ -117,8 +100,7 @@ pub enum AuthError {
         stage: AuthStage,
         source: serde_json::Error,
     },
-    /// The configured total is not representable as an absolute deadline, so no
-    /// handshake can be attempted against it.
+    /// `InvalidDeadline` reports a total that cannot form an absolute deadline.
     InvalidDeadline {
         total: Duration,
     },
@@ -129,8 +111,7 @@ pub enum AuthError {
     },
     InvalidServerProof,
     DaemonIdMismatch,
-    /// The peer authenticated a `daemon_ver` other than the one in the
-    /// connection-file snapshot, so the discovered identity is inconsistent.
+    /// `DaemonVerMismatch` reports a `daemon_ver` that differs from the connection-file snapshot.
     DaemonVerMismatch,
     InvalidClientAuth,
 }
@@ -143,24 +124,19 @@ pub fn compute_proof(
     daemon_ver: &str,
     daemon_id: &[u8],
 ) -> [u8; PROOF_LEN] {
-    let daemon_ver_bytes = daemon_ver.as_bytes();
-    let daemon_ver_len =
-        u32::try_from(daemon_ver_bytes.len()).expect("auth messages bound daemon_ver to u32");
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
-    mac.update(domain.as_bytes());
-    mac.update(client_nonce);
-    mac.update(server_nonce);
-    mac.update(&daemon_ver_len.to_be_bytes());
-    mac.update(daemon_ver_bytes);
-    mac.update(daemon_id);
-    mac.finalize().into_bytes().into()
+    mc_shm_transport::setup_auth::compute_proof(
+        key,
+        domain,
+        client_nonce,
+        server_nonce,
+        daemon_ver,
+        daemon_id,
+    )
 }
 
-/// An absolute handshake deadline. Every per-stage read/write recomputes the time
-/// remaining until `at`, so the WHOLE handshake (length byte + body, across all
-/// stages, plus error teardown) is bounded by a single wall-clock budget. Passing
-/// a bare `Duration` to each step instead would let a slow peer spend the full
-/// budget on every length read AND every body read — multiplying the real bound.
+/// Each read and write uses the time remaining until `at`, so all stages share one deadline.
+/// All reads, writes, and teardown share the absolute deadline `at`.
+/// Per-step durations would let a slow peer consume the full budget for each length and body read.
 #[derive(Clone, Copy)]
 struct Deadline {
     at: time::Instant,
@@ -168,10 +144,7 @@ struct Deadline {
 }
 
 impl Deadline {
-    /// Fallible because the total is operator configuration: `Instant +
-    /// Duration` panics when the sum is unrepresentable, and a `Duration::MAX`
-    /// auth deadline would take down the connection task rather than reporting
-    /// a bad setting.
+    /// `Instant::checked_add` returns `InvalidDeadline` for an unrepresentable deadline instead of panicking.
     fn starting_now(total: Duration) -> Result<Self, AuthError> {
         let at = time::Instant::now()
             .checked_add(total)
@@ -179,7 +152,7 @@ impl Deadline {
         Ok(Self { at, total })
     }
 
-    /// Time left until the deadline, or `Timeout` if it has already elapsed.
+    /// `Deadline::remaining` returns the time until the deadline or `Timeout` after it elapses.
     fn remaining(&self, stage: AuthStage) -> Result<Duration, AuthError> {
         let remaining = self.at.saturating_duration_since(time::Instant::now());
         if remaining.is_zero() {
@@ -192,22 +165,15 @@ impl Deadline {
         }
     }
 
-    /// Time left until the deadline, clamped to zero — for best-effort teardown
-    /// that must not outlive the handshake budget.
+    /// An elapsed deadline yields zero time for teardown so teardown cannot outlive the handshake budget.
     fn remaining_or_zero(&self) -> Duration {
         self.at.saturating_duration_since(time::Instant::now())
     }
 }
 
-/// Error-path teardown for either handshake side.
 ///
-/// Bounded by the SAME absolute deadline as the handshake itself, so a failed
-/// attempt — and the unauthenticated-handshake slot it holds — is released
-/// promptly instead of waiting out another full budget.
+/// Teardown shares the handshake deadline, so it cannot extend the handshake budget.
 ///
-/// The policy lives here rather than in both wrappers: the surrounding four lines
-/// of scaffolding are shape, but *how* a failed handshake tears down is the part
-/// that must not diverge between server and client.
 async fn teardown_failed_handshake<S>(stream: &mut S, deadline: Deadline)
 where
     S: AsyncWrite + Unpin,
@@ -343,10 +309,9 @@ where
     if server_proof.daemon_id != conn.daemon_id {
         return Err(AuthError::DaemonIdMismatch);
     }
-    // Wire protocol §5.2: the client MUST require `ServerProof.daemon_ver` to
-    // equal the connection-file `daemon_ver`, and MUST emit no `ClientAuth`
-    // until all three checks succeed. The proof authenticates `daemon_ver`;
-    // this comparison also binds it to the discovery snapshot used to dial.
+    // `ServerProof.daemon_ver` must match the connection-file snapshot.
+    // The client emits `ClientAuth` only after validating the server proof, `daemon_id`, and `daemon_ver`.
+    // Comparing `server_proof.daemon_ver` with `conn.daemon_ver` binds the authenticated version to the connection metadata used to dial.
     if server_proof.daemon_ver != conn.daemon_ver {
         return Err(AuthError::DaemonVerMismatch);
     }
@@ -387,25 +352,9 @@ fn random_nonce() -> Result<[u8; NONCE_LEN], AuthError> {
     Ok(nonce)
 }
 
-/// Both directions of this comparison are fenced, verified by mutation rather than
-/// assumed, because a proof check has the failure mode where a suite proves only
-/// that it can say NO.
 ///
-/// ALWAYS-FALSE (no proof ever verifies, every connection in the fleet refused) is
-/// caught by the handshake integration tests and by two bootstrap tests -- named
-/// for key rotation and singleton probing, so this is coverage carried by tests
-/// about something else. Narrowing either would remove it silently.
 ///
-/// ALWAYS-TRUE is caught by `foreign_server_reused_port_never_receives_client_auth`
-/// -- the case where a client must refuse a server that cannot produce the proof.
-/// Named for the refusal, and it holds that direction directly.
 ///
-/// The construction feeding it is pinned separately by
-/// `committed_wire_vectors_pin_the_proof_construction`, which reddens for a constant
-/// proof AND for one that folds only part of its input -- the second matters because
-/// a partial-input proof still produces different outputs for different inputs, so
-/// any distinctness assertion passes it while a proof minted against one daemon
-/// verifies against another.
 fn constant_time_eq(expected: &[u8; PROOF_LEN], actual: &[u8; PROOF_LEN]) -> bool {
     expected.as_slice().ct_eq(actual.as_slice()).into()
 }
@@ -419,8 +368,7 @@ where
     S: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
-    // Both the length read and the body read recompute the time remaining against
-    // the same absolute deadline, so the two together cannot exceed the budget.
+    // Both reads use the same absolute deadline, so their combined duration cannot exceed the budget.
     let mut len_bytes = [0u8; 4];
     read_exact_deadline(stream, &mut len_bytes, stage, deadline).await?;
     let len = u32::from_le_bytes(len_bytes);
@@ -641,9 +589,6 @@ mod tests {
 
     #[test]
     fn proof_debug_output_never_carries_the_proof_bytes() {
-        // V24 classifies proof bytes as sensitive diagnostics. A derived `Debug`
-        // prints the whole HMAC, so one `{:?}` in an error path or panic message
-        // persists a live authentication transcript secret.
         let sentinel = 0xAB;
         let server = ServerProof {
             daemon_id: [1; DAEMON_ID_LEN],
@@ -658,7 +603,6 @@ mod tests {
             "server_proof bytes leaked into Debug: {rendered}"
         );
         assert!(rendered.contains("[redacted]"), "{rendered}");
-        // The identifying, non-secret fields stay debuggable.
         assert!(rendered.contains("1.2.3"), "{rendered}");
         assert!(rendered.contains("server_nonce"), "{rendered}");
 
@@ -675,8 +619,7 @@ mod tests {
 
     #[test]
     fn an_unrepresentable_auth_deadline_is_rejected_not_panicked() {
-        // The total is operator configuration, so `Duration::MAX` must report a
-        // bad setting rather than panic inside the connection task.
+        // `Deadline::starting_now` returns `InvalidDeadline` when the configured duration is unrepresentable instead of panicking.
         let error = Deadline::starting_now(Duration::MAX)
             .err()
             .expect("an unrepresentable total has no absolute deadline");
@@ -695,12 +638,6 @@ mod tests {
     const TEST_DAEMON_VER: &str = "mc-host-auth-test-1";
     const TEST_ROLE: &str = "client";
 
-    /// The TypeScript client asserts its handshake against the same fixed
-    /// vectors (`packages/plugin/src/shared/mc-host-client/auth.test.ts`), so
-    /// they form a cross-language contract: changing the domain separator,
-    /// the field order, or the MAC breaks the build here, where the change is
-    /// being made, instead of surfacing as a handshake failure against a peer
-    /// that has not been rebuilt.
     #[test]
     fn committed_wire_vectors_pin_the_proof_construction() {
         let key: Vec<u8> = (0x00..0x20).collect();
@@ -770,9 +707,7 @@ mod tests {
         serde_json::from_slice(&body).expect("decode auth json")
     }
 
-    /// Write only the 4-byte length prefix of an auth message, withholding
-    /// the body — stalls the peer mid-message so the within-stage deadline
-    /// can be exercised.
+    /// The test peer writes only the 4-byte length prefix and withholds the body to stall the peer within the stage deadline.
     async fn write_auth_len_only<T>(stream: &mut DuplexStream, value: &T)
     where
         T: Serialize,
@@ -834,10 +769,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn server_deadline_spans_length_and_body_within_one_stage() {
-        // The bug this guards: applying the timeout independently to the
-        // length read and the body read lets a single stage consume ~2x the
-        // budget. Here the client sends the ClientHello length prefix late,
-        // then withholds the body until the absolute deadline has passed.
         let key = vec![0x5a; MIN_KEY_LEN];
         let daemon_id = [0x6b; DAEMON_ID_LEN];
         let deadline = Duration::from_millis(100);
@@ -860,7 +791,7 @@ mod tests {
         yield_now().await;
         assert!(!server_task.is_finished());
 
-        // Cross the absolute deadline (60 + 50 > 100) without sending the body.
+        // The test peer exceeds the 100-unit absolute deadline by waiting 60 + 50 units before sending the body.
         advance(Duration::from_millis(50)).await;
         yield_now().await;
         assert!(
@@ -880,8 +811,6 @@ mod tests {
         ));
     }
 
-    /// Drives one full handshake against `authenticate_server` and returns
-    /// the server's `ServerProof` message.
     async fn complete_handshake(key: &[u8], daemon_id: [u8; DAEMON_ID_LEN]) -> ServerProof {
         let (mut client, mut server) = duplex(4096);
         let key_owned = key.to_vec();
@@ -1076,10 +1005,7 @@ mod tests {
         let conn = ConnectionInfo {
             schema: crate::connection_file::SCHEMA_VERSION,
             wire_version: crate::wire::PROTOCOL_VERSION,
-            endpoints: vec![crate::connection_file::Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: 1,
-            }],
+            setup_socket: "/tmp/mc-host.sock".to_owned(),
             key: key.clone(),
             daemon_id: expected_daemon_id,
             pid: 1,

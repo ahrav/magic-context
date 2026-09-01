@@ -36,10 +36,7 @@ unsafe extern "C" fn finalize_owned(_env: sys::napi_env, _data: *mut c_void, hin
     drop(unsafe { Box::from_raw(hint.cast::<OwnedProbe>()) });
 }
 
-/// Severs a partially constructed external ArrayBuffer from its borrowed
-/// memory so no JS-visible alias survives a failed view creation. `released`
-/// is marked only when detachment succeeded; otherwise the finalizer still
-/// reports the alias through the leak diagnostics.
+/// On typed-array or reference creation failure, `abandon_arraybuffer` attempts to detach the external ArrayBuffer. It sets `released` only after successful detachment, so `finalize_borrowed` increments `LEAK_DIAGNOSTICS` if detachment fails.
 fn abandon_arraybuffer(env: &Env, arraybuffer: sys::napi_value, released: &Arc<AtomicBool>) {
     // SAFETY: arraybuffer is a live external ArrayBuffer in env.
     if unsafe { sys::napi_detach_arraybuffer(env.raw(), arraybuffer) } == sys::Status::napi_ok {
@@ -161,7 +158,7 @@ pub(crate) fn detach(env: &Env, external: &ExternalRef) -> Result<()> {
         "ArrayBuffer detachment failed",
     )?;
     let mut detached = false;
-    // SAFETY: value remains valid until reference deletion below.
+    // `arraybuffer` remains valid until `napi_delete_reference` deletes `reference`.
     check(
         unsafe { sys::napi_is_detached_arraybuffer(env.raw(), value, &mut detached) },
         "ArrayBuffer detachment verification failed",
@@ -250,7 +247,7 @@ pub(crate) fn create_owned_probe<'env>(env: &'env Env, len: usize) -> Result<Unk
         return Err(error);
     }
     let mut typedarray = std::ptr::null_mut();
-    // SAFETY: arraybuffer is live and exact-sized.
+    // SAFETY: `arraybuffer` is live and has byte length `len`.
     check(
         unsafe {
             sys::napi_create_typedarray(

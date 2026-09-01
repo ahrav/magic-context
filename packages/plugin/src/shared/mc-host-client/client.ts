@@ -1,16 +1,16 @@
 /**
- * Thin routed and managed consumer facade over the connection-generation
+ * `McHostClient` is a routed and managed consumer facade over the connection-generation engine.
  * engine.
  *
- * `McHostClient` owns connection coalescing (single-flight connect), reconnect
- * after generation retirement (reread the connection file plus full reauth),
- * the managed-route cache, control-plane response validation, and bounded
- * redacted diagnostics. The generation layer below never imports this file.
+ * `McHostClient` coalesces concurrent connection attempts into one connect operation.
+ * `McHostClient` rereads the connection file and fully reauthenticates after generation retirement.
+ * `McHostClient` caches managed routes and validates control-plane responses.
+ * `McHostClient` bounds and redacts diagnostics; the generation layer never imports this module.
  *
- * Replay ownership: raw `request()` never replays a body. Managed
- * `call()` owns exactly one replay token per call, spendable only on a
- * proven `not_sent` or a terminal `unknown_channel` (route evicted first),
- * only while the caller is active and the operation deadline is live.
+ * `request()` never replays a body.
+ * `call()` owns one replay token per call.
+ * `call()` spends its replay token only after proven `not_sent` or terminal `unknown_channel`, after evicting the route.
+ * `call()` spends its replay token only while the caller is active and the operation deadline remains live.
  * `outcome_unknown` is never replayed by any facade path.
  */
 
@@ -18,7 +18,6 @@ import { access } from "node:fs/promises";
 import {
     type ConnectionDiagnosticEvent,
     ConnectionGeneration,
-    type ConnectionGenerationOptions,
     type JsonReceiveBody,
     type PendingRequest,
     type RequestTerminal,
@@ -40,7 +39,6 @@ import {
     SocketTimeoutError,
 } from "./errors";
 import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
-import { flagsBinary } from "./protocol";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -48,25 +46,6 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
-import {
-    ACTIVATION_CORRELATION,
-    commitRequestJson,
-    decodeActivateResponse,
-    decodeCommitResponse,
-    decodeNegotiateResponse,
-    encodeActivateRequest,
-    encodeNegotiateRequest,
-    type FallbackReason,
-    NEGOTIATION_VERSION,
-    type NegotiateResponse,
-    NegotiationError,
-    TRANSPORT_TCP,
-} from "./transport-negotiation";
-import {
-    type ClientTransportProvider,
-    ClientTransportRegistry,
-    sanitizedCandidateFactory,
-} from "./transport-provider";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -85,18 +64,16 @@ import { sameDaemonId } from "./types";
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
-/** Matches npm subc-client 0.4.1 `DEFAULT_REQUEST_TIMEOUT_MS`. */
+/* */
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-/** One bounded route-open deadline shared by the whole managed retry loop. */
+/** `call()` shares one route-open deadline across the managed retry loop. */
 const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
-/** Separate bounded shutdown deadline for route and connection Goodbye. */
+/** `shutdown()` uses a separate deadline for route and connection Goodbye. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
-export const DEFAULT_RECOVERY_DEADLINE_MS = 30_000;
 /** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
 const MAX_CONTROL_BODY_LEN = 65_536;
 /**
- * Escalating retry schedule shared by the allowlisted route.open retry
- * backoff and the stale-success replacement pacing in both setup loops.
+ * `SETUP_RETRY_*` governs allowlisted `route.open` retries and stale-success replacement pacing in both setup loops.
  */
 const SETUP_RETRY_BASE_MS = 100;
 const SETUP_RETRY_CAP_MS = 2_000;
@@ -109,13 +86,12 @@ export const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
 const DEFAULT_MANAGED_TARGET_KIND: ManagedRouteKind = "management_surface";
 
 /**
- * One immutable, redacted diagnostics snapshot (KTD12): frame identity,
- * byte counts, and connection metadata only — never key, proof, nonce,
- * body bytes, or full bind identity.
+ * A diagnostics event contains only redacted frame identity, byte counts, and connection metadata.
+ * Diagnostics events exclude keys, proofs, nonces, body bytes, and full bind identities.
  */
 export interface McHostDiagnosticsEvent {
     readonly type: ConnectionDiagnosticEvent["type"] | "connected" | "parse" | "retired";
-    /** Wall-clock milliseconds assigned at emission. */
+    /** `timestampMs` records wall-clock milliseconds at emission. */
     readonly atMs: number;
     readonly frameType?: number;
     readonly channel?: number;
@@ -125,84 +101,41 @@ export interface McHostDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
-    /** Negotiated transport name on `connected` events. */
-    readonly transport?: string;
-    /** Closed-set TCP fallback reason on `connected` events, if any. */
-    readonly fallbackReason?: FallbackReason;
+    readonly transport?: "shm";
 }
 
 export type McHostDiagnosticsObserver = (event: McHostDiagnosticsEvent) => void;
 
 /**
- * Facade construction options. `ConnectOptions` is the consumer surface;
- * the rest are bounded policy knobs and injectable test seams.
+ * `ConnectOptions` defines consumer-facing construction options; remaining options bound policy or inject dependencies.
  */
 export interface McHostClientOptions extends ConnectOptions {
-    /** Injectable monotonic clock for every operation deadline. */
+    /** The clock supplies monotonic time for every operation deadline. */
     clock?: MonotonicClock;
-    /** Injectable backoff sleep for deterministic retry tests. */
+    /** The sleep function injects backoff delays so retries are deterministic in tests. */
     sleep?: (ms: number) => Promise<void>;
     requestTimeoutMs?: number;
     routeOpenDeadlineMs?: number;
     shutdownDeadlineMs?: number;
     /**
-     * Test seam forwarded to the connection-file read's `afterOpen` hook;
-     * lets tests race a snapshot against deadlines deterministically.
-     * @internal Not part of the consumer contract.
+     * The `afterOpen` hook is forwarded to connection-file reads so tests can race snapshots against deadlines deterministically.
      */
     connectionFileAfterOpen?: () => void | Promise<void>;
     /**
-     * Read-only diagnostics observer (KTD12). Events are frozen, size- and
-     * rate-bounded, and redacted; observer exceptions are swallowed and
+     * The diagnostics observer receives frozen, size- and rate-bounded redacted events; observer exceptions are swallowed.
      * excess events are dropped rather than blocking protocol work.
      */
     diagnostics?: McHostDiagnosticsObserver;
     maxDiagnosticEventsPerSecond?: number;
-    /** Bounded generation-policy overrides for tests (queue caps, deadlines). */
-    generationOptions?: Partial<
-        Pick<
-            ConnectionGenerationOptions,
-            | "frameDeadlineMs"
-            | "maxBodyLen"
-            | "memoryCapBytes"
-            | "maxQueuedFrames"
-            | "maxQueuedBytes"
-            | "controlReserveFrames"
-            | "cleanupTicketMs"
-            | "generateNonce"
-        >
-    >;
-    /** @internal Not part of the consumer contract. */
-    transportProviders?: readonly ClientTransportProvider[];
 }
 
 interface ActiveConnection {
     readonly generation: ConnectionGeneration;
-    /** Opaque token binding this connection's route handles. */
+    /** `connectionToken` binds this connection's route handles. */
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
     readonly liveRoutes: Map<number, RouteHandle>;
-    /** The selected transport remains fixed from publication until retirement. */
-    transport: string;
-    /** Closed-set reason when the selection was an explicit TCP fallback. */
-    fallbackReason?: FallbackReason;
-    role?: "shadow";
 }
-
-/**
- * One client-wide re-upgrade episode: fenced to the exact source primary, bounded by one immutable deadline, and cancellable so owner close and primary retirement release every shadow connection permit (KTD5-KTD7). commentlint: allow(JUDGE)
- */
-interface RecoveryEpisode {
-    readonly source: ActiveConnection;
-    readonly deadline: Deadline;
-    cancelled: boolean;
-    readonly shadowGenerations: Set<ConnectionGeneration>;
-}
-
-type ShadowOutcome =
-    | { kind: "promote"; conn: ActiveConnection }
-    | { kind: "retry" }
-    | { kind: "stop" };
 
 interface CachedManagedRoute {
     readonly target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
@@ -211,19 +144,15 @@ interface CachedManagedRoute {
     handle: RouteHandle | null;
     opening: SetupFlight<RouteHandle> | null;
     /**
-     * Set by `closeRoute` while an open is in flight; the open must not
-     * install its handle and instead sends best-effort route Goodbye.
+     * `closeRoute` marks an in-flight open as closed; the open must not install its handle and instead sends best-effort route Goodbye.
      */
     closed: boolean;
 }
 
 /**
- * One shared setup operation (a connect or a managed route open) with
- * explicit replacement eligibility (KTD1). The creator awaits `promise`
- * directly; a joiner races it against its own stage deadline. `replaceable`
- * turns true only at the exact owner-budget-exhaustion exits (KTD3), so a
- * surviving joiner may coalesce one replacement; permanent failures and
- * close outcomes leave it false.
+ * `SetupFlight` shares a connect or managed route open and records explicit replacement eligibility.
+ * `SetupFlight`'s creator awaits `promise` directly; each joiner races it against its own stage deadline.
+ * `replaceable` becomes true only at owner-budget-exhaustion exits, so a surviving joiner may coalesce one replacement; permanent failures and close outcomes leave it false.
  */
 interface SetupFlight<T> {
     promise: Promise<T>;
@@ -231,12 +160,8 @@ interface SetupFlight<T> {
 }
 
 /**
- * Race a shared flight against the caller's own stage deadline (KTD2). The
- * rejection implies `stage.isExpired()`: `armExpiryTimer` re-arms until the
- * clock provably crosses the end, and a fulfillment that settles after
- * expiry is rejected rather than adopted. `flight` has a creation-time
- * rejection observer, preventing unhandled rejections when a caller
- * abandons it after losing the race.
+ * `raceAgainstStage` rejects only after `stage.isExpired()`; `armExpiryTimer` re-arms until expiry and rejects post-expiry fulfillment.
+ * `flight`'s creation-time rejection observer prevents unhandled rejections when callers abandon the flight after losing the race.
  */
 async function raceAgainstStage<T>(
     flight: Promise<T>,
@@ -251,10 +176,7 @@ async function raceAgainstStage<T>(
                 cancelTimer = armExpiryTimer(stage, () => reject(makeError()));
             }),
         ]);
-        // The stage is authoritative over timer delivery order on both
-        // branches: a settlement queued ahead of an overdue timer callback
-        // must not let the caller adopt setup that exceeded its own stage
-        // budget, nor report the shared flight's failure as its own.
+        // `raceAgainstStage` rejects setup that settles after the caller's stage expires, even when its settlement callback runs before the expiry timer; it does not attribute the shared flight's failure to that caller.
         if (stage.isExpired()) throw makeError();
         return result;
     } catch (error) {
@@ -280,11 +202,8 @@ function routeStageError(): McHostCallError {
 }
 
 /**
- * Escalating bounded pacer for the stale-success re-entry (KTD4
- * fall-through) in a setup loop. A stale success settles without consuming
- * the caller's budget, so an unpaced re-entry would replace flights at
- * socket speed while the daemon keeps retiring fresh setup (for example a
- * Goodbye coalesced into the same read chunk as the final setup bytes).
+ * Stale-success re-entry in a setup loop uses an escalating bounded pacer.
+ * A stale success does not consume the caller's budget, so the pacer prevents socket-speed flight replacement while the daemon retires fresh setup.
  * Each wait is clamped to the caller's stage, so pacing never extends it.
  */
 function makeReplacementPacer(
@@ -299,9 +218,7 @@ function makeReplacementPacer(
 }
 
 /**
- * `clearSlot` receives this flight's identity on settlement, so an old
- * flight never clears a newer one (KTD1). Two-phase construction is safe:
- * `promise` is assigned before anything can read it, since `run` only
+ * `clearSlot` receives the settling flight's identity, so an old flight cannot clear a newer flight.
  * writes `replaceable`.
  */
 function makeSetupFlight<T>(
@@ -322,17 +239,9 @@ interface RequestParams {
     options: RequestOptions;
     responseMode?: "json" | "binary";
     mode?: "unary" | "stream";
-    /** Retained-item ceiling for a stream-mode request. */
+    /** The ceiling limits retained items for each stream-mode request. */
     maxStreamItems?: number;
     binary?: boolean;
-    /**
-     * Retain the raw wire Error terminal on the thrown failure. Only the
-     * negotiation family needs it (legacy-fallback classification reads the
-     * exact bytes); every other request leaves it off so a peer-controlled
-     * body — up to the frame limit — is not held alive by a caller's error
-     * outside the channel's released reader charge.
-     */
-    captureErrorTerminal?: boolean;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -349,10 +258,7 @@ function causeMessage(cause: unknown): string {
 }
 
 /**
- * The closed set of route.open rejection codes meaning "the target is
- * momentarily unavailable but a later route.open could succeed" (wire doc
- * 10.2). A rejected route.open is provably pre-send for the application
- * body, so retrying it never risks a duplicate dispatch.
+ * These `route.open` rejection codes indicate transient target unavailability, so a later `route.open` may succeed.
  */
 function isRetryableRouteOpenCode(code: string | undefined): boolean {
     return (
@@ -363,7 +269,7 @@ function isRetryableRouteOpenCode(code: string | undefined): boolean {
     );
 }
 
-/** True when the connection file exists; parity with npm subc-client 0.4.1. */
+/* */
 export async function connectionFileExists(path: string): Promise<boolean> {
     try {
         await access(path);
@@ -374,16 +280,14 @@ export async function connectionFileExists(path: string): Promise<boolean> {
 }
 
 /**
- * Reconnect-transience classification, semantics-compatible with npm
- * subc-client 0.4.1. Recognition works cross-bundle by error `name` and
- * `kind`/`code` shape, not only `instanceof`.
+ * Recognition works cross-bundle by error `name` and `kind`/`code` shape, not only `instanceof`.
  */
 export function isConsumerReconnectTransient(err: unknown): boolean {
     if (err instanceof McHostCallError) {
         return err.kind === "not_sent" || err.kind === "outcome_unknown";
     }
     const name = err instanceof Error ? err.name : undefined;
-    if (name === "SocketClosedError" || name === "SocketTimeoutError" || name === "AuthError") {
+    if (name === "SocketClosedError" || name === "SocketTimeoutError") {
         return true;
     }
     if (name === "McHostCallError") {
@@ -391,26 +295,6 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
         return kind === "not_sent" || kind === "outcome_unknown";
     }
     if (name === "McHostClientError" || name === "ConnectionFileError") return false;
-    const code = errorCode(err);
-    return (
-        code === "ECONNREFUSED" ||
-        code === "ECONNRESET" ||
-        code === "EPIPE" ||
-        code === "ETIMEDOUT" ||
-        code === "ENOENT"
-    );
-}
-
-/**
- * Shadow recovery retries only discovery and dial failures; authentication
- * and protocol failures stop the episode permanently. Recognition is
- * name/code-based so a different bundled copy of an error class still
- * classifies correctly.
- */
-function isShadowDialTransient(err: unknown): boolean {
-    const name = err instanceof Error ? err.name : undefined;
-    if (name === "AuthError") return false;
-    if (name === "SocketClosedError" || name === "SocketTimeoutError") return true;
     const code = errorCode(err);
     return (
         code === "ECONNREFUSED" ||
@@ -431,37 +315,22 @@ export class McHostClient {
     private readonly requestTimeoutMs: number;
     private readonly routeOpenDeadlineMs: number;
     private readonly shutdownDeadlineMs: number;
-    private readonly recoveryDeadlineMs = DEFAULT_RECOVERY_DEADLINE_MS;
     private readonly defaultIdentity: BindIdentity | undefined;
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly credentialSource: Record<string, string | undefined> | undefined;
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
-    private readonly generationOptions: McHostClientOptions["generationOptions"];
     private readonly diagnostics: McHostDiagnosticsObserver | undefined;
     private readonly maxDiagnosticEventsPerSecond: number;
-    private readonly transportRegistry: ClientTransportRegistry;
 
     private active: ActiveConnection | null = null;
     private connecting: SetupFlight<ActiveConnection> | null = null;
-    /** Draining generation slot; occupied from promotion until drain completes (KTD7). commentlint: allow(JUDGE) */
-    private predecessor: ActiveConnection | null = null;
-    /** At most one client-wide recovery episode (KTD5). commentlint: allow(JUDGE) */
-    private recovery: RecoveryEpisode | null = null;
-    /** RouteHandles opened by the managed-route cache, not caller-owned raw handles; the drain closes orphaned managed handles at pending-zero while raw handles wait for their caller's explicit close (R10). commentlint: allow(JUDGE) */
+    /** Route handles opened by the managed-route cache. */
     private readonly managedHandles = new WeakSet<RouteHandle>();
     private readonly routes = new Map<string, CachedManagedRoute>();
-    /** In-flight route.open attempts, drained bounded during owner close. */
+    /** Owner close bounds draining in-flight `route.open` attempts. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
-    /**
-     * In-flight route.open attempts per connection. A route.open terminal
-     * empties the pending set BEFORE its awaiting continuation inserts the
-     * new handle into `liveRoutes`, so a pending-zero retirement check
-     * alone would retire a draining predecessor between those two steps
-     * and hand the caller an immediately-stale handle.
-     */
-    private readonly routeOpenCounts = new Map<ActiveConnection, number>();
     private closeStarted = false;
     private closePromise: Promise<void> | null = null;
 
@@ -481,16 +350,13 @@ export class McHostClient {
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
         this.connectionFileAfterOpen = options.connectionFileAfterOpen;
-        this.generationOptions = options.generationOptions;
         this.diagnostics = options.diagnostics;
         this.maxDiagnosticEventsPerSecond =
             options.maxDiagnosticEventsPerSecond ?? DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND;
-        this.transportRegistry = new ClientTransportRegistry(options.transportProviders ?? []);
     }
 
     /**
-     * Read the connection file, dial, and authenticate under one handshake
-     * deadline, then return the ready client.
+     * Connection setup shares one handshake deadline across file reading, dialing, and authentication.
      */
     static async connect(options: McHostClientOptions): Promise<McHostClient> {
         const client = new McHostClient(options);
@@ -498,15 +364,13 @@ export class McHostClient {
         return client;
     }
 
-    /** The daemon version reported by the current connection, if any. */
+    /* */
     get daemonVer(): string | null {
         return this.active?.snapshot.daemonVer ?? null;
     }
 
     /**
-     * Handshake-retained peer identity for the current connection, or null
-     * when no authenticated generation is live. Lifecycle policy must use
-     * this, never {@link publication}, for compatibility and fencing.
+     * Lifecycle policy must use the retained peer identity, not {@link publication}, for compatibility and fencing.
      */
     get authenticated(): AuthenticatedPeer | null {
         const active = this.active;
@@ -516,18 +380,14 @@ export class McHostClient {
         if (daemonVer === null || daemonId === null) return null;
         return {
             daemonVer,
-            // Copied, like every other crossing of this value (`auth.ts`,
-            // `transport-provider.ts`): callers must not be able to mutate the
-            // retained identity that authorizes compatibility and fencing.
+            // Callers must not mutate the retained identity used for fencing.
             daemonId: daemonId.slice(),
             proof: "current",
         };
     }
 
     /**
-     * Connection-file `daemon_ver`/`pid` for the current connection, or null.
-     * Untrusted display metadata only: it must never authorize
-     * compatibility, shutdown, or cleanup.
+     * Publication metadata is untrusted display metadata and must never authorize compatibility, shutdown, or cleanup.
      */
     get publication(): PublicationDiagnostics | null {
         const active = this.active;
@@ -535,10 +395,14 @@ export class McHostClient {
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
     }
 
+    /** True after irreversible owner close begins. */
+    get isClosed(): boolean {
+        return this.closeStarted;
+    }
+
     /**
-     * Open a route and return its connection-bound immutable handle. One
-     * attempt under one bounded deadline; retry policy belongs to owners
-     * above (managed `call()` owns its own allowlisted retry loop).
+     * routeOpen makes one attempt under one bounded deadline and returns a connection-bound immutable handle.
+     * Retry policy belongs to callers; managed call() owns an allowlisted retry loop.
      */
     async routeOpen(
         target: RouteTarget,
@@ -557,8 +421,7 @@ export class McHostClient {
     }
 
     /**
-     * Send one routed request on exactly the supplied route generation and
-     * return the JSON-parsed response body. Never replays the body.
+     * request sends one routed request on the supplied route generation and never replays the body.
      */
     async request(
         handle: RouteHandle,
@@ -605,10 +468,7 @@ export class McHostClient {
     }
 
     /**
-     * Collect one bounded JSON stream through StreamEnd, preserving item order.
-     * The stream is bounded by both the connection's pending byte budget and a
-     * retained-item ceiling, so a peer cannot make the client hold unbounded
-     * per-item decode overhead under the byte budget alone.
+     * The stream is bounded by the connection pending-byte budget and a retained-item ceiling, preventing unbounded per-item decode overhead under the byte budget alone.
      */
     async requestStream<Item = unknown>(
         handle: RouteHandle,
@@ -649,10 +509,8 @@ export class McHostClient {
     }
 
     /**
-     * Managed route + request convenience: opens and caches a route keyed by
-     * (target kind, module id, identity, consumer identity), reconnecting
-     * and reopening after retirement. Sends `{method, params}` and returns
-     * the JSON-parsed response. Owns exactly one body-replay token.
+     * call() caches routes by target kind, module ID, identity, and consumer identity and reopens them after retirement.
+     * call() replays a request at most once after an unknown-channel or not-sent failure while the caller remains active and before the deadline.
      */
     async call<Response = unknown>(
         moduleId: string,
@@ -682,8 +540,7 @@ export class McHostClient {
                 const callerActive = !this.closeStarted && options.signal?.aborted !== true;
                 const mayReplay = !replaySpent && callerActive && !deadline.isExpired();
                 if (err.kind === "terminal" && err.code === "unknown_channel" && mayReplay) {
-                    // The host proved no dispatch; evict the dead route and
-                    // spend the one token on a fresh-route retry (KTD8).
+                    // The host proved no dispatch; evict the dead route.
                     replaySpent = true;
                     this.evictHandle(handle);
                     continue;
@@ -697,25 +554,20 @@ export class McHostClient {
         }
     }
 
-    /** List catalog entries through a validated tagged `catalog.list`. */
+    /* */
     async catalogList(options: { timeoutMs?: number } = {}): Promise<CatalogEntry[]> {
         return (await this.catalogSnapshot(options)).modules;
     }
 
     /**
-     * One strictly validated `catalog.list`: tagged generation, closed-shape
-     * host `subc_ops`, and per-module id/version/roles/control_ops. Any
-     * duplicate, missing field, or out-of-bounds value is a terminal
-     * `malformed_control_response` — never a cast.
+     * catalog.list requires a tagged generation, closed-shape host subc_ops, and per-module id, version, roles, and control_ops.
+     * Any duplicate, missing field, or out-of-bounds value throws malformed_control_response; the response is never cast.
      *
-     * Unknown fields are *ignored*, not rejected: wire doc §7.1 makes forward
-     * compatibility the rule for this family, so a newer daemon adding a field
-     * must not strand an older client. The negotiation family (§7.7.1) is the
-     * one closed-shape exception and is validated elsewhere.
+     * Unknown fields are ignored, not rejected.
+     * The parser ignores unknown fields so newer daemons can add fields without stranding older clients.
+     * The negotiation family permits fields that closed-shape responses reject.
      *
-     * `timeoutMs` overrides the client-wide request timeout so a caller holding
-     * an aggregate deadline can spend only the time it has left here instead of
-     * starting a fresh full-length request budget.
+     * timeoutMs overrides the client-wide request timeout so callers can spend only their remaining aggregate-deadline budget.
      */
     async catalogSnapshot(options: { timeoutMs?: number } = {}): Promise<CatalogSnapshot> {
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
@@ -726,10 +578,10 @@ export class McHostClient {
     }
 
     /**
-     * Bounded authenticated `host.shutdown`. Resolves only after the host's
-     * correlated success response is fully received — the caller-observable
-     * stop-commit point. Never called by `close()`/`closeAsync()`; ordinary
-     * client close remains connection teardown only.
+     * host.shutdown resolves only after its correlated success response is fully received.
+     * host.shutdown resolves only after its correlated success response is fully received—the caller-observable stop-commit point.
+     * `close()` and `closeAsync()` never call `host.shutdown`; they only tear down the connection.
+     * `close()` and `closeAsync()` perform connection teardown only.
      */
     async hostShutdown(options: { timeoutMs?: number } = {}): Promise<void> {
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
@@ -738,7 +590,7 @@ export class McHostClient {
         await this.controlRequest(active, bodyText, "host.shutdown", deadline);
     }
 
-    /** Read host-owned component readiness without opening a routed module. */
+    /** The readiness operation reads host-owned component readiness without opening a routed module. */
     async hostStatus(options: { timeoutMs?: number } = {}): Promise<HostStatusSnapshot> {
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const active = await this.ensureConnection(deadline);
@@ -748,8 +600,8 @@ export class McHostClient {
     }
 
     /**
-     * Tear down exactly the supplied route generation: evict caches, send
-     * route Goodbye, and await the write bounded by the shutdown deadline.
+     * Route teardown removes exactly the supplied route generation.
+     * Route teardown evicts caches, sends route Goodbye, and awaits the write within the shutdown deadline.
      */
     async closeRoute(handle: RouteHandle): Promise<void> {
         const conn = this.requireLiveHandle(handle);
@@ -760,12 +612,10 @@ export class McHostClient {
         }
         conn.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
         await conn.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
     /**
-     * Synchronous close for existing callers: fires the bounded async
-     * teardown and returns immediately. New code should prefer
+     * close() starts bounded asynchronous teardown and returns immediately.
      * `closeAsync()`.
      */
     close(): void {
@@ -773,10 +623,10 @@ export class McHostClient {
     }
 
     /**
-     * Awaitable owner close under one bounded shutdown deadline: drain
-     * in-flight route.open attempts (so a late success becomes route
-     * Goodbye instead of a cached route), send connection Goodbye
-     * best-effort, flush, then retire the generation. Idempotent.
+     * closeAsync() uses one bounded shutdown deadline.
+     * closeAsync() drains in-flight route.open attempts.
+     * A late route.open success sends route Goodbye instead of entering the route cache.
+     * closeAsync() sends connection Goodbye best-effort, flushes, retires the generation, and is idempotent.
      */
     closeAsync(): Promise<void> {
         if (this.closePromise) return this.closePromise;
@@ -786,15 +636,14 @@ export class McHostClient {
     }
 
     // ------------------------------------------------------------------
-    // Connection ownership: single-flight connect and retirement reaction.
+    // The connection owner replaces a retired generation.
     // ------------------------------------------------------------------
 
     private async ensureConnection(
         deadline: Deadline,
         expectedDaemonId?: Uint8Array,
     ): Promise<ActiveConnection> {
-        // R1: one immutable handshake stage per caller, derived once from its
-        // own operation deadline and kept through every join and replacement.
+        // Each caller derives one immutable handshake stage from its operation deadline and retains it through every join and replacement.
         const stage = deadline.stage(this.handshakeTimeoutMs);
         const pace = makeReplacementPacer(stage, this.sleep);
         for (;;) {
@@ -818,30 +667,26 @@ export class McHostClient {
             }
             let conn: ActiveConnection;
             try {
-                // KTD2: the owner awaits its bounded operation directly to keep
-                // existing error and retirement behavior; a joiner races the
-                // shared flight against its own stage.
+                // The owner awaits its bounded operation directly so timeout and retirement errors propagate unchanged.
+                // Each joiner waits on the shared flight against its own stage.
                 conn = owner
                     ? await flight.promise
                     : await raceAgainstStage(flight.promise, stage, connectionStageError);
             } catch (error) {
-                // A joiner whose own stage expired detaches without mutating
-                // the shared flight (R2). Only owner-budget exhaustion of a
-                // joined flight authorizes one coalesced replacement (R3).
+                // A joiner whose stage expires detaches without mutating the shared flight.
+                // Only owner-budget exhaustion of a joined flight authorizes one coalesced replacement.
                 if (owner || !flight.replaceable || stage.isExpired() || this.closeStarted) {
                     throw error;
                 }
                 continue;
             }
-            // KTD4: adopt only a still-current, non-retired generation; a
-            // stale success re-enters recovery under the unchanged stage.
+            // The connection owner adopts only a still-current, non-retired generation; a stale success re-enters recovery under the unchanged stage.
             if (this.active === conn && !conn.generation.isRetired()) {
                 this.assertExpectedDaemon(conn.generation, expectedDaemonId);
                 return conn;
             }
             if (stage.isExpired()) throw connectionStageError();
-            // Pace the replacement dial unless a live candidate is already
-            // installed (the loop head adopts it without new I/O).
+            // The loop head adopts a live candidate without new I/O; otherwise, pace the replacement dial.
             const candidate = this.active;
             if (!candidate || candidate.generation.isRetired()) {
                 await pace();
@@ -854,8 +699,7 @@ export class McHostClient {
         stage: Deadline,
         flight: SetupFlight<ActiveConnection>,
     ): Promise<ActiveConnection> {
-        // Reconnect rereads the file and reauthenticates from scratch (wire
-        // doc Section 12); credentials are never cached across generations.
+        // Reconnect rereads the file and reauthenticates; credentials are not cached across generations.
         let snapshot: ConnectionSnapshot;
         try {
             snapshot = await readConnectionFile(this.connectionFile, {
@@ -863,7 +707,7 @@ export class McHostClient {
                 afterOpen: this.connectionFileAfterOpen,
             });
         } catch (error) {
-            // KTD3: the connection-file stage budget is the failure authority.
+            // Only `ConnectionFileError` with code `deadline_expired` makes `flight` replaceable.
             if (error instanceof ConnectionFileError && error.code === "deadline_expired") {
                 flight.replaceable = true;
             }
@@ -872,8 +716,7 @@ export class McHostClient {
         let conn: ActiveConnection | null = null;
         let retiredReason: RetirementReason | null = null;
         const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
+            setupSocket: snapshot.setupSocket,
             credentials: {
                 key: snapshot.key,
                 daemonId: snapshot.daemonId,
@@ -886,30 +729,21 @@ export class McHostClient {
             onRouteGoodbye: (channel, epoch) => {
                 if (conn) this.onRouteGoodbye(conn, channel, epoch);
             },
-            onPendingZero: () => {
-                if (conn) this.onPendingDrained(conn);
-            },
-            onLeaseReleased: () => {
-                if (conn) this.onPendingDrained(conn);
-            },
             // Skip per-frame event allocation entirely when no observer is
             // configured; the generation's hook check short-circuits on
             // undefined.
             onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-            ...this.generationOptions,
         });
         conn = {
             generation,
             token: newConnectionToken(),
             snapshot,
             liveRoutes: new Map(),
-            transport: TRANSPORT_TCP,
         };
         try {
             await generation.start(stage);
         } catch (error) {
-            // KTD3: only the setup-deadline retirement is an owner-budget
-            // exit; auth, socket, and protocol failures never authorize a
+            // Only retirement with reason `setup_deadline` makes `flight` replaceable; auth, socket, and protocol failures do not.
             // replacement.
             if (retiredReason === "setup_deadline") flight.replaceable = true;
             throw error;
@@ -918,355 +752,45 @@ export class McHostClient {
             generation.retire("owner_close");
             throw new McHostClientError("client closed", "client_closed");
         }
-        // KTD4 stale-success: a generation that retired during its own setup
-        // (for example a Goodbye coalesced into the final handshake chunk)
-        // skips negotiation; ensureConnection re-enters recovery under the
-        // caller's unchanged stage.
+        // A generation that retires during setup is never published.
         if (generation.isRetired()) return conn;
-        // R5/KTD5: negotiate on authenticated channel 0 BEFORE publication,
-        // so no caller can observe a generation without a selection.
-        let selection: NegotiateResponse;
-        try {
-            selection = await this.negotiateTransport(generation, stage);
-        } catch (error) {
-            generation.retire("negotiation_failed", error);
-            // KTD3: negotiation that died on the owner's setup stage is
-            // owner-budget exhaustion; survivors may coalesce one
-            // replacement.
-            if (stage.isExpired()) flight.replaceable = true;
-            throw error;
-        }
-        if (this.closeStarted) {
-            generation.retire("owner_close");
-            throw new McHostClientError("client closed", "client_closed");
-        }
-        if (selection.kind === "grant") {
-            try {
-                return await this.activateCandidate(conn, selection, stage);
-            } catch (error) {
-                // KTD3: activation that died on the owner's setup stage is
-                // owner-budget exhaustion, exactly like the earlier stages;
-                // survivors may coalesce one replacement.
-                if (stage.isExpired()) flight.replaceable = true;
-                throw error;
-            }
-        }
-        // The authenticated bootstrap becomes the finalized generation with
-        // its negotiation correlation consumed; the selection stays sticky
-        // until retirement (KTD5).
-        // KTD4 stale-success: the frame pump can retire the generation in
-        // the same batch that resolved the negotiation (a coalesced Goodbye
-        // or EOF). A dead generation must not be published or reported
-        // connected; the returned stale conn re-enters recovery in
-        // ensureConnection like the pre-negotiation stale-success path.
-        if (generation.isRetired()) return conn;
-        conn.fallbackReason = selection.reason;
         this.active = conn;
-        this.emitConnected(conn, conn.fallbackReason);
-        // R11: exact `unavailable` is the only fallback that starts an automatic shared-memory recovery probe; every other reason and reasonless TCP stay sticky. commentlint: allow(JUDGE)
-        if (conn.fallbackReason === "unavailable") this.startRecovery(conn);
-        return conn;
-    }
-
-    /**
-     * Send the versioned offer as the generation's first channel-0 request.
-     * Only a strictly decoded selection continues; every failure — including
-     * any wire Error terminal — propagates so setup fails closed without
-     * same-generation TCP fallback (KTD7).
-     */
-    private async negotiateTransport(
-        generation: ConnectionGeneration,
-        stage: Deadline,
-    ): Promise<NegotiateResponse> {
-        const offers = this.transportRegistry.offers();
-        const body = encodeNegotiateRequest({ negotiationVersion: NEGOTIATION_VERSION, offers });
-        let terminal: RequestTerminal;
-        try {
-            terminal = await this.awaitRequest(generation, {
-                channel: 0,
-                epoch: 0,
-                body,
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-        } catch (error) {
-            if (
-                error instanceof McHostCallError &&
-                error.kind === "terminal" &&
-                error.errorTerminal !== undefined
-            ) {
-                // Every Error terminal fails closed with a bounded error:
-                // the raw body is peer-controlled and its message must not
-                // enter caller-visible error graphs (R14). There is no
-                // `unsupported_operation` continuation. The distinct code
-                // makes version skew self-describing: a host that does not
-                // implement `transport.negotiate` answers this request with
-                // an Error terminal.
-                throw new McHostCallError(
-                    "terminal",
-                    "transport negotiation failed: host returned an error terminal (host may predate transport negotiation; restart or upgrade the mc-host daemon)",
-                    "host_negotiation_rejected",
-                );
-            }
-            throw error;
-        }
-        try {
-            // Strict decode against the sent offers: an unoffered selection
-            // or any version/field violation is malformed, never fallback
-            // evidence (R12). Negotiation-family responses must be UTF-8
-            // JSON with `binary = 0`.
-            if (flagsBinary(terminal.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            return decodeNegotiateResponse(
-                requireJsonReceiveBody(terminal.body).text ?? "",
-                offers,
-            );
-        } catch (error) {
-            throw wrapNegotiationError(error);
-        }
-    }
-
-    /**
-     * KTD4 activate-then-commit barrier over one injected provider
-     * candidate: activation at candidate correlation 1 consumes the one-use
-     * token, commit at correlation 2 finalizes, and only then is the
-     * candidate generation published — with its application correlation
-     * allocator already at 3 — while the bootstrap retires. Any failure or
-     * uncertainty closes BOTH channels without TCP continuation (R12).
-     */
-    private async activateCandidate(
-        bootstrap: ActiveConnection,
-        grant: Extract<NegotiateResponse, { kind: "grant" }>,
-        stage: Deadline,
-    ): Promise<ActiveConnection> {
-        const conn = await this.prepareCandidate(bootstrap, grant, stage);
-        // Atomic promotion: publish the finalized candidate, then retire the
-        // bootstrap; the host already replaced it after the commit response
-        // reached local completion.
-        this.active = conn;
-        bootstrap.generation.retire("owner_close");
         this.emitConnected(conn);
         return conn;
     }
 
-    /**
-     * Run one grant through candidate construction, activation, and commit
-     * without publishing. Any failure or uncertainty retires BOTH the
-     * candidate and the bootstrap. A shadow caller passes its episode's
-     * `shadow` generation set so the candidate's retirement callbacks stay
-     * episode-internal until promotion clears the role.
-     */
-    private async prepareCandidate(
-        bootstrap: ActiveConnection,
-        grant: Extract<NegotiateResponse, { kind: "grant" }>,
-        stage: Deadline,
-        shadow?: Set<ConnectionGeneration>,
-    ): Promise<ActiveConnection> {
-        const provider = this.transportRegistry.find(
-            grant.selected.transport,
-            grant.selected.capabilityVersion,
-        );
-        if (!provider) {
-            // Unreachable through the decoder (a selection must name a sent
-            // offer), kept as a fail-closed guard.
-            const failure = new McHostCallError(
-                "terminal",
-                "host granted a transport with no installed provider",
-                "negotiation_failed",
-            );
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        const snapshot = bootstrap.snapshot;
-        // A candidate channel performs no handshake: its authority is the
-        // bootstrap's, carried across the activate-then-commit barrier. The
-        // identity is read here, before the candidate exists, so the candidate
-        // inherits it instead of adopting whatever its channel reports.
-        const inheritedDaemonVer = bootstrap.generation.daemonVer;
-        const inheritedDaemonId = bootstrap.generation.authenticatedDaemonId;
-        if (inheritedDaemonVer === null || inheritedDaemonId === null) {
-            // The bootstrap authenticates before it can negotiate, so this is
-            // unreachable; kept as a fail-closed guard because promotion off an
-            // unauthenticated generation would publish an identity that nothing
-            // proved.
-            const failure = new McHostCallError(
-                "terminal",
-                "transport promotion requires an authenticated bootstrap identity",
-                "negotiation_failed",
-            );
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        let conn: ActiveConnection | null = null;
-        let candidate: ConnectionGeneration;
-        try {
-            // The generation constructor invokes the channel factory — and
-            // therefore the provider's `connect()` — synchronously, so a
-            // throwing provider surfaces here, before the activation `try`
-            // below exists to retire the channels.
-            candidate = new ConnectionGeneration({
-                host: snapshot.endpoint.host,
-                port: snapshot.endpoint.port,
-                credentials: {
-                    key: snapshot.key,
-                    daemonId: snapshot.daemonId,
-                    daemonVer: snapshot.daemonVer,
-                },
-                channelFactory: sanitizedCandidateFactory(
-                    grant.selected.transport,
-                    provider,
-                    grant.descriptor,
-                    // The provider gets its own copy: a provider that retains
-                    // and mutates the array must not reach the identity this
-                    // candidate inherits.
-                    inheritedDaemonId.slice(),
-                ),
-                inheritedIdentity: {
-                    daemonVer: inheritedDaemonVer,
-                    daemonId: inheritedDaemonId,
-                },
-                firstCorrelation: ACTIVATION_CORRELATION,
-                onRetired: (info) => {
-                    if (conn) this.onGenerationRetired(conn, info);
-                },
-                onRouteGoodbye: (channel, epoch) => {
-                    if (conn) this.onRouteGoodbye(conn, channel, epoch);
-                },
-                onPendingZero: () => {
-                    if (conn) this.onPendingDrained(conn);
-                },
-                onLeaseReleased: () => {
-                    if (conn) this.onPendingDrained(conn);
-                },
-                onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-                ...this.generationOptions,
-            });
-        } catch (error) {
-            const failure = wrapNegotiationError(error);
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        shadow?.add(candidate);
-        conn = {
-            generation: candidate,
-            token: newConnectionToken(),
-            snapshot,
-            liveRoutes: new Map(),
-            transport: grant.selected.transport,
-            ...(shadow !== undefined ? { role: "shadow" as const } : {}),
-        };
-        try {
-            await candidate.start(stage);
-            const activate = await this.awaitRequest(candidate, {
-                channel: 0,
-                epoch: 0,
-                body: encodeActivateRequest(grant.activationToken),
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-            // Negotiation-family responses must be UTF-8 JSON with
-            // `binary = 0`; a mismatched flag is malformed, never
-            // promotion evidence.
-            if (flagsBinary(activate.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            decodeActivateResponse(requireJsonReceiveBody(activate.body).text ?? "");
-            const commit = await this.awaitRequest(candidate, {
-                channel: 0,
-                epoch: 0,
-                body: commitRequestJson(),
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-            if (flagsBinary(commit.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            decodeCommitResponse(requireJsonReceiveBody(commit.body).text ?? "");
-        } catch (error) {
-            const failure = boundedNegotiationFailure(error);
-            candidate.retire("negotiation_failed", failure);
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        if (this.closeStarted || candidate.isRetired()) {
-            const failure = this.closeStarted
-                ? new McHostClientError("client closed", "client_closed")
-                : new McHostCallError(
-                      "not_sent",
-                      "candidate channel retired before promotion",
-                      "negotiation_failed",
-                  );
-            const reason = this.closeStarted ? "owner_close" : "negotiation_failed";
-            candidate.retire(reason, failure);
-            bootstrap.generation.retire(reason, failure);
-            throw failure;
-        }
-        return conn;
-    }
-
     private onGenerationRetired(conn: ActiveConnection, info: RetirementInfo): void {
-        // Shadow teardown is episode-internal; the recovery loop owns it.
-        if (conn.role === "shadow") return;
-        if (this.predecessor === conn) {
-            // Drain completion (or a failed predecessor) is internal handoff
-            // traffic under a live primary, never a client-level `retired`.
-            this.predecessor = null;
-            return;
-        }
         if (this.active === conn) {
             this.active = null;
             for (const cached of this.routes.values()) {
                 cached.handle = null;
             }
-            // The episode is fenced to this exact source primary (KTD6);
-            // cancel it so in-flight shadow permits are released promptly.
-            if (this.recovery !== null && this.recovery.source === conn) {
-                this.cancelRecovery(this.recovery);
-            }
-        } else if (this.active !== null) {
-            // A non-active generation retiring while another connection is
-            // published is internal handoff traffic — the bootstrap retiring
-            // under a freshly promoted candidate. Emitting `retired` here
-            // would interleave a spurious client-level event with the
-            // candidate's `connected`. Setup failures still emit: no
-            // connection is published while a setup flight runs.
-            return;
         }
         this.emitDiagnostics({ type: "retired", reason: info.reason });
     }
 
     private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
-        if (this.active !== conn && this.predecessor !== conn) return;
+        if (this.active !== conn) return;
         const handle = conn.liveRoutes.get(channel);
         if (!handle || handle.epoch !== epoch) return;
         conn.liveRoutes.delete(channel);
         this.detachCachedHandle(handle);
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
-    /** The live connection owning `handle`: the primary or the draining predecessor. */
+    /** Returns the live mandatory-ring connection owning `handle`. */
     private connectionFor(handle: RouteHandle): ActiveConnection | null {
-        for (const conn of [this.active, this.predecessor]) {
-            if (
-                conn !== null &&
-                !conn.generation.isRetired() &&
-                belongsToConnection(handle, conn.token) &&
-                conn.liveRoutes.get(handle.channel) === handle
-            ) {
-                return conn;
-            }
-        }
-        return null;
+        const conn = this.active;
+        return conn !== null &&
+            !conn.generation.isRetired() &&
+            belongsToConnection(handle, conn.token) &&
+            conn.liveRoutes.get(handle.channel) === handle
+            ? conn
+            : null;
     }
 
     /**
      * Managed-route cache eligibility: only the primary may serve a cached
-     * managed handle, so new managed acquisitions never land on a draining
-     * predecessor (R10).
+     * managed handle.
      */
     private isPrimaryLiveHandle(handle: RouteHandle): boolean {
         const conn = this.connectionFor(handle);
@@ -1300,8 +824,8 @@ export class McHostClient {
     }
 
     /**
-     * `closeRoute` uses the returned keys to mark and evict every cached
-     * entry for `handle`; the other callers only need the detach.
+     * `closeRoute` uses the returned keys to mark and evict every cached entry for `handle`.
+     * Callers that do not own `handle` only detach the route.
      */
     private detachCachedHandle(handle: RouteHandle): [string, CachedManagedRoute][] {
         const detached: [string, CachedManagedRoute][] = [];
@@ -1314,272 +838,29 @@ export class McHostClient {
         return detached;
     }
 
-    private emitConnected(conn: ActiveConnection, fallbackReason?: FallbackReason): void {
+    private emitConnected(conn: ActiveConnection): void {
         this.emitDiagnostics({
             type: "connected",
             daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: conn.snapshot.pid,
-            transport: conn.transport,
-            ...(fallbackReason !== undefined ? { fallbackReason } : {}),
+            transport: "shm",
         });
     }
 
     // ------------------------------------------------------------------
-    // Fresh-generation TCP-to-shared-memory re-upgrade (R9-R11). commentlint: allow(JUDGE)
     // ------------------------------------------------------------------
 
     /**
-     * Begin one client-wide recovery episode fenced to `source`. Only an
-     * exact `unavailable` TCP fallback reaches this point; the deadline is
-     * created once here and never reset by any retry (KTD5). commentlint: allow(JUDGE)
-     */
-    private startRecovery(source: ActiveConnection): void {
-        if (this.closeStarted) return;
-        const prior = this.recovery;
-        // A prior episode is fenced to a superseded primary; cancel it so
-        // its shadow permits are released before the new episode dials.
-        if (prior !== null) this.cancelRecovery(prior);
-        const episode: RecoveryEpisode = {
-            source,
-            deadline: Deadline.start(this.recoveryDeadlineMs, this.clock),
-            cancelled: false,
-            shadowGenerations: new Set(),
-        };
-        this.recovery = episode;
-        void this.runRecoveryEpisode(episode)
-            .catch(() => {})
-            .finally(() => {
-                if (this.recovery === episode) this.recovery = null;
-            });
-    }
-
-    private cancelRecovery(episode: RecoveryEpisode): void {
-        episode.cancelled = true;
-        for (const generation of [...episode.shadowGenerations]) {
-            generation.retire("owner_close");
-        }
-    }
-
-    private recoveryStopped(episode: RecoveryEpisode): boolean {
-        return (
-            episode.cancelled ||
-            this.closeStarted ||
-            this.active !== episode.source ||
-            episode.source.generation.isRetired()
-        );
-    }
-
-    private async runRecoveryEpisode(episode: RecoveryEpisode): Promise<void> {
-        let delayMs = SETUP_RETRY_BASE_MS;
-        const pace = async (): Promise<void> => {
-            await this.sleep(episode.deadline.stageBudgetMs(delayMs));
-            delayMs = Math.min(delayMs * 2, SETUP_RETRY_CAP_MS);
-        };
-        for (;;) {
-            if (this.recoveryStopped(episode) || episode.deadline.isExpired()) return;
-            // An occupied predecessor slot defers the whole attempt: wait
-            // without creating a candidate so no third generation and no
-            // extra connection permit exist while two are still draining.
-            if (this.predecessor !== null) {
-                await pace();
-                continue;
-            }
-            const outcome = await this.shadowAttempt(episode);
-            if (outcome.kind === "promote") {
-                this.finishPromotion(episode, outcome.conn);
-                return;
-            }
-            if (outcome.kind === "stop") return;
-            await pace();
-        }
-    }
-
-    /**
-     * One full fresh setup attempt: reread the connection file, dial,
-     * authenticate, negotiate, and — on a grant — activate and commit,
-     * all bounded by the episode deadline. Retries only discovery/dial
-     * transients and repeated exact `unavailable`; every other outcome
-     * stops the episode permanently (KTD6). commentlint: allow(JUDGE)
-     */
-    private async shadowAttempt(episode: RecoveryEpisode): Promise<ShadowOutcome> {
-        const stage = episode.deadline.stage(this.handshakeTimeoutMs);
-        let snapshot: ConnectionSnapshot;
-        try {
-            snapshot = await readConnectionFile(this.connectionFile, {
-                deadline: stage,
-            });
-        } catch (error) {
-            // Only discovery churn retries: a daemon rewriting its
-            // connection file mid-restart surfaces as a briefly missing
-            // file, a replaced-during-read race, or an expired stage (the
-            // loop's episode deadline bounds repeats). Every other
-            // connection-file failure — permissions, ownership, malformed
-            // content — is permanent validation evidence and stops the
-            // episode, matching the reconnect path's terminal
-            // classification (KTD6).
-            if (
-                error instanceof ConnectionFileError &&
-                (error.code === "not_found" ||
-                    error.code === "replaced_during_read" ||
-                    error.code === "deadline_expired")
-            ) {
-                return { kind: "retry" };
-            }
-            return { kind: "stop" };
-        }
-        const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
-            credentials: {
-                key: snapshot.key,
-                daemonId: snapshot.daemonId,
-                daemonVer: snapshot.daemonVer,
-            },
-            ...this.generationOptions,
-        });
-        episode.shadowGenerations.add(generation);
-        try {
-            try {
-                await generation.start(stage);
-            } catch (error) {
-                return { kind: isShadowDialTransient(error) ? "retry" : "stop" };
-            }
-            if (this.recoveryStopped(episode)) {
-                generation.retire("owner_close");
-                return { kind: "stop" };
-            }
-            if (generation.isRetired()) return { kind: "retry" };
-            let selection: NegotiateResponse;
-            try {
-                selection = await this.negotiateTransport(generation, stage);
-            } catch (error) {
-                // Malformed negotiation and host error terminals stop the
-                // episode; they are never fallback or retry evidence.
-                generation.retire("negotiation_failed", error);
-                return { kind: "stop" };
-            }
-            if (selection.kind === "tcp") {
-                generation.retire("owner_close");
-                // Repeated exact `unavailable` keeps the episode alive under
-                // its ORIGINAL deadline; a reasonless selection, a legacy
-                // fallback, and every other reason stop it permanently.
-                return { kind: selection.reason === "unavailable" ? "retry" : "stop" };
-            }
-            const bootstrap: ActiveConnection = {
-                generation,
-                token: newConnectionToken(),
-                snapshot,
-                liveRoutes: new Map(),
-                transport: TRANSPORT_TCP,
-                role: "shadow",
-            };
-            let conn: ActiveConnection;
-            try {
-                conn = await this.prepareCandidate(
-                    bootstrap,
-                    selection,
-                    stage,
-                    episode.shadowGenerations,
-                );
-            } catch {
-                // Grant attachment, activation, and commit failures stop
-                // recovery; prepareCandidate already retired both channels,
-                // releasing the shadow permits.
-                return { kind: "stop" };
-            }
-            // The host replaced the bootstrap at commit; only the committed
-            // candidate survives to the promotion fence.
-            generation.retire("owner_close");
-            return { kind: "promote", conn };
-        } finally {
-            episode.shadowGenerations.delete(generation);
-        }
-    }
-
-    /**
-     * Source-fenced publication: the shadow commit becomes the primary only
-     * while the exact source primary is still published and the predecessor
-     * slot is free; any other state retires the candidate instead (KTD6). commentlint: allow(JUDGE)
-     */
-    private finishPromotion(episode: RecoveryEpisode, conn: ActiveConnection): void {
-        episode.shadowGenerations.delete(conn.generation);
-        if (
-            this.recoveryStopped(episode) ||
-            this.predecessor !== null ||
-            conn.generation.isRetired()
-        ) {
-            conn.generation.retire("owner_close");
-            return;
-        }
-        conn.role = undefined;
-        this.predecessor = episode.source;
-        this.active = conn;
-        this.emitConnected(conn);
-        this.maybeRetirePredecessor();
-    }
-
-    private onPendingDrained(conn: ActiveConnection): void {
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
-    }
-
-    /**
-     * Retire the draining predecessor once no pending work AND no live
-     * route handles remain on it. Orphaned managed-cache routes close at
-     * pending-zero; caller-owned raw handles keep the drain open until
-     * their explicit close (R10). commentlint: allow(JUDGE)
-     */
-    private maybeRetirePredecessor(): void {
-        const pred = this.predecessor;
-        if (pred === null) return;
-        if (pred.generation.isRetired()) {
-            this.predecessor = null;
-            return;
-        }
-        const stats = pred.generation.stats();
-        if (stats.pendingRequests > 0) return;
-        // A route.open whose terminal already settled but whose awaiting
-        // continuation has not yet recorded the handle keeps the drain
-        // open; the continuation's completion re-invokes this check.
-        if ((this.routeOpenCounts.get(pred) ?? 0) > 0) return;
-        // A settled binary or stream terminal hands its ReceiveLease to the
-        // caller, whose storage aliases the channel until an explicit
-        // release; retirement force-releases every lease, so a drain with
-        // live leases stays open and each release re-invokes this check.
-        if (stats.activeReceiveLeases > 0) return;
-        for (const [channel, handle] of [...pred.liveRoutes]) {
-            if (!this.managedHandles.has(handle)) continue;
-            pred.liveRoutes.delete(channel);
-            pred.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-            this.detachCachedHandle(handle);
-        }
-        if (pred.liveRoutes.size > 0) return;
-        this.predecessor = null;
-        const generation = pred.generation;
-        generation.enqueueConnectionGoodbye();
-        void generation
-            .flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock))
-            .catch(() => {})
-            .finally(() => generation.retire("owner_close"));
-    }
-
-    // ------------------------------------------------------------------
-    // Requests: one pending entry, caller abort, terminal classification.
-    // ------------------------------------------------------------------
-
-    /**
-     * Run one request to its terminal. A wire Error terminal becomes a
-     * `terminal` McHostCallError with the canonical body's stable code. On a
-     * caller abort, the rejection carries the cleanup ticket, and a
-     * post-write routed abort enqueues a correlation-scoped Cancel; channel
-     * 0 never sees Cancel (KTD9 handles it by retirement in the caller).
+     * Wire Error terminals become a `terminal` McHostCallError with the canonical body's stable code.
+     * A caller abort rejects with the cleanup ticket.
+     * A post-write routed abort enqueues a correlation-scoped Cancel; channel 0 never receives Cancel.
+     * A channel-0 caller abort retires the generation.
      */
     private async awaitRequest(
         generation: ConnectionGeneration,
         params: RequestParams,
     ): Promise<RequestTerminal> {
-        // The one publication choke point every request-shaped method passes
-        // through: the daemon-binding gate runs here, before any byte is
-        // enqueued, so no publisher can forget it.
+        // The daemon-binding gate runs before `generation.request` sends any bytes.
         this.assertExpectedDaemon(generation, params.options.expectedDaemonId);
         const signal = params.options.signal;
         const pending: PendingRequest = generation.request({
@@ -1607,18 +888,6 @@ export class McHostClient {
             if (terminal.kind === "error") {
                 const errorBody = requireJsonReceiveBody(terminal.body);
                 const failure = terminalFromErrorBody(errorBody);
-                if (params.captureErrorTerminal === true) {
-                    failure.errorTerminal = {
-                        bodyText: errorBody.text,
-                        flags: terminal.flags,
-                        // A stream frame ahead of the terminal means the
-                        // host produced response data, which cannot prove a
-                        // no-dispatch rejection. Read the arrival flag, not
-                        // `stream`: unary mode drains stream bodies
-                        // privately and always reports an empty array.
-                        streamed: terminal.sawStream,
-                    };
-                }
                 throw failure;
             }
             return terminal;
@@ -1635,7 +904,7 @@ export class McHostClient {
         }
     }
 
-    /** Send one channel-0 control request and validate the tagged response. */
+    /* */
     private async controlRequest(
         active: ActiveConnection,
         bodyText: string,
@@ -1681,7 +950,6 @@ export class McHostClient {
     }
 
     // ------------------------------------------------------------------
-    // Route opening: validation, close races, and ambiguous-open handling.
     // ------------------------------------------------------------------
 
     private controlRouteOpen(
@@ -1697,16 +965,8 @@ export class McHostClient {
             () => undefined,
         );
         this.pendingRouteOpens.add(tracked);
-        this.routeOpenCounts.set(active, (this.routeOpenCounts.get(active) ?? 0) + 1);
         void tracked.finally(() => {
             this.pendingRouteOpens.delete(tracked);
-            const remaining = (this.routeOpenCounts.get(active) ?? 1) - 1;
-            if (remaining <= 0) this.routeOpenCounts.delete(active);
-            else this.routeOpenCounts.set(active, remaining);
-            // The settled continuation may have been the last obligation
-            // holding a draining predecessor open (its handle is in
-            // `liveRoutes` now, or the attempt failed): re-evaluate.
-            if (this.predecessor === active) this.maybeRetirePredecessor();
         });
         return run;
     }
@@ -1725,7 +985,7 @@ export class McHostClient {
         } catch (error) {
             // KTD9: an ambiguous channel-0 route.open (possible send, no
             // terminal) has no handle and Cancel is illegal on channel 0,
-            // so retire the generation before any recovery.
+            // so retire the generation before reconnecting.
             if (error instanceof McHostCallError && error.kind === "outcome_unknown") {
                 active.generation.retire("ambiguous_route_open", error);
             }
@@ -1748,8 +1008,7 @@ export class McHostClient {
             );
         }
         if (this.closeStarted) {
-            // KTD9 owner-close race: never cache the late route; best-effort
-            // Goodbye (a failed enqueue retires the generation internally).
+            // During an owner-close race, the client does not cache a late route and enqueues Goodbye best-effort because failed enqueue retires the generation internally.
             active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
             throw new McHostCallError(
                 "not_sent",
@@ -1762,7 +1021,6 @@ export class McHostClient {
     }
 
     // ------------------------------------------------------------------
-    // Managed route cache and its bounded allowlisted retry loop.
     // ------------------------------------------------------------------
 
     private async managedRouteHandle(
@@ -1785,15 +1043,13 @@ export class McHostClient {
             { kind: ManagedRouteKind }
         >;
         const consumerIdentity = this.envConsumerIdentity();
-        // The key stays daemon-independent so one logical binding owns one slot:
-        // a rotation retires the generation, so `isPrimaryLiveHandle` already
-        // refuses a handle from the previous daemon, and `assertExpectedDaemon`
-        // fences publication. Keying by identity instead would strand one entry
-        // per rotation and let a caller without an expectation open a second
-        // concurrent route for the same target.
+        // The daemon-independent key ensures one logical binding owns one slot.
+        // Generation retirement makes `isPrimaryLiveHandle` reject handles from the previous daemon.
+        // `assertExpectedDaemon` fences publication after daemon rotation.
+        // Keying by identity would strand one cache entry per daemon rotation.
+        // Identity-based keys would let callers without a daemon expectation open a second route for the same target.
         const key = routeCacheKey(target, identity, consumerIdentity);
-        // R1: one immutable route-open stage per caller, derived once and
-        // kept through every join and replacement decision.
+        // One immutable route-open stage per caller is derived once and kept through every join and replacement decision.
         const stage = deadline.stage(this.routeOpenDeadlineMs);
         const pace = makeReplacementPacer(stage, this.sleep);
         for (;;) {
@@ -1809,11 +1065,10 @@ export class McHostClient {
                 };
                 this.routes.set(key, cached);
             }
-            // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10). commentlint: allow(JUDGE)
+            // Only the active generation serves cached managed handles.
             if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) {
                 const active = this.active;
-                // Without a live connection the identity cannot be refreshed;
-                // the cached handle stays authoritative for its channel.
+                // Without a live connection, the identity cannot be refreshed, so the cached handle remains authoritative for its channel.
                 if (active === null) return cached.handle;
                 const currentIdentity = this.identityForConnection(active, baseIdentity);
                 if (
@@ -1842,7 +1097,7 @@ export class McHostClient {
             }
             let handle: RouteHandle;
             try {
-                // KTD2: owner awaits directly; a joiner races its own stage.
+                // The owner awaits directly; a joiner races its own stage.
                 handle = owner
                     ? await flight.promise
                     : await raceAgainstStage(flight.promise, stage, routeStageError);
@@ -1852,9 +1107,7 @@ export class McHostClient {
                 }
                 continue;
             }
-            // KTD4: adopt only the cache's current live handle for this route
-            // identity; a stale success recovers here, before any body-replay
-            // token is considered.
+            // Before considering any body-replay token, stale-success handling adopts only the cache's current live handle for this route identity.
             if (
                 this.routes.get(key) === cached &&
                 cached.handle === handle &&
@@ -1863,8 +1116,7 @@ export class McHostClient {
                 return handle;
             }
             if (stage.isExpired()) throw routeStageError();
-            // Pace the replacement open unless a live handle is already
-            // installed (the loop head adopts it without new I/O).
+            // The loop head adopts an installed live handle without new I/O.
             const current = this.routes.get(key);
             if (!(current?.handle && this.isPrimaryLiveHandle(current.handle))) {
                 await pace();
@@ -1874,9 +1126,9 @@ export class McHostClient {
     }
 
     /**
-     * Open one cached managed route under one bounded route-open deadline.
-     * Only the allowlisted momentary route.open rejections retry (with
-     * bounded backoff); transient connection failures reconnect; the
+     * The owner opens one cached managed route under a bounded route-open deadline.
+     * Only allowlisted momentary `route.open` rejections retry with bounded backoff.
+     * Transient connection failures reconnect.
      * application body is never sent before route success.
      */
     private async openCachedRoute(
@@ -1900,7 +1152,7 @@ export class McHostClient {
                 );
             }
             if (deadline.isExpired()) {
-                // KTD3: the owner's route-open budget is the failure authority.
+                // The owner's route-open budget determines when route opening fails.
                 flight.replaceable = true;
                 throw routeStageError();
             }
@@ -1909,17 +1161,15 @@ export class McHostClient {
                 active = await this.ensureConnection(deadline, expectedDaemonId);
             } catch (error) {
                 if (error instanceof McHostCallError) throw error;
-                // KTD3: a snapshot that outlives its stage names the clamped
-                // handshake budget, not the route budget, so it reconnects
-                // like any transient setup failure; every other
-                // connection-file failure stays terminal.
+                // A stage-expired snapshot reconnects under the clamped handshake budget; other `ConnectionFileError`s are terminal.
+                // A snapshot that outlives its stage uses the clamped handshake budget, not the route budget, and reconnects as a transient setup failure.
+                // Every other connection-file failure is terminal.
                 const transient =
                     isConsumerReconnectTransient(error) ||
                     (error instanceof ConnectionFileError && error.code === "deadline_expired");
                 if (transient && !this.closeStarted) {
                     if (await backoff()) continue;
-                    // KTD3: transient reconnects ended only because the
-                    // owner's budget ran out.
+                    // Transient reconnects continue until the owner's budget expires or a connection succeeds.
                     flight.replaceable = true;
                 }
                 throw new McHostCallError(
@@ -1963,7 +1213,7 @@ export class McHostClient {
                 if (error.code === "route_closed" || this.closeStarted) throw error;
                 if (error.kind === "terminal" && isRetryableRouteOpenCode(error.code)) {
                     if (await backoff()) continue;
-                    // KTD3: the allowlisted retry budget is owner budget.
+                    // The allowlisted retry budget is the owner's budget.
                     flight.replaceable = true;
                     throw new McHostCallError(
                         "not_sent",
@@ -1973,15 +1223,12 @@ export class McHostClient {
                     );
                 }
                 if (error.kind === "not_sent" || error.kind === "outcome_unknown") {
-                    // A local encode rejection is deterministic: the same
-                    // oversized control body fails every attempt, so neither
-                    // retry nor replacement can change the outcome.
+                    // When `error.code` is `control_body_too_large`, retries and replacements cannot change the deterministic encoding failure.
                     if (error.code === "control_body_too_large") throw error;
-                    // An ambiguous open already retired its generation; the
+                    // An `outcome_unknown` channel-0 `route.open` retires the generation because Cancel is illegal on channel 0 and no terminal or handle exists.
                     // next loop iteration reconnects under the same deadline.
                     if (await backoff()) continue;
-                    // KTD3: this transient surfaced only because the owner's
-                    // budget ran out; survivors may coalesce one replacement.
+                    // After the owner's route-open budget expires, remaining callers may coalesce on one replacement route.
                     flight.replaceable = true;
                     throw error;
                 }
@@ -1991,13 +1238,10 @@ export class McHostClient {
     }
 
     // ------------------------------------------------------------------
-    // Bounded owner close.
     // ------------------------------------------------------------------
 
     private async runClose(): Promise<void> {
         const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
-        // Cancel shadow publication FIRST: a commit racing owner close must not publish, and every shadow connection permit is released (R11). commentlint: allow(JUDGE)
-        if (this.recovery !== null) this.cancelRecovery(this.recovery);
         if (this.connecting) {
             try {
                 await this.connecting.promise;
@@ -2020,17 +1264,14 @@ export class McHostClient {
                 cancelWait?.();
             }
         }
-        // Primary and predecessor close under the same bounded deadline.
-        const conns = [this.active, this.predecessor].filter(
-            (conn): conn is ActiveConnection => conn !== null && !conn.generation.isRetired(),
-        );
+        const conns =
+            this.active !== null && !this.active.generation.isRetired() ? [this.active] : [];
         for (const conn of conns) conn.generation.enqueueConnectionGoodbye();
         await Promise.all(conns.map((conn) => conn.generation.flushWrites(deadline)));
         for (const conn of conns) conn.generation.retire("owner_close");
     }
 
     // ------------------------------------------------------------------
-    // Bounded, redacted diagnostics.
     // ------------------------------------------------------------------
 
     private emitDiagnostics(event: Omit<McHostDiagnosticsEvent, "atMs">): void {
@@ -2046,7 +1287,7 @@ export class McHostClient {
         try {
             observer(Object.freeze({ ...event, atMs: now }));
         } catch {
-            // Observer exceptions must never affect protocol work (KTD12).
+            // Observer exceptions must never affect protocol work.
         }
     }
 
@@ -2076,7 +1317,6 @@ export class McHostClient {
 }
 
 // ----------------------------------------------------------------------
-// Body encoding and terminal classification helpers.
 // ----------------------------------------------------------------------
 
 function encodeBody(body: unknown): DirectFrameBody {
@@ -2086,7 +1326,7 @@ function encodeBody(body: unknown): DirectFrameBody {
     return utf8FrameBody(text);
 }
 
-/** Canonical compact `route.open` request body (wire doc 7.2). */
+/* */
 function routeOpenBody(
     target: RouteTarget,
     identity: BindIdentity,
@@ -2123,13 +1363,13 @@ type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string
 
 function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody {
     if (body instanceof ReceiveLease) {
-        // A quarantined release throws after onRelease has already accounted
-        // the outcome; the unexpected_binary_response error must win here.
+        // A quarantined release throws only after `onRelease` accounts for the outcome.
+        // The method throws `unexpected_binary_response` only after `onRelease` accounts for the quarantined outcome.
         if (!body.isReleased()) {
             try {
                 body.release();
             } catch {
-                // Quarantine is already accounted by onRelease before the throw.
+                // `onRelease` must run before the throw so it accounts for quarantine.
             }
         }
         throw new McHostCallError(
@@ -2141,7 +1381,7 @@ function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody 
     return body;
 }
 
-/** Canonical `ErrorBody {code, message, retry_after_ms?}` into a terminal error. */
+/* */
 function terminalFromErrorBody(body: JsonReceiveBody): McHostCallError {
     if (typeof body.value === "object" && body.value !== null && !Array.isArray(body.value)) {
         const parsed = body.value as {
@@ -2204,15 +1444,6 @@ function requireOpArray(value: unknown, field: string, allowEmpty: boolean): str
 }
 
 function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSnapshot {
-    const keys = Object.keys(parsed).sort();
-    const expected = ["health", "metrics", "op"];
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-        throw new McHostCallError(
-            "terminal",
-            "host.status response rejected: unexpected shape",
-            "malformed_control_response",
-        );
-    }
     if (parsed.op !== "host.status") {
         throw new McHostCallError(
             "terminal",
@@ -2239,20 +1470,29 @@ function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSna
             "malformed_control_response",
         );
     }
+    const sharedMemory = parsed.shared_memory;
+    if (
+        sharedMemory !== undefined &&
+        (sharedMemory === null || typeof sharedMemory !== "object" || Array.isArray(sharedMemory))
+    ) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: shared_memory is not an object",
+            "malformed_control_response",
+        );
+    }
     return {
         health,
         metrics: parsed.metrics as Record<string, unknown>,
+        ...(sharedMemory === undefined
+            ? {}
+            : { sharedMemory: sharedMemory as Record<string, unknown> }),
     };
 }
 
 /**
- * A `catalog.list` response is an ordinary control response, so it follows the
- * wire doc Section 7.1 rule: unknown fields are ignored, both at the top level
- * and inside each module entry, which lets a host add backward-compatible
- * fields without breaking this client. The negotiation family (Section 7.7.1)
- * is the only closed-shape exception and is decoded elsewhere. Ignoring
- * unknown fields never relaxes the required ones: every field this snapshot
- * exposes is still rejected when absent, wrong-typed, or out of bounds.
+ * The decoder treats `catalog.list` as an open-shape control response: it ignores unknown fields but rejects missing, ill-typed, or out-of-bounds required fields.
+ * The decoder rejects responses whose required exposed fields are absent, ill-typed, or out of bounds.
  */
 function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot {
     const generation = parsed.generation;
@@ -2289,12 +1529,6 @@ function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot 
         ) {
             throw malformedCatalog("module_version is not a bounded nonempty string");
         }
-        // Count-bounded but deliberately not element-validated: `roles` is an
-        // opaque pass-through the protocol requires to survive intact, so it is
-        // typed `unknown[]` rather than cast to a shape this client would be
-        // guessing at. The whole body is already capped by
-        // MAX_CONTROL_BODY_LEN, so an unvalidated element is not a resource
-        // risk; any consumer that interprets a role must narrow it itself.
         const roles = record.roles;
         if (!Array.isArray(roles) || roles.length > MAX_CATALOG_ROLES) {
             throw malformedCatalog("roles is not a bounded array");
@@ -2308,39 +1542,6 @@ function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot 
         };
     });
     return { generation, subcOps, modules };
-}
-
-function wrapNegotiationError(error: unknown): Error {
-    if (error instanceof NegotiationError) {
-        return new McHostCallError(
-            "terminal",
-            `transport negotiation failed: ${error.message}`,
-            "negotiation_failed",
-            error,
-        );
-    }
-    return error instanceof Error ? error : new Error(String(error));
-}
-
-/**
- * Negotiation-path failure sanitizer: a wire Error terminal carries
- * peer-controlled text, so it is replaced with a bounded failure before it
- * can enter retirement info or caller-visible error graphs (R14). Every
- * other failure keeps `wrapNegotiationError` semantics.
- */
-function boundedNegotiationFailure(error: unknown): Error {
-    if (
-        error instanceof McHostCallError &&
-        error.kind === "terminal" &&
-        error.errorTerminal !== undefined
-    ) {
-        return new McHostCallError(
-            "terminal",
-            "transport negotiation failed: host error terminal",
-            "negotiation_failed",
-        );
-    }
-    return wrapNegotiationError(error);
 }
 
 function toManagedCallError(error: unknown): McHostCallError {
@@ -2370,8 +1571,7 @@ function routeCacheKey(
         ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
         : "";
     const credentialPart = Object.entries(identity.credential_fingerprints ?? {})
-        // Code-point sort (NOT localeCompare), matching `shared/stable-json.ts`:
-        // the key must not depend on the runtime's collation.
+        // Sort with UTF-16 code-unit comparison so the key does not depend on runtime collation.
         .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
         .map(([provider, fingerprint]) => `${provider}:${fingerprint}`)
         .join(",");

@@ -21,7 +21,7 @@ import { resolveMural } from "./resolve-mural";
 import { getMural } from "./storage-mural";
 import { setClaimMuralCue } from "./storage-mural-cues";
 
-/** The gated pool `ensureMuralRendered` builds a mural from. */
+/** `ensureMuralRendered` builds murals from this gated pool. */
 function muralPool(db: Database, projectIdentity: string): ProjectMemoryClaimSnapshot[] {
     const result = readProjectMemoryCurrentState(db, {
         projectIds: resolveProjectIdsForIdentities(db, [projectIdentity]),
@@ -31,7 +31,7 @@ function muralPool(db: Database, projectIdentity: string): ProjectMemoryClaimSna
     return result.items;
 }
 
-/** Seed one claim with a cue keyed to its current revision locator. */
+/* */
 function seedCuedClaim(
     db: Database,
     project: string,
@@ -131,8 +131,7 @@ describe("resolveMural", () => {
                 ids.push(claim.publicClaimId);
             }
             const entries = resolveMural(db, project, 200, muralPool(db, project));
-            // Some claims fit the 200-token budget (excluded from the mural),
-            // the rest overflow (included). So the mural is a strict subset.
+            // Claims that fit the 200-token budget are excluded from the mural.
             expect(entries.length).toBeGreaterThan(0);
             expect(entries.length).toBeLessThan(ids.length);
         } finally {
@@ -151,7 +150,6 @@ describe("resolveMural", () => {
                 category: "ARCHITECTURE",
                 importance: 50,
             });
-            // The cue below uses a locator that is not current.
             const stale = seedProjectMemoryClaim(db, {
                 projectIdentity: project,
                 content: "current content",
@@ -163,7 +161,7 @@ describe("resolveMural", () => {
                 revisionLocator: `${stale.publicClaimId}/r1/${"0".repeat(64)}`,
                 cue: "stale cue",
             });
-            // Current locator, older renderer epoch.
+            // The cue uses the current revision locator with an older renderer epoch.
             const oldEpoch = seedProjectMemoryClaim(db, {
                 projectIdentity: project,
                 content: "old renderer epoch content",
@@ -201,7 +199,7 @@ describe("resolveMural", () => {
 
             const entries = resolveMural(db, project, 1, muralPool(db, project));
             const order = entries.map((entry) => entry.publicClaimId);
-            // ARCHITECTURE band first (high before low), then NAMING band.
+            // The resolver orders the ARCHITECTURE band by descending importance before the NAMING band.
             expect(order.indexOf(archHigh.publicClaimId)).toBeLessThan(
                 order.indexOf(archLow.publicClaimId),
             );
@@ -209,8 +207,7 @@ describe("resolveMural", () => {
                 order.indexOf(naming.publicClaimId),
             );
 
-            // Claims with equal importance within a category band sort by
-            // public claim ID ascending.
+            // Equal-importance claims within a category band sort by ascending public claim ID.
             const archHigh2 = seedCuedClaim(db, project, "ARCHITECTURE", "arch high 2", 90);
             const after = resolveMural(db, project, 1, muralPool(db, project)).map(
                 (entry) => entry.publicClaimId,
@@ -273,8 +270,7 @@ describe("mural coverage gate", () => {
                 "quarantined mural secret",
                 99,
             );
-            // The mural is an image, so absence has to be asserted on the
-            // resolved entries: a hard-hidden row must never reach the render.
+            // Hard-hidden rows must be absent from resolved entries before rendering.
             const before = resolveMural(db, project, 1, muralPool(db, project));
             expect(before.map((entry) => entry.publicClaimId)).toContain(hidden.publicClaimId);
 
@@ -282,8 +278,7 @@ describe("mural coverage gate", () => {
 
             const after = resolveMural(db, project, 1, muralPool(db, project));
             expect(after.map((entry) => entry.publicClaimId)).not.toContain(hidden.publicClaimId);
-            // The PERSISTED manifest is the artifact later renders serve
-            // from, so absence must hold on its stored claim ids too.
+            // Later renders serve the PERSISTED manifest, so its stored claim IDs must exclude hard-hidden rows.
             const rendered = ensureMuralRendered(db, project, 1);
             expect(rendered.hasMural).toBe(true);
             const persisted = getMural(db, project);
@@ -373,7 +368,7 @@ describe("ensureMuralRendered (on-demand render + change detection)", () => {
             expect(stored?.width).toBe(first.width);
             expect(stored?.height).toBe(first.height);
 
-            // Same pool → same text hash → no re-render, same data URL bytes.
+            // Identical pools produce the same text hash, avoid rerendering, and return identical data URL bytes.
             const second = ensureMuralRendered(db, project, 100);
             expect(second.hasMural).toBe(true);
             expect(second.rerendered).toBe(false);
@@ -409,7 +404,6 @@ describe("ensureMuralRendered (on-demand render + change detection)", () => {
                 seedCuedClaim(db, project, "ARCHITECTURE", `fact ${i} padding words here now`, 50);
             }
             const first = ensureMuralRendered(db, project, 100);
-            // A new cued overflow claim changes the resolved text and
             // triggers re-rendering.
             seedCuedClaim(db, project, "NAMING", "a brand new naming cue entry appears", 90);
             const second = ensureMuralRendered(db, project, 100);
@@ -433,8 +427,7 @@ describe("ensureMuralRendered (on-demand render + change detection)", () => {
                     50,
                 );
             }
-            // Writing during the coverage cue-state read creates a
-            // claim-generation race before post-render revalidation.
+            // A write during the coverage cue-state read creates a claim-generation race before post-render revalidation.
             const originalPrepare = db.prepare.bind(db);
             let fired = false;
             db.prepare = ((sql: string) => {

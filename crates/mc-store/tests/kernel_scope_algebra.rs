@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use mc_store::kernel::{
     coerce_version, scope_equivalent, scope_matches, scope_overlaps, scope_subsumes,
     CanonicalScope, Dimension, GraphOracle, MatchOutcome, ScopeFormError, ScopeMatchContext,
-    ScopeTermSpec, TermValue, UnknownGraph,
+    ScopeTermSpec, TermValue, UnknownGraph, VersionSpec,
 };
 use proptest::prelude::*;
 
@@ -117,7 +117,9 @@ fn round_trips_every_dimension_operator_combination() {
                 "version_range" => {
                     assert_eq!(
                         term,
-                        &TermValue::VersionRange(">=1.2.0, <2.0.0".to_string())
+                        &TermValue::VersionRange(
+                            VersionSpec::parse(">=1.2.0, <2.0.0").expect("valid requirement")
+                        )
                     )
                 }
                 "git_reachable" => assert_eq!(term, &TermValue::GitReachable(oid(7))),
@@ -193,6 +195,40 @@ fn redaction_placeholder_branch_decodes_as_placeholder_term() {
     assert_eq!(
         decoded.term(Dimension::Branch),
         Some(&TermValue::RedactedPlaceholder)
+    );
+}
+
+#[test]
+fn keyed_and_operator_redaction_tokens_decode_as_placeholder_terms() {
+    // Covers the `<REDACTED:...>` and `[redacted:operator]` families, which
+    // carry no `_REDACTED>` fragment.
+    for value in [
+        "deploy_token=<REDACTED:token>",
+        "<REDACTED:bearer>",
+        "[redacted:operator]",
+    ] {
+        let decoded = scope(&[exact("branch", value)]);
+        assert_eq!(
+            decoded.term(Dimension::Branch),
+            Some(&TermValue::RedactedPlaceholder),
+            "{value} must decode as a placeholder"
+        );
+    }
+}
+
+#[test]
+fn keyed_redaction_tokens_never_match_or_subsume() {
+    let a = scope(&[exact("branch", "release/<REDACTED:key>")]);
+    let b = scope(&[exact("branch", "release/<REDACTED:key>")]);
+    let oracle = UnknownGraph;
+    assert!(!scope_subsumes(&a, &b, &oracle));
+    assert!(!scope_equivalent(&a, &b, &oracle));
+    let ctx = ScopeMatchContext::new().with_value(Dimension::Branch, "release/<REDACTED:key>");
+    assert_eq!(scope_matches(&a, &ctx, &oracle), MatchOutcome::Uncertain);
+    let plain = scope(&[exact("branch", "main")]);
+    assert_eq!(
+        scope_matches(&plain, &ctx, &oracle),
+        MatchOutcome::Uncertain
     );
 }
 
@@ -319,14 +355,111 @@ fn coerce_version_pads_and_demotes_suffixes() {
     let vendored = coerce_version("1.2.3ubuntu1").expect("vendor suffix coerces");
     assert_eq!((vendored.major, vendored.minor, vendored.patch), (1, 2, 3));
     assert!(
-        !vendored.pre.is_empty(),
-        "vendor suffix becomes pre-release"
+        vendored.pre.is_empty() && !vendored.build.is_empty(),
+        "vendor suffix becomes build metadata, not a pre-release"
+    );
+    // Kernel-style strings parse as strict semver with a pre-release; the
+    // qualifier must still land in build metadata so plain ranges match.
+    let kernel = coerce_version("5.15.0-91-generic").expect("kernel version coerces");
+    assert_eq!((kernel.major, kernel.minor, kernel.patch), (5, 15, 0));
+    assert!(kernel.pre.is_empty() && !kernel.build.is_empty());
+    let req = semver::VersionReq::parse(">=5.0.0").expect("valid requirement");
+    assert!(req.matches(&kernel), "suffixed version satisfies the range");
+    // Four-component platform versions truncate to the semver core.
+    assert_eq!(
+        coerce_version("10.0.19041.1"),
+        Some(semver::Version::new(10, 0, 19041))
     );
     let build = coerce_version("1.2.3+build.5").expect("build metadata parses");
     assert_eq!((build.major, build.minor, build.patch), (1, 2, 3));
     assert!(build.pre.is_empty());
     assert_eq!(coerce_version("not-a-version"), None);
     assert_eq!(coerce_version(""), None);
+}
+
+#[test]
+fn glued_vendor_suffix_keeps_every_later_component() {
+    let seven = coerce_version("5.4ubuntu2.91").expect("glued suffix coerces");
+    let nine = coerce_version("5.4ubuntu2.93").expect("glued suffix coerces");
+    assert_eq!((seven.major, seven.minor, seven.patch), (5, 4, 0));
+    assert_eq!(seven.build.as_str(), "ubuntu2.91");
+    assert_ne!(
+        seven, nine,
+        "distinct vendor revisions must not coerce onto one version"
+    );
+    let req = semver::VersionReq::parse(">=5.0.0, <6.0.0").expect("valid requirement");
+    assert!(req.matches(&seven) && req.matches(&nine));
+}
+
+#[test]
+fn prerelease_requirement_matches_the_prerelease_value() {
+    let pinned = scope(&[version_range("platform", "=1.0.0-beta.2")]);
+    let exact_pre = ScopeMatchContext::new().with_value(Dimension::Platform, "1.0.0-beta.2");
+    assert_eq!(
+        scope_matches(&pinned, &exact_pre, &UnknownGraph),
+        MatchOutcome::Matches,
+        "a requirement naming a prerelease compares against the written prerelease"
+    );
+    let other_pre = ScopeMatchContext::new().with_value(Dimension::Platform, "1.0.0-beta.3");
+    assert_eq!(
+        scope_matches(&pinned, &other_pre, &UnknownGraph),
+        MatchOutcome::DoesNotMatch
+    );
+    // A plain release range still ignores the qualifier, so kernel-style
+    // strings keep matching.
+    let plain = scope(&[version_range("platform", ">=5.0.0, <6.0.0")]);
+    let kernel = ScopeMatchContext::new().with_value(Dimension::Platform, "5.15.0-91-generic");
+    assert_eq!(
+        scope_matches(&plain, &kernel, &UnknownGraph),
+        MatchOutcome::Matches
+    );
+}
+
+#[test]
+fn reserved_payload_column_makes_a_term_malformed() {
+    let cases = [
+        (exact("branch", "main"), Dimension::Branch),
+        (set("environment", &["prod"]), Dimension::Environment),
+        (range("entity", Some("a"), Some("b")), Dimension::Entity),
+        (version_range("platform", ">=1.0.0"), Dimension::Platform),
+    ];
+    for (mut spec, dimension) in cases {
+        spec.payload = Some("{\"unsupported\":true}".to_string());
+        assert_eq!(
+            CanonicalScope::from_term_specs(&[spec]).unwrap_err(),
+            ScopeFormError::ConflictingColumns(dimension),
+            "no operator owns the payload column"
+        );
+    }
+}
+
+#[test]
+fn redacted_bounds_and_requirements_decode_uncertain() {
+    // Lexicographic order over replacement tokens is an artifact of which
+    // secret each one replaced, so ordering must not reject the scope.
+    let reversed = scope(&[range(
+        "branch",
+        Some("<GITHUB_TOKEN_REDACTED>"),
+        Some("<AWS_ACCESS_KEY_ID_REDACTED>"),
+    )]);
+    assert_eq!(
+        reversed.term(Dimension::Branch),
+        Some(&TermValue::RedactedPlaceholder)
+    );
+    let identical = scope(&[range(
+        "branch",
+        Some("<REDACTED:password>"),
+        Some("<REDACTED:password>"),
+    )]);
+    assert_eq!(
+        identical.term(Dimension::Branch),
+        Some(&TermValue::RedactedPlaceholder)
+    );
+    let requirement = scope(&[version_range("platform", ">=<REDACTED:bearer>")]);
+    assert_eq!(
+        requirement.term(Dimension::Platform),
+        Some(&TermValue::RedactedPlaceholder)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +695,7 @@ fn term_value_to_spec(dimension: Dimension, value: &TermValue) -> Option<ScopeTe
             Some(set(name, &values))
         }
         TermValue::Range { start, end } => Some(range(name, start.as_deref(), end.as_deref())),
-        TermValue::VersionRange(req) => Some(version_range(name, req)),
+        TermValue::VersionRange(spec) => Some(version_range(name, spec.raw())),
         TermValue::GitReachable(oid) => Some(git_reachable(name, oid)),
         TermValue::RedactedPlaceholder => None,
     }

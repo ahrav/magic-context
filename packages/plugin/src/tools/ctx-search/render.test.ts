@@ -15,8 +15,8 @@ import { packSearchResults } from "./render";
 
 const SESSION = "session-1";
 
-/** Text-only view of the packer, kept as a local helper so the rendering
- *  contract tests below stay focused on the emitted text. */
+/** formatSearchResults keeps rendering contract tests focused on emitted text.
+ * */
 function formatSearchResults(
     query: string,
     results: UnifiedSearchResult[],
@@ -137,14 +137,14 @@ describe("packed search text rendering", () => {
         const shownBlocks = (text.match(/\[\d+\] \[memory\]/g) ?? []).length;
         expect(shownBlocks).toBeGreaterThan(0);
         expect(shownBlocks).toBeLessThan(50);
-        // Ranked prefix: block indexes are 1..shownBlocks with none skipped.
+        // Shown blocks use consecutive indexes from 1 through shownBlocks.
         for (let index = 1; index <= shownBlocks; index += 1) {
             expect(text).toContain(`[${index}] [memory]`);
         }
         expect(text).toContain(
             `(${50 - shownBlocks} results omitted to fit the output budget — refine the query or lower the limit)`,
         );
-        // Complete blocks only: every shown block still carries its tail marker.
+        // Every shown block carries its tail marker.
         for (let index = 0; index < shownBlocks; index += 1) {
             expect(text).toContain(`tail-${index}`);
         }
@@ -178,8 +178,7 @@ describe("packed search text rendering", () => {
         // The lone message block ranks last, so packing drops it first.
         const results: UnifiedSearchResult[] = [...memories, messageResult(9, filler)];
         const text = formatSearchResults("hints", results, SESSION);
-        // Packing must omit the last-ranked message block so the test covers
-        // hint suppression after every source-bearing block is omitted.
+        // Packing suppresses the hint when it omits every source-bearing block.
         expect(text).not.toContain("[message]");
         expect(text).not.toContain("Use ctx_expand(start, end)");
         expect(estimateTokens(text)).toBeLessThanOrEqual(MAX_RENDERED_RESULT_TOKENS);
@@ -222,7 +221,6 @@ describe("packSearchResults", () => {
         expect(packed.delivered.length).toBe(shownBlocks);
         expect(packed.delivered).toEqual(results.slice(0, shownBlocks));
         expect(packed.omittedCount).toBe(50 - shownBlocks);
-        // Delivered blocks are fully rendered; omitted blocks are fully absent.
         for (const delivered of results.slice(0, shownBlocks)) {
             expect(packed.text).toContain(`id=${delivered.publicClaimId}`);
         }

@@ -117,12 +117,9 @@ describe("smart-note evaluation reducer characterization", () => {
 
 describe("dueReadyReason surrogate-boundary parity", () => {
     test("a cap that splits a surrogate pair drops the lone high surrogate", () => {
-        // Prefix "Smart note #1: " is 15 units; unit 240 falls inside an
-        // emoji pair when the signal is all non-BMP scalars (odd prefix).
+        // The 15-unit prefix makes a 240-unit cap split a non-BMP signal's surrogate pair.
         const signal = "\u{1F600}".repeat(200);
         const reason = dueReadyReason(1, JSON.stringify({ signals: [signal] }));
-        // The Rust reducer never emits a broken pair; both authorities must
-        // persist the identical 239-unit value.
         expect(reason.length).toBe(239);
         const last = reason.charCodeAt(reason.length - 1);
         expect(last >= 0xd800 && last <= 0xdbff).toBe(false);

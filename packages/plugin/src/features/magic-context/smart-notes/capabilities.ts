@@ -63,8 +63,6 @@ export function isSecretDeniedPath(repoRelativePath: string): boolean {
     if (segments.includes(".git") || segments.includes("secrets")) return true;
     const basename = segments.at(-1) ?? "";
 
-    // Smart-note checks may intentionally use egress, so readFile must be
-    // conservative about files that commonly hold credentials.
     if (basename === ".npmrc" || basename.startsWith(".env")) return true;
     if (basename === ".pgpass" || basename === ".netrc") return true;
     if (SECRET_KEY_EXTENSIONS.some((extension) => basename.endsWith(extension))) return true;
@@ -139,8 +137,7 @@ async function guardedReadFileBody(
     throwIfAborted(signal);
     if (!parentReal || !isPathInside(rootReal, parentReal)) return null;
 
-    // A parent directory may be a symlink, so policy must be re-applied to the
-    // canonical path rather than trusting only the caller's lexical spelling.
+    // A symlinked parent can move `target` outside `rootReal` or into a denied path; recheck the canonical path.
     const canonicalTarget = path.join(parentReal, path.basename(target));
     const canonicalRelative = normalizeRepoPath(path.relative(rootReal, canonicalTarget));
     if (

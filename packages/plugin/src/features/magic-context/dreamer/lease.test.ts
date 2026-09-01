@@ -53,13 +53,10 @@ describe("dreamer lease (atomic CAS)", () => {
 
     it("keyed leases for different domains do NOT block each other", () => {
         const db = makeDb();
-        // memory domain held — key-files and global user-memories stay free.
         expect(acquireLease(db, "h-mem", "memory:git:abc")).toBe(true);
         expect(acquireLease(db, "h-kf", "key-files:git:abc")).toBe(true);
         expect(acquireLease(db, "h-um", "user-memories")).toBe(true);
-        // Same memory domain, second holder → blocked.
         expect(acquireLease(db, "h-mem2", "memory:git:abc")).toBe(false);
-        // Same domain but DIFFERENT project → independent, free.
         expect(acquireLease(db, "h-mem3", "memory:git:other")).toBe(true);
         expect(getLeaseHolder(db, "memory:git:abc")).toBe("h-mem");
         expect(getLeaseHolder(db, "key-files:git:abc")).toBe("h-kf");
@@ -82,7 +79,6 @@ describe("dreamer lease (atomic CAS)", () => {
         const db = makeDb();
         expect(acquireLease(db, "legacy-holder")).toBe(true); // default = DREAMING_LEASE_KEY
         expect(isLeaseActive(db, DREAMING_LEASE_KEY)).toBe(true);
-        // A keyed domain lease is unaffected by the legacy lease being held.
         expect(acquireLease(db, "h-mem", "memory:git:abc")).toBe(true);
         expect(isLeaseActive(db)).toBe(true); // legacy still held
         closeQuietly(db);
@@ -91,7 +87,6 @@ describe("dreamer lease (atomic CAS)", () => {
     it("lets another holder reclaim an expired lease", () => {
         const db = makeDb();
         expect(acquireLease(db, "holder-a")).toBe(true);
-        // Force expiry in the past.
         db.prepare("UPDATE dream_state SET value = ? WHERE key = 'dreaming_lease_expiry'").run(
             String(Date.now() - 1),
         );
@@ -130,8 +125,7 @@ describe("dreamer lease (atomic CAS)", () => {
         expect(acquireLease(db, "holder-a", "memory:proj")).toBe(true);
         expect(db.prepare("CREATE TABLE guarded_writes (value TEXT)").run()).toBeDefined();
 
-        // Simulate the unsafe old pattern's gap: holder-a peeked successfully,
-        // then its lease expired and another runner claimed it before the write.
+        // A guarded write must recheck ownership after the lease can expire.
         expect(getLeaseHolder(db, "memory:proj")).toBe("holder-a");
         expireLease(db, "lease:memory:proj:expiry");
         expect(acquireLease(db, "holder-b", "memory:proj")).toBe(true);
@@ -157,7 +151,7 @@ describe("dreamer lease (atomic CAS)", () => {
         dbB.exec("PRAGMA journal_mode=WAL");
         try {
             const results = [acquireLease(dbA, "holder-a"), acquireLease(dbB, "holder-b")];
-            // Exactly one process may hold the global dream lease at a time.
+            // Exactly one holder may hold the default dream lease at a time.
             expect(results.filter(Boolean)).toHaveLength(1);
         } finally {
             closeQuietly(dbA);
@@ -231,7 +225,6 @@ describe("startLeaseHeartbeat", () => {
     it("reclaims a self-inflicted expiry instead of declaring lost (transient-tolerant)", async () => {
         const db = makeDb();
         expect(acquireLease(db, "holder-a")).toBe(true);
-        // Simulate a missed beat: the lease expired but nobody else took it.
         expireLease(db);
         let lostReason: string | null = null;
         const hb = startLeaseHeartbeat(
@@ -244,7 +237,7 @@ describe("startLeaseHeartbeat", () => {
             20,
         );
         await sleep(50);
-        // renew-or-reclaim: the heartbeat re-acquires the free lease, no loss.
+        // The heartbeat reclaims an unclaimed expired lease.
         expect(lostReason).toBeNull();
         expect(hb.lost).toBe(false);
         expect(getLeaseHolder(db)).toBe("holder-a");
@@ -253,11 +246,8 @@ describe("startLeaseHeartbeat", () => {
     });
 
     it("declares lost (not reclaim) when the lease lapsed past a full TTL — split-brain guard", async () => {
-        // A >TTL stall (e.g. machine sleep): our lease lapsed and a sibling could
-        // have acquired AND mutated in the gap. Even though the lease may now be
-        // free, blindly reclaiming + continuing on our stale snapshot is
-        // split-brain — the heartbeat must declare lost. (A short ≤TTL gap still
-        // reclaims; see the transient-tolerant test above.)
+        // After a >TTL gap, the heartbeat must report the lease lost rather than continue on a stale snapshot.
+        // The heartbeat can reclaim a lease after a ≤TTL gap.
         const db = makeDb();
         const realNow = Date.now();
         const clock = { value: realNow };
@@ -265,8 +255,6 @@ describe("startLeaseHeartbeat", () => {
         try {
             expect(acquireLease(db, "holder-a")).toBe(true);
             let lostReason: string | null = null;
-            // Short interval so a real timer beat fires; the FIRST synchronous
-            // beat confirms ownership at t0 (lastConfirmedAt = realNow).
             const hb = startLeaseHeartbeat(
                 db,
                 "holder-a",
@@ -278,9 +266,6 @@ describe("startLeaseHeartbeat", () => {
             );
             expect(hb.lost).toBe(false);
 
-            // Jump the clock 3 minutes (> 2min TTL): our own lease has lapsed
-            // (isLeaseActive false), so the next beat's renewLease fails and the
-            // gap exceeds the TTL.
             clock.value = realNow + 3 * 60 * 1000;
             await sleep(60);
 
@@ -339,7 +324,6 @@ describe("startLeaseHeartbeat", () => {
             },
             20,
         );
-        // A genuine theft: expire then let another holder claim it.
         expireLease(db);
         expect(acquireLease(db, "holder-b")).toBe(true);
         await sleep(80);

@@ -1,20 +1,11 @@
 /**
- * Focused real-host Synapse smoke: starts the `synapse_host` example over a
- * model bundle, then drives all four application operations through the
- * managed McHostClient — discovery, one query, an ambiguous batch replay, a
- * host restart with resubmission, and the degraded (unconfigured) lane.
  *
- * Hermetic mode (default) uses the committed synapse-tiny bundle and needs a
- * native ONNX Runtime shared library:
  *   MC_SYNAPSE_TEST_ORT_LIBRARY=/path/to/libonnxruntime.so \
  *     bun scripts/smoke-mc-host-synapse.ts
  *
- * Production mode certifies the exact owner-provisioned bundle and refuses
- * the toy fixture, placeholder hashes, and unexpected identity:
  *   MC_SYNAPSE_SMOKE_MODE=production \
  *   MC_SYNAPSE_SMOKE_BUNDLE=/path/to/bundle \
  *   MC_SYNAPSE_TEST_ORT_LIBRARY=/path/to/libonnxruntime.so \
- *   [MC_SYNAPSE_SMOKE_FINGERPRINT=… MC_SYNAPSE_SMOKE_DIMS=… MC_SYNAPSE_SMOKE_EPOCH=…] \
  *     bun scripts/smoke-mc-host-synapse.ts
  */
 
@@ -207,9 +198,6 @@ const manifest = readBundleJson<BundleManifest>("manifest.json");
 const corpus = readBundleJson<BundleCorpus>(String(manifest.corpus?.name ?? "corpus.json"));
 
 if (mode === "production") {
-    // The release smoke must never silently pass on the toy bundle or a
-    // placeholder identity. Only the positive assertion counts: an omitted or
-    // non-boolean provenance flag is refused, not waved through.
     if (manifest.provenance?.production !== true) {
         fail("production mode requires provenance.production === true");
     }
@@ -365,7 +353,6 @@ let degradedIsolated = false;
 let durableReceipts = false;
 
 try {
-    // ---------------- Degraded lane first: no bundle configured. -----------
     log("starting synapse_host with no bundle (degraded lane)");
     let connectionFile = await startHost("-");
     {
@@ -378,7 +365,6 @@ try {
             assert.equal(code, "artifact_invalid", `degraded bind code was ${code}`);
             log("degraded lane rejected with artifact_invalid (no retry storm)");
         }
-        // Magic Context stays routable beside the degraded lane.
         const handle = await client.routeOpen(
             { kind: "tool_provider", module_id: "magic-context" },
             identity,
@@ -391,7 +377,6 @@ try {
     }
     await stopHost(true);
 
-    // ---------------- Certified lane: all four operations. -----------------
     log(`starting synapse_host with bundle ${bundleDir} (${mode} mode)`);
     connectionFile = await startHost(bundleDir);
     const client = await McHostClient.connect({ connectionFile });
@@ -441,8 +426,6 @@ try {
         observedOperations.add("embed.batch");
         jobId = String(first.job_id);
         assert.equal(first.done, false);
-        // An ambiguous send replays the same canonical page and must reuse
-        // the retained job.
         const replay = body(await client.call("synapse", "embed.batch", batchParams, callOptions));
         assert.equal(replay.job_id, jobId, "an equal replay must reuse the job");
         log(`embed.batch admitted job ${jobId}; replay reused it`);
@@ -463,7 +446,6 @@ try {
         await client.closeAsync();
     }
 
-    // ---------------- Host restart: module_restarted then resubmit. --------
     log("restarting the host to fence the retained job");
     await stopHost(true);
     connectionFile = await startHost(bundleDir);
@@ -507,13 +489,10 @@ try {
         await restarted.closeAsync();
     }
 
-    // ---------------- Durable application into a real SQLite file. ---------
     log("running the durable ledger application against a file-backed database");
     {
         const dbPath = join(dataDir, "smoke.sqlite");
         const { db } = createDirectTestDatabase({ path: dbPath });
-        // Scratch destination for the receipt application; the ledger contract
-        // is destination-agnostic through writeDestination().
         db.exec(
             "CREATE TABLE smoke_embedding_destination (item_id TEXT NOT NULL, embedding BLOB NOT NULL, model_id TEXT NOT NULL, PRIMARY KEY(item_id, model_id))",
         );
@@ -623,12 +602,6 @@ if (mode === "production" && reportPath !== undefined) {
             kernel,
             glibc,
             exact_floor: kernel === "4.18" && glibc === "2.28",
-            // `checkOracleEvidence` requires this exact key and feeds it to
-            // `evaluatePlatform`, then requires the report host to equal the
-            // oracle host canonically. Omitting it made every report from this
-            // script inadmissible as production evidence on any host, however
-            // valid. Probed through the same function the lifecycle gate uses,
-            // so the recorded fact is the one that was actually evaluated.
             procfs_self_fd_exec: detectProcSelfFd(),
         },
         inputs: {
@@ -645,17 +618,7 @@ if (mode === "production" && reportPath !== undefined) {
         degraded_isolated: degradedIsolated,
         durable_receipts: durableReceipts,
         network_access: (() => {
-            // Any route out of the namespace on any interface but loopback, in
-            // either family. The old predicate looked only for an IPv4 default
-            // route, so a namespace holding a specific IPv4 route or any IPv6
-            // route recorded `none` — and `buildLock` treats `none` as proof the
-            // oracle ran offline, letting a routable namespace mint production
-            // evidence that claims networking was disabled.
             //
-            // This still infers isolation from the routing table rather than
-            // proving it. Enforce isolation externally where the claim has to be
-            // airtight; an unreadable table is reported as reachable because it
-            // proves nothing either way.
             const routed = (
                 path: string,
                 header: boolean,
@@ -676,8 +639,6 @@ if (mode === "production" && reportPath !== undefined) {
                         return dev !== undefined && dev !== "lo";
                     });
             };
-            // `/proc/net/route` carries a header row and names the interface
-            // first; `/proc/net/ipv6_route` has no header and names it last.
             const reachable =
                 routed("/proc/net/route", true, (fields) => fields[0]) ||
                 routed("/proc/net/ipv6_route", false, (fields) => fields[fields.length - 1]);

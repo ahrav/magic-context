@@ -1,10 +1,6 @@
 /**
- * Playground: tag-owner migration backfill measurement.
  *
- * Tests the proposed Option 12 fix without touching real MC data:
- *   - Adds tool_owner_message_id column
- *   - Backfills oldest assistant message id for each tool tag's callID
- *   - Reports timing, coverage, orphan stats, and validates invariants
+ * The script backfills the oldest assistant message ID for each tool tag's callID.
  *
  * Usage:
  *   bun packages/plugin/scripts/playground-migrate-tag-owners.ts \
@@ -76,7 +72,6 @@ function main() {
     mc.exec("PRAGMA synchronous=NORMAL");
     mc.exec(`ATTACH '${args.ocPath}' AS oc`);
 
-    // ── Step 1: schema migration ──────────────────────────────────────────
     const t0 = performance.now();
     const cols = mc
         .prepare("PRAGMA table_info(tags)")
@@ -89,8 +84,8 @@ function main() {
             console.log("           will ROLLBACK at end so no on-disk change.");
             mc.exec("BEGIN");
             mc.exec("ALTER TABLE tags ADD COLUMN tool_owner_message_id TEXT DEFAULT NULL");
-            // We'll rollback at end; meanwhile UPDATE statements are real
-            // SQL prepared against the in-txn schema — but rollback discards them.
+            // UPDATE statements execute before ROLLBACK.
+            // ROLLBACK removes the added column and all dry-run updates.
         } else {
             mc.exec("ALTER TABLE tags ADD COLUMN tool_owner_message_id TEXT DEFAULT NULL");
         }
@@ -100,12 +95,10 @@ function main() {
     }
     console.log("");
 
-    // ── Step 2: build per-session callID -> oldest_assistant_msg_id map ──
-    // Strategy: one big query per session. We avoid 185k point queries.
+    // Query each session once instead of issuing one point query per tool tag.
     console.log("Step 2: backfill tool_owner_message_id");
     const t1 = performance.now();
 
-    // Sessions in MC that have tool tags
     const sessionsWithToolTagsRow = mc
         .prepare(
             `SELECT DISTINCT session_id FROM tags WHERE type='tool' AND tool_owner_message_id IS NULL`,
@@ -116,7 +109,6 @@ function main() {
 
     // Prepared statements.
     // Mirror packages/plugin/src/hooks/magic-context/tool-drop-target.ts
-    // extractToolCallObservation() shape coverage:
     //   - type='tool' or type='tool-invocation' → callID lives in $.callID
     //   - type='tool_use' (Anthropic shape) → callID lives in $.id
     // We only want assistant-side parts (invocations or OpenCode's combined
@@ -159,7 +151,7 @@ function main() {
     let largestSessionTime = 0;
     let largestSessionId = "";
 
-    // Buffer all updates and run inside a single transaction for speed
+    // A single transaction avoids per-update commit overhead.
     const updateAll = mc.transaction(
         (
             updates: Array<{ sessionId: string; callId: string; ownerId: string }>,
@@ -172,15 +164,13 @@ function main() {
 
     for (const { session_id: sessionId } of sessionsWithToolTagsRow) {
         const sessionStart = performance.now();
-        // 2a. Get the canonical "oldest assistant per callID" map for this session
-        // by walking OpenCode's parts.
+        // OpenCode parts map each callID to its oldest assistant message.
         const rows = findOwnerStmt.all(sessionId) as Array<{
             callid: string;
             owner_id: string;
             t_created: number;
         }>;
 
-        // Reduce to oldest per callid
         const oldestByCallId = new Map<string, { ownerId: string; tCreated: number }>();
         for (const r of rows) {
             const existing = oldestByCallId.get(r.callid);
@@ -192,7 +182,6 @@ function main() {
             }
         }
 
-        // 2b. Find tool tags for this session that need owner
         const toolTagRows = mc
             .prepare(
                 `SELECT message_id FROM tags WHERE session_id=? AND type='tool' AND tool_owner_message_id IS NULL`,
@@ -258,7 +247,6 @@ function main() {
     console.log(`  Slowest session:               ${largestSessionId} took ${fmtMs(largestSessionTime)}`);
     console.log("");
 
-    // ── Step 3: validate invariants ──────────────────────────────────────
     console.log("Step 3: validate post-migration invariants");
     const t3 = performance.now();
 
@@ -277,8 +265,7 @@ function main() {
         `  Tool tags with non-NULL owner that DOESN'T exist in OpenCode: ${orphanCount.n}`,
     );
 
-    // Invariant 2: detect collisions — multiple tool tags for same (session, callID) but
-    // different owners. These are the cases the new column should disambiguate.
+    // tool_owner_message_id distinguishes tool tags that share a (session, callID) but have different owners.
     const collisions = mc
         .prepare(
             `SELECT session_id, message_id AS callid,
@@ -306,7 +293,6 @@ function main() {
         }
     }
 
-    // Invariant 3: count NULL owners by reason
     const nullStats = mc
         .prepare(
             `SELECT COUNT(*) AS total_null,
@@ -318,7 +304,6 @@ function main() {
     console.log(`  NULL-owner tool tags (orphaned legacy):`);
     console.log(`    total: ${fmtCount(nullStats.total_null)} (active=${fmtCount(nullStats.null_active)} dropped=${fmtCount(nullStats.null_dropped)})`);
 
-    // Invariant 4: sessions where backfill failed entirely
     const failedSessions = mc
         .prepare(
             `SELECT t.session_id, COUNT(*) AS unmapped_tags,
@@ -336,7 +321,6 @@ function main() {
         }
     }
 
-    // Invariant 5: spot-check the user's known-bad session
     const bug = mc
         .prepare(
             `SELECT tag_number, status, message_id, tool_owner_message_id

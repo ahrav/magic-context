@@ -122,14 +122,6 @@ if [[ -d "$BENCHMARKS_SOURCE/.cortexkit" ]]; then
     cp -R "$BENCHMARKS_SOURCE/.cortexkit" "$SNAPSHOT/repo/.cortexkit"
 fi
 
-# OpenCode loads directory plugins through their package.json entry. The dist
-# bundle inlines almost everything but externalizes @opencode-ai/plugin (the
-# host resolves it through the workspace node_modules), so the snapshot
-# package declares exactly that one dependency and installs it here on the
-# host. The subtree is pure JS, so a host-side install is portable to the
-# linux container. The full plugin package.json is deliberately NOT copied:
-# its dependency list includes macOS-native onnx binaries that cannot load
-# inside the container.
 cp -R "$PLUGIN_DIST/." "$SNAPSHOT/plugin/dist/"
 plugin_version=$(jq -r '.version' "$REPO_ROOT/packages/plugin/package.json")
 plugin_api_version=$(jq -r '.version' \

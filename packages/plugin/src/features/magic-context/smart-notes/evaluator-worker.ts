@@ -30,13 +30,12 @@ export interface EvaluatorWorkerPolicy {
 export interface SmartNoteEvaluatorWorkerDeps {
     transport: EvaluatorWorkerTransport;
     /**
-     * Build the phase executors for one claimed snapshot. Executors run QuickJS
-     * through `runCompiledSmartNoteCheck`, so each sandbox execution serializes
-     * itself for exactly its own window. The worker deliberately holds no
-     * process-wide sandbox reservation across a claim: a claim lease outlives a
-     * bounded QuickJS run by orders of magnitude, so waiting behind one run is
-     * cheap, whereas holding the global slot across an LLM compile or fallback
-     * confirmation would stall every other project's sweep for the length of a
+     * Executors run QuickJS through `runCompiledSmartNoteCheck`.
+     * Each `runCompiledSmartNoteCheck` call serializes only its own sandbox execution.
+     * The worker does not reserve a process-wide sandbox slot for a claim lease.
+     * A claim lease outlasts a bounded QuickJS run.
+     * The worker reserves the sandbox only for QuickJS execution, not LLM compilation or fallback confirmation.
+     * Holding the global sandbox slot during LLM compilation or fallback confirmation would block other projects for a network round-trip.
      * network round-trip.
      */
     executors: (
@@ -101,10 +100,9 @@ function outcomeWire(outcome: SmartNoteEvaluationOutcome): Record<string, unknow
 }
 
 /**
- * Client-initiated evaluator worker for the Rust note authority (protocol
- * v2.0, zero-wait polling). The worker owns explicit registration lifecycle:
- * availability exists only while registration and heartbeat are live, and a
- * host restart or route teardown withdraws it without any persisted state.
+ * The worker owns the registration lifecycle.
+ * Availability exists only while registration and heartbeats are live.
+ * A host restart or route teardown withdraws registration without persisted state.
  */
 export class SmartNoteEvaluatorWorker {
     private readonly deps: SmartNoteEvaluatorWorkerDeps;
@@ -113,9 +111,9 @@ export class SmartNoteEvaluatorWorker {
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     private pendingAcquisitionId: string | null = null;
     private disposed = false;
-    /** Whether the most recent abandon actually released the claim. */
+    /* */
     private lastAbandonReleased = true;
-    /** Abort handle for the claim currently executing, if any. */
+    /* */
     private activeClaimController: AbortController | null = null;
     /** Settlement of the claim currently executing; never rejects. */
     private activeClaimSettled: Promise<void> | null = null;
@@ -133,9 +131,6 @@ export class SmartNoteEvaluatorWorker {
     }
 
     /**
-     * Claim-renewal cadence. An explicit dependency override wins for tests;
-     * otherwise follow the cadence the authority published at registration so a
-     * lease change on the Rust side cannot silently outrun the client.
      */
     private claimRenewIntervalMs(): number {
         return this.deps.heartbeatMs ?? this.registration?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
@@ -146,10 +141,7 @@ export class SmartNoteEvaluatorWorker {
     }
 
     /**
-     * Registration-identity fence accepted by every fenced method. The module
-     * validates each method against a closed field set, so this carries only the
-     * fields common to all of them; claim-scoped calls add `evaluator_slot`
-     * through {@link claimBody}.
+     * Every fenced method validates the registration identity.
      */
     private fencedBody(extra: Record<string, unknown>): Record<string, unknown> {
         if (!this.registration) throw new Error("evaluator worker is not registered");
@@ -162,7 +154,7 @@ export class SmartNoteEvaluatorWorker {
         };
     }
 
-    /** Fence for the claim-scoped methods (next/renew/complete/abandon). */
+    /** The registration fence applies to claim-scoped methods: next, renew, complete, and abandon. */
     private claimBody(extra: Record<string, unknown>): Record<string, unknown> {
         return this.fencedBody({ evaluator_slot: EVALUATOR_SLOT, ...extra });
     }
@@ -170,10 +162,8 @@ export class SmartNoteEvaluatorWorker {
     async register(signal?: AbortSignal): Promise<boolean> {
         if (this.disposed) return false;
         if (this.registration) return true;
-        // Concurrent callers (the hook's eager startup register racing a timer
-        // drain's lazy register) must share one attempt: two successful
-        // registrations would silently overwrite each other, leaking whichever
-        // token loses as a module-side registration no heartbeat sustains.
+        // Concurrent `register()` callers share one attempt to prevent successful registrations from overwriting each other's tokens.
+        // Concurrent successful registrations would overwrite one token and leave it without heartbeats.
         if (this.registerInFlight) return this.registerInFlight;
         const attempt = this.registerAttempt(signal);
         this.registerInFlight = attempt;
@@ -204,9 +194,8 @@ export class SmartNoteEvaluatorWorker {
                 }),
             );
         } catch (error) {
-            // A transient transport failure stays local: callers treat false as
-            // "unavailable, retry on the next drain", while a throw here would
-            // propagate out of drainOnce and abort the caller's whole sweep tick.
+            // Return `false` after a transport failure so callers can continue without surfacing the failure.
+            // Throwing would abort the `drainOnce` sweep tick.
             this.logLine(`registration failed: ${error}`);
             return false;
         }
@@ -217,9 +206,9 @@ export class SmartNoteEvaluatorWorker {
             return false;
         }
         if (this.disposed) {
-            // Disposal raced the in-flight registration. Installing the token
-            // would start a heartbeat that keeps the module advertising an
-            // evaluator no drain path will ever service; release it instead.
+            // Disposal can race an in-flight registration.
+            // Installing the token would start a heartbeat that advertises an unserviceable evaluator.
+            // No drain path services the evaluator; unregister the token.
             try {
                 await this.deps.transport.call({
                     method: "note.evaluation.unregister",
@@ -235,8 +224,6 @@ export class SmartNoteEvaluatorWorker {
             }
             return false;
         }
-        // Follow the authority's published renewal cadence; fall back only when
-        // the field is absent so the lease and the client cannot drift apart.
         const publishedHeartbeat = response.heartbeat_ms;
         this.registration = {
             token,
@@ -248,10 +235,8 @@ export class SmartNoteEvaluatorWorker {
         };
         this.lastAbandonReleased = true;
         this.startHeartbeat();
-        // Callers that joined this attempt (register() shares one in-flight
-        // promise) may have changed the policy after the registration request
-        // captured its snapshot. Republish so the module does not hold a stale
-        // wake/retina policy until the periodic heartbeat.
+        // Callers sharing `register()`'s in-flight promise can change policy after the request captures policy.
+        // Republishing prevents stale wake/retina policy until the next periodic heartbeat.
         const current = this.deps.policy();
         if (
             current.wakeOwned !== policy.wakeOwned ||
@@ -295,26 +280,19 @@ export class SmartNoteEvaluatorWorker {
                 this.dropRegistration(registration);
             }
         } catch (error) {
-            // A throw is the module's error-frame path (bad_request,
-            // registration_unknown after a module restart), which means the lease
-            // is not renewed. Retaining the registration here would make
-            // `registered` report a liveness the module has already dropped and
-            // would stop `drainOnce` from ever re-registering.
             this.logLine(`heartbeat failed; dropping registration: ${error}`);
             this.dropRegistration(registration);
         }
     }
 
     private dropRegistration(checked: Registration): void {
-        // Overlapping heartbeats can settle out of order: a slow failure for a
-        // registration that re-registration already replaced must not tear
-        // down the replacement or abort its claim.
+        // The identity check ignores heartbeat failures from replaced registrations.
+        // A slow failure for an old registration must not tear down its replacement.
+        // A heartbeat failure for an old registration must not abort the replacement's claim.
         if (this.registration !== checked) return;
         this.registration = null;
         this.stopHeartbeat();
-        // Without credentials the running claim can neither complete nor
-        // abandon (claimBody requires a registration), so letting its executor
-        // finish only burns the prompt; the claim replays after re-registration.
+        // Without registration, a running claim cannot complete or abandon.
         this.activeClaimController?.abort(new Error("evaluator registration dropped"));
     }
 
@@ -340,34 +318,14 @@ export class SmartNoteEvaluatorWorker {
 
     async dispose(): Promise<void> {
         this.disposed = true;
-        // Abort in-flight claim work and wait for its terminal release while
-        // the registration is still live: unregistering first would strand the
-        // claim active until lease expiry with its executor still running.
         this.activeClaimController?.abort(new Error("evaluator worker disposed"));
         await this.activeClaimSettled;
         await this.unregister();
     }
 
     /**
-     * Zero-wait drain: poll for Rust-selected work until the authority reports
-     * no_work, the deadline passes, or the signal aborts.
      *
-     * Normal phase fairness lives in the authority: each (registration, slot,
-     * mode) owns a bounded selection cycle (full 10/5/3/3 across
-     * due/compile/liveness/fallback; nonbillable 10/10 across due/liveness).
-     * The authority separates the two reasons it can report no work: a spent
-     * cycle answers `cycle_exhausted` (and resets that cycle), while an empty
-     * queue answers plain `no_work`. Only the latter is a drained queue. This
-     * drain consumes one `cycle_exhausted` before it claims anything, so a
-     * cursor left spent by an earlier truncated drain costs one poll instead of
-     * this whole pass. The client-side caps below are defensive backstops for
-     * recovered claims and malformed authorities, not the fairness mechanism.
      *
-     * `excludeBillable` asks the authority for sandbox-only phases (due,
-     * liveness); compile and fallback claims launch LLM prompts and belong to
-     * the scheduled full-budget drain. `maxCompilePerRun`/`maxFallbackPerRun`
-     * bound the billable claims this drain executes client-side (default: the
-     * legacy per-run caps).
      */
     async drainOnce(args: {
         deadline: number;
@@ -376,11 +334,7 @@ export class SmartNoteEvaluatorWorker {
         maxCompilePerRun?: number;
         maxFallbackPerRun?: number;
     }): Promise<DrainResult> {
-        // Serialize drains: the timer sweep, the scheduled dreamer task, and a
-        // manual /ctx-dream can all reach this worker concurrently, and the
-        // acquisition id, evaluator slot 0, and active-claim fields are shared
-        // per-instance state. Interleaved drains would replay one durable
-        // claim into two executors.
+        // Interleaved drains would replay one durable claim to two executors.
         const run = this.drainChain.then(
             () => this.drainOnceExclusive(args),
             () => this.drainOnceExclusive(args),
@@ -409,24 +363,21 @@ export class SmartNoteEvaluatorWorker {
         if (!this.registration) {
             if (!(await this.register(args.signal))) return result;
         }
-        // The authority's fallback cycle already excludes notes it claimed in
-        // this cycle, so a healthy drain never sees a repeat. A repeat can
-        // still arrive from a recovered claim or a malformed authority; one
-        // confirmation prompt per note per drain bounds that billable loop.
+        // The authority excludes notes claimed during the current fallback cycle.
+        // The authority returns each fallback note at most once per cycle.
+        // Recovered claims and malformed authorities can return a repeated fallback note.
+        // One confirmation prompt per note per drain bounds repeated billable fallback prompts.
         const fallbackAttempted = new Set<number>();
-        // Authority-side quota exhaustion returns no_work before these caps
-        // bind; they survive as backstops so a recovered billable claim or a
-        // malformed authority still cannot launch more than
-        // MAX_COMPILE_PER_RUN compiler prompts and MAX_FALLBACK_PER_RUN
-        // confirmation prompts in one pass.
+        // Authority-side quota exhaustion returns `no_work` before the client-side caps bind.
+        // The client-side caps prevent recovered claims and malformed authorities from exceeding per-run prompt limits.
+        // A drain runs at most `maxCompile` compiler prompts.
+        // A drain runs at most `maxFallback` confirmation prompts.
         let compileClaims = 0;
         let fallbackClaims = 0;
-        // A cursor left spent by an earlier truncated drain answers this pass's
-        // first poll with `cycle_exhausted`. Consuming that answer once, before
-        // this pass has claimed anything, lets the pass run against the cursor
-        // the authority just reset. Once this pass has claimed work the cursor
-        // is its own, so exhaustion is a real pass boundary and the phase
-        // quotas must not be handed out twice.
+        // A cursor spent by an earlier truncated drain returns `cycle_exhausted` on the next pass's first poll.
+        // The drain consumes one `cycle_exhausted` only before claiming work.
+        // After the drain claims work, `cycle_exhausted` marks a real pass boundary.
+        // The drain must not allocate phase quotas twice.
         let cycleResetConsumed = false;
         const maxCompile = args.maxCompilePerRun ?? MAX_COMPILE_PER_RUN;
         const maxFallback = args.maxFallbackPerRun ?? MAX_FALLBACK_PER_RUN;
@@ -438,12 +389,11 @@ export class SmartNoteEvaluatorWorker {
                     cycleResetConsumed = true;
                     continue;
                 }
-                // This pass spent its own cycle: a real pass boundary.
+                // The drain must not reset phase quotas after it exhausts its own cycle.
                 result.drained = true;
                 break;
             }
             if (next === "no_work") {
-                // Nothing is eligible for this mode right now.
                 result.drained = true;
                 break;
             }
@@ -451,12 +401,9 @@ export class SmartNoteEvaluatorWorker {
             if (next === "stop") break;
             result.claimed += 1;
             if (this.disposed || args.signal?.aborted || !this.registration) {
-                // dispose() may have aborted and unregistered — or a failed
-                // heartbeat dropped the registration — while next() was in
-                // flight; executing would start a potentially billable claim
-                // with no credentials left to complete or abandon it.
-                // Best-effort release — if the registration is already gone,
-                // the lease expires server-side.
+                // dispose() or a failed heartbeat can remove the registration while next() is in flight.
+                // Executing after registration loss can start a billable claim with no credentials to complete or abandon it.
+                // If the registration is gone, abandon() relies on server-side lease expiry.
                 this.lastAbandonReleased = await this.abandon(
                     next.claimId,
                     "registration lost during poll",
@@ -476,10 +423,7 @@ export class SmartNoteEvaluatorWorker {
                 }
             }
             if (next.snapshot.phase === "fallback") {
-                // Re-selection of an already-attempted note within one drain
-                // means the authority is not honoring its in-cycle fallback
-                // exclusion (or a recovered claim replayed); end the drain
-                // without consuming a fallback budget slot.
+                // A repeated fallback note ends the drain without consuming a fallback budget slot.
                 if (fallbackAttempted.has(next.noteId)) {
                     this.lastAbandonReleased = await this.abandon(
                         next.claimId,
@@ -511,17 +455,14 @@ export class SmartNoteEvaluatorWorker {
                 this.activeClaimSettled = null;
             }
             if (done === "conflict") {
-                // The store fenced this one claim; other queued phases are
-                // unaffected. Counted as abandoned: claimed but not completed.
+                // A conflict is counted as abandoned because the claim was not completed.
                 result.abandoned += 1;
                 continue;
             }
             if (done === "failed") break;
             if (done === "abandoned") {
                 result.abandoned += 1;
-                // A claim we could not terminally release is still active, so the
-                // authority would hand the same phase back on the next poll.
-                // Stop instead of re-running it until the lease expires.
+                // The drain stops polling after `abandon()` cannot release a claim to avoid reclaiming the active phase.
                 if (!this.lastAbandonReleased) break;
                 continue;
             }
@@ -551,8 +492,7 @@ export class SmartNoteEvaluatorWorker {
                 }),
             );
         } catch (error) {
-            // Unknown outcome: keep the acquisition id so the durable decision
-            // is recovered instead of leasing a second note.
+            // The client retains the acquisition ID after an unknown outcome so the next poll recovers any durable decision instead of leasing a second note.
             this.logLine(`next failed (will replay acquisition): ${error}`);
             return "stop";
         }
@@ -568,10 +508,7 @@ export class SmartNoteEvaluatorWorker {
                     phase !== "liveness" &&
                     phase !== "fallback")
             ) {
-                // The authority already granted a durable claim under this
-                // acquisition id. Keep the id so the next poll replays that
-                // decision instead of minting a fresh UUID and stranding the
-                // leased note until its lease expires.
+                // The client retains the acquisition ID after an unknown outcome so the next poll can replay a durable decision.
                 this.logLine("next returned a malformed claim (will replay acquisition)");
                 return "stop";
             }
@@ -595,20 +532,13 @@ export class SmartNoteEvaluatorWorker {
             };
         }
         if (result === "no_work") {
-            // The authority recorded (or replayed) a durable decision for this
-            // acquisition; it is consumed.
+            // A recorded or replayed durable decision consumes the acquisition ID.
             this.pendingAcquisitionId = null;
-            // `cycle_exhausted` means the answer came from a spent selection
-            // cursor, not an empty queue, and the authority has already reset
-            // that cursor. Reporting it as a drained queue would let a drain
-            // truncated by its deadline silently cost the next drain its whole
-            // pass. Older authorities omit the field and stay on the plain path.
+            // The client resets the cursor on `cycle_exhausted` so deadline-truncated drains preserve the next pass; absent fields use the plain path.
             return response.cycle_exhausted === true ? "cycle_exhausted" : "no_work";
         }
         if (result === "expired") {
-            // The replayed decision aged out of the authority's retention
-            // window: it says nothing about whether work exists NOW. Consume
-            // the stale id and poll again with a fresh acquisition.
+            // The client discards an expired replay acquisition ID and polls with a fresh ID because work availability is unknown.
             this.pendingAcquisitionId = null;
             return "retry";
         }
@@ -618,23 +548,18 @@ export class SmartNoteEvaluatorWorker {
             result === "stale" ||
             result === "invalid"
         ) {
-            // A lost claim response whose claim later reached a terminal state
-            // (completed, released, or fenced by a note edit) replays that
-            // terminal kind. The decision is consumed; retaining the id would
-            // replay it forever and wedge the worker.
+            // The client treats a lost claim response as unresolved until the client recovers the claim's terminal state.
+            // A recovered terminal state (`completed`, `released`, or fenced by a note edit) replays its terminal kind.
+            // Consume the acquisition ID after a terminal decision; retaining it would replay the decision forever and wedge the worker.
             this.pendingAcquisitionId = null;
             return "retry";
         }
         if (result === "authority_changed") {
-            // Terminal replay or a live authority transition: either way the
-            // acquisition is spent and this drain should not keep polling
-            // through the handover.
+            // Terminal replay and live authority transitions consume the acquisition, so the drain stops polling through the handover.
             this.pendingAcquisitionId = null;
             return "stop";
         }
-        // `busy` records no durable decision, and an unrecognized result is an
-        // unknown outcome: keep the acquisition id so the next poll replays
-        // whatever decision may exist instead of leasing a second note.
+        // `busy` records no durable decision. An unrecognized result retains the acquisition ID so the next poll can replay any durable decision instead of leasing a second note.
         if (result === "busy") return "stop";
         this.logLine(`next returned ${String(result)}`);
         return "stop";
@@ -674,18 +599,15 @@ export class SmartNoteEvaluatorWorker {
             );
             const result = response.result;
             if (result === "applied" || result === "replayed") {
-                // `applied` returns the note payload flat; `replayed` nests the
-                // recovered payload under `response`, so unwrap before reading
-                // the status or a replayed surface is miscounted as a plain
+                // `applied` returns the note payload flat, but `replayed` nests it under `response`; unwrap the replayed payload before reading its status.
+                // Unwrapping the replayed payload prevents a replayed surface from being miscounted as a plain surface.
                 // completion.
                 const applied = result === "replayed" ? asRecord(response.response) : response;
                 return applied.status === "ready" ? "surfaced" : "completed";
             }
             if (result === "stale" || result === "expired") {
-                // Per-note outcomes: a concurrent edit/dismissal fenced the
-                // claim (the revision-fence CAS working as designed) or the
-                // lease lapsed. The claim is already terminal server-side, so
-                // the drain can move on to unrelated work.
+                // A concurrent edit or dismissal can fence the claim, and a lapsed lease is terminal server-side; the drain can move to unrelated work.
+                // A lapsed lease is terminal server-side, so the drain can move to unrelated work.
                 this.logLine(`completion for note #${claim.noteId} superseded: ${String(result)}`);
                 return "conflict";
             }
@@ -721,10 +643,7 @@ export class SmartNoteEvaluatorWorker {
         } catch (error) {
             this.logLine(`renew failed: ${error}`);
             if (isRetry) {
-                // The renewal interval is half the lease. Two failures inside
-                // one interval mean the next scheduled attempt lands at the
-                // lease boundary; abort instead of billing work the authority
-                // may already re-hand to another drain.
+                // Abort after the retry renewal fails to avoid billing work another drain may own.
                 controller.abort(new Error("claim lease renewal failing"));
                 return;
             }
@@ -736,9 +655,6 @@ export class SmartNoteEvaluatorWorker {
     }
 
     /**
-     * Terminally release a claim. `reason` is local telemetry only: the module's
-     * abandon schema is closed and carries no reason field, so sending it would
-     * reject the release and leave the claim to be re-handed out until its lease
      * expires.
      */
     private async abandon(claimId: string, reason: string): Promise<boolean> {

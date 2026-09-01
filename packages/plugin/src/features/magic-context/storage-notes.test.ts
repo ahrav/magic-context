@@ -210,7 +210,6 @@ const normative = JSON.parse(
 ) as { revision_matrix_cases: NormativeCase[] };
 
 describe("smart-note revision matrix: normative fixture replay", () => {
-    // Fixture cases use different absolute pre-states; compare revision
     // deltas instead.
     for (const matrixCase of normative.revision_matrix_cases) {
         if (

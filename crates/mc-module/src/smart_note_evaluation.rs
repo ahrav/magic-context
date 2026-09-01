@@ -1,32 +1,19 @@
-//! Smart-note evaluation transition contract: the Rust port of the TypeScript
-//! reducer in packages/plugin/src/features/magic-context/smart-notes/
-//! (evaluation-state.ts, schedule.ts, storage.ts) plus the vendored 5-field
-//! cron evaluator (dreamer/cron.ts). Both implementations replay the frozen
-//! fixture crates/mc-module/testdata/smart-note-evaluation-golden.json, so
-//! lifecycle behavior cannot drift between languages.
 //!
-//! Pure functions throughout: callers supply the pre-state, a phase-scoped
-//! outcome, the transition clock, and a timezone (cron matching is a
-//! wall-clock concept; production passes the machine-local zone).
+//! Cron matching uses the supplied timezone's wall clock.
 
 use chrono::{Datelike, TimeZone, Timelike};
 use serde::Deserialize;
 
 /// Compiled-check policy version; other versions force recompilation.
 pub const SMART_NOTE_CHECK_POLICY_VERSION: i64 = 1;
-/// Minimum delay before the next check of a note.
 pub const SMART_NOTE_CHECK_FLOOR_MS: i64 = 5 * 60 * 1000;
-/// Maximum delay before the next check of a note.
 pub const SMART_NOTE_CHECK_CEILING_MS: i64 = 24 * 60 * 60 * 1000;
 /// Delay used when a note has no usable cron schedule.
 pub const SMART_NOTE_CHECK_DEFAULT_INTERVAL_MS: i64 = 60 * 60 * 1000;
 /// A check false for this long becomes eligible for a liveness recheck.
 pub const SMART_NOTE_CHECK_MAX_STALENESS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// Minimum spacing between liveness recheck attempts.
 pub const SMART_NOTE_CHECK_LIVENESS_RECHECK_MS: i64 = 24 * 60 * 60 * 1000;
-/// Compile-phase selection cap per evaluation run.
 pub const MAX_COMPILE_PER_RUN: usize = 5;
-/// Fallback-phase selection cap per evaluation run.
 pub const MAX_FALLBACK_PER_RUN: usize = 3;
 /// Liveness-phase fresh-claim quota per full selection cycle.
 pub(crate) const MAX_LIVENESS_PER_RUN: usize = 3;
@@ -36,17 +23,14 @@ const NONBILLABLE_PHASE_QUOTA: usize = 10;
 pub const MAX_COMPILATION_FAILURES: i64 = 3;
 /// Consecutive check failures before a compiled note needs reauthoring.
 pub const MAX_FAILURES_BEFORE_REAUTHOR: i64 = 3;
-/// Due-phase selection cap default.
 pub const DEFAULT_MAX_DUE_CHECKS: usize = 10;
 
 const MINUTE_MS: i64 = 60_000;
-/// Forward search bound for cron next-occurrence (~4 years, covers Feb-29-only
-/// crons). No occurrence within the bound means "never".
+/// Forward search bound for cron next-occurrence.
+/// No occurrence within the bound returns `None`.
 const MAX_SEARCH_MS: i64 = 4 * 366 * 24 * 60 * MINUTE_MS;
 
 // ---------------------------------------------------------------------------
-// Cron (port of dreamer/cron.ts, minus the civil-minute exclusion the
-// smart-note path never uses)
 // ---------------------------------------------------------------------------
 
 /// Parsed 5-field cron: per-field membership bitmasks plus the Vixie
@@ -65,7 +49,6 @@ fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Parse one field into a membership bitmask, or `None` on error.
 /// `dow_field` enables the 7→0 Sunday alias (after range validation, so `7`
 /// is accepted but `8` is rejected).
 fn parse_field(token: &str, min: u64, max: u64, dow_field: bool) -> Option<u64> {
@@ -124,8 +107,7 @@ fn parse_field(token: &str, min: u64, max: u64, dow_field: bool) -> Option<u64> 
         while v <= hi {
             let normalized = if dow_field && v == 7 { 0 } else { v };
             mask |= 1u64 << normalized;
-            // A wire-supplied step near u64::MAX would wrap `v` back under
-            // `hi` and re-enter the loop; overflow means the range is done.
+            // A step near `u64::MAX` ends the range on overflow.
             let Some(next) = v.checked_add(step) else {
                 break;
             };
@@ -139,8 +121,8 @@ fn parse_field(token: &str, min: u64, max: u64, dow_field: bool) -> Option<u64> 
     }
 }
 
-/// Parse a 5-field cron expression (`minute hour dom month dow`). Numeric
-/// fields only; empty/whitespace input is rejected.
+/// `parse_cron` accepts exactly five numeric fields: `minute hour dom month dow`.
+/// `parse_cron` rejects empty or whitespace-only input.
 fn parse_cron(expression: &str) -> Option<ParsedCron> {
     let trimmed = expression.trim();
     if trimmed.is_empty() {
@@ -177,10 +159,9 @@ fn matches_day(cron: &ParsedCron, dom_value: u32, dow_value: u32) -> bool {
     }
 }
 
-/// First instant strictly after `after_ms` whose LOCAL civil time in `tz`
-/// matches `cron`. Steps by epoch minutes and reads civil fields off each
-/// candidate, so DST transitions are handled by construction. `None` if no
-/// match within `after_ms + min(MAX_SEARCH_MS, max_search_ms)`.
+/// `next_occurrence` returns the first instant strictly after `after_ms` whose local civil time in `tz` matches `cron`.
+/// Evaluating each epoch-minute candidate by local civil fields handles DST transitions.
+/// `next_occurrence` returns `None` when no match occurs by `after_ms + min(MAX_SEARCH_MS, max_search_ms)`.
 fn next_occurrence<Tz: TimeZone>(
     cron: &ParsedCron,
     after_ms: i64,
@@ -193,9 +174,9 @@ fn next_occurrence<Tz: TimeZone>(
         .checked_add(MINUTE_MS)?;
     let cap_ms = after_ms.saturating_add(max_search_ms.clamp(0, MAX_SEARCH_MS));
     while cursor_ms <= cap_ms {
-        // An in-range instant maps to exactly one civil time; an instant
-        // beyond chrono's representable date range maps to none, which ends
-        // the search as "no occurrence" instead of panicking.
+        // Each representable epoch instant maps to one local civil time.
+        // `timestamp_millis_opt` returns no civil time outside chrono's representable date range.
+        // An unrepresentable `cursor_ms` makes `next_occurrence` return `None` rather than panic.
         let civil = tz.timestamp_millis_opt(cursor_ms).single()?;
         if mask_has(cron.minute, civil.minute())
             && mask_has(cron.hour, civil.hour())
@@ -209,8 +190,7 @@ fn next_occurrence<Tz: TimeZone>(
     None
 }
 
-/// Parse + compute next-due epoch (ms) for a schedule string. `None` for
-/// empty / invalid / effectively-never schedules.
+/// `next_due_at_ms` returns `None` when parsing fails or no occurrence is found within the search cap.
 fn next_due_at_ms<Tz: TimeZone>(
     expression: &str,
     after_ms: i64,
@@ -221,19 +201,15 @@ fn next_due_at_ms<Tz: TimeZone>(
     next_occurrence(&cron, after_ms, max_search_ms, tz)
 }
 
-/// Whether a wire-submitted cron expression parses under this contract's
+/// `is_valid_smart_note_cron` returns whether `expression` parses as a five-field numeric cron expression.
 /// 5-field grammar.
 pub fn is_valid_smart_note_cron(expression: &str) -> bool {
     parse_cron(expression).is_some()
 }
 
 // ---------------------------------------------------------------------------
-// Schedule (port of smart-notes/schedule.ts)
 // ---------------------------------------------------------------------------
 
-/// Absolute epoch (ms) of the next check for a note: cron-driven delta (or
-/// the default interval when the cron is absent/invalid/never), clamped to
-/// [floor, ceiling], plus deterministic jitter, clamped again.
 pub fn next_smart_note_check_due_at<Tz: TimeZone>(
     cron: Option<&str>,
     now: i64,
@@ -244,7 +220,7 @@ pub fn next_smart_note_check_due_at<Tz: TimeZone>(
     let raw_next = cron
         .filter(|c| !c.trim().is_empty())
         .and_then(|c| next_due_at_ms(c, now, SMART_NOTE_CHECK_CEILING_MS, tz))
-        // The TS source treats a (unreachable) zero epoch as "no occurrence".
+        // A zero epoch denotes no occurrence.
         .filter(|&ms| ms != 0);
     let raw_delta = match raw_next {
         Some(next) => next - now,
@@ -256,9 +232,6 @@ pub fn next_smart_note_check_due_at<Tz: TimeZone>(
     now + bounded
 }
 
-/// FNV-1a-seeded jitter in [-max, +max] where max = min(60s, 10% of the
-/// interval). The hash step mirrors JS exactly: u32 wrapping arithmetic over
-/// UTF-16 code units, and `floor(interval * 0.1)` in binary floating point.
 fn deterministic_jitter_ms(interval_ms: i64, note_id: i64, hash: Option<&str>) -> i64 {
     let max = 60_000i64.min((interval_ms as f64 * 0.1).floor() as i64);
     if max <= 0 {
@@ -274,10 +247,8 @@ fn deterministic_jitter_ms(interval_ms: i64, note_id: i64, hash: Option<&str>) -
 }
 
 // ---------------------------------------------------------------------------
-// Reducer (port of smart-notes/evaluation-state.ts)
 // ---------------------------------------------------------------------------
 
-/// The lifecycle projection owned by this contract.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SmartNoteLifecycleState {
     pub status: String,
@@ -301,7 +272,6 @@ pub struct SmartNoteLifecycleState {
     pub policy_version: i64,
 }
 
-/// Normalized compiler output recorded with its producing source revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledCheckArtifact {
     pub compiled_check: String,
@@ -334,7 +304,7 @@ pub enum FallbackOutcome {
     False,
 }
 
-/// Phase-scoped outcome: a smuggled cross-phase result cannot type-check.
+/// Phase-specific outcome types prevent cross-phase results from type-checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmartNoteEvaluationOutcome {
     Compile(CompileOutcome),
@@ -343,11 +313,9 @@ pub enum SmartNoteEvaluationOutcome {
     Fallback(FallbackOutcome),
 }
 
-/// Result of one reduction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmartNoteReduction {
     pub next: SmartNoteLifecycleState,
-    /// True when this transition surfaced the note (status became ready).
     pub surfaced: bool,
 }
 
@@ -359,23 +327,16 @@ pub fn evaluation_backoff_ms(failure_count: i64) -> i64 {
     minutes * 60 * 1000
 }
 
-/// Host-derived ready reason for a due-phase met result: the manifest's first
-/// signal, else its summary, else a fixed default; truncated to 240 units.
+/// The ready reason uses the signal, then its summary, then a fixed default, and truncates to 240 UTF-16 code units.
 ///
-/// The bound is 240 UTF-16 code units, not 240 Unicode scalars, because the
-/// TypeScript reducer this mirrors truncates with `String.prototype.slice`. For a
-/// reason containing non-BMP characters the two counts differ, and this field is
-/// persisted, so counting scalars here would let the two authorities store
-/// different `ready_reason` values for the same note.
+/// The bound is 240 UTF-16 code units because TypeScript `String.prototype.slice` uses UTF-16 units; scalar counting would persist a different `ready_reason` for non-BMP input.
 pub fn due_ready_reason(note_id: i64, manifest_json: Option<&str>) -> String {
     let signal = manifest_signal_or_summary(manifest_json)
         .unwrap_or_else(|| "compiled check returned met=true".to_string());
     truncate_utf16_units(&format!("Smart note #{note_id}: {signal}"), 240)
 }
 
-/// Truncate to at most `max_units` UTF-16 code units, matching JS `slice`.
-/// A trailing lone surrogate (a split surrogate pair) is dropped rather than
-/// emitted, since Rust `String` cannot hold an unpaired surrogate.
+/// A split surrogate pair is dropped because Rust `String` cannot hold an unpaired surrogate.
 fn truncate_utf16_units(value: &str, max_units: usize) -> String {
     if value.chars().map(char::len_utf16).sum::<usize>() <= max_units {
         return value.to_string();
@@ -393,9 +354,6 @@ fn truncate_utf16_units(value: &str, max_units: usize) -> String {
     out
 }
 
-/// Mirror of parseSmartNoteManifest for the fields the ready reason reads:
-/// unparseable/absent JSON yields the empty manifest; `signals` keeps only
-/// string entries and an all-invalid array is treated as absent.
 fn manifest_signal_or_summary(manifest_json: Option<&str>) -> Option<String> {
     let json = manifest_json.filter(|j| !j.is_empty())?;
     let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -611,8 +569,7 @@ fn reduce_liveness<Tz: TimeZone>(
             ),
             surfaced: false,
         },
-        // Liveness runs a previously healthy compiled check; a logic error
-        // here means the check itself broke, so reauthoring is immediate.
+        // Liveness runs a previously healthy compiled check; a logic error during liveness means the check itself broke, so reauthoring is immediate.
         CheckOutcome::LogicFailed => {
             attempted.check_status = "failing".to_string();
             SmartNoteReduction {
@@ -657,7 +614,6 @@ fn reduce_fallback(
     }
 }
 
-/// Derive the complete next lifecycle state for one phase outcome.
 pub fn reduce_smart_note_evaluation<Tz: TimeZone>(
     pre: &SmartNoteLifecycleState,
     outcome: &SmartNoteEvaluationOutcome,
@@ -674,24 +630,18 @@ pub fn reduce_smart_note_evaluation<Tz: TimeZone>(
 }
 
 // ---------------------------------------------------------------------------
-// Phase selection (port of smart-notes/storage.ts, as pure functions over
 // note snapshots)
 // ---------------------------------------------------------------------------
 
-/// The note fields the phase selectors consult.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmartNoteSelectionSnapshot {
     pub id: i64,
     pub status: String,
-    /// Retina compile pipeline status; a retina handoff skips notes it
     /// already compiled.
     pub compile_status: Option<String>,
     pub created_at: i64,
-    /// Only artifact PRESENCE affects selection, so the snapshot avoids copying
-    /// the artifact body for every pending note on every acquisition poll.
+    /// Only artifact presence affects selection, so the snapshot avoids copying artifact bodies for every pending note on every acquisition poll.
     pub has_compiled_check: bool,
-    /// Fallback rotation key: unchecked notes sort ahead of checked ones,
-    /// then least-recently checked first.
     pub last_checked_at: Option<i64>,
     pub check_status: String,
     pub check_quarantined_until: Option<i64>,
@@ -706,7 +656,6 @@ fn eligible(note: &SmartNoteSelectionSnapshot, retina_handoff: bool) -> bool {
         && (!retina_handoff || note.compile_status.as_deref() != Some("compiled"))
 }
 
-/// Compiled, on-policy, unquarantined notes whose next check is due, earliest
 /// due first.
 pub fn get_due_compiled_smart_note_checks(
     notes: &[SmartNoteSelectionSnapshot],
@@ -730,8 +679,6 @@ pub fn get_due_compiled_smart_note_checks(
     selected
 }
 
-/// Notes whose check must be (re)compiled: never compiled, failing, or on an
-/// old policy — once due, oldest note first.
 pub fn get_smart_notes_needing_compilation(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -754,8 +701,6 @@ pub fn get_smart_notes_needing_compilation(
     selected
 }
 
-/// Compiled notes false past the max-staleness window and outside the
-/// liveness recheck spacing, stalest first.
 pub fn get_stale_compiled_smart_notes(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -782,9 +727,6 @@ pub fn get_stale_compiled_smart_notes(
     selected
 }
 
-/// Fallback-status notes ordered unchecked-first, then oldest
-/// `last_checked_at`, then note ID. A repeatedly-false note therefore rotates
-/// behind notes that have not yet received a confirmation opportunity.
 pub fn get_fallback_smart_notes(
     notes: &[SmartNoteSelectionSnapshot],
     limit: usize,
@@ -806,18 +748,12 @@ pub fn get_fallback_smart_notes(
 }
 
 // ---------------------------------------------------------------------------
-// Selection cycles: the fair multi-acquisition policy. The stateful cycle
-// behavior is specified by the hand-authored traces in
-// testdata/smart-note-evaluation-normative.json, not by the generated golden.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SmartNoteCycleMode {
-    /// Full-budget drain: due, compile, liveness, fallback (10/5/3/3).
     Full,
-    /// `exclude_billable` drain: sandbox-only due and liveness (10/10).
-    /// Compile and fallback claims launch LLM prompts and belong to the
-    /// scheduled full-budget drain.
+    /// Nonbillable mode permits only sandbox due and liveness claims.
     Nonbillable,
 }
 
@@ -851,26 +787,15 @@ const NONBILLABLE_CYCLE_PROFILE: &[(SmartNotePhase, usize)] = &[
     (SmartNotePhase::Liveness, NONBILLABLE_PHASE_QUOTA),
 ];
 
-/// Boot-ephemeral fair-selection position for one (registration, slot, mode).
 ///
-/// A cycle prefers earlier phases but grants each phase a bounded number of
-/// fresh claims. The caller commits the proposed successor only after the
-/// store durably commits a fresh claim, and resets the cycle only after a
-/// fresh durable `no_work`, so replays, recovery, and failures never move the
 /// cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SmartNoteSelectionCycle {
     mode: SmartNoteCycleMode,
-    /// Position in the mode profile. Phases before it are passed for this
-    /// cycle: work that becomes eligible for an earlier phase waits for the
-    /// next cycle, matching the legacy one-pass sweep shape.
+    /// Earlier phases are skipped until the next cycle; newly eligible work waits.
     phase_index: usize,
-    /// Fresh claims left for the current phase.
     remaining: usize,
-    /// Fallback notes already claimed in this cycle, bounded by the fallback
-    /// quota. A false or abandoned fallback note stays eligible in the store,
-    /// so without this exclusion the deterministic ordering would hand the
-    /// same note back before later fallback notes get an opportunity.
+    /// Excluding attempted fallback IDs lets later fallback notes receive claims before retries.
     attempted_fallback: Vec<i64>,
 }
 
@@ -892,11 +817,7 @@ fn cycle_profile(mode: SmartNoteCycleMode) -> &'static [(SmartNotePhase, usize)]
     }
 }
 
-/// One fresh selection under `cycle`: the chosen `(note_id, phase)` plus the
-/// proposed successor cycle. Empty phases and exhausted quotas advance to the
-/// next phase without spending their quotas elsewhere. `None` means the cycle
-/// is spent or nothing is eligible; the store records that as `no_work` and
-/// the caller answers a FRESH `no_work` by resetting this mode's cycle.
+/// Empty or exhausted phases advance without transferring unused quota.
 pub(crate) fn select_smart_note_evaluation_cycle(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -1042,15 +963,12 @@ mod tests {
         policy_version: Option<i64>,
     }
 
-    /// Generator insertNote defaults for keys the fixture omits.
     fn snapshot_with_defaults(note: &SelectionNoteJson, now: i64) -> SmartNoteSelectionSnapshot {
         SmartNoteSelectionSnapshot {
             id: note.id,
             status: note.status.clone().unwrap_or_else(|| "pending".to_string()),
             compile_status: note.compile_status.clone(),
             created_at: note.created_at.unwrap_or(now - 1_000_000),
-            // The fixture records the artifact itself; selection only observes
-            // presence, so map it here rather than changing the frozen fixture.
             has_compiled_check: note.compiled_check.is_some(),
             last_checked_at: note.last_checked_at,
             check_status: note
@@ -1273,8 +1191,6 @@ mod tests {
                 .unwrap()
         }
 
-        /// Content edits increment source_revision and state_version;
-        /// pending-to-pending transitions increment state_version only.
         fn stage(store: &McStore, mut note: StoredNote, src: i64, state: i64) -> StoredNote {
             for i in 0..src {
                 note = match store
@@ -1393,10 +1309,6 @@ mod tests {
                 "create" => note,
                 "edit_compiler_input" => {
                     if case.id == "edit_project" {
-                        // A project move cannot be expressed through the module
-                        // authority: update_note_cas pins project_path in its
-                        // WHERE clause. The TypeScript replay in
-                        // storage-notes.test.ts covers this case.
                         continue;
                     }
                     let pre = pre.expect("edit pre");
@@ -1520,13 +1432,10 @@ mod tests {
         }
     }
 
-    /// The TypeScript reducer truncates `ready_reason` with `String.slice`, which
-    /// counts UTF-16 code units. Counting Unicode scalars here would persist a
-    /// different value for the same note whenever the reason runs past the bound
-    /// with non-BMP characters in it.
+    /// The TypeScript reducer truncates `ready_reason` with `String.slice`, which counts UTF-16 code units.
     #[test]
     fn due_ready_reason_truncates_on_utf16_units_like_the_ts_reducer() {
-        // Each emoji is one scalar but TWO UTF-16 units.
+        // A non-BMP scalar value uses two UTF-16 code units.
         let signal = "\u{1F600}".repeat(200);
         let manifest = format!("{{\"signals\":[\"{signal}\"]}}");
         let reason = due_ready_reason(1, Some(manifest.as_str()));
@@ -1536,12 +1445,10 @@ mod tests {
             units <= 240,
             "expected at most 240 UTF-16 units, got {units}"
         );
-        // A scalar-based bound would have kept 240 emoji (480 units).
         assert!(
             reason.chars().count() < 240,
             "scalar-counted truncation would exceed the JS bound"
         );
-        // Never emit a broken pair.
         assert!(reason.is_char_boundary(reason.len()));
     }
 
@@ -1556,8 +1463,7 @@ mod tests {
 
     #[test]
     fn next_occurrence_survives_extreme_instants() {
-        // i64::MIN underflows the minute-floor multiplication and i64::MAX
-        // overflows the cap; both must resolve to "no occurrence", never a
+        // `i64::MIN` must not underflow the minute-floor multiplication, and `i64::MAX` must not overflow the cap; both return no occurrence.
         // debug-build panic.
         let utc = chrono::Utc;
         assert_eq!(
@@ -1570,10 +1476,7 @@ mod tests {
         );
     }
 
-    // The golden fixtures exercise each phase selector in isolation; this pins
-    // phase precedence inside one fresh cycle so an ordering regression cannot
-    // slip past the fixture replay. The full stateful cycle behavior is owned
-    // by the hand-authored normative traces.
+    // Golden fixtures isolate each phase selector and enforce phase precedence within a fresh cycle.
     #[test]
     fn cycle_selection_prefers_due_then_compile_then_liveness_then_fallback() {
         let now: i64 = 1_781_542_800_000;
@@ -1641,8 +1544,7 @@ mod tests {
         );
         assert_eq!(pick(&[], &full), None);
 
-        // The nonbillable cycle never hands out compile or fallback work and
-        // still reaches liveness past a compile candidate.
+        // Nonbillable cycles never claim compile or fallback work and can reach liveness despite a compile candidate.
         assert_eq!(pick(&all, &nonbillable), Some((1, "due".to_string())));
         assert_eq!(
             pick(&no_due, &nonbillable),
@@ -1652,8 +1554,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Normative cycle traces: the intentional multi-acquisition policy
-    // oracle, hand-authored from R1-R7 of the fair-selection contract.
     // ------------------------------------------------------------------
 
     #[derive(Deserialize)]
@@ -1696,10 +1596,9 @@ mod tests {
         Claim { note_id: i64, phase: String },
     }
 
-    /// One fresh acquisition. A claim removes the note from the eligible pool
-    /// until an `after` patch touches it (the patch models the committed
-    /// completion row and returns the note to the pool); a bare `{}` patch
-    /// models an abandon that released the claim without changing the row.
+    /// Each claim uses a fresh acquisition and removes the note from the eligible pool.
+    /// An `after` patch returns the claimed note to the eligible pool after modeling its committed completion row.
+    /// A bare `{}` patch releases the claim without changing the row.
     #[derive(Deserialize)]
     struct CycleStep {
         expect: CycleExpectation,
@@ -1823,8 +1722,8 @@ mod tests {
                             "case {} step {step_index}",
                             case.id
                         );
-                        // A fresh committed claim installs the proposal and
-                        // holds the note out of the pool until completion.
+                        // A fresh committed claim installs the proposal.
+                        // A committed claim marks the note unavailable until completion.
                         cycle = proposal;
                         pool.iter_mut()
                             .find(|(note, _)| note.id == selected_id)

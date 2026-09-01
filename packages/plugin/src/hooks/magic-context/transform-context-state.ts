@@ -47,8 +47,7 @@ export function loadContextUsage(
             contextUsageMap.set(sessionId, {
                 ...persisted,
                 lastResponseTime: persistedLastResponseTime ?? persisted.updatedAt,
-                // last_response_time also advances on provider errors that carry no usage.
-                // A persisted percentage therefore has no process-local freshness proof.
+                // Persisted usage has no process-local freshness.
                 hasUsageTokens: false,
             });
             return persisted.usage;

@@ -68,9 +68,7 @@ function dueCompiledNote(db: Database) {
     return note;
 }
 
-// A different test file (ctx-note tools) exercises the gate and can leave the
-// module-level verdict cache populated when the full suite interleaves files, so
-// this file must clear it on entry, not only on exit.
+// Reset the module-level verdict cache before each test to isolate tests.
 beforeEach(() => {
     __wakePlaneTest.reset();
 });
@@ -189,8 +187,7 @@ describe("wakePlaneStatus", () => {
         __wakePlaneTest.setPublicationReader(() => publication);
 
         expect(await wakePlaneStatus()).toBe("present");
-        // A replacement daemon republishes its connection file; the capability
-        // the previous daemon proved must not carry over to it.
+        // A replacement daemon must not inherit the previous daemon's capability verdict.
         publication = "dev:ino:2000:64";
         hasWakePlane = false;
         expect(await wakePlaneStatus()).toBe("absent");
@@ -198,17 +195,16 @@ describe("wakePlaneStatus", () => {
     });
 
     test("discards an in-flight answer when the daemon republishes mid-probe", async () => {
-        // The captured publication was only re-checked on the NEXT call, so the
-        // initiating caller and everyone coalesced on the in-flight probe still
-        // got an answer describing a daemon that had already been replaced.
-        // Reporting `present` from the old incarnation would suppress standalone
-        // evaluation even if the replacement offers no wake plane at all.
+        // A probe result is valid only while its captured connection-file publication remains unchanged.
+        // A probe result is valid only while its captured connection-file publication remains unchanged.
+        // A probe result is valid only while its captured connection-file publication remains unchanged.
+        // An old `present` verdict would suppress standalone evaluation even when the replacement offers no wake plane.
         let probes = 0;
         let publication = "dev:ino:1000:64";
         let releaseProbe: (() => void) | undefined;
-        // Synchronize on probe ENTRY rather than sleeping: a timer only makes the
-        // race likely, so on a slow schedule `releaseProbe` would still be unset
-        // and releasing it below would be a no-op that hangs the test.
+        // The test waits for probe entry rather than sleeping because a timer can fire before `releaseProbe` is assigned.
+        // The test waits for probe entry rather than sleeping because a timer can fire before `releaseProbe` is assigned.
+        // The test waits for probe entry rather than sleeping because a timer can fire before `releaseProbe` is assigned.
         let signalProbeStarted: (() => void) | undefined;
         const probeStarted = new Promise<void>((resolve) => {
             signalProbeStarted = resolve;
@@ -226,17 +222,15 @@ describe("wakePlaneStatus", () => {
         const first = wakePlaneStatus();
         const coalesced = wakePlaneStatus();
         await probeStarted;
-        // The daemon is replaced while the probe is still parked.
         publication = "dev:ino:2000:64";
         releaseProbe?.();
 
-        // Neither the initiator nor the coalesced caller may adopt the old
-        // daemon's affirmative answer.
+        // Neither the initiator nor a coalesced caller may adopt the old daemon's affirmative answer.
         expect(await first).toBe("unknown");
         expect(await coalesced).toBe("unknown");
         expect(probes).toBe(1);
 
-        // Nothing was retained, so the next call re-probes against the new owner.
+        // The replacement invalidates the cached verdict, so the next call probes the replacement daemon.
         releaseProbe = undefined;
         __wakePlaneTest.setCatalogProbe(async () => {
             probes += 1;
@@ -247,14 +241,11 @@ describe("wakePlaneStatus", () => {
     });
 
     test("dials and binds to the connection file the lifecycle owner publishes", () => {
-        // The lifecycle resolver honors MAGIC_CONTEXT_TEST_DATA_DIR; getDataDir()
-        // ignores it. That makes it the discriminator: reading getDataDir() here
-        // would stat a different path, so a managed start would neither answer
-        // the catalog probe nor retire the negative answer cached before it.
+        // The lifecycle resolver honors `MAGIC_CONTEXT_TEST_DATA_DIR`, but `getDataDir()` ignores it; using `getDataDir()` would stat a different path and miss catalog probing and cached-`absent` invalidation.
         //
-        // HOME is deliberately not the lever here. Under NODE_ENV=test the
-        // lifecycle resolver backstops to a throwaway root before it ever
-        // consults HOME, so a HOME-derived expectation proves nothing.
+        // HOME cannot select the lifecycle root: under `NODE_ENV=test`, the lifecycle resolver uses a throwaway root before consulting HOME.
+        // HOME cannot select the lifecycle root: under `NODE_ENV=test`, the lifecycle resolver uses a throwaway root before consulting HOME.
+        // HOME cannot select the lifecycle root: under `NODE_ENV=test`, the lifecycle resolver uses a throwaway root before consulting HOME.
         const root = mkdtempSync(join(tmpdir(), "wake-plane-root-"));
         const previousXdg = process.env.XDG_DATA_HOME;
         const previousTestRoot = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
@@ -274,11 +265,11 @@ describe("wakePlaneStatus", () => {
     });
 
     test("re-probes a negative answer once a daemon publishes", async () => {
-        // Under lazy demand-start the first passive probe usually runs before
-        // any Rust or Synapse demand, so it caches a negative answer with no
-        // publication. The managed start that follows publishes a connection
-        // file and takes over scheduled wakes; retaining the negative answer for
-        // the rest of its TTL would leave both planes evaluating conditions.
+        // A passive probe before demand-start can cache `absent` without a connection-file publication.
+        // A passive probe before demand-start can cache `absent` without a connection-file publication.
+        // A managed start must invalidate a cached `absent` verdict after publishing its connection file.
+        // A managed start must invalidate a cached `absent` verdict after publishing its connection file.
+        // A managed start must invalidate a cached `absent` verdict after publishing its connection file.
         let probes = 0;
         let hasWakePlane = false;
         let publication: string | null = null;

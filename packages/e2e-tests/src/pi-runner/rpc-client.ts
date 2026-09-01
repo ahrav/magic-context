@@ -1,15 +1,13 @@
 /**
- * Persistent Pi RPC client for e2e tests.
  *
- * Pi's `--mode rpc` protocol is strict JSONL over stdio: commands are JSON
- * objects written to stdin and delimited only by LF (`\n`); stdout emits JSONL
- * responses (`type: "response"`, with the caller-provided `id`) interleaved
- * with asynchronous agent events (`agent_start`, `agent_end`, `message_end`,
- * extension UI requests, etc.). This client keeps one Pi subprocess alive for a
- * whole `PiTestHarness`, correlates command responses by `id`, and exposes an
- * event registry for per-turn collection. It intentionally does not use Node's
- * `readline` because that treats U+2028/U+2029 as line separators even though
- * they are valid inside JSON strings.
+ * Pi's `--mode rpc` protocol uses JSONL over stdio.
+ * Pi accepts only LF-delimited JSON objects on stdin.
+ * Pi identifies each `type: "response"` object with the caller-provided `id`.
+ * Pi can emit `agent_start`, `agent_end`, `message_end`, and extension UI requests asynchronously.
+ * `PiTestHarness` keeps one Pi subprocess alive for its entire lifetime.
+ * `PiTestHarness` matches command responses by `id` and collects events per turn.
+ * The client avoids Node's `readline` because `readline` treats U+2028 and U+2029 as line separators.
+ * JSON strings can contain U+2028 and U+2029.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";

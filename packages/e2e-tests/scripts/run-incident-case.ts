@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
 
 /**
- * Child bootstrap for one isolated incident case. Writes exactly one
- * schema-versioned envelope on the fd-3 result channel; stdout/stderr carry
+ * The child writes exactly one schema-versioned envelope to fd 3; stdout and stderr carry diagnostics only.
  * diagnostics only.
  */
 
@@ -101,10 +100,7 @@ async function main(): Promise<void> {
 
     if (precondition.satisfied) {
         const checks = registered.verifier(observation);
-        // A verifier that omits a declared check (or emits nothing) must never
-        // read as green: absence of failures is only meaningful when every
-        // normative check was actually judged. Throwing loses the envelope,
-        // which the parent classifies as a crash.
+        // A verifier must emit every normative check before the case can pass.
         const emitted = new Set(checks.map((entry) => entry.id));
         for (const required of variant.normative_checks) {
             if (!emitted.has(required)) {
@@ -121,7 +117,6 @@ async function main(): Promise<void> {
         envelope.observation_signature =
             failed.length === 0 ? null : rowDigest(observation);
     } else {
-        // A failed reproduction precondition must never reach the verifier.
         envelope.precondition_reason = precondition.reason;
         envelope.preconditions = "failed";
         envelope.blocked_by =
@@ -136,7 +131,6 @@ async function main(): Promise<void> {
 main()
     .then(() => process.exit(0))
     .catch((error: unknown) => {
-        // Diagnostics only — the parent classifies a missing envelope as crash.
         console.error(
             `incident case failed: ${error instanceof Error ? error.message : String(error)}`,
         );

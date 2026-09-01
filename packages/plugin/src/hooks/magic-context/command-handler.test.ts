@@ -134,13 +134,7 @@ async function expectSentinel(promise: Promise<unknown>, sentinel: string): Prom
         await promise;
         throw new Error(`Expected sentinel ${sentinel}`);
     } catch (error) {
-        // Still a real Error carrying the sentinel message, the universal
-        // fallback for any host that does not recognize the Effect HTTP tags.
         expect(String(error)).toContain(sentinel);
-        // AND duck-types an Effect HttpServerResponse.empty({status:204}) so
-        // OpenCode 1.17.x recognizes it (plain-string TypeId), suppresses the
-        // JSON-500 log, and writes a clean 204 — no TUI/log leak. Lock the exact
-        // shape Response.toWeb dereferences on the empty-body path.
         const e = error as Record<string, unknown>;
         expect(e["~effect/http/HttpServerResponse"]).toBe("~effect/http/HttpServerResponse");
         expect(e["~effect/ErrorReporter/ignore"]).toBe(true);
@@ -589,7 +583,6 @@ describe("createMagicContextCommandHandler", () => {
                 sendNotification,
             });
 
-            // First call — shows confirmation warning, does NOT run recomp
             await expectSentinel(
                 handler["command.execute.before"](
                     { command: "ctx-recomp", sessionID: "ses-recomp", arguments: "" },
@@ -608,7 +601,6 @@ describe("createMagicContextCommandHandler", () => {
                 {},
             );
 
-            // Second call within 60s — actually runs recomp
             sendNotification.mockClear();
             await expectSentinel(
                 handler["command.execute.before"](
@@ -690,7 +682,6 @@ describe("createMagicContextCommandHandler", () => {
                 "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
             );
 
-            // Deprecated flag does not run recomp itself; it redirects to the command.
             expect(executeRecomp).not.toHaveBeenCalled();
             expect(sendNotification).toHaveBeenCalledWith(
                 "ses-upgrade-legacy",
@@ -786,8 +777,6 @@ describe("createMagicContextCommandHandler", () => {
                 [{ method: string; body: Record<string, unknown>; timeoutMs?: number }]
             >;
             expect(calls[0]?.[0].method).toBe("session.wrapup");
-            // The requested keep watermark is forwarded unchanged (no 5/100 clamp):
-            // the module honors it as given, matching the TypeScript orchestrator.
             expect(calls[0]?.[0].body.keep).toBe(250);
             expect(calls[0]?.[0].body.command_id).toEqual(expect.any(String));
             expect(calls[0]?.[0].timeoutMs).toBe(MAX_WRAPUP_REQUEST_BUDGET_MS);
@@ -940,8 +929,6 @@ describe("createMagicContextCommandHandler", () => {
             );
 
             expect(calls.map((call) => call.method)).toEqual(["session.wrapup", "session.recomp"]);
-            // The requested keep watermark is forwarded unchanged; the module honors
-            // it as given (no 5/100 clamp), matching the TypeScript orchestrator.
             expect(calls[0]?.body.keep).toBe(999);
             expect(typeof calls[0]?.body.command_id).toBe("string");
             expect(typeof calls[1]?.body.command_id).toBe("string");
@@ -987,10 +974,6 @@ describe("createMagicContextCommandHandler", () => {
         it("runs the managed upgrade (recomp + migration) and throws the sentinel", async () => {
             insertLegacyCompartment(db, "ses-su-legacy");
             const sendNotification = mock(async () => {});
-            // The command path now delegates to the unified `runUpgrade` (shared
-            // recomp-orchestrator: full recomp → once-per-project memory
-            // migration), so it gets the same fallback + progress as the RPC
-            // dialog path. The command handler just invokes it and reports.
             const runUpgrade = mock(
                 async () => "## Session Upgrade — Complete\n\nRebuilt 1 compartment.",
             );
@@ -1068,7 +1051,6 @@ describe("createMagicContextCommandHandler", () => {
                 protectedTags: 3,
                 sendNotification,
                 dreamer: {
-                    // command handler only reads `config` for presence; runManual is the entry.
                     config: {} as never,
                     projectPath: "/repo/project",
                     runManual,
@@ -1084,7 +1066,6 @@ describe("createMagicContextCommandHandler", () => {
                 "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
             );
 
-            // No arg → run all enabled tasks (task is undefined).
             expect(runManual).toHaveBeenCalledWith(undefined);
             expect(sendNotification.mock.calls[0]?.[1]).toContain("Backlog before starting:");
             expect(sendNotification.mock.calls[0]?.[1]).toContain("Starting dream run...");

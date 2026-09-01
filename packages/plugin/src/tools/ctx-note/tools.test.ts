@@ -422,9 +422,7 @@ describe("createCtxNoteTools", () => {
     });
 
     it("defaults to read (not write) when content is an empty string and no action is given", async () => {
-        // GPT-family models fill every optional param, so a read arrives as
-        // { content: "", surface_condition: "" } with no action. That must
-        // default to read, not infer write and reject the empty content.
+        // When action is absent, empty content and surface_condition default to read rather than a write validation error.
         await tools.ctx_note.execute(
             { action: "write", content: "An existing note" },
             toolContext(),
@@ -639,7 +637,6 @@ describe("createCtxNoteTools", () => {
             );
         }
 
-        // Default read: newest 25, footer pointing at the 5 older ones.
         const firstPage = await tools.ctx_note.execute({ action: "read" }, toolContext());
         expect(firstPage).toContain("note number 30"); // newest present
         expect(firstPage).toContain("note number 6"); // 25th newest present
@@ -648,7 +645,6 @@ describe("createCtxNoteTools", () => {
             'Showing 25 of 30 (newest first) — 5 older: ctx_note(action="read", offset=25)',
         );
 
-        // Older page via offset.
         const secondPage = await tools.ctx_note.execute(
             { action: "read", offset: 25 },
             toolContext(),
@@ -658,7 +654,6 @@ describe("createCtxNoteTools", () => {
         expect(secondPage).not.toContain("note number 30");
         expect(secondPage).not.toContain("older: ctx_note"); // no further pages
 
-        // Custom limit caps the page.
         const small = await tools.ctx_note.execute({ action: "read", limit: 3 }, toolContext());
         expect(small).toContain("note number 30");
         expect(small).toContain("note number 28");

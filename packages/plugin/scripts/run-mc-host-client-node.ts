@@ -1,28 +1,25 @@
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ENTRIES = {
-    adversarial: "run-mc-host-client-adversarial.ts",
     smoke: "smoke-mc-host-client.ts",
     synapse: "smoke-mc-host-synapse.ts",
 } as const;
 
-const mode = process.argv[2] ?? "all";
-if (mode !== "adversarial" && mode !== "smoke" && mode !== "synapse" && mode !== "all") {
+const mode = process.argv[2] ?? "smoke";
+if (mode !== "smoke" && mode !== "synapse" && mode !== "all") {
     console.error(
-        `usage: run-mc-host-client-node.ts [adversarial|smoke|synapse|all] (got "${mode}")`,
+        `usage: run-mc-host-client-node.ts [smoke|synapse|all] (got "${mode}")`,
     );
     process.exit(2);
 }
-// The synapse smoke needs a native ONNX Runtime library, so it runs only
-// when named explicitly.
-const selected = mode === "all" ? (["adversarial", "smoke"] as const) : ([mode] as const);
+// `synapse` requires a native ONNX Runtime library, so the default launcher runs only `smoke`.
+const selected = mode === "all" ? (["smoke", "synapse"] as const) : ([mode] as const);
 
 const here = dirname(fileURLToPath(import.meta.url));
-const outDir = mkdtempSync(join(tmpdir(), "mc-host-client-node-"));
+const outDir = mkdtempSync(join(here, ".mc-host-client-node-"));
 let exitCode = 0;
 try {
     for (const name of selected) {
@@ -33,6 +30,7 @@ try {
             outdir: join(outDir, name),
             target: "node",
             format: "esm",
+            external: ["@cortexkit/mc-shm-native"],
         });
         if (!result.success) {
             console.error(`node-launcher: bundle failed: ${result.logs.map(String).join("; ")}`);

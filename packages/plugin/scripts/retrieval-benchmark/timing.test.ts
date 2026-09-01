@@ -33,13 +33,11 @@ describe("nearestRankPercentile", () => {
         // n=4: p50 rank = ceil(0.5*4) = 2 -> second smallest; p95 rank = 4.
         expect(nearestRankPercentile([40, 10, 30, 20], 50)).toBe(20);
         expect(nearestRankPercentile([40, 10, 30, 20], 95)).toBe(40);
-        // n=100 (1..100): p50 -> 50, p95 -> 95, p100 -> max.
         const hundred = Array.from({ length: 100 }, (_, i) => 100 - i);
         expect(nearestRankPercentile(hundred, 50)).toBe(50);
         expect(nearestRankPercentile(hundred, 95)).toBe(95);
         expect(nearestRankPercentile(hundred, 100)).toBe(100);
-        // A reported percentile is always an observed sample: n=3 p50 rank
-        // ceil(1.5)=2, never an interpolated midpoint.
+        // For n=3, p50 has rank ceil(1.5) = 2 and is never an interpolated midpoint.
         expect(nearestRankPercentile([1, 2, 10], 50)).toBe(2);
         expect(nearestRankPercentile([7], 95)).toBe(7);
     });
@@ -68,8 +66,6 @@ describe("nearestRankPercentile", () => {
 });
 
 describe("traceTimingEvidence", () => {
-    // Root [0,95]; lexical [10,50] and dense [30,80] overlap without
-    // nesting; fusion [80,90] depends on both scans.
     const validSpans: SearchTraceSpan[] = [
         span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 95 }),
         span({
@@ -116,7 +112,7 @@ describe("traceTimingEvidence", () => {
 
     it("reports the dependency critical path as an independent diagnostic", () => {
         const evidence = traceTimingEvidence(validSpans);
-        // dense(50) + fusion(10): unrelated to the 80ms temporal union.
+        // The critical path is vector_scan (50 ms) plus fusion (10 ms), not the 80 ms temporal union.
         expect(evidence.criticalPathMs).toBe(60);
         expect(evidence.criticalPath).toEqual([3, 4]);
         expect(evidence.criticalPathMs).not.toBe(evidence.coveredMs);

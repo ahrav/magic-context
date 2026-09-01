@@ -1,14 +1,6 @@
 /**
- * Historian structural eval lane — freeze governance (R11/R12/KD4 via KTD7).
  *
- * Clones the retrieval-benchmark promotion pattern: privacy scan before any
- * parser, operator-supplied approvals (one per kind: privacy, gold-intent)
- * bound to the exact release-tuple fingerprint, owner-only review directory
- * outside version control, atomic rename into an immutable release
- * directory, and tombstone-in-vN+1 errata — existing releases are never
- * edited. Generic modules (`canonicalFingerprint`, the privacy scan) are
- * imported directly; the retrieval lane's own contract/promote stay frozen
- * governance code, cloned in structure only.
+ * Existing releases are immutable; later releases carry errata as tombstones.
  */
 
 import {
@@ -56,7 +48,7 @@ export const RELEASE_FILES = {
     scenariosDir: "scenarios",
 } as const;
 
-/** Corpus-size budget (R1), enforced identically by promotion and by loading. */
+/** Promotion and loading enforce the same 10–30 scenario budget. */
 export const CORPUS_SIZE_BUDGET = { min: 10, max: 30 } as const;
 
 export interface PromotionInput {
@@ -66,7 +58,7 @@ export interface PromotionInput {
     approvals: readonly unknown[];
     releasesRoot: string;
     releaseVersion: string;
-    /** Errata carried forward from prior releases plus any new tombstones (R12). */
+    /** Carries forward prior-release errata and adds new tombstones. */
     tombstones?: readonly string[];
     forbiddenTokens?: readonly string[];
     /** Word-bounded username/identifier deny list, forwarded to the privacy scan. */
@@ -78,11 +70,7 @@ function fail(diagnostics: string[]): never {
 }
 
 /**
- * Byte-strict release read-back: fingerprints are computed over PARSED
- * values, so a plain `JSON.parse` would let an in-place edit of an installed
- * release (duplicate members — where a reviewer sees the first value and the
- * code takes the last — or re-serialized bytes) pass the tamper checks.
- * Canonical-byte verification rejects anything `writeReleaseTree` did not
+ * Canonical-byte verification rejects duplicate members and non-canonical encodings before fingerprint checks.
  * produce.
  */
 function readReleaseJson(path: string, label: string): unknown {
@@ -96,8 +84,7 @@ function checkApprovals(rawApprovals: readonly unknown[], releaseFingerprint: st
     for (const approval of approvals) {
         if (byKind.has(approval.kind)) diagnostics.push(`approvals.${approval.kind}: duplicate-kind`);
         byKind.set(approval.kind, approval);
-        // Bound to the WHOLE release — version, tuple, and tombstones — so a
-        // prior release's approvals cannot be replayed on a manifest that drops
+        // Approvals bind the release version, tuple, and tombstones to prevent replay against a different release.
         // a tombstone.
         if (approval.releaseFingerprint !== releaseFingerprint) {
             diagnostics.push(`approvals.${approval.kind}: stale-or-foreign-release`);
@@ -111,17 +98,9 @@ function checkApprovals(rawApprovals: readonly unknown[], releaseFingerprint: st
 }
 
 /**
- * Evidence must correspond EXACTLY to the corpus: one entry per scenario, filed
- * under that scenario's own id, and no entries for anything else.
+ * Mutation evidence must contain exactly one entry for every corpus scenario, keyed by that scenario's ID.
  *
- * Coverage alone is too weak in both directions. The fingerprint covers a
- * scenario's content, not the id an entry files it under, so a producer or
- * assembly regression can attribute a real result to the wrong scenario — and
- * every diagnostic here, plus the published artifact itself, is keyed by id, so
- * the mismatch would misdirect whoever reads it. In the other direction, entries
- * for scenarios outside the release claim mutation coverage the release does not
- * have, and `releaseArtifactFingerprint` would authenticate that claim rather
- * than contradict it.
+ * Evidence IDs must match corpus IDs because scenario fingerprints do not bind entries to IDs, and extra entries would authenticate non-release coverage.
  */
 function checkMutationEvidence(
     evidence: MutationEvidenceArtifact,
@@ -143,9 +122,7 @@ function checkMutationEvidence(
         }
         if (!entry.green) diagnostics.push(`mutation-evidence.${scenario.id}: not-green`);
     }
-    // Count only: an evidence `scenarioId` is checked for being a non-empty
-    // string, not against `SCENARIO_ID_RE`, so an unmatched entry's id is
-    // arbitrary unreviewed text and naming it would put that in the logs.
+    // Unmatched entries' `scenarioId` values need only be non-empty strings, so diagnostics report their count instead of unreviewed IDs.
     const unrepresented = evidence.scenarios.filter((entry) => !matched.has(entry.scenarioFingerprint)).length;
     if (unrepresented > 0) {
         diagnostics.push(`mutation-evidence: ${unrepresented} of ${evidence.scenarios.length} entries not in the corpus`);
@@ -154,38 +131,20 @@ function checkMutationEvidence(
 }
 
 /**
- * Fingerprint over ALL THREE published artifact groups — the manifest (including
- * approver strings), the recomputed mutation evidence, and the scenario corpus.
- * This is the value an operator records out of band at promotion time and passes
- * back to `loadRelease`: nothing inside the release directory can authenticate
- * itself, so without an external anchor an editor can rewrite `approver`, or
- * fabricate green evidence for a battery that never ran, and still satisfy every
+ * Operators must supply this out-of-band fingerprint to `loadRelease`; release-directory contents cannot authenticate themselves.
+ * Without an external fingerprint, an editor can rewrite `approver` or fabricate green evidence while passing in-directory checks.
  * in-directory check.
  *
- * All three are covered because they are separately mutable. Anchoring only the
- * manifest would leave the evidence file forgeable: the parser proves an artifact
- * is internally consistent and covers every mutation class, not that any mutation
- * was ever executed.
+ * The anchor includes all independently mutable artifacts; internal consistency does not prove mutations ran.
  *
- * The scenarios are covered DIRECTLY, not via `manifest.releaseTuple`. That tuple
- * is built from `scenarioFingerprint`, which deliberately excludes harness-owned
- * trigger pressure so pressure cannot move a semantic identity or invalidate an
- * approval — leaving those values bound to no artifact at all. They are not
- * inert: `modelContextLimit` with the per-turn and spike usage decides WHEN the
- * historian fires. Left out, an edit to an installed release could swap one
- * lint-clean pressure recipe for another, so two runs labelled with the same
- * frozen release would measure different schedules while every in-directory check
- * and the anchor still matched. Approvals stay trigger-independent:
- * `releaseApprovalFingerprint` covers the version, tuple, and tombstones.
+ * `releaseArtifactFingerprint` hashes scenarios directly because `releaseTuple` omits trigger pressure.
+ * `scenarioFingerprint` excludes trigger pressure so approvals remain trigger-independent.
+ * `releaseArtifactFingerprint` hashes trigger-pressure fields because changing them changes historian schedules without changing `releaseTuple`.
+ * `modelContextLimit`, per-turn usage, and spike usage determine when the historian fires.
+ * `releaseApprovalFingerprint` remains trigger-independent and covers the version, tuple, and tombstones.
  *
- * Scenarios are ordered by id HERE rather than by any caller, because the two
- * call sites obtain them differently and neither order is canonical: promotion
- * has the operator's array order, while `loadRelease` has lexicographic FILENAME
- * order, and those disagree whenever one id is a prefix of another (`-` sorts
- * before the `.` of `.json`, so `hse-a-b.json` precedes `hse-a.json` while
- * `hse-a` precedes `hse-a-b`). Canonicalizing inside the anchor keeps promotion's
- * returned value and any later recomputation identical. Ids are unique — both
- * `promoteRelease` and `buildReleaseTuple` enforce it — so the order is total.
+ * `releaseArtifactFingerprint` sorts scenarios by ID because promotion and `loadRelease` supply different noncanonical orders.
+ * Scenario IDs must be unique so sorting by id defines a total order.
  */
 export function releaseArtifactFingerprint(
     manifest: ReleaseManifest,
@@ -197,22 +156,14 @@ export function releaseArtifactFingerprint(
 }
 
 /**
- * Corpus-wide hard-negative coverage (R2): the union of declared families must be
- * the whole set.
+ * Declared hard-negative families must cover every `HARD_NEGATIVE_FAMILIES` member.
  *
- * Per-scenario lint only proves each scenario exercises the families IT declares,
- * so a corpus of unique, lint-clean scenarios inside the size budget can cover a
- * single family and still pass every other gate — the promotion tests demonstrate
- * exactly that shape, promoting ten semantic variants of one reference scenario.
- * A release could then omit user-correction, current-vs-historical, or
- * prompt-injection coverage entirely while publishing green mutation evidence,
- * because the battery only ever asserts what each scenario claims. Family names
- * come from `HARD_NEGATIVE_FAMILIES`, not the corpus, so naming the missing ones
- * echoes no artifact content.
+ * Per-scenario lint verifies only each scenario's declared families.
+ * A lint-clean corpus can declare only one family.
+ * A release can omit user-correction, current-vs-historical, and prompt-injection coverage despite green mutation evidence.
+ * Missing-family names come from `HARD_NEGATIVE_FAMILIES`, not corpus artifacts.
  *
- * Exported so the per-PR `--lint` gate applies the same rule as freeze promotion:
- * a corpus that promotion would reject must not pass the cheap gate, or a release
- * could freeze in a state the per-PR gate then rejects forever.
+ * `--lint` and freeze promotion call `checkFamilyCoverage` to enforce one family-coverage rule.
  */
 export function checkFamilyCoverage(scenarios: readonly HistorianEvalScenario[]): string[] {
     const declared = new Set(scenarios.flatMap((scenario) => scenario.families));
@@ -220,16 +171,13 @@ export function checkFamilyCoverage(scenarios: readonly HistorianEvalScenario[])
     return missing.length > 0 ? [`release.families: missing-${missing.join(",")}`] : [];
 }
 
-/** Real regular file — not a symlink whose target lives outside the frozen tree. */
+/** `assertRegularFile` rejects all symlinks. */
 function assertRegularFile(path: string, label: string): void {
     if (!lstatSync(path).isFile()) fail([`${label}: not-a-regular-file`]);
 }
 
 /**
- * Canonical `vN` only. `v01` and `v1` share an ordinal, so accepting both would
- * let two directory names claim the same release position and defeat the
- * monotonicity check — and a strict load that certified `v01` would accept a
- * release the promoter refuses to publish.
+ * `assertCanonicalVersion` rejects noncanonical spellings such as `v01`, which share `v1`'s ordinal.
  */
 function assertCanonicalVersion(version: string, label: string): void {
     if (!RELEASE_VERSION_RE.test(version) || version !== `v${versionOrdinal(version)}`) {
@@ -237,23 +185,20 @@ function assertCanonicalVersion(version: string, label: string): void {
     }
 }
 
-/** Real directory — not a symlink whose target lives outside the releases root. */
+/** `assertRealDirectory` rejects all symlinks. */
 function assertRealDirectory(path: string, label: string): void {
     if (!lstatSync(path).isDirectory()) fail([`${label}: not-a-real-directory`]);
 }
 
 export interface LoadReleaseOptions {
     /**
-     * Expected `releaseArtifactFingerprint`, from a trust anchor outside the
-     * release directory. Omit only when the caller already trusts the tree (the
-     * promoter's own read-back of bytes it just wrote).
+     * `expectedArtifactFingerprint` must come from a trust anchor outside the release directory.
+     * Callers may omit `expectedArtifactFingerprint` only when they already trust the release tree.
      */
     expectedArtifactFingerprint?: string;
     /**
-     * Deny lists for the privacy gate, in the form promotion takes them. Supplied
-     * here because a release assembled outside this promoter never passed that
-     * gate at all, and one this promoter published passed it only against the
-     * lists in force then — which cannot cover a list that has grown since.
+     * `forbiddenTokens` and `forbiddenIdentifiers` are the promotion privacy deny lists.
+     * Privacy scanning is required for releases assembled outside the promoter.
      * Omitting both means no scan, matching a caller that already trusts the tree.
      */
     forbiddenTokens?: readonly string[];
@@ -261,16 +206,9 @@ export interface LoadReleaseOptions {
 }
 
 /**
- * Strict consumer path: load a release directory back through the full
- * parse + lint + fingerprint pipeline. Fails closed on a symlinked release
- * directory, unexpected entries, symlinked artifacts, a corpus outside the size
- * budget, sensitive content when deny lists are supplied, fingerprint drift,
- * tombstoned scenarios present in the corpus, or missing/ungreen mutation
  * evidence.
  *
- * Gate order mirrors promotion: structural shape, then the privacy scan over
- * UNPARSED values (parser diagnostics interpolate scenario ids and field paths),
- * then the parsers, then authenticity, then the cross-artifact semantics.
+ * The privacy scan runs on unparsed values because parser diagnostics interpolate scenario IDs and field paths.
  */
 export function loadRelease(
     releaseDir: string,
@@ -280,47 +218,37 @@ export function loadRelease(
     scenarios: HistorianEvalScenario[];
     mutationEvidence: MutationEvidenceArtifact;
 } {
-    // The release directory itself, before anything reads through it. Every read
-    // below follows a symlink here and the child checks would then see an
-    // ordinary tree, so a `vN` entry linked outside the releases root would pass
-    // the whole strict path while its bytes stay mutable outside the supposedly
+    // Child checks would see an ordinary tree after resolving a releaseDir symlink.
+    // A `vN` symlink outside `releasesRoot` could pass the version-directory check.
+    // Such a symlink would leave release bytes mutable outside the releases root.
     // immutable release.
     assertRealDirectory(releaseDir, "release");
     const entries = readdirSync(releaseDir).sort();
     const expected: string[] = [RELEASE_FILES.evidence, RELEASE_FILES.manifest, RELEASE_FILES.scenariosDir];
     const unexpected = entries.filter((entry) => !expected.includes(entry));
     if (unexpected.length > 0 || entries.length !== expected.length) {
-        // Counts only: entry names from an externally assembled tree have not
-        // been through the privacy scan (which covers scenario values, not
-        // filesystem names), so echoing them would push unreviewed text —
-        // a forbidden token, customer identifier, or local path — into logs.
+        // `loadRelease` reports entry counts because entry names have not passed the privacy scan.
+        // Reporting filenames could expose unscanned sensitive content in logs.
         fail([
             `release: unexpected entries (${unexpected.length} unexpected of ${entries.length}, expected ${expected.length})`,
         ]);
     }
-    // Name checks alone are satisfied by symlinks, and every read below
-    // follows them: a self-consistent link farm would pass `loadRelease`
-    // while later runs load bytes that can change outside the supposedly
-    // immutable release directory.
+    // `loadRelease` rejects symlinks because name checks accept them and later reads follow them.
+    // Later reads follow symlinks, so a self-consistent link farm would pass `loadRelease`.
     assertRegularFile(join(releaseDir, RELEASE_FILES.manifest), "release.manifest");
     assertRegularFile(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence");
     const scenariosDir = join(releaseDir, RELEASE_FILES.scenariosDir);
     assertRealDirectory(scenariosDir, "release.scenarios");
 
     const scenarioFiles = readdirSync(scenariosDir).sort();
-    // Position-based labels, for the same reason the entry check above reports
-    // counts: a scenario filename from an externally assembled tree has not been
-    // through the privacy scan (which covers scenario values, not filesystem
-    // names). `parseScenario` prefixes every validation diagnostic with its
-    // label, so a filename there would push unreviewed text — a forbidden token,
-    // customer identifier, or local path — into logs on any malformed scenario.
+    // `loadRelease` uses index-based labels so parser diagnostics cannot echo unscanned filenames.
+    // `parseScenario` includes its label in every validation diagnostic.
+    // A filename used as a label could expose unscanned content in diagnostics.
     // The index is enough to locate the file, since the list is sorted.
     for (const [index, file] of scenarioFiles.entries()) {
         assertRegularFile(join(scenariosDir, file), `release.scenarios[${index}]`);
     }
-    // The same budget promotion enforces (R1): a separately assembled or
-    // truncated release must not pass the strict path with a corpus that
-    // promotion would reject.
+    // `loadRelease` enforces `CORPUS_SIZE_BUDGET` to match promotion's corpus-size limit.
     if (scenarioFiles.length < CORPUS_SIZE_BUDGET.min || scenarioFiles.length > CORPUS_SIZE_BUDGET.max) {
         fail([
             `release: corpus size ${scenarioFiles.length} outside the ${CORPUS_SIZE_BUDGET.min}-${CORPUS_SIZE_BUDGET.max} budget (R1)`,
@@ -332,11 +260,6 @@ export function loadRelease(
     const rawScenarios = scenarioFiles.map((file, index) =>
         readReleaseJson(join(scenariosDir, file), `release.scenarios[${index}]`),
     );
-    // Privacy gate BEFORE any parser, exactly as promotion orders it: schema
-    // diagnostics interpolate scenario ids and field paths, so a parser run first
-    // could echo the very content the scan exists to keep out of logs. Covers all
-    // three artifact groups — approver strings and tombstone ids are published
-    // verbatim in the manifest, and evidence entries carry ids no charset rule
     // constrains.
     if (options.forbiddenTokens !== undefined || options.forbiddenIdentifiers !== undefined) {
         const privacyDiagnostics = scanForSensitiveContent(
@@ -352,40 +275,22 @@ export function loadRelease(
     }
 
     const manifest = parseManifest(rawManifest);
-    // `parseManifest` accepts the broad `RELEASE_VERSION_RE` shape, so an
-    // externally assembled release could declare `v01` and be certified here
-    // while `promoteRelease` refuses to publish it.
+    // The validator rejects noncanonical version strings that `parseManifest` accepts but `promoteRelease` refuses.
+    // `parseManifest` accepts `v01` under `RELEASE_VERSION_RE`.
+    // `promoteRelease` refuses to publish `v01`.
     assertCanonicalVersion(manifest.releaseVersion, "release.manifest.releaseVersion");
-    // The declared version must also be the version this tree is INSTALLED as.
-    // Nothing above compares them: a copied or hand-edited `releases/v2` holding
-    // a valid v1 manifest passes every check, and the lane then runs the v2
-    // corpus while labelling its report v1 — and prior-release traversal reads
-    // the same mislabelled tree as v2. `installedReleases` already enforces this
-    // for predecessors; the consumer path did not.
+    // `manifest.releaseVersion` must equal a version-named `releaseDir` basename; otherwise a copied release can run a corpus under the wrong reported version.
     //
-    // Guarded on the directory being version-named, because the promoter loads
-    // its own review and staging trees through here under `historian-eval-promote-*`
-    // and `.staging-*` names that legitimately do not encode a version. Both
-    // names are `RELEASE_VERSION_RE`-bounded when the guard fires, so reporting
-    // them echoes no artifact content.
+    // Labels that interpolate only `entry` cannot echo arbitrary artifact content because `RELEASE_VERSION_RE` bounds `entry`.
     //
-    // Resolved before the basename is taken: `basename` is purely lexical, so
-    // `releases/v2/.` yields `.` and a trailing separator or a `..` component
-    // shifts it likewise — each one skipping the guard on the very tree it names.
-    // `resolve` collapses those components first, so the check binds to the
-    // directory that is actually read.
+    // `resolve` prevents `.` and `..` path components from bypassing the version-directory check.
     const installedAs = basename(resolve(releaseDir));
     if (RELEASE_VERSION_RE.test(installedAs) && manifest.releaseVersion !== installedAs) {
         fail([`release.manifest.releaseVersion: declares ${manifest.releaseVersion} in directory ${installedAs}`]);
     }
     const mutationEvidence = parseMutationEvidence(rawEvidence);
     const scenarios = rawScenarios.map((raw, index) => parseScenario(raw, `release.scenarios[${index}]`));
-    // Authenticity before any content is trusted, over all three artifact groups:
-    // each file is separately mutable, and the evidence parser proves internal
-    // consistency and full class coverage — not that the battery ever ran.
-    // Parsing first is validation, not trust: the parsers reject malformed input,
-    // and the anchor needs parsed values because it fingerprints values, not bytes
-    // (`readReleaseJson` already pins the bytes to their canonical form).
+    // The fingerprint check runs after parsing so the anchor covers validated values.
     if (
         options.expectedArtifactFingerprint !== undefined &&
         releaseArtifactFingerprint(manifest, mutationEvidence, scenarios) !== options.expectedArtifactFingerprint
@@ -425,36 +330,25 @@ function writeReleaseTree(dir: string, manifest: ReleaseManifest, scenarios: rea
     }
 }
 
-/** Ordinal of a `vN` directory name. Canonical form only — see `promoteRelease`. */
+/* */
 function versionOrdinal(version: string): number {
     return Number(version.slice(1));
 }
 
 /**
- * Every installed release, newest last. One pass serves both obligations that
- * read prior state: tombstone inheritance (R12) and succession, so they cannot
- * disagree about which releases exist.
+ * `installedReleases` returns installed releases in ascending version order.
+ * The validator uses one ordered release list for tombstone inheritance and succession.
  *
- * Prior releases are read as LINEAGE, not re-certified as current manifests.
- * `parseManifest` pins the scenario-schema, privacy-policy, and sanitizer
- * versions to the ones this lane implements, so rotating any of them would make
- * every already-installed manifest unparseable and block all further promotion —
- * precisely when those releases' tombstones still have to be carried forward. A
- * predecessor is consulted for what it retired, not approved again.
+ * The consumer uses each predecessor only to inherit its tombstones, not to recertify its manifest.
  *
- * Fails closed on a version-named directory without a loadable manifest: a
- * corrupt releases root read as "carries no tombstones" would silently
- * re-admit a retracted scenario into vN+1.
+ * The validator fails when a version-named directory lacks a loadable manifest; otherwise a retracted scenario could re-enter a later release.
  *
- * Prior lineage is trusted as filesystem state, and that is the boundary of what
- * this check can reach. The symlink guards prove the bytes live inside the
- * releases root; nothing proves they are the bytes that were approved, so an
- * in-place canonical rewrite that drops a tombstone would be inherited as a
- * smaller set. The external artifact anchor cannot close this: verifying one
- * would mean re-certifying a predecessor through `parseManifest`, which is the
- * policy-rotation trap this function exists to avoid. Closing it needs trusted
- * prior state — the append-only tombstone registry `assertReleaseSuccession`
- * already names — which would supply the lineage instead of the predecessor's
+ * `installedReleases` trusts prior lineage as filesystem state and cannot verify that its files were approved.
+ * Symlink guards keep manifest bytes inside `releasesRoot` but cannot prove that they were approved.
+ * An in-place canonical rewrite can remove a tombstone despite the symlink guards.
+ * A canonical manifest rewrite that removes a tombstone reduces the inherited tombstone set.
+ * `parseManifest` re-certifies predecessors under the lane's policy versions.
+ * Preventing canonical rewrites from dropping tombstones requires trusted prior state.
  * own manifest.
  */
 function installedReleases(releasesRoot: string): ReleaseLineage[] {
@@ -467,13 +361,7 @@ function installedReleases(releasesRoot: string): ReleaseLineage[] {
             if (!existsSync(manifestPath)) {
                 fail([`release: prior release ${entry} has no readable manifest; refusing to inherit tombstones`]);
             }
-            // Same symlink rule the consumer path applies, because this read does
-            // not go through `loadRelease`: a linked release directory or manifest
-            // resolves outside the releases root, where its tombstone list stays
-            // mutable. Dropping a tombstone there before the next promotion would
-            // shrink the inherited set and let a retired scenario be published
-            // again. Entry names are `RELEASE_VERSION_RE`-bounded, so labelling
-            // them echoes no artifact content.
+            // `installedReleases` applies the consumer symlink checks because it bypasses `loadRelease`.
             assertCanonicalVersion(entry, `release.${entry}`);
             assertRealDirectory(join(releasesRoot, entry), `release.${entry}`);
             assertRegularFile(manifestPath, `release.${entry}.manifest`);
@@ -481,13 +369,8 @@ function installedReleases(releasesRoot: string): ReleaseLineage[] {
                 readReleaseJson(manifestPath, `release.${entry}.manifest`),
                 `release.${entry}.manifest`,
             );
-            // Ordering above is by DIRECTORY name, but succession is enforced
-            // against the manifest's own `releaseVersion`. A manifest copied into
-            // a differently named directory — a v1 manifest under v100 — would
-            // sort newest while reporting v1, so promoting v2 would be compared
-            // against v1 and admitted, leaving the numerically later, immutable
-            // v100 still serving a scenario v2 retired. Both names are
-            // `RELEASE_VERSION_RE`-bounded, so reporting them echoes no artifact
+            // Directory ordering uses directory names, while succession uses manifest `releaseVersion`.
+            // `lineage.releaseVersion` must equal the directory name so directory ordering cannot misorder succession.
             // content.
             if (lineage.releaseVersion !== entry) {
                 fail([`release: prior release ${entry} declares version ${lineage.releaseVersion}`]);
@@ -496,7 +379,7 @@ function installedReleases(releasesRoot: string): ReleaseLineage[] {
         });
 }
 
-/** Prior releases' tombstones persist in every later release (R12). */
+/** Prior releases' tombstones persist in every later release. */
 function inheritedTombstones(prior: readonly ReleaseLineage[]): string[] {
     const tombstones = new Set<string>();
     for (const lineage of prior) {
@@ -505,27 +388,21 @@ function inheritedTombstones(prior: readonly ReleaseLineage[]): string[] {
     return [...tombstones].sort();
 }
 
-/** Exclusive promotion lock for one releases root. */
+/** The promotion lock excludes other promoters for the same releases root. */
 const PROMOTION_LOCK = ".promote.lock";
 
 /**
- * Serialize promotion across the whole read-validate-publish window for one
+ * The promotion lock serializes promotion from reading through publishing for each releases root.
  * releases root.
  *
- * The lineage snapshot and the publishing rename are far apart, and everything
- * between them assumes the snapshot is still current. Two concurrent promoters
- * both read the same predecessor, validate independently, and publish: if one
- * introduces a tombstone, the other never sees it and can publish the retired
- * scenario despite being numerically later, which is exactly the state
- * `assertReleaseSuccession` exists to prevent. The staging sweep is worse than a
- * stale read — it deletes `.staging-*` trees unconditionally, so one promoter can
- * destroy another's in-flight candidate. Operator-serial promotion was assumed
- * but never enforced; this enforces it.
+ * The lineage snapshot must remain current until the publishing rename.
+ * Concurrent promoters can validate the same predecessor and publish independently without the promotion lock.
+ * A concurrent promoter can publish a tombstoned scenario after reading the predecessor before another promoter publishes the tombstone.
+ * The staging sweep can delete another promoter's in-flight `.staging-*` candidate.
  *
- * Fails closed on an existing lock rather than stealing it: a lock whose owner is
- * still working is precisely the case that must not proceed, and this cannot tell
- * that apart from a crashed owner's leftover. The diagnostic names the path so an
- * operator can clear it deliberately. `wx` makes creation the atomic test-and-set.
+ * Lock acquisition rejects an existing lock because a live owner cannot be distinguished from a stale lock.
+ * The diagnostic names `.promote.lock` so an operator can remove a confirmed stale lock.
+ * `wx` atomically creates the lock only when it does not exist.
  */
 function withPromotionLock<T>(releasesRoot: string, run: () => T): T {
     mkdirSync(releasesRoot, { recursive: true });
@@ -553,11 +430,9 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
     }
     assertCanonicalVersion(input.releaseVersion, "release");
 
-    // Privacy gate FIRST — before any parser, because schema diagnostics
-    // interpolate scenario ids and field paths. Approvals and tombstones are
-    // scanned too: approver strings are published verbatim into the immutable
-    // manifest, and a tombstone id is an operator-authored string that every
-    // LATER manifest also carries forward.
+    // Promotion scans for sensitive content before parsing because parser diagnostics include scenario IDs and field paths.
+    // Promotion scans approvals because approver strings are copied verbatim into the immutable manifest.
+    // Promotion scans tombstones because later manifests carry their IDs forward.
     const privacyDiagnostics = scanForSensitiveContent(
         { scenarios: input.scenarios, approvals: input.approvals, tombstones: input.tombstones ?? [] },
         {
@@ -580,9 +455,7 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
     const familyDiagnostics = checkFamilyCoverage(scenarios);
     if (familyDiagnostics.length > 0) fail(familyDiagnostics);
 
-    // Everything from here reads or mutates the releases root, so it runs under
-    // the exclusive lock: the lineage snapshot below must still be current when
-    // the rename publishes.
+    // Promotion holds the lock from the lineage snapshot through the publishing rename.
     return withPromotionLock(input.releasesRoot, () => promoteUnderLock(input, scenarios, ids));
 }
 
@@ -591,15 +464,11 @@ function promoteUnderLock(
     scenarios: readonly HistorianEvalScenario[],
     ids: ReadonlySet<string>,
 ): { releaseDir: string; artifactFingerprint: string } {
-    // Cheap rejection gates run before the battery: tombstone conflicts,
-    // approval binding, and version collisions each reject in microseconds,
-    // while the recomputed battery costs seconds per promotion.
+    // Promotion runs tombstone, approval, and version-collision checks before recomputing the battery to avoid unnecessary battery work.
     const prior = installedReleases(input.releasesRoot);
     const inherited = inheritedTombstones(prior);
     const tombstones = [...new Set([...inherited, ...(input.tombstones ?? [])])].sort();
-    // Inherited ids get scanned too, against THIS promotion's deny lists: they
-    // are about to be republished into a new immutable manifest, and the lists
-    // can name something no earlier promotion was told to reject.
+    // Promotion scans inherited IDs against this promotion's deny lists because the immutable manifest republishes them.
     const tombstonePrivacy = scanForSensitiveContent(
         { tombstones },
         { forbiddenTokens: input.forbiddenTokens, forbiddenIdentifiers: input.forbiddenIdentifiers },
@@ -620,26 +489,17 @@ function promoteUnderLock(
 
     const destination = join(input.releasesRoot, input.releaseVersion);
     if (existsSync(destination)) {
-        // Immutability: an existing release is never modified; errata go
-        // into vN+1 (R12). Checked before succession so re-promoting the
-        // newest version reports the collision rather than the weaker
-        // "not later than" diagnostic.
+        // Promotion never modifies an existing release.
+        // Promotion checks destination collisions before succession so re-promoting the newest version reports a collision.
         fail(["release: version already installed"]);
     }
-    // Succession against the newest installed release, not just the exact
-    // destination: publishing v1 after v2 would leave the numerically later —
-    // and immutable — v2 still serving a scenario v1 retired, so the vN+1
-    // errata rule could never retire it. The contract owns this rule (it also
-    // refuses dropped tombstones) so promotion and manifest audit agree.
+    // Promotion checks succession against the newest installed release, not only the destination version.
     const newest = prior.at(-1);
     if (newest !== undefined) {
         assertReleaseSuccession(newest, nextLineage);
     }
 
-    // Admission gate (R13): the battery is recomputed here rather than
-    // accepted from the caller, so no scenario can enter a frozen release
-    // with forged or stale evidence; the recomputed artifact is what gets
-    // published beside the corpus.
+    // Promotion recomputes the mutation battery instead of accepting caller-supplied evidence.
     const evidence = runMutationBattery(scenarios);
     checkMutationEvidence(evidence, scenarios);
 
@@ -651,8 +511,7 @@ function promoteUnderLock(
         tombstones,
     };
 
-    // Owner-only review directory OUTSIDE version control: the reviewed
-    // bytes must be exactly what the strict consumer path accepts.
+    // `loadRelease` must accept the review bytes before publication.
     const reviewDir = mkdtempSync(join(realpathSync.native(tmpdir()), "historian-eval-promote-"));
     try {
         if (hasGitAncestor(reviewDir)) {
@@ -664,11 +523,8 @@ function promoteUnderLock(
         rmSync(reviewDir, { recursive: true, force: true });
     }
 
-    // A crash between staging and rename strands a fully populated
-    // `.staging-*` tree beside the releases, where it would be committable.
-    // Staged trees are unpublished by construction (publication is the
-    // atomic rename), and promotions are operator-serial per releases root,
-    // so removing leftovers here is safe.
+    // A crash after `mkdtempSync` and before `renameSync` can leave a `.staging-*` directory.
+    // `renameSync(staging, destination)` publishes a staged tree.
     for (const entry of readdirSync(input.releasesRoot)) {
         if (entry.startsWith(".staging-")) {
             rmSync(join(input.releasesRoot, entry), { recursive: true, force: true });
@@ -677,26 +533,14 @@ function promoteUnderLock(
     const staging = mkdtempSync(join(input.releasesRoot, ".staging-"));
     try {
         writeReleaseTree(staging, manifest, scenarios, evidence);
-        // Tamper check: re-load the exact staged bytes before publication.
+        // `loadRelease` must validate the staged tree before `renameSync` publishes it.
         loadRelease(staging);
         renameSync(staging, destination);
     } catch (error) {
         rmSync(staging, { recursive: true, force: true });
         throw error;
     }
-    // The caller records this out of band; it is the only anchor that lets a
-    // later `loadRelease` detect an edited approver string or forged evidence.
     //
-    // Publication (the rename above) is not atomic with the caller's recording
-    // of this value, and cannot be — they are separate stores. A crash in
-    // between leaves vN installed with no recorded anchor, which is recoverable
-    // WITHOUT re-promoting: the anchor is a pure function of the published
-    // manifest and evidence, so passing a `loadRelease` of the installed tree
-    // back through `releaseArtifactFingerprint` reproduces it exactly.
-    // Recording before the rename would only invert the exposure, leaving an
-    // anchor on file for a release that was never published. Recompute promptly:
-    // recomputation trusts the bytes on disk, so it can only certify a tree
-    // nobody has edited since the crash.
     return {
         releaseDir: destination,
         artifactFingerprint: releaseArtifactFingerprint(manifest, evidence, scenarios),

@@ -1,8 +1,8 @@
-//! End-to-end Synapse lane over a real authenticated host route with the
-//! committed synapse-tiny bundle and the certified FastEmbed backend.
+//! These tests exercise a Synapse lane over a real authenticated host route.
+//! These tests use the `synapse-tiny` bundle and certified FastEmbed backend.
 //!
-//! Vector-serving tests need a native ONNX Runtime library via
-//! `MC_SYNAPSE_TEST_ORT_LIBRARY`; the degraded-bundle path runs without it.
+//! Vector-serving tests require a native ONNX Runtime library in `MC_SYNAPSE_TEST_ORT_LIBRARY`.
+//! The degraded-bundle path runs without an ONNX Runtime library.
 
 mod support;
 
@@ -60,7 +60,6 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
         let entry = entry.expect("entry");
         std::fs::copy(entry.path(), dir.path().join(entry.file_name())).expect("copy");
     }
-    // One flipped byte in the model artifact.
     let model_path = dir.path().join("model.onnx");
     let mut bytes = std::fs::read(&model_path).expect("model");
     bytes[0] ^= 0x01;
@@ -87,8 +86,7 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
     let body = frame.json();
     let modules = body["modules"].as_array().expect("modules");
     assert_eq!(modules.len(), 3);
-    // Neither module implements any control op; `wake.create` stays
-    // excluded so wake-plane probes fail open (AE10).
+    // `wake.create` is excluded so wake-plane probes fail open.
     support::assert_control_ops(&body["modules"], &[]);
 
     let err = support::synapse::open_synapse_route_rejection(&mut client).await;
@@ -174,7 +172,6 @@ async fn all_four_operations_serve_certified_vectors_over_the_wire() {
         assert!((g - e).abs() <= tolerance, "query drift beyond tolerance");
     }
 
-    // embed.batch + paged embed.result over three corpus texts.
     let texts: Vec<&str> = corpus["items"]
         .as_array()
         .expect("items")

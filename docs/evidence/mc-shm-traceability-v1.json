@@ -113,8 +113,7 @@
       "id": "R12",
       "status": "INCONCLUSIVE",
       "evidence": [
-        "crates/mc-shm-transport/benches/manifests/v1.json",
-        "docs/perf/mc-shm-hardware-envelope.md"
+        "crates/mc-shm-transport/benches/manifests/v1.json"
       ],
       "note": "No hot or cold profile has a designated-host winner."
     },
@@ -141,8 +140,7 @@
       "status": "INCONCLUSIVE",
       "evidence": [
         "crates/mc-shm-transport/benches/manifests/v1.json",
-        "crates/mc-shm-transport/benches/hardware_envelope.rs",
-        "docs/perf/mc-shm-hardware-envelope.md"
+        "crates/mc-shm-transport/benches/hardware_envelope.rs"
       ],
       "note": "Manifest hosts are unset and no paired campaign has run."
     },
@@ -170,8 +168,7 @@
       "status": "INCONCLUSIVE",
       "evidence": [
         "crates/mc-shm-transport/tests/contract.rs#purity_gate_rejects_injected_copy_allocation_queue_and_wake",
-        "crates/mc-shm-transport/benches/hardware_envelope.rs",
-        "docs/perf/mc-shm-hardware-envelope.md"
+        "crates/mc-shm-transport/benches/hardware_envelope.rs"
       ],
       "note": "Counter gate works; full production-shaped paired measurements are absent."
     },
@@ -179,8 +176,7 @@
       "id": "R19",
       "status": "PARTIAL",
       "evidence": [
-        "docs/mc-host-shm-transport.md#trusted-peer-boundary",
-        "docs/perf/mc-shm-hardware-envelope.md#evidence-boundary"
+        "docs/mc-host-shm-transport.md#trusted-peer-boundary"
       ],
       "note": "Post-publication immutability is an explicit trusted-peer precondition; peer-mutation characterization remains unimplemented."
     }
@@ -241,8 +237,7 @@
       "id": "AE7",
       "status": "INCONCLUSIVE",
       "evidence": [
-        "crates/mc-shm-transport/benches/hardware_envelope.rs",
-        "docs/perf/mc-shm-hardware-envelope.md"
+        "crates/mc-shm-transport/benches/hardware_envelope.rs"
       ]
     },
     {
@@ -260,8 +255,7 @@
       "id": "AE9",
       "status": "INCONCLUSIVE",
       "evidence": [
-        "crates/mc-shm-transport/benches/manifests/v1.json",
-        "docs/perf/mc-shm-hardware-envelope.md"
+        "crates/mc-shm-transport/benches/manifests/v1.json"
       ],
       "note": "No qualifying arm; provider registries remain empty."
     },
@@ -314,8 +308,7 @@
       "id": "AE15",
       "status": "INCONCLUSIVE",
       "evidence": [
-        "crates/mc-shm-transport/benches/manifests/v1.json",
-        "docs/perf/mc-shm-hardware-envelope.md"
+        "crates/mc-shm-transport/benches/manifests/v1.json"
       ]
     }
   ]

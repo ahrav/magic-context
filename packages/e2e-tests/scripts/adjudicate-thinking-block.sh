@@ -30,7 +30,6 @@ else
 fi
 
 cat > "$ARTIFACT" <<EOF
-# Thinking-block safety adjudication
 
 The suite was invoked serially 20 times. This artifact records the observed
 verdict without changing the suite or the harness to make a failure disappear.
@@ -40,7 +39,6 @@ verdict without changing the suite or the harness to make a failure disappear.
 - Fail count: $fail_count
 - Verdict: $verdict
 
-## Failure output
 ${failure_output:-No failure output; all 20 invocations produced a passing summary.}
 EOF
 

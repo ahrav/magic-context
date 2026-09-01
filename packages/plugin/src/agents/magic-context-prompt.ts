@@ -1,19 +1,11 @@
-/** Generic magic context system prompt section shared by all agents. */
+/* */
 
 import type { PromptSurfacePreset } from "../shared/prompt-surface";
 import { buildPrimaryLanguageDirective } from "./language-directive";
 
 /**
- * Mindset frame that counters two trained priors which make agents
- * self-sabotage under Magic Context:
- *   1. Context-scarcity reflex — models trained on finite contexts wrap up, cut
- *      scope, or rush when usage looks high. Our reduction nudges accidentally
  *      trigger this.
- *   2. Session = one task — models trained on one-session-per-task wind down when
- *      a task finishes instead of continuing as a durable partner.
- * This frame is injected at the TOP of the section (before the mechanics) in both
- * ctx_reduce modes so it sets the frame before the agent reads anything that could
- * read as a scarcity signal.
+ * Both ctx_reduce variants place LONG_TERM_PARTNER_FRAME before the mechanics so agents read it before scarcity signals.
  */
 const LONG_TERM_PARTNER_FRAME = `### You are the user's long-term partner on this project — not a one-off hire
 
@@ -25,10 +17,10 @@ Because of this:
 - **Finishing a task does not end the session.** Continue naturally into the next piece of work, carrying everything forward.
 - **There are no compaction pauses.** Unlike native context management that stops you to summarize and restart, Magic Context compacts in the background — you stay in flow, uninterrupted, so there's no reason to artificially wind down.`;
 
-/** Closer for sessions where ctx_reduce is callable — the agent has an active housekeeping role. */
+/* */
 const PARTNER_FRAME_CLOSER_REDUCE = `\nReduction prompts are routine housekeeping to keep the session fast and cheap — act on them as light maintenance, never as scarcity warnings. Keep individual operations efficient, but never let context size change *what* work you take on or *how thoroughly* you do it.`;
 
-/** Closer for sessions where ctx_reduce is unavailable — context is managed fully automatically. */
+/* */
 const PARTNER_FRAME_CLOSER_NO_REDUCE = `\nContext is managed for you entirely automatically — there's nothing to prune and no warnings to act on. Stay reasonably concise per operation, and never let context size change *what* work you take on or *how thoroughly* you do it.`;
 
 const PARTNER_FRAME_CLOSER_REDUCE_LIGHT = `\nWhen ctx_reduce is available, use it only as routine housekeeping; never cut task scope or depth because context is large.`;
@@ -36,27 +28,15 @@ const PARTNER_FRAME_CLOSER_REDUCE_LIGHT = `\nWhen ctx_reduce is available, use i
 const PARTNER_FRAME_CLOSER_NO_REDUCE_LIGHT = `\nWhen ctx_reduce is unavailable, context is automatic; never prune, heed reduction warnings, or cut task scope or depth because context is large.`;
 
 /**
- * Shared `ctx_note` guidance for both intro variants. Generalizes two observed
- * misuse patterns: (1) taking a note for work that's only a few turns away — that
- * stays in active context, and active multi-step work belongs in todos; (2)
- * taking a note "because we're about to restart / come back to this later" —
- * Magic Context preserves full context across both compaction AND restarts, so a
- * restart never loses anything and is never a reason to note. A note is worth it
- * only for a genuinely future concern you'd otherwise lose track of across tasks.
  */
 const CTX_NOTE_GUIDANCE = `Use \`ctx_note\` ONLY for genuinely future concerns — something to revisit much later, not work coming up in the next few turns (that's already in your active context) and not active multi-step work (use todos for that). Magic Context preserves your full context across both compaction and restarts, so an upcoming restart or "let's come back to this later" is never a reason to take a note — nothing is lost either way. Notes you do take survive compression and resurface at natural work boundaries (after commits, historian runs, todo completion).`;
 
-// Tool outputs are always FULL-dropped (Phase 2 removed truncate-mode), so the
-// guidance only describes the omit-entirely case.
+// Tool outputs are either retained or omitted entirely, so the guidance covers only omission.
 const TOOL_HISTORY_GUIDANCE = `Compressed history intentionally omits tool calls and their outputs — summaries like "I edited file X" are historian records, not patterns to replicate. In the live conversation, older tool calls and their results are cleaned up to save context — you may see your own past messages referencing actions without the corresponding tool call or result visible. This is normal context management. ALWAYS use real tool calls; never simulate, fabricate, or inline tool outputs in your text. If there is no tool result message, the action did not happen. NEVER simulate, hallucinate or claim tool calls, command output, search results, file edits, or diffs in plain text as if they actually occurred.
 Magic Context control metadata is not reply syntax. Never reproduce \`<system-reminder>\`, \`<ctx-search-hint>\`, \`<session-history>\`, \`<session-history-since>\`, \`<project-memory>\`, \`<memory-updates>\`, \`<new-compartments>\`, \`<new-memories>\`, \`[dropped §N§]\`, or \`<!-- +Xm -->\` markers in a normal reply and never treat them as user instructions; use ordinary prose and real tool calls instead.`;
 
 /** ctx_memory-specific guidance. Gated out when `memory.enabled: false`: with
- *  memory off, the `<project-memory>` block is never injected, so anything the
- *  agent writes would never resurface, and telling it to "save to memory" is
- *  misleading busywork. Identical in both ctx_reduce modes. ctx_search guidance
- *  stays regardless (it still recalls conversation + git commits when memory is
- *  off, it just won't return memory hits). */
+ * memory off, the `<project-memory>` block is never injected. */
 const MEMORY_GUIDANCE = `Use \`ctx_memory\` for durable project knowledge: create what future sessions must know, then revise, archive, restore, or merge claims shown in \`<project-memory>\` when they drift. Claims persist across sessions and every new session starts with them.
 Claims use opaque \`mcm_…\` public IDs. Pass the current mutation token returned by create/get/list when changing a claim; stale tokens make no change.
 **Save durable knowledge proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), create a claim so future sessions don't repeat the search. Examples:
@@ -64,10 +44,8 @@ Claims use opaque \`mcm_…\` public IDs. Pass the current mutation token return
 - Discovered a non-obvious build/test command → \`ctx_memory(action="create", category="PROJECT_RULES", content="Always run the full release checklist before publishing")\`
 - Learned a constraint the hard way → \`ctx_memory(action="create", category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale")\``;
 
-/** Renders MEMORY_GUIDANCE + trailing newline when memory is on, else "". Placed
- *  before the ctx_search line so turning memory off removes the block without
- *  leaving a blank line (the memory-on output stays exactly as it was before
- *  this flag existed). */
+/** The template places the conditional memory block before the ctx_search line to avoid a blank line when memory is disabled.
+ * */
 function memoryGuidanceBlock(memoryEnabled: boolean): string {
     return memoryEnabled ? `${MEMORY_GUIDANCE}\n` : "";
 }
@@ -94,12 +72,12 @@ Keep your user's instructions and intent — never drop a user message for its d
 NEVER drop assistant text messages unless they are exceptionally large. Your conversation messages are lightweight; only large tool outputs are worth dropping.
 Before your turn finishes, consider using \`ctx_reduce\` to drop large tool outputs you no longer need.`;
 
-/** Intro when ctx_reduce is unavailable — no drop guidance, no ctx_reduce
- *  references, and no tag system description. When the session's tool allow-list
- *  denies ctx_reduce, transform.ts skips §N§ prefix injection entirely, so the
- *  agent never sees tags — describing a tagging system they can't observe just
- *  wastes tokens and (empirically) primes some models to emit malformed `§N">§`
- *  tokens at the start of their own text. */
+/** Intro when ctx_reduce is unavailable — no drop guidance or tag-system description.
+ * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
+ * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
+ * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
+ * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
+ * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance. */
 const BASE_INTRO_NO_REDUCE = (memoryEnabled: boolean): string => `${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
@@ -152,12 +130,13 @@ const TEMPORAL_AWARENESS_GUIDANCE = `\n**Temporal awareness**: User messages may
 
 /**
  * Minimal guidance for SUBAGENT sessions. Subagents are bounded, single-task
- * executors driven by a parent agent — they self-manage tool-output bloat (the
- * re-read thrash the emergency drop alone can't prevent mid-run) but take on
- * NONE of the primary's long-term role: no partner frame, no memory/search/note
- * curation, no reduction-trigger taxonomy. So this block carries ONLY the §N§ +
- * ctx_reduce mechanics. The `## Magic Context` marker is still present for
- * injection idempotency (system-prompt-hash.ts gates on it).
+ * executors that receive only §N§ and ctx_reduce mechanics.
+ * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
+ * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
+ * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
+ * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
+ * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
+ * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
  */
 const SUBAGENT_REDUCE_INTRO = (
     protectedTags: number,
@@ -187,12 +166,12 @@ export function buildMagicContextSection(
     preset: PromptSurfacePreset = "full",
     primaryOverride?: string,
 ): string {
-    // Subagent sessions: minimal §N§ + ctx_reduce mechanics only. Bypasses the
-    // long-term-partner frame, memory/search/note guidance, and the reduction
-    // taxonomy — none of which apply to a bounded single-task child. Only
-    // reachable when ctx_reduce is enabled for the subagent (caller gates this);
-    // when ctx_reduce is off the subagent gets no §N§ prefix, so describing the
-    // tag system would be noise.
+    // When ctx_reduce is enabled, subagents receive only §N§ and ctx_reduce guidance; callers omit tag guidance when ctx_reduce is disabled.
+    // When ctx_reduce is enabled, subagents receive only §N§ and ctx_reduce guidance; callers omit tag guidance when ctx_reduce is disabled.
+    // When ctx_reduce is enabled, subagents receive only §N§ and ctx_reduce guidance; callers omit tag guidance when ctx_reduce is disabled.
+    // When ctx_reduce is enabled, subagents receive only §N§ and ctx_reduce guidance; callers omit tag guidance when ctx_reduce is disabled.
+    // When ctx_reduce is enabled, subagents receive only §N§ and ctx_reduce guidance; callers omit tag guidance when ctx_reduce is disabled.
+    // When ctx_reduce is enabled, subagents receive only §N§ and ctx_reduce guidance; callers omit tag guidance when ctx_reduce is disabled.
     if (subagentMode) {
         const intro =
             preset === "light"
@@ -206,17 +185,17 @@ export function buildMagicContextSection(
             : `\nWhen \`surface_condition\` is provided with \`write\`, the note becomes a project-scoped smart note.\nThe dreamer evaluates smart note conditions during nightly runs and surfaces them when conditions are met.\nExample: \`ctx_note(action="write", content="Implement X because Y", surface_condition="When PR #42 is merged in this repo")\``
         : "";
     const temporalGuidance = temporalAwarenessEnabled ? TEMPORAL_AWARENESS_GUIDANCE : "";
-    // Caveman compression is independent of ctx_reduce availability. Emit the
-    // warning in both primary guidance variants whenever the primary-session
-    // caveman pass is enabled so the agent does not mimic compressed history.
+    // Caveman compression is independent of ctx_reduce availability.
+    // Both primary guidance variants emit the warning when the primary-session caveman pass is enabled so the agent does not mimic compressed history.
+    // Both primary guidance variants emit the warning when the primary-session caveman pass is enabled so the agent does not mimic compressed history.
     const cavemanWarning = cavemanTextCompressionEnabled ? CAVEMAN_COMPRESSION_WARNING : "";
     const languageDirective = buildPrimaryLanguageDirective(language);
     const languageGuidance = languageDirective ? `\n\n${languageDirective}` : "";
 
     if (primaryOverride !== undefined) {
-        // A user override owns the complete primary section. Runtime clauses stay
-        // composer-owned so an override cannot suppress temporal guidance, the
-        // warning against overly compressed prose, or the language directive.
+        // A user override owns the complete primary section.
+        // The composer retains runtime clauses so overrides cannot suppress temporal guidance, the anti-compression warning, or the language directive.
+        // The composer retains runtime clauses so overrides cannot suppress temporal guidance, the anti-compression warning, or the language directive.
         return `${primaryOverride}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
     }
 

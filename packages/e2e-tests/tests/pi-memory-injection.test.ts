@@ -68,8 +68,6 @@ describe("pi memory injection", () => {
         const directive = "pi seeded directive: prefer stable cross-harness memory checks";
         emitMemoryWriteOnce(directive);
         await h.sendPrompt("remember the project memory directive", { timeoutMs: 60_000 });
-        // v86 trust policy: an agent write starts CANDIDATE and is hidden
-        // from automatic surfaces; injection needs a verified row.
         promoteMemoryToVerified(h.contextDbPath(), directive);
         await h.newSession();
 
@@ -81,8 +79,7 @@ describe("pi memory injection", () => {
         const assertion = await h.sendPrompt("read my project memory", { timeoutMs: 60_000 });
         expect(assertion.sessionId).toBeTruthy();
 
-        // The assertion session has no historian output; memory injection alone
-        // must build the session-history wrapper and project-memory payload.
+        // Memory injection must build the session-history wrapper and project-memory payload when the assertion session has no historian output.
         expect(countCompartments(assertion.sessionId!)).toBe(0);
 
         const body = JSON.stringify(h.mock.lastRequest()!.body);

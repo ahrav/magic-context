@@ -15,10 +15,7 @@ export interface ChunkBlock {
     meta: SessionChunkLine[];
     commitHashes: string[];
     /**
-     * True when every part in this block came from tool-call summaries only
-     * (no textual narrative from the user or assistant). Historian often skips
-     * such blocks — that's safe as long as we know the skipped range is
-     * tool-only, so we mark the block here and let validation absorb the gap.
+     * isToolOnly is true when every part in the block came from a tool-call summary.
      */
     isToolOnly: boolean;
 }
@@ -56,8 +53,8 @@ export function extractTexts(parts: unknown[]): string[] {
     return texts;
 }
 
-/** Extract compact tool-call summaries from message parts.
- *  Returns lines like "TC: Fix lint errors" or "TC: read(src/index.ts)". */
+/**
+ * extractToolCallSummaries returns tool-call summaries prefixed with `TC:`. */
 export function extractToolCallSummaries(parts: unknown[]): string[] {
     const summaries: string[] = [];
     for (const part of parts) {
@@ -70,7 +67,6 @@ export function extractToolCallSummaries(parts: unknown[]): string[] {
         const input = state.input as Record<string, unknown> | null;
         const metadata = state.metadata as Record<string, unknown> | null;
 
-        // Prefer explicit description (bash tool always has one)
         const description =
             (input && typeof input.description === "string" && input.description) ||
             (metadata && typeof metadata.description === "string" && metadata.description);
@@ -79,7 +75,6 @@ export function extractToolCallSummaries(parts: unknown[]): string[] {
             continue;
         }
 
-        // Fall back to tool_name(key_arg) for common tools
         const toolName = p.tool as string;
         const keyArg = extractKeyArg(toolName, input);
         summaries.push(keyArg ? `TC: ${toolName}(${keyArg})` : `TC: ${toolName}`);
@@ -89,17 +84,14 @@ export function extractToolCallSummaries(parts: unknown[]): string[] {
 
 function extractKeyArg(_toolName: string, input: Record<string, unknown> | null): string | null {
     if (!input) return null;
-    // File-oriented tools: show the path
     if (typeof input.filePath === "string") return truncateArg(input.filePath);
     if (typeof input.path === "string") return truncateArg(input.path);
-    // Search tools: show the pattern/query
     if (typeof input.pattern === "string") return truncateArg(input.pattern);
     if (typeof input.query === "string") return truncateArg(input.query);
     // Symbol tools
     if (typeof input.symbol === "string") return input.symbol;
     // Module tools
     if (typeof input.module === "string") return input.module;
-    // Memory/note tools: show the action
     if (typeof input.action === "string") return input.action;
     return null;
 }

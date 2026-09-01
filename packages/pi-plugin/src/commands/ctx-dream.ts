@@ -37,7 +37,6 @@ export function registerCtxDreamCommand(
 				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
 			deps.onProjectSeen?.(project.projectIdentity);
 
-			// Optional single-task arg: `/ctx-dream verify`.
 			const requested =
 				typeof args === "string" ? args.trim() : String(args ?? "").trim();
 			let task: DreamTaskName | undefined;
@@ -81,8 +80,7 @@ export function registerCtxDreamCommand(
 				backlogTasks,
 			);
 
-			// Tell the user we're starting a real run, including the read-only count
-			// captured before the task acquires its lease.
+			// The initial status reports the backlog before lease acquisition.
 			sendCtxStatusMessage(
 				pi,
 				{
@@ -106,7 +104,6 @@ export function registerCtxDreamCommand(
 				},
 			);
 
-			// Dreamer v2: run due/forced tasks now via the per-task scheduler.
 			try {
 				const result = await runPiDreamForProject(
 					project.projectIdentity,
@@ -126,9 +123,6 @@ export function registerCtxDreamCommand(
 					lines.push(`Skipped (no work): ${result.skippedNoWork.join(", ")}`);
 				if (result.deferredBusy.length > 0)
 					lines.push(
-						// "Busy" means the task's DOMAIN lease is held — usually
-						// a sibling task (e.g. a scheduled verify blocking a
-						// manual curate), not this task itself.
 						`Busy: ${result.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
 					);
 				if (Object.keys(result.backlogAfter ?? {}).length > 0) {

@@ -18,9 +18,6 @@ function stripPackageNameFromPath(pathValue: string, packageName: string): strin
 }
 
 /**
- * Resolve the cache root only. Auto-update never edits, removes, or installs
- * into this tree: OpenCode owns versioned cache directories and reconciles the
- * exact spec selected by the configuration on the next boot.
  */
 export function resolveInstallContext(
     runtimePackageJsonPath: string | null = getCurrentRuntimePackageJsonPath(),

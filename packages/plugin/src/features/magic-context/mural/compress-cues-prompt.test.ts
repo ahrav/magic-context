@@ -78,7 +78,6 @@ describe("validateCue (per-cue, applied on write)", () => {
 
     test("rejects an over-budget cue for its importance band", () => {
         expect(validateCue("x".repeat(51), 50)?.reason).toContain("over-budget");
-        // The same length is fine at high importance (budget 90).
         expect(validateCue("x".repeat(51), 80)).toBeNull();
     });
 

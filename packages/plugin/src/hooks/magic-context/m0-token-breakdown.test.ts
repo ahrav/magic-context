@@ -6,10 +6,6 @@ import { computeM0BlockTokens } from "./m0-token-breakdown";
 import { estimateTokens } from "./read-session-formatting";
 
 /**
- * The shared m[0] breakdown is the single source of truth for BOTH the OpenCode
- * sidebar/RPC and the Pi /ctx-status dialog, so they can never re-diverge on
- * categories or measurement (Pi had drifted: it still showed retired Facts and
- * lacked Docs/User Profile/v2-memory measurement).
  */
 
 const SESSION_ID = "ses_m0_breakdown";
@@ -45,7 +41,6 @@ describe("computeM0BlockTokens", () => {
                 "<session-history>\n## 1-9 · Did a thing\nbody text\n</session-history>",
             ),
         );
-        // v2: facts retired (promoted to memories) → always 0.
         expect(b.factTokens).toBe(0);
         db.close();
     });

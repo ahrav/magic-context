@@ -1,17 +1,6 @@
 /**
- * Versioned smart-note evaluation transition contract.
  *
- * One reducer owns every lifecycle transition for the four evaluation phases.
- * Both state authorities consume it: the TypeScript SQLite adapter applies
- * reductions through `applySmartNoteReduction`, and the Rust authority ports
- * the same contract (crates/mc-module/src/smart_note_evaluation.rs). Both
- * implementations replay the frozen characterization fixture
- * (crates/mc-module/testdata/smart-note-evaluation-golden.json), so lifecycle
- * behavior cannot drift between languages.
  *
- * The reducer is pure: callers supply the pre-state, a semantic outcome, and
- * the transition clock. Evaluators never compute persisted lifecycle state;
- * cancellation is an abandon, never an outcome.
  */
 import type { Database } from "../../../shared/sqlite";
 import { nextSmartNoteCheckDueAt } from "./schedule";
@@ -29,10 +18,10 @@ export const MAX_FAILURES_BEFORE_REAUTHOR = 3;
 
 export type EvaluationPhase = "compile" | "due" | "liveness" | "fallback";
 
-/** Normalized compiler output recorded with its producing source revision. */
+/* */
 export interface CompiledCheckArtifact {
     compiledCheck: string;
-    /** Normalized manifest serialized in fixed key order (compiler output order). */
+    /* */
     manifestJson: string;
     checkHash: string;
     checkCron: string;
@@ -45,7 +34,7 @@ export type SmartNoteEvaluationOutcome =
     | { phase: "liveness"; kind: "met" | "false" | "logic_failed" | "network_failed" }
     | { phase: "fallback"; kind: "met" | "false" };
 
-/** The lifecycle projection owned by this contract. */
+/* */
 export interface SmartNoteLifecycleState {
     status: string;
     readyAt: number | null;
@@ -79,21 +68,17 @@ export interface SmartNoteReduction {
     surfaced: boolean;
 }
 
-/** Backoff after the Nth consecutive failure: min(24h, 5 * 2^(N-1)) minutes. */
+/* */
 export function evaluationBackoffMs(failureCount: number): number {
     const minutes = Math.min(24 * 60, 5 * 2 ** Math.max(0, failureCount - 1));
     return minutes * 60 * 1000;
 }
 
-/** Host-derived ready reason for a due-phase met result. */
+/* */
 export function dueReadyReason(noteId: number, manifestJson: string | null): string {
     const manifest = parseSmartNoteManifest(manifestJson);
     const signal = manifest.signals?.[0] ?? manifest.summary ?? "compiled check returned met=true";
     const sliced = `Smart note #${noteId}: ${signal}`.slice(0, 240);
-    // slice counts UTF-16 units and can split a surrogate pair at the cap. A
-    // trailing lone high surrogate cannot survive persistence, and the Rust
-    // reducer never emits one, so drop it and store the same 239-unit value
-    // in both authorities.
     const last = sliced.charCodeAt(sliced.length - 1);
     return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
 }
@@ -264,9 +249,6 @@ function reduceLiveness(
                 next: falseFields(attempted, ctx, pre.checkCron, pre.checkHash),
             };
         case "logic_failed":
-            // Liveness runs a previously healthy compiled check; a logic error
-            // here means the check itself broke, so reauthoring is immediate
-            // rather than counted toward the normal failure threshold.
             return { surfaced: false, next: { ...attempted, checkStatus: "failing" } };
         default:
             return { surfaced: false, next: attempted };
@@ -300,10 +282,7 @@ function reduceFallback(
 }
 
 /**
- * Derive the complete next lifecycle state for one phase outcome.
  *
- * The outcome's phase is the authority-selected phase; outcomes are
- * phase-scoped by construction so a smuggled cross-phase result cannot
  * type-check.
  */
 export function reduceSmartNoteEvaluation(
@@ -323,7 +302,7 @@ export function reduceSmartNoteEvaluation(
     }
 }
 
-/** Read the lifecycle projection off a full note row shape. */
+/* */
 export function lifecycleStateFromNote(note: {
     status: string;
     readyAt: number | null;
@@ -369,12 +348,7 @@ export function lifecycleStateFromNote(note: {
 }
 
 /**
- * Persist a reduction on the file authority.
  *
- * Writes the full lifecycle projection and advances `state_version` (a
- * lifecycle transition never changes compiler inputs, so `source_revision`
- * stays). Callers wrap this in `commitSmartNoteState` so the stale-result CAS
- * guard and the write share one transaction.
  */
 export function applySmartNoteReduction(
     db: Database,

@@ -1,11 +1,5 @@
 /**
- * Unified `setup` command.
  *
- * Resolves the harness target via `--harness` flag or auto-detection
- * (`resolveAdaptersForCommand`), then dispatches to the per-harness
- * setup flows instead of collapsing them into one generic flow: OpenCode has
- * DCP/OMO conflicts, while Pi and OMP share the extension runtime but differ in
- * installation and native context/memory conflict handling.
  */
 import type { HarnessAdapter } from "../adapters/types";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
@@ -21,9 +15,6 @@ export async function runSetup(argv: string[]): Promise<number> {
     let adapters: HarnessAdapter[];
     try {
         adapters = await resolveAdaptersForCommand(argv, {
-            // Both harness wizards write the same Magic Context config. Keep setup
-            // single-target until shared choices are collected once and registration
-            // is split into harness-specific phases.
             allowMulti: false,
             verb: "setup",
         });
@@ -42,8 +33,6 @@ export async function runSetup(argv: string[]): Promise<number> {
     for (const adapter of adapters) {
         log.step(`Configuring ${adapter.displayName} (${adapter.pluginPackageName})…`);
 
-        // Each harness owns its no-host flow. In particular, an explicit OpenCode
-        // setup can continue for a Desktop or not-yet-installed host.
         const code = await dispatchSetup(adapter, dryRun);
         if (code !== 0) {
             anyFailure = true;

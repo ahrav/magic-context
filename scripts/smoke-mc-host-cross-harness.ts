@@ -199,8 +199,6 @@ async function daemonIdentity(dataRoot: string): Promise<readonly number[]> {
 }
 
 /**
- * Narrows one replay item to its control unit, or undefined when the item is
- * not a `{kind: "control", unit}` envelope.
  */
 function controlUnit(item: unknown): Record<string, unknown> | undefined {
     if (item === null || typeof item !== "object" || Array.isArray(item)) return undefined;
@@ -212,10 +210,7 @@ function controlUnit(item: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * Concatenates the assistant text the replay carries for one run.
  *
- * Mirrors the producer's nested `message.content[].text` shape, so a replay
- * that keeps its dispatch metadata but drops every response unit yields "".
  */
 function assistantTextForRun(items: readonly unknown[], runId: string): string {
     let text = "";
@@ -285,10 +280,6 @@ async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
             const runId = sent.run_id as string;
             const deadline = Date.now() + 60_000;
             for (;;) {
-                // Prove the deadline before dispatching. Clamping an expired
-                // budget to 1 ms would fail the request as a client timeout and
-                // throw before the deadline assertion below could name the real
-                // cause, turning a slow run into an opaque transport error.
                 const remainingMs = deadline - Date.now();
                 assert.ok(
                     remainingMs > 0,
@@ -329,10 +320,6 @@ async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
                 }),
                 `${harness} replay did not prove concrete adapter dispatch`,
             );
-            // Dispatch metadata alone does not prove the user got an answer: a
-            // replay that retains the harness_dispatch control unit but loses
-            // every response unit would still satisfy the check above while the
-            // run reports completed. Require the assistant text for this run.
             const assistantText = assistantTextForRun(replay, runId);
             assert.ok(
                 assistantText.trim() !== "",

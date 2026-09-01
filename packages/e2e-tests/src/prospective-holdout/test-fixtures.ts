@@ -43,11 +43,7 @@ export function readyPolicies(): { analysis: PolicyOwnerDocument; scorecard: Pol
 }
 
 /**
- * `epochId` names the epoch the freeze binds, so one repository can hold sibling epochs.
  *
- * The independent reviewer is disjoint from every approver `closeManifest` stamps: an actor
- * attesting the release identities the epoch compares may not also attest the intake and
- * admission boundary those releases are measured over.
  */
 export function freezeManifest(options: { epochId?: string } = {}): ReleaseFreezeManifest {
     const policies = readyPolicies();
@@ -242,13 +238,7 @@ export function cellResultFixture(
 }
 
 /**
- * `subjective` marks the single admitted case as needing adjudication, which is the only
- * condition under which an epoch owes a trusted `adjudication-close.json`. Omitting it keeps
- * the manifest, and therefore its subject fingerprint, byte-identical to the objective cohort.
  *
- * `intakeIds` names the three dispositions the manifest carries. A repository holding more
- * than one epoch needs a distinct set per epoch, because a disposition is terminal for the
- * intake it names and no later cohort may claim that intake again.
  */
 export function closeManifest(
     freeze = freezeManifest(),
@@ -293,10 +283,6 @@ export function closeManifest(
 }
 
 /**
- * Yields a pid that is not running: a child is spawned and reaped so the kernel
- * releases its pid, then each candidate is confirmed dead so a recycled pid cannot
- * make an abandoned-lock fixture look live. Returns null when nothing can be
- * proven dead, which lets a caller skip rather than assert against a live process.
  */
 export function deadPid(): number | null {
     const reaped = spawnSync(process.execPath, ["--version"], { stdio: "ignore" }).pid;
@@ -312,8 +298,6 @@ export function deadPid(): number | null {
 }
 
 /**
- * The `frozen` lifecycle event an epoch commits to, which is where intake review reads
- * publication time from.
  */
 export function frozenEventFixture(occurredAt = "2026-09-01T00:00:00Z"): LifecycleEvent {
     return appendLifecycleEvent([], {

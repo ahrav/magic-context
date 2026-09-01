@@ -1,5 +1,4 @@
-//! Owner-provisioned model bundle: strict manifest schema, artifact
-//! confinement, and byte-hash verification before any model construction.
+//! Bundle loading enforces a strict manifest schema.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -10,11 +9,7 @@ use super::protocol::sha256_hex;
 use super::{jobs, SynapseLimits};
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-/// Aggregate byte budget for all model weights a loaded bundle retains: the
-/// ONNX graph plus every external initializer together. One budget bounds
-/// the total because every buffer stays resident for the component's
-/// lifetime, and an oversized bundle must degrade only this lane, never
-/// exhaust host memory.
+/// MAX_MODEL_BYTES covers the ONNX graph and all external initializers.
 const MAX_MODEL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_SIDE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_INITIALIZERS: usize = 16;
@@ -22,17 +17,13 @@ const MAX_ARTIFACT_NAME_BYTES: usize = 255;
 const MAX_PROVENANCE_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_DIMS: u64 = 16_384;
 const MAX_MAX_TOKENS: u64 = 1_048_576;
-/// The epoch crosses the wire as a JSON number and the TypeScript client holds
-/// it in a double, which rounds above this value while the host keeps the
-/// exact integer. A rounded epoch reaches the host as a different
-/// `required_epoch` and a different canonical request key, so every embedding
-/// request would be rejected for a constraint mismatch the owner cannot see.
+/// `MAX_TABLE_EPOCH` prevents TypeScript JSON-number rounding from changing `table_epoch`.
 const MAX_TABLE_EPOCH: u64 = 9_007_199_254_740_991;
 const MAX_CORPUS_ITEMS: usize = 256;
 const MAX_CORPUS_TEXT_BYTES: usize = 1024 * 1024;
 
-/// Output names FastEmbed's precedence machinery accepts as `&'static str`;
-/// a manifest may only select one of these or a bounded index.
+/// Manifest output names must be in `OUTPUT_NAME_ALLOWLIST`.
+/// Manifest output indices must not exceed `MAX_OUTPUT_INDEX`.
 const OUTPUT_NAME_ALLOWLIST: &[&str] = &[
     "text_embeds",
     "last_hidden_state",
@@ -41,9 +32,7 @@ const OUTPUT_NAME_ALLOWLIST: &[&str] = &[
 ];
 const MAX_OUTPUT_INDEX: u64 = 7;
 
-/// Why a bundle was refused. The message is a stable, bounded reason that
-/// never carries artifact bytes; the fingerprint-mismatch reason alone
-/// includes the expected canonical digest, which owners need to repair
+/// Bundle errors omit artifact bytes.
 /// their manifest.
 #[derive(Debug, Clone)]
 pub struct BundleError(pub String);
@@ -133,7 +122,6 @@ pub enum SelectedOutput {
 }
 
 impl BundleManifest {
-    /// Resolves the manifest's bounded output selector against the closed
     /// FastEmbed vocabulary.
     pub fn selected_output(&self) -> Result<SelectedOutput, BundleError> {
         match (&self.output.name, self.output.index, self.output.only_one) {
@@ -168,8 +156,6 @@ pub struct Corpus {
     pub items: Vec<CorpusItem>,
 }
 
-/// A bundle whose every artifact byte was read once, confined to the bundle
-/// directory, and verified against its manifest hash.
 pub struct VerifiedBundle {
     pub manifest: BundleManifest,
     pub max_text_bytes: usize,
@@ -182,18 +168,10 @@ pub struct VerifiedBundle {
     pub corpus: Corpus,
 }
 
-/// Loads and verifies a bundle directory.
 ///
-/// `expected_manifest_sha256` is the digest an outer trust root already
-/// committed for `manifest.json` — the generation manifest, in the daemon. The
-/// bundle's own manifest names and hashes every artifact underneath it, so
-/// binding these bytes to the outer digest is what extends that trust root over
-/// the whole bundle. Without it, this function proves only that a bundle is
-/// internally self-consistent: a directory swapped in after the generation was
-/// validated would carry its own coherent manifest and serve different
-/// embedding bytes while the daemon still reported the selected generation as
-/// valid. `None` is for callers that have no outer digest to offer, which is the
-/// hermetic-fixture case, never a production lane.
+/// `expected_manifest_sha256` binds the parsed `manifest.json` to the outer trust root.
+/// The outer manifest digest extends trust over every artifact named by `manifest.json`.
+/// `None` permits callers that have no outer digest.
 pub fn load_bundle(
     dir: &Path,
     limits: &SynapseLimits,
@@ -206,9 +184,7 @@ pub fn load_bundle(
     }
 
     let manifest_bytes = read_artifact(dir, "manifest.json", MAX_MANIFEST_BYTES)?;
-    // Checked against the bytes this call actually parsed, so a later
-    // replacement of the pathname cannot substitute a manifest behind the
-    // artifacts verified below.
+    // A later pathname replacement cannot substitute the manifest parsed by this call.
     if let Some(expected) = expected_manifest_sha256 {
         if sha256_hex(&manifest_bytes) != expected {
             return Err(err(
@@ -241,9 +217,8 @@ pub fn load_bundle(
         read_verified_open(open_artifact(dir, &artifact.name)?, artifact, cap)
     };
 
-    // Metadata-only pre-check over the very descriptors the reads below draw
-    // from: an oversized weight total fails here, before any large read makes
-    // the bytes resident, and each descriptor's own length bounds its read.
+    // The pre-check rejects oversized total weights before reading them.
+    // `MAX_MODEL_BYTES` bounds resident weight bytes, and each descriptor's length bounds its read.
     let mut weights = Vec::with_capacity(1 + manifest.external_initializers.len());
     weights.push(open_artifact(dir, &manifest.model_file.name)?);
     for artifact in &manifest.external_initializers {
@@ -281,12 +256,9 @@ pub fn load_bundle(
     validate_tokenizer_config(&tokenizer_config_file, manifest.max_tokens)?;
     let corpus = parse_corpus(&corpus_bytes, manifest.dims as usize)?;
 
-    // The fingerprint must be derived from the embedding-space fields, not
-    // merely well-formed: every artifact byte is verified against its
-    // manifest hash above, so binding the fingerprint to those hashes makes
-    // it impossible to edit the space and keep the old lane identity. Field
-    // checks run first so a specific fault reports its own reason; this is
-    // the final coherence gate.
+    // The fingerprint must be derived from embedding-space fields, not manifest hashes.
+    // Binding the fingerprint to verified artifact hashes prevents edits from preserving the lane identity.
+    // Field checks run before fingerprint validation so each invalid field reports its own error.
     let expected = canonical_fingerprint(&manifest);
     if manifest.fingerprint != expected {
         return Err(err(format!(
@@ -309,8 +281,7 @@ pub fn load_bundle(
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<BundleManifest, BundleError> {
-    // Two-stage parse: the strict pass rejects duplicate keys, which
-    // serde_json would otherwise silently resolve by field order.
+    // `serde_json::Value` retains the last duplicate key; the strict pass rejects duplicates instead.
     let value = crate::control::strict_json::parse(bytes)
         .map_err(|_| err("manifest is not strict JSON"))?;
     serde_json::from_value(value).map_err(|_| err("manifest schema invalid"))
@@ -357,19 +328,15 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
     Ok(())
 }
 
-/// Worst-case request-input bytes the full queued-job set can hold beyond
-/// its item texts: per-job key copies plus per-item id/hash charges. The
-/// queued-text budget (`max_queued_request_bytes`) counts text bytes only,
-/// while the runtime charges each admitted job [`jobs::job_input_bytes`] —
-/// which also holds both key copies, the decoded id and hash capacities,
-/// and their admission-time metadata copies — so startup must budget this
-/// term too or a validated configuration can still exhaust scratch.
+/// The full queue budget includes per-job key copies and per-item ID/hash charges in addition to item text.
+/// `max_queued_request_bytes` counts text bytes only.
+/// The startup budget must include `jobs::job_input_bytes` for each admitted job.
+/// `jobs::job_input_bytes` includes both key copies, decoded ID/hash capacities, and admission-time metadata copies.
+/// `max_queued_request_bytes` alone can permit scratch exhaustion because it excludes the per-job runtime charge.
 ///
-/// Derived by running the runtime's own accounting over worst-case-shaped
-/// inputs rather than re-stating its terms, so the two cannot drift apart.
+/// `per_waiter_charge_bound` uses the runtime accounting on worst-case-shaped inputs to avoid duplicated formulas drifting apart.
 fn max_queued_metadata_bytes(limits: &SynapseLimits) -> Option<u64> {
-    // JSON decoding may retain up to twice the decoded length as String
-    // capacity — the same factor `per_waiter_charge_bound` assumes.
+    // `per_waiter_charge_bound` assumes JSON decoding can retain String capacity up to twice the decoded length.
     fn worst_decoded(len: usize) -> String {
         let mut decoded = String::with_capacity(len.saturating_mul(2));
         decoded.extend(std::iter::repeat_n('a', len));
@@ -381,8 +348,7 @@ fn max_queued_metadata_bytes(limits: &SynapseLimits) -> Option<u64> {
         // Text bytes are budgeted separately by `max_queued_request_bytes`.
         text: String::new(),
     };
-    // The canonical request key is validated to 64 lowercase hex characters,
-    // and the job charges its length (twice), never its capacity.
+    // The canonical request key must contain 64 lowercase hexadecimal characters.
     let key = "a".repeat(64);
     let per_item = u64::try_from(jobs::job_input_bytes("", std::slice::from_ref(&worst_item)))
         .expect("one item's charge fits u64");
@@ -422,11 +388,9 @@ pub(crate) fn validate_serving_limits(
     Ok(())
 }
 
-/// The manifest-independent half of serving validation: every bound that is
-/// a pure function of the configured [`SynapseLimits`]. Limits are trusted
-/// startup configuration, so a violation here is operator error that must
-/// fail initialization loudly; only manifest-dependent bounds (dimensions,
-/// recommended rows) may degrade the lane instead.
+/// `SynapseLimits` validation is a pure function of the configured limits.
+/// A `SynapseLimits` violation fails initialization as an operator configuration error.
+/// Manifest dimensions or recommended rows that exceed configured limits degrade the lane.
 pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError> {
     if limits.query_admission_permits().is_none() {
         return Err(err("query admission capacity exceeds the semaphore limit"));
@@ -453,27 +417,17 @@ pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError>
             "host queued request bytes are below the max batch text bytes",
         ));
     }
-    // A tokenizer token can span multiple UTF-8 bytes, so no token-to-byte
-    // conversion is universally safe. The validated byte cap travels with
-    // the bundle and is advertised beside max_tokens instead.
+    // Tokenizer tokens can span multiple UTF-8 bytes, so no universal token-to-byte conversion exists.
 
-    // Retained job metadata (keys plus id/hash copies) lives for the whole
-    // retention window inside the scratch pool, in a slice reserved for it;
-    // reservations are validated against the pool minus that slice. Checked
-    // after the more specific reservation checks so their diagnostics win
-    // when a configuration trips several.
+    // Retained metadata occupies a dedicated scratch-pool slice for the retention window.
+    // The validator runs the retained-metadata reservation check after specific reservation checks so their diagnostics take precedence.
     let reservable_scratch =
         crate::config::SCRATCH_RESERVED_BYTES - crate::config::RETAINED_METADATA_RESERVED_BYTES;
 
-    // The result-page metadata reservation is a fixed function of these
-    // limits, taken from the scratch pool on every `embed.result` — while
-    // that request still holds its own decoded charge: up to twice the
-    // validated job-id and cursor lengths plus the 64-byte request key
-    // (decode scratch can retain up to double the decoded length as
-    // capacity) and the response scratch. A combined maximum above the
-    // pool's ceiling would make every poll fail `queue_full` forever even
-    // on an idle host — a permanent, config-induced outage that must
-    // reject at startup instead of surfacing one request at a time.
+    // Each embed.result request reserves result-page metadata from the scratch pool.
+    // Result requests retain decoded job-ID and cursor capacity while reserving page metadata.
+    // Decoded request buffers can retain twice their decoded length as capacity.
+    // The validator rejects configurations whose result-page metadata and request charge exceed reservable_scratch; otherwise every embed.result poll returns queue_full.
     let page_meta_bytes = limits
         .page_item_bound()
         .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
@@ -490,16 +444,12 @@ pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError>
         )));
     }
 
-    // The parse reservation is method-independent (the method cannot be
-    // decoded before reserving without unaccounted allocations), so its
-    // per-item term applies to every request. A body that decodes into a
-    // valid request under these limits is bounded by what they advertise:
-    // JSON escaping expands one text byte to at most six (`\u00XX`), and
-    // each batch item adds at most an escaped id, its hash, and the field
-    // skeleton — all capped by the preflight body maximum. If the worst
-    // advertised body's reservation exceeds the scratch pool, a request
-    // within advertised limits is permanently unservable, so the
-    // configuration rejects here instead of one request at a time.
+    // Parse reservation precedes method decoding to avoid unaccounted allocations.
+    // The parser applies the parse reservation's per-item term to every request because method decoding follows reservation.
+    // JSON escaping expands one text byte to at most six bytes (`\u00XX`).
+    // Each batch item adds an escaped ID, its hash, and field-skeleton overhead.
+    // The preflight body maximum caps batch-item overhead.
+    // The validator rejects configurations when the largest advertised body's parse reservation exceeds the scratch pool; otherwise an advertised request is unservable.
     const ESCAPED_BYTE_FACTOR: usize = 6;
     const ITEM_BODY_ENVELOPE_BYTES: usize = 2048;
     const BODY_ENVELOPE_BYTES: usize = 4096;
@@ -535,10 +485,8 @@ pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError>
         }
     }
 
-    // Every admitted query retains its decoded String capacity and response
-    // scratch while waiting. The active query and all K waiters must coexist
-    // with a full queued-batch budget (text bytes plus the worst per-job key
-    // and metadata charge), and the largest parse reservation.
+    // The active query and every configured waiter must coexist with queued-batch memory and the largest parse reservation.
+    // Queued-batch memory includes text bytes and the worst per-job key and metadata charge.
     let query_slots = limits
         .query_admission_permits()
         .and_then(|permits| u64::try_from(permits).ok())
@@ -562,9 +510,9 @@ pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError>
         )));
     }
 
-    // A full retention set that overflowed its reserved slice would starve
-    // the worst advertised request until expiry — the same permanent-outage
-    // class, reached by nothing more than completing batches.
+    // The validator prevents retained metadata from exceeding its reserved scratch-pool slice.
+    // Overflowing the retained-metadata reservation can starve the worst advertised request until expiry.
+    // Completing batches can exhaust the retained-metadata reservation without new requests.
     let retained_worst = (limits.max_retained_jobs as u64).saturating_mul(
         128u64.saturating_add(
             (limits.max_batch_items as u64)
@@ -586,9 +534,8 @@ fn validate_artifact_ref(artifact: &ArtifactRef) -> Result<(), BundleError> {
     if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
         return Err(err("artifact name out of bounds"));
     }
-    // Bare file names only: path separators or dot-relative names could
-    // escape the bundle directory, and request data never reaches here to
-    // pick them, so any such name is owner error, not routing.
+    // Artifact names must be bare file names because separators and dot-relative names could escape the bundle directory.
+    // Such names are owner errors because request data cannot select them.
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
         return Err(err("artifact name contains a path separator"));
     }
@@ -606,24 +553,16 @@ pub(crate) fn validate_sha256_hex(hash: &str) -> Result<(), &'static str> {
     {
         return Err("hash is not 64 lowercase hex characters");
     }
-    // A placeholder hash can never be produced by hashing real bytes, and
-    // accepting one would certify artifacts nobody hashed.
     if hash.bytes().all(|b| b == hash.as_bytes()[0]) {
         return Err("hash is a placeholder");
     }
     Ok(())
 }
 
-/// The canonical lane fingerprint: SHA-256 over a versioned, newline-joined
-/// `key=value` serialization of exactly the manifest fields that determine
-/// the embedding space — artifact hashes, external-initializer names, pooling,
-/// quantization, output selection, truncation length, dimensions, and the
-/// destination-table epoch. Fields that cannot change a served vector (model name,
-/// provenance, `recommended_batch`) are excluded, so tuning them never
-/// forces a new lane identity. Packaging tools mirror the exact byte layout.
+/// The lane fingerprint uses SHA-256 over a versioned, newline-joined `key=value` serialization.
+/// The fingerprint excludes model name, provenance, and `recommended_batch` because they cannot change a served vector.
 ///
-/// Assumes an already-validated manifest. Initializer names are byte-length
-/// prefixed, so delimiters inside a legal filename cannot forge another field.
+/// Length-prefixing initializer names prevents delimiters in legal filenames from forging fields.
 pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
     let output = match (
         &manifest.output.name,
@@ -633,8 +572,6 @@ pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
         (Some(name), None, None) => format!("name:{name}"),
         (None, Some(index), None) => format!("index:{index}"),
         (None, None, Some(true)) => "only_one".to_owned(),
-        // validate_manifest rejects every other combination before the
-        // fingerprint comparison, so this arm never reaches enforcement.
         _ => "unselected".to_owned(),
     };
     let mut lines = String::from("mc-synapse-fingerprint-v2");
@@ -676,14 +613,10 @@ pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
     sha256_hex(lines.as_bytes())
 }
 
-/// One confined artifact held open for reading, paired with the length its
-/// own descriptor reports.
+/// The reader must use the descriptor whose metadata was validated.
 ///
-/// Validation and reading share this descriptor because a path resolved twice
-/// can name two different files: bytes fetched through a second lookup are not
-/// the bytes whose type and length were checked, so a regular file that passes
-/// the bound can be replaced by a symlink or a far larger file before the
-/// read. Pinning the descriptor makes the checked file the read file.
+/// A second path lookup can read bytes whose type and length were never checked.
+/// A path replacement can redirect the second lookup to a symlink or larger file.
 #[derive(Debug)]
 pub(crate) struct OpenRegularFile {
     pub(crate) file: std::fs::File,
@@ -704,9 +637,7 @@ impl OpenRegularFile {
     }
 }
 
-/// Opens one path without following its final component and pins the checked
-/// regular file to a descriptor. Callers read this descriptor so replacement
-/// of the path cannot change the bytes after validation.
+/// Callers must read the checked descriptor so path replacement cannot change the bytes after validation.
 pub(crate) fn open_regular_file(path: &Path) -> Result<OpenRegularFile, OpenRegularFileError> {
     let fd = rustix::fs::open(
         path,
@@ -731,29 +662,24 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<OpenRegularFile, OpenRegu
     })
 }
 
-/// Opens one confined artifact without following a symlink at the final
-/// component, then validates the descriptor's own metadata.
 fn open_artifact(dir: &Path, name: &str) -> Result<OpenRegularFile, BundleError> {
     let path: PathBuf = dir.join(name);
     // NOFOLLOW turns a symlink into an open failure rather than a redirect.
-    // NONBLOCK keeps the open itself from parking: a FIFO planted under an
-    // artifact name would otherwise block until a writer appears, before
-    // `fstat` can reject it as a non-regular file.
+    // `O_NONBLOCK` prevents opening a planted FIFO from blocking.
     open_regular_file(&path).map_err(|error| match error {
         OpenRegularFileError::Missing => err(format!("artifact is missing: {name}")),
         OpenRegularFileError::NotRegular => err(format!("artifact is not a regular file: {name}")),
     })
 }
 
-/// Reads at most the length this descriptor reported. Growth after the length
-/// check truncates the read into a hash mismatch instead of an allocation the
-/// bound never authorized.
+/// The reader limits reads to the checked length to bound allocation.
+/// The reader limits reads to the checked length to bound allocation.
+/// The reader limits reads to the checked length to bound allocation.
 fn read_open_artifact(open: OpenRegularFile, name: &str) -> Result<Vec<u8>, BundleError> {
     open.read()
         .map_err(|_| err(format!("artifact read failed: {name}")))
 }
 
-/// Bound-checks, reads, and hash-verifies one opened artifact.
 fn read_verified_open(
     open: OpenRegularFile,
     artifact: &ArtifactRef,
@@ -770,8 +696,7 @@ fn read_verified_open(
     Ok(bytes)
 }
 
-/// Rejects a weight set whose total exceeds `budget`. Saturating addition:
-/// a sum that would overflow is by definition over any real budget.
+/// `total > budget` detects saturation only when `budget < u64::MAX`.
 fn validate_weights_budget(
     lengths: impl IntoIterator<Item = u64>,
     budget: u64,
@@ -816,18 +741,11 @@ fn validate_tokenizer_config(bytes: &[u8], max_tokens: u64) -> Result<(), Bundle
         .get("model_max_length")
         .and_then(serde_json::Value::as_number)
         .ok_or_else(|| err("tokenizer_config lacks model_max_length"))?;
-    // The manifest is the serving boundary. Hugging Face uses a very large
-    // model_max_length sentinel for tokenizers without a smaller tokenizer
-    // limit; that does not compete with a stricter manifest limit. A lower
-    // tokenizer ceiling would make truncation depend on which path wins.
+    // Values at least `max_tokens` do not impose a stricter tokenizer limit.
+    // The validator rejects lower tokenizer ceilings so the manifest defines the truncation limit.
     let below_manifest = match declared.as_u64() {
         Some(declared) => declared < max_tokens,
-        // Not representable as u64: either that oversized integer sentinel or a
-        // malformed value. A token-count ceiling is an integer, so a finite
-        // non-integral value is rejected outright rather than compared — `8192.5`
-        // against a manifest limit of `8192` otherwise read as "not below" and
-        // was accepted, leaving bundle validation to disagree with whatever the
-        // tokenizer implementation does with the fraction.
+        // The validator rejects `8192.5` rather than treating it as at least `8192`.
         None => {
             let declared = declared
                 .as_f64()
@@ -912,9 +830,6 @@ mod tests {
         );
     }
 
-    /// A token count is an integer. The oversized-integer sentinel and a
-    /// fraction both fail `as_u64`, so only the fractional part separates the
-    /// value the manifest tolerates from the one it must refuse.
     #[test]
     fn fractional_tokenizer_ceilings_are_rejected() {
         for body in [
@@ -929,8 +844,6 @@ mod tests {
             );
         }
 
-        // An integral value written with a fractional part is still an integer
-        // ceiling, and a whole-number float is what a JSON encoder may emit.
         let integral = br#"{"model_max_length":8192.0,"pad_token":"[PAD]"}"#;
         assert!(validate_tokenizer_config(integral, 8192).is_ok());
     }
@@ -1030,17 +943,11 @@ mod tests {
         assert!(error.0.contains("maximum batch result"));
     }
 
-    /// A page-metadata bound that (together with the poll request's own
-    /// decoded charge) exceeds the fixed scratch pool would fail every
-    /// `embed.result` with `queue_full` forever — a permanent
-    /// config-induced outage — so the configuration must reject at
     /// startup.
     #[test]
     fn a_page_bound_above_the_scratch_pool_is_rejected() {
         let manifest = manifest();
         let per_item = (jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES) as u64;
-        // Fits the pool by itself, but not alongside the request's own
-        // charge — the boundary a page-only check would wave through.
         let boundary = (crate::config::SCRATCH_RESERVED_BYTES / per_item) as usize;
         let limits = SynapseLimits {
             max_page_vectors: boundary,
@@ -1052,8 +959,6 @@ mod tests {
             .expect_err("a page bound above the scratch pool is a permanent outage");
         assert!(error.0.contains("result-page metadata"));
 
-        // The bound is clamped by max_batch_items, so an oversized
-        // max_page_vectors alone stays valid.
         let limits = SynapseLimits {
             max_page_vectors: boundary,
             ..SynapseLimits::default()
@@ -1061,10 +966,6 @@ mod tests {
         assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
-    /// A configuration whose advertised limits permit a request the fixed
-    /// scratch pool can never fund — the method-independent per-item
-    /// headroom applied to a large advertised body — must reject at
-    /// startup, not one `schema_violation` at a time.
     #[test]
     fn an_unservable_advertised_request_is_rejected_at_startup() {
         let manifest = manifest();
@@ -1078,10 +979,6 @@ mod tests {
             .expect_err("an unservable advertised request is a permanent outage");
         assert!(error.0.contains("parse reservation"));
 
-        // A moderately larger advertised query stays valid when the queued
-        // metadata term is halved beside it (the queued-job set and the
-        // query lane share one scratch pool): the reservation's item term is
-        // what overflows the pool, not the larger text alone.
         let limits = SynapseLimits {
             max_text_bytes: 2 * 1024 * 1024,
             max_queued_jobs: 32,
@@ -1090,15 +987,9 @@ mod tests {
         assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
-    /// A retention set whose worst metadata overflows its reserved slice
-    /// of the scratch pool would starve the worst advertised request until
-    /// expiry — reached by nothing more than completing batches — so the
-    /// configuration must reject at startup.
     #[test]
     fn an_oversized_retention_set_is_rejected_at_startup() {
         let manifest = manifest();
-        // Small text limits keep the advertised-request check satisfied so
-        // the retained check is the one that fires.
         let limits = SynapseLimits {
             max_batch_items: 150,
             max_batch_text_bytes: 1024 * 1024,
@@ -1109,7 +1000,6 @@ mod tests {
             .expect_err("an oversized retention set is a permanent outage");
         assert!(error.0.contains("retained job metadata"));
 
-        // Halving the retention count restores validity at the same item cap.
         let limits = SynapseLimits {
             max_batch_items: 150,
             max_batch_text_bytes: 1024 * 1024,
@@ -1126,8 +1016,6 @@ mod tests {
         assert!(validate_weights_budget([4, 6], 10).is_ok());
         assert!(validate_weights_budget([4, 7], 10).is_err());
         assert!(validate_weights_budget([11], 10).is_err());
-        // Sixteen small initializers each under a per-file view of the cap
-        // still fail in aggregate.
         assert!(validate_weights_budget(vec![1u64; 16], 10).is_err());
     }
 
@@ -1145,8 +1033,6 @@ mod tests {
         let open = open_artifact(dir.path(), "artifact.bin").expect("open");
         assert_eq!(open.len, 5);
 
-        // The file grows on the same inode between the length check and the
-        // read, which is the window a second path lookup would read through.
         std::fs::write(&path, vec![b'x'; 1 << 20]).expect("grow");
 
         let bytes = read_open_artifact(open, "artifact.bin").expect("read");

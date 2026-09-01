@@ -1,18 +1,17 @@
-//! Protected-tail boundary + compartment trigger: WHERE the compactable/
-//! protected split sits and WHETHER a historian run should fire, decided purely
-//! from the in-memory tail. Historian execution lives elsewhere; this is the
-//! deterministic decision layer.
+//! This unit computes the compactable/protected split from the in-memory tail.
+//! The in-memory tail alone determines whether a historian run fires.
+//! Historian execution occurs outside this unit.
 //!
-//! All token measurement in this unit is a pure function of caller-provided
-//! message/block bytes and caller-provided context. There is no I/O, wall clock,
-//! store access, or ambient cache state here: the same inputs always produce the
-//! same boundary and trigger decision.
+//! Token measurement depends only on caller-provided message and block bytes and context.
+//! This unit performs no I/O and reads no wall clock.
+//! This unit reads no store or ambient cache state.
+//! Identical inputs produce identical boundary and trigger decisions.
 
 use crate::chunk_text::{
-    clean_user_text, compact_role, compact_text_for_summary, extract_key_arg, format_block_line,
-    is_system_directive, merge_commit_hashes, normalize_text,
+    clean_user_text, clean_user_text_cow, compact_role, compact_text_for_summary, extract_key_arg,
+    format_block_line, is_system_directive, merge_commit_hashes, normalize_text,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -21,8 +20,6 @@ use serde_json::Value;
 
 use crate::scheduler::escalation_bands;
 use crate::selection::SelKind;
-
-// --- Constants for protected-tail sizing and trigger thresholds. ---
 
 const ALPHA: f64 = 0.3;
 const FLOOR_RATIO: f64 = 0.08;
@@ -50,21 +47,16 @@ const TAIL_SIZE_TRIGGER_MULTIPLIER: f64 = 3.0;
 const FORCE80_CAP_TIER_PERCENTAGE: f64 = 80.0;
 const BLOCK_UNTIL_DONE_PERCENTAGE: f64 = 95.0;
 
-/// Message role used by boundary and trigger decisions.
+/// Boundary and trigger decisions use this message role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
-    /// A user-authored message.
     User,
-    /// An assistant-authored message.
     Assistant,
-    /// A system-authored message.
     System,
-    /// Any provider-specific role not otherwise known to the module.
     Other(String),
 }
 
 impl Role {
-    /// Convert a provider role string to the narrow role vocabulary this unit reads.
     pub fn from_provider(value: &str) -> Self {
         match value {
             "user" => Role::User,
@@ -74,7 +66,6 @@ impl Role {
         }
     }
 
-    /// Return the provider role spelling used when formatting messages into historian `U:`/`A:`/`TC:` chunks.
     pub fn as_str(&self) -> &str {
         match self {
             Role::User => "user",
@@ -85,66 +76,56 @@ impl Role {
     }
 }
 
-/// One original pre-reduction content block inside a [`BoundaryMsg`].
+/// `BoundaryBlock` retains the original pre-reduction content block.
 #[derive(Debug, Clone)]
 pub struct BoundaryBlock {
-    /// Stable block id (follows the same id convention used by the sibling selection module).
+    /// The block retains its stable `id`.
     pub id: String,
-    /// Block ordinal within the flat tail. Message-level algorithms use the parent
-    /// message ordinal; this remains available for callers that preserve block order.
+    /// Message-level algorithms use the parent message ordinal, not this block ordinal.
+    /// Callers that preserve block order use the block ordinal.
     pub ordinal: u64,
-    /// Typed content kind (`SelKind`, shared with the selection module for cross-module consistency).
     pub kind: SelKind,
-    /// True for provider/server-executed tool blocks; these cannot start an in-flight tool-call arc.
+    /// `provider_executed` is true for provider/server-executed tool blocks; such blocks cannot start an in-flight tool-call arc.
     pub provider_executed: bool,
-    /// Original byte length supplied by the caller for diagnostics.
+    /// The caller supplies this original byte length for diagnostics.
     pub byte_size: usize,
-    /// Tool arc id for calls/results/reasoning that belong to the same invocation.
+    /// Calls, results, and reasoning from one invocation share this tool arc ID.
     pub arc_id: Option<String>,
-    /// Original pre-reduction block bytes as UTF-8 text, shared with the flat projection.
+    /// The flat projection shares these original pre-reduction UTF-8 bytes.
     ///
-    /// Boundary and trigger token measurement always uses this value, never a
-    /// rendered reduction placeholder. Sharing the projection's allocation keeps
-    /// trigger evaluation from cloning every raw block on every pass.
+    /// Boundary and trigger token measurement uses `original`, never a rendered reduction placeholder.
+    /// Sharing the flat projection allocation avoids cloning raw blocks during trigger evaluation.
     pub original: Arc<str>,
-    /// Token count for `original`, computed once while constructing this pass's boundary input.
-    /// Keeping it beside the source lets projected-drop and boundary walks share the same exact
-    /// measurement instead of running byte-BPE repeatedly over an unchanged multi-megabyte tail.
+    /// Boundary-input construction computes this token count for `original` once per pass.
+    /// Keeping `token_count` beside `original` lets projected-drop and boundary walks reuse the same measurement.
+    /// Reusing the measurement avoids repeated token estimation for unchanged tails.
     pub original_token_count: usize,
-    /// Optional rendered form after reduction. It is deliberately ignored by every
-    /// decision function and exists only to make the raw-byte invariant testable.
     pub rendered: Option<String>,
-    /// Mirrors OpenCode text parts marked `ignored`; ignored user text does not
-    /// contribute to the live-prompt floor, which keeps the current user prompt protected.
+    /// Ignored user text mirrors OpenCode text parts marked `ignored`.
+    /// Ignored user text contributes to the live-prompt floor, protecting the current user prompt.
     pub ignored: bool,
 }
 
-/// Message-grouped boundary input.
 #[derive(Debug, Clone)]
 pub struct BoundaryMsg {
-    /// Absolute raw-session ordinal for the message.
+    /// The message retains `ordinal` as its absolute raw-session ordinal.
     pub message_ordinal: u64,
     /// Provider message id. Used only for diagnostics; boundary and trigger logic do not read it.
     pub message_id: String,
-    /// Provider message role.
     pub role: Role,
-    /// Original blocks that belong to this message.
     pub blocks: Vec<BoundaryBlock>,
 }
 
-/// Inputs for resolving the protected-tail boundary.
 #[derive(Debug, Clone)]
 pub struct BoundaryContext {
-    /// Main model context limit in tokens.
+    /// The field limits the main model context to this token count.
     pub context_limit: f64,
-    /// Execute threshold percentage used to derive usable context.
+    /// The execute threshold percentage derives usable context.
     pub execute_threshold_percentage: f64,
-    /// Current input usage percentage.
     pub usage_percentage: f64,
-    /// Current input token count; fractional inputs are rounded to the nearest token.
+    /// Fractional inputs are rounded to the nearest token.
     pub usage_input_tokens: f64,
-    /// Last raw message ordinal already published in a compartment, or `None` before
-    /// the first compartment. Ordinal 0 can be a real published end.
+    /// `last_published_end_ordinal` is `None` before the first compartment; ordinal 0 can be a published end.
     pub last_compartment_end_ordinal: Option<u64>,
     /// Previous boundary ordinal from an earlier calculation; retained so that floor can be reapplied.
     pub prior_boundary_ordinal: u64,
@@ -175,7 +156,6 @@ impl Default for BoundaryContext {
     }
 }
 
-/// Token target details for the protected-tail window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProtectedTailTokenTarget {
     /// Usable context tokens: `context_limit × execute_threshold%`.
@@ -198,12 +178,11 @@ pub struct ProtectedTailTokenTarget {
     pub reserve: f64,
 }
 
-/// Result of resolving the compactable/protected split.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryResolution {
     /// First protected raw-message ordinal; messages before this are eligible head.
     pub protected_start_ordinal: u64,
-    /// Half-open compactable range, from `last_compartment_end + 1` up to the head cap.
+    /// Half-open compactable range from `last_compartment_end_ordinal + 1` to the head cap.
     pub eligible_head: Range<u64>,
     /// Scaled protected-tail token target used to walk backward from the newest message.
     pub n_tokens: f64,
@@ -211,7 +190,7 @@ pub struct BoundaryResolution {
     pub floored_by_live_prompt: bool,
     /// True when a recent open tool invocation fenced the boundary or head.
     pub fenced_by_open_arc: bool,
-    /// True raw tokens in `offset..protected_start_ordinal`.
+    /// True raw tokens before `protected_start_ordinal`.
     pub true_raw_eligible_tokens: f64,
     /// True when the per-run cap had to include one atomic message/arc larger than the cap.
     pub oversize_atomic_unit: bool,
@@ -234,8 +213,8 @@ pub struct WrapupBoundaryResolution {
 /// Chunked tail measurement in the historian's `U:`/`A:`/`TC:` block format.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkEstimate {
-    /// Token count used by trigger decisions. When scanning stops early, this
-    /// saturates at `budget_stop` so `has_more` never under-reports the threshold.
+    /// Token count used by trigger decisions.
+    /// The token count saturates at `budget_stop` when scanning stops early so `has_more` does not under-report the threshold.
     pub tokens: f64,
     /// True when the scan stopped before the eligible tail ended.
     pub has_more: bool,
@@ -243,24 +222,19 @@ pub struct ChunkEstimate {
     pub formatted_blocks: Vec<String>,
     /// Token count per formatted block before any saturation.
     pub block_tokens: Vec<f64>,
-    /// Number of raw messages represented in formatted blocks.
+    /// `message_count` counts raw messages represented by `formatted_blocks`.
     pub message_count: usize,
-    /// Number of assistant commit clusters in the formatted prefix.
+    /// `commit_cluster_count` counts assistant commit clusters in the formatted prefix.
     pub commit_cluster_count: usize,
 }
 
-/// Inputs for checking whether the historian should fire.
 #[derive(Debug, Clone)]
 pub struct TriggerContext {
-    /// Boundary context used for the primary protected-tail resolution.
+    /// The primary protected-tail resolution uses `boundary`.
     pub boundary: BoundaryContext,
-    /// True when a historian/compartment run is already active.
     pub compartment_in_progress: bool,
-    /// Projected post-drop usage percentage supplied by the caller, if available.
     pub projected_post_drop_percentage: Option<f64>,
-    /// Whether commit clusters may trigger a run.
     pub commit_cluster_trigger_enabled: bool,
-    /// Minimum assistant commit clusters required for the commit trigger.
     pub min_commit_clusters: usize,
 }
 
@@ -276,21 +250,19 @@ impl Default for TriggerContext {
     }
 }
 
-/// Reason a trigger decision fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerReason {
     /// Context pressure reached the projected-headroom threshold and drops are not enough.
     ProjectedHeadroom,
     /// Context pressure reached the threshold-derived force band.
     ForceBand,
-    /// Enough assistant commit clusters accumulated in the eligible head.
+    /// `CommitClusters` fires when the eligible head contains at least `min_commit_clusters` assistant commit clusters.
     CommitClusters,
-    /// Enough TC-chunked tail eligible for historian summarization accumulated.
+    /// `TailSize` fires when `eligible_chunk_tokens` reaches `tail_size_bar`.
     TailSize,
 }
 
 impl TriggerReason {
-    /// Wire spelling used for serialized trigger results.
     pub fn as_str(self) -> &'static str {
         match self {
             TriggerReason::ProjectedHeadroom => "projected_headroom",
@@ -301,39 +273,34 @@ impl TriggerReason {
     }
 }
 
-/// Pure trigger result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TriggerDecision {
-    /// True when the historian should fire.
     pub fire: bool,
-    /// Fire reason, absent when `fire` is false.
+    /// `reason` is `None` when `fire` is false.
     pub reason: Option<TriggerReason>,
-    /// Last raw-message ordinal the run may consume, always before the protected tail.
+    /// `consume_through_ordinal` precedes the protected tail's first ordinal.
     pub consume_through_ordinal: Option<u64>,
-    /// The exact boundary snapshot that produced a fire decision. The assembler consumes
-    /// this object directly so the trigger and chunk snapshot cannot resolve different ranges.
+    /// The trigger stores the exact boundary snapshot that produced a fire decision.
+    /// The assembler consumes `boundary` directly so trigger and chunk snapshots resolve the same range.
     pub boundary: Option<BoundaryResolution>,
-    /// Progress toward the tail_size bar, present whenever a boundary was resolved (fire or
-    /// not). Diagnostics-only: rendering it must never influence the decision itself.
+    /// The trigger records `progress` whenever it resolves a boundary.
+    /// Rendering `progress` must not influence the trigger decision.
     pub progress: Option<TriggerProgress>,
 }
 
-/// Why the trigger did or did not fire, in numbers. Surfaced through the transform
-/// response's historian diagnostics so a stalled rig drive is diagnosable per pass
-/// (eligible content vs the bar, and how much tail the protected boundary is holding back).
+/// `TriggerProgress` reports eligible content and the protected-tail boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TriggerProgress {
-    /// TC-chunked tokens in the eligible head (what tail_size compares against the bar).
+    /// `eligible_chunk_tokens` counts TC-chunked tokens before `protected_start_ordinal`.
     pub eligible_chunk_tokens: f64,
-    /// The tail_size fire bar (trigger_budget x multiplier).
+    /// `tail_size_bar` equals `trigger_budget` multiplied by the tail-size multiplier.
     pub tail_size_bar: f64,
-    /// Protected-tail token target N; shrinks as usage grows.
+    /// `n_tokens` is protected-tail target N and shrinks as usage grows.
     pub n_tokens: f64,
-    /// First protected ordinal (eligible head ends here).
+    /// The eligible head ends immediately before `protected_start_ordinal`.
     pub protected_start_ordinal: u64,
 }
 
-/// Derive the size-trigger budget from context size and execute threshold.
 pub fn derive_trigger_budget(context_limit: f64, execute_threshold_percentage: f64) -> f64 {
     if !context_limit.is_finite() || context_limit <= 0.0 {
         return TRIGGER_BUDGET_MIN;
@@ -357,7 +324,6 @@ fn compartment_offset(
         .or_else(|| first_live_message_ordinal(messages))
 }
 
-/// Derive the protected-tail token target before optional emergency scaling.
 pub fn derive_protected_tail_token_target(ctx: &BoundaryContext) -> ProtectedTailTokenTarget {
     let safe_context_limit = if ctx.context_limit.is_finite() && ctx.context_limit > 0.0 {
         ctx.context_limit
@@ -400,12 +366,10 @@ pub fn derive_protected_tail_token_target(ctx: &BoundaryContext) -> ProtectedTai
     }
 }
 
-/// Resolve the protected-tail boundary from original pre-reduction message bytes.
+/// The resolver uses original pre-reduction message bytes to resolve the protected-tail boundary.
 ///
-/// The token walk intentionally ignores [`BoundaryBlock::rendered`]. Dropped or
-/// skeletonized render placeholders are compose-time presentation; the durable raw
-/// session still contains the original bytes, and those are the bytes the historian
-/// would summarize if the trigger fired.
+/// The token walk ignores [`BoundaryBlock::rendered`].
+/// Skeletonized render placeholders affect only compose-time presentation; the durable raw session retains original bytes for historian summarization.
 pub fn resolve_protected_tail_boundary(
     messages: &[BoundaryMsg],
     ctx: &BoundaryContext,
@@ -504,16 +468,13 @@ fn resolve_protected_tail_boundary_with_index(
     protected_tail_start = index.clamp_ordinal(protected_tail_start);
 
     if ctx.fold_is_only_reclaim && raw_message_count > 0 {
-        // On verbatim-tail profiles, folding is the only reclaim path, while the newest message
-        // is still forwarded in full. Keep the newest message and its tool pair out of the
-        // fold so the live turn cannot become a durable compartment boundary.
+        // The fold excludes the newest message and its tool pair so the live turn cannot become a durable compartment boundary.
         let newest_floor = newest_message_protected_floor(&arcs, index);
         protected_tail_start = protected_tail_start.min(newest_floor).max(offset);
         protected_tail_start = index.clamp_ordinal(protected_tail_start);
     }
 
-    // Runtime floors, semantic snapping, and the newest-message guard can each move a previously
-    // safe candidate. Pairing is the final boundary invariant, so re-fence after all of them.
+    // Pairing is the final boundary invariant, so the code re-fences after runtime floors, semantic snapping, and the newest-message guard.
     protected_tail_start =
         fence_boundary_for_completed_tool_arcs(protected_tail_start, &arcs, offset);
 
@@ -546,16 +507,12 @@ fn resolve_protected_tail_boundary_with_index(
     }
 }
 
-/// Resolve the fixed keep watermark for an explicit session wrapup.
+/// `resolve_wrapup_boundary` resolves the fixed keep watermark for an explicit session wrapup.
 ///
-/// The watermark counts messages of every role. Safety adjustments may move it earlier,
-/// retaining more than `keep`, but never later. This keeps tool invocations atomic and
-/// leaves the newest message, including its complete tool arc, in the verbatim tail.
+/// The watermark counts every role and may move earlier, but never later, to keep tool invocations atomic and retain the newest complete tool arc in the verbatim tail.
 ///
-/// `context_limit` and `execute_threshold_percentage` are the session's resolved
-/// geometry. They feed the same trigger-budget derivation the normal boundary uses, so
-/// the user-boundary snap window scales with the actual model window and effective
-/// threshold instead of a synthetic constant.
+/// `context_limit` and `execute_threshold_percentage` feed the same trigger-budget derivation as the normal boundary.
+/// The user-boundary snap window uses the resolved context limit and execute threshold rather than a synthetic constant.
 pub fn resolve_wrapup_boundary(
     messages: &[BoundaryMsg],
     last_compartment_end_ordinal: Option<u64>,
@@ -632,8 +589,7 @@ pub fn resolve_wrapup_boundary(
         }
         protected_tail_start = refenced;
 
-        // A keep value of one still cannot make the latest tool result's invocation
-        // eligible. The normal verbatim-tail guard defines the same protected floor.
+        // A keep value of 1 cannot make the latest tool result's invocation eligible; the normal verbatim-tail guard enforces the same floor.
         protected_tail_start =
             protected_tail_start.min(newest_message_protected_floor(&arcs, &index));
     }
@@ -657,7 +613,6 @@ pub fn resolve_wrapup_boundary(
     }
 }
 
-/// Measure TC-chunked content for a message range.
 pub fn chunked_message_estimate(
     messages: &[BoundaryMsg],
     start_ordinal: u64,
@@ -704,11 +659,7 @@ fn chunked_message_estimate_with_estimator(
     builder.finish(total_message_count, eligible_end_ordinal)
 }
 
-/// Check whether a compartment/historian run should fire from the in-memory tail.
 ///
-/// This performs the authoritative scan of the provided messages. No persistent
-/// metadata pre-filter is present here: a pre-filter can only skip work, while
-/// this pure unit already has the in-memory tail needed for the full decision.
 pub fn check_compartment_trigger(
     messages: &[BoundaryMsg],
     ctx: &TriggerContext,
@@ -960,9 +911,7 @@ fn select_per_run_cap(
         .max(1.0);
     if usage_percentage >= BLOCK_UNTIL_DONE_PERCENTAGE {
         force95_per_run_cap(usable, n)
-    // Capacity sizing deliberately retains its historical 80% tier. For execute
-    // thresholds from 84% through 90%, this cap no longer coincides with the
-    // derived force-band transition.
+    // For execute thresholds from 84% through 90%, the 80% capacity cap differs from the derived force-band transition.
     } else if usage_percentage >= FORCE80_CAP_TIER_PERCENTAGE {
         force80_per_run_cap(usable, n)
     } else {
@@ -997,7 +946,6 @@ struct TokenIndex {
     terminal_ordinal: u64,
     ordinals: Vec<u64>,
     prefix: Vec<f64>,
-    tokens_by_ordinal: HashMap<u64, f64>,
 }
 
 impl TokenIndex {
@@ -1014,7 +962,7 @@ impl TokenIndex {
         messages: &[BoundaryMsg],
         mut block_tokens: impl FnMut(&BoundaryBlock) -> usize,
     ) -> Self {
-        let mut totals_by_ordinal = BTreeMap::new();
+        let mut message_totals = Vec::with_capacity(messages.len());
         for message in messages {
             let total = message
                 .blocks
@@ -1022,27 +970,32 @@ impl TokenIndex {
                 .map(&mut block_tokens)
                 .map(|tokens| tokens as f64)
                 .sum::<f64>();
-            *totals_by_ordinal
-                .entry(message.message_ordinal)
-                .or_insert(0.0) += total;
+            message_totals.push((message.message_ordinal, total));
+        }
+        if !message_totals.is_sorted_by_key(|(ordinal, _)| *ordinal) {
+            message_totals.sort_by_key(|(ordinal, _)| *ordinal);
         }
 
-        let ordinals: Vec<u64> = totals_by_ordinal.keys().copied().collect();
+        let mut ordinals: Vec<u64> = Vec::with_capacity(message_totals.len());
+        let mut prefix = Vec::with_capacity(message_totals.len() + 1);
+        prefix.push(0.0);
+        for (ordinal, total) in message_totals {
+            if ordinals.last() == Some(&ordinal) {
+                let last = prefix.len() - 1;
+                prefix[last] += total;
+            } else {
+                ordinals.push(ordinal);
+                let previous = prefix.last().copied().unwrap_or(0.0);
+                prefix.push(previous + total);
+            }
+        }
+
         let first_ordinal = ordinals.first().copied().unwrap_or(1);
         let last_ordinal = ordinals.last().copied().unwrap_or(0);
         let terminal_ordinal = ordinals
             .last()
             .map(|ordinal| ordinal.saturating_add(1))
             .unwrap_or(1);
-        let mut prefix = Vec::with_capacity(ordinals.len() + 1);
-        prefix.push(0.0);
-        let mut tokens_by_ordinal = HashMap::new();
-        for ordinal in &ordinals {
-            let total = totals_by_ordinal.get(ordinal).copied().unwrap_or(0.0);
-            tokens_by_ordinal.insert(*ordinal, total);
-            let previous = prefix.last().copied().unwrap_or(0.0);
-            prefix.push(previous + total);
-        }
 
         Self {
             raw_message_count: ordinals.len() as u64,
@@ -1051,12 +1004,16 @@ impl TokenIndex {
             terminal_ordinal,
             ordinals,
             prefix,
-            tokens_by_ordinal,
         }
     }
 
+    /// Per-message totals are integer-valued, so adjacent prefix sums differ
+    /// by the exact stored total.
     fn token_for_ordinal(&self, ordinal: u64) -> f64 {
-        self.tokens_by_ordinal.get(&ordinal).copied().unwrap_or(0.0)
+        match self.ordinals.binary_search(&ordinal) {
+            Ok(index) => self.prefix[index + 1] - self.prefix[index],
+            Err(_) => 0.0,
+        }
     }
 
     fn total_tokens(&self) -> f64 {
@@ -1197,9 +1154,8 @@ struct ToolArc {
     res_ordinal: Option<u64>,
 }
 
-/// True when a tail beginning at `boundary` would retain a completed result without its call.
-/// Every boundary rule uses this predicate so signed-reasoning protection and ordinary tool
-/// pairing cannot disagree about whether an arc is whole.
+/// The predicate returns true when a tail beginning at `boundary` retains a completed result without its call.
+/// All boundary rules use the same predicate so signed-reasoning protection and ordinary tool pairing classify arc completeness identically.
 pub(crate) fn completed_tool_arc_crosses_boundary(
     inv_ordinal: u64,
     res_ordinal: u64,
@@ -1215,16 +1171,16 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
         res: Vec<u64>,
     }
 
-    let mut partial: BTreeMap<String, PartialArc> = BTreeMap::new();
+    let mut partial: BTreeMap<&str, PartialArc> = BTreeMap::new();
     for message in messages {
         for block in &message.blocks {
             if block.provider_executed {
                 continue;
             }
-            let Some(arc_id) = &block.arc_id else {
+            let Some(arc_id) = block.arc_id.as_deref() else {
                 continue;
             };
-            let entry = partial.entry(arc_id.clone()).or_default();
+            let entry = partial.entry(arc_id).or_default();
             match &block.kind {
                 SelKind::ToolCall { .. } => entry.inv.push(message.message_ordinal),
                 SelKind::ToolResult { .. } => entry.res.push(message.message_ordinal),
@@ -1256,8 +1212,7 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
     arcs
 }
 
-/// Return the earliest ordinal that must stay in the protected tail so the newest message and its
-/// whole tool arc are never folded into a compartment.
+/// The helper returns the earliest protected ordinal that preserves the newest message and its complete tool arc.
 fn newest_message_protected_floor(arcs: &[ToolArc], index: &TokenIndex) -> u64 {
     let last = index.last_ordinal;
     arcs.iter()
@@ -1289,8 +1244,7 @@ fn fence_boundary_for_completed_tool_arcs(candidate: u64, arcs: &[ToolArc], floo
         return candidate;
     }
 
-    // Overlapping arcs form one atomic interval: moving to either edge of only the first arc could
-    // cut a neighbor. Expand the whole component before choosing its safe side.
+    // Overlapping arcs form one atomic interval, so the fence expands the full component before choosing a safe side.
     for _ in 0..=completed.len() {
         let min_invocation = component
             .iter()
@@ -1324,8 +1278,7 @@ fn fence_boundary_for_completed_tool_arcs(candidate: u64, arcs: &[ToolArc], floo
         .max()
         .unwrap_or(candidate);
     if min_invocation < floor {
-        // An invocation below the publication floor is already summarized. Moving backward cannot
-        // reunite that pair, so close the entire overlapping component forward instead.
+        // The fence advances the boundary past the component's last result when the component starts below `publication_floor_ordinal`.
         max_result.saturating_add(1)
     } else {
         min_invocation
@@ -1351,8 +1304,7 @@ fn fence_boundary_for_tool_arcs(
             break;
         }
     }
-    // An open-arc adjustment can move the cut into an overlapping completed arc. Reapply the
-    // same whole-arc predicate to the final candidate rather than trusting iteration order.
+    // The function rechecks completed arcs because an open-arc adjustment can enter an overlapping completed arc.
     boundary = fence_boundary_for_completed_tool_arcs(boundary, arcs, publication_floor_ordinal);
     FenceResult { boundary, open_arc }
 }
@@ -1363,8 +1315,6 @@ fn fence_wrapup_boundary_for_tool_arcs(candidate: u64, arcs: &[ToolArc], offset:
         let mut next = boundary;
         for arc in arcs {
             let Some(result) = arc.res_ordinal else {
-                // Interrupted invocations older than the watermark cannot pin every later
-                // wrapup. Open invocations already in the retained tail need no adjustment.
                 continue;
             };
             if arc.inv_ordinal >= offset && arc.inv_ordinal < next && next <= result {
@@ -1526,7 +1476,7 @@ struct ChunkBlock {
     start_ordinal: u64,
     end_ordinal: u64,
     parts: Vec<String>,
-    meta: Vec<(u64, String)>,
+    meta: Vec<u64>,
     commit_hashes: Vec<String>,
     is_tool_only: bool,
 }
@@ -1539,7 +1489,7 @@ struct ChunkBuilder<'a> {
     messages_processed: usize,
     last_ordinal: u64,
     current_block: Option<ChunkBlock>,
-    pending_noise_meta: Vec<(u64, String)>,
+    pending_noise_meta: Vec<u64>,
     formatted_blocks: Vec<String>,
     block_tokens: Vec<f64>,
     commit_cluster_count: usize,
@@ -1567,7 +1517,7 @@ impl<'a> ChunkBuilder<'a> {
     }
 
     fn push_message(&mut self, message: &BoundaryMsg) -> bool {
-        let meta = (message.message_ordinal, message.message_id.clone());
+        let meta = message.message_ordinal;
         if message.role == Role::User && !has_meaningful_user_text(&message.blocks) {
             let tc_summaries = extract_tool_call_summaries(&message.blocks);
             if tc_summaries.is_empty() {
@@ -1592,7 +1542,7 @@ impl<'a> ChunkBuilder<'a> {
             let start = self
                 .pending_noise_meta
                 .first()
-                .map(|(ordinal, _)| *ordinal)
+                .copied()
                 .unwrap_or(message.message_ordinal);
             let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
             meta_list.push(meta);
@@ -1610,20 +1560,20 @@ impl<'a> ChunkBuilder<'a> {
 
         let role = compact_role(message.role.as_str());
         let text_parts = text_parts(message);
-        let tool_summaries = if text_parts.is_empty() {
-            extract_tool_call_summaries(&message.blocks)
-        } else {
+        let msg_has_narrative = !text_parts.is_empty();
+        let tool_summaries = if msg_has_narrative {
             Vec::new()
+        } else {
+            extract_tool_call_summaries(&message.blocks)
         };
-        let mut all_parts = text_parts.clone();
+        let mut all_parts = text_parts;
         all_parts.extend(tool_summaries);
-        let compacted = compact_text_for_summary(&all_parts.join(" / "), message.role.as_str());
+        let compacted = compact_text_for_summary(all_parts.join(" / "), message.role.as_str());
         let text = compacted.text;
         if text.is_empty() {
             self.pending_noise_meta.push(meta);
             return true;
         }
-        let msg_has_narrative = !text_parts.is_empty();
         if let Some(current) = self
             .current_block
             .as_mut()
@@ -1647,7 +1597,7 @@ impl<'a> ChunkBuilder<'a> {
         let start = self
             .pending_noise_meta
             .first()
-            .map(|(ordinal, _)| *ordinal)
+            .copied()
             .unwrap_or(message.message_ordinal);
         let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
         meta_list.push(meta);
@@ -1684,7 +1634,7 @@ impl<'a> ChunkBuilder<'a> {
         self.last_ordinal = current_block
             .meta
             .last()
-            .map(|(ordinal, _)| *ordinal)
+            .copied()
             .unwrap_or(current_block.end_ordinal);
         self.messages_processed += current_block.meta.len();
         self.formatted_blocks.push(block_text);
@@ -1726,8 +1676,9 @@ fn has_meaningful_user_text(blocks: &[BoundaryBlock]) -> bool {
         if block.ignored || !matches!(block.kind, SelKind::Text) {
             return false;
         }
-        let cleaned = clean_user_text(&block.original);
-        !cleaned.trim().is_empty() && !is_system_directive(&cleaned)
+        let cleaned = clean_user_text_cow(&block.original);
+        let trimmed = cleaned.trim();
+        !trimmed.is_empty() && !is_system_directive(trimmed)
     })
 }
 
@@ -2357,8 +2308,6 @@ mod tests {
             tool_result_msg(124, "covered-arc", "tool result"),
         ];
         let arcs = build_tool_arcs(&messages);
-        // A chunk through ordinal 128 has exclusive eligible end 129, so the 123-124 arc is
-        // wholly inside the head and neither the forward nor backward fence moves its boundary.
         let candidate = 129;
         let pre_deploy = arcs.iter().fold(candidate, |boundary, arc| {
             arc.res_ordinal.map_or(boundary, |result| {
@@ -2520,11 +2469,6 @@ mod tests {
 
     #[test]
     fn fold_only_guard_protects_multi_result_newest_arc() {
-        // Documents the real CC wire shape (verified across 57 prod captures): parallel tool calls
-        // are ONE assistant message of N tool_use blocks paired to ONE user message of N tool_result
-        // blocks. build_tool_arcs yields N arcs all sharing inv=assistant_ord, res=user_ord, so the
-        // newest (user tool_result) message's protected floor = the shared invocation ordinal, and
-        // the whole 2-wide multi-result arc stays in the verbatim tail.
         let head = text_msg(1, Role::Assistant, &"head ".repeat(60_000));
         let multi_call = BoundaryMsg {
             message_ordinal: 2,
@@ -2592,11 +2536,6 @@ mod tests {
 
     #[test]
     fn fold_only_guard_folds_large_head_before_deep_newest_arc() {
-        // AIPROXY over-protection edge: the newest message is a tool_result whose invocation is
-        // several ordinals back, with large messages INSIDE the arc, and a large head precedes the
-        // arc. The whole newest arc [2..=5] must stay protected tail (never split), but the large
-        // head before the arc invocation must STILL fold — the guard only ever lowers
-        // protected_tail_start to the newest arc's invocation, never into the head.
         let tail = vec![
             text_msg(1, Role::Assistant, &"head ".repeat(60_000)),
             tool_call_msg(2, "arc-deep"),
@@ -2697,13 +2636,6 @@ mod tests {
 
     #[test]
     fn wrapup_user_snap_window_scales_with_session_geometry() {
-        // The keep-watermark candidate lands on ordinal 5; a meaningful user message
-        // sits about 10k tokens before it (ordinals 3..5). With a 1M x 65% geometry
-        // the derived trigger budget is about 32.5k, so the snap window reaches the
-        // user message and retains it. With a 128k x 65% geometry the budget floors
-        // at 5k, the snap cannot reach the user message, and the later candidate is
-        // kept — the same divergence the TypeScript resolver avoids by passing the
-        // session's real context limit and threshold.
         let tail = vec![
             text_msg(1, Role::User, "start the session"),
             text_msg(2, Role::Assistant, &"preamble filler ".repeat(4_000)),

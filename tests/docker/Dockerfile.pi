@@ -74,6 +74,7 @@ RUN mkdir -p /test && cd /test && \
 COPY packages/pi-plugin/dist/ /test/mc-pi/dist/
 COPY packages/pi-plugin/package.json /test/mc-pi/package.json
 COPY packages/pi-plugin/README.md /test/mc-pi/README.md
+COPY packages/mc-shm-native/package.json packages/mc-shm-native/index.js packages/mc-shm-native/index.ts /test/mc-shm-native/
 
 # Install runtime deps with flat npm layout for the Pi extension itself.
 # Even though Pi loads the extension via `pi install`, we keep deps
@@ -81,6 +82,7 @@ COPY packages/pi-plugin/README.md /test/mc-pi/README.md
 # requires (better-sqlite3, comment-json, etc.) work. better-sqlite3
 # builds from source here for the linux/amd64 runtime.
 RUN cd /test/mc-pi && \
+    npm pkg set 'dependencies.@cortexkit/mc-shm-native=file:/test/mc-shm-native' && \
     npm install --omit=dev --no-audit --no-fund --workspaces=false \
         --no-package-lock --legacy-peer-deps 2>&1 | tail -5
 
@@ -91,6 +93,7 @@ RUN cd /test/mc-pi && \
 COPY packages/cli/dist/ /test/mc-cli/dist/
 COPY packages/cli/package.json /test/mc-cli/package.json
 RUN cd /test/mc-cli && \
+    npm pkg set 'dependencies.@cortexkit/mc-shm-native=file:/test/mc-shm-native' && \
     npm install --omit=dev --no-audit --no-fund --workspaces=false \
         --no-package-lock --legacy-peer-deps 2>&1 | tail -5
 # Symlink `magic-context` onto PATH so `magic-context doctor --harness pi`

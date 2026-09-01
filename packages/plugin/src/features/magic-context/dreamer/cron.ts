@@ -1,16 +1,7 @@
 /**
- * Minimal 5-field cron evaluator for per-task dreamer scheduling.
+ * Evaluates five-field cron expressions for dreamer scheduling.
  *
- * Why vendored (no dependency): we only need "next occurrence after time T", the
- * 3-day package-release-age floor makes pulling a dep awkward, and the surface is
- * small. Shared core — both OpenCode and Pi import this via @magic-context/core.
  *
- * Fields: `minute hour day-of-month month day-of-week`
- *   minute 0-59 · hour 0-23 · dom 1-31 · month 1-12 · dow 0-6 (0 or 7 = Sunday)
- * Each field supports: a star wildcard, a star-with-step (every-N), a single
- * value `a`, a range `a-b`, a range-with-step `a-b/step`, an open step `a/step`
- * (a..max), and comma-lists of any of those. Numeric only — month and weekday
- * NAMES are intentionally unsupported (smaller surface; add later if asked).
  * Empty string `""` means "never" and is handled by the caller, not here.
  *
  * Day matching uses Vixie OR-semantics: when BOTH dom and dow are restricted
@@ -18,7 +9,6 @@
  * that one is consulted; when neither is restricted, every day matches.
  *
  * Timezone: all matching is in the machine's LOCAL time — the dreamer's whole
- * purpose is "run while the user is asleep", which is a wall-clock concept.
  * nextOccurrence steps by real (epoch) minutes and reads LOCAL civil fields off
  * each candidate, so DST transitions are handled correctly by construction (no
  * setHours/local-constructor normalization, which is DST-ambiguous).
@@ -53,14 +43,12 @@ const FIELDS: FieldSpec[] = [
 
 const MINUTE_MS = 60_000;
 /**
- * Forward search bound for nextOccurrence. ~4 years covers Feb-29-only crons
- * (leap years are ≤4 apart) and the longest legitimate gaps; anything past it is
- * treated as "never" (e.g. an impossible `0 0 31 2 *` — Feb 31). Generous so a
- * valid-but-rare schedule is never wrongly reported as never.
+ * Search for at most 4 × 366 days; return null when no match is found.
+ * Anything past the bound is treated as "never" (for example, impossible `0 0 31 2 *`).
  */
 const MAX_SEARCH_MS = 4 * 366 * 24 * 60 * MINUTE_MS;
 
-/** Parse one field into the set of matching values, or null on error. */
+/* */
 function parseField(token: string, spec: FieldSpec): Set<number> | null {
     const values = new Set<number>();
     const normalize = (n: number): number => (spec.name === "day-of-week" && n === 7 ? 0 : n);
@@ -69,7 +57,6 @@ function parseField(token: string, spec: FieldSpec): Set<number> | null {
         const piece = part.trim();
         if (piece.length === 0) return null;
 
-        // Split off an optional /step.
         const [rangePart, stepPart, ...extra] = piece.split("/");
         if (extra.length > 0) return null;
         let step = 1;
@@ -110,8 +97,8 @@ function parseField(token: string, spec: FieldSpec): Set<number> | null {
     return values.size > 0 ? values : null;
 }
 
-/** Parse a 5-field cron expression. Empty/whitespace is rejected here — callers
- *  treat `""` as "never" before calling. */
+/** Empty or whitespace-only input is rejected; callers handle `""` as "never" before calling.
+ * */
 export function parseCron(expression: string): ParseCronResult {
     const trimmed = expression.trim();
     if (trimmed.length === 0) {
@@ -151,7 +138,7 @@ export function parseCron(expression: string): ParseCronResult {
     };
 }
 
-/** True if the expression parses; thin wrapper for config validation. */
+/* */
 export function isValidCron(expression: string): boolean {
     return parseCron(expression).ok;
 }
@@ -165,7 +152,7 @@ function matchesDay(cron: ParsedCron, date: Date): boolean {
     return true;
 }
 
-/** True if `date`'s local civil fields match the cron. */
+/* */
 export function matchesCron(cron: ParsedCron, date: Date): boolean {
     return (
         cron.minute.has(date.getMinutes()) &&
@@ -184,14 +171,12 @@ function civilMinuteKey(date: Date): string {
 
 /**
  * First instant strictly after `after` whose LOCAL civil time matches `cron`.
- * Returns null if none within the ~4-year cap (effectively-never schedules).
+ * Returns null if no occurrence exists within the search cap.
  *
  * @param excludeCivilMinute Skip any candidate sharing this `YYYY-MM-DD HH:mm`
  *   key. Pass the just-consumed run's scheduled civil minute when advancing
  *   `next_due_at` so a DST fall-back's repeated wall minute doesn't double-fire
- *   the same daily slot. (For sub-hourly every-N schedules, only the exact
- *   consumed minute is skipped; the other repeated-hour minutes still fire, which
- *   is correct — more real time elapsed.)
+ * For sub-hourly every-N schedules, only the consumed minute is skipped; other repeated-hour minutes still fire because more real time elapsed.
  */
 export function nextOccurrence(
     cron: ParsedCron,
@@ -200,7 +185,6 @@ export function nextOccurrence(
     maxSearchMs = MAX_SEARCH_MS,
 ): Date | null {
     const afterMs = after.getTime();
-    // Align to the next whole minute strictly after `after` (never returns `after`).
     let cursorMs = Math.floor(afterMs / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
     const capMs = afterMs + Math.max(0, Math.min(MAX_SEARCH_MS, maxSearchMs));
 
@@ -217,13 +201,11 @@ export function nextOccurrence(
 }
 
 /**
- * Convenience: parse + compute next-due epoch (ms) for a schedule string.
- * Returns null for `""` / invalid / effectively-never schedules — the caller
- * persists `next_due_at = NULL` in all of those cases.
+ * Returns `null` for empty, invalid, or schedules with no occurrence within the search cap.
  *
  * @param consumedScheduledAtMs When advancing after a run, pass the epoch of the
  *   slot just satisfied (the prior `next_due_at`); its civil minute is excluded
- *   to prevent the DST repeated-minute double-fire.
+ * The exclusion prevents a DST repeated minute from firing twice.
  */
 export function nextDueAtMs(
     expression: string,

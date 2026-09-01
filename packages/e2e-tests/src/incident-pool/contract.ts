@@ -1,10 +1,8 @@
 /**
- * Strict, versioned contracts for the incident regression pool (U1).
+ * This module defines strict, versioned contracts for the incident regression pool.
  *
- * Every parser is exact-key: unknown fields reject, enums are closed, and all
- * IDs/labels are static allowlisted-format strings so no dynamic fixture data
- * can ride a report or check label. Pattern follows
- * scripts/validate-mode-manifest.ts and the retrieval-benchmark contracts.
+ * Every parser rejects unknown fields and values outside closed enums.
+ * IDs and labels must match the formats declared by their schemas.
  */
 
 export const SOURCE_INVENTORY_SCHEMA = "incident-source-inventory/v1";
@@ -13,7 +11,7 @@ export const ADJUDICATION_EVENT_SCHEMA = "incident-adjudication/v1";
 export const EMERGENCY_REDACTION_SCHEMA = "incident-emergency-redaction/v1";
 export const PROSPECTIVE_SOURCE_SCHEMA = "incident-prospective-source/v1";
 
-/** Closed source-claim disposition vocabulary (R2). */
+/* */
 export const SOURCE_DISPOSITIONS = [
     "executable_accepted_behavior",
     "executable_fixed_regression",
@@ -70,8 +68,8 @@ export const REDACTION_SCOPES = [
 ] as const;
 export type RedactionScope = (typeof REDACTION_SCOPES)[number];
 
-/** Static ID formats. Lowercase kebab only — no interpolation, spaces, or
- *  template characters, so labels cannot carry fixture data. */
+/**
+ * */
 const idPattern = (prefix: string): RegExp =>
     new RegExp(`^${prefix}-[a-z0-9]+(?:-[a-z0-9]+)*$`);
 export const SOURCE_ITEM_ID_RE = idPattern("src");
@@ -273,7 +271,7 @@ function asUniqueIdArray(value: unknown, re: RegExp, label: string): string[] {
     return ids;
 }
 
-/** Exact-key parse of the committed source inventory (R1, R2). */
+/** The parser rejects unknown fields when parsing the committed source inventory. */
 export function parseSourceInventory(raw: unknown): SourceInventory {
     const root = asRecord(raw, "inventory");
     requireExactKeys(root, ["schema", "items"], "inventory");
@@ -535,7 +533,7 @@ function parseVariant(raw: unknown, label: string): IncidentVariant {
     };
 }
 
-/** Exact-key parse of the committed incident catalog (R3, R4). */
+/** The parser rejects unknown fields when parsing the committed incident catalog. */
 export function parseIncidentCatalog(raw: unknown): IncidentCatalog {
     const root = asRecord(raw, "catalog");
     requireExactKeys(root, ["schema", "families"], "catalog");
@@ -608,9 +606,8 @@ export function parseIncidentCatalog(raw: unknown): IncidentCatalog {
 }
 
 /**
- * blocked_by is a scheduling dependency, so a cycle would deadlock the
- * scheduler with every member permanently waiting on another. Existence
- * checks above cannot see one; reject it at parse time instead.
+ * Existence checks do not detect dependency cycles.
+ * The parser rejects dependency cycles.
  */
 function rejectBlockedByCycles(families: IncidentCatalog["families"]): void {
     const dependents = new Map<string, string[]>();
@@ -619,8 +616,6 @@ function rejectBlockedByCycles(families: IncidentCatalog["families"]): void {
             dependents.set(variant.id, [...variant.blocked_by]);
         }
     }
-    // Iterative depth-first search with a node-state mark (1 = on stack,
-    // 2 = fully explored); any back edge to an on-stack node is a cycle.
     const state = new Map<string, 0 | 1 | 2>();
     for (const start of dependents.keys()) {
         if (state.get(start)) continue;
@@ -652,7 +647,7 @@ function rejectBlockedByCycles(families: IncidentCatalog["families"]): void {
     }
 }
 
-/** Exact-key parse of one adjudication ledger event. */
+/** The parser rejects fields outside the adjudication-event schema. */
 export function parseAdjudicationEvent(
     raw: unknown,
     label: string,
@@ -777,8 +772,8 @@ export function parseAdjudicationEvent(
     };
 }
 
-/** Exact-key parse of one emergency-redaction event — the only authorized
- *  destructive-history input (KTD1). */
+/** The parser rejects fields outside the emergency-redaction schema.
+ * */
 export function parseProspectiveIncidentSource(
     raw: unknown,
     label = "prospective source",

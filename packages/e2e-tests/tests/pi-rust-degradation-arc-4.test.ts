@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { join } from "node:path";
@@ -87,7 +86,7 @@ describe("FM-PI-4: provider-proven pressure at the Pi refusal boundary", () => {
 				timeoutMs: 60_000,
 			});
 		} catch {
-			// The first provider rejection is expected; message_end persists its proof.
+			// The first provider rejection is expected.
 		}
 		expect(providerProofSent).toBe(true);
 

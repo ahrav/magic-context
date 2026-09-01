@@ -32,11 +32,9 @@ export interface ApplyMidTurnDeferralOutput {
 }
 
 export function applyMidTurnDeferral(input: ApplyMidTurnDeferralInput): ApplyMidTurnDeferralOutput {
-    // Scope: bypass evaluation is nested under base === "execute".
     if (input.base === "defer") {
         return { midTurnAdjustedSchedulerDecision: "defer", sideEffect: "none" };
     }
-    // base === "execute"
     if (input.bypassReason !== "none") {
         return { midTurnAdjustedSchedulerDecision: "execute", sideEffect: "none" };
     }

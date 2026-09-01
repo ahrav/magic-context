@@ -1,25 +1,19 @@
 /**
- * Parses a range string into a sorted, deduplicated array of integers.
+ * The parser returns sorted, deduplicated integers for a range string.
  *
  * Supported syntax:
- * - Single number: "5" → [5]
- * - Range: "3-5" → [3, 4, 5]
- * - Comma-separated: "1,2,9" → [1, 2, 9]
- * - Mixed: "1-5,8,12-15" → [1, 2, 3, 4, 5, 8, 12, 13, 14, 15]
+ * The parser accepts a single integer, such as "5".
+ * The parser expands inclusive ranges: "3-5" produces [3, 4, 5].
+ * The parser accepts comma-separated integers: "1,2,9" produces [1, 2, 9].
+ * The parser combines comma-separated integers and inclusive ranges.
  *
- * Tolerant of the `§N§` tag notation the agent sees in the transcript: a model
- * frequently copies the markers verbatim (e.g. `§302§-§380§`) instead of the bare
- * numbers. Since `§` (U+00A7) is never legitimate in a numeric range, we strip it
- * up front and accept the numbers rather than erroring — the markers are exactly
- * the identifiers we want to drop anyway.
+ * The parser accepts §N§-wrapped numeric tokens.
+ * § is invalid range syntax, so the parser removes every § before parsing.
  *
  * @throws {Error} on empty string, non-numeric input, reversed ranges, or ranges exceeding 1000 elements
  */
 export function parseRangeString(input: string): number[] {
     const maxRangeElements = 1000;
-    // Strip the §N§ tag markers the agent sees in the transcript (it commonly
-    // pastes them back verbatim). § has no meaning in a range, so this is safe
-    // and unambiguous: "§302§-§380§" → "302-380", "§5§" → "5".
     const trimmed = input.replace(/§/g, "").trim();
 
     if (trimmed === "") {

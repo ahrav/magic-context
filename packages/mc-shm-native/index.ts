@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { markAsUntransferable } from "node:worker_threads";
 
 export const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1";
+export const DESCRIPTOR_SCHEMA_VERSION = 3;
 
 export interface NativeCapabilities {
     available: boolean;
@@ -14,13 +19,43 @@ export interface NativeCapabilities {
     reason?: string;
 }
 
+export type NativeStartupFailureReason =
+    | "missing_addon"
+    | "unsupported_platform"
+    | "missing_manifest"
+    | "wrong_platform_payload"
+    | "missing_checksum"
+    | "checksum_mismatch"
+    | "debug_build"
+    | "wrong_platform_binary"
+    | "capability_unavailable";
+
+/** Bounded startup failure safe for cross-package classification. */
+export class NativeStartupError extends Error {
+    constructor(readonly reason: NativeStartupFailureReason) {
+        super(`shared-memory native startup failed: ${reason}`);
+        this.name = "NativeStartupError";
+    }
+}
+
 export interface NativeDescriptor {
     profile: string;
-    pid: number;
     hostToPeerFd: number;
+    hostToPeerDataReadyFd: number;
+    hostToPeerCapacityReadyFd: number;
     hostToPeerGrant: string;
     peerToHostFd: number;
+    peerToHostDataReadyFd: number;
+    peerToHostCapacityReadyFd: number;
     peerToHostGrant: string;
+}
+
+export interface NativeSetupOptions {
+    setupSocket: string;
+    key: Uint8Array;
+    daemonId: Uint8Array;
+    daemonVer: string;
+    timeoutMs: number;
 }
 
 export interface NativeTestPair {
@@ -32,6 +67,8 @@ export interface NativeTestPair {
 
 interface NativeAddon {
     napiVersion(): number;
+    buildProfile(): string;
+    buildTarget(): string;
     createExternalProbe(length: number): Uint8Array;
     detachArrayBuffer(buffer: ArrayBuffer): boolean;
     registerCleanupProbe(path: string): void;
@@ -41,6 +78,9 @@ interface NativeAddon {
     workerLimit(): number;
     activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
+    connectSetup(options: NativeSetupOptions): Promise<number>;
+    finishSetup(pending: number): Promise<number>;
+    peerClosed(channel: number): boolean;
     createTestPair(): {
         first: number;
         second: number;
@@ -77,23 +117,117 @@ interface NativeAddon {
             segments: Uint8Array[],
         ) => void,
     ): boolean;
+    watch(channel: number, callback: () => void): void;
+    readinessHandled(): boolean;
     release(channel: number, token: number): void;
     close(channel: number): void;
     forceClose(channel: number): void;
 }
 
 let loaded: NativeAddon | null | undefined;
+let loadError: Error | undefined;
+let constructorCapability: NativeCapabilities | undefined;
+
+const PLATFORM_PACKAGES = {
+    "linux-x64": {
+        package: "@cortexkit/mc-host-linux-x64-gnu",
+        target: "linux-x64-gnu",
+        nativeTarget: "linux-x86_64",
+    },
+} as const;
+
+const ADDON_PAYLOAD_PATH = "payload/native/mc_shm_native.node";
+
+type PlatformPackage = (typeof PLATFORM_PACKAGES)[keyof typeof PLATFORM_PACKAGES];
+
+export function supportsNativePlatform(platform: string, arch: string): boolean {
+    return `${platform}-${arch}` in PLATFORM_PACKAGES;
+}
+
+function platformPackage(): PlatformPackage {
+    const platform = PLATFORM_PACKAGES[`${process.platform}-${process.arch}` as keyof typeof PLATFORM_PACKAGES];
+    if (!platform) throw new NativeStartupError("unsupported_platform");
+    return platform;
+}
+
+function packageAddonPath(platform: PlatformPackage): string {
+    const require = createRequire(import.meta.url);
+    let packageJsonPath: string;
+    try {
+        packageJsonPath = require.resolve(`${platform.package}/package.json`);
+    } catch {
+        throw new NativeStartupError("missing_addon");
+    }
+    const packageDir = dirname(packageJsonPath);
+    const manifestPath = join(packageDir, "payload-manifest.json");
+    let manifest: {
+        package?: { name?: string; target?: string };
+        files?: { path?: string; sha256?: string }[];
+    };
+    try {
+        manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    } catch {
+        throw new NativeStartupError("missing_manifest");
+    }
+    if (
+        manifest.package?.name !== platform.package ||
+        manifest.package.target !== platform.target
+    ) {
+        throw new NativeStartupError("wrong_platform_payload");
+    }
+    const entry = manifest.files?.find(({ path }) => path === ADDON_PAYLOAD_PATH);
+    if (!entry || !/^[0-9a-f]{64}$/.test(entry.sha256 ?? "")) {
+        throw new NativeStartupError("missing_checksum");
+    }
+    const addonPath = join(packageDir, ADDON_PAYLOAD_PATH);
+    if (!existsSync(addonPath)) {
+        throw new NativeStartupError("missing_addon");
+    }
+    const actual = createHash("sha256").update(readFileSync(addonPath)).digest("hex");
+    if (actual !== entry.sha256) {
+        throw new NativeStartupError("checksum_mismatch");
+    }
+    return addonPath;
+}
+
+function requireAddon(): NativeAddon {
+    if (loaded) return loaded;
+    if (loadError) throw loadError;
+    try {
+        const platform = platformPackage();
+        const localPath = new URL("./mc_shm_native.node", import.meta.url);
+        const addonPath = existsSync(localPath)
+            ? fileURLToPath(localPath)
+            : packageAddonPath(platform);
+        const native = createRequire(import.meta.url)(addonPath) as NativeAddon;
+        if (native.buildProfile() !== "release") {
+            throw new NativeStartupError("debug_build");
+        }
+        if (native.buildTarget() !== platform.nativeTarget) {
+            throw new NativeStartupError("wrong_platform_binary");
+        }
+        loaded = native;
+        return native;
+    } catch (error) {
+        loadError = error instanceof Error ? error : new Error(String(error));
+        loaded = null;
+        throw loadError;
+    }
+}
+
+function capableAddon(): NativeAddon {
+    const native = requireAddon();
+    const capability = (constructorCapability ??= probeCapabilities());
+    if (!capability.available) throw new NativeStartupError("capability_unavailable");
+    return native;
+}
 
 function addon(): NativeAddon | null {
-    if (loaded !== undefined) return loaded;
     try {
-        loaded = createRequire(import.meta.url)(
-            "./mc_shm_native.node",
-        ) as NativeAddon;
+        return requireAddon();
     } catch {
-        loaded = null;
+        return null;
     }
-    return loaded;
 }
 
 function protect(segments: readonly Uint8Array[]): void {
@@ -114,15 +248,8 @@ export function probeCapabilities(): NativeCapabilities {
         transferPrevention: false,
         cleanupHooks: false,
     };
-    if (process.platform !== "linux") {
-        return { available: false, ...base, reason: "platform_unsupported" };
-    }
-    if (!("Bun" in globalThis) && process.release.name === "node") {
-        return {
-            available: false,
-            ...base,
-            reason: "node_detachment_unavailable",
-        };
+    if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+        return { available: false, ...base, reason: "node_detachment_unavailable" };
     }
     const native = addon();
     if (!native)
@@ -199,6 +326,18 @@ export function probeCapabilities(): NativeCapabilities {
                 reason: "detachment_unavailable",
             };
         }
+        if (typeof native.registerCleanupProbe !== "function") {
+            return {
+                available: false,
+                ...base,
+                napiVersion,
+                externalArrayBuffer,
+                exactBounds,
+                detachment: true,
+                transferPrevention,
+                reason: "cleanup_hooks_unavailable",
+            };
+        }
         return {
             available: true,
             napiVersion,
@@ -206,7 +345,7 @@ export function probeCapabilities(): NativeCapabilities {
             exactBounds,
             detachment: true,
             transferPrevention,
-            cleanupHooks: typeof native.registerCleanupProbe === "function",
+            cleanupHooks: true,
         };
     } catch {
         return {
@@ -301,10 +440,6 @@ export class NativeProducerReservation {
         beforePublish?: () => void,
     ): void {
         this.assertActive();
-        // Spent before the native call: commit_reservation detaches the
-        // producer token native-side before its later validation can throw,
-        // so a retry (or the abort() in an error path) would target an
-        // already-detached token and mask the original error.
         this.active = false;
         this.native.commitReservation(
             this.channel,
@@ -317,10 +452,6 @@ export class NativeProducerReservation {
 
     abort(): void {
         if (!this.active) return;
-        // Same spent-before-native rule as commit(): never leave a window
-        // where a throwing native call can be retried against a detached
-        // token. A pre-detach native failure leaves the reservation tracked
-        // in the channel registry, which close() aborts.
         this.active = false;
         this.native.abortReservation(this.channel, this.token);
     }
@@ -365,21 +496,33 @@ export class NativeReceiveLease {
 
     release(): void {
         if (this.released) throw new Error("receive lease is already released");
-        // Spent before the native call so a throwing release is never
-        // retried against a possibly-detached token. Cleanup of a
-        // live-but-failed lease is owned by channel close.
         this.released = true;
         this.native.release(this.channel, this.token);
     }
 
     [Symbol.dispose](): void {
-        // Disposal is idempotent; explicit double release() keeps its throw.
         if (this.released) return;
         this.release();
     }
 
     private assertActive(): void {
         if (this.released) throw new Error("receive lease is released");
+    }
+}
+
+const readinessHandlers = new Map<number, () => void>();
+
+function dispatchReadiness(): void {
+    try {
+        for (const handler of [...readinessHandlers.values()]) {
+            try {
+                handler();
+            } catch {
+                // One failed channel cannot starve readiness for other channels.
+            }
+        }
+    } finally {
+        if (loaded?.readinessHandled()) queueMicrotask(dispatchReadiness);
     }
 }
 
@@ -392,18 +535,18 @@ export class NativeChannel {
     ) {}
 
     static attach(descriptor: NativeDescriptor): NativeChannel {
-        const native = addon();
-        if (!native || !probeCapabilities().available) {
-            throw new Error("shared-memory native capability unavailable");
-        }
+        const native = capableAddon();
         return new NativeChannel(native, native.attach(descriptor));
     }
 
+    static async connectSetup(options: NativeSetupOptions): Promise<NativeChannel> {
+        const native = capableAddon();
+        const pending = await native.connectSetup(options);
+        return new NativeChannel(native, await native.finishSetup(pending));
+    }
+
     static createTestPair(): NativeTestPair {
-        const native = addon();
-        if (!native || !probeCapabilities().available) {
-            throw new Error("shared-memory native capability unavailable");
-        }
+        const native = capableAddon();
         const pair = native.createTestPair();
         return {
             first: new NativeChannel(native, pair.first),
@@ -462,7 +605,18 @@ export class NativeChannel {
         );
     }
 
-    poll(deliver: (lease: NativeReceiveLease) => void): boolean {
+    startReadiness(handler: () => void): void {
+        this.assertOpen();
+        readinessHandlers.set(this.id, handler);
+        try {
+            this.native.watch(this.id, dispatchReadiness);
+        } catch (error) {
+            readinessHandlers.delete(this.id);
+            throw error;
+        }
+    }
+
+    drainOne(deliver: (lease: NativeReceiveLease) => void): boolean {
         this.assertOpen();
         return this.native.poll(this.id, (token, header, segments) => {
             deliver(
@@ -477,14 +631,26 @@ export class NativeChannel {
         });
     }
 
+    /**
+     * True once the host has dropped the setup socket that scopes this channel's
+     * lifetime. A ring that has simply gone quiet is indistinguishable from a
+     * dead peer without this signal.
+     */
+    peerClosed(): boolean {
+        if (this.closed) return true;
+        return this.native.peerClosed(this.id);
+    }
+
     close(): void {
         if (this.closed) return;
+        readinessHandlers.delete(this.id);
         this.native.close(this.id);
         this.closed = true;
     }
 
     forceClose(): void {
         if (this.closed) return;
+        readinessHandlers.delete(this.id);
         this.native.forceClose(this.id);
         this.closed = true;
     }

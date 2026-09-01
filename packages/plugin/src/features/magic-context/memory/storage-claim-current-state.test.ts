@@ -169,9 +169,7 @@ describe("current-state provider: anti-memory surface exclusion", () => {
             const antiId = publicIdOf(anti);
 
             // Laundering happens when a lane re-creates content it consumed
-            // into a NEW row: the rewrite can drop the negation and resurrect
-            // the rejected approach under a positive category. Curate and
-            // hygiene do that, so they must never see a warning.
+            // Curate and hygiene can re-create consumed content in a new row, so they must not see a warning.
             for (const surface of ["auto_inject", "maintenance_hygiene"] as const) {
                 const automatic = readProjectMemoryCurrentState(ctx.db, {
                     projectIds: [ctx.projectId],
@@ -185,10 +183,9 @@ describe("current-state provider: anti-memory surface exclusion", () => {
                 ]);
             }
 
-            // Verification re-judges a warning in place — renew, demote, or
-            // revise under the same category through the typed writer — so it
-            // cannot mint a positive-category copy and must see the row. Denying
-            // it would leave a warning un-re-judged until its TTL lapsed.
+            // Verification re-judges a warning in place.
+            // Verification must see the warning because it cannot mint a positive-category copy.
+            // Denying verification leaves a warning un-re-judged until its TTL lapses.
             for (const surface of ["explicit_search", "maintenance_verification"] as const) {
                 const visible = readProjectMemoryCurrentState(ctx.db, {
                     projectIds: [ctx.projectId],
@@ -207,16 +204,13 @@ describe("current-state provider: anti-memory surface exclusion", () => {
 
 describe("current-state provider: workspace revalidation", () => {
     test("a workspace epoch change between authorization and publication is stale", () => {
-        // The caller authorizes against a snapshot taken before the read. If
-        // membership or shared categories are revoked in flight, echoing the
-        // caller's epoch made the staleness check compare a value to itself, so
-        // a claim from a since-removed project could still be published.
+        // The caller authorizes against a snapshot taken before the read.
+        // The read must compare the caller's authorization epoch with a newly computed epoch.
         const ctx = setup();
         try {
             createClaimOp(ctx, "op-a", "Workspace claim content.");
             const identities = ["git:u2-current"];
-            // The direct fixture carries claim tables only; the workspace
-            // fingerprint reads the project epoch from `project_state`.
+            // The direct fixture omits `project_state`, where the workspace fingerprint reads the project epoch.
             ctx.db.exec(`
                 CREATE TABLE IF NOT EXISTS project_state (
                     project_path TEXT PRIMARY KEY,
@@ -230,7 +224,6 @@ describe("current-state provider: workspace revalidation", () => {
                 .run("git:u2-current");
             const epochBefore = computeWorkspaceEpochFingerprint(ctx.db, identities);
 
-            // Same state: the read publishes.
             const ok = readProjectMemoryCurrentState(ctx.db, {
                 projectIds: [ctx.projectId],
                 workspaceEpoch: epochBefore,
@@ -238,7 +231,7 @@ describe("current-state provider: workspace revalidation", () => {
             });
             expect(ok.status).toBe("ok");
 
-            // Revoke: bump the project's memory epoch, which the fingerprint covers.
+            // Revocation bumps the project's memory epoch, which the fingerprint covers.
             ctx.db
                 .prepare(
                     "UPDATE project_state SET project_memory_epoch = project_memory_epoch + 1 WHERE project_path = ?",
@@ -261,10 +254,9 @@ describe("current-state provider: workspace revalidation", () => {
 
 describe("auto-injection lane: workspace revalidation", () => {
     test("a revoked workspace makes the automatic lane refuse to publish", () => {
-        // Automatic injection has the least recourse of any surface: nothing
-        // downstream re-checks authorization. A workspace mutation bumps
-        // project_memory_epoch, not the claim generation in the vector, so the
-        // recomputed fingerprint is the only signal that sharing changed.
+        // Automatic injection has no downstream authorization re-check.
+        // Workspace mutations increment `project_memory_epoch`, not the claim generation in the vector.
+        // The recomputed workspace fingerprint is the only signal that sharing changed.
         const ctx = setup();
         try {
             createClaimOp(ctx, "op-auto", "Auto-injected claim.");
@@ -291,7 +283,6 @@ describe("auto-injection lane: workspace revalidation", () => {
             });
             expect(served?.items.length ?? 0).toBeGreaterThan(0);
 
-            // Sharing revoked after the caller authorized.
             ctx.db
                 .prepare(
                     "UPDATE project_state SET project_memory_epoch = project_memory_epoch + 1 WHERE project_path = ?",
@@ -314,10 +305,8 @@ describe("auto-injection lane: workspace revalidation", () => {
 
 describe("current-state provider: unsupported policy version", () => {
     test("a future policy version fails closed on auto-inject and is labeled unknown in search", () => {
-        // An older process still attached to the database must not trust a
-        // projection a newer writer produced: its stored bits were decided under
-        // policy semantics this binary cannot interpret. The shared evaluator and
-        // the legacy adapter both fail closed here.
+        // An older process must reject a projection produced by a newer writer when its policy semantics are unsupported.
+        // The shared evaluator and legacy adapter fail closed when the stored policy version exceeds the binary's supported semantics.
         const ctx = setup();
         try {
             const claim = createClaimOp(ctx, "op-future", "Future-policy claim.");
@@ -338,7 +327,7 @@ describe("current-state provider: unsupported policy version", () => {
             if (auto.status !== "ok") throw new Error("unreachable");
             expect(auto.items.map((item) => item.publicClaimId)).not.toContain(publicIdOf(claim));
 
-            // Explicit search may still serve it, but only as a labeled unknown.
+            // Explicit search may still serve claims with unsupported policy versions, but only as labeled unknowns.
             const explicit = readProjectMemoryCurrentState(ctx.db, {
                 projectIds: [ctx.projectId],
                 surface: "explicit_search",
@@ -457,8 +446,7 @@ describe("current-state provider: fail-closed corruption (scenario 12)", () => {
     test("a missing attributes row fails closed", () => {
         const ctx = setup();
         try {
-            // A claim written outside the kernel: revision and evidence exist
-            // but the project-memory attribute row does not.
+            // A claim written outside the kernel can have revision and evidence rows without a project-memory attribute row.
             ctx.db
                 .transaction(() => {
                     const episodeId = createEpisode(ctx.db, { projectId: ctx.projectId });
@@ -507,7 +495,6 @@ describe("current-state provider: fail-closed corruption (scenario 12)", () => {
             const created = createClaimOp(ctx, "op-a", "Corruptible claim.");
             const ref = getProjectMemoryClaimByPublicId(ctx.db, publicIdOf(created));
             if (!ref) throw new Error("unreachable");
-            // Direct SQL: a second revision with no evidence, pointer advanced.
             ctx.db
                 .transaction(() => {
                     ctx.db
@@ -537,7 +524,7 @@ describe("current-state provider: fail-closed corruption (scenario 12)", () => {
                 readProjectMemoryCurrentState(ctx.db, { projectIds: [ctx.projectId] }),
             ).toThrow(/no evidence rows/);
 
-            // Rewind the pointer by direct SQL: a stale current pointer.
+            // A newer revision leaves the current pointer stale.
             const rewound = createDirectTestDatabase().db;
             try {
                 const projectId = ensureProject(rewound, "git:u2-current");
@@ -622,7 +609,7 @@ describe("current-state provider: fail-closed corruption (scenario 12)", () => {
                 closeQuietly(malformed);
             }
 
-            // A broken lifecycle head: attributes exist, ledger does not.
+            // The lifecycle head has attributes but no ledger row.
             const noLedger = createDirectTestDatabase().db;
             try {
                 const projectId = ensureProject(noLedger, "git:u2-current");

@@ -1,12 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { registerExitAbort, unregisterExitAbort } from "./exit-abort-registry";
 
-// Captured before any registration so we can isolate the ONE listener the
-// registry installs process-wide (it intentionally never removes it, mirroring
-// production, so the suite must not strip it either).
+// The baseline excludes the registry listener, allowing tests to isolate it.
+// The registry retains its process-wide listener, so the suite leaves it installed.
 const baseline = process.listenerCount("exit");
 
-/** The registry's single 'exit' listener (the first one added past baseline). */
+/** The registry adds one 'exit' listener after baseline. */
 function registryListener(): () => void {
     return process.listeners("exit").slice(baseline)[0] as () => void;
 }
@@ -25,13 +24,12 @@ describe("exit-abort-registry", () => {
         registerExitAbort(a);
         registerExitAbort(b);
 
-        // Invoke the registry's listener directly (emitting 'exit' would end the
+        // The test invokes the registry listener directly because emitting 'exit' ends the test process.
         // test process).
         registryListener()();
 
         expect(a.signal.aborted).toBe(true);
         expect(b.signal.aborted).toBe(true);
-        // Still exactly one listener after firing.
         expect(process.listenerCount("exit") - baseline).toBe(1);
     });
 

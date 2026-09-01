@@ -58,7 +58,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            // Ignore EBUSY on Windows
+            // Cleanup failures must not mask test failures.
         }
     }
     tempDirs.length = 0;
@@ -77,7 +77,6 @@ function useTempDataHome(prefix: string): string {
 }
 
 function resolveDbPath(dataHome: string): string {
-    // Plugin v0.16+ — shared cortexkit/magic-context path. See data-path.ts.
     return join(dataHome, "cortexkit", "magic-context", "context.db");
 }
 
@@ -106,7 +105,6 @@ describe("magic-context storage", () => {
             },
         } as unknown as Database;
 
-        //#when / then
         expect(() => ensureColumn(racingDb, "race_table", "raced_column", "TEXT")).not.toThrow();
         const columns = dbA.prepare("PRAGMA table_info(race_table)").all() as Array<{
             name?: string;
@@ -301,7 +299,6 @@ describe("magic-context storage", () => {
         const sessionId = "ses-auto-decision";
         const first = { messageId: "m1", decision: "hint" as const, text: "STORED" };
 
-        //#when / then
         expect(appendAutoSearchHintDecision(db, sessionId, first)).toEqual({
             ok: true,
             kind: "appended",
@@ -493,7 +490,6 @@ describe("magic-context storage", () => {
                 throw new Error("boom");
             },
         } as unknown as Database;
-        //#when + #then
         expect(() => insertTag(failingDb, "ses-x", "m", "message", 1, 1)).toThrow("boom");
         expect(() => updateTagStatus(failingDb, "ses-x", 1, "dropped")).toThrow("boom");
         expect(() => getTagsBySession(failingDb, "ses-x")).toThrow("boom");
@@ -511,13 +507,11 @@ describe("magic-context storage", () => {
     it("fails closed in openDatabase when file path setup fails (no in-memory fallback)", () => {
         //#given
         const dataHome = useTempDataHome("context-storage-fail-closed-");
-        // Force mkdirSync to fail by creating a file at one of the expected
-        // parent directories (cortexkit). The new shared path is
-        // <dataHome>/cortexkit/magic-context/, so blocking the cortexkit
-        // segment forces openDatabase() into its fail-closed branch.
+        // A file at <dataHome>/cortexkit prevents openDatabase() from creating its database directory.
+        // Blocking cortexkit forces openDatabase() to throw.
         writeFileSync(join(dataHome, "cortexkit"), "not-a-directory", "utf-8");
         //#when/#then
-        // openDatabase MUST throw — no silent in-memory fallback. See storage-db.ts.
+        // openDatabase() must throw instead of falling back to an in-memory database.
         expect(() => openDatabase()).toThrow(/storage unavailable/i);
         // closeDatabase must remain safe even when no DB ever opened.
         expect(() => closeDatabase()).not.toThrow();
@@ -572,17 +566,13 @@ describe("magic-context storage", () => {
 
     it("preserves numeric columns when text columns are NULL (regression: cache bust cascade)", () => {
         //#given
-        // Simulates an older row seeded before ensureColumn added last_transform_error
-        // with a DEFAULT. SQLite sets existing rows to NULL, not the default, so the
-        // text column is NULL but the numeric columns (last_response_time,
-        // last_context_percentage, etc.) carry real cumulative state.
-        // Pre-fix: validator rejected the row, getOrCreateSessionMeta returned
-        // defaults with lastResponseTime=0, scheduler thought TTL had elapsed on
-        // every pass, applyPendingOperations re-ran forever, and each execute
-        // mutation busted cache.
+        // The seed represents a legacy row created before last_transform_error had a default.
+        // Legacy rows can contain NULL last_transform_error despite the column default.
+        // last_response_time and last_context_percentage retain cumulative state.
+        // last_transform_error is NULL while the numeric columns retain cumulative state.
+        // Rejecting this legacy row resets lastResponseTime to 0, causing every scheduler pass to rerun applyPendingOperations and invalidate the cache.
         const db = makeMemoryDatabase();
         const realResponseTime = 1_700_000_000_000;
-        // First seed the row so subsequent UPDATE matches.
         db.prepare(
             `INSERT INTO session_meta (session_id, last_response_time, cache_ttl, counter)
              VALUES (?, ?, '59m', 42)`,
@@ -602,7 +592,7 @@ describe("magic-context storage", () => {
         //#when
         const meta = getOrCreateSessionMeta(db, "ses-nullish");
 
-        //#then — real cumulative state must survive, not be reset to defaults
+        // The migration must preserve cumulative state instead of resetting it to defaults.
         expect(meta.sessionId).toBe("ses-nullish");
         expect(meta.lastResponseTime).toBe(realResponseTime);
         expect(meta.cacheTtl).toBe("59m");

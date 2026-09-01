@@ -57,7 +57,7 @@ export interface LkgEntryProjection {
     timeCreated: number | null;
     finish: unknown;
     hasIncompleteTool: boolean;
-    /** Compute the non-enumerable digest lazily so only LKG capture or replay validation hashes message content. */
+    /* */
     contentDigest?: () => string | null;
 }
 
@@ -253,9 +253,6 @@ function outputMessageIsPostAnchor(
 }
 
 /**
- * Build the replay prefix and serialize it once. The returned `jsonPrefix` is
- * the exact artifact stored in the last-known-good replay entry; callers must
- * use it as-is rather than serialize the prefix again.
  */
 export function buildLkgPrefix(
     input: LkgEntryProjection[] | MessageLike[],
@@ -397,13 +394,6 @@ function partIsOpenCodeStepMetadata(part: unknown): boolean {
 }
 
 /**
- * The Anthropic adapter merges adjacent assistant content before sending it. A
- * completed non-provider-executed tool result materializes as user content and
- * starts a new assistant run, while OpenCode's step markers do not materialize
- * on the provider wire.
- * Each resulting assistant run may contain only one leading thinking block; a
- * later signed block would invalidate its provider signature, so recovery declines
- * the entire replay instead of attempting a rewrite.
  */
 export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean {
     let index = 0;

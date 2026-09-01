@@ -1,13 +1,11 @@
-//! The one shared hardened subprocess runner both harness adapters use
-//! (KTD6, R17, R19).
 //!
-//! Everything security-relevant about running a harness child lives here so
-//! OpenCode and Pi cannot drift apart: no shell, a dedicated Unix process
-//! group as the cancellation unit, a daemon-startup environment snapshot
-//! with host launch-identity variables removed, prompt delivery over stdin,
-//! private `0700`/`0600` temp files, bounded concurrent stdout/stderr
-//! draining, timeout, graceful group termination with SIGKILL escalation,
-//! leader reaping before completion, and redacted structural diagnostics
+//! OpenCode and Pi use this runner to prevent their subprocess-security behavior from diverging.
+//! The runner does not invoke a shell and uses a dedicated Unix process group.
+//! The runner uses a dedicated Unix process group as the cancellation unit and snapshots the daemon-startup environment.
+//! The runner removes host launch-identity variables from its environment snapshot and delivers prompts over stdin.
+//! The runner creates temp directories and files with `0700` and `0600` permissions and drains stdout and stderr concurrently with bounded buffers.
+//! On timeout, the runner terminates the process group gracefully, then escalates to `SIGKILL`.
+//! The runner reaps the process-group leader before reporting completion and emits only redacted structural diagnostics.
 //! only.
 
 use std::ffi::{OsStr, OsString};
@@ -29,39 +27,31 @@ use super::backend::{
     BackendError, BackendEvent, BackendTerminal, ErrorClass, EventSink, SinkStatus,
 };
 
-/// Host launch-identity variables stripped from every child environment
-/// (R17): a harness child inheriting these could reconnect to the daemon as
-/// the supervised module itself.
+/// Every child environment excludes the host launch-identity variables.
+/// A harness child inheriting these variables could reconnect to the daemon as the supervised module.
 pub const HOST_LAUNCH_IDENTITY_VARS: [&str; 2] = [
     crate::wire::SUBC_MODULE_ID_ENV,
     crate::wire::SUBC_LAUNCH_NONCE_ENV,
 ];
 
-/// Immutable copy of the daemon-startup environment (R17): provider
-/// credentials and user configuration are trusted inputs, while the host's
-/// launch-identity variables are removed at capture so no later composition
-/// step can forget to strip them.
+/// `EnvSnapshot` preserves an immutable copy of the daemon-startup environment.
+/// `EnvSnapshot` treats provider credentials and user configuration as trusted inputs.
+/// Capture removes host launch-identity variables so later environment composition cannot reintroduce them.
 ///
-/// The variable list is behind an `Arc`, so the per-run clones taken by
-/// backend `execute` paths and the Pi provider fallback share one
-/// allocation: concurrent runs retain one environment-sized buffer total,
-/// not one per handle.
+/// The `Arc` lets per-run `execute` clones and the Pi provider fallback share the environment allocation.
 #[derive(Clone)]
 pub struct EnvSnapshot {
     vars: Arc<[(OsString, OsString)]>,
 }
 
-/// Per-value byte cap for one admitted credential. Shared with the launcher's
-/// envelope admission so both boundaries reject the same inputs; matches the
-/// release contract's `harness_unavailable.value_cap_bytes`.
+/// This cap rejects credential values larger than 16 KiB.
 pub const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
-/// Aggregate byte cap on an admitted credential set; matches the release
+/// This cap limits the combined byte length of an admitted credential set.
 /// contract's `harness_unavailable.row_cap_bytes`.
 pub const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
-/// Key-derivation domain committed into every credential fingerprint;
-/// matches the release contract's `credential_fingerprint.domain`.
+/// Every credential fingerprint includes this key-derivation domain.
 pub const CREDENTIAL_FINGERPRINT_DOMAIN: &str = "subc-broca-credential-v1";
-/// Fingerprint pre-image layout identifier; matches the release contract's
+/// This identifier fixes the credential-fingerprint pre-image layout.
 /// `credential_fingerprint.canonicalization`.
 pub const CREDENTIAL_FINGERPRINT_CANONICALIZATION: &str = "harness-provider-name-length-value/1";
 
@@ -82,10 +72,7 @@ impl CredentialRowError {
     }
 }
 
-/// The single alias-to-canonical provider map. Every canonicalization site —
-/// row selection, fingerprint derivation, and send-time verification — must
-/// resolve through this function so an alias admitted by one site can never
-/// be rejected or renamed by another.
+/// All provider canonicalization resolves through this function so aliases accepted during row selection remain accepted with the same canonical name during fingerprint derivation and send-time verification.
 pub fn canonical_provider(
     harness: &str,
     provider: &str,
@@ -101,16 +88,9 @@ pub fn canonical_provider(
 }
 
 impl EnvSnapshot {
-    /// Builds a bounded snapshot from explicit startup variables — the
-    /// launcher envelope's admitted credential rows in production. Each
-    /// variable is charged its string bytes plus
-    /// [`ENV_ENTRY_OVERHEAD_BYTES`], so an environment of many short
-    /// variables cannot pass the ceiling while its per-entry container
-    /// costs push each spawn representation past the declared headroom.
+    /// The constructor builds a bounded snapshot from explicit startup variables.
+    /// Each variable is charged its string bytes plus `ENV_ENTRY_OVERHEAD_BYTES`, so many short variables cannot bypass the ceiling through per-entry container overhead.
     ///
-    /// Fails when the charge exceeds [`MAX_ENV_SNAPSHOT_BYTES`], which is
-    /// what makes the component's declared retained reservation a real
-    /// ceiling; the admission rejects rather than truncates.
     ///
     /// [`ENV_ENTRY_OVERHEAD_BYTES`]: super::config::ENV_ENTRY_OVERHEAD_BYTES
     /// [`MAX_ENV_SNAPSHOT_BYTES`]: super::config::MAX_ENV_SNAPSHOT_BYTES
@@ -137,9 +117,8 @@ impl EnvSnapshot {
         Ok(snapshot)
     }
 
-    /// Builds a snapshot from explicit startup variables. The identity strip
-    /// applies here too, so a snapshot can never carry
-    /// `SUBC_MODULE_ID`/`SUBC_LAUNCH_NONCE` regardless of construction path.
+    /// Snapshots never carry `SUBC_MODULE_ID` or `SUBC_LAUNCH_NONCE`.
+    /// Snapshots exclude `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` regardless of construction path.
     pub fn from_vars(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         let vars = vars
             .into_iter()
@@ -157,9 +136,7 @@ impl EnvSnapshot {
         &self.vars
     }
 
-    /// Selects exactly the release-qualified direct API-key row for one
-    /// canonical provider. No ambient loader, proxy, cloud-chain, package
-    /// manager, HOME/XDG, PATH, or unrelated provider variable survives.
+    /// No ambient loader, proxy, cloud-chain, package manager, HOME/XDG, PATH, or unrelated provider variable survives.
     pub fn provider_row(
         &self,
         harness: &str,
@@ -224,30 +201,27 @@ impl EnvSnapshot {
 
 impl std::fmt::Debug for EnvSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Environment values are credentials (R19): report the count only.
+        // Environment values are credentials; report only the count.
         f.debug_struct("EnvSnapshot")
             .field("var_count", &self.vars.len())
             .finish()
     }
 }
 
-/// Shared execution bounds for one harness run. Defaults match the module
-/// transport ceiling; tests shrink them to keep hang and flood fixtures
+/// `ExecutionBounds` applies to one harness run.
 /// fast.
 #[derive(Clone, Debug)]
 pub struct SubprocessLimits {
-    /// Whole-run wall-clock bound; an elapsed run is terminated and mapped
-    /// to one failed terminal (R18).
+    /// `timeout` terminates an elapsed run and maps it to one failed terminal.
     pub run_timeout: Duration,
-    /// Grace between the group SIGTERM and the SIGKILL escalation (R10).
+    /// `termination_grace` delays group SIGKILL after group SIGTERM.
     pub termination_grace: Duration,
-    /// Grace between clean stream EOF and forced termination, for CLIs that
-    /// finish their output but linger instead of exiting (the Pi print-mode
-    /// shutdown gap mirrored from `subagent-runner.ts`).
+    /// `post_eof_grace` waits for the child to exit after clean stream EOF before forced termination.
+    /// Clean stream EOF can precede process exit.
     pub drain_grace: Duration,
-    /// Bounded stdout retention (R17/AE10); a flooding child is stopped.
+    /// `stdout_limit` stops a child that exceeds the retained stdout bound.
     pub max_stdout_bytes: usize,
-    /// Bounded stderr retention (R17); stderr is diagnostics-only.
+    /// The runner retains bounded stderr for diagnostics only.
     pub max_stderr_bytes: usize,
 }
 
@@ -263,94 +237,66 @@ impl Default for SubprocessLimits {
     }
 }
 
-/// One fully specified child invocation. The prompt travels only through
-/// `stdin` (R17) — argv carries flags and trusted paths, never caller text.
+/// The prompt travels only through stdin.
+/// `stdin` carries the prompt; argv carries flags and trusted paths, never caller text.
 pub struct SubprocessSpec {
     pub executable: PathBuf,
     pub args: Vec<String>,
-    /// The complete child environment (the child is spawned with
-    /// `env_clear`): snapshot variables first, adapter-owned control
-    /// variables last so they win on collision.
+    /// The child uses `env_clear`; adapter-owned control variables follow snapshot variables and win collisions.
     pub env: Vec<(OsString, OsString)>,
     pub working_dir: PathBuf,
     pub stdin: Vec<u8>,
-    /// Retained directory descriptors that child path arguments reference.
+    /// `inherit_fds` retains descriptors referenced by child path arguments.
     pub inherit_fds: Vec<RawFd>,
 }
 
-/// How a child run ended, structurally. Diagnostics built from this carry no
-/// child output (R19).
+/// child output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubprocessEnd {
-    /// Natural exit with a code.
     Exited(i32),
-    /// The transcript is complete but the leader lingered — either its
-    /// streams closed cleanly and it outlived the drain grace, or the
-    /// terminal probe recognized a decisive transcript while the child kept
-    /// its pipes open — and it was terminated; parsers treat this like a
-    /// clean exit because the transcript is complete.
+    /// DrainKilled means the transcript completed but the leader exceeded the drain grace or kept pipes open after a decisive probe; parsers treat it as a clean exit.
+    /// DrainKilled applies when the leader outlives the drain grace after clean stream EOF.
+    /// DrainKilled also applies when a terminal probe recognizes a decisive transcript while the child keeps its pipes open.
     DrainKilled,
-    /// Killed by a signal we did not send.
+    /// `Signaled` means `run` did not send the killing signal.
     Signaled,
     TimedOut,
     Cancelled,
     StdoutOverflow,
     StderrOverflow,
-    /// Reading the child's stdout failed. Distinct from EOF: the transcript
-    /// is of unknown completeness, so no prefix of it may be trusted even
-    /// when the child then exits cleanly.
+    /// CaptureFailed records a stdout read failure; parsers distrust the transcript even after a clean exit.
     CaptureFailed,
-    /// A group signal failed for a reason other than "already gone", so the
-    /// run cannot be reported as settled: descendants may still be
-    /// executing a billable request.
+    /// A group signal failure other than "already gone" leaves the run unsettled because descendants may still execute billable requests.
     TeardownUnconfirmed,
 }
 
-/// What newly completed stdout says about the run's completion, so the run
-/// loop can shorten its deadline to the drain grace without mistaking a
-/// retryable failure for the end of the run.
+/// ProbeSignal tells run whether newly completed stdout permits shortening the deadline to the drain grace without treating a retryable failure as final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeSignal {
-    /// Nothing bearing on completion.
+    /// `Quiet` provides no completion signal.
     Quiet,
-    /// The run ended in a way nothing can supersede.
+    /// `Decisive` prevents later output from changing the terminal classification.
     Decisive,
-    /// The run ended in a failure the harness may retry itself. The drain
-    /// still arms — a final failure must not burn the whole run budget and
-    /// come back as a timeout, which would erase its classification — but a
-    /// [`ProbeSignal::Continues`] before the grace expires restores the full
+    /// A retryable terminal failure arms the drain grace so a final failure retains its classification; ProbeSignal::Continues before the grace expires restores the full deadline.
     /// deadline.
     Provisional,
-    /// The run is producing more work (a new turn or an automatic retry
-    /// began), so a provisional arming was premature.
+    /// ProbeSignal::Continues indicates that new work began, so provisional drain arming was premature.
     Continues,
 }
 
-/// Bounded captured output plus the structural end state.
 pub struct SubprocessResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub end: SubprocessEnd,
-    /// Whether the whole prompt reached the child's stdin before it closed.
-    /// A transcript produced without the full prompt answers a truncated
-    /// question, so parsers refuse it even when the end state looks clean.
+    /// prompt_delivered is true only when the whole prompt reached the child's stdin before it closed; parsers reject transcripts otherwise, even after a clean end state.
     pub prompt_delivered: bool,
 }
 
-/// Spawns and supervises one harness child (KTD6). Returns after the leader
-/// is reaped on every path, including timeout, cancellation, and overflow,
-/// so lifecycle completion upstream can never observe a live child (R10).
+/// Returns after the leader is reaped on every path, including timeout, cancellation, and overflow, so lifecycle completion upstream can never observe a live child.
 ///
-/// `terminal_probe`, when supplied, inspects each region of newly completed
-/// stdout lines exactly once and reports what that region says about
-/// completion — the total probing cost stays linear in the transcript. A
-/// terminal rearms the run deadline to the drain grace, so a harness that
-/// finishes its output without closing its pipes (the Pi print-mode shutdown
-/// gap) ends as a drain kill with the completed transcript instead of burning
-/// the whole run timeout and failing. A [`ProbeSignal::Provisional`] terminal
-/// arms the same way but is revocable: if the harness resumes before the
-/// grace expires, the original deadline is restored, so a self-retrying
-/// harness is never killed mid-retry.
+/// `terminal_probe` inspects each newly completed stdout-line region exactly once.
+/// A terminal signal rearms the run deadline to the drain grace.
+/// If the harness resumes before the grace expires, it is not killed during its retry.
 pub async fn run(
     spec: SubprocessSpec,
     limits: &SubprocessLimits,
@@ -368,36 +314,29 @@ pub async fn run(
     let mut command = tokio::process::Command::new(&executable);
     command
         .args(&args)
-        // No inherited environment: the child sees exactly the snapshot
-        // plus adapter control variables (R17).
         .env_clear()
         .current_dir(&working_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // A fresh process group makes the whole harness descendant tree the
-        // cancellation unit (KTD6); provider or extension grandchildren die
-        // with the leader.
+        // A fresh process group makes the harness descendant tree the cancellation unit.
+        // Group cleanup targets provider and extension grandchildren in the harness process group.
         .process_group(0)
-        // Backstop only: every ordinary path below reaps explicitly.
+        // Ordinary paths reap explicitly; `Drop` is only a backstop.
         .kill_on_drop(true);
-    // Crash-safe fate binding: the leader asks the kernel to SIGKILL it if
-    // the spawning host thread dies, covering host crashes and SIGKILLs
-    // that never run the drop backstop — otherwise an orphaned harness
-    // keeps executing a billable run that the replacement host reports as
-    // `missing`, and recovery could refire it. `pdeathsig` covers only the
-    // leader; the startup sweep in [`group_registry`] handles descendants
-    // that survive it, and the group sweep covers every ordinary path.
+    // On Linux, `pdeathsig` asks the kernel to SIGKILL the leader when its parent process dies.
+    // Drop cleanup does not run after SIGKILL.
+    // `pdeathsig` applies only to the leader.
+    // The startup sweep in [`group_registry`] handles descendants that survive the leader.
+    // Group cleanup handles descendants on ordinary termination paths.
     //
-    // The parent check closes the window where the host dies between fork
-    // and prctl. It compares against the host's own pid captured pre-fork —
-    // not against init — so a host legitimately running as PID 1 (container
-    // entrypoint) still spawns; only an actual re-parent aborts.
+    // The parent check closes the window where the host dies between `fork` and `pdeathsig` setup.
+    // The check compares the child's parent PID with `host_pid` captured before `fork`.
+    // Comparing with `host_pid` permits a host running as PID 1.
+    // The parent check aborts when the child no longer has `host_pid` as its parent.
     let host_pid = std::process::id();
     let child_inherit_fds = inherit_fds.clone();
-    // SAFETY: the hook runs post-fork/pre-exec, where only async-signal-safe
-    // operations are permitted. All three calls are raw syscalls (prctl,
-    // getppid) with no allocation, locking, or libc state access.
+    // SAFETY: `pre_exec` runs after `fork` and before `exec`, so its closure must avoid allocation and locking.
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
@@ -420,12 +359,7 @@ pub async fn run(
     }
 
     let mut child = command.spawn()?;
-    // The `Command` and the adapter's env vector each hold a full copy of
-    // the child environment, which can approach the platform exec limit;
-    // both are freed as soon as the child exists so concurrent runs retain
-    // no environment-sized allocations for their lifetime (the spawned
-    // child keeps its own kernel-side copy, and `kill_on_drop` transferred
-    // to the `Child` at spawn).
+    // Dropping `command` and `env` releases their environment-sized allocations before concurrent runs continue.
     drop(command);
     drop(env);
     drop(args);
@@ -437,56 +371,35 @@ pub async fn run(
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
         .and_then(rustix::process::Pid::from_raw);
-    // Crash-ownership registration is a barrier before prompt delivery,
-    // and it fails closed: both harnesses start their billable provider
-    // request only after reading the prompt from stdin, so no billable
-    // work can exist without a durable registry record for the replacement
-    // host to sweep. If the record cannot be written, the group is killed
-    // before any prompt bytes flow — pre-prompt descendants are the only
-    // residue of a crash in this window, and they hold no billable
-    // request. `Drop` removes the record on every exit of this function
-    // once the group has been reaped in-process. (No fsync: the record
-    // only needs to survive a host-process crash — power loss kills the
-    // children with it.)
+    // Crash-ownership registration is a barrier before prompt delivery.
+    // Registration failure sends `KILL` before stdin delivery.
     let group_record =
         group.and_then(|g| group_registry::GroupRecord::record(g.as_raw_nonzero().get()));
     if group_record.is_none() {
         let signalled = kill_group(group, rustix::process::Signal::KILL).is_ok();
-        // Covers the (theoretical) missing-group-id case kill_group skips.
+        // `child.start_kill()` covers a missing or unaddressable process group.
         let _ = child.start_kill();
-        // Same proof obligations as `terminate_group`, bounded the same
-        // way: an unbounded wait on a leader wedged in uninterruptible
-        // kernel state would hold this task — and every waiter parked on
-        // its `work_done` — indefinitely, and a member merely signalled is
-        // not a member proven gone. The member scan runs before the reap,
-        // while the unreaped leader still pins the pgid.
+        // `timeout` prevents an uninterruptible leader from blocking `work_done` waiters indefinitely.
         let members_gone = wait_other_members_gone(group, limits.termination_grace).await;
         let reaped = tokio::time::timeout(limits.termination_grace, child.wait())
             .await
             .is_ok();
         if !(signalled && members_gone && reaped) {
-            // No registry record exists to retain — its absence is why this
-            // branch runs — so the unproven teardown can only ride the
-            // terminal: `spawn_failure` maps this marker to
-            // `BackendTerminal::FailedUnresolved`, and cancel, delete, and
-            // shutdown latch `work_unresolved` from it. No prompt bytes
-            // have flowed (registration is a barrier before delivery), so
-            // the surviving processes hold no billable request, but they
-            // are unrecorded and the host must not vouch for their death.
+            // The registration-failure path returns `RegistrationTeardownUnproven` when teardown cannot be proven.
+            // No prompt bytes have flowed because registration precedes stdin delivery.
+            // The host cannot report the group as terminated until teardown is proven.
             return Err(io::Error::other(RegistrationTeardownUnproven));
         }
         return Err(io::Error::other(
             "crash-ownership registration failed before prompt delivery",
         ));
     }
-    // Held in a slot rather than a plain binding: a teardown that cannot
-    // PROVE the group is gone retains the record instead of dropping it, so
-    // this host's successor sweeps those descendants once this host exits.
+    // `group_record` remains `Some` until teardown is proven, retaining the registry record.
+    // The successor sweeps the group's descendants after this host exits.
     let mut group_record = group_record;
 
-    // Prompt delivery is concurrent with output draining: a child that
-    // fills its stdout pipe before reading stdin must not deadlock us.
-    // stdin is closed (dropped) after delivery so print-mode reads see EOF.
+    // Concurrent prompt delivery and output draining prevent a child that fills stdout before reading stdin from deadlocking the host.
+    // Prompt delivery drops stdin after writing so print-mode reads receive EOF.
     let mut stdin_pipe = child.stdin.take();
     let mut stdin_task = tokio::spawn(async move {
         let Some(mut stdin) = stdin_pipe.take() else {
@@ -504,20 +417,16 @@ pub async fn run(
     let mut stderr_open = true;
     let mut stdout_chunk = [0u8; 8192];
     let mut stderr_chunk = [0u8; 8192];
-    // Kept so a revoked provisional arming restores the ORIGINAL budget
-    // rather than granting a fresh one: a harness that retries cannot extend
-    // its run by retrying.
+    // `run_deadline` preserves the original timeout budget when provisional arming is revoked.
     let run_deadline = tokio::time::Instant::now() + limits.run_timeout;
     let deadline = tokio::time::sleep_until(run_deadline);
     tokio::pin!(deadline);
     let mut terminal_seen = false;
     let mut arming_revocable = false;
-    // Everything before this offset has already been probed; each complete
+    // Bytes before `probed_to` have already been probed.
     // line is inspected exactly once no matter how the reads chunk it.
     let mut probed_to = 0usize;
 
-    // One loop drains both streams concurrently under their byte caps while
-    // watching the timeout and the cancellation token (R17).
     let abnormal = loop {
         if !stdout_open && !stderr_open {
             break None;
@@ -525,9 +434,8 @@ pub async fn run(
         tokio::select! {
             biased;
             () = cancel.cancelled() => break Some(SubprocessEnd::Cancelled),
-            // After the probe fires the (rearmed) deadline is the drain
-            // grace: the transcript is complete, so a still-open pipe is the
-            // shutdown gap, not a timeout.
+            // After the probe fires, the rearmed deadline limits drain grace because the transcript is complete.
+            // After the transcript completes, an open pipe marks a shutdown gap rather than a run timeout.
             () = &mut deadline => break Some(if terminal_seen {
                 SubprocessEnd::DrainKilled
             } else {
@@ -535,25 +443,20 @@ pub async fn run(
             }),
             read = stdout_pipe.read(&mut stdout_chunk), if stdout_open => match read {
                 Ok(0) => stdout_open = false,
-                // NOT EOF: the rest of the transcript is unknown, and a
-                // parseable prefix plus a clean child exit would otherwise
-                // publish a truncated answer — or miss a contradictory
-                // terminal — as success.
+                // A read error is not EOF because the remaining transcript is unknown.
+                // A parseable prefix and clean child exit could publish a truncated answer as success.
+                // A truncated transcript could omit a contradictory terminal.
                 Err(_) => break Some(SubprocessEnd::CaptureFailed),
                 Ok(n) => {
                     if stdout.len() + n > limits.max_stdout_bytes {
                         break Some(SubprocessEnd::StdoutOverflow);
                     }
                     stdout.extend_from_slice(&stdout_chunk[..n]);
-                    // Probing continues after a revocable arming, because
-                    // the signal that revokes it arrives later.
+                    // Probing continues after revocable arming because revocation arrives later.
                     if !terminal_seen || arming_revocable {
                         if let Some(probe) = terminal_probe {
-                            // Only the newly appended bytes are searched for
-                            // a line end: everything between `probed_to` and
-                            // this chunk was already searched on its own
-                            // arrival and held no newline, so a single long
-                            // line cannot make the search quadratic.
+                            // Searching only new bytes prevents a long line from making newline search quadratic.
+                            // Bytes preceding the newly appended chunk were already searched and contained no newline.
                             let appended_at = stdout.len() - n;
                             if let Some(last_newline) = stdout[appended_at..]
                                 .iter()
@@ -573,12 +476,9 @@ pub async fn run(
                                             deadline.as_mut().reset(drain_deadline);
                                         }
                                     }
-                                    // Only a revocable arming is undone; a
-                                    // decisive terminal stands whatever
-                                    // follows it. The restored deadline may
-                                    // already be past, which correctly ends
-                                    // the run as a timeout rather than
-                                    // granting the retry free budget.
+                                    // The code undoes only revocable arming.
+                                    // A decisive terminal remains valid after subsequent output.
+                                    // The restored deadline may already be past, ending the run as a timeout rather than granting retry free budget.
                                     ProbeSignal::Continues => {
                                         if arming_revocable {
                                             terminal_seen = false;
@@ -614,21 +514,14 @@ pub async fn run(
             end
         }
         None => {
-            // Clean EOF on both streams: give the leader a bounded grace to
-            // exit on its own before forcing it (the transcript is already
-            // complete either way). The exit is observed WITHOUT reaping so
-            // the zombie leader keeps the pgid pinned while the descendant
-            // sweep runs — a reaped leader with no surviving descendants
-            // frees the pgid for reuse, and a post-reap sweep could SIGKILL
-            // an unrelated recycled process group.
+            // After both streams reach EOF, the code waits up to `limits.drain_grace` for the leader to exit without reaping it; its zombie pins the pgid until the descendant sweep completes.
             let exit = wait_exited_unreaped(group, limits.drain_grace).await;
             if exit != LeaderExit::Running {
                 let signalled =
                     kill_group_fenced(group, exit, rustix::process::Signal::KILL).is_ok();
-                // Same proof obligation as `terminate_group`: the fenced
-                // KILL only signals; a member in uninterruptible kernel
-                // state must be observed gone before this teardown counts
-                // as proven. Checked while the unreaped leader still pins
+                // A fenced `KILL` only signals; the code retains the process-group fence until the sweep completes to prevent signaling a recycled pgid.
+                // The teardown succeeds only after the process group is observed gone.
+                // The teardown checks member disappearance while the unreaped leader pins the pgid.
                 // the pgid.
                 group_gone =
                     signalled && wait_other_members_gone(group, limits.termination_grace).await;
@@ -648,13 +541,7 @@ pub async fn run(
             }
         }
     };
-    // A signal that failed for anything but "already gone" leaves
-    // descendants possibly running, so the run is NOT settled: the end state
-    // says so (no transcript is trusted past an abnormal end) and the record
-    // is retained rather than dropped, since dropping it would delete the
-    // only evidence of that work while cancel or delete reported success.
-    // The record outlives this host deliberately — we could not signal those
-    // descendants, so only a successor should.
+    // The host retains the record while descendants may still be running.
     let end = if group_gone {
         end
     } else {
@@ -665,12 +552,9 @@ pub async fn run(
     };
     drop(group_record);
 
-    // The whole process group is dead on every path above, so the writer
-    // settles promptly: it either finished long ago or its pipe just broke.
-    // An incomplete write means the child produced its output without the
-    // full prompt; the result records that so parsers can refuse the
-    // transcript. The timeout is a backstop against an inherited stdin fd
-    // surviving the sweep and counts as non-delivery.
+    // The timeout bounds the write when a surviving process retains stdin.
+    // An incomplete write sets `prompt_delivered` to false.
+    // A timeout caused by an inherited stdin fd surviving the sweep counts as non-delivery.
     let prompt_delivered = match tokio::time::timeout(Duration::from_secs(1), &mut stdin_task).await
     {
         Ok(joined) => joined.unwrap_or(false),
@@ -687,9 +571,7 @@ pub async fn run(
     })
 }
 
-/// Signals a whole process group. `ESRCH` — the group is already gone — is
-/// the success case; any other failure means descendants may still be
-/// running, which the caller must not mistake for a completed teardown.
+/// `ESRCH` means the group is already gone; any other failure may leave descendants running.
 fn kill_group(
     group: Option<rustix::process::Pid>,
     signal: rustix::process::Signal,
@@ -701,34 +583,24 @@ fn kill_group(
     }
 }
 
-/// Whether the leader has exited, and whether its pgid is still fenced
 /// against reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaderExit {
-    /// Still running at the deadline (or no pid to poll).
     Running,
-    /// Exited and NOT reaped: the zombie holds the pgid, so a group signal
-    /// provably cannot reach a recycled group.
+    /// An exited, unreaped leader's zombie holds the pgid, so group signals cannot reach a recycled group.
     ExitedFenced,
-    /// Already reaped by someone else — `SIGCHLD=SIG_IGN`,
-    /// `SA_NOCLDWAIT`, or another in-process reaper — so no zombie fences
-    /// the pgid and it may already belong to an unrelated group.
+    /// If `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or another in-process reaper has reaped the leader, no zombie fences the pgid.
+    /// Without a zombie fence, the pgid may already belong to an unrelated group.
     ExitedUnfenced,
 }
 
-/// Waits up to `budget` for the leader to exit WITHOUT reaping it, via
-/// `waitid(..., WNOWAIT)`: the unreaped zombie keeps the process group id
-/// pinned, which is what makes the callers' descendant sweep race-free
-/// against pid/pgid recycling.
+/// The function waits up to `budget` for the leader to exit without reaping it.
+/// An unreaped zombie pins the process-group ID, preventing PID/PGID recycling during descendant sweeps.
 async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Duration) -> LeaderExit {
     let Some(pid) = group else {
-        // No pid means no pgid to sweep either, so the caller's fallback
-        // (direct kill-and-reap) is already race-free.
         return LeaderExit::Running;
     };
-    // ponytail: 10ms poll instead of SIGCHLD plumbing — tokio owns the
-    // child's SIGCHLD handling, and a bounded poll is a few syscalls per
-    // run; switch to pidfd if runs-per-second ever makes this measurable.
+    // Tokio owns the child's `SIGCHLD` handling, so the function uses a 10 ms bounded poll.
     const POLL: Duration = Duration::from_millis(10);
     let deadline = tokio::time::Instant::now() + budget;
     loop {
@@ -737,11 +609,7 @@ async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Durat
             | rustix::process::WaitIdOptions::NOHANG;
         match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
             Ok(Some(_)) => return LeaderExit::ExitedFenced,
-            // Only "not our waitable child anymore" proves the leader is
-            // gone. Any other errno (EINTR under concurrent SIGCHLD, for
-            // instance) proves nothing: reporting exited there would skip
-            // the documented SIGTERM-then-grace path for a child that is
-            // still shutting down cleanly, so keep polling until the
+            // `NotWaitable` proves that the leader exited.
             // deadline decides.
             Err(rustix::io::Errno::CHILD | rustix::io::Errno::SRCH) => {
                 return LeaderExit::ExitedUnfenced
@@ -755,13 +623,12 @@ async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Durat
     }
 }
 
-/// Signals the group, but only when the pgid is provably still this run's.
+/// Membership checks reduce, but cannot eliminate, recycled-pgid signaling.
 ///
-/// With a zombie leader the pgid cannot be reused, so the signal is safe. If
-/// the leader was already reaped (no fence), the numeric pgid may belong to
-/// an unrelated group, so the signal goes out only while `/proc` still
-/// shows a member — the residual window is the instant between that check
-/// and the signal, versus leaking this run's descendants if we never signal.
+/// A zombie leader pins the pgid, preventing reuse.
+/// When the leader has been reaped, the numeric pgid may belong to an unrelated group.
+/// Scan errors do not suppress the signal, prioritizing descendant cleanup over a possible leaked group.
+/// The check-to-signal window can still target a recycled pgid; never signaling can leak descendants.
 fn kill_group_fenced(
     group: Option<rustix::process::Pid>,
     exit: LeaderExit,
@@ -770,12 +637,6 @@ fn kill_group_fenced(
     if exit == LeaderExit::ExitedUnfenced {
         let Some(pid) = group else { return Ok(()) };
         let pgid = pid.as_raw_nonzero().get();
-        // An unverifiable scan must not read as "no members": skipping the
-        // signal there leaks this run's descendants AND the crash record is
-        // removed as this run ends, so nothing would ever sweep them. One
-        // retry, then signal — an unlikely recycled-pgid hit is a bounded
-        // wrong signal, while a missed kill is billable work running with
-        // no recovery path left.
         let live = group_registry::group_has_members(pgid)
             .or_else(|_| group_registry::group_has_members(pgid))
             .unwrap_or(true);
@@ -786,12 +647,10 @@ fn kill_group_fenced(
     kill_group(group, signal)
 }
 
-/// Polls until no process other than the group leader remains in the
-/// group, bounded by `budget`. Run while the leader is still an unreaped
-/// zombie: the zombie pins the pgid, so the scan can never read a recycled
-/// group. `true` only when the group provably emptied — scan failures and
-/// the deadline both answer `false`, because an unproven teardown must
-/// never count as a proven one.
+/// Callers must keep the leader unreaped so its zombie prevents pgid recycling during the poll.
+/// Callers must keep the leader unreaped so its zombie prevents pgid recycling during the poll.
+/// pgid.
+/// Return `false` on deadline expiry; scan failures leave teardown unproven and continue polling.
 async fn wait_other_members_gone(group: Option<rustix::process::Pid>, budget: Duration) -> bool {
     let Some(pid) = group else { return true };
     let pgid = pid.as_raw_nonzero().get();
@@ -808,15 +667,7 @@ async fn wait_other_members_gone(group: Option<rustix::process::Pid>, budget: Du
     }
 }
 
-/// Graceful group termination: SIGTERM the whole group, escalate to SIGKILL
-/// after the bounded grace, sweep the group, verify the group emptied, and
-/// reap the leader within one more grace before returning (R10). The final
-/// group SIGKILL is sent while the leader is still an unreaped zombie — the
-/// zombie pins the pgid, so the sweep can never target a recycled process
-/// group. A leader that stays unreapable past the final grace, or a group
-/// member that cannot be shown gone, is reported as an error so the run
-/// ends as an unconfirmed teardown instead of wedging its task or claiming
-/// a teardown the host never proved.
+/// Send the final `SIGKILL` before reaping so the zombie pins the pgid.
 async fn terminate_group(
     group: Option<rustix::process::Pid>,
     child: &mut tokio::process::Child,
@@ -830,26 +681,14 @@ async fn terminate_group(
     if exit == LeaderExit::Running {
         kill_group(group, rustix::process::Signal::KILL)?;
         let _ = child.start_kill();
-        // SIGKILL cannot be caught, so the leader dies promptly; the bound
-        // only guards against pathological kernel states wedging the run.
+        // SIGKILL cannot be caught; the bound limits time spent waiting for exit.
         exit = wait_exited_unreaped(group, grace).await;
     }
     let signalled = kill_group_fenced(group, exit, rustix::process::Signal::KILL);
-    // Verified BEFORE the reap, while the unreaped zombie still pins the
-    // pgid: a SIGKILLed member survives only in uninterruptible kernel
-    // state, and it must be observed GONE — not merely signalled — before
-    // this teardown counts as proven, or the caller drops the crash record
-    // while an unrecorded descendant still runs.
+    // Check that no other group members remain before reaping the leader so its zombie pins the pgid.
+    // Wait for members to disappear rather than treating `SIGKILL` delivery as teardown proof.
     let members_gone = wait_other_members_gone(group, grace).await;
-    // Bounded reap: SIGKILL makes the leader waitable promptly unless it is
-    // wedged in uninterruptible kernel state, and an unbounded wait there
-    // would hold `work_done` hostage — cancel, delete, and shutdown all
-    // park on it — turning the advertised finite teardown into an
-    // indefinite request or host shutdown that retains the instance lock.
-    // An unreapable leader is an unconfirmed teardown: the error makes the
-    // caller retain the crash record so a successor sweeps the group, and
-    // the abandoned zombie keeps the pgid pinned against reuse until the
-    // runtime's orphan reaper collects it.
+    // Bound `child.wait()` by `grace` to prevent an unreapable leader from blocking teardown indefinitely.
     if tokio::time::timeout(grace, child.wait()).await.is_err() {
         return Err(io::Error::other(
             "harness leader was not reapable within the termination grace",
@@ -863,18 +702,14 @@ async fn terminate_group(
     signalled
 }
 
-/// A sensitive-file cleanup failure, reduced to a bounded structural fact
-/// (R19): the error kind only, never a path or file content.
+/// Report sensitive-file cleanup failures by error kind only; never include paths or file contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupFailure {
     pub kind: io::ErrorKind,
 }
 
-/// The one spelling of a cleanup failure inside a terminal's message. Both
-/// the producer of that text ([`CleanupFailure`]'s `Display`) and its only
-/// consumer (the Pi provider-fallback gate, which must not retry over a run
-/// that left private prompt material on disk) name this constant, so a
-/// rewording cannot silently change retry behavior.
+/// The provider fallback uses `CleanupFailure`'s `Display` text as its retry discriminator.
+/// The Pi fallback gate does not retry after cleanup leaves private prompt material on disk.
 pub(crate) const CLEANUP_FAILURE_MARKER: &str = "cleanup failed";
 
 impl std::fmt::Display for CleanupFailure {
@@ -883,10 +718,9 @@ impl std::fmt::Display for CleanupFailure {
     }
 }
 
-/// A fresh private temp directory forced to `0700` regardless of the
-/// inherited umask, holding this run's sensitive files (R17). Cleanup is
-/// explicit and fallible so a failure stays observable (R19); `Drop` only
-/// backstops early-return paths best-effort.
+/// This run's sensitive files use a fresh directory forced to `0700` despite the inherited umask.
+/// Cleanup failures remain observable because callers handle cleanup explicitly.
+/// `Drop` backstops early-return paths with best-effort cleanup.
 pub struct PrivateDir {
     path: Option<PathBuf>,
 }
@@ -894,17 +728,13 @@ pub struct PrivateDir {
 impl PrivateDir {
     pub fn create(prefix: &str) -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        // Rooted in the crash-swept run root, and named with the creating
-        // host's identity, so a directory holding a run's hidden prompt and
-        // transcript can be proven stale and removed after a crash instead
-        // of persisting until someone clears /tmp (R17/R19).
+        // The crash sweeper removes directories in the run root whose names identify their creator.
+        // The crash sweeper removes stale prompt and transcript directories.
         let base = group_registry::private_run_root()?;
         let owner_boot = group_registry::owner_boot_tag()?;
         let owner_pid = std::process::id();
         let owner_start = group_registry::owner_start_time()?;
-        // Requesting 0700 at mkdir(2) closes the window where a permissive
-        // umask would briefly leave the fresh directory group/world-visible
-        // before the chmod below lands (R17).
+        // Requesting `0700` at `mkdir(2)` prevents a permissive umask from exposing the new directory before `set_permissions` runs.
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
         for _ in 0..16 {
@@ -915,12 +745,10 @@ impl PrivateDir {
                 "{prefix}-{owner_boot}-{owner_pid}-{owner_start}-{:016x}",
                 u64::from_le_bytes(nonce)
             ));
-            // `create` fails on any existing entry, including a planted
-            // symlink, so success proves the path is fresh and ours.
+            // `create` rejects existing entries, including symlinks, so success uses a previously absent pathname.
             match builder.create(&candidate) {
                 Ok(()) => {
-                    // mkdir(2) modes are still umask-filtered; force exactly
-                    // 0700 regardless of the inherited umask (R17).
+                    // `mkdir(2)` modes are umask-filtered, so `set_permissions` forces `0700`.
                     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))?;
                     let meta = fs::symlink_metadata(&candidate)?;
                     if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
@@ -941,28 +769,20 @@ impl PrivateDir {
         self.path.as_deref().expect("live until cleanup")
     }
 
-    /// Creates `name` inside the directory as a fresh regular file forced
-    /// to `0600` regardless of the inherited umask (R17).
+    /// Creates `name` as a fresh regular file forced to `0600` regardless of the inherited umask.
     pub fn write_private(&self, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
         use std::io::Write;
         let path = self.path().join(name);
-        // `create_new` refuses existing entries and symlinks: fresh and ours.
+        // `create_new` rejects existing entries and symlinks, so success uses a previously absent pathname.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
         file.write_all(bytes)?;
-        // Deliberately no fsync: this file exists only for the child that
-        // reads it moments later and is unlinked when the run ends, so
-        // durability across power loss is worthless here — while fsync is
-        // the one operation on this path that can genuinely stall an async
-        // worker under I/O pressure. A later open(2) in another process
-        // sees these bytes without it. The remaining operations are
-        // bounded metadata syscalls (create, chmod, statx, and at most two
-        // unlinks plus an rmdir at cleanup).
+        // No `fsync`: the child reads this file before cleanup.
         drop(file);
-        // The open(2) mode is umask-filtered; force exactly 0600 (R17).
+        // The `open(2)` mode is umask-filtered, so `set_permissions` forces `0600`.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let meta = fs::symlink_metadata(&path)?;
         if !meta.file_type().is_file() || meta.file_type().is_symlink() {
@@ -971,8 +791,7 @@ impl PrivateDir {
         Ok(path)
     }
 
-    /// Removes the directory and everything in it. The result must reach
-    /// the run terminal (R19): callers merge it via [`merge_cleanup`].
+    /// `merge_cleanup` propagates cleanup failures to the run terminal.
     pub fn cleanup(mut self) -> Result<(), CleanupFailure> {
         let path = self.path.take().expect("cleanup runs once");
         fs::remove_dir_all(&path).map_err(|err| CleanupFailure { kind: err.kind() })
@@ -987,10 +806,7 @@ impl Drop for PrivateDir {
     }
 }
 
-/// Folds a cleanup result into the run terminal (R19): cleanup failure is
-/// observable on the failure path and prevents an unqualified success on
-/// the success path — a completed run whose sensitive files may still exist
-/// is reported as one classified failure naming both facts.
+/// A cleanup failure converts a completed run to a failure because sensitive files may remain.
 pub fn merge_cleanup(
     terminal: BackendTerminal,
     cleanup: Result<(), CleanupFailure>,
@@ -1012,8 +828,8 @@ pub fn merge_cleanup(
             error.message = format!("{}; additionally {failure}", error.message);
             BackendTerminal::Failed(error)
         }
-        // Merging a cleanup failure must not downgrade the unresolved
-        // teardown: cancel and delete still cannot claim the work stopped.
+        // `merge_cleanup` must not downgrade an unresolved teardown failure.
+        // Cancel and delete must not claim work stopped while teardown remains unresolved.
         BackendTerminal::FailedUnresolved(mut error) => {
             error.message = format!("{}; additionally {failure}", error.message);
             BackendTerminal::FailedUnresolved(error)
@@ -1021,13 +837,11 @@ pub fn merge_cleanup(
     }
 }
 
-/// Marker payload for a spawn error whose pre-prompt process group could
-/// not be proven torn down: crash-ownership registration failed (so no
-/// registry record exists for a successor to sweep) AND the SIGKILLed
-/// group could not be shown gone within the grace. [`spawn_failure`] maps
-/// it to [`BackendTerminal::FailedUnresolved`] so cancel, delete, and
-/// shutdown latch `work_unresolved` instead of vouching for a teardown the
-/// host never proved.
+/// `RegistrationTeardownUnproven` marks a spawn error whose pre-prompt process group was not proven torn down.
+/// Crash-ownership registration failure leaves no registry record for a successor to sweep.
+/// The marker requires a missing registry record and a SIGKILLed group not confirmed gone within the grace period.
+/// Cancel, delete, and shutdown latch `work_unresolved` for `BackendTerminal::FailedUnresolved`.
+/// `work_unresolved` prevents shutdown from claiming an unproven teardown.
 #[derive(Debug)]
 struct RegistrationTeardownUnproven;
 
@@ -1043,11 +857,6 @@ impl std::fmt::Display for RegistrationTeardownUnproven {
 
 impl std::error::Error for RegistrationTeardownUnproven {}
 
-/// Maps a spawn failure to the run terminal (missing executables are run
-/// failures, not host failures — plan assumption). The message is
-/// structural only. Process-table and memory pressure clear on their own,
-/// so those kinds stay retryable; configuration failures (missing
-/// executable, permissions) are permanent.
 pub(crate) fn spawn_failure(harness: HarnessName, err: &io::Error) -> BackendTerminal {
     if err
         .get_ref()
@@ -1099,7 +908,7 @@ pub(crate) fn harness_unavailable_failure(
     })
 }
 
-/// Tiny name carrier so shared diagnostics never format request content.
+/// A name carrier prevents shared diagnostics from formatting request content.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum HarnessName {
     OpenCode,
@@ -1115,10 +924,8 @@ impl HarnessName {
     }
 }
 
-/// Maps an abnormal structural end to one canonical failed terminal (R18).
-/// Returns `None` for ends the parser should interpret from the transcript.
-/// Classification may consult bounded stderr for the error class, but the
-/// message never quotes child output (R19).
+/// The parser returns `None` for ends it should interpret from the transcript.
+/// Classification may use bounded stderr for the error class but never quote child output.
 pub(crate) fn abnormal_end_terminal(
     harness: HarnessName,
     end: SubprocessEnd,
@@ -1153,8 +960,6 @@ pub(crate) fn abnormal_end_terminal(
             provider_code: None,
         },
         SubprocessEnd::Cancelled => BackendError {
-            // The supervisor's first-terminal-wins arbitration replaces this
-            // with its own cancellation terminal; the class is a formality.
             class: ErrorClass::Transient,
             message: format!("{name} backend run was cancelled"),
             retry_after_secs: None,
@@ -1166,19 +971,16 @@ pub(crate) fn abnormal_end_terminal(
             retry_after_secs: None,
             provider_code: None,
         },
-        // An I/O failure on the pipe says nothing about the request, so a
-        // retry may well succeed.
+        // A pipe I/O failure does not classify the request, so a retry can succeed.
         SubprocessEnd::CaptureFailed => BackendError {
             class: ErrorClass::Transient,
             message: format!("{name} backend output capture failed"),
             retry_after_secs: None,
             provider_code: None,
         },
-        // Transient: whatever denied the signal (a policy, a credential
-        // change) may not deny the next run, and the caller must see that
-        // this one did not settle.
-        // The one end whose work may still be running: it is reported as a
-        // terminal the supervisor must not treat as proof the work stopped.
+        // Signal denial is transient because a later run may be permitted.
+        // The terminal must report that the work did not settle.
+        // The supervisor must not treat `BackendTerminal::FailedUnresolved` as proof that the work stopped.
         SubprocessEnd::TeardownUnconfirmed => {
             return Some(BackendTerminal::FailedUnresolved(BackendError {
                 class: ErrorClass::Transient,
@@ -1191,9 +993,7 @@ pub(crate) fn abnormal_end_terminal(
     Some(BackendTerminal::Failed(error))
 }
 
-/// A bounded parse failure: structural position only, never line content
-/// (R19). Every malformed-output shape funnels here so R18's "one canonical
-/// failed terminal" holds.
+/// A bounded parse failure records structural position, never line content.
 pub(crate) fn parse_failure(harness: HarnessName, detail: &str) -> BackendTerminal {
     BackendTerminal::Failed(BackendError {
         class: ErrorClass::Permanent,
@@ -1203,9 +1003,7 @@ pub(crate) fn parse_failure(harness: HarnessName, detail: &str) -> BackendTermin
     })
 }
 
-/// Closed keyword classification for provider failure text (R18). Ordering
-/// matters: authentication and context-overflow phrasing often also
-/// mentions retries, so those classes are checked first.
+/// Authentication and context-overflow classes are checked first because their phrasing can also mention retries.
 pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
     let lower = text.to_ascii_lowercase();
     const AUTH: [&str; 5] = [
@@ -1216,12 +1014,6 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
         "forbidden",
     ];
     const AUTH_CODES: [&str; 2] = ["401", "403"];
-    // Broca-path provider text never leaves this process (the wire message
-    // is host-authored, R19), so this list — not the module scheduler's
-    // regex set, which only sees text on its own non-Broca paths — is the
-    // sole classifier for these failures. It therefore mirrors every
-    // phrasing that set recognizes, as plain substrings: the `\d+` patterns
-    // reduce to their literal prefixes, which is what actually discriminates.
     const OVERFLOW: [&str; 20] = [
         "context length",
         "context window",
@@ -1275,14 +1067,8 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
     ErrorClass::Permanent
 }
 
-/// Whether `haystack` contains `code` as a standalone token rather than as
-/// digits inside a longer identifier. A plain substring match reads `401`
-/// out of an unrelated request id like `req-40123` or `req-x401abc`, and
-/// misreading a provider failure as `AuthRequired` is expensive: the
-/// historian path treats it as fatal for every remaining model from that
-/// provider, and the Pi adapter spends a canonical-provider retry on it.
-/// Boundaries are non-alphanumeric on both sides, so `status 401`, `(401)`,
-/// and `401:` match while `x401abc` does not.
+/// A substring match misreads `401` in `req-40123` or `req-x401abc`.
+/// Boundaries are non-alphanumeric on both sides, so `status 401`, `(401)`, and `401:` match while `x401abc` does not.
 fn contains_status_code(haystack: &str, code: &str) -> bool {
     haystack.match_indices(code).any(|(index, _)| {
         let before = haystack[..index].chars().next_back();
@@ -1292,22 +1078,11 @@ fn contains_status_code(haystack: &str, code: &str) -> bool {
     })
 }
 
-/// Ceiling on any retry delay extracted from provider output. The text is
-/// untrusted: without a cap, hostile "retry after 99999999999" phrasing
-/// would persist a durable historian backoff decades into the future.
+/// The parser caps retry delays from untrusted provider text.
 pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
-/// Extracts a retry delay in seconds from provider failure text (R18 retry
-/// metadata), clamped to [`MAX_RETRY_AFTER_SECS`] because the source text
-/// is untrusted. Only an explicit delay form counts — `retry after <n>`,
-/// `retry in <n>`, `retrying after <n>`, `Retry-After: <n>`, or an echoed
-/// `retryAfter` field, with an optional unit — so an unrelated number later
-/// in the message (a request id, a status reference) is never persisted as
-/// a durable backoff.
+/// The parser extracts only explicit retry delays from provider failure text and clamps them to [`MAX_RETRY_AFTER_SECS`].
 ///
-/// Single pass, O(1) extra memory beyond the lowercased copy: a provider
-/// error can be MiBs, and materializing per-token metadata would multiply
-/// this scan's declared one-transcript budget by the token count.
 pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     let lower = text.to_ascii_lowercase();
     let mut saw_verb = false;
@@ -1317,8 +1092,7 @@ pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty());
     for token in tokens {
-        // A bare number already rode an explicit delay form; this token is
-        // either its unit or unrelated prose (which means seconds).
+        // After an explicit delay, an unrecognized following token leaves the delay in seconds.
         if let Some(value) = pending {
             return Some(apply_delay_unit(value, token));
         }
@@ -1331,7 +1105,6 @@ pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
                 }
                 return Some(apply_delay_unit(value, unit));
             }
-            // Not a number: fall through and re-evaluate this token below.
         }
         if saw_verb {
             saw_verb = false;
@@ -1341,11 +1114,9 @@ pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
             }
         }
         match token {
-            // Closed verb vocabulary: prefix matching would also catch
-            // "retrieval after 300 items".
+            // Exact matching prevents `retrieval after 300 items` from being parsed as a retry delay.
             "retry" | "retries" | "retried" | "retrying" => saw_verb = true,
-            // A lowered `retryAfter` field echo carries the delay keyword
-            // glued to the verb.
+            // `retryAfter` lowercases to `retryafter`, so it is treated as an explicit retry-delay marker.
             "retryafter" => saw_delay_keyword = true,
             _ => {}
         }
@@ -1353,9 +1124,7 @@ pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     pending.map(|value| value.min(MAX_RETRY_AFTER_SECS))
 }
 
-/// Splits one token into its leading digit run and the remaining glued
-/// unit. An over-long digit run overflows `u64::from_str`; treat it as the
-/// cap rather than dropping the (real) retry signal entirely.
+/// A digit run that overflows `u64` clamps to `MAX_RETRY_AFTER_SECS` rather than discarding the retry signal.
 fn split_delay_number(token: &str) -> Option<(u64, &str)> {
     let digits_end = token
         .find(|c: char| !c.is_ascii_digit())
@@ -1367,7 +1136,6 @@ fn split_delay_number(token: &str) -> Option<(u64, &str)> {
     Some((value, &token[digits_end..]))
 }
 
-/// Converts a delay to clamped seconds given its (possibly empty) unit.
 fn apply_delay_unit(value: u64, unit: &str) -> u64 {
     let secs = match unit {
         // A bare number after an explicit delay keyword means seconds.
@@ -1375,31 +1143,20 @@ fn apply_delay_unit(value: u64, unit: &str) -> u64 {
         "ms" | "millisecond" | "milliseconds" => value.div_ceil(1000).max(1),
         "m" | "min" | "mins" | "minute" | "minutes" => value.saturating_mul(60),
         "h" | "hr" | "hrs" | "hour" | "hours" => value.saturating_mul(3600),
-        // The following token is prose, not a unit; the number still rode
-        // an explicit delay form, so it counts as seconds.
+        // An unrecognized unit after an explicit delay form leaves the number in seconds.
         _ => value,
     };
     secs.min(MAX_RETRY_AFTER_SECS)
 }
 
-/// Ceiling on JSON structural cardinality in one harness output line.
+/// `MAX_LINE_JSON_NODES` caps structural JSON nodes in one harness output line.
 ///
-/// An untyped `serde_json::Value` parse allocates a node per array element
-/// and object entry, so a line of tiny values (`[0,0,0,...]`) amplifies far
-/// beyond its byte length — the capture budget models a parsed line as
-/// transcript-sized, not as a node graph. Bounding the node count keeps the
-/// worst-case DOM on the order of a megabyte, inside the existing
-/// per-backend capture headroom, without capping line LENGTH (a legitimate
-/// assistant message is one long line).
+/// Parsing untyped `serde_json::Value` allocates a node for each array element and object entry, so tiny values can exceed the capture budget's allocation model.
+/// Bounding the node count prevents tiny JSON values from amplifying DOM allocation beyond the transcript-sized capture budget.
+/// The bound limits node count without limiting line length.
 ///
-/// Generous for the closed print-mode vocabulary: a real event carries
-/// message and content-block structure in the tens to low thousands.
 pub(crate) const MAX_LINE_JSON_NODES: usize = 32_768;
 
-/// Whether `text` stays within [`MAX_LINE_JSON_NODES`]. Counts only
-/// structural punctuation OUTSIDE string literals: prose commas in an
-/// assistant message are content, not nodes, and must never trip the bound.
-/// Single pass, no allocation.
 pub(crate) fn json_nodes_within_bound(text: &str) -> bool {
     let mut nodes = 0usize;
     let mut in_string = false;
@@ -1430,9 +1187,7 @@ pub(crate) fn json_nodes_within_bound(text: &str) -> bool {
     true
 }
 
-/// Admits a provider-supplied error code onto the wire only in short
-/// identifier shape: provider output can echo prompt or credential content
-/// (R19), so anything beyond `[A-Za-z0-9_.-]{1,64}` is dropped rather than
+/// The wire admits provider codes only if they match `[A-Za-z0-9_.-]{1,64}`.
 /// forwarded.
 pub(crate) fn sanitized_provider_code(code: &str) -> Option<String> {
     (!code.is_empty()
@@ -1443,10 +1198,7 @@ pub(crate) fn sanitized_provider_code(code: &str) -> Option<String> {
     .then(|| code.to_owned())
 }
 
-/// First terminal wins; any second terminal is contradictory and fails the
-/// whole run (R18) — an error after a claimed success must never be
-/// reported as completed, and vice versa. Shared by both harness parsers so
-/// the contradictory-terminal spelling cannot drift.
+/// A success terminal and an error terminal cannot both be reported.
 pub(crate) fn commit_terminal(
     slot: &mut Option<BackendTerminal>,
     terminal: BackendTerminal,
@@ -1459,10 +1211,6 @@ pub(crate) fn commit_terminal(
     Ok(())
 }
 
-/// The shared post-run gate (KTD6): a transcript is trusted only after a
-/// clean end; the parsed events are emitted until the sink closes; every
-/// abnormal end yields the exact "transcript unavailable" detail so
-/// `finalize` maps it to one canonical failure.
 pub(crate) fn parse_clean_transcript(
     result: &SubprocessResult,
     events: &EventSink,
@@ -1474,9 +1222,7 @@ pub(crate) fn parse_clean_transcript(
     ) {
         return Err("transcript unavailable".to_owned());
     }
-    // A syntactically valid transcript from a child that never received the
-    // whole prompt answers a truncated question; refusing it here turns a
-    // silent wrong answer into one bounded failure.
+    // Reject transcripts when stdin closes before the whole prompt is delivered; they may answer a truncated prompt.
     if !result.prompt_delivered {
         return Err("prompt delivery failed before the child closed stdin".to_owned());
     }
@@ -1489,9 +1235,8 @@ pub(crate) fn parse_clean_transcript(
     Ok(terminal)
 }
 
-/// The shared adapter tail (KTD6): abnormal ends win, then the parsed
-/// transcript terminal, then bounded parse failure — and cleanup is merged
-/// last so it is observable on every path (R19).
+/// Abnormal ends take precedence over parsed terminals and parse failures.
+/// `finalize` merges cleanup last so cleanup failures are observable on every path.
 pub(crate) fn finalize(
     harness: HarnessName,
     result: &SubprocessResult,
@@ -1509,54 +1254,39 @@ pub(crate) fn finalize(
     merge_cleanup(terminal, cleanup)
 }
 
-/// Crash-orphan registry: one file per live harness process group, so a
+/// The crash-orphan registry stores one file per live harness process group.
 /// replacement host can kill groups a crashed predecessor left behind.
 ///
-/// `pdeathsig` fate-binds only the group leader — provider or extension
-/// descendants survive it and can keep executing a billable request that
-/// the replacement host reports as `missing` (and recovery would refire).
-/// The sweep closes that gap at the only crash-safe point available to an
-/// unprivileged host: the next startup, before any status can be answered.
+/// `pdeathsig` terminates only the group leader; provider and extension descendants can survive it.
+/// Descendants can survive the host and continue executing after the leader exits.
+/// The host sweeps orphaned groups at startup before answering status.
 ///
-/// Kill authority is deliberately narrow. An entry's group is killed only
-/// when the recording host is provably dead AND the group is provably the
-/// recorded one: either the leader still runs with the recorded pid, start
-/// time, and boot id — or the leader is gone but processes remain in its
-/// group, which the kernel's pgid reservation proves are descendants of
-/// the recorded run (a pid in use as a pgid is not reallocated, so a
-/// reissued leader pid conversely proves the whole group is gone). The
-/// remaining TOCTOU — the group emptying between the membership check and
-/// the kill — is the same window every `kill(-pgid)` caller accepts.
+/// The orphan sweep kills an entry's group only when its recording host is dead and the group matches the recorded run.
+/// A group matches its recorded run only if its leader's PID, start time, and boot ID match, or the leader is gone while processes remain in its group.
+/// The group can empty between the membership check and `kill(-pgid)`.
 pub mod group_registry {
     use std::os::unix::fs::MetadataExt;
 
     use super::*;
 
-    /// Reads a process's start time (clock ticks since boot, field 22 of
-    /// `/proc/<pid>/stat`). `Ok(None)` means the pid provably does not
-    /// exist; `Err` means the answer is UNKNOWN (a transient read failure or
-    /// an unreadable stat format) and callers must not guess, because both
-    /// "owner is dead" and "leader is gone" are kill/unlink decisions.
+    /// The Linux `/proc/<pid>/stat` field 22 records a process start time in clock ticks since boot.
+    /// For `/proc/<pid>/stat`, `Ok(None)` means the PID provably does not exist; `Err` means the answer is unknown.
+    /// Callers must not guess on `Err`, because treating the owner or leader as gone can kill a live group or remove its registry entry.
     fn proc_start_time(pid: i32) -> io::Result<Option<u64>> {
         proc_stat_fields(pid).map(|fields| fields.map(|(_, start)| start))
     }
 
-    /// Like [`proc_start_time`], but treats a zombie as dead: a crashed
-    /// host can linger unreaped (same pid, same start time) while its
-    /// supervisor already runs the replacement, and a zombie cannot be
+    /// A zombie counts as dead because an unreaped crashed host can retain its PID and start time.
     /// holding runs.
     fn proc_live_start_time(pid: i32) -> io::Result<Option<u64>> {
         Ok(proc_stat_fields(pid)?.and_then(|(state, start)| (state != 'Z').then_some(start)))
     }
 
-    /// The process state character and start time from `/proc/<pid>/stat`.
-    /// The comm field may contain spaces and parentheses, so everything
-    /// after the LAST ')' is unambiguous: state is the first field there and
-    /// starttime the 20th.
+    /// Parse after the last `)` because `comm` may contain spaces and parentheses.
     fn proc_stat_fields(pid: i32) -> io::Result<Option<(char, u64)>> {
         let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            // The only proof that a pid is gone.
+            // `NotFound` is the only condition treated as proof that the PID is gone.
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
@@ -1575,23 +1305,20 @@ pub mod group_registry {
         Ok(Some((state, start)))
     }
 
-    /// Whether any RUNNABLE process still belongs to process group `pgid`.
-    /// Used only after the group's recorded leader is gone: the kernel
-    /// keeps a pgid reserved while the group has members, so survivors
-    /// found here can only be members of the recorded group. Zombies do
-    /// not count — a dead-but-unreaped member cannot execute work, cannot
-    /// receive a signal, and is reaped by its parent (or init) on its own
-    /// schedule the sweep does not control. A scan that cannot be
-    /// completed is an error, never "no members" — that answer would both
-    /// skip the kill and delete the record proving the orphan exists.
+    /// `group_has_members` checks whether any non-zombie process belongs to PGID `pgid`.
+    /// `group_has_members` runs only after the recorded leader is gone.
+    /// The kernel reserves a PGID while the group has members.
+    /// Any non-zombie process found then belongs to the recorded group.
+    /// Zombies do not count because they cannot execute work.
+    /// A zombie is reaped by its parent or init independently of the sweep.
+    /// A scan that cannot complete returns an error rather than “no members” so the sweep neither skips the kill nor deletes the orphan record.
     pub(crate) fn group_has_members(pgid: i32) -> io::Result<bool> {
         scan_group_members(pgid, None)
     }
 
-    /// Like [`group_has_members`], excluding the group leader itself
-    /// (whose pid equals the pgid): used while the leader is a
-    /// deliberately unreaped zombie, whose `/proc` entry still names the
-    /// pgid. The zombie pins the pgid against reuse but is not a
+    /// Exclude the leader because its unreaped zombie retains the PGID but cannot execute work.
+    /// The deliberately unreaped zombie's `/proc` entry still names the PGID.
+    /// The zombie prevents PGID reuse but cannot execute work.
     /// surviving member.
     pub(crate) fn group_has_other_members(pgid: i32) -> io::Result<bool> {
         scan_group_members(pgid, Some(pgid))
@@ -1609,7 +1336,7 @@ pub mod group_registry {
             if Some(pid) == exclude_pid {
                 continue;
             }
-            // A process that exits mid-scan is simply not a member.
+            // A process that exits mid-scan is not a member.
             match proc_stat_pgrp_state(pid) {
                 Ok(Some((pgrp, state))) if pgrp == pgid && state != 'Z' && state != 'X' => {
                     return Ok(true)
@@ -1622,8 +1349,7 @@ pub mod group_registry {
         Ok(false)
     }
 
-    /// The process group and state of `pid` (fields 5 and 3 of
-    /// `/proc/<pid>/stat`: the third and first fields after comm).
+    /// `/proc/<pid>/stat` stores state and process group as the first and third fields after `comm`.
     fn proc_stat_pgrp_state(pid: i32) -> io::Result<Option<(i32, char)>> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let unreadable = || io::Error::other("unreadable /proc stat format");
@@ -1641,31 +1367,20 @@ pub mod group_registry {
         Ok(Some((pgrp, state)))
     }
 
-    /// The current boot's identity. Fallible on purpose: substituting a
-    /// placeholder would make every existing record compare as a different
-    /// boot, and the sweep would delete them all without checking or
-    /// killing their groups — destroying the evidence AND skipping the kill
-    /// in one step.
+    /// `boot_id` must not use a placeholder, because one would make existing records appear to come from a different boot.
+    /// `sweep` would delete all records without checking or killing their groups if `boot_id` used a placeholder.
     fn boot_id() -> io::Result<String> {
         Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned())
     }
 
-    /// The registry directory, shared by every host incarnation of this
-    /// uid. Pre-existing directories are accepted only when they are a
-    /// real directory we own with no group/world access — the sweep kills
-    /// processes named by these files, so a directory another uid can
-    /// write into would be a kill-by-proxy primitive.
+    /// The registry directory is shared by all host incarnations of the UID.
+    /// The sweep kills groups named by registry files, so another UID must not be able to write the directory.
     ///
-    /// Rooted at a literal `/tmp`, NOT `std::env::temp_dir()`: crash
-    /// ownership is only transferable if every incarnation derives the same
-    /// path, and `temp_dir()` follows `TMPDIR`, so a replacement launched
-    /// with a different environment would sweep an empty registry and let
-    /// recovery refire while the predecessor's descendants still run. A
-    /// per-service private `/tmp` namespace (systemd `PrivateTmp`) is
-    /// still shared by predecessor and successor of that same service,
-    /// which is exactly the scope this needs.
+    /// `registry_dir` uses literal `/tmp` because `TMPDIR` can differ between predecessor and replacement.
+    /// A replacement with a different `TMPDIR` would miss predecessor records, allowing recovery while descendant processes still run.
+    /// `PrivateTmp` shares a service's `/tmp` namespace between predecessor and successor.
     fn registry_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
         let uid = rustix::process::getuid().as_raw();
@@ -1719,19 +1434,14 @@ pub mod group_registry {
         }
     }
 
-    /// A live registry entry. Removal is by `Drop`, so holding one in the
-    /// spawning function's scope covers every exit path — once the group
-    /// is reaped in-process, the crash record must not outlive it.
+    /// Holding `GroupRecord` through spawning removes its file on `Drop` after in-process reaping, so the crash record cannot outlive the group.
     pub struct GroupRecord {
         path: PathBuf,
     }
 
     impl GroupRecord {
-        /// Records `leader_pid`'s group, or `None` when the record cannot be
-        /// written or either process's identity cannot be established. The
-        /// spawner treats `None` as fatal for the run and kills the group
-        /// before delivering the prompt, so no billable work exists without
-        /// a durable record.
+        /// `record` returns `None` if it cannot write the record or establish either process identity.
+        /// The spawner kills the group before delivering the prompt when `record` returns `None`.
         pub fn record(leader_pid: i32) -> Option<Self> {
             let leader_start = proc_start_time(leader_pid).ok().flatten()?;
             let owner_pid = std::process::id() as i32;
@@ -1750,9 +1460,7 @@ pub mod group_registry {
     }
 
     impl GroupRecord {
-        /// Keeps the record on disk instead of removing it: the caller could
-        /// not prove this run's group is gone, so ownership must outlive the
-        /// run and be swept once this host exits.
+        /// The caller retains the record if it cannot prove the group has exited; a later host sweep removes it.
         pub fn retain(self) {
             std::mem::forget(self);
         }
@@ -1764,45 +1472,33 @@ pub mod group_registry {
         }
     }
 
-    /// Kills process groups recorded by dead host incarnations and removes
-    /// their entries; returns how many groups were signalled. Entries whose
-    /// owning host is still alive are left untouched, so concurrent hosts
-    /// (including test processes) never sweep each other's live runs.
+    /// `sweep` kills groups recorded by dead host incarnations and removes their entries.
+    /// `sweep` leaves entries owned by live hosts untouched, so concurrent hosts do not sweep each other's runs.
     ///
-    /// Fails closed on every ambiguity: an unreadable registry, an
-    /// unreadable record, or a `/proc` lookup that cannot answer whether a
-    /// process exists all propagate, and the record is left in place. The
-    /// caller must keep the component unavailable, because both
-    /// alternatives are worse than refusing to start — reading an unknown
-    /// as "no orphan" lets recovery refire a run whose descendant is still
-    /// executing, and unlinking a record after a failed scan destroys the
-    /// only evidence that the orphan exists.
+    /// `sweep` propagates unreadable-registry, unreadable-record, and indeterminate `/proc` lookup errors without removing the record.
+    /// Treating an unknown `/proc` result as "no orphan" can refire a run while its descendant executes.
     pub fn sweep_orphaned_groups() -> io::Result<usize> {
         let dir = registry_dir()?;
         let current_boot = boot_id()?;
         let mut killed = 0;
         for file in fs::read_dir(&dir)? {
             let path = file?.path();
-            // Records are files; the sibling `runs/` tree is swept
-            // separately by `sweep_orphaned_run_dirs`.
+            // Only regular files are registry records; `sweep_orphaned_run_dirs` sweeps `runs/`.
             if !path.is_file() {
                 continue;
             }
             let text = match fs::read_to_string(&path) {
                 Ok(text) => text,
-                // A record removed by its own owner between the listing and
-                // this read is not an error.
+                // `NotFound` means another process removed the record after directory enumeration.
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),
             };
-            // Content that was read successfully but does not parse names no
-            // group and can only be garbage; removing it is safe.
+            // A record that does not parse cannot identify a group.
             let Some(entry) = Entry::parse(&text) else {
                 remove_swept_record(&path)?;
                 continue;
             };
-            // A different boot means every recorded process is gone and
-            // both pids may have been reissued: never kill, just clean up.
+            // A record from a different boot must be removed without signaling because its PIDs may be reused.
             if entry.boot_id != current_boot {
                 remove_swept_record(&path)?;
                 continue;
@@ -1811,16 +1507,13 @@ pub mod group_registry {
                 continue;
             }
             let group_live = match proc_start_time(entry.leader_pid)? {
-                // Same pid and start time: provably the recorded leader.
+                // Matching `leader_pid` and `leader_start` identifies the recorded leader.
                 Some(start) if start == entry.leader_start => true,
-                // The leader's pid was reissued to another process. That is
-                // impossible while the recorded group still has members (a
-                // pid in use as a pgid is not reallocated), so the group is
+                // A reused leader PID proves the recorded group is gone: a PID used as a PGID cannot be reallocated while group members remain.
                 // provably gone.
                 Some(_) => false,
                 // The leader was reaped (pdeathsig kills only the leader).
-                // Members keep the pgid reserved, so any process still in
-                // that group can only be a surviving descendant of the
+                // Surviving members retain the PGID, so they are descendants of the recorded run.
                 // recorded run.
                 None => group_has_members(entry.leader_pid)?,
             };
@@ -1829,23 +1522,12 @@ pub mod group_registry {
                     match rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
                     {
                         Ok(()) => killed += 1,
-                        // The group exited between the membership proof and
-                        // the signal: the expected race, and the outcome the
-                        // sweep wanted. Failing startup over it would strand
-                        // the replacement host on an already-resolved record.
+                        // `SRCH` means the group exited after membership verification; treat it as resolved rather than failing startup.
                         Err(rustix::io::Errno::SRCH) => {}
                         Err(err) => return Err(err.into()),
                     }
                 }
-                // A signalled group is not a resolved group: a member in
-                // uninterruptible kernel state — or one the mixed-credential
-                // group signal could not reach — survives the SIGKILL, and
-                // removing the record here would delete the only evidence
-                // of that work while recovery refires the run beside the
-                // survivor. The record is removed only once membership
-                // provably drains; otherwise the sweep fails and startup
-                // refuses to proceed over an unresolved group, exactly as
-                // it does for an unverifiable scan.
+                // The caller keeps the record after `SIGKILL` until membership drains, because surviving members could otherwise cause recovery to refire the run beside them.
                 if !wait_group_empty_blocking(entry.leader_pid, SWEEP_MEMBER_GRACE)? {
                     return Err(io::Error::other(
                         "a swept group's members could not be confirmed stopped",
@@ -1857,16 +1539,13 @@ pub mod group_registry {
         Ok(killed)
     }
 
-    /// How long the sweep waits for a SIGKILLed group's membership to
-    /// drain. SIGKILL is uncatchable, so members die within milliseconds
-    /// unless wedged in uninterruptible kernel state; the grace only
-    /// bounds that pathological wait before startup fails closed.
+    /// SIGKILL cannot be caught; members in uninterruptible kernel state can delay group removal.
+    /// `SWEEP_MEMBER_GRACE` bounds the wait for uninterruptible members before startup fails closed.
     const SWEEP_MEMBER_GRACE: Duration = Duration::from_secs(5);
 
-    /// Polls [`group_has_members`] until the group is provably empty or
-    /// `budget` elapses. Blocking on purpose: the sweep runs once at
-    /// startup, before any request work exists to starve. Scan errors
-    /// propagate — an unverifiable scan must never read as "empty".
+    /// The startup sweep runs before request work, so `wait_group_empty_blocking` may block until `budget` elapses.
+    /// The startup sweep runs before request work, so blocking cannot starve requests.
+    /// `group_has_members` errors propagate so an unverifiable scan never reads as empty.
     fn wait_group_empty_blocking(pgid: i32, budget: Duration) -> io::Result<bool> {
         let deadline = std::time::Instant::now() + budget;
         loop {
@@ -1880,9 +1559,8 @@ pub mod group_registry {
         }
     }
 
-    /// Removes a record whose group has been resolved. A record already gone
-    /// (a concurrent host's `Drop`) is success; anything else would leave
-    /// the sweep unable to prove it finished.
+    /// `remove_swept_record` treats `NotFound` as success because the record is already absent.
+    /// Any other removal error prevents the sweep from proving that the record was removed.
     fn remove_swept_record(path: &Path) -> io::Result<()> {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -1891,8 +1569,7 @@ pub mod group_registry {
         }
     }
 
-    /// A filename-safe short form of the current boot id, for tagging the
-    /// run directories this host owns.
+    /// `owner_boot_tag` retains the first 16 alphanumeric characters of the boot ID for filename-safe run-directory names.
     pub(crate) fn owner_boot_tag() -> io::Result<String> {
         Ok(boot_id()?
             .chars()
@@ -1901,15 +1578,11 @@ pub mod group_registry {
             .collect())
     }
 
-    /// This host's start time, for tagging the run directories it owns.
     pub(crate) fn owner_start_time() -> io::Result<u64> {
         let owner_pid = std::process::id() as i32;
         proc_start_time(owner_pid)?.ok_or_else(|| io::Error::other("this process has no stat"))
     }
 
-    /// Root for per-run private directories, inside the same private
-    /// per-uid tree as the crash records so a crashed host's sensitive run
-    /// files can be swept by the same startup pass.
     pub fn private_run_root() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
         let root = registry_dir()?.join("runs");
@@ -1927,17 +1600,11 @@ pub mod group_registry {
         Ok(root)
     }
 
-    /// Removes per-run private directories left behind by dead hosts, and
-    /// returns how many were removed. A crash skips `PrivateDir`'s cleanup
-    /// and its `Drop`, so a run's hidden prompt and transcript would
-    /// otherwise stay on disk indefinitely and accumulate across crashes
+    /// `sweep_orphaned_run_dirs` removes a directory only after proving that its recorded owner is gone.
     /// (R17/R19).
     ///
-    /// A directory is removed only when its recorded owner is provably gone,
-    /// by the same pid-plus-start-time proof the group sweep uses, so a
-    /// concurrent host's live run directories are never touched. Fails
-    /// closed for the same reason: deleting a live run's private files
-    /// would break the run, and leaving an unverifiable one is a bounded
+    /// The sweep uses the recorded PID and start time to avoid deleting a live owner's directory.
+    /// The sweep leaves unverifiable directories in place because deleting a live run's private files would break that run.
     /// disk cost.
     pub fn sweep_orphaned_run_dirs() -> io::Result<usize> {
         let root = private_run_root()?;
@@ -1948,8 +1615,6 @@ pub mod group_registry {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            // `<prefix>-<owner boot>-<owner pid>-<owner start>-<nonce>`: the
-            // owner identity is the last four fields.
             let mut fields = name.rsplitn(5, '-');
             let (Some(_nonce), Some(start), Some(pid), Some(boot)) =
                 (fields.next(), fields.next(), fields.next(), fields.next())
@@ -1959,18 +1624,11 @@ pub mod group_registry {
             let (Ok(pid), Ok(start)) = (pid.parse::<i32>(), start.parse::<u64>()) else {
                 continue;
             };
-            // A different boot is unconditionally stale: pid and start ticks
-            // are both measured per boot, so on a `/tmp` that survives a
-            // reboot the successor can land on the same pair and mistake the
-            // previous incarnation for itself — keeping a directory holding
-            // the old run's prompt and OpenCode database.
             if boot != current_boot {
                 remove_run_dir(&path, &mut removed)?;
                 continue;
             }
-            // Zombie owners count as dead, exactly as in the group sweep: a
-            // crashed host can linger unreaped with its pid and start time
-            // intact, and it cannot be using these files.
+            // Treat zombie owners as dead because they cannot use these files.
             if proc_live_start_time(pid)? == Some(start) {
                 continue;
             }
@@ -1979,8 +1637,6 @@ pub mod group_registry {
         Ok(removed)
     }
 
-    /// Removes one stale run directory. A directory already gone (a
-    /// concurrent sweep, or its owner's own cleanup) is success.
     fn remove_run_dir(path: &Path, removed: &mut usize) -> io::Result<()> {
         match fs::remove_dir_all(path) {
             Ok(()) => {

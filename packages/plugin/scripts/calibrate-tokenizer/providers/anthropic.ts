@@ -1,10 +1,5 @@
 /**
- * Anthropic backend: hits the official `/v1/messages/count_tokens` endpoint
- * which returns deterministic input_tokens for a given request body without
- * actually running inference. Free, fast, exact.
  *
- * Uses the OAuth access token from auth.json with the same beta headers
- * OpenCode/Claude Code use, so OAuth-only models work.
  */
 
 interface ModelTest {
@@ -64,8 +59,6 @@ export async function measureAnthropic(
     }
     const access = auth.access;
 
-    // System-only request: keep system prompt as one big text block (single block
-    // so per-block overhead doesn't dominate; matches what the plugin renders).
     const systemBody = {
         model: test.modelId,
         system: systemText,
@@ -81,8 +74,6 @@ export async function measureAnthropic(
     };
     const toolsApi = await callCountTokens(toolsBody, access);
 
-    // Subtract baseline (~9 tokens for the {role:user,content:"x"} envelope plus
-    // the floor) so the returned numbers reflect just the system / tools content.
     const baselineBody = {
         model: test.modelId,
         messages: [{ role: "user", content: "x" }],

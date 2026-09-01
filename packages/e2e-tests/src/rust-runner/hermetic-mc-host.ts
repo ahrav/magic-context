@@ -1,4 +1,4 @@
-/** Direct mc-host fixture stack for Rust-mode E2E tests. */
+/* */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
@@ -111,9 +111,8 @@ function processExecutable(pid: number): string | null {
 }
 
 /**
- * Report whether a process is stopped, from the state field of
- * `/proc/<pid>/stat`: `T` is stopped, any other state is running. `null` means
- * no state is observable — the process is gone, or the system has no `/proc`.
+ * `T` is stopped; every other state is not stopped.
+ * `null` means `/proc/<pid>/stat` was unavailable or lacked a state field.
  */
 function processStopped(pid: number): boolean | null {
     let stat: string;
@@ -122,8 +121,8 @@ function processStopped(pid: number): boolean | null {
     } catch {
         return null;
     }
-    // The comm field is parenthesized and may itself contain spaces and
-    // parentheses, so the state field is the first token after the LAST ")".
+    // The parenthesized `comm` field can contain spaces and parentheses.
+    // The state field is the first token after the last `)`.
     const state = stat
         .slice(stat.lastIndexOf(")") + 1)
         .trim()
@@ -132,14 +131,13 @@ function processStopped(pid: number): boolean | null {
 }
 
 /**
- * Wait until the process reaches the state a just-sent SIGSTOP or SIGCONT
- * produces. Signal delivery is asynchronous, so a request issued straight after
- * `kill` can outrun it and exercise the wrong path.
+ * `waitForProcessState` polls for the expected state after SIGSTOP or SIGCONT.
+ * Signal delivery is asynchronous.
+ * A state read immediately after `kill` can observe the previous process state.
  *
- * An elapsed window resolves rather than throwing: a drill asserts the module's
- * behavior while the host is paused, and failing it because this confirmation
- * ran out of time would report the harness instead of the mechanism. An
- * unobservable state resolves for the same reason.
+ * The timeout resolves so a state-confirmation failure does not mask the drill result.
+ * Timing out while confirming the process state would report a harness failure instead of a mechanism failure.
+ * The function resolves when the process state is unobservable so a harness failure does not mask the drill result.
  */
 async function waitForProcessState(
     pid: number,
@@ -215,11 +213,10 @@ function reapRecordedRustProcesses(): void {
                 try {
                     process.kill(entry.pid, "SIGKILL");
                 } catch {
-                    // Process exited after identity check.
                 }
             }
         } catch {
-            // Partial records prove no process identity.
+            // Malformed or unreadable records provide no usable process identity.
         } finally {
             if (stale) rmSync(pidPath, { force: true });
         }
@@ -233,11 +230,8 @@ export function detectRustModePrereqs(releaseRoot?: VerifiedReleaseRoot): RustMo
             skipReason: "direct mc-host fixture requires Unix sockets",
         };
     }
-    // The fixture always links `BrocaComponent`, and its `initialize` refuses
-    // every non-Linux target because crash-ownership records and sweeps read
-    // `/proc` process identity. Excluding only Windows let a macOS runner report
-    // the prerequisites as met, build the fixture, and then fail during startup
-    // instead of taking the skip path this check exists to provide.
+    // `BrocaComponent.initialize` rejects non-Linux targets because crash-ownership records and sweeps read `/proc` process identity.
+    // `BrocaComponent.initialize` rejects non-Linux targets because crash-ownership records and sweeps read `/proc` process identity.
     if (process.platform !== "linux") {
         return {
             ok: false,
@@ -265,13 +259,9 @@ export function detectRustModePrereqs(releaseRoot?: VerifiedReleaseRoot): RustMo
     if (cargo.error || cargo.status !== 0) {
         return { ok: false, skipReason: "cargo is not available on PATH" };
     }
-    // A present `Cargo.toml` and a working `cargo` do not make the fixture
-    // buildable: the workspace has mandatory `../commons` path dependencies, so a
-    // checkout without that sibling resolves nothing. Without this, such a
-    // checkout reported the prerequisites as met, bypassed every suite's `skipIf`,
-    // and failed inside `buildDirectHostFixture` instead of skipping. `cargo
-    // metadata` resolves the whole workspace and names the target we build, which
-    // is what `scripts/check-rust-prerequisites.ts` already does.
+    // `Cargo.toml` and `cargo` are insufficient because the workspace requires `../commons` path dependencies.
+    // A checkout without the `../commons` sibling cannot resolve the workspace.
+    // `cargo metadata` resolves the whole workspace and identifies the target to build.
     const metadata = spawnSync(
         "cargo",
         [
@@ -337,7 +327,7 @@ function runCargo(args: string[]): Promise<{ ok: boolean; stderr: string }> {
     });
 }
 
-/** Build U5 fixture once per Bun process. Cargo handles cross-process incremental caching. */
+/** The module caches the U5 fixture per Bun process; Cargo caches builds across processes. */
 export function buildDirectHostFixture(releaseRoot?: VerifiedReleaseRoot): Promise<string> {
     if (releaseRoot) return Promise.resolve(releaseRootPath(releaseRoot, "rustHost"));
     if (fixtureBuild) return fixtureBuild;
@@ -701,13 +691,13 @@ class FixtureControlClient {
 }
 
 export interface HermeticMcHostOptions {
-    /** OpenCode XDG data root. Fixture and module store live beneath this owner-only directory. */
+    /** The fixture and module store use the owner-only OpenCode XDG data root. */
     dataDir: string;
     fixtureBin: string;
     startTimeoutMs?: number;
 }
 
-/** Running U5 direct-host fixture. No provider or module subprocess exists. */
+/** The U5 direct-host fixture starts no provider or module subprocess. */
 export class HermeticMcHostStack {
     readonly connectionFile: string;
     readonly controlPath: string;
@@ -749,8 +739,8 @@ export class HermeticMcHostStack {
             return stack;
         } catch (error) {
             // stop() throws when the child survives its teardown escalation.
-            // Discarding that keeps the startup cause as the thrown error;
-            // the surviving child stays reachable through its PID record.
+            // The startup path ignores teardown errors so it rethrows the startup failure.
+            // The PID record retains the surviving child's PID for reaping.
             await stack.stop().catch(() => undefined);
             throw error;
         }
@@ -817,7 +807,6 @@ export class HermeticMcHostStack {
         try {
             file = readFileSync(this.logPath, "utf8").slice(-MAX_LOG_BYTES);
         } catch {
-            // Log file is optional.
         }
         return `${this.stdout}${this.stderr}${file}`.slice(-MAX_LOG_BYTES);
     }
@@ -882,16 +871,12 @@ export class HermeticMcHostStack {
     }
 
     /**
-     * Graceful JSONL shutdown, then SIGTERM fallback. Always await exit;
-     * isolated state is removed only once the child is gone.
+     * The teardown removes isolated state only after the child exits.
      */
     async stop(): Promise<void> {
         await this.closeStatusClient();
         const child = this.child;
-        // A child whose spawn failed has no pid while both exit fields stay
-        // null: there is no process to signal, so treating it as live burns
-        // every escalation window and then preserves the data tree for a
-        // reaper that has no pid record to act on.
+        // A spawn failure leaves no PID to signal; treating it as live would exhaust every escalation timeout and preserve data the reaper cannot associate with a process.
         let exited =
             child === null ||
             child.pid === undefined ||
@@ -902,7 +887,6 @@ export class HermeticMcHostStack {
             try {
                 await this.control?.gracefulShutdown();
             } catch {
-                // Fixture may already be unavailable.
             }
             exited = await waitForChildExit(child, 5_000);
             if (!exited) {
@@ -918,9 +902,7 @@ export class HermeticMcHostStack {
         this.control = null;
         this.child = null;
         if (!exited) {
-            // The surviving child's PID record lives inside dataDir, so both
-            // stay on disk past this failed teardown: that record is the only
-            // identity the next run's reaper has for killing the leaked child.
+            // A surviving child's PID record remains in `dataDir` after failed teardown so the next run's reaper can identify and kill it.
             throw new Error(
                 "direct mc-host fixture did not exit during teardown",
             );
@@ -1036,11 +1018,7 @@ export class HermeticMcHostStack {
         verifyPublication(this.controlPath, 0o600);
         verifyPublication(this.connectionFile, 0o600);
 
-        // The control socket and the client-visible catalog probe use unrelated
-        // sockets and share no data, so both handshakes run at once. A control
-        // client that connects is adopted even when the probe fails, which
-        // keeps teardown on its graceful-shutdown path, and a control failure
-        // takes precedence over a probe failure.
+        // The control socket and catalog probe use independent sockets, so their handshakes run concurrently.
         const control = new FixtureControlClient(this.controlPath);
         const [connected, probed] = await Promise.allSettled([
             control.connect(),
@@ -1051,7 +1029,7 @@ export class HermeticMcHostStack {
         if (probed.status === "rejected") throw probed.reason;
     }
 
-    /** Prove the client-visible path: connection-file read, auth handshake, catalog over the real wire. */
+    /* */
     private async probeCatalog(): Promise<void> {
         const probe = await McHostClient.connect({
             connectionFile: this.connectionFile,
@@ -1071,11 +1049,6 @@ export class HermeticMcHostStack {
     }
 
     /**
-     * Continue a live child before signalling teardown. A SIGSTOPped fixture
-     * runs no graceful shutdown and holds SIGTERM pending until it resumes, so
-     * every teardown path burns its full timeout without this. SIGCONT to a
-     * running process has no effect, which is why the resume stays
-     * unconditional instead of tracking paused state.
      */
     private resumeBeforeTeardown(child: ChildProcess): void {
         if (child.exitCode === null && child.signalCode === null)
@@ -1089,11 +1062,8 @@ export class HermeticMcHostStack {
     }
 
     /**
-     * Reuse one status client, coalescing concurrent connects on the in-flight
-     * attempt. Assigning the field only after the connect resolves lets two
-     * callers each establish a client and strand the one whose assignment is
-     * overwritten, so followers await the leader's attempt instead. A failed
-     * attempt clears the stored promise, leaving the next call free to retry.
+     * The fixture reuses one status client and coalesces concurrent connections onto the in-flight attempt.
+     * The `statusClientPromise` check prevents concurrent callers from creating clients before `statusClient` is assigned.
      */
     private async ensureStatusClient(
         identity: BindIdentity,
@@ -1119,8 +1089,6 @@ export class HermeticMcHostStack {
     }
 
     private async closeStatusClient(): Promise<void> {
-        // An in-flight connect publishes its client on resolution, so teardown
-        // settles that attempt first rather than stranding its socket.
         const connecting = this.statusClientPromise;
         this.statusClientPromise = null;
         if (connecting) await connecting.catch(() => undefined);
@@ -1157,7 +1125,6 @@ export class HermeticMcHostStack {
                 } satisfies RustE2ePidFile),
             );
         } catch {
-            // PID file is cleanup safety net only.
         }
     }
 }
@@ -1169,7 +1136,6 @@ export const __hermeticMcHostTest = {
         stderr: string;
         retainedLog: string;
     } {
-        // SAFETY: This module guarantees that stack has stdout, stderr, and logPath diagnostic fields.
         const internal = stack as unknown as {
             stdout: string;
             stderr: string;
@@ -1179,7 +1145,6 @@ export const __hermeticMcHostTest = {
         try {
             retainedLog = readFileSync(internal.logPath, "utf8").slice(-MAX_LOG_BYTES);
         } catch {
-            // Retained fixture log is optional.
         }
         return { stdout: internal.stdout, stderr: internal.stderr, retainedLog };
     },

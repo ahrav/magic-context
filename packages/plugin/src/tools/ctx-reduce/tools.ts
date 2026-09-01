@@ -41,9 +41,7 @@ const ctxReduceArgsShape = {
         .optional()
         .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
 };
-// The tool definition exposes only the documented argument shape to the model
-// provider, but older callers may still send extra arguments. Parse with
-// passthrough so execute() can receive those fields without advertising them.
+// Accepts fields outside ctxReduceArgsShape.
 const ctxReduceArgsSchema = tool.schema.object(ctxReduceArgsShape).passthrough();
 
 function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
@@ -122,9 +120,6 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                     if (queued <= 0) {
                         return "All requested tags were already queued or processed. No new action is needed.";
                     }
-                    // The module owns range parsing and tag canonicalization. Keep the
-                    // existing queued acknowledgement shape without reimplementing that
-                    // parsing in the OpenCode tool.
                     return `Queued: drop ${formatRawDropForAck(args.drop)}.`;
                 } catch (error) {
                     return `Error: Failed to queue ctx_reduce operations. ${getErrorMessage(error)}`;

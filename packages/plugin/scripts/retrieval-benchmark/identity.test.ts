@@ -111,8 +111,7 @@ describe("resolveRankedLocators", () => {
             "duplicate",
             "duplicate",
         ]);
-        // One-based ranks: reciprocal rank and nDCG discounts consume the
-        // field directly, so the first result must be rank 1, never 0.
+        // Ranks are one-based because reciprocal rank and nDCG consume them directly.
         expect(resolved.map((r) => r.rank)).toEqual([1, 2, 3, 4]);
         const ids = new Set(
             resolved.map((r) => (r.status === "unresolved" ? "" : r.canonicalId)),

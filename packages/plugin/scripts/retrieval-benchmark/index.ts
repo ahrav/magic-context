@@ -1,11 +1,9 @@
 /**
- * Pure storage-independent facade for the judged retrieval corpus.
  *
- * The only entry point U5 may import. Loads reviewed immutable releases,
- * resolves scenario-scoped physical locators onto canonical relevance
- * identities, keeps unjudged distinct from nonrelevant, and iterates
- * deterministic synthetic scale corpora. No database, recovery, or promotion
- * code is reachable from this module.
+ * This module resolves scenario-scoped locators to canonical relevance identities.
+ * This module preserves unjudged results separately from nonrelevant results.
+ * This module iterates deterministic synthetic-scale corpora.
+ * This module cannot reach database, recovery, or promotion code.
  */
 
 import { lstatSync, readdirSync } from "node:fs";
@@ -86,7 +84,7 @@ export interface ReviewedRelease {
     syntheticProfiles: SyntheticProfilesArtifact;
     manifest: ManifestArtifact;
     aliasIndex: AliasIndex;
-    /** Recomputed (not declared) artifact fingerprints. */
+    /** The loader recomputes these artifact fingerprints instead of trusting declared values. */
     fingerprints: {
         corpus: string;
         judgments: string;
@@ -110,24 +108,20 @@ function readJson(dir: string, name: string): unknown {
 }
 
 /**
- * Load one reviewed release directory, failing closed before any scoring or
- * timing consumer can see inconsistent data: privacy scan first (so no later
- * diagnostic can echo rejected content), then strict schemas, recomputed
- * fingerprints against the approved release tuple, current privacy policy and
- * sanitizer versions, approvals bound to the exact tuple, and referential and
+ * The loader fails closed before scoring consumers receive inconsistent data.
+ * The loader scans privacy before parsing so diagnostics cannot echo rejected content.
+ * The loader validates strict schemas and recomputes fingerprints against the approved release tuple.
+ * The loader checks the current privacy-policy and sanitizer versions and binds approvals to the exact tuple.
+ * The loader validates referential and partition integrity.
  * partition integrity.
  *
- * `forbiddenTokens` is an optional operator deny list (project codenames,
- * customer names) applied on top of the pattern gates. It is optional here
- * because the tokens are themselves sensitive: they cannot ship inside the
- * repository or the release, so a loader without access to the list must
- * still be able to validate the fingerprinted bytes deterministically.
+ * `forbiddenTokens` is an optional operator deny list applied in addition to the pattern gates.
+ * A loader without the list can validate the fingerprinted bytes deterministically.
  */
-/** Every entry in a reviewed release directory must be one of the four
- *  reviewed artifacts, as a regular file: an extra file (a raw recovery
- *  draft, say) would live under the approved version directory without ever
- *  passing the privacy or approval boundary. Diagnostics carry counts, not
- *  names — an unexpected filename is itself unreviewed content. */
+/**
+ * Every release-directory entry must be a reviewed regular artifact; extra files bypass privacy and approval validation.
+ * An unreviewed draft could otherwise remain in the approved version directory without passing privacy or approval validation.
+ * */
 function checkReleaseEntries(releaseDir: string): void {
     let entries: string[];
     try {
@@ -153,10 +147,10 @@ export function loadReviewedRelease(
     options: {
         forbiddenTokens?: readonly string[];
         forbiddenIdentifiers?: readonly string[];
-        /** Trust anchor from OUTSIDE the release directory (reviewed source,
-         *  CI config): the recomputed manifest fingerprint must match, which
-         *  binds the approval records themselves — a release directory is
-         *  otherwise self-consistent under fabricated approvals. */
+        /** The caller provides the trust anchor outside the release directory.
+         * The recomputed manifest fingerprint must match the externally trusted fingerprint.
+         * Matching the trusted manifest fingerprint binds the approval records.
+         * */
         expectedManifestFingerprint?: string;
     } = {},
 ): ReviewedRelease {
@@ -166,8 +160,7 @@ export function loadReviewedRelease(
     const syntheticRaw = readJson(releaseDir, RELEASE_FILES.syntheticProfiles);
     const manifestRaw = readJson(releaseDir, RELEASE_FILES.manifest);
 
-    // The privacy gate runs before any parse or cross-artifact validation:
-    // no later diagnostic can echo content the scan would have rejected.
+    // The privacy gate runs before parsing and cross-artifact validation.
     const violations = scanForSensitiveContent(
         {
             corpus: corpusRaw,
@@ -204,10 +197,9 @@ export function loadReviewedRelease(
     if (fingerprints.syntheticProfiles !== tuple.syntheticProfilesFingerprint) {
         diagnostics.push("release.synthetic-profiles: fingerprint-mismatch");
     }
-    // The tuple binds the three artifacts, and approvals bind to the tuple —
-    // but nothing inside the directory can authenticate the approvals
-    // themselves. When the caller supplies a trusted manifest fingerprint,
-    // the whole manifest (approval records included) must match it.
+    // The release tuple binds the three artifacts, and approvals bind to that tuple.
+    // Nothing inside the directory can authenticate the approval records.
+    // The manifest, including approval records, must match the trusted fingerprint.
     if (
         options.expectedManifestFingerprint !== undefined &&
         fingerprints.manifest !== options.expectedManifestFingerprint
@@ -225,9 +217,6 @@ export function loadReviewedRelease(
     const corpus = parseCorpus(corpusRaw);
     const judgments = parseJudgments(judgmentsRaw);
     const syntheticProfiles = parseSyntheticProfiles(syntheticRaw);
-    // Generator invariants are enforced at load, not first iteration: a
-    // release with an unusable profile must reject here rather than pass
-    // review and then fail hours into a scale run.
     const profileDiagnostics: string[] = [];
     for (const [i, profile] of syntheticProfiles.profiles.entries()) {
         try {
@@ -259,9 +248,6 @@ export interface JudgmentLookup {
 }
 
 /**
- * Judgment lookup with an explicit unjudged state: a pair outside the
- * recorded pool is UNJUDGED, never grade 0 (validateRelease already
- * guarantees every pooled pair carries a grade).
  */
 export function buildJudgmentLookup(judgments: JudgmentsArtifact): JudgmentLookup {
     const grades = new Map<string, 0 | 1 | 2>();

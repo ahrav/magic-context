@@ -1,52 +1,37 @@
 /// <reference types="bun-types" />
 
 /**
- * Context-overflow recovery (issue #32 regression test).
  *
- * Scenario: a model with a MISDETECTED context limit — the plugin (and
- * everything downstream) believes the model has a 128K window, but the real
- * provider limit is 120K. This is the exact trap from issue #32 where
- * `lemonade/GLM-4.7-Flash-GGUF` (a local GGUF model) is not in models.dev,
- * so `resolveContextLimit()` falls back to the 128K default while the real
- * runtime limit is smaller.
+ * The plugin and downstream components use a misdetected 128K context limit.
+ * The test reproduces a configured limit that exceeds the provider limit.
+ * `lemonade/GLM-4.7-Flash-GGUF` is a local GGUF model absent from models.dev.
+ * `resolveContextLimit()` falls back to the 128K default.
+ * The provider runtime limit is smaller than 128K.
  *
- * ## What this verifies (end-to-end)
  *
- * 1. **Detection** — When the provider returns an overflow error, the plugin
- *    parses it against the shared overflow pattern set and records:
- *       - `session_meta.needs_emergency_recovery = 1`
- *       - `session_meta.detected_context_limit = <real limit parsed from error>`
+ * The plugin parses provider overflow errors with the shared overflow patterns.
+ * The plugin sets `session_meta.needs_emergency_recovery` to `1`.
+ * The plugin stores the limit parsed from the error in `session_meta.detected_context_limit`.
  *
- * 2. **Pressure correction** — The very next transform pass resolves context
- *    limit from `session_meta.detected_context_limit` (the persisted real
- *    limit) instead of the models.dev / default fallback, so pressure math
- *    finally reflects reality.
+ * The next transform resolves its context limit from `session_meta.detected_context_limit`.
+ * `session_meta.detected_context_limit` persists the provider's parsed context limit.
+ * Pressure calculations stop using the models.dev/default fallback after detection.
+ * Pressure calculations use the detected provider limit.
  *
- * 3. **Recovery** — The emergency recovery flag forces the percentage to 95%
- *    even if the model's self-reported usage still looks low, which fires
- *    the existing 95% emergency path (abort + historian + aggressive drops).
- *    NOTE: recovery runs on a transform pass AFTER detection. On opencode
- *    <=1.15 an overflow triggered in-turn compaction (a second pass same
- *    turn), so recovery completed same-turn. On opencode >=1.16 (commit
- *    7e09660c3, "respect disabled auto compaction on overflow") a session
- *    with `compaction.auto:false` — the Magic Context default — errors the
- *    turn and goes idle with NO in-turn second pass, so recovery fires on
- *    the user's NEXT prompt. The plugin is correct in both cases; this test
- *    drives a follow-up turn and asserts on persisted state so it is
+ * `needs_emergency_recovery` forces pressure to 95%.
+ * The forced 95% pressure overrides low self-reported usage.
+ * At 95%, the emergency path aborts, invokes historian, and drops context.
+ * Recovery runs on the transform pass after detection.
+ * OpenCode <=1.15 runs a second in-turn compaction pass after overflow.
+ * OpenCode <=1.15 can complete recovery in the same turn.
+ * OpenCode >=1.16 runs recovery on a follow-up turn.
+ * The test drives a follow-up turn and asserts persisted state to support both OpenCode behaviors.
  *    version-agnostic.
  *
- * 4. **Completion** — When historian successfully publishes a compartment,
- *    the recovery flag is cleared so future turns aren't stuck at 95%.
- *    `detected_context_limit` remains — it's the authoritative real limit
- *    and remains valuable for future pressure math.
+ * When historian publishes a compartment, it clears the recovery flag.
+ * Clearing `needs_emergency_recovery` prevents future turns from remaining at 95% pressure.
  *
- * ## Why this is an e2e test, not a unit test
  *
- * Unit tests already cover the pattern matcher, storage helpers, and the
- * `resolveContextLimit` session-override path individually. What this test
- * verifies is the integration: that the `session.error` event from OpenCode
- * actually reaches our handler, the persisted state is actually read by the
- * next transform, and the historian actually clears the flag.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -63,10 +48,7 @@ interface SessionMetaRow {
 let h: TestHarness;
 
 beforeAll(async () => {
-    // modelContextLimit is what the plugin *believes* — the default. The
-    // mock provider then tells it the real limit is smaller via the overflow
-    // error (matching the issue #32 scenario where lemonade accepts the
-    // request at the plugin's default 128k but rejects somewhere under that).
+    // The provider can accept the configured limit but enforce a smaller actual limit.
     h = await TestHarness.create({
         modelContextLimit: 128_000,
         magicContextConfig: {
@@ -85,8 +67,6 @@ describe("context overflow recovery", () => {
         async () => {
             h.mock.reset();
 
-            // Phase 1: answer main-agent turns normally so we have some
-            // history to compartmentalize before overflow hits.
             let mainCalls = 0;
             let mainShouldOverflow = false;
             let historianCalls = 0;
@@ -94,20 +74,14 @@ describe("context overflow recovery", () => {
                 if (isHistorianRequest(body)) return null;
                 mainCalls++;
 
-                // On the Nth main request, return a context-overflow error
-                // with a reported real limit of 120000. This mimics
-                // lemonade/LMStudio-style errors — non-SSE JSON body with an
-                // Anthropic-shaped error envelope and a message string that
-                // matches the overflow regex set and carries the real limit.
                 if (mainShouldOverflow) {
                     mainShouldOverflow = false;
                     return {
                         error: {
                             status: 400,
                             type: "invalid_request_error",
-                            // Matches the Groq pattern:
-                            //   /reduce the length of the messages/i
-                            // and the extractor pulls out 120000 as the real limit.
+                            // The error message must match `/reduce the length of the messages/i`.
+                            // The extractor reads 120000 as the context limit.
                             message:
                                 "This model's maximum context length is 120000 tokens. Please reduce the length of the messages.",
                         },
@@ -151,8 +125,7 @@ describe("context overflow recovery", () => {
 
             const sessionId = await h.createSession();
 
-            // Build a few turns of history so historian has something to
-            // compartmentalize once triggered.
+            // Historian needs history to compartmentalize.
             for (let i = 1; i <= 6; i++) {
                 await h.sendPrompt(sessionId, `user turn ${i}: some work ${h.ballast(2_000)}`, {
                     timeoutMs: 30_000,
@@ -169,42 +142,27 @@ describe("context overflow recovery", () => {
                 return row ?? { needs_emergency_recovery: null, detected_context_limit: null };
             };
 
-            // Baseline: no overflow state yet.
             const before = readState();
             expect(before.needs_emergency_recovery ?? 0).toBe(0);
             expect(before.detected_context_limit).toBeFalsy();
 
             const historianBeforeOverflow = historianCalls;
 
-            // Flip the switch: the next main request will return a context-overflow
-            // error from the provider.
             mainShouldOverflow = true;
 
-            // Fire the turn that will overflow. The provider returns 400, so the
-            // SDK throws. What opencode does next depends on its version:
-            //   - opencode <=1.15: an overflow set `needsCompaction`, which ran
-            //     opencode's compaction flow IN-TURN — producing a second
-            //     transform pass on which our recovery fired same-turn.
-            //   - opencode >=1.16 (commit 7e09660c3, "respect disabled auto
-            //     compaction on overflow"): with `compaction.auto:false` (what
-            //     every Magic Context user sets), opencode now errors the turn
-            //     and goes idle — NO in-turn compaction, no second transform
-            //     pass. Recovery therefore fires on the user's NEXT prompt.
-            // Either way, DETECTION happens on this turn via the session.error
-            // event; RECOVERY may be deferred to the next turn. The test asserts
-            // detection here, then drives a follow-up turn and asserts recovery —
-            // version-agnostic across both behaviors.
+            // A 400 response causes the SDK call to throw.
+            // with `compaction.auto:false`, OpenCode errors the turn and goes idle with no in-turn compaction or second transform pass.
+            // Recovery can run during the failing turn or on the next prompt.
+            // The `session.error` event detects overflow on the failing turn.
             try {
                 await h.sendPrompt(sessionId, "user turn that will overflow", {
                     timeoutMs: 30_000,
                 });
             } catch {
-                // expected — provider returned 400
+                // The provider returns 400 for this prompt.
             }
 
-            // Detection must persist on the overflow turn itself (the session.error
-            // handler records the real limit + arms recovery), independent of when
-            // the recovery historian actually runs.
+            // The `session.error` handler persists the real limit and arms recovery on the overflow turn, regardless of when historian recovery runs.
             const afterOverflow = await h.waitFor(
                 () => {
                     const s = readState();
@@ -224,58 +182,34 @@ describe("context overflow recovery", () => {
             const mainCallsBeforeFollowup = mainCalls;
 
             if (process.env.MC_E2E_MODE === "rust") {
-                // Rust delegates the transform/recovery ladder to McHandler rather
-                // than the OpenCode-only fail-closed request sequencing below.
-                // Its successful historian fold is also unavailable without the
-                // hermetic Broca runner, so retain the shared overflow-detection
-                // assertion and report the excluded completion contract.
+                // Rust delegates the transform/recovery ladder to `McHandler` instead of using OpenCode's fail-closed request sequencing.
+                // Rust requires the hermetic Broca runner for a successful historian fold.
                 console.log(`[rust-e2e] overflow recovery mock-capture assertions SKIPPED: ${FOLD_SKIP_REASON}`);
                 expect(afterOverflow.detected_context_limit).toBe(120000);
                 return;
             }
 
-            // Drive the recovery turn. On opencode >=1.16 this is the pass that
-            // bumps to 95% and fires the emergency historian; on <=1.15 recovery
-            // already completed in-turn and this is just a normal follow-up (the
-            // waitFor below still passes because the flag is already cleared and
-            // the historian already ran). The follow-up prompt itself may succeed
-            // or throw depending on timing — either is fine; we assert on state.
+            // On OpenCode >=1.16, the follow-up triggers the 95% emergency-historian pass.
+            // On OpenCode <=1.15, recovery completes during the overflow turn.
+            // `sendPrompt` may resolve or reject; persisted state determines recovery.
             try {
                 await h.sendPrompt(sessionId, "follow-up turn that drives recovery", {
                     timeoutMs: 30_000,
                 });
             } catch {
-                // tolerated — recovery is asserted via persisted state, not the
-                // prompt's own resolution.
             }
             if (recoveryWasPendingBeforeFollowup) {
                 const recoveryStillPending = (readState().needs_emergency_recovery ?? 0) === 1;
                 if (recoveryStillPending) {
-                    // The historian did not publish, so the prompt is still the
-                    // doomed shape: the fail-closed transform must interrupt the
-                    // run before OpenCode emits another main-model request.
-                    // Historian traffic is counted separately by the matcher above.
+                    // While `needs_emergency_recovery === 1`, the fail-closed transform must interrupt the run.
+                    // The fail-closed transform must interrupt before OpenCode emits another main-model request.
                     expect(mainCalls).toBe(mainCallsBeforeFollowup);
                 }
-                // Otherwise the recovery pass force-fired the historian, blocked
-                // until it published, and the fold materialized in that same pass
-                // — the prompt is compacted and no longer doomed, so the
-                // fail-closed gate deliberately lets the request proceed
-                // (aborting after a successful in-pass fold would interrupt a
-                // healthy request). Main-model calls advancing is the success
-                // path here; the end-state assertions below prove the recovery
-                // actually completed rather than leaked.
+                // A successful follow-up recovery pass force-fires and waits for the historian.
+                // The recovery pass waits for historian publication before the fold materializes.
             }
 
-            // Wait for the recovery cycle to complete. End state evidence:
-            //   - detected_context_limit persisted (proves detection worked)
-            //   - needs_emergency_recovery cleared to 0 (proves historian ran
-            //     the recovery path to completion — clearEmergencyRecovery
-            //     only fires inside the successful-publication transaction)
-            //   - at least one compartment was written (proves historian
-            //     published, not just attempted)
-            //   - at least one new historian HTTP request was received
-            //     (proves the emergency path triggered the historian)
+            // `h.countCompartments(sessionId) >= 1` confirms publication rather than only an attempt.
             let afterRecovery: SessionMetaRow;
             try {
                 afterRecovery = await h.waitFor(
@@ -304,7 +238,6 @@ describe("context overflow recovery", () => {
                 );
             }
 
-            // Final state assertions — documents the intended post-recovery shape.
             expect(afterRecovery.detected_context_limit).toBe(120000);
             expect(afterRecovery.needs_emergency_recovery).toBe(0);
             expect(h.countCompartments(sessionId)).toBeGreaterThanOrEqual(1);
@@ -336,7 +269,6 @@ describe("context overflow recovery", () => {
                 // expected
             }
 
-            // Give the event bus time to deliver.
             await Bun.sleep(1_500);
 
             const ctx = h.contextDb();
@@ -346,8 +278,6 @@ describe("context overflow recovery", () => {
                 )
                 .get(sessionId) as SessionMetaRow | undefined;
 
-            // Rate-limit errors must NOT trigger recovery. This guards against
-            // an overly broad pattern match in overflow-detection.ts.
             expect(row?.needs_emergency_recovery ?? 0).toBe(0);
             expect(row?.detected_context_limit ?? null).toBeFalsy();
         },

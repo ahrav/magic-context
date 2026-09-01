@@ -51,8 +51,7 @@ describe("parseCorpus", () => {
     });
 
     it("rejects queries production search cannot execute as written", () => {
-        // Whitespace-only explicit query: schema-valid, but production trims
-        // it to nothing.
+        // Production trims whitespace-only explicit queries to empty strings despite schema validity.
         const blank = corpusJson();
         (blank.queries as Record<string, unknown>[])[0].queryText = "   ";
         expect(diagnosticsOf(() => parseCorpus(blank))).toContain(
@@ -64,8 +63,7 @@ describe("parseCorpus", () => {
         expect(diagnosticsOf(() => parseCorpus(oversized))).toContain(
             "corpus.queries[0].queryText: not-executable",
         );
-        // Markup the live automatic extractor strips: the approved text and
-        // the production query would differ even inside every bound.
+        // The live automatic extractor strips markup, so approved text can differ from the production query within every bound.
         const markup = corpusJson();
         const markupQuery = (markup.queries as Record<string, unknown>[])[0];
         markupQuery.mode = "automatic";
@@ -75,8 +73,7 @@ describe("parseCorpus", () => {
         expect(diagnosticsOf(() => parseCorpus(markup))).toContain(
             "corpus.queries[0].queryText: not-executable",
         );
-        // Over-bounds automatic query: production silently truncates, which
-        // would replay a different query than the judged one.
+        // Production silently truncates over-bounds automatic queries, replaying a query different from the judged query.
         const truncated = corpusJson();
         const autoQuery = (truncated.queries as Record<string, unknown>[]).find(
             (q) => q.mode === "automatic",
@@ -88,8 +85,6 @@ describe("parseCorpus", () => {
                 "not-executable",
             );
         } else {
-            // Fixture corpus is explicit-only: exercise the automatic arm via
-            // a mode flip on the first query.
             const q = (truncated.queries as Record<string, unknown>[])[0];
             q.mode = "automatic";
             q.queryText = "word ".repeat(8 * 1024);
@@ -105,8 +100,7 @@ describe("parseCorpus", () => {
         const dev = queries.find((q) => q.id === "q-error-message-dev");
         const hold = queries.find((q) => q.id === "q-error-message-hold");
         if (!dev || !hold) throw new Error("fixture queries missing");
-        // Different paraphrase groups, same normalized text: the holdout
-        // intent is already exposed to development tuning.
+        // Same normalized text in different paraphrase groups exposes holdout intent to development tuning.
         hold.queryText = `  ${String(dev.queryText).toUpperCase()} `;
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus: query text reused across partitions (q-error-message-dev, q-error-message-hold)",
@@ -125,29 +119,22 @@ describe("parseCorpus", () => {
         const corpus = corpusJson();
         const query = (corpus.queries as Record<string, unknown>[])[0];
         query.mode = "automatic";
-        // Narrower than AUTO_SEARCH_SOURCES: drops competing lanes.
         query.sourceFilters = ["memory"];
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus.queries[0].sourceFilters: automatic-mismatch",
         );
-        // null (all enabled sources) is broader than the automatic path.
         query.sourceFilters = null;
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus.queries[0].sourceFilters: automatic-mismatch",
         );
-        // The exact production set (any order) plus the unbounded cutoff
-        // production automatic search uses is accepted.
         query.sourceFilters = ["git_commit", "memory", "message"];
         (query.visibleState as Record<string, unknown>).messageOrdinalCutoff = null;
         expect(() => parseCorpus(corpus)).not.toThrow();
-        // The automatic path also fixes its result limit at 10.
         query.resultLimit = 20;
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus.queries[0].resultLimit: automatic-mismatch",
         );
         query.resultLimit = 10;
-        // A bounded cutoff on an automatic scenario would drop competing
-        // results production automatic search returns.
         (query.visibleState as Record<string, unknown>).messageOrdinalCutoff = 1;
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus.queries[0].visibleState.messageOrdinalCutoff: automatic-mismatch",
@@ -188,8 +175,6 @@ describe("parseCorpus", () => {
             kind: string;
             semanticPayload: { kind: string; title: string; body: string };
         }>;
-        // Distinct id and locator, identical semantic payload: without the
-        // gate this re-registers one identity under a second document id.
         documents[1].kind = documents[0].kind;
         documents[1].semanticPayload = { ...documents[0].semanticPayload };
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
@@ -273,8 +258,6 @@ describe("validateRelease", () => {
         corpus.queries[1].paraphraseGroup = canary;
         const diagnostics = diagnosticsOf(() => validateRelease(corpus, judgments));
         expect(diagnostics.some((d) => d.includes("paraphrase group crosses"))).toBe(true);
-        // The free-form group value is never echoed; offending queries are
-        // named by their regex-bounded ids instead.
         expect(diagnostics.join("\n")).not.toContain(canary);
         expect(diagnostics.some((d) => d.includes(corpus.queries[0].id))).toBe(true);
     });
@@ -294,9 +277,6 @@ describe("validateRelease", () => {
 
     it("rejects a payload twin that re-registers holdout target content in development", () => {
         const { corpus, judgments } = makeValidRelease();
-        // corpus.documents[i] pairs with corpus.queries[i]; queries alternate
-        // development/holdout, so documents[1] is the holdout target twinned
-        // into the development pool under a distinct document id.
         const developmentQuery = corpus.queries[0];
         const holdoutTarget = corpus.documents[1];
         const twin = {
@@ -319,9 +299,6 @@ describe("validateRelease", () => {
 
     it("rejects a positive message target behind a zero ordinal cutoff", () => {
         const { corpus, judgments } = makeValidRelease();
-        // error-message queries pair with a "message"-kind document in the
-        // fixture rotation; cutoff 0 makes that target structurally
-        // unretrievable (ordinals are 1-based, cutoff is an inclusive max).
         const query = corpus.queries.find((q) => q.id === "q-error-message-dev");
         if (!query) throw new Error("fixture query missing");
         query.visibleState.messageOrdinalCutoff = 0;
@@ -334,14 +311,10 @@ describe("validateRelease", () => {
         const { corpus, judgments } = makeValidRelease();
         const query = corpus.queries.find((q) => q.id === "q-error-message-dev");
         if (!query) throw new Error("fixture query missing");
-        // The paired document is "message"-kind; filters omitting "message"
-        // make the target structurally unreachable in production search.
         query.sourceFilters = ["memory"];
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target excluded by source filters (q-error-message-dev, d-error-message-dev)",
         );
-        // Compartment chunks ride the "message" lane: a compartment target
-        // is reachable iff "message" is present.
         const compartmentQuery = corpus.queries.find((q) => q.id === "q-architecture-rationale-dev");
         if (!compartmentQuery) throw new Error("fixture query missing");
         compartmentQuery.sourceFilters = ["message"];
@@ -351,7 +324,6 @@ describe("validateRelease", () => {
 
     it("rejects a paraphrase group whose queries disagree on category", () => {
         const { corpus, judgments } = makeValidRelease();
-        // Same partition, same group, different categories.
         const a = corpus.queries.find((q) => q.id === "q-error-message-dev");
         const b = corpus.queries.find((q) => q.id === "q-temporal-dev");
         if (!a || !b) throw new Error("fixture queries missing");
@@ -363,15 +335,12 @@ describe("validateRelease", () => {
 
     it("rejects an automatic scenario whose positive target is outside automatic sources", () => {
         const { corpus, judgments } = makeValidRelease();
-        // user-directive pairs with a "primer"-kind document in the fixture
-        // rotation; the production automatic path never searches primers.
         const query = corpus.queries.find((q) => q.id === "q-user-directive-dev");
         if (!query) throw new Error("fixture query missing");
         query.mode = "automatic";
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target outside automatic search sources (q-user-directive-dev, d-user-directive-dev)",
         );
-        // A message-kind target stays valid under automatic mode.
         const messageQuery = corpus.queries.find((q) => q.id === "q-error-message-dev");
         if (!messageQuery) throw new Error("fixture query missing");
         query.mode = "explicit";
@@ -383,16 +352,12 @@ describe("validateRelease", () => {
         const { corpus, judgments } = makeValidRelease();
         const document = corpus.documents.find((d) => d.id === "d-error-message-dev");
         if (!document) throw new Error("fixture document missing");
-        // All aliases now belong to a different project: session-scoped and
-        // project-only resolution both miss, so the target can never resolve.
         for (const alias of document.aliases) {
             alias.projectScope = "git:some-other-project";
         }
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no alias in scenario scope (q-error-message-dev, d-error-message-dev)",
         );
-        // A session-bound alias in the right project is unreachable from a
-        // session-less scenario; a session-less alias is always reachable.
         for (const alias of document.aliases) {
             alias.projectScope = "git:fixture-project";
             alias.sessionScope = "ses-someone-elses";
@@ -404,9 +369,6 @@ describe("validateRelease", () => {
 
     it("rejects a memory target hidden by the scenario's visible-memory set", () => {
         const { corpus, judgments } = makeValidRelease();
-        // exact-symbol-path pairs with a "memory"-kind document whose single
-        // alias locator is a numeric memory id; hiding that id makes the
-        // target structurally unretrievable (production hard-filters it).
         const query = corpus.queries.find((q) => q.id === "q-exact-symbol-path-dev");
         const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
         if (!query || !document) throw new Error("fixture entries missing");
@@ -420,8 +382,6 @@ describe("validateRelease", () => {
         const { corpus, judgments } = makeValidRelease();
         const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
         if (!document) throw new Error("fixture document missing");
-        // Memory results encode as memory:<numeric id>; a migration-only or
-        // non-numeric alias can never appear in production output.
         document.aliases[0].locator = "not-a-memory-id";
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
@@ -431,8 +391,6 @@ describe("validateRelease", () => {
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
-        // Canonical decimal only: production interpolates numeric ids, so a
-        // leading-zero spelling can never byte-match an emitted locator.
         const zeroRelease = makeValidRelease();
         const zeroDoc = zeroRelease.corpus.documents.find(
             (d) => d.id === "d-exact-symbol-path-dev",
@@ -444,10 +402,7 @@ describe("validateRelease", () => {
         ).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
-        // Locators beyond MAX_SAFE_INTEGER are rejected even when they
-        // survive a Number -> String round-trip (2^53 does): seeding
-        // subtracts from and sorts the value as a JS number, and locators
-        // like "0" can never come back from AUTOINCREMENT.
+        // SQLite `AUTOINCREMENT` never emits locator `0`.
         for (const locator of [String(2 ** 53), "0"]) {
             const unsafeRelease = makeValidRelease();
             const unsafeDoc = unsafeRelease.corpus.documents.find(
@@ -480,8 +435,8 @@ describe("validateRelease", () => {
         const query = corpus.queries.find((q) => q.id === "q-exact-symbol-path-dev");
         const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
         if (!query || !document) throw new Error("fixture entries missing");
-        // A migration alias production cannot emit must not rescue a memory
-        // target whose only producible alias is hidden.
+        // A migration-only alias that production cannot emit cannot rescue a hidden producible memory alias.
+        // A target with no visible producible alias is unreachable.
         document.aliases.push({
             namespace: "claim",
             locator: "migration-spelling",
@@ -496,9 +451,9 @@ describe("validateRelease", () => {
 
     it("rejects a positive target pooled in the opposite partition", () => {
         const { corpus, judgments } = makeValidRelease();
-        // d-error-message-hold is positive for its holdout query; adding it
-        // to a development pool with grade 0 exposes the holdout target's
-        // content to development tuning as a labeled distractor.
+        // `d-error-message-hold` is the positive target for its holdout query.
+        // A grade-0 development judgment makes `d-error-message-hold` a labeled distractor.
+        // A grade-0 development judgment exposes the holdout target's content to development tuning.
         const devPool = judgments.pools.find((p) => p.queryId === "q-error-message-dev");
         if (!devPool) throw new Error("fixture pool missing");
         devPool.documentIds.push("d-error-message-hold");
@@ -517,8 +472,8 @@ describe("validateRelease", () => {
         const { corpus, judgments } = makeValidRelease();
         const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
         if (!document) throw new Error("fixture document missing");
-        // 2^53 + 1: a valid SQLite INTEGER that rounds when read as a JS
-        // number, so the emitted locator would differ from the alias.
+        // `2^53 + 1` is a valid SQLite integer that JavaScript rounds when reading it as a number.
+        // JavaScript rounds `2^53 + 1`, so production emits a locator different from the alias.
         document.aliases[0].locator = "9007199254740993";
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
@@ -531,9 +486,7 @@ describe("validateRelease", () => {
         const target = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
         const other = corpus.documents.find((d) => d.id === "d-error-message-dev");
         if (!query || !target || !other) throw new Error("fixture entries missing");
-        // The scenario runs in a session; another document claims the same
-        // (namespace, locator, project) under that session, so resolution
-        // always prefers it and the positive target can never earn credit.
+        // Session resolution prefers the competing document, so the positive target cannot earn credit.
         query.fixtureScope.sessionScope = "ses-fixture-1";
         other.aliases.push({
             namespace: target.aliases[0].namespace,
@@ -553,10 +506,8 @@ describe("validateRelease", () => {
         const other = corpus.documents.find((d) => d.id === "d-error-message-dev");
         if (!query || !target || !other) throw new Error("fixture entries missing");
         if (target.kind !== "compartment") throw new Error("expected a compartment target");
-        // The target's production alias is chunk:<id>; another document
-        // claims the SAME key via the dialect spelling "compartment" under
-        // the scenario's session — the resolver canonicalizes both, so the
-        // session alias shadows the project fallback.
+        // A `compartment` alias can claim the target's `chunk:<id>` key.
+        // The resolver canonicalizes `chunk:<id>` and `compartment:<id>`, so the session alias shadows the project fallback.
         query.fixtureScope.sessionScope = "ses-fixture-1";
         other.aliases.push({
             namespace: "compartment",
@@ -688,7 +639,6 @@ describe("facade boundary", () => {
     it("index.ts imports no database, recovery, or promotion code", () => {
         const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
         const forbidden = ["sqlite", "storage", "promote", "recover", "bun:sqlite"];
-        // Covers static imports, re-exports, dynamic import() and require().
         const references = source
             .split("\n")
             .map((line, i) => ({ line, number: i + 1 }))
@@ -701,7 +651,7 @@ describe("facade boundary", () => {
         expect(violations).toEqual([]);
     });
 
-    // `import type` is erased at runtime and intentionally skipped.
+    // `import type` is erased at runtime, so the runtime scanner skips it.
     function runtimeImports(filePath: string): string[] {
         const source = readFileSync(filePath, "utf8");
         const specifiers: string[] = [];
@@ -782,9 +732,7 @@ describe("facade boundary", () => {
                 if (!entry.name.endsWith(".ts")) continue;
                 for (const specifier of runtimeImports(path)) {
                     if (!specifier.startsWith(".")) continue;
-                    // Compare against the resolved scripts root: a substring
-                    // match on "/scripts/" would fire on any checkout whose
-                    // own path contains a scripts component.
+                    // The `"/scripts/"` match also matches checkout paths with a `scripts` component, so it resolves the scripts root.
                     const resolved = resolve(dirname(path), specifier);
                     if (resolved === scriptsRoot || resolved.startsWith(scriptsRoot + sep)) {
                         offenders.push(`${relative(srcRoot, path)} -> ${specifier}`);

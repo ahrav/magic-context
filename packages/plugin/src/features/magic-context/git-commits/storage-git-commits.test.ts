@@ -78,7 +78,6 @@ describe("storage-git-commits", () => {
         expect(evicted).toBe(2);
         expect(getCommitCount(db, "git:proj")).toBe(3);
 
-        // oldest two (timestamps 0, 1000) evicted, newest three (2000, 3000, 4000) kept
         expect(getLatestIndexedCommitTimeMs(db, "git:proj")).toBe(4000);
     });
 

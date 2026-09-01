@@ -1,23 +1,6 @@
-// Pi parity for the ctx_reduce nudge redesign (Channels 1 & 2).
 //
-// Band/guard math is shared from `@magic-context/core`; Pi's rendered-entry
-// classifier is a shape-specific twin because Pi keeps thinking, signatures,
-// tool calls, and tool results in different envelopes:
 //
-//   Channel 1 (in-turn tool-output nudge): OpenCode appends to a tool's
-//   `output.output` string in `tool.execute.after`; Pi appends a TextContent
-//   block to a `toolResult.content[]` in `pi.on("tool_result")`. Both persist
-//   (OpenCode→DB, Pi→JSONL via `appendMessage` on `message_end`) and replay
-//   verbatim, so both are "free sticky" with no anchor/CAS/replay machinery.
 //
-//   Channel 2 (ceiling nudge): OpenCode delivers via the in-process client's
-//   `promptAsync` (which joins the in-flight runner on OpenCode >= 1.17.7). Pi
-//   calls the native `pi.sendMessage(..., { deliverAs })` as a hidden custom
-//   message (`display:false`). The `channel2_nudge_state` lease is persisted and
-//   token-bound, so sibling processes sharing a session database cannot change a
-//   lease after another process has claimed it. It carries the intent from the
-//   pipeline point that records it to the later `tool_result` or `agent_end`
-//   event that delivers it.
 
 import { randomUUID } from "node:crypto";
 import {
@@ -46,10 +29,7 @@ import { measurePiToolResultDelta } from "./tail-hygiene-walk-pi";
 
 export type Channel1State = SharedChannel1State;
 
-// Per-session Channel 1 metric baseline. Written at the end of each pipeline
-// pass (post-drop), read in the `tool_result` handler. Primary-only: subagents
-// never get a baseline, which is how Channel 1 stays off for them (matches
-// OpenCode's `channel1StateBySession` gating).
+// Sessions without a baseline receive no Channel 1 reminder.
 const channel1StateBySession = new Map<string, Channel1State>();
 
 export function setPiChannel1Baseline(
@@ -69,7 +49,7 @@ export function clearPiChannel1State(sessionId: string): void {
 	channel1StateBySession.delete(sessionId);
 }
 
-/** Mark that the agent ran ctx_reduce since the last baseline refresh (suppress self-nag). */
+/** A `ctx_reduce` since the last baseline refresh suppresses self-nag. */
 export function markPiChannel1Reduced(sessionId: string, db?: Database): void {
 	const state = channel1StateBySession.get(sessionId);
 	if (state) {
@@ -94,7 +74,7 @@ function isPiTextContent(c: unknown): c is PiTextContent {
 	);
 }
 
-/** Concatenated text of a `toolResult.content[]` (image blocks ignored). */
+/* */
 function toolResultText(content: readonly unknown[]): string {
 	let text = "";
 	for (const c of content) {
@@ -104,11 +84,6 @@ function toolResultText(content: readonly unknown[]): string {
 }
 
 /**
- * Channel 1 decision for a just-finished tool result. Returns the reminder
- * TextContent block to append (so the caller's `tool_result` handler can return
- * `{ content: [...event.content, block] }`), or null when no nudge should fire.
- * `toolName` of `ctx_reduce` short-circuits to suppression (the agent is
- * actively managing context) — mirrors OpenCode's `tool.execute.after` branch.
  */
 export function maybeChannel1ReminderForToolResult(args: {
 	db: Database;
@@ -129,12 +104,11 @@ export function maybeChannel1ReminderForToolResult(args: {
 	}
 
 	const text = toolResultText(args.content);
-	// Content-based idempotency (bare `<system-reminder>` opener is the marker).
+	// A bare `<system-reminder>` opener marks already-processed content.
 	if (text.includes(CHANNEL1_SENTINEL)) return null;
 
-	// The result enters the rendered tail on the next context pass. Until then,
-	// the recency reserve protects this newest tool output: it increases total
-	// tail tokens (T), while reclaimable tokens (U) remain unchanged.
+	// The recency reserve excludes the newest tool result from reclamation until the next context pass.
+	// The recency reserve increases total tail tokens (T) without increasing reclaimable tokens (U).
 	const deltaTokens = measurePiToolResultDelta(args.content);
 	if (deltaTokens === 0) return null;
 	state.turnDeltaT += deltaTokens;
@@ -161,15 +135,9 @@ export function maybeChannel1ReminderForToolResult(args: {
 }
 
 /**
- * Minimal shape of the Pi API needed to deliver a Channel 2 ceiling nudge.
- * Uses `sendMessage` (custom message) rather than `sendUserMessage` so the nudge
- * can render `display: false` — hidden from the Pi TUI while still reaching the
- * model (Pi converts a `role:"custom"` entry to a model-visible user message via
- * `convertToLlm`). This is the Pi parity for OpenCode marking the same nudge
- * `synthetic: true`: an agent-directed steer should drive the run + reach the
- * model but NOT show up as a literal user turn the user didn't type. Available
- * since published pi-coding-agent 0.74.0 (our floor); MC already uses
- * `sendMessage` for /ctx-status.
+ * Pi's `sendMessage` supports hidden custom messages; `sendUserMessage` does not.
+ * With `display: false`, Pi hides custom messages in the TUI while sending them to the model.
+ * The nudge must reach the model without appearing as a user-authored turn.
  */
 interface PiSendMessage {
 	sendMessage: (
@@ -186,22 +154,16 @@ interface PiSendMessage {
 const CHANNEL2_NUDGE_CUSTOM_TYPE = "magic-context:ceiling-nudge";
 
 /**
- * Deliver a pending Channel 2 ceiling nudge for `sessionId`, if any. Safe to
- * call from both delivery sites; no-ops unless a `pending` intent exists.
- * Delivered as a hidden custom message (`sendMessage` + `display:false`) so it
- * reaches the model but is not presented as a literal user turn.
  *
- * Delivery sites + mode:
- * - `tool_result` (mid-turn, the primary site): deliverAs "steer" — Pi queues
- *   the message and the agent loop pulls it at the next step boundary, so the
- *   agent is warned while the pile is still growing and can act this turn.
- * - `agent_end` (idle fallback): catches the intent when the turn ended before
- *   a tool boundary could deliver it; deliverAs "followUp" starts a fresh turn.
+ * At `tool_result`, use `deliverAs: "steer"`; Pi delivers the message at the next agent-step boundary.
+ * A `steer` message lets the agent act during the current turn.
+ * `agent_end` delivery uses `deliverAs: "followUp"` when no tool boundary delivered the intent.
+ * `deliverAs: "followUp"` starts a fresh turn.
  *
- * Lease: pending → claimed(token) → delivered. A token is issued while claiming,
- * re-checked immediately before send, and required to confirm or revert. This
- * prevents a sibling process from changing a newer claimant's lease. Returns
- * true only when delivery is confirmed.
+ * The nudge state transitions from `pending` to `claimed(token)` to `delivered`.
+ * The delivery path re-checks its claim token before sending and before confirming or reverting.
+ * The claim token prevents another process from confirming or reverting a newer claim.
+ * `maybeDeliverChannel2Pi` returns `true` only when delivery is confirmed.
  */
 export function maybeDeliverChannel2Pi(
 	pi: PiSendMessage,
@@ -217,9 +179,9 @@ export function maybeDeliverChannel2Pi(
 	}
 	if (state !== "pending") return false;
 
-	// Revalidate from the same U/T baseline shape used when the pipeline armed
-	// the intent. Unknown or generation-invalidated measurements hold `pending`;
-	// a known false fourth-band predicate cancels it to the re-armable state.
+	// `maybeDeliverChannel2Pi` re-evaluates the pending intent against the cached Channel 1 baseline.
+	// `maybeDeliverChannel2Pi` leaves the intent pending when `evaluateChannel2` cannot evaluate the baseline.
+	// `maybeDeliverChannel2Pi` clears the pending intent when the evaluation is known and `shouldTrigger` is false.
 	const baseline = channel1StateBySession.get(sessionId);
 	if (!baseline) return false;
 	const evaluation = evaluateChannel2(baseline);
@@ -228,8 +190,7 @@ export function maybeDeliverChannel2Pi(
 		try {
 			casChannel2NudgeState(db, sessionId, "pending", "");
 		} catch {
-			// If resetting the intent fails, a later evaluation pass retries the
-			// reset and re-checks whether the nudge is still needed.
+			// `maybeDeliverChannel2Pi` leaves the intent pending when resetting its state fails.
 		}
 		return false;
 	}
@@ -256,9 +217,6 @@ export function maybeDeliverChannel2Pi(
 			);
 			return false;
 		}
-		// display: false → hidden from the Pi TUI (agent steer, not a user turn),
-		// but still model-visible via convertToLlm. deliverAs preserves the
-		// existing scheduling (steer mid-turn / followUp at agent_end).
 		pi.sendMessage(message, { deliverAs });
 	} catch (error) {
 		try {
@@ -309,8 +267,8 @@ export function maybeDeliverChannel2Pi(
 		);
 		return false;
 	} catch (error) {
-		// The nudge has already been handed to Pi; never re-arm on a post-send
-		// confirm failure, or a transient DB error can duplicate a cycle delivery.
+		// `maybeDeliverChannel2Pi` never re-arms the intent after Pi accepts the message.
+		// `maybeDeliverChannel2Pi` never re-arms a sent nudge because a transient DB error could duplicate delivery.
 		sessionLog(
 			sessionId,
 			"channel2 ceiling nudge sent but token-confirm failed; lease state left unchanged:",

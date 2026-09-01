@@ -1,7 +1,7 @@
-//! Broca protocol conformance: strict five-operation decoding, the 512 KiB
-//! request boundary, bind validation, and wire-shape compatibility with the
-//! JSON `HistorianProducer` sends and parses today.
+//! The wire shape matches JSON `HistorianProducer` sends and parses.
 
+// Broca conformance drives a Synapse primary, which ships only for `linux-x64-gnu`.
+#![cfg(target_os = "linux")]
 mod support;
 
 use std::sync::Arc;
@@ -51,8 +51,7 @@ fn each_valid_operation_decodes_its_exact_schema() {
     assert_eq!(send.max_output_tokens, 32_000);
     assert_eq!(send.temperature, 0.1);
 
-    // Canonical model strings split at the FIRST slash; remaining slashes
-    // belong to the model segment.
+    // Canonical model strings split at the first slash; remaining slashes belong to the model segment.
     let request = protocol::parse_request(
         &body(serde_json::json!({
             "method": "session.send",
@@ -105,8 +104,7 @@ fn each_valid_operation_decodes_its_exact_schema() {
             run_id: "broca-abc-1".to_owned()
         }
     );
-    // The session is the route identity, so delete accepts empty params or
-    // no params field at all.
+    // Because the session is the route identity, delete accepts empty params or no `params` field.
     assert_eq!(
         protocol::parse_request(
             &body(serde_json::json!({ "method": "session.delete", "params": {} })),
@@ -204,8 +202,7 @@ fn every_malformed_shape_is_rejected_with_schema_violation() {
             mutate(&ok_text, "\"provider\":\"prov\"", "\"provider\":\"\""),
             false,
         ),
-        // Both fields become one argv token for the harness CLI; a leading
-        // '-' would make that token flag-shaped to the child's own parser.
+        // The harness passes the two fields as one argv token; a leading `-` makes the token resemble a child-parser flag.
         (
             "flag-shaped provider",
             mutate(
@@ -324,8 +321,6 @@ fn every_malformed_shape_is_rejected_with_schema_violation() {
 
 #[test]
 fn the_512kib_boundary_admits_exactly_and_rejects_one_byte_over() {
-    // Measure the fixed envelope around a one-byte prompt, then pad the
-    // prompt so the whole body lands exactly on the cap.
     let probe = send_body("p", None);
     let envelope = probe.len() - 1;
     let at_cap = send_body(&"p".repeat(config::MAX_SEND_BODY_BYTES - envelope), None);
@@ -349,10 +344,9 @@ fn the_512kib_boundary_admits_exactly_and_rejects_one_byte_over() {
 fn error_unit_stays_within_terminal_headroom_after_json_escaping() {
     use mc_host::broca::backend::{BackendError, ErrorClass};
 
-    // Control characters JSON-escape to six bytes each (`\u00XX`): a raw-byte
-    // diagnostic bound alone would let two such fields encode past the
-    // headroom charged at admission. The worst case must still fit alongside
-    // the `run_started` unit, which shares the same reserved slice.
+    // Admission headroom must accommodate two diagnostic fields and the `run_started` unit.
+    // Admission headroom must accommodate the worst-case diagnostic encoding and the `run_started` unit.
+    // The `run_started` unit shares the reserved slice.
     let hostile = "\u{1}".repeat(4096);
     let run_id = "r".repeat(protocol::MAX_RUN_ID_BYTES);
     let unit = protocol::error_unit(
@@ -374,9 +368,6 @@ fn error_unit_stays_within_terminal_headroom_after_json_escaping() {
     );
 }
 
-/// Exercises the component's bind checks directly: the host's control layer
-/// refuses relative roots and empty identity fields before a bind, so these
-/// component-level rejections are unreachable over the wire.
 #[tokio::test]
 async fn bind_requires_absolute_root_nonempty_session_and_supported_harness() {
     let component = BrocaComponent::new(ScriptedBackend::completing("out"));
@@ -500,12 +491,10 @@ async fn credential_snapshot_must_match_before_backend_spawn() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(backend.starts(), 1);
+    drop(client);
     host.shutdown().await.expect("host shutdown");
 }
 
-/// One authenticated round trip through all five operations in the
-/// historian order, asserting the exact JSON field names the Rust
-/// producer's `unit_*` helpers and `classify_run_state` parse today.
 #[tokio::test]
 async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     let backend = ScriptedBackend::completing("historian output");
@@ -530,8 +519,7 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
         .expect("send returns run_id")
         .to_owned();
 
-    // A byte-identical resend must return the original run and never start
-    // a second backend.
+    // A byte-identical resend returns the original run without starting a second backend.
     let replay = call(
         &mut client,
         command_ch,
@@ -572,9 +560,7 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     assert_eq!(units[2]["unit"]["type"], "run_finished");
     assert_eq!(units[2]["unit"]["finish_reason"], "completed");
 
-    // The inserted JSON whitespace does not change the parsed request, but
-    // idempotency hashes exact request-body bytes, so this request
-    // conflicts rather than deduplicates.
+    // Idempotency hashes exact request-body bytes, so requests that differ only by JSON whitespace conflict rather than deduplicate.
     let mut spaced_body = serde_json::to_vec(&serde_json::json!({
         "method": "session.send",
         "params": send_params("summarize", Some("role guidance"), "prov/model-a"),
@@ -600,7 +586,6 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     assert_eq!(conflict.ty, support::raw_client::TY_ERROR);
     assert_eq!(conflict.error_code(), "idempotency_conflict");
 
-    // A rejected idempotency conflict leaves later replays unchanged.
     let corr = send_call(
         &mut client,
         sub_ch,
@@ -635,7 +620,6 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     )
     .await;
     assert_eq!(cancelled.json(), serde_json::json!({ "ok": true }));
-    // Cancel after completion is idempotent and cannot change the run's
     // committed state.
     let status = call(
         &mut client,
@@ -669,7 +653,6 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
         serde_json::json!({ "run_id": run_id, "state": "missing" })
     );
 
-    // The retained tombstone must block resurrection of the session.
     let resurrect = call(
         &mut client,
         command_ch,

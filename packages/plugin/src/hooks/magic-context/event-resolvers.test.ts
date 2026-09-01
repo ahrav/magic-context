@@ -17,16 +17,11 @@ import {
 
 describe("event-resolvers", () => {
     describe("resolveContextLimit", () => {
-        // resolveContextLimit reads from getModelsDevContextLimit (which overlays
-        // opencode.json custom provider limits on top of the models.dev cache).
-        // The tests below validate the fallback-to-default path. The models.dev
-        // integration is covered by models-dev-cache tests.
+        // getModelsDevContextLimit overlays opencode.json provider limits on the models.dev cache.
 
         it("resolves anthropic context from models.dev when available", () => {
-            //#when — models.dev may return 200K (real limit) or 128K (default if no models.json)
             const limit = resolveContextLimit("anthropic", "claude-opus-4-5");
 
-            //#then — should NOT be 1M; uses models.dev real limit or conservative default
             expect(limit).toBeLessThanOrEqual(200_000);
             expect(limit).toBeGreaterThan(0);
         });
@@ -89,15 +84,12 @@ describe("event-resolvers", () => {
     });
 
     describe("resolveTrustedContextLimit", () => {
-        // The history-budget resolver uses this to avoid deriving the decay
-        // budget from a bare 128K guess for an UNKNOWN model (which would shrink
-        // history below the live-usage back-derivation for a large-context
-        // model). Trusted = real models.dev hit or detected-overflow only.
+        // resolveTrustedContextLimit prevents unknown models from shrinking history budgets based on the 128K fallback.
+        // resolveTrustedContextLimit trusts only models.dev limits and detected overflows.
 
         it("returns a real limit for a known model (not undefined)", () => {
             const limit = resolveTrustedContextLimit("anthropic", "claude-opus-4-5");
-            // Known model resolves to its real models.dev limit (or, if no
-            // models.json is present in CI, undefined — never the 128K guess).
+            // Without models.json, resolveTrustedContextLimit returns undefined rather than the 128K fallback.
             if (limit !== undefined) {
                 expect(limit).toBeGreaterThan(0);
                 expect(limit).not.toBe(128_000);
@@ -182,7 +174,7 @@ describe("event-resolvers", () => {
                     lastUsageContextLimit: 1_048_576,
                     lastObservedModelKey: "openai/gpt-alias-test",
                 });
-                // Simulate a legacy session row whose model key uses the old provider prefix.
+                // Legacy session rows use the old provider prefix.
                 db.prepare(
                     "UPDATE session_meta SET last_observed_model_key = ? WHERE session_id = ?",
                 ).run("openai-codex/gpt-alias-test", sessionId);
@@ -270,7 +262,6 @@ describe("event-resolvers", () => {
         });
 
         it("prefers exact provider/model key when present", () => {
-            //#given — user wrote the derived key
             const config = { default: 65, "openai/gpt-5.4-fast": 25 };
 
             //#when
@@ -281,18 +272,16 @@ describe("event-resolvers", () => {
         });
 
         it("falls back to base model key when user wrote base (no derived)", () => {
-            //#given — user wrote base key, runtime is derived (e.g., -fast variant)
             const config = { default: 65, "openai/gpt-5.4": 25 };
 
-            //#when — modelKey is the derived form
             const result = resolveExecuteThreshold(config, "openai/gpt-5.4-fast", 65);
 
-            //#then — should match "openai/gpt-5.4" after suffix strip
+            // Derived model keys match their base keys after suffix stripping.
             expect(result).toBe(25);
         });
 
         it("prefers most-specific match when both derived and base configured", () => {
-            //#given — user wrote BOTH keys, want derived to win
+            // When both keys exist, the derived key takes precedence.
             const config = {
                 default: 65,
                 "openai/gpt-5.4-fast": 20,
@@ -309,7 +298,7 @@ describe("event-resolvers", () => {
         });
 
         it("matches bare model id (no provider prefix) in config", () => {
-            //#given — user wrote just the model id without provider
+            // Providerless model IDs match configured model keys.
             const config = { default: 65, "gpt-5.4-fast": 25 };
 
             //#when
@@ -347,7 +336,6 @@ describe("event-resolvers", () => {
                 default: number;
                 [key: string]: number;
             };
-            // Simulate missing default by deleting
             delete (config as Record<string, unknown>).default;
 
             //#when
@@ -368,25 +356,21 @@ describe("event-resolvers", () => {
             //#when
             const result = resolveExecuteThreshold(config, undefined, 65);
 
-            //#then — undefined modelKey hits the no-model branch, not the per-model lookup
             expect(result).toBe(42);
         });
     });
 
     describe("resolveExecuteThreshold (tokens-based)", () => {
         it("uses execute_threshold_tokens when set for the model, overriding percentage", () => {
-            //#when — 100K tokens / 200K context = 50%
             const result = resolveExecuteThreshold(65, "github-copilot/gpt-5.2-codex", 65, {
                 tokensConfig: { "github-copilot/gpt-5.2-codex": 100_000 },
                 contextLimit: 200_000,
             });
 
-            //#then — overrides percentage (65) with derived (50)
             expect(result).toBe(50);
         });
 
         it("uses execute_threshold_tokens.default for models not explicitly listed", () => {
-            //#when — default 150K / 400K = 37.5%
             const result = resolveExecuteThreshold(65, "openai/gpt-5.4", 65, {
                 tokensConfig: { default: 150_000 },
                 contextLimit: 400_000,
@@ -397,13 +381,11 @@ describe("event-resolvers", () => {
         });
 
         it("clamps token value above 90% × contextLimit and still returns capped percentage", () => {
-            //#when — 500K requested on 200K model: cap is 180K (90% of 200K) = 90%
             const result = resolveExecuteThreshold(65, "some/model", 65, {
                 tokensConfig: { "some/model": 500_000 },
                 contextLimit: 200_000,
             });
 
-            //#then — clamped to 90% max
             expect(result).toBe(90);
         });
 
@@ -416,12 +398,11 @@ describe("event-resolvers", () => {
                 { tokensConfig: undefined, contextLimit: 400_000 },
             );
 
-            //#then — percentage-based match
             expect(result).toBe(45);
         });
 
         it("falls through to percentage when contextLimit is missing (tokens unusable)", () => {
-            //#when — no contextLimit, tokens ignored
+            // resolveExecuteThreshold ignores tokens when contextLimit is undefined.
             const result = resolveExecuteThreshold(55, "x/y", 65, {
                 tokensConfig: { "x/y": 100_000 },
             });
@@ -431,7 +412,7 @@ describe("event-resolvers", () => {
         });
 
         it("picks exact model key before default in tokens config", () => {
-            //#when — exact key wins over default
+            // An exact key takes precedence over the default.
             const result = resolveExecuteThreshold(65, "github-copilot/gpt-5.2-codex", 65, {
                 tokensConfig: {
                     default: 200_000,
@@ -440,18 +421,16 @@ describe("event-resolvers", () => {
                 contextLimit: 400_000,
             });
 
-            //#then — exact 40K / 400K = 10%
             expect(result).toBe(10);
         });
 
         it("supports progressive lookup (derived → base) for tokens config", () => {
-            //#when — user set tokens for base model, session is on derived variant
+            // Derived variants use the base model's token setting.
             const result = resolveExecuteThreshold(65, "openai/gpt-5.4-fast", 65, {
                 tokensConfig: { "openai/gpt-5.4": 100_000 },
                 contextLimit: 400_000,
             });
 
-            //#then — finds base model match (25%)
             expect(result).toBe(25);
         });
     });
@@ -464,7 +443,6 @@ describe("event-resolvers", () => {
                 contextLimit: 200_000,
             });
 
-            //#then — 100K/200K = 50%, mode must be tokens, absolute preserved
             expect(detail.mode).toBe("tokens");
             expect(detail.percentage).toBe(50);
             expect(detail.absoluteTokens).toBe(100_000);
@@ -472,14 +450,13 @@ describe("event-resolvers", () => {
         });
 
         it("reports mode='tokens' via progressive base-model match (display-drift fix)", () => {
-            //#given — /ctx-status previously missed this path and mislabeled as percentage
-            //#when — user wrote base key, runtime is derived
+            // A base-model tokens key must match a derived runtime model.
             const detail = resolveExecuteThresholdDetail(65, "openai/gpt-5.4-fast", 65, {
                 tokensConfig: { "openai/gpt-5.4": 100_000 },
                 contextLimit: 400_000,
             });
 
-            //#then — mode is tokens because base key matched
+            // A matching base key selects tokens mode.
             expect(detail.mode).toBe("tokens");
             expect(detail.percentage).toBe(25);
             expect(detail.absoluteTokens).toBe(100_000);
@@ -487,7 +464,6 @@ describe("event-resolvers", () => {
         });
 
         it("reports mode='percentage' when no tokens key or default matches", () => {
-            //#when — tokens config missing this model entirely, no default
             const detail = resolveExecuteThresholdDetail(
                 { default: 55, "openai/gpt-5.4": 45 },
                 "openai/gpt-5.4",
@@ -506,7 +482,7 @@ describe("event-resolvers", () => {
         });
 
         it("reports mode='percentage' when contextLimit is missing (tokens unusable)", () => {
-            //#when — tokens config present but no contextLimit → cannot apply
+            // Without a contextLimit, tokens configuration cannot apply.
             const detail = resolveExecuteThresholdDetail(55, "x/y", 65, {
                 tokensConfig: { "x/y": 100_000 },
             });
@@ -517,21 +493,19 @@ describe("event-resolvers", () => {
         });
 
         it("reports mode='tokens' with absoluteTokens equal to clamp cap when over-cap", () => {
-            //#when — 500K requested on 200K model → clamp to 180K (90%)
             const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
                 tokensConfig: { "some/model": 500_000 },
                 contextLimit: 200_000,
                 sessionId: "ses-test-clamp-detail",
             });
 
-            //#then — tokens won, clamped to cap, percentage = 90
+            // A valid tokens configuration takes precedence and clamps at 90%.
             expect(detail.mode).toBe("tokens");
             expect(detail.percentage).toBe(90);
             expect(detail.absoluteTokens).toBe(180_000);
         });
 
         it("guards against NaN contextLimit (runtime division hazard) — falls through to percentage", () => {
-            //#given — caller derives contextLimit from inputTokens/percentage and percentage is 0
             const nanLimit = 0 / 0;
 
             //#when
@@ -540,7 +514,7 @@ describe("event-resolvers", () => {
                 contextLimit: nanLimit,
             });
 
-            //#then — NaN contextLimit cannot form a valid cap; safely use percentage config
+            // NaN contextLimit falls back to percentage configuration.
             expect(detail.mode).toBe("percentage");
             expect(detail.percentage).toBe(55);
             expect(Number.isFinite(detail.percentage)).toBe(true);
@@ -557,38 +531,33 @@ describe("event-resolvers", () => {
                 contextLimit: -100_000,
             });
 
-            //#then — both must fall through without throwing
+            // resolveExecuteThreshold ignores invalid context limits without throwing.
             expect(zero.mode).toBe("percentage");
             expect(neg.mode).toBe("percentage");
         });
 
         it("guards against non-finite/non-positive token values (e.g., NaN injected at runtime)", () => {
-            //#when — token value is NaN somehow (would poison percentage math)
+            // A NaN token value falls back to percentage configuration.
             const detail = resolveExecuteThresholdDetail(55, "x/y", 65, {
                 tokensConfig: { "x/y": Number.NaN },
                 contextLimit: 200_000,
             });
 
-            //#then — bad value ignored, fall through to percentage
             expect(detail.mode).toBe("percentage");
             expect(detail.percentage).toBe(55);
         });
 
         it("guards against negative percentage config by reverting to fallback", () => {
-            //#given — schema normally blocks this but a runtime mutation could produce it
             //#when
             const detail = resolveExecuteThresholdDetail(-5 as unknown as number, "x/y", 42);
 
-            //#then — fallback used, percentage non-negative
+            // Negative percentage values use the fallback percentage.
             expect(detail.mode).toBe("percentage");
             expect(detail.percentage).toBe(42);
         });
 
         it("dedupes clamp warn: repeated resolution of the same over-cap config only warns once", () => {
-            // The dedupe key is (sessionId|modelKey|tokenVal|cap). Calling the resolver
-            // many times with the same inputs must not log repeatedly. We can't assert
-            // the log directly without a mock, but we CAN assert the function stays pure
-            // on the return value (no crash, no behavior change across calls).
+            // The resolver deduplicates clamp logs by (sessionId|modelKey|tokenVal|cap).
             const opts = {
                 tokensConfig: { "some/model": 500_000 },
                 contextLimit: 200_000,
@@ -598,20 +567,18 @@ describe("event-resolvers", () => {
             const b = resolveExecuteThresholdDetail(65, "some/model", 65, opts);
             const c = resolveExecuteThresholdDetail(65, "some/model", 65, opts);
 
-            //#then — stable output across repeated calls
             expect(a).toEqual(b);
             expect(b).toEqual(c);
         });
 
         it("sets clamped + configuredValue when a tokens config is reduced to the cap (#241)", () => {
-            //#when — 190K requested on a 128K model → cap is 90% × 128K = 115.2K
             const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
                 tokensConfig: { "some/model": 190_000 },
                 contextLimit: 128_000,
                 sessionId: "ses-test-clamped-flag-tokens",
             });
 
-            //#then — clamp surfaced with the original value so displays can show the math
+            // Clamp metadata preserves the requested token value for displays.
             expect(detail.mode).toBe("tokens");
             expect(detail.clamped).toBe(true);
             expect(detail.configuredValue).toBe(190_000);
@@ -620,13 +587,11 @@ describe("event-resolvers", () => {
         });
 
         it("leaves clamped unset when a tokens config fits under the cap (#241)", () => {
-            //#when — 100K on a 200K model = 50%, well under the 90% cap
             const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
                 tokensConfig: { "some/model": 100_000 },
                 contextLimit: 200_000,
             });
 
-            //#then — no clamp occurred, no clamp metadata attached
             expect(detail.mode).toBe("tokens");
             expect(detail.clamped).toBeUndefined();
             expect(detail.configuredValue).toBeUndefined();
@@ -634,10 +599,9 @@ describe("event-resolvers", () => {
         });
 
         it("sets clamped + configuredValue when a percentage config is capped at 90 (#241)", () => {
-            //#when — a runtime-derived percentage above the 90% cap
             const detail = resolveExecuteThresholdDetail(95, "some/model", 65);
 
-            //#then — capped to 90, original 95 surfaced for display
+            // The resolver caps the threshold at 90% and retains 95% for display.
             expect(detail.mode).toBe("percentage");
             expect(detail.clamped).toBe(true);
             expect(detail.configuredValue).toBe(95);

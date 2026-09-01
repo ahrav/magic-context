@@ -26,10 +26,9 @@ export interface OmpPluginInfo {
 export const OMP_PLUGIN_PACKAGE = "@cortexkit/pi-magic-context";
 
 /**
- * OMP's published CLI is a Bun script (`#!/usr/bin/env bun`), not a native
- * executable, and Windows ignores shebangs entirely. A bare `dist/cli.js` path
- * is therefore only usable when we can run it through Bun ourselves, so
- * package-root discovery reports nothing unless Bun is resolvable.
+ * OMP publishes its CLI as a Bun script (`#!/usr/bin/env bun`), not a native executable.
+ * Windows does not execute shebangs.
+ * A bare `dist/cli.js` path requires Bun to run it.
  */
 function detectOmpPackageCli(): string | null {
     const packageDir = getOmpPackageDir();
@@ -47,7 +46,7 @@ function detectOmpPackageCli(): string | null {
     }
 }
 
-/** Build the argv for an OMP path, routing Bun scripts through the Bun runtime. */
+/* */
 export function getOmpCommandInvocation(
     ompPath: string,
     args: string[],

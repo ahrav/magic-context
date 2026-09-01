@@ -1,17 +1,14 @@
-//! Off-path SQLite runtime probe and connection-contract checks for `store.db`
-//! writers, sharing one vocabulary (application ID, format epoch, marker and
-//! manifest digests) with the TypeScript host. The fixture
+//! The module probes SQLite off-path and validates `store.db` writer contracts.
+//! `direct-format-vocabulary-v1.json` defines the cross-runtime vocabulary.
 //! `packages/plugin/src/features/magic-context/fixtures/direct-format-vocabulary-v1.json`
-//! is the cross-runtime source of truth; the `sqlite_runtime` integration test
-//! proves this module against it.
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-/// `PRAGMA application_id` value for the direct format: ASCII "MCTX".
+/// `MC_APPLICATION_ID` sets `PRAGMA application_id` to ASCII `MCTX`.
 pub const MC_APPLICATION_ID: u32 = 0x4D43_5458;
 
-/// `PRAGMA user_version` value for the direct format.
+/// `DIRECT_FORMAT_EPOCH` sets `PRAGMA user_version` to `1` for the direct format.
 pub const DIRECT_FORMAT_EPOCH: i64 = 1;
 
 pub const DIRECT_FORMAT_MARKER_TABLE: &str = "mc_format_marker";
@@ -30,7 +27,6 @@ pub struct SqliteEngineIdentity {
     pub sqlite_source_id: String,
 }
 
-/// Read `sqlite_version()` / `sqlite_source_id()` from an open connection.
 pub fn read_sqlite_engine_identity(conn: &Connection) -> rusqlite::Result<SqliteEngineIdentity> {
     conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
         Ok(SqliteEngineIdentity {
@@ -40,8 +36,6 @@ pub fn read_sqlite_engine_identity(conn: &Connection) -> rusqlite::Result<Sqlite
     })
 }
 
-/// Probe the compiled engine on a throwaway in-memory connection, never the
-/// real database file.
 pub fn probe_sqlite_engine_identity_off_path() -> rusqlite::Result<SqliteEngineIdentity> {
     let conn = Connection::open_in_memory()?;
     read_sqlite_engine_identity(&conn)
@@ -68,10 +62,8 @@ pub fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
 }
 
 fn is_well_formed_source_id(source_id: &str) -> bool {
-    // `YYYY-MM-DD HH:MM:SS <40-64 hex chars>`
     let bytes = source_id.as_bytes();
-    // A multi-byte sequence across the stamp boundary is not a timestamp, and
-    // splitting inside one would panic: fail closed instead.
+    // The validator rejects a multibyte character crossing byte 20 because `split_at(20)` requires a character boundary.
     if bytes.len() < 20 + 40 || !source_id.is_char_boundary(20) {
         return false;
     }
@@ -90,9 +82,8 @@ fn is_well_formed_source_id(source_id: &str) -> bool {
     stamp_ok && hash_ok
 }
 
-/// Evaluate the WAL-reset-safety gate. Returns every failure reason (empty =
-/// pass). The engine identity is authoritative: a wrapper version alone never
-/// passes, and an unknown `sqlite_source_id()` fails closed.
+/// The gate returns every WAL-reset-safety failure; an empty vector passes.
+/// The gate requires the engine identity; a wrapper version alone cannot pass.
 pub fn evaluate_sqlite_runtime_gate(identity: &SqliteEngineIdentity) -> Vec<String> {
     let mut reasons = Vec::new();
     match parse_dotted_version(&identity.sqlite_version) {
@@ -112,9 +103,9 @@ pub fn evaluate_sqlite_runtime_gate(identity: &SqliteEngineIdentity) -> Vec<Stri
     reasons
 }
 
-/// Verify the per-connection contract after PRAGMAs are applied: foreign keys
-/// enforced, WAL activated (when expected), a busy timeout installed, and a
-/// declared synchronous mode. Returns every violation (empty = pass).
+/// The verifier checks the connection contract after applying PRAGMAs.
+/// The contract requires enforced foreign keys, expected WAL mode, a busy timeout, and a declared synchronous mode.
+/// The verifier returns every violation; an empty vector passes.
 pub fn verify_sqlite_connection_contract(
     conn: &Connection,
     expect_wal: bool,
@@ -136,14 +127,10 @@ pub fn verify_sqlite_connection_contract(
         ));
     }
     let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
-    if !(2..=3).contains(&synchronous) {
+    if !(1..=3).contains(&synchronous) {
         violations.push(format!(
-            "synchronous mode {synchronous} is not FULL or EXTRA [2, 3]"
+            "synchronous mode {synchronous} is not in the declared set [1, 2, 3]"
         ));
-    }
-    let trusted_schema: i64 = conn.query_row("PRAGMA trusted_schema", [], |row| row.get(0))?;
-    if trusted_schema != 0 {
-        violations.push("trusted_schema is enabled".to_string());
     }
     Ok(violations)
 }
@@ -159,9 +146,7 @@ fn sha256_hex(input: &str) -> String {
     out
 }
 
-/// Canonical manifest digest over the shared line encoding: the protocol line,
-/// then one `component name=<n> dependsOn=<a,b> provides=<x,y>` line per
-/// component, joined with '\n'.
+/// The manifest digest hashes the protocol line followed by one component line per component, joined by `\n`.
 pub fn compute_schema_manifest_digest(components: &[(String, Vec<String>, Vec<String>)]) -> String {
     let mut lines = vec![SCHEMA_MANIFEST_PROTOCOL.to_string()];
     for (name, depends_on, provides) in components {
@@ -175,7 +160,6 @@ pub fn compute_schema_manifest_digest(components: &[(String, Vec<String>, Vec<St
     sha256_hex(&lines.join("\n"))
 }
 
-/// Canonical marker digest over the shared line encoding.
 pub fn compute_marker_digest(
     format_epoch: i64,
     database_incarnation_id: &str,

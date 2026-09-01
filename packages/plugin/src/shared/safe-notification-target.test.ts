@@ -21,8 +21,6 @@ describe("isDefaultSessionTitle", () => {
     it("does not match real titles", () => {
         expect(isDefaultSessionTitle("Quick test")).toBe(false);
         expect(isDefaultSessionTitle("New session - notes")).toBe(false);
-        // Prefix alone isn't enough — the timestamp must match exactly,
-        // mirroring OpenCode's Session.isDefaultTitle.
         expect(isDefaultSessionTitle("New session - 2026-06-10")).toBe(false);
     });
 });
@@ -86,7 +84,6 @@ describe("waitForSafeNotificationTarget", () => {
         expect(
             await waitForSafeNotificationTarget(throwing, "ses-throw", { attempts: 2, delayMs: 1 }),
         ).toBe("safe");
-        // Direct-shape response (no `.data` wrapper) is also recognized.
         const direct = {
             session: { get: async () => ({ title: "Real title" }) },
         };

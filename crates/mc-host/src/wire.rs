@@ -1,5 +1,5 @@
-//! The connection engine and its transports share frame encoding, protocol
-//! size caps, and aggregate resident-byte accounting.
+//! The connection engine and transports share frame encoding.
+//! The connection engine and transports share protocol size caps and resident-byte accounting.
 //!
 //! ```text
 //!  offset  size  field     type    purpose
@@ -13,37 +13,32 @@
 //!   21 -> body
 //! ```
 //!
-//! Little-endian. **Frozen prefix:** `len` (u32 @ 0) and `ver` (u8 @ 4) keep
-//! fixed meaning and position in every future version; `decode_header`
-//! enforces that discipline.
+//! Every envelope version preserves little-endian `len` (u32 at 0) and `ver` (u8 at 4).
+//! Every envelope version preserves `len` and `ver` meanings and offsets.
+//! `decode_header` enforces the fixed meanings and offsets of `len` and `ver`.
 
 use std::{error::Error, fmt, sync::Arc};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 2;
 
-/// Fixed header length for `PROTOCOL_VERSION` 2.
 pub const HEADER_LEN: usize = 21;
 
-/// Bytes of the frozen prefix (`len` u32 + `ver` u8) that are stable across
-/// every envelope version.
+/// `FROZEN_PREFIX_LEN` counts the `len` and `ver` bytes fixed across all envelope versions.
 pub const FROZEN_PREFIX_LEN: usize = 5;
 
-/// Maximum frame body accepted before allocation (64 MiB).
 pub const MAX_FRAME_BODY_LEN: u32 = 64 * 1024 * 1024;
 
-/// Env var naming the module id a supervised child registers under.
-/// Canonical version-2 vocabulary (KTD8): the name is protocol surface and
-/// must stay byte-identical.
+/// `SUBC_MODULE_ID_ENV` identifies the module under which a supervised child registers.
+/// The environment-variable name is protocol surface and must remain byte-identical.
 pub const SUBC_MODULE_ID_ENV: &str = "SUBC_MODULE_ID";
 
-/// Env var carrying the one-time launch nonce injected into a spawned
-/// reserved module. Canonical version-2 vocabulary (KTD8).
+/// `SUBC_LAUNCH_NONCE_ENV` carries the one-time nonce injected into a spawned child.
+/// The environment-variable name is protocol surface and must remain byte-identical.
 pub const SUBC_LAUNCH_NONCE_ENV: &str = "SUBC_LAUNCH_NONCE";
 
-/// Frame kind (`type` byte at offset 5).
+/// `FrameType` encodes the frame kind in header byte 5.
 ///
 /// `CANCEL`, `PING`, `PONG`, and `GOODBYE` are pure-header frames (`len == 0`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +59,6 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    /// Map the raw `type` byte to a `FrameType`, or `None` if unknown.
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             0 => Self::Request,
@@ -88,7 +82,7 @@ impl FrameType {
     }
 }
 
-/// Scheduling priority carried in `flags` bits 1-2.
+/// `Priority` encodes `flags` bits 1–2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Priority {
@@ -108,7 +102,7 @@ impl Priority {
     }
 }
 
-/// Admission behavior carried in `flags` bits 4-5.
+/// `AdmissionClass` encodes `flags` bits 4–5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AdmissionClass {
@@ -136,13 +130,12 @@ const FLAG_ADMISSION_MASK: u8 = 0b0011_0000; // bits 4-5
 const FLAG_ADMISSION_SHIFT: u8 = 4;
 const FLAG_RESERVED_MASK: u8 = 0b1100_0000; // bits 6-7 must be zero
 
-/// The `flags` byte (offset 6): binary, priority, last, admission, then
+/// Bits 6–7 of `flags` are reserved.
 /// reserved bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flags(pub u8);
 
 impl Flags {
-    /// Build flags with the default [`AdmissionClass::Normal`] class.
     pub fn new(binary: bool, priority: Priority, last: bool) -> Self {
         let mut b = 0u8;
         if binary {
@@ -155,36 +148,31 @@ impl Flags {
         Flags(b)
     }
 
-    /// Body is raw bytes (bulk lane) rather than JSON-RPC.
     pub fn is_binary(self) -> bool {
         self.0 & FLAG_BINARY != 0
     }
 
-    /// Final frame of a streamed message.
+    /// `FLAG_LAST` marks the final frame of a streamed message.
     pub fn is_last(self) -> bool {
         self.0 & FLAG_LAST != 0
     }
 
-    /// Decode the priority bits, or `None` if they hold a reserved value.
     pub fn priority(self) -> Option<Priority> {
         Priority::from_bits((self.0 & FLAG_PRIORITY_MASK) >> FLAG_PRIORITY_SHIFT)
     }
 
-    /// Decode the admission-class bits, or `None` if they hold `0b11`.
     pub fn admission_class(self) -> Option<AdmissionClass> {
         AdmissionClass::from_bits((self.0 & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT)
     }
 
-    /// True if either reserved bit (6-7) is set.
     pub fn has_reserved_bits(self) -> bool {
         self.0 & FLAG_RESERVED_MASK != 0
     }
 }
 
-/// A decoded envelope header. The body is the `len` bytes that follow it.
+/// The body is the `len` bytes that follow the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvelopeHeader {
-    /// Number of body bytes after the header.
     pub len: u32,
     /// Envelope version.
     pub ver: u8,
@@ -192,16 +180,15 @@ pub struct EnvelopeHeader {
     pub ty: FrameType,
     /// Flag bits.
     pub flags: Flags,
-    /// Sender-local route slot; 0 is the control channel.
+    /// `channel` is sender-local; channel 0 is the control channel.
     pub channel: u16,
-    /// Sender-local binding epoch; 0 is reserved for the control channel.
+    /// `epoch` is sender-local; channel 0 reserves epoch 0.
     pub epoch: u32,
     /// Correlation id.
     pub corr: u64,
 }
 
 impl EnvelopeHeader {
-    /// Serialize the header to its fixed 21-byte little-endian form.
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(&self.len.to_le_bytes());
@@ -215,31 +202,54 @@ impl EnvelopeHeader {
     }
 }
 
-/// Why a header could not be decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// Fewer than `FROZEN_PREFIX_LEN` bytes — cannot even read `len`/`ver`.
-    TooShortForPrefix { have: usize },
+    /// The input contains fewer than `FROZEN_PREFIX_LEN` bytes, so the decoder cannot read `len` or `ver`.
+    TooShortForPrefix {
+        have: usize,
+    },
     /// `ver` is not a version this build understands.
-    UnsupportedVersion { ver: u8 },
-    /// Version known but fewer than its header length is present.
-    TooShortForHeader { have: usize, need: usize },
-    /// `type` byte is not a known `FrameType`.
-    UnknownFrameType { byte: u8 },
+    UnsupportedVersion {
+        ver: u8,
+    },
+    /// The input specifies a known version but contains fewer than that version's header bytes.
+    TooShortForHeader {
+        have: usize,
+        need: usize,
+    },
+    UnknownFrameType {
+        byte: u8,
+    },
     /// A reserved flag bit (6-7) is set.
-    ReservedFlagBits { flags: u8 },
+    ReservedFlagBits {
+        flags: u8,
+    },
     /// Priority bits 1-2 hold the reserved value `0b11`.
-    ReservedPriorityBits { flags: u8 },
+    ReservedPriorityBits {
+        flags: u8,
+    },
     /// Admission bits 4-5 hold the reserved value `0b11`.
-    ReservedAdmissionClass { flags: u8 },
-    /// SHEDDABLE is set on a frame type that must be delivered.
-    SheddableIllegalFrameType { ty: FrameType, flags: u8 },
+    ReservedAdmissionClass {
+        flags: u8,
+    },
+    /// `AdmissionClass::Sheddable` cannot be set on a frame type that must be delivered.
+    SheddableIllegalFrameType {
+        ty: FrameType,
+        flags: u8,
+    },
     /// Channel 0 carried an epoch other than its reserved epoch 0.
-    NonzeroEpochOnControlChannel { epoch: u32 },
+    NonzeroEpochOnControlChannel {
+        epoch: u32,
+    },
     /// A routed channel carried epoch 0, which is reserved for channel 0.
-    ZeroEpochOnRoutedChannel { channel: u16 },
-    /// A pure-header frame declared body bytes.
-    PureHeaderFrameWithBody { ty: FrameType, len: u32 },
+    ZeroEpochOnRoutedChannel {
+        channel: u16,
+    },
+    /// Pure-header frames require a zero-length body.
+    PureHeaderFrameWithBody {
+        ty: FrameType,
+        len: u32,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -287,8 +297,7 @@ impl fmt::Display for DecodeError {
 
 impl Error for DecodeError {}
 
-/// How many header bytes a given envelope version occupies. Driven by the
-/// frozen prefix: read `ver`, then learn the full header length here.
+/// The frozen prefix makes `ver` available before the full header length is known.
 fn header_len_for_version(ver: u8) -> Option<usize> {
     match ver {
         PROTOCOL_VERSION => Some(HEADER_LEN),
@@ -296,13 +305,9 @@ fn header_len_for_version(ver: u8) -> Option<usize> {
     }
 }
 
-/// Decode an envelope header from the front of `bytes`, following the
 /// frozen-prefix discipline:
-/// 1. need at least the 5-byte prefix to read `len` + `ver`;
-/// 2. dispatch the full header length on `ver`;
-/// 3. need the full header present; then parse the rest.
 ///
-/// Never panics on malformed input — returns a typed [`DecodeError`].
+/// `decode_header` returns a typed [`DecodeError`] instead of panicking on malformed input.
 pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     if bytes.len() < FROZEN_PREFIX_LEN {
         return Err(DecodeError::TooShortForPrefix { have: bytes.len() });
@@ -345,10 +350,7 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     if channel == 0 && epoch != 0 {
         return Err(DecodeError::NonzeroEpochOnControlChannel { epoch });
     }
-    // Epoch 0 is reserved for the control channel (Section 6.1), so a routed
-    // channel without an epoch names no bindable route. Rejecting it here keeps
-    // the framing layer's identity contract symmetric instead of leaving the
-    // frame to be dropped as unmatched further up.
+    // Epoch 0 is reserved for channel 0; routed channels require a nonzero epoch.
     if channel != 0 && epoch == 0 {
         return Err(DecodeError::ZeroEpochOnRoutedChannel { channel });
     }
@@ -367,26 +369,15 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     })
 }
 
-/// Interoperability body maximum: exactly 64 MiB (protocol §6.3).
 pub const MAX_BODY_LEN: u32 = MAX_FRAME_BODY_LEN;
 
-/// Profile cap for a channel-0 control body (protocol §7.1).
 pub const MAX_CONTROL_BODY_LEN: u32 = 65_536;
 
-/// Aggregate resident-byte accounting.
 ///
-/// One permit is one byte. Charges attach to the buffers they account for and
-/// travel with moves; host-managed copies acquire a second charge. Tokio's
-/// semaphore is FIFO, so a queued maximum-size acquisition cannot be starved
-/// by later small ones; the frame deadline bounds how long an admission may
 /// wait.
 #[derive(Clone)]
 pub struct ByteBudget {
     semaphore: Arc<Semaphore>,
-    /// Permits the budget was created with. Retained because the semaphore
-    /// reports only what is currently available, and distinguishing "cannot
-    /// be satisfied right now" from "can never be satisfied" needs the
-    /// ceiling: the second case is a permanent rejection, not backpressure.
     capacity: usize,
 }
 
@@ -399,16 +390,10 @@ impl ByteBudget {
         }
     }
 
-    /// The ceiling an acquisition is measured against. A request for more
-    /// than this can never succeed no matter how much traffic drains, so
-    /// callers must report it as permanent rather than retryable.
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Waits for `bytes` of budget. Callers must bound the wait (deadline or
-    /// cancellation); the reader races this against the frame deadline and
-    /// emit paths race it against generation retirement.
     pub async fn charge(&self, bytes: u32) -> ByteCharge {
         let permit = self
             .semaphore
@@ -421,9 +406,6 @@ impl ByteBudget {
         }
     }
 
-    /// Atomically reserves `bytes` without waiting. `None` means the budget
-    /// cannot cover the request right now (or the count does not fit a
-    /// permit count); nothing is acquired partially.
     pub fn try_charge(&self, bytes: usize) -> Option<ByteCharge> {
         let bytes = u32::try_from(bytes).ok()?;
         if bytes == 0 {
@@ -443,16 +425,14 @@ impl ByteBudget {
     }
 }
 
-/// One held byte charge; releases its bytes on drop.
+/// Dropping a charge releases its held bytes.
 #[derive(Debug)]
 pub struct ByteCharge {
-    // Held for its Drop: releasing the permit returns the bytes to the
-    // budget at exactly the point the accounted buffer dies.
+    // Dropping `permit` returns its bytes to the budget.
     permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ByteCharge {
-    /// A zero-byte charge for header-only frames.
     pub fn none() -> Self {
         Self { permit: None }
     }
@@ -463,9 +443,7 @@ impl ByteCharge {
             .map_or(0, OwnedSemaphorePermit::num_permits)
     }
 
-    /// Splits `bytes` off into an independently owned charge. `None` when
-    /// this charge holds fewer than `bytes`; the original is unchanged then,
-    /// so a failed split can never create or destroy permits.
+    /// A failed split leaves the permit count unchanged.
     pub(crate) fn split(&mut self, bytes: usize) -> Option<ByteCharge> {
         if bytes == 0 {
             return Some(ByteCharge::none());
@@ -483,18 +461,13 @@ impl ByteCharge {
         }
     }
 
-    /// Monotonic shrink: releases everything above `bytes` back to the
-    /// budget immediately. A request to grow (bytes above the held count)
-    /// is a no-op — a charge can never be inflated after acquisition.
+    /// Requests above the acquired byte count leave the charge unchanged.
+    /// A charge cannot exceed its acquired byte count.
     pub(crate) fn shrink_to(&mut self, bytes: usize) {
         drop(self.split_excess(bytes));
     }
 
-    /// Monotonic shrink that hands the released permits back instead of
-    /// dropping them, so a caller holding a lock can defer the release
-    /// until after the guard falls. Releasing a permit takes the budget's
-    /// own waiter lock and wakes queued waiters, which must not happen
-    /// underneath an unrelated mutex.
+    /// Releasing a permit takes the budget's waiter lock and wakes queued waiters; callers must not release a permit while holding an unrelated mutex.
     pub(crate) fn split_excess(&mut self, bytes: usize) -> ByteCharge {
         let excess = self.bytes().saturating_sub(bytes);
         if excess == 0 {
@@ -536,8 +509,7 @@ pub struct EncodeError {
     pub body_len: usize,
 }
 
-/// Encodes one complete frame (header then body) as a single buffer so the
-/// writer emits it in one logical write.
+/// The writer emits the frame in one logical write.
 #[cfg(test)]
 pub fn encode_frame(
     ty: FrameType,
@@ -591,9 +563,7 @@ pub fn encode_owned_frame(
         corr: id.corr,
     }
     .encode();
-    // Exact-size growth: amortized `reserve` may double a full-capacity body
-    // (a 64 MiB response would hold 128 MiB), exceeding what the caller's
-    // byte-budget charge accounts for.
+    // Exact-size growth avoids `reserve` doubling a full-capacity body.
     body.reserve_exact(HEADER_LEN);
     body.resize(body_len + HEADER_LEN, 0);
     body.copy_within(..body_len, HEADER_LEN);
@@ -632,13 +602,10 @@ pub fn encode_split_frame(
     Ok((header.to_vec(), body))
 }
 
-/// Default flags for host-emitted body frames.
 pub fn response_flags(binary: bool, last: bool) -> Flags {
     Flags::new(binary, Priority::Interactive, last)
 }
 
-/// Flags for host-emitted pure-header frames: binary 0, last 0, Normal
-/// admission (protocol §6.1).
 pub fn pure_header_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
@@ -816,8 +783,6 @@ mod tests {
             decode_header(&h.encode()),
             Err(DecodeError::NonzeroEpochOnControlChannel { epoch: u32::MAX })
         );
-        // Epoch 0 is reserved for channel 0, so a routed channel must carry a
-        // nonzero epoch. Both halves of the pairing are structural.
         let h = hdr_with_epoch(
             0,
             FrameType::Request,
@@ -834,7 +799,6 @@ mod tests {
 
     #[test]
     fn sheddable_rejected_on_every_illegal_frame_type() {
-        // AdmissionClass::Sheddable = 0b10 at bits 4-5.
         let flags = Flags(Flags::new(false, Priority::Passive, false).0 | 0b0010_0000);
         assert_eq!(flags.admission_class(), Some(AdmissionClass::Sheddable));
         for ty in [
@@ -865,16 +829,16 @@ mod tests {
     fn capacity_separates_permanent_from_transient_exhaustion() {
         let budget = ByteBudget::new(100);
         assert_eq!(budget.capacity(), 100);
-        // Above the ceiling: no drain can ever satisfy it, so a caller must
-        // report this permanently rather than as retryable backpressure.
+        // No drain can satisfy a request above the ceiling.
+        // Requests above the ceiling return permanent rather than retryable backpressure.
         assert!(budget.try_charge(101).is_none());
         assert_eq!(
             budget.available(),
             budget.capacity(),
             "a request above the ceiling consumes nothing"
         );
-        // Within the ceiling but currently held: the same `None`, and only
-        // `capacity` distinguishes it from the permanent case.
+        // A request within `capacity` can return `None` while bytes are held.
+        // `capacity` distinguishes transient from permanent `None`.
         let held = budget.try_charge(80).expect("fits");
         assert!(budget.try_charge(40).is_none());
         assert!(
@@ -919,7 +883,7 @@ mod tests {
         portion.shrink_to(10);
         assert_eq!(portion.bytes(), 10);
         assert_eq!(budget.available(), 40);
-        // Growing is refused: shrink is monotonic.
+        // shrink_to only reduces a charge; requests above its current size leave it unchanged.
         portion.shrink_to(usize::MAX);
         assert_eq!(portion.bytes(), 10);
         assert_eq!(budget.available(), 40);

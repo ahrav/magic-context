@@ -4,17 +4,11 @@ import { recursiveCharacterSplit } from "./recursive-text-splitter";
 const charLen = (t: string) => t.length;
 
 // ---------------------------------------------------------------------------
-// Frozen pre-change reference (characterization oracle)
+// The reference independently defines expected output and work costs.
 //
-// Verbatim copy of the implementation as it existed BEFORE the indexed-window
-// optimization (front-drain `shift()` + drain-time re-measurement). It shares
-// NO code with the production splitter, so a behavior change there cannot
-// silently rewrite these expectations. The instrumentation models the two
-// costs the optimization removes:
-//   - `lengthCalls`: every lengthFunction invocation (the old code measured
-//     each fragment again while draining the window front);
-//   - `frontDrainCopiedUnits`: elements moved by each `shift()` (the array
-//     front copy the old drain paid per flushed window element).
+// The reference shares no code with the production splitter, so production changes cannot rewrite its expectations.
+// `lengthCalls` counts every `lengthFunction` call, including front-drain re-measurements.
+// `frontDrainCopiedUnits` sums `currentDoc.length` before each `currentDoc.shift()`.
 // ---------------------------------------------------------------------------
 
 interface ReferenceWork {
@@ -116,10 +110,6 @@ function referenceSplit(
     return { chunks: splitTextRecursive(text, separators, options.chunkSize), work };
 }
 
-// Literal known-answer anchors, recorded from the pre-change implementation.
-// These protect against a shared-reference bug: if BOTH the production
-// splitter and the frozen reference drifted identically, the literals below
-// would still fail.
 const tokenLen = (t: string) => t.split(/\s+/).filter(Boolean).length;
 
 const GOLDEN_FIXTURES: Array<{
@@ -201,7 +191,6 @@ describe("recursiveCharacterSplit", () => {
         for (const chunk of out) {
             expect(chunk.length).toBeLessThanOrEqual(10);
         }
-        // Round-trips the content (modulo separator trimming).
         expect(out.join("").replace(/\s/g, "")).toBe(text.replace(/\s/g, ""));
     });
 
@@ -244,7 +233,6 @@ describe("recursiveCharacterSplit", () => {
 describe("recursiveCharacterSplit output characterization (R34)", () => {
     for (const fixture of GOLDEN_FIXTURES) {
         test(`literal anchor: ${fixture.name}`, () => {
-            // Direct ordered comparison — no sorting, no whitespace normalization.
             expect(recursiveCharacterSplit(fixture.text, fixture.options)).toEqual(
                 fixture.expected,
             );
@@ -252,7 +240,7 @@ describe("recursiveCharacterSplit output characterization (R34)", () => {
 
         test(`frozen reference parity: ${fixture.name}`, () => {
             const reference = referenceSplit(fixture.text, fixture.options);
-            // The reference is deterministic across repeated evaluation.
+            // With `charLen` and a fresh `work` object, `referenceSplit` returns deterministic chunks and work counters.
             expect(referenceSplit(fixture.text, fixture.options).chunks).toEqual(reference.chunks);
             expect(reference.chunks).toEqual(fixture.expected);
             expect(recursiveCharacterSplit(fixture.text, fixture.options)).toEqual(
@@ -264,7 +252,7 @@ describe("recursiveCharacterSplit output characterization (R34)", () => {
     test("empty input and unsplittable fragments keep terminal behavior", () => {
         expect(referenceSplit("", { chunkSize: 4, lengthFunction: charLen }).chunks).toEqual([]);
         expect(recursiveCharacterSplit("", { chunkSize: 4, lengthFunction: charLen })).toEqual([]);
-        // With no finer separator, an over-budget fragment is emitted as-is.
+        // With no finer separator, a fragment whose measured length is at least `chunkSize` is emitted as-is.
         const options = {
             chunkSize: 2,
             lengthFunction: tokenLen,
@@ -309,16 +297,14 @@ describe("recursiveCharacterSplit output characterization (R34)", () => {
 });
 
 describe("recursiveCharacterSplit work bounds (R35)", () => {
-    /** Adversarial merge-window family: `n` short words packed into windows
-     *  whose size grows with `n`, so the pre-change front drain pays a
-     *  superlinear copy cost while a linear implementation does not. */
+    /**
+     * */
     function adversarialFixture(n: number): {
         text: string;
         chunkSize: number;
         wordCount: number;
     } {
         const words = Array.from({ length: n }, (_, i) => `w${String(i % 97).padStart(2, "0")}`);
-        // Window holds ~n/8 fragments, so old-drain copying scales ~n²/8.
         return { text: words.join(" "), chunkSize: Math.floor(n / 2), wordCount: n };
     }
 
@@ -337,9 +323,6 @@ describe("recursiveCharacterSplit work bounds (R35)", () => {
         const { text, chunkSize, wordCount } = adversarialFixture(400);
         const counter = countingCharLen();
         recursiveCharacterSplit(text, { chunkSize, lengthFunction: counter.fn });
-        // One measurement per fragment. Restoring drain-time measurement (the
-        // old `total -= lengthFunction(currentDoc[0])` loop) doubles this and
-        // fails the exact bound.
         expect(counter.calls()).toBe(wordCount);
     });
 
@@ -359,15 +342,10 @@ describe("recursiveCharacterSplit work bounds (R35)", () => {
             lengthFunction: largeCounter.fn,
         });
 
-        // Independent algebraic bound: exactly one call per fragment, so 2N
-        // input costs exactly 2x the calls of N input.
         expect(smallCounter.calls()).toBe(small.wordCount);
         expect(largeCounter.calls()).toBe(large.wordCount);
         expect(largeCounter.calls()).toBe(2 * smallCounter.calls());
 
-        // The frozen reference demonstrates the avoided superlinear costs on
-        // the same fixtures: repeated tokenization (more than one call per
-        // fragment) and front-drain copying that grows faster than 2x.
         const smallRef = referenceSplit(small.text, {
             chunkSize: small.chunkSize,
             lengthFunction: charLen,
@@ -382,7 +360,6 @@ describe("recursiveCharacterSplit work bounds (R35)", () => {
             3 * smallRef.work.frontDrainCopiedUnits,
         );
 
-        // Output parity holds on the scaling family too.
         expect(smallChunks).toEqual(smallRef.chunks);
         expect(largeChunks).toEqual(largeRef.chunks);
     });

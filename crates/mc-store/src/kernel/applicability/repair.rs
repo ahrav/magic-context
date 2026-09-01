@@ -214,7 +214,9 @@ pub fn commit_read_repair(
     });
     match result {
         Ok(receipt) => {
-            engine.confirm_durable_append(&object.token);
+            // A dropped confirmation is safe: an evicted entry misses on the
+            // next evaluation, which re-derives the verdict and re-appends.
+            let _ = engine.confirm_durable_append(&object.token);
             Ok(AppendOutcome::Landed {
                 commit_seq: receipt.commit_seq,
                 replayed: receipt.replayed,

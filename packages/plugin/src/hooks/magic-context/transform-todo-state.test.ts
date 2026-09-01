@@ -1,16 +1,9 @@
 /// <reference types="bun-types" />
 
 /**
- * Synthetic-todowrite injection tests covering all 7 branches of the
- * todo state placement logic in transform-postprocess-phase.ts.
  *
- * Cache-safety invariant under test: defer-pass replays produce
- * byte-identical message shape to the previous defer pass on the same
- * data. We verify by:
- *   1. Snapshotting the synthetic part after a cache-busting pass.
- *   2. Running multiple defer passes in sequence.
- *   3. Asserting each defer pass leaves the message array structurally
- *      identical (same tool callID, same anchor message, same input).
+ * A defer replay must preserve the previous defer pass's message array structure.
+ * Defer replays use the same tool callID, anchor message, and input.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
@@ -49,7 +42,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     tempDirs.length = 0;
     process.env.XDG_DATA_HOME = undefined;
@@ -113,10 +106,7 @@ function buildMessages(): MessageLike[] {
 }
 
 /**
- * Mirrors the production logic at transform-postprocess-phase.ts:712-790.
- * Pulled out into a helper so we can drive it with explicit inputs from
- * tests without booting the full transform pipeline. Must stay in sync
- * with the production code.
+ * The helper must match `applyTodoSynthesis` placement behavior.
  */
 function runTodoSynthesis(args: {
     db: ReturnType<typeof openDatabase>;
@@ -141,7 +131,7 @@ function runTodoSynthesis(args: {
             persistedAnchor.callId === part.callID &&
             injectPersistedTodoAnchor(messages, persistedAnchor.messageId, part)
         ) {
-            // Mirror production: backfill stateJson if it's empty (legacy upgrade row).
+            // Empty `stateJson` identifies legacy rows; the backfill upgrades them.
             if (persistedAnchor.stateJson.length === 0) {
                 setPersistedTodoSyntheticAnchor(
                     db,
@@ -164,8 +154,7 @@ function runTodoSynthesis(args: {
             sessionMeta.lastTodoState,
         );
     } else if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
-        // Defer pass — replay rebuilds from PERSISTED stateJson, NOT from
-        // sessionMeta.lastTodoState. Council Finding #1 fix.
+        // During a defer pass, replay rebuilds from persisted `stateJson`.
         const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
         if (part !== null && part.callID === persistedAnchor.callId) {
             injectPersistedTodoAnchor(messages, persistedAnchor.messageId, part);
@@ -234,8 +223,7 @@ describe("todo state synthesis — live permission cache boundaries", () => {
         expect(countSyntheticParts(bustMessages)).toBe(1);
         const frozenBytes = JSON.stringify(bustMessages);
 
-        // A permission flip is not allowed to mutate a defer prefix. The cached
-        // allow verdict is replayed until the next cache-busting pass.
+        // A permission flip cannot mutate a defer prefix; the cached allow verdict is replayed until the next cache-busting pass.
         denied = true;
         updateSessionMeta(db, sessionId, {
             lastTodoState: JSON.stringify([
@@ -362,8 +350,7 @@ describe("todo state synthesis — cache-busting branches", () => {
         );
 
         const messages = buildMessages();
-        // Pre-seed: pretend the part is already in messages (simulates state
-        // already injected on a prior pass that's now persisted).
+        // The pre-seeded part simulates injection on a prior persisted pass.
         const part = buildSyntheticTodoPart(ACTIVE_TODOS_JSON);
         if (!part) throw new Error("part null");
         const asst2 = messages.find((m) => m.info.id === "msg-asst-2");
@@ -378,7 +365,6 @@ describe("todo state synthesis — cache-busting branches", () => {
             fullFeatureMode: true,
         });
 
-        // Idempotent: still exactly one synthetic part on msg-asst-2.
         expect(countSyntheticParts(messages)).toBe(1);
         const found = findSyntheticPart(messages);
         expect(found?.messageId).toBe("msg-asst-2");
@@ -390,15 +376,14 @@ describe("todo state synthesis — cache-busting branches", () => {
     });
 
     it("Branch 3 (fresh-message variant): cache-bust + matching anchor + no pre-seeded synthetic → injection lands at persisted anchor", () => {
-        // Realistic Branch 3: OpenCode rebuilds messages from its DB every
-        // pass (no synthetic part survives), but our persisted anchor still
-        // matches. Injection should land at the persisted anchor message,
-        // not at the LATEST assistant. Closes Council Finding #8.
+        // The replay injects at the matching persisted anchor when OpenCode rebuilds messages without synthetic parts.
+        // OpenCode can rebuild messages without synthetic parts while the persisted anchor remains valid.
+        // Injection must land at the persisted anchor message.
         useTempDataHome("todo-b3-fresh-");
         const db = openDatabase();
         const callId = computeSyntheticCallId(ACTIVE_TODOS_JSON);
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
-        // Anchor at msg-asst-1, NOT the latest assistant.
+        // Injection must anchor at `msg-asst-1`, not the latest assistant message.
         setPersistedTodoSyntheticAnchor(db, "ses-1", callId, "msg-asst-1", ACTIVE_TODOS_JSON);
 
         const messages = buildMessages(); // fresh, no synthetic seeded
@@ -413,8 +398,6 @@ describe("todo state synthesis — cache-busting branches", () => {
 
         expect(countSyntheticParts(messages)).toBe(1);
         const found = findSyntheticPart(messages);
-        // Lands at the PERSISTED anchor (asst-1), not the latest (asst-2).
-        // injectToolPartIntoAssistantById succeeded → no fall-through to fresh.
         expect(found?.messageId).toBe("msg-asst-1");
         // Anchor unchanged.
         expect(getPersistedTodoSyntheticAnchor(db, "ses-1")).toEqual({
@@ -482,7 +465,7 @@ describe("todo state synthesis — cache-busting branches", () => {
         const oldCallId = "mc_synthetic_todo_oldoldoldoldold0";
         const newCallId = computeSyntheticCallId(ACTIVE_TODOS_JSON);
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
-        // Old persisted state was terminal-shaped (different content) → different callId.
+        // Different persisted `stateJson` produces a different callId.
         setPersistedTodoSyntheticAnchor(db, "ses-1", oldCallId, "msg-asst-1", TERMINAL_TODOS_JSON);
 
         const messages = buildMessages();
@@ -508,7 +491,6 @@ describe("todo state synthesis — cache-busting branches", () => {
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
         setPersistedTodoSyntheticAnchor(db, "ses-1", oldCallId, "msg-prior", ACTIVE_TODOS_JSON);
 
-        // No assistant messages in this window
         const messages: MessageLike[] = [
             {
                 info: { id: "msg-user-only", role: "user", sessionID: "ses-1" },
@@ -607,7 +589,6 @@ describe("todo state synthesis — defer branches and byte stability", () => {
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
         setPersistedTodoSyntheticAnchor(db, "ses-1", callId, "msg-asst-2", ACTIVE_TODOS_JSON);
 
-        // Snapshot after first defer pass
         const initialMessages = buildMessages();
         runTodoSynthesis({
             db,
@@ -618,8 +599,6 @@ describe("todo state synthesis — defer branches and byte stability", () => {
         });
         const baseline = JSON.stringify(initialMessages);
 
-        // Run 5 more defer passes from FRESH messages each time (simulates
-        // OpenCode rebuilding the message array from its DB on every pass).
         for (let i = 0; i < 5; i += 1) {
             const messages = buildMessages();
             runTodoSynthesis({
@@ -634,17 +613,15 @@ describe("todo state synthesis — defer branches and byte stability", () => {
     });
 
     it("CACHE STABILITY: defer replays PERSISTED state JSON, not last_todo_state (Council Finding #1)", () => {
-        // The critical scenario: between cache-bust T0 and defer T1, a real
-        // todowrite mutates last_todo_state. The defer pass MUST replay the
-        // OLD state at the OLD anchor (what T0 emitted) so prefix bytes stay
-        // identical. Without this, T1 diverges from T0 at the anchor and
-        // breaks Anthropic prompt cache.
+        // A real `todowrite` can update `lastTodoState` between cache-busting and defer passes.
+        // The defer pass must replay the state persisted by the preceding cache-busting pass.
+        // The defer pass replays the state at the persisted anchor to preserve the cached prefix.
+        // Replaying newer state changes the prefix at the persisted anchor.
+        // A changed prefix prevents prompt-cache reuse.
         useTempDataHome("todo-finding1-");
         const db = openDatabase();
-        // T0 injected ACTIVE_TODOS_JSON at msg-asst-2 with the matching callId.
         const oldCallId = computeSyntheticCallId(ACTIVE_TODOS_JSON);
         setPersistedTodoSyntheticAnchor(db, "ses-1", oldCallId, "msg-asst-2", ACTIVE_TODOS_JSON);
-        // Then the agent called real todowrite that updated last_todo_state.
         const newState = JSON.stringify([
             { content: "Brand new todo", status: "pending", priority: "low" },
         ]);
@@ -659,14 +636,12 @@ describe("todo state synthesis — defer branches and byte stability", () => {
             fullFeatureMode: true,
         });
 
-        // Defer replays the OLD state — still exactly one synthetic part,
-        // with the OLD callId (matching what T0 sent on the wire).
         expect(countSyntheticParts(messages)).toBe(1);
         const found = findSyntheticPart(messages);
         expect(found?.messageId).toBe("msg-asst-2");
         const part = found?.part as { callID?: string };
         expect(part?.callID).toBe(oldCallId);
-        // Anchor unchanged — next cache-bust will pick up newState.
+        // The next cache-busting pass uses `lastTodoState` instead of the persisted anchor state.
         expect(getPersistedTodoSyntheticAnchor(db, "ses-1")).toEqual({
             callId: oldCallId,
             messageId: "msg-asst-2",
@@ -675,15 +650,11 @@ describe("todo state synthesis — defer branches and byte stability", () => {
     });
 
     it("CACHE STABILITY: T0 cache-bust → T1 defer with fresh messages → byte-identical (Council Finding #3)", () => {
-        // The end-to-end T0→T1 stability test: cache-bust pass at T0 from
-        // fresh messages, snapshot stringified output, rebuild messages from
-        // scratch (simulates OpenCode reloading from its DB), run defer pass
-        // at T1, assert identical bytes.
+        // Rebuilt-message defer passes must reproduce cache-busting output byte-for-byte.
         useTempDataHome("todo-t0-t1-");
         const db = openDatabase();
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
 
-        // T0: cache-bust pass injects + persists.
         const t0Messages = buildMessages();
         runTodoSynthesis({
             db,
@@ -693,10 +664,8 @@ describe("todo state synthesis — defer branches and byte stability", () => {
             fullFeatureMode: true,
         });
         const t0Bytes = JSON.stringify(t0Messages);
-        // Sanity: synthetic landed.
         expect(countSyntheticParts(t0Messages)).toBe(1);
 
-        // T1: defer pass starts from fresh messages (OpenCode rebuilds from DB).
         const t1Messages = buildMessages();
         runTodoSynthesis({
             db,
@@ -711,10 +680,7 @@ describe("todo state synthesis — defer branches and byte stability", () => {
     });
 
     it("CACHE STABILITY: T0 cache-bust → real todowrite → T1 defer → still byte-identical (Council Finding #1 e2e)", () => {
-        // The exact T0-state-changed-T1 scenario as an integration test.
-        // T0 injects ACTIVE_TODOS_JSON; then the agent's real todowrite
-        // updates last_todo_state; then T1 runs as a defer pass. T1 bytes
-        // must equal T0 bytes.
+        // The defer output must equal the preceding cache-busting output byte-for-byte.
         useTempDataHome("todo-t0-t1-changed-");
         const db = openDatabase();
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
@@ -729,7 +695,7 @@ describe("todo state synthesis — defer branches and byte stability", () => {
         });
         const t0Bytes = JSON.stringify(t0Messages);
 
-        // Real todowrite fires between T0 and T1, updating last_todo_state.
+        // A real `todowrite` fires between T0 and T1, updating `lastTodoState`.
         const newState = JSON.stringify([
             { content: "different", status: "in_progress", priority: "high" },
         ]);
@@ -745,33 +711,26 @@ describe("todo state synthesis — defer branches and byte stability", () => {
         });
         const t1Bytes = JSON.stringify(t1Messages);
 
-        // T1 must equal T0 byte-for-byte even though last_todo_state changed.
+        // T1 must equal T0 byte-for-byte even though `lastTodoState` changed.
         expect(t1Bytes).toBe(t0Bytes);
     });
 
     it("CACHE STABILITY: legacy row with empty stateJson self-heals on cache-bust + replays on next defer (Oracle final audit)", () => {
-        // The exact upgrade scenario Oracle's final audit flagged:
-        // a user on the original v0.17 build had `(callId, messageId, stateJson='')`
-        // persisted because that build only stored callId+messageId. The v11
-        // migration's DEFAULT '' added the column, but existing rows have
-        // stateJson=''. Without self-heal, the next defer pass would skip
-        // replay (line 770 gate fails on length===0) and the synthetic would
-        // vanish from T1 — exactly the regression we're guarding against.
+        // Persisted `stateJson === ""` identifies a legacy anchor requiring repair.
+        // The repair backfills anchors with `stateJson === ""` before defer replay.
+        // An empty stateJson prevents the defer pass from replaying the synthetic part.
         useTempDataHome("todo-legacy-stateJson-");
         const db = openDatabase();
         updateSessionMeta(db, "ses-1", { lastTodoState: ACTIVE_TODOS_JSON });
-        // Seed a legacy row: callId matches current snapshot, but stateJson is empty.
         const callId = computeSyntheticCallId(ACTIVE_TODOS_JSON);
         setPersistedTodoSyntheticAnchor(db, "ses-1", callId, "msg-asst-2", "");
 
-        // Pre-seed a synthetic part on the anchor message (simulates state
-        // already injected on a previous pass before this build was loaded).
+        // The cache-bust pass must preserve the anchor message's existing synthetic part.
         const part = buildSyntheticTodoPart(ACTIVE_TODOS_JSON);
         if (!part) throw new Error("part null");
         const asst2 = buildMessages().find((m) => m.info.id === "msg-asst-2");
         if (!asst2) throw new Error("asst-2 missing");
 
-        // T0: cache-bust pass on a legacy row.
         const t0Messages = buildMessages();
         const t0Asst2 = t0Messages.find((m) => m.info.id === "msg-asst-2");
         if (!t0Asst2) throw new Error("t0 asst-2 missing");
@@ -785,14 +744,12 @@ describe("todo state synthesis — defer branches and byte stability", () => {
         });
         const t0Bytes = JSON.stringify(t0Messages);
 
-        // Backfill must have happened — anchor row now has stateJson.
         const after = getPersistedTodoSyntheticAnchor(db, "ses-1");
         expect(after?.callId).toBe(callId);
         expect(after?.messageId).toBe("msg-asst-2");
         expect(after?.stateJson).toBe(ACTIVE_TODOS_JSON);
 
-        // T1: defer pass from fresh messages (OpenCode rebuild). Without the
-        // backfill, this would skip injection and produce different bytes.
+        // Without stateJson backfill, the defer pass skips injection and changes the serialized messages.
         const t1Messages = buildMessages();
         runTodoSynthesis({
             db,
@@ -846,8 +803,6 @@ describe("todo state synthesis — wire shape", () => {
         if (!found) throw new Error("synthetic part missing");
         const part = found.part as Record<string, unknown>;
 
-        // These five fields are the OpenCode tool-part contract that the
-        // serializer expects. Any drift here breaks Anthropic / OpenAI
         // serialization downstream.
         expect(part.type).toBe("tool");
         expect(part.tool).toBe("todowrite");

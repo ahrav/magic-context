@@ -51,16 +51,11 @@ describe("catalog-bound executable verifier gate", () => {
     const key = `packages/e2e-tests/${scenario}`;
 
     it("covers every executable module the committed catalog binds", () => {
-        // The mutation-command map names Rust degradation tests and standalone
-        // Bun test files, never the modules that score the pool. Deriving the
-        // set from the bindings is what puts the scoring verifiers under a gate.
         const files = boundVerifierFiles(committedCatalog());
         expect(files.length).toBeGreaterThan(0);
         for (const file of files) {
             expect(file.startsWith("src/incident-pool/scenarios/")).toBe(true);
         }
-        // Every registered case's module is represented, so no scoring verifier
-        // sits outside the compared set.
         expect(builtinIncidentCaseRegistry().size).toBe(21);
     });
 
@@ -93,7 +88,7 @@ describe("catalog-bound executable verifier gate", () => {
     });
 
     it("accepts a module the accepted base never bound", () => {
-        // A new case has no accepted bytes to drift from.
+        // The accepted base has no bytes for a newly bound module to drift from.
         expect(() =>
             assertCatalogBoundVerifierBytesUnchanged(
                 {},

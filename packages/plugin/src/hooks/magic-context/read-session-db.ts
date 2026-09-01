@@ -28,10 +28,6 @@ function getOpenCodeDbPath(): string {
 }
 
 /**
- * Whether OpenCode's session DB file exists. Raw-message readers consult this
- * before opening it so a harness with no OpenCode DB (a Pi-only install, or a
- * transform whose per-session RawMessageProvider was unregistered out-of-band)
- * degrades to "no messages" instead of throwing `unable to open database file`.
  */
 export function openCodeDbExists(): boolean {
     return existsSync(getOpenCodeDbPath());
@@ -69,15 +65,12 @@ export function withReadOnlySessionDb<T>(fn: (db: Database) => T): T {
     return fn(getReadOnlySessionDb());
 }
 
-// Intentional: exported for tests; production relies on process-exit cleanup (same as closeDatabase)
 export function closeReadOnlySessionDb(): void {
     closeCachedReadOnlyDb();
 }
 
 export function getRawSessionMessageCountFromDb(db: Database, sessionId: string): number {
-    // Exclude compaction summary messages injected by magic-context.
-    // These are structural markers for OpenCode's filterCompacted, not real user/assistant content.
-    // Use COALESCE to handle NULL json_extract results (messages without summary/finish fields).
+    // COALESCE treats NULL json_extract results from messages without summary or finish fields as non-summary values.
     const row = db
         .prepare(
             `SELECT COUNT(*) as count FROM message WHERE session_id = ?
@@ -156,23 +149,9 @@ function hasNewerRealUserMessage(
              LIMIT 1`,
         )
         .get(sessionId, latestAssistantTimeCreated) as ExistenceRow | null;
-    // OpenCode persists synthetic as an annotation on the PART row's data, never
-    // on the message row. So separating injected from real user messages requires
-    // a part join. A user message is injected iff it HAS at least one part AND
-    // EVERY part is machine-generated — where a part is machine-generated if it
-    // carries either synthetic=true, a marker part (metadata.marker.kind), or
-    // an ignored flag. Marker parts are deliberately NON-synthetic so the TUI
-    // renders them as visible system-event lines; they are identified
-    // structurally. Ignored parts are dropped by opencode's own model-facing
-    // serializer (message-v2.ts:206): an ignored text part is never pushed into
-    // the model-facing message, so a message whose parts are all ignored cannot
-    // constitute a real user turn. ALL-parts semantics is load-bearing: a real
-    // operator prompt may include a synthetic `agent` part from an @mention —
-    // classifying that as injected would release the mid-turn lock on genuine
-    // human input (the inverse bug, and worse). The EXISTS guard on part rows is
-    // the vacuous-ALL fence: a partless message satisfies "every part is
-    // machine-generated" trivially, so it must count as real to avoid incorrectly
-    // suppressing a lock release.
+    // Parts with synthetic=true, metadata.marker.kind, or an ignored flag do not make a user message real.
+    // A user message with at least one non-synthetic, unmarked, non-ignored part counts as real.
+    // A partless user message counts as real.
     return row?.one === 1;
 }
 
@@ -182,12 +161,7 @@ interface AssistantModelRow {
 }
 
 /**
- * Read the provider/model of the most recent assistant message for a session
- * directly from OpenCode's SQLite DB. Used as a fallback when the in-memory
- * `liveModelBySession` map is empty — for example when `/ctx-status` is invoked
- * before any transform pass has populated the map after restart.
  *
- * Returns null for brand-new sessions with no assistant turn yet.
  */
 interface MessageTimeRow {
     id?: string;
@@ -195,11 +169,7 @@ interface MessageTimeRow {
 }
 
 /**
- * Resolve `time_created` (ms since epoch) for a set of OpenCode message IDs.
- * Returns a Map keyed by message ID. Missing IDs are simply omitted.
  *
- * Used by temporal-awareness to map compartment start/end message IDs to
- * wall-clock dates for `## start-end · date · title` headings in
  * `<session-history>`.
  */
 export function getMessageTimesFromOpenCodeDb(
@@ -211,8 +181,6 @@ export function getMessageTimesFromOpenCodeDb(
 
     try {
         withReadOnlySessionDb((db) => {
-            // SQLite limits on IN (?, ?, ...) are high (~999 by default) so a
-            // single batched query is safe for any realistic compartment count.
             const placeholders = messageIds.map(() => "?").join(",");
             const rows = db
                 .prepare(

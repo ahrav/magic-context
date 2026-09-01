@@ -183,15 +183,13 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
         const db = createTestDb();
         try {
             const sessionId = "ses-test-1";
-            // Resolve a project identity that getMemoriesByProject will key on.
-            // Using process.cwd() as the directory matches what the production
-            // call site does (the RPC handler receives the user's directory).
+            // getMemoriesByProject keys memories by the resolved project identity.
             const directory = process.cwd();
             const projectIdentity = resolveProjectIdentity(directory);
 
-            // Insert a few memories under this project so renderMemoryBlock has
-            // real content to tokenize. Without these, the on-demand render
-            // returns an empty block and tokens stay at 0.
+            // The test seeds memories for the resolved project identity so renderMemoryBlock has content to tokenize.
+            // Without seeded memories, renderMemoryBlock returns an empty block and its token count is 0.
+            // renderMemoryBlock returns an empty block when no memories are seeded, so its token count is 0.
             seedProjectMemoryClaim(db, {
                 projectIdentity,
                 category: "PROJECT_RULES",
@@ -204,9 +202,6 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                     "OpenCode source lives at ~/Work/OSS/opencode (cloned for cross-reference, not a workspace package).",
             });
 
-            // Seed session_meta with the regression-trigger shape:
-            //   memory_block_cache = ''  (cleared by historian/recomp/etc.)
-            //   memory_block_count > 0  (preserved across cache busts)
             db.prepare(
                 `INSERT INTO session_meta (
                     session_id, last_input_tokens, last_context_percentage,
@@ -222,9 +217,8 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                 4000, // injection budget tokens, matching default config
             );
 
-            // The bug: memoryTokens used to be 0 here because the fallback path
-            // wasn't implemented. After the fix, it should be > 0 because we
-            // render the memory block on-demand from the memories table.
+            // When memory_block_cache is empty and memory_block_count is positive, memoryTokens derives from the rendered memories block.
+            // With seeded memories and an empty memory_block_cache, memoryTokens comes from the rendered memories block.
             expect(snapshot.memoryBlockCount).toBe(2);
             expect(snapshot.memoryTokens).toBeGreaterThan(0);
         } finally {
@@ -281,8 +275,8 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             const m0 =
                 "<session-history>\n</session-history>\n\n" +
                 "<project-memory>\n<ARCHITECTURE>\n#1: a durable architectural fact about the system\n</ARCHITECTURE>\n</project-memory>";
-            // memory_block_cache holds the LEGACY v1 shape — must be IGNORED for
-            // the token bucket now (it under-counts the real injected cost).
+            // The token calculation ignores memory_block_cache because it stores the legacy v1 shape.
+            // The token bucket ignores memory_block_cache because it under-counts the injected cost.
             const v1Cache = "<project-memory>\n- a durable architectural fact\n</project-memory>";
 
             db.prepare(
@@ -564,9 +558,9 @@ describe("buildStatusDetail — history token reuse (council audit bg_51106601 #
 
             const detail = buildStatusDetail(db, sessionId, directory);
 
-            // v2: facts are retired as a render source (promoted to memories), so
-            // factTokens is 0 and the history block is compartments only — facts
-            // no longer contribute to rendered <session-history> bytes.
+            // In v2, facts are promoted to memories and no longer supply rendered content.
+            // In v2, factTokens is 0, and <session-history> renders only compartments.
+            // In v2, facts no longer contribute to rendered <session-history> bytes.
             expect(detail.compartmentTokens).toBeGreaterThan(0);
             expect(detail.factTokens).toBe(0);
             expect(detail.historyBlockTokens).toBe(detail.compartmentTokens);
@@ -582,9 +576,8 @@ describe("buildStatusDetail — storage versions probe", () => {
         try {
             const detail = buildStatusDetail(db, "ses-storage-versions", process.cwd());
 
-            // The probe must carry the live MAX(schema_migrations) value, not a
-            // hardcoded one, plus this build's fence. A fully migrated test DB sits
-            // exactly at the fence.
+            // The probe uses the live MAX(schema_migrations) value and this build's fence.
+            // A fully migrated test database has MAX(schema_migrations) equal to the fence.
             expect(detail.storage_versions.context_db_schema_version).toBe(
                 getPersistedSchemaVersion(db),
             );
@@ -605,11 +598,10 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
             const sessionId = "ses-status-never";
             const directory = process.cwd();
 
-            // Force-create the session meta row so the UPDATE lands on an existing row.
+            // The test force-creates the session meta row so the UPDATE lands on an existing row.
             db.prepare(`INSERT INTO session_meta (session_id) VALUES (?)`).run(sessionId);
-            // Seed last_response_time: the cacheNeverExpires branch only runs
-            // inside `if (lastResponseTime > 0)` — without this the test would
-            // pass even if Infinity leaked into cacheRemainingMs.
+            // The test seeds last_response_time because cacheNeverExpires runs only when lastResponseTime > 0.
+            // Without a positive lastResponseTime, the test would not detect Infinity in cacheRemainingMs.
             db.prepare(
                 "UPDATE session_meta SET cache_ttl = ?, last_response_time = ? WHERE session_id = ?",
             ).run("never", Date.now() - 60_000, sessionId);
@@ -618,11 +610,11 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
 
             expect(detail.cacheNeverExpires).toBe(true);
             expect(detail.cacheExpired).toBe(false);
-            // Infinity must NOT leak into the numeric RPC field — JSON.stringify
-            // converts Infinity to null, violating the StatusDetail contract.
+            // Infinity must not reach the numeric RPC field because JSON.stringify converts it to null.
+            // JSON.stringify converts Infinity to null, violating the StatusDetail contract.
             // -1 is the never-expires sentinel: distinguishable from 0 (expired)
-            // by the value alone, so a consumer that never learned the flag cannot
-            // misread a warm lane as expired.
+            // -1 distinguishes never-expiring entries from expired entries (0), so consumers need not read a separate flag.
+            // -1 distinguishes never-expiring entries from expired entries (0).
             expect(detail.cacheRemainingMs).toBe(-1);
             expect(detail.cacheTtlMs).toBe(-1);
             const roundTripped = JSON.parse(JSON.stringify(detail));

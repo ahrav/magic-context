@@ -3,17 +3,11 @@
  * Export the project-identity inventory as a ck-projects seed_import corpus.
  *
  * One JSONL line per identity:
- *   {"identity": "git:<sha>"|"dir:<md5-12>", "roots": [...], "sources": {"session_bindings": n, "memory_rows": n}}
+ * Each line is a JSON object with identity, roots, and session_bindings and memory_rows source counts.
  *
- * The dump is deliberately UNCLEANED: dir:-transient aliases (git-cooldown
- * fallbacks for roots that also carry a git: identity) and dead worktree roots
- * stay in, because the registry's seed importer wants real topology to exercise
- * its identity_split / alias_occupied merge arms and the seeds-only
- * skip-with-provenance path for missing roots. "sources" is report provenance
- * only; it never enters the registry's hash contract.
+ * The dump retains dir:-transient aliases and dead worktree roots.
  *
  * Usage: bun packages/plugin/scripts/export-project-identities.ts [out.jsonl]
- * Reads the live context.db (identities) and opencode.db (session directories)
  * read-only; writes to stdout when no path is given.
  */
 import { storageSubtreePath } from "../src/shared/data-path";
@@ -52,9 +46,6 @@ interface Row {
 
 const rows: Row[] = [];
 
-// session_projects binds session -> identity; the session's working directory
-// (the observed root) lives in the harness store. Join across the two DBs
-// in-process: identity map from context.db, directories from opencode.db.
 const directoryBySession = new Map<string, string>();
 for (const r of opencodeDb
     .prepare("SELECT id, directory FROM session WHERE directory IS NOT NULL")
@@ -65,9 +56,7 @@ for (const r of db
     .prepare("SELECT session_id, project_path AS identity FROM session_projects")
     .all() as Array<{ session_id: string; identity: string }>) {
     const root = directoryBySession.get(r.session_id) ?? null;
-    // A home identity is valid for an explicitly opted-in session, but must
-    // never seed the fleet registry: its root would otherwise contain every
-    // unrelated directory below $HOME.
+    // A canonical-home root must never seed the fleet registry because it contains unrelated directories below $HOME.
     if (r.identity === homeIdentity || (root !== null && isCanonicalHomeRoot(root))) continue;
     rows.push({
         identity: r.identity,
@@ -76,16 +65,13 @@ for (const r of db
     });
 }
 
-// Claim rows carry the identity through `projects`; they contribute source
-// counts (and can surface identities that never got a session binding, e.g.
+// Claim rows contribute source counts and can surface identities without session bindings.
 // imported pools).
 for (const r of db
     .prepare(
         "SELECT DISTINCT projects.canonical_identity AS identity FROM claims JOIN projects ON projects.id = claims.project_id WHERE projects.canonical_identity LIKE 'git:%' OR projects.canonical_identity LIKE 'dir:%'",
     )
     .all() as Array<{ identity: string }>) {
-    // Claim-only rows have no harness root to inspect, so recognize the same
-    // canonical-home dir: identity directly.
     if (r.identity === homeIdentity) continue;
     rows.push({ identity: r.identity, root: null, source: "memory_rows" });
 }

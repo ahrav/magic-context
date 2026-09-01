@@ -1,12 +1,8 @@
 /**
- * Transaction-local claim policy write kernel and fact readers
- * (claim-trust-policy plan: U2; KTD1-KTD4, KTD7, KTD9).
  *
- * Every writer here assumes the caller already holds the outer write
- * transaction (`runInMemoryClaimsWriteTransaction` / the operation envelope),
- * matching the claim-operation kernel pattern. Policy decisions,
- * projection rows, outbox effects, and generations therefore commit together
- * (R27); the append-only v86 triggers enforce the ledger invariants at the
+ * Callers must hold the outer write transaction.
+ * Policy decisions, projection rows, outbox effects, and generations commit together.
+ * Database triggers enforce ledger invariants.
  * database boundary.
  */
 
@@ -39,7 +35,7 @@ export interface PolicySubjectRow {
     policyVersion: number;
 }
 
-/** Whether this database migrated to v86. */
+/* */
 export function hasClaimPolicySchema(db: Database): boolean {
     return (
         db
@@ -73,11 +69,9 @@ export interface CreatePolicySubjectInput {
     nowMs?: number;
 }
 
-/** Load the revision's exact content digest or refuse the write: every
- *  authority row (policy subject, approval, enforcement artifact) binds to
- *  the revision's exact bytes, and a missing revision must fail the write
- *  rather than bind against unchecked data. Shared so a future change to
- *  this binding (extra validation, column change) lands once. */
+/**
+ * Reject writes when `revisionId` has no `claim_revisions` row.
+ * */
 function loadRevisionDigestOrThrow(db: Database, revisionId: number): string {
     const revision = db
         .prepare("SELECT content_sha256 AS digest FROM claim_revisions WHERE id = ?")
@@ -87,11 +81,7 @@ function loadRevisionDigestOrThrow(db: Database, revisionId: number): string {
 }
 
 /**
- * Freeze one immutable policy subject for a revision (R1, KTD2). The bound
- * digest is read from the revision row itself so callers cannot bind foreign
- * content; the database guards re-prove project, digest, and origin evidence.
- * Idempotent: an existing subject row is returned untouched (a held-open
- * writer omission stays readable as conservative unknown until then, R26).
+ * The function reads `source_digest` from `claim_revisions` to prevent caller-supplied digest bindings.
  */
 export function createPolicySubjectInCurrentTransaction(
     db: Database,
@@ -150,11 +140,8 @@ export interface AppendMaturityAssertionInput {
 }
 
 /**
- * Append one maturity decision (KTD1). Reads the stream head inside the
- * caller's immediate transaction, consumes exactly the current predecessor,
- * and lets the chain/ladder/collision triggers reject a racing writer's
- * duplicate successor. Returns null when the head already sits at or above
- * the requested rung (idempotent no-op).
+ * The transition consumes only the current predecessor in the caller's transaction.
+ * The function returns `null` when the head is already at or above the requested rung.
  */
 export function appendMaturityAssertionInCurrentTransaction(
     db: Database,
@@ -206,9 +193,9 @@ export interface RecordDispositionEventInput {
     nowMs?: number;
 }
 
-/** Append one explicit disposition assert/clear (R14). Idempotent per state:
- * asserting an already-active disposition (or clearing an inactive one)
- * returns null instead of appending noise. */
+/**
+ * The function returns `null` when asserting an active disposition or clearing an inactive disposition.
+ * */
 export function recordDispositionEventInCurrentTransaction(
     db: Database,
     input: RecordDispositionEventInput,
@@ -253,10 +240,9 @@ export interface RecordApprovalActionInput {
 }
 
 /**
- * Append one host-confirmed approval action (R10, KTD5). The revision digest
- * is bound from the current revision row inside the same transaction; the
- * database guards re-prove the binding. Replaying a completed command
- * identity returns the stored row id; reusing it for a different revision or
+ * The function binds the approval digest from `claim_revisions` in the same transaction.
+ * Database constraints revalidate the approval digest binding.
+ * A replayed completed command identity returns its stored row ID.
  * action fails.
  */
 export function recordApprovalActionInCurrentTransaction(
@@ -314,13 +300,13 @@ export interface RecordEnforcementArtifactInput {
     evaluator: string;
     evaluatorVersion: string;
     evaluatorResult: EnforcementArtifactResult;
-    /** Filesystem root the evaluation ran in; revalidation only rehashes
-     *  from this checkout (clones/worktrees share the project identity). */
+    /**
+     * */
     enforcedFromRoot?: string | null;
     nowMs?: number;
 }
 
-/** Append one content-addressed enforcement artifact record (R11, KTD6). */
+/* */
 export function recordEnforcementArtifactInCurrentTransaction(
     db: Database,
     input: RecordEnforcementArtifactInput,
@@ -352,7 +338,7 @@ export function recordEnforcementArtifactInCurrentTransaction(
     return Number(result.lastInsertRowid);
 }
 
-/** Append one artifact revocation event (KTD6): removes ENFORCED support. */
+/** Revocation removes ENFORCED support. */
 export function revokeEnforcementArtifactInCurrentTransaction(
     db: Database,
     artifactId: number,
@@ -369,9 +355,8 @@ export function revokeEnforcementArtifactInCurrentTransaction(
 }
 
 /**
- * Every passing, unrevoked enforcement artifact for the revision. Revocation
- * must cover the full set: revoking only the latest would let a re-approval
- * restore ENFORCED through an older still-valid artifact.
+ * Revocation must cover every passing, unrevoked enforcement artifact for the revision.
+ * Revocation cannot restore `ENFORCED` through an older still-valid artifact.
  */
 export function currentValidArtifactIds(db: Database, revisionId: number): number[] {
     const rows = db
@@ -389,10 +374,9 @@ export function currentValidArtifactIds(db: Database, revisionId: number): numbe
 }
 
 // ---------------------------------------------------------------------------
-// Current-support fact readers (R15): append-only history in, booleans out.
 // ---------------------------------------------------------------------------
 
-/** Latest effective approval action for the revision, or null. */
+/* */
 export function currentApprovalActionId(db: Database, revisionId: number): number | null {
     const row = db
         .prepare(
@@ -403,7 +387,7 @@ export function currentApprovalActionId(db: Database, revisionId: number): numbe
     return row?.action === "approve" ? row.id : null;
 }
 
-/** Latest passing, unrevoked enforcement artifact for the revision, or null. */
+/* */
 export function currentValidArtifactId(db: Database, revisionId: number): number | null {
     const row = db
         .prepare(
@@ -451,21 +435,18 @@ function explicitDispositionActive(
     return row?.action === "assert";
 }
 
-/** Independently rooted evidence group count over supports evidence (R6,
- * KTD4). `independence_key` is one input, capped by distinct extractor runs
- * (repeated tool calls / one extractor run count once) and distinct observed
- * content (mirrors and copies of one source count once).
- * ponytail: derivation lineage of model summaries is not detectable for
- * legacy rows; U2 writers keep summaries on the source's independence_key. */
+/** Independently rooted evidence groups count supports by independence key, extractor run, and observed content.
+ * Repeated tool calls from one extractor run count once.
+ * Mirrors and copies of one source count once.
+ * Derivation lineage of model summaries is not detectable for legacy rows.
+ * For legacy rows, U2 writers keep summaries on the source's `independence_key`. */
 export function countIndependentEvidenceGroups(db: Database, revisionId: number): number {
-    // JOINT independence, not marginal cardinalities: the minimum of three
-    // distinct counts reads 2 for (keyA,run1,X), (keyA,run2,Y), (keyB,run1,Y)
-    // even though every pair shares a key, a run, or content — promoting a
-    // revision to CORROBORATED on evidence that is not independently rooted.
-    // The only consumer threshold is >= 2, so an existence check for one
-    // fully-distinct pair decides the count. It runs in SQL over the FULL
-    // support set: any application-side row cap could truncate away the one
-    // row that completes a qualifying pair.
+    // Count jointly distinct evidence groups; do not use the minimum of marginal key, run, and content counts.
+    // The marginal minimum is 2 for `(keyA, run1, X)`, `(keyA, run2, Y)`, and `(keyB, run1, Y)`.
+    // Those three rows contain no fully distinct pair because every pair shares a key, run, or content.
+    // A fully distinct pair produces a count of 2.
+    // The query evaluates the full support set because a fully distinct pair determines the count.
+    // The query evaluates the full support set because an application-side row cap could omit the fully distinct pair that determines the count.
     const row = db
         .prepare(
             `SELECT
@@ -492,19 +473,12 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
 }
 
 /**
- * The only producer whose explicit-user observation may grant explicit-user
- * credit to a revision that changes content. The retired Tauri dashboard
- * recorded the new content as the observation's own `extracted_text`, and
- * existing databases still hold revisions it authored, so this producer tag
- * and its qualification rule are load-bearing for their trust classification
- * even though no current surface writes new observations under it.
+ * `dashboard:tauri` is the only producer whose explicit-user observation can grant explicit-user credit to a content-changing revision.
  */
 export const EXPLICIT_USER_REVISION_PRODUCER = "dashboard:tauri";
 
-/** Exact explicit-user evidence for this revision. First revisions retain
- * their stated provenance. Later revisions qualify only when their bytes still
- * equal the first revision or when an observation from the
- * `EXPLICIT_USER_REVISION_PRODUCER` channel recorded the revision's exact
+/** Revision 1 accepts explicit-user supporting evidence without content-hash matching.
+ * Later revisions require either the initial content hash or a matching `dashboard:tauri` observation.
  * bytes. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
     return (
@@ -533,9 +507,8 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
 }
 
 export function readActiveDispositions(db: Database, revisionId: number): ActiveDispositions {
-    // Verification status is ONE current outcome: the latest event across
-    // verified/stale/flagged supersedes every earlier one. Filtering per
-    // disposition would let a stale->flagged transition keep both active.
+    // The latest verified, stale, or flagged event is the only active verification outcome.
+    // Filtering each disposition separately would keep both stale and flagged active after a stale-to-flagged transition.
     const verificationOutcome = latestVerificationOutcome(db, revisionId, [
         "verified",
         "stale",
@@ -584,16 +557,15 @@ export function readPolicySupport(db: Database, revisionId: number): PolicySuppo
     };
 }
 
-/** Evaluate the pure policy decision from authoritative rows (KTD7). Callers
- * on the per-write hot path pass their already-gathered `support` so the
- * multi-query fact read runs once per revision write, not twice. */
+/**
+ * Callers on the per-write hot path pass their already-gathered `support`.
+ * Using the supplied `support` avoids a second multi-query fact read per revision write. */
 export function computePolicyDecisionForRevision(
     db: Database,
     revisionId: number,
     precomputed: { support?: PolicySupport; subject?: PolicySubjectRow | null } = {},
 ): PolicyDecision {
-    // `undefined` means "not precomputed"; an explicit null is the known
-    // absence of a subject and must not trigger a re-read.
+    // `undefined` means no precomputed subject; `null` means no subject and must not trigger a re-read.
     const subject =
         precomputed.subject === undefined ? readPolicySubject(db, revisionId) : precomputed.subject;
     return evaluateClaimPolicy({
@@ -626,9 +598,9 @@ export function readRevisionIdentity(db: Database, revisionId: number): Revision
 }
 
 /**
- * Materialize one revision's effective decision into the rebuildable
- * projection (KTD7). `generation` is the project claim generation the
- * decision was computed under; readers verify it before publishing content.
+ * The projection is rebuildable from authoritative rows.
+ * `generation` is the claim generation the decision was computed under;
+ * Readers verify `generation` before publishing content.
  */
 export function updateEffectivePolicyProjectionInCurrentTransaction(
     db: Database,
@@ -637,12 +609,11 @@ export function updateEffectivePolicyProjectionInCurrentTransaction(
     generation: number,
     nowMs?: number,
 ): void {
-    // An "unknown" taint only arises for a missing subject or an unsupported
-    // policy version, and `refreshEffectivePolicyInCurrentTransaction` skips
-    // the write for both. Persisting it would require inventing a concrete
-    // taint (the CHECK constraint has no "unknown" word), and any substitute
-    // is directive-capable — a silent trust upgrade for a claim of unproven
-    // origin. Fail closed instead of relying on every caller to pre-check.
+    // Unknown taint represents a missing subject or an unsupported policy version.
+    // `refreshEffectivePolicyInCurrentTransaction` cannot materialize unknown taint.
+    // The CHECK constraint permits no unknown taint value.
+    // Any substitute taint is directive-capable, silently upgrading unproven origin.
+    // The code fails closed rather than requiring every caller to pre-check.
     if (decision.originTaint === "unknown") {
         throw new Error(
             `refusing to project an unknown origin taint for revision ${identity.revisionId}`,
@@ -690,9 +661,6 @@ export function currentProjectPolicyGeneration(db: Database, projectId: number):
 }
 
 /**
- * Recompute and materialize one revision's effective policy from
- * authoritative rows. Returns the decision so callers can attach it to an
- * outbox effect in the same envelope (R27).
  */
 export function refreshEffectivePolicyInCurrentTransaction(
     db: Database,
@@ -701,22 +669,17 @@ export function refreshEffectivePolicyInCurrentTransaction(
 ): PolicyDecision {
     const identity = readRevisionIdentity(db, revisionId);
     if (!identity) throw new Error(`claim revision ${revisionId} does not exist`);
-    // Read the subject once and share it with the decision computation and
-    // the projection guard below; this runs on the per-write hot path and
-    // every corpus-wide backfill pass.
     const subject = readPolicySubject(db, revisionId);
     const decision = computePolicyDecisionForRevision(db, revisionId, {
         support: options.support,
         subject,
     });
-    // A revision without a frozen subject stays absent from the projection:
-    // absence is the fail-closed contract, and writing a row would need a
-    // fabricated taint value the CHECK constraint has no word for. A subject
-    // written by a NEWER policy version is likewise not interpretable here:
-    // overwriting its projection would stamp the current policy_version and a
-    // fabricated taint over the row, erasing the very signal
-    // (`policy_version > CLAIM_POLICY_VERSION`) readers use to treat it as
-    // unknown. Keep the newer build's row untouched.
+    // A revision without a frozen subject has no projection row; absence fails closed.
+    // A revision without a frozen subject has no projection row; writing one would require an unsupported taint value.
+    // This evaluator cannot interpret a subject whose policy version exceeds `CLAIM_POLICY_VERSION`.
+    // Overwriting a projection from a newer policy version would replace its newer `policy_version` with the current version and fabricate taint.
+    // Overwriting the projection would erase the policy-version signal readers use to treat the row as unknown.
+    // Readers treat rows with `policy_version > CLAIM_POLICY_VERSION` as unknown.
     if (subject == null || decision.reasonCodes.includes("policy_version_unsupported")) {
         return decision;
     }
@@ -731,7 +694,6 @@ export function refreshEffectivePolicyInCurrentTransaction(
 }
 
 // ---------------------------------------------------------------------------
-// Projector watermarks (KTD9)
 // ---------------------------------------------------------------------------
 
 export function readProjectorWatermark(
@@ -748,8 +710,8 @@ export function readProjectorWatermark(
     return row ?? null;
 }
 
-/** Advance one projector watermark; regression is rejected (at-most-once
- * generation acknowledgement, KTD9). */
+/**
+ * */
 export function advanceProjectorWatermarkInCurrentTransaction(
     db: Database,
     consumer: string,

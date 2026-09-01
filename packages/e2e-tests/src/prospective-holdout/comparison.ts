@@ -1,4 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import type { CohortCloseManifest, ReleaseFreezeManifest } from "./contract";
 import { HoldoutContractError } from "./contract";
 import type { ProspectiveCellResult } from "./runner";
@@ -143,22 +144,15 @@ export function buildPairedFacts(
             }
         }
         if (committed.length === 0) throw new HoldoutContractError(["comparison: missing-pair"]);
-        // Attempts run in order from 0, so a coordinate's committed attempts form a contiguous
-        // run. A hole leaves a committed attempt index that names a run with no predecessor in
-        // the store, which is the same defect class as an index outside the retry bound.
+        // Committed attempts must be contiguous from 0; holes are invalid retry indices.
         if (committedAttempts.some((attempt, index) => attempt !== index)) {
             throw new HoldoutContractError(["comparison: attempt-invalid"]);
         }
-        // A retry exists to rerun a pair that did not complete, so every attempt before the last
-        // must leave at least one arm short of "completed". Once both arms complete, the
-        // coordinate's outcome is settled; admitting a later attempt would let a second run
-        // replace that outcome, so a completed pass at attempt N could hide a completed failure
-        // at attempt N+1.
+        // A later attempt would replace the settled outcome.
         if (committed.slice(0, -1).some(isCompletePair)) {
             throw new HoldoutContractError(["comparison: retry-after-completion"]);
         }
-        // The last attempt is the only one the rules above permit to be complete, so it carries
-        // the coordinate's outcome.
+        // The final attempt carries the coordinate's outcome.
         const chosen = committed[committed.length - 1]!;
         const [releaseN, releaseNMinus1] = chosen;
         if (
@@ -181,11 +175,15 @@ export function buildPairedFacts(
             status: isCompletePair(chosen) ? "complete" : "incomplete",
         });
     }
-    return facts.sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        )
-    );
+    return facts.sort(comparePairedFacts);
+}
+
+// Locale-dependent ordering and `:`-joined keys both let equal-ranking inputs decide order, so each field is compared in sequence.
+export function comparePairedFacts(left: PairedCaseFact, right: PairedCaseFact): number {
+    return compareCodeUnits(left.caseId, right.caseId) ||
+        compareCodeUnits(left.model, right.model) ||
+        compareCodeUnits(`${left.seed}`, `${right.seed}`) ||
+        compareCodeUnits(left.platform, right.platform);
 }
 
 export function assertAaSymmetry(left: ProspectiveCellResult, right: ProspectiveCellResult): void {
@@ -204,10 +202,7 @@ export function assertAaSymmetry(left: ProspectiveCellResult, right: Prospective
         health: cell.runHealth,
         outcome: cell.productOutcome,
         // The projection is compared as serialized text, so listing order would decide symmetry.
-        // A runner emits this list sorted, but a committed `outcomes.json` row is hand-authorable
-        // and the parser only rejects duplicates, so two rows naming one failure set in different
-        // orders reach here as legitimate evidence. Sorting a copy compares the set the row states
-        // without reordering the caller's cell.
+        // A sorted copy makes symmetry independent of `failedChecks` order.
         checks: [...cell.failedChecks].sort(),
         reason: cell.reasonCode,
     });

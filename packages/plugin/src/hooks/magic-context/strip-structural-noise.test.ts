@@ -1,5 +1,3 @@
-/// <reference types="bun-types" />
-
 import { describe, expect, it } from "bun:test";
 import {
     applyFrozenTrailingBlankDecisions,
@@ -230,8 +228,7 @@ describe("stripStructuralNoise", () => {
 
         const stripped = stripStructuralNoise([msg]);
 
-        // We now replace parts with sentinels regardless — message isn't emptied.
-        // Length stays 2 so array position hashing is stable across passes.
+        // Sentinels preserve the message's part positions.
         expect(stripped).toBe(2);
         expect(msg.parts).toHaveLength(2);
         expect(msg.parts).toEqual([

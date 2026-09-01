@@ -61,6 +61,7 @@ RUN git config --global user.email "test@cortexkit.local" && \
 # already produced packages/plugin/dist/.
 COPY packages/plugin/dist/ /test/mc-opencode/dist/
 COPY packages/plugin/package.json /test/mc-opencode/package.json
+COPY packages/mc-shm-native/package.json packages/mc-shm-native/index.js packages/mc-shm-native/index.ts /test/mc-shm-native/
 # Drop devDependencies from the copied manifest. Nothing in this image
 # installs them (the plugin install below is --omit=dev), and one of them
 # uses the `workspace:` protocol, which npm rejects while parsing the
@@ -69,6 +70,8 @@ COPY packages/plugin/package.json /test/mc-opencode/package.json
 # marks external and resolves at runtime — goes missing and OpenCode
 # silently declines to load the plugin.
 RUN node -e "const f='/test/mc-opencode/package.json';const p=require(f);delete p.devDependencies;require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+RUN mkdir -p /test/mc-opencode/node_modules/@cortexkit && \
+    ln -s /test/mc-shm-native /test/mc-opencode/node_modules/@cortexkit/mc-shm-native
 # README is intentionally NOT copied — it's gitignored locally (regenerated
 # from the root README when packaging) and unused inside
 # the image. Pinning a COPY here would break CI on main where the file
@@ -85,6 +88,7 @@ COPY packages/cli/package.json /test/mc-cli/package.json
 RUN apt-get update && apt-get install -y python3 build-essential \
     && rm -rf /var/lib/apt/lists/*
 RUN cd /test/mc-cli && \
+    npm pkg set 'dependencies.@cortexkit/mc-shm-native=file:/test/mc-shm-native' && \
     npm install --omit=dev --no-audit --no-fund --workspaces=false \
         --no-package-lock --legacy-peer-deps 2>&1 | tail -5
 # Symlink `magic-context` onto PATH so `magic-context doctor --harness

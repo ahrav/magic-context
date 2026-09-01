@@ -5,9 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import packageJson from "../package.json";
 
-// The exporter stamps the LIVE plugin version into each report's reporter field.
-// Deriving the expectation from package.json keeps this test true across releases;
-// a pinned literal broke the v0.37.0 release pipeline at the version-bump commit.
+// REPORTER derives its version from package.json so version bumps do not require test updates.
 const REPORTER = `magic-context@${packageJson.version}`;
 
 describe("export-window-reports", () => {

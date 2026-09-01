@@ -87,18 +87,11 @@ function claimById(pool: PoolDescriptor, claimId: string) {
 }
 
 /**
- * Characters a filler is never drawn from: whitespace would be trimmed away, and
- * these five change how a manifest is split or parsed.
+ * Whitespace is excluded because trimming removes it.
  */
 const FILLER_EXCLUDED = new Set(["<", ">", "&", '"', ","]);
 
 /**
- * Filler candidates, widest first: printable ASCII, then Latin-1 and Latin
- * Extended letters. Roughly 480 distinct characters, so exhausting the domain
- * takes a fixture that names that many distinct characters among its forbidden
- * anchors. That is not literally unbounded — no fixed alphabet can be — but a
- * fixture reaching it gets a named error rather than a wrong baseline, because
- * every caller verifies the content it builds.
  */
 function* fillerCandidates(): Generator<string> {
     for (const [start, end] of [
@@ -119,14 +112,8 @@ function containsAny(content: string, phrases: readonly string[]): boolean {
 }
 
 /**
- * A character whose folded form appears in none of `phrases`. Anchor checks are
- * case-insensitive substring tests, so a string built only from this character
- * contains no phrase, and any substring spanning it cannot match one.
  *
- * The candidate is tested as a complete folded string rather than looked up among
- * the phrases' individual characters: folding can lengthen a character —
- * `"İ".toLowerCase()` is `"i"` plus a combining dot — so a phrase equal to that
- * two-unit sequence holds neither unit in a way a per-character set would catch.
+ * The function compares complete lowercase strings because `toLowerCase()` can expand one character into multiple code units.
  */
 function fillerAbsentFrom(phrases: readonly string[], description: string): string {
     const lowered = phrases.map((phrase) => phrase.toLowerCase());
@@ -140,43 +127,21 @@ function fillerAbsentFrom(phrases: readonly string[], description: string): stri
 }
 
 /**
- * Update content that carries every required anchor, no forbidden one, and fits
- * the production content cap.
+ * `buildUpdateContent` returns content containing every required anchor, excluding every forbidden anchor, and fitting the production cap.
  *
- * The contract rejects a forbidden anchor contained in a single required anchor
- * but not one spanning their join: required `alpha` and `beta` with forbidden
- * `alpha; beta` validates, yet the delimiter-joined baseline would contain the
- * forbidden phrase and fail scoring, making `runMutationBattery` throw on its
- * own supposedly-correct baseline. A separator holding a character absent from
- * every forbidden anchor makes a spanning match impossible.
+ * Required `alpha` and `beta` may coexist with forbidden `alpha; beta` because the forbidden anchor spans their join.
+ * A delimiter-joined baseline would contain that forbidden phrase and make `runMutationBattery` reject its baseline.
  *
- * The contract also caps each individual anchor, which is the length it can
- * prove unsatisfiable, but anchors may overlap inside one body so it cannot
- * reject a combined length. This construction does not exploit that overlap, so
- * a fixture whose anchors only fit when interleaved gets a named error here
- * rather than the opaque "baseline must pass all scorers".
+ * Production caps each anchor individually, although overlapping anchors can fit in one body.
  */
 /**
- * Update content that carries every required anchor, no forbidden one, fits the
- * production content cap, and takes an identity no other live claim holds —
- * including one an earlier update in this same batch just took.
+ * `passingUpdateContent` assigns an identity that no live claim holds, including identities assigned by earlier updates in the batch.
  *
- * The contract rejects a forbidden anchor contained in a single required anchor
- * but not one spanning their join: required `alpha` and `beta` with forbidden
- * `alpha; beta` validates, yet the delimiter-joined baseline would contain the
- * forbidden phrase and fail scoring, making `runMutationBattery` throw on its
- * own supposedly-correct baseline. A separator holding a character absent from
- * every forbidden anchor makes a spanning match impossible.
+ * Validation checks required anchors independently, so a forbidden phrase can span joined anchors; the separator uses a character absent from every forbidden anchor to prevent spanning matches.
  *
- * The contract also caps each individual anchor, which is the length it can
- * prove unsatisfiable, but anchors may overlap inside one body so it cannot
- * reject a combined length. This construction does not exploit that overlap, so
- * a fixture whose anchors only fit when interleaved gets a named error here
- * rather than the opaque "baseline must pass all scorers".
+ * `passingUpdateContent` rejects fixtures that fit only through overlapping anchors.
  *
- * `ledger` carries the identities already spoken for and is updated in place, so
- * two updates whose anchors generate the same body do not silently converge on
- * one identity — which the scorer would reject as unappliable on the second.
+ * `ledger` records identities claimed by earlier updates so later updates avoid them.
  */
 function passingUpdateContent(
     fixture: DreamerMutationFixture,
@@ -184,23 +149,15 @@ function passingUpdateContent(
     ledger: Map<string, string>,
 ): string {
     const claim = claimById(fixture.pool, gold.claimId);
-    // The revision vacates whatever this claim held, matching the exemption
-    // production grants a claim against its own identity.
+    // Deleting `claim`'s current identity lets its update retain that identity, as production permits.
     ledger.delete(claimIdentity(claim.category, claim.content));
     let content = buildUpdateContent(gold);
-    // Padding shifts the normalized identity while keeping every anchor present,
-    // which is what makes such a fixture satisfiable rather than broken. Each pad
-    // appends a distinct suffix and the ledger is finite, so a free identity
-    // arrives within `ledger.size + 1` attempts; the content cap is the real
-    // limit, and it is checked below.
+    // Each padding attempt appends a suffix; a fixed finite `ledger` yields a free identity within `ledger.size + 1` attempts unless the content cap prevents it.
     for (let attempt = 0; attempt <= ledger.size && ledger.has(claimIdentity(claim.category, content)); attempt += 1) {
         const filler = fillerAbsentFrom(
             gold.forbiddenUpdateAnchors,
             "a pad character absent from every forbidden update anchor",
         );
-        // Spend only what the cap leaves: a body one character short of the limit
-        // is still separable, so a two-character suffix would refuse a fixture a
-        // one-character one satisfies.
         const remaining = VERIFY_UPDATE_CONTENT_MAX_LENGTH - content.length;
         if (remaining <= 0) break;
         content = remaining >= 2 ? `${content} ${filler}` : `${content}${filler}`;
@@ -218,8 +175,7 @@ function passingUpdateContent(
 
 function buildUpdateContent(gold: VerifyGoldClaim): string {
     if (gold.requiredUpdateAnchors.length === 0) {
-        // Production refuses an empty replacement body, so the baseline still
-        // needs content when the gold requires no anchor.
+        // Production rejects empty replacement bodies, so anchorless gold needs filler.
         return fillerAbsentFrom(
             gold.forbiddenUpdateAnchors,
             "a filler character absent from every forbidden update anchor",
@@ -240,20 +196,15 @@ function buildUpdateContent(gold: VerifyGoldClaim): string {
 }
 
 /**
- * Keeps an anchor's own edge whitespace inside the body. `parseVerifyManifest`
- * trims the body before the scorer runs, so an anchor like `" alpha "` sitting at
- * the outer edge loses its spaces and the supposedly correct baseline fails —
- * even though such gold is satisfiable by placing the anchor inside other
- * content. The pad is a character absent from every forbidden anchor, so it
- * cannot introduce one, and untouched gold keeps its exact former bytes.
+ * `buildUpdateContent` pads edge-whitespace anchors so manifest trimming preserves each anchor.
+ * `buildUpdateContent` uses padding absent from every forbidden anchor to prevent padding from creating a forbidden match.
+ * `buildUpdateContent` preserves unmodified anchor bytes when padding is unnecessary.
  */
 function padEdgeWhitespace(content: string, gold: VerifyGoldClaim): string {
     const needsLeading = gold.requiredUpdateAnchors.some((anchor) => /^\s/.test(anchor));
     const needsTrailing = gold.requiredUpdateAnchors.some((anchor) => /\s$/.test(anchor));
     if (!needsLeading && !needsTrailing) return content;
-    // Pad each side independently: the contract charges an anchor only for the
-    // edges it actually holds whitespace on, so padding the other side too would
-    // refuse a fixture that just fits.
+    // `buildUpdateContent` pads only anchor edges containing whitespace; padding both edges can reject a fixture that exactly fits.
     const pad = fillerAbsentFrom(
         gold.forbiddenUpdateAnchors,
         "a pad character absent from every forbidden update anchor",
@@ -262,8 +213,7 @@ function padEdgeWhitespace(content: string, gold: VerifyGoldClaim): string {
 }
 
 /**
- * A path outside `files`. Among `files.length + 1` distinct candidates at least
- * one cannot collide, so the loop always returns.
+ * `files.length + 1` distinct candidates guarantee one path outside `files`, so the loop always returns.
  */
 function pathAbsentFrom(files: readonly string[]): string {
     for (let index = 0; index <= files.length; index += 1) {
@@ -274,8 +224,7 @@ function pathAbsentFrom(files: readonly string[]): string {
 }
 
 function correctVerifyManifest(fixture: DreamerMutationFixture): string {
-    // One ledger for the whole manifest: production stages these updates in this
-    // order, and each takes its identity for the rest of the batch.
+    // `ledger` spans the manifest because production stages updates in order and reserves each identity for the rest of the batch.
     const ledger = liveIdentities(fixture.pool);
     const entries = fixture.verifyGold.claims.map((gold) => {
         const claim = claimById(fixture.pool, gold.claimId);
@@ -302,10 +251,8 @@ function correctClassifyManifest(fixture: DreamerMutationFixture): string {
     const entries = fixture.classifyGold.claims.map((gold) => {
         const claim = claimById(fixture.pool, gold.claimId);
         const attributes = `importance="${gold.importance.min}" scope="${gold.scope}"`;
-        // Reporting `shareable="true"` for sensitive content is forced back to
-        // false, so gold expecting it to stay shareable is reachable only by
-        // omitting the attribute and letting the stored value stand. The parser
-        // requires at least one classification field, which importance and scope
+        // Sensitive content with `shareable="true"` is stored as `false`; gold can expect the existing shareable value only when the attribute is omitted.
+        // The request requires at least one classification field; `importance` and `scope` satisfy that requirement.
         // supply.
         if (gold.shareable && hasShareabilitySensitiveText(claim.content)) {
             return `<memory claim="${claim.publicClaimId}" ${attributes}/>`;
@@ -328,21 +275,17 @@ function escapeRegExp(value: string): string {
 function replaceEntry(manifest: string, publicClaimId: string, replacement: string): string {
     const escaped = escapeRegExp(publicClaimId);
     const pattern = new RegExp(`<(?:verified|archive)\\b[^>]*claim="${escaped}"[^>]*/>|<update\\b[^>]*claim="${escaped}"[^>]*>[\\s\\S]*?</update>`);
-    // A callback keeps the replacement bytes literal. Passing the string form
-    // lets `$&`, `$1`, or a backtick token inside an authored anchor expand into
-    // the matched entry, so the mutation would carry content nobody wrote — and
-    // for the forbidden-anchor case the forbidden phrase would vanish from it
-    // and the mutation could score PASS.
+    // The callback keeps replacement bytes literal.
+    // String replacement expands `$&`, `$1`, and backtick tokens in authored anchors.
+    // String replacement expansion can inject matched content into the mutation.
+    // Expansion can remove the forbidden phrase and let the mutation score PASS.
     const changed = manifest.replace(pattern, () => replacement);
     if (changed === manifest) throw new Error(`mutation fixture could not replace verify entry ${publicClaimId}`);
     return changed;
 }
 
 /**
- * Rewrites one claim's `files` attribute in a mappings manifest. Scoping to the
- * claim id matters because claims may declare identical file sets, and an
- * unscoped match rewrites whichever entry appears first rather than the one the
- * mutation class selected.
+ * Claims can share file sets, so matching by files alone can rewrite the first matching entry instead of `publicClaimId`.
  */
 function replaceMapFiles(manifest: string, publicClaimId: string, files: readonly string[]): string {
     const pattern = new RegExp(`(<memory\\b[^>]*claim="${escapeRegExp(publicClaimId)}"[^>]*files=")[^"]*(")`);
@@ -352,15 +295,12 @@ function replaceMapFiles(manifest: string, publicClaimId: string, files: readonl
 }
 
 /**
- * Constructs the parser treats as an entry boundary, matched case-sensitively
- * because every one of the parser's own regexes is.
  */
 const PARSER_ACTIVE_RE = /<\/?(?:verified|update|archive)\b/;
 
 /**
- * A spelling of `anchor` that can sit inside an update body, raising the case of
- * any entry construct so the parser ignores it while the folded anchor still
- * matches. Throws when no spelling survives, which is only the closing root tag.
+ * Uppercasing entry constructs makes them inert to case-sensitive parser regexes while preserving a case-folded anchor match.
+ * The embedding helper throws when only `</verify>` prevents embedding the anchor.
  */
 function inertAnchorSpelling(anchor: string): string {
     const spelling = embeddableForbiddenAnchor(anchor);
@@ -371,13 +311,10 @@ function inertAnchorSpelling(anchor: string): string {
 }
 
 /**
- * A spelling of `anchor` that can sit inside an update body, or null when none
  * can.
  *
- * The forbidden check is case-insensitive while the entry regexes are not, so
- * raising an entry construct's case keeps the anchor matchable while making it
- * inert to the parser. The root close tag has no such escape: the body extraction
- * folds case, so any spelling of it truncates the body and no equivalent
+ * Case-insensitive forbidden matching recognizes uppercased entry tags, while case-sensitive entry regexes ignore them.
+ * `</verify>` cannot be embedded because case-folded body extraction treats every spelling as its closing tag.
  * survives.
  */
 function embeddableForbiddenAnchor(anchor: string): string | null {
@@ -405,10 +342,6 @@ function mutationManifest(
         case "wrong-archival":
             return { task: "verify", manifest: replaceEntry(verify, verifiedClaim.publicClaimId, `<archive claim="${verifiedClaim.publicClaimId}" reason="wrong"/>`) };
         case "missed-archival": {
-            // A backing set is required whenever the manifest retains a claim,
-            // so an archived claim carrying no mapping needs a stand-in here:
-            // an empty attribute would be rejected as invalid output before the
-            // scorer could observe the missed archival this class exercises.
             const files = archivedClaim.files.length > 0 ? archivedClaim.files : ["mutation/retained.ts"];
             return { task: "verify", manifest: replaceEntry(verify, archivedClaim.publicClaimId, `<verified claim="${archivedClaim.publicClaimId}" files="${files.join(",")}"/>`) };
         }
@@ -417,12 +350,9 @@ function mutationManifest(
         case "verified-for-update":
             return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<verified claim="${updatedClaim.publicClaimId}" files="${updatedClaim.files.join(",")}"/>`) };
         case "update-missing-anchor": {
-            // The mutation has to actually omit a required anchor, so it needs
-            // an update gold that has one: with none, any replacement is valid
-            // content and the case would score PASS. A fixed sentence is not
-            // enough either — ordinary anchors such as `required` or `facts`
-            // occur in it and score PASS the same way. Content built from a
-            // character absent from every anchor provably omits all of them.
+            // `runMutationBattery` accepts updates that omit a required anchor.
+            // A fixed sentence may contain a required anchor and pass.
+            // A character absent from every anchor omits all anchors.
             const target = requiredGold(
                 fixture.verifyGold.claims,
                 (entry) => entry.verdict === "update" && entry.requiredUpdateAnchors.length > 0,
@@ -436,12 +366,9 @@ function mutationManifest(
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "update-forbidden-anchor": {
-            // Read the gold that actually carries an embeddable forbidden anchor
-            // rather than the first update: a fixture whose first update has none
-            // but whose later one does has everything this class needs, and
-            // taking the first would abort the whole battery. Embeddability
-            // matters because a forbidden anchor spelling an entry boundary would
-            // end the entry before the scorer could observe it.
+            // The first update must not contain a forbidden anchor.
+            // The forbidden anchor must not terminate the update entry.
+            // An entry-boundary anchor terminates the entry before scoring.
             const target = requiredGold(
                 fixture.verifyGold.claims,
                 (entry) =>
@@ -457,10 +384,9 @@ function mutationManifest(
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "wrong-independence": {
-            // Either direction is a wrong independence claim, so an all-independent
-            // map gold is mutable too: replacing an independent entry with one
-            // carrying files parses as file-bound. Requiring a file-bound target
-            // would abort the battery on a contract-valid fixture.
+            // Changing an independent entry to file-bound, or vice versa, is a wrong independence claim.
+            // An all-independent map can be mutated by adding files to one entry.
+            // Adding files makes an independent entry file-bound.
             const target = requiredGold(fixture.mapGold.claims, () => true, "map gold");
             const claim = claimById(fixture.pool, target.claimId);
             const flipped = target.independent
@@ -471,10 +397,7 @@ function mutationManifest(
         case "missing-gold-file": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
             const claim = claimById(fixture.pool, target.claimId);
-            // Dropping the first path is the mutation. A single-file gold has
-            // nothing to drop, so it needs a stand-in the gold does not already
-            // name — otherwise `replaceMapFiles` sees no textual change and
-            // throws instead of producing the mutation.
+            // A replacement path absent from `target.files` changes a single-file gold's file mapping.
             const remaining = target.files.length > 1 ? target.files.slice(1) : [pathAbsentFrom(target.files)];
             return { task: "map", manifest: replaceMapFiles(map, claim.publicClaimId, remaining) };
         }
@@ -492,13 +415,11 @@ function mutationManifest(
             return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*scope=")${target.scope}`), `$1${wrong}`) };
         }
         case "wrong-shareable": {
-            // Two usable shapes. Non-sensitive content lets the emitted attribute
-            // be flipped either way. Sensitive content with `true` gold has no
-            // emitted attribute — the baseline omits it so the stored value is
-            // preserved — so the mutation inserts `shareable="false"`, which
-            // changes the applied value. Only sensitive content with `false` gold
-            // is unusable: the attribute is emitted, and flipping it to `true` is
-            // rescued by the override, leaving the applied value equal to gold.
+            // Sensitive content with a `true` gold value omits `shareable`.
+            // Omitting `shareable` preserves the stored value.
+            // The mutation inserts `shareable="false"` to change a `true` stored value.
+            // `shareable` flips cannot mutate sensitive content with a `false` gold value.
+            // Flipping an emitted `shareable` value to `true` does not change the applied value.
             const target = requiredGold(
                 fixture.classifyGold.claims,
                 (entry) =>

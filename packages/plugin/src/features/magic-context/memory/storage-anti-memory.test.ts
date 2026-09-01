@@ -320,8 +320,7 @@ describe("anti-memory typed operations", () => {
             expect(first.outcome).toBe("applied");
             expect(first.replayed).toBe(false);
 
-            // The stored expiry now equals the request's, so a pre-transaction
-            // forward-progress check would throw here; the receipt must win.
+            // The receipt check precedes forward-progress validation when stored and requested expiry are equal.
             const retry = extendAntiMemoryTtl(
                 db,
                 { producer: "test", operationKey: "extend" },
@@ -364,9 +363,6 @@ describe("anti-memory typed operations", () => {
                 },
             );
             const publicClaimId = publicIdOf(created);
-            // Mimics an in-transaction maintenance caller (dreamer curate /
-            // classify / verify) that reaches the stage function directly,
-            // bypassing the typed anti-memory API.
             expect(() =>
                 runClaimOperation(
                     db,
@@ -391,7 +387,7 @@ describe("anti-memory typed operations", () => {
                     2,
                 ),
             ).toThrow(/anti-memory/);
-            // The typed reader must still work: no payload-less revision landed.
+            // Revisions retain payloads so typed reads remain valid.
             expect(readAntiMemory(db, publicClaimId)?.revision).toBe(1);
         } finally {
             closeQuietly(db);
@@ -521,8 +517,7 @@ describe("anti-memory typed operations", () => {
             );
             expect(first.replayed).toBe(false);
 
-            // An unrelated revise moves the stored payload away from the bytes
-            // the extension happened to re-state.
+            // An unrelated revision moves the stored payload away from the bytes the extension restated.
             reviseAntiMemory(
                 db,
                 { producer: "test", operationKey: "revise" },
@@ -535,9 +530,6 @@ describe("anti-memory typed operations", () => {
                 },
             );
 
-            // The extension request itself never carried a payload, so its
-            // digest must not have drifted with the row: this retry replays
-            // rather than raising ClaimOperationKeyReuseError.
             const retry = extendAntiMemoryTtl(
                 db,
                 { producer: "test", operationKey: "extend" },
@@ -563,9 +555,7 @@ describe("anti-memory typed operations", () => {
             };
             createAntiMemory(db, { producer: "test", operationKey: "create" }, request);
 
-            // Importance reaches the persisted attributes, so a different
-            // importance is a different request: replaying the first receipt
-            // would silently drop the new value.
+            // A different importance is a different request; replaying the first receipt would drop the new value.
             expect(() =>
                 createAntiMemory(
                     db,
@@ -592,9 +582,7 @@ describe("anti-memory typed operations", () => {
             };
             createAntiMemory(db, { producer: "test", operationKey: "create" }, request);
 
-            // A caller-supplied expiry reaches the persisted attributes, so a
-            // different expiry is a different request: replaying the first
-            // receipt would silently keep the old TTL.
+            // A different caller-supplied expiry is a different request; replaying the first receipt would keep the old TTL.
             expect(() =>
                 createAntiMemory(
                     db,
@@ -623,10 +611,7 @@ describe("anti-memory typed operations", () => {
                 { ...request, nowMs: 10 },
             );
 
-            // The digest records the REQUESTED expiry, which is absent here. The
-            // resolved default is nowMs + TTL, so digesting the resolved value
-            // would make this honest retry a different request purely because
-            // the clock advanced.
+            // The digest records the requested expiry, not the resolved default, so retries without an expiry remain stable as the clock advances.
             const retry = createAntiMemory(
                 db,
                 { producer: "test", operationKey: "create" },
@@ -684,10 +669,9 @@ describe("anti-memory typed operations", () => {
             if (claim === null) throw new Error("unreachable");
             const revisionLocator = formatRevisionLocator(claim);
 
-            // Both attach to one exact revision, and the typed writer appends a
-            // fresh revision on every extension without carrying them over, so
-            // a verified path-scoped warning would lose its authority and scope
-            // on its next TTL extension. Refuse rather than downgrade silently.
+            // The writer rejects TTL extensions of verified path-scoped warnings because each extension appends a revision without carrying verification or scope forward.
+            // The writer rejects TTL extensions of verified path-scoped warnings because a new revision would omit verification and scope.
+            // The writer rejects TTL extensions of verified path-scoped warnings rather than silently downgrading them.
             expect(() =>
                 recordProjectMemoryVerification(
                     db,
@@ -742,7 +726,6 @@ describe("anti-memory typed operations", () => {
                 },
             );
             const publicClaimId = publicIdOf(created);
-            // Both clients start from the same snapshot.
             const sharedToken = computeProjectMemoryMutationToken(db, publicClaimId);
 
             const winner = extendAntiMemoryTtl(
@@ -758,9 +741,7 @@ describe("anti-memory typed operations", () => {
             );
             expect(winner.outcome).toBe("applied");
 
-            // Forward progress from the loser's snapshot, behind the winner's
-            // expiry. Its token is now superseded, so this is a lost race and
-            // the contract's stale outcome — not bad input.
+            // A token computed from the loser's snapshot is stale after the winner advances expiry; report the stale outcome rather than invalid input.
             const loser = extendAntiMemoryTtl(
                 db,
                 { producer: "test", operationKey: "extend-loser" },

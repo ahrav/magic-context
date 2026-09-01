@@ -13,10 +13,6 @@ import {
 } from "./claim-visibility-policy";
 
 /**
- * The label an agent would see for a decision, derived through the SHIPPED
- * label path. `decideMemoryPolicy` calls `explicitSearchLabelFromFields` with
- * the projected columns, so asserting against it here keeps these
- * sanitization tests pointed at the code agents actually reach.
  */
 function labelFor(decision: PolicyDecision): string | null {
     const explicit = decision.surfaces.explicit_search;
@@ -25,8 +21,6 @@ function labelFor(decision: PolicyDecision): string | null {
         effectiveMaturity: decision.effectiveMaturity,
         originTaint: decision.originTaint,
         dispositions: decision.activeDispositions,
-        // Unsupported versions label as unknown policy exactly like missing
-        // rows: both mean this evaluator cannot vouch for the stored state.
         policyMissing:
             decision.reasonCodes.includes("policy_state_missing") ||
             decision.reasonCodes.includes("policy_version_unsupported"),
@@ -181,9 +175,6 @@ describe("visibility matrix", () => {
         );
         expect(future.surfaces.auto_inject.eligible).toBeFalse();
         expect(future.reasonCodes).toContain("policy_version_unsupported");
-        // Unsupported versions read exactly like missing state: the stored
-        // taint was written under a scheme this evaluator does not
-        // understand, and the label must say so — matching the storage path
         // in storage-claim-visibility.ts.
         expect(future.originTaint).toBe("unknown");
         expect(labelFor(future)).toContain("taint:unknown");

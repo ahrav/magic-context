@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";

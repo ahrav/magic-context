@@ -190,8 +190,6 @@ describe("auto-update-checker/checker", () => {
                     "0.15.6",
                 ),
             ).toBe(true);
-            // Atomic write: staged to a temp file in the same dir, then renamed
-            // onto the real config path.
             expect(writes[0]?.data).toContain('"@cortexkit/opencode-magic-context@0.15.6"');
             expect(writes[0]?.data).toContain("// plugins");
             expect(writes[0]?.path).not.toBe("/config/opencode.jsonc");

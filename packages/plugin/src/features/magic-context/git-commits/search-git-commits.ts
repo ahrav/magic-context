@@ -1,12 +1,8 @@
 /**
- * Hybrid FTS + semantic search for indexed git commits.
  *
- * Returns raw scored matches; the caller (unifiedSearch) slots these into
- * the existing merged ranking with source boosts.
+ * unifiedSearch applies source boosts when it merges these raw scored matches.
  *
- * Lanes emit compact candidates (SHA, lane scores, `committed_at`, discovery
- * ordinal); only the selected top-K SHAs are hydrated into full commit records,
- * so a large candidate pool never pays for metadata it cannot return.
+ * The lanes retain only SHA, lane scores, committed_at, and discovery ordinal until top-K hydration, avoiding metadata loads for unreturned candidates.
  */
 
 import { log } from "../../../shared/logger";
@@ -40,7 +36,7 @@ interface CandidateRow {
 interface CommitCandidate {
     sha: string;
     committedAtMs: number;
-    /** Discovery position: FTS candidates first, then semantic-only ones. */
+    /** ordinal records discovery position: FTS candidates first, then semantic-only candidates. */
     ordinal: number;
     ftsScore?: number;
     semanticScore?: number;
@@ -103,27 +99,27 @@ function getBySHAsStatement(db: Database): PreparedStatement {
 
 export interface GitCommitSearchHit {
     commit: StoredGitCommit;
-    /** 0..1 combined score. */
+    /** score stores the combined score in [0, 1]. */
     score: number;
     matchType: "semantic" | "fts" | "hybrid";
 }
 
 export interface SearchGitCommitsOptions {
     limit: number;
-    /** Raw semantic score weight. Default 0.7. */
+    /** semanticWeight weights raw semantic scores; defaults to 0.7. */
     semanticWeight?: number;
-    /** Raw FTS score weight. Default 0.3. */
+    /** ftsWeight weights raw FTS scores; defaults to 0.3. */
     ftsWeight?: number;
-    /** When semantic OR FTS has only one signal, scale the score by this
-     *  penalty to favor hybrid matches. Default 0.8. */
+    /** The singleSourcePenalty scales scores with only one lane signal to favor hybrid matches; default 0.8.
+     * */
     singleSourcePenalty?: number;
     /** Pre-computed query embedding. When omitted, we skip the semantic pass. */
     queryEmbedding?: Float32Array | null;
-    /** ID of the model that generated queryEmbedding; commit vectors are read only from the same model space. */
+    /** queryModelId identifies the model that generated queryEmbedding; commit vectors are read only from the same model space. */
     queryModelId?: string | null;
-    /** Receives the decoded commit-vector byte counts when the semantic pass loads embeddings. */
+    /** vectorLoadObserver receives decoded commit-vector byte counts when the semantic pass loads embeddings. */
     onVectorLoad?: VectorLoadObserver;
-    /** Trace phase boundaries for the lexical, semantic, and fusion passes. */
+    /** stageMarks records phase boundaries for the lexical, semantic, and fusion passes. */
     stages?: HybridLaneStageMarks;
 }
 
@@ -163,8 +159,6 @@ function scoreCandidate(
 }
 
 /**
- * Return top-K commits matching `query` for `projectPath`, combining FTS
- * and semantic ranks. Falls back to LIKE when FTS fails (e.g. short queries).
  */
 export function searchGitCommitsSync(
     db: Database,
@@ -180,13 +174,11 @@ export function searchGitCommitsSync(
         ftsWeight: options.ftsWeight ?? 0.3,
         singleSourcePenalty: options.singleSourcePenalty ?? 0.8,
     };
-    // R37: the requested limit is clamped to the lane ceiling so no caller can
-    // widen the selected output past the shared candidate bound.
+    // `limit` is clamped to `MAX_LANE_CANDIDATES` so no caller can exceed the shared candidate bound.
     const limit = Math.min(options.limit, MAX_LANE_CANDIDATES);
     const fetchLimit = Math.min(Math.max(limit * 3, 30), MAX_LANE_CANDIDATES);
 
-    // Selection and hydration read one snapshot, so a concurrent indexer cannot
-    // make the hydrated rows disagree with the ranked candidates.
+    // Selection and hydration share one snapshot, preventing a concurrent indexer from changing hydrated rows after ranking.
     return db.transaction((): GitCommitSearchHit[] => {
         const candidates = new Map<string, CommitCandidate>();
         const addCandidate = (sha: string, committedAtMs: number): CommitCandidate => {
@@ -201,7 +193,6 @@ export function searchGitCommitsSync(
             return candidate;
         };
 
-        // ---- FTS pass ---------------------------------------------------
         options.stages?.lexicalStart();
         const lexicalRows: CandidateRow[] = [];
         const sanitized = sanitizeFtsQuery(trimmed);
@@ -221,7 +212,6 @@ export function searchGitCommitsSync(
             }
         }
 
-        // LIKE fallback when FTS returned nothing (short tokens, exact-substring queries)
         if (lexicalRows.length === 0) {
             lexicalRows.push(
                 ...(getLikeFallbackStatement(db).all(
@@ -238,7 +228,6 @@ export function searchGitCommitsSync(
         });
         options.stages?.lexicalEnd(lexicalRows.length);
 
-        // ---- Semantic pass ----------------------------------------------
         if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
             options.stages?.vectorStart();
             const embeddings = loadProjectCommitEmbeddings(
@@ -247,11 +236,7 @@ export function searchGitCommitsSync(
                 options.queryModelId,
                 options.onVectorLoad,
             );
-            // Brute-force scoring must visit every cached vector, but only the
-            // strongest fetchLimit similarities may join the candidate pool so
-            // fusion, scoring, and the final sort are bounded by the lane cap
-            // rather than the commit corpus. Newer commits win similarity ties,
-            // matching the final-rank tie-break below.
+            // Semantic scoring visits every cached vector but admits only the top fetchLimit candidates, bounding fusion and final sorting to MAX_LANE_CANDIDATES; newer commits break similarity ties.
             const semanticHits: Array<{ sha: string; committedAtMs: number; similarity: number }> =
                 [];
             for (const [sha, entry] of embeddings.entries()) {
@@ -272,7 +257,6 @@ export function searchGitCommitsSync(
             options.stages?.vectorSkipped();
         }
 
-        // ---- Select top-K before any metadata read ----------------------
         options.stages?.fusionStart();
         const scored: ScoredCandidate[] = [];
         for (const candidate of candidates.values()) {
@@ -281,7 +265,6 @@ export function searchGitCommitsSync(
         }
         scored.sort((left, right) => {
             if (right.score !== left.score) return right.score - left.score;
-            // Newer commits win ties
             if (right.candidate.committedAtMs !== left.candidate.committedAtMs) {
                 return right.candidate.committedAtMs - left.candidate.committedAtMs;
             }
@@ -293,7 +276,6 @@ export function searchGitCommitsSync(
             return [];
         }
 
-        // ---- Hydrate only the winners -----------------------------------
         const rows = getBySHAsStatement(db).all(
             projectPath,
             JSON.stringify(selected.map((entry) => entry.candidate.sha)),

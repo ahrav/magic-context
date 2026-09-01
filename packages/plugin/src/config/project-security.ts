@@ -1,45 +1,31 @@
 import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "./schema/magic-context";
 
 /**
- * Security hardening for PROJECT-level (repo-supplied, untrusted) config.
  *
- * A project config lives inside a repository the user cloned. Opening a repo
- * must never let that repo's config escalate privilege or exfiltrate secrets.
- * These helpers run on the raw project config BEFORE/AFTER it is merged over the
- * trusted user config, mutating the relevant object in place and returning
+ * A project config belongs to the cloned repository and is untrusted.
+ * A repository config must never escalate privilege or exfiltrate secrets.
+ * The project-config sanitizers run before and after repository config is merged over trusted user config.
+ * The project-config sanitizers mutate raw project config in place and return human-readable warnings.
  * human-readable warnings.
  *
- * Shared by both harnesses (OpenCode `config/index.ts` and Pi
- * `config/index.ts`) so the trust boundary is identical cross-harness.
  */
 
-/** Hidden agents that run with elevated/autonomous capability. */
+/** These hidden agents run with elevated or autonomous capability. */
 const HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"] as const;
 const HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"] as const;
 const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"] as const;
 
 /**
- * Fields on a hidden-agent block that constitute a privilege-escalation /
- * code-execution vector when set from an untrusted repo:
+ * An untrusted repository must not set these hidden-agent fields because they can escalate privileges or execute code.
  *
- *  - `prompt`     — reprograms the agent's instructions. The dreamer runs
- *                   AUTONOMOUSLY in the background with `bash`/`edit`/`webfetch`,
- *                   so a repo-supplied prompt is an unattended exfil/RCE path.
+ * A repository-supplied `prompt` can reprogram Dreamer, which runs autonomously with `bash`, `edit`, and `webfetch`, enabling unattended exfiltration or code execution.
  *  - `permission` — broadens the agent's per-tool permissions.
- *  - `tools`      — enable/disable map; could flip a denied tool (e.g. `bash`)
- *                   on for an agent whose allow-list intentionally excludes it.
- *  - `system_prompt` — sidekick's custom system prompt. It takes precedence over
- *                   the built-in prompt (sidekick/agent.ts reads
- *                   `config.system_prompt` before `config.prompt`), so leaving it
- *                   unstripped reopens the exact reprogramming vector `prompt`
- *                   closes — a cloned repo could rewrite sidekick's instructions
+ * `tools` can enable a denied tool such as `bash` for an agent whose allow-list excludes it.
+ * `system_prompt` takes precedence over Sidekick's built-in prompt, so a repository could reprogram Sidekick through `/ctx-aug` unless it is stripped.
  *                   via `/ctx-aug`.
  *
- * Dreamer model/cadence fields are deliberately NOT stripped: a repo may tune
- * its own dreamer overlays and schedules through the user's provider auth.
- * Historian model selection stays USER-tier only, and compaction thresholds are
- * project raise-only, so a cloned repo cannot force earlier compaction or extra
- * historian spend on the user's dime.
+ * Dreamer model and cadence fields remain allowed so a repository can tune its overlays and schedules through the user's provider authentication.
+ * Historian model selection is user-only, and project compaction thresholds can only increase, preventing cloned repositories from forcing earlier compaction or extra Historian spending.
  */
 const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
 const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"] as const;
@@ -185,47 +171,33 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
 }
 
 /**
- * Strip unsafe fields from a raw PROJECT config IN PLACE, before it is merged
- * over the user config. Returns warnings describing what was ignored.
  *
  * Closes:
- *  - `auto_update` — a repo must not suppress plugin self-updates (which can
- *    carry security fixes).
- *  - `fail_closed_blocking` — a repo must not un-block (or force-block) the
- *    loud inoperability gate; only the user may restore silent degrade.
- *  - `allow_home_project` — only the user may opt a home-directory session
- *    into a durable project identity.
- *  - `output_reserve` / `models.window_overlay_path` — only the user may change
- *    process-wide window geometry inputs.
+ * A repository must not suppress plugin self-updates because updates can carry security fixes.
+ * A repository must not change `fail_closed_blocking`, which can unblock or force-block the loud inoperability gate.
+ * Only user config may set `fail_closed_blocking` to `false`.
+ * `allow_home_project` may establish a durable project identity only from user config.
+ * Only user config may change `output_reserve` or `models.window_overlay_path`.
  *  - `language`: a repo must not inject prompt text through a user preference.
- *  - `sqlite` — `sqlite.cache_size_mb` / `mmap_size_mb` become PRAGMAs on the
- *    process-global shared DB handle (one connection across every project in the
- *    process). A cloned repo could set a huge value to exhaust host memory /
- *    address space — a resource-exhaustion vector with no legitimate per-repo
- *    use. Honor user-level config only.
- *  - `storage.enforce_private_permissions` — changing a shared store from
- *    owner-private to group-readable changes every session and memory's local
- *    confidentiality. Only the machine operator's user config may opt into an
- *    externally managed trusted-group deployment.
- *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
- *    where private memory/search/commit text is embedded. User-level config is
- *    the trust boundary for embedding destinations.
- *  - `transform_mode` is intentionally allowed at project tier so a repository
- *    can opt its own runtime into the experimental Rust pipeline. The resolver
- *    requires user-tier consent (a user-level `transform_mode` selection or
- *    trusted user-level `subc` configuration) before Rust — and the managed
- *    native-host lifecycle it may demand-start — can activate.
- *  - `historian.model` / `historian.fallback_models` — historian model spend is
- *    user-level only; a cloned repo cannot force extra compaction cost.
- *  - `mural.model` — mural cue-compressor model selection is user-level only;
- *    a cloned repo cannot choose a model that sends project memory to a provider.
- *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
- *    the user's Pi child processes load.
- *  - `prompt_surface.guidance_override_path` / `tool_descriptions` — a repository
- *    may select a reviewed preset, but must not inject arbitrary guidance or tool
- *    description text into the user's provider-visible prompt.
- *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
- *    re-permission the historian/dreamer/sidekick.
+ * Only user config may set `sqlite` because its settings apply as PRAGMAs on the shared DB handle.
+ * `sqlite` settings affect the shared DB handle used by every project in the process.
+ * Project `sqlite` values could exhaust host memory or address space because they affect the shared DB handle.
+ * Only user config may set `storage.enforce_private_permissions` because it changes the shared store's confidentiality.
+ * Changing `storage.enforce_private_permissions` affects every session's local-memory confidentiality.
+ * Only user config may enable an externally managed trusted-group deployment.
+ * Only user config may set `embedding.endpoint`, `embedding.provider`, or `embedding.fallback_provider`.
+ * Embedding destinations receive private memory, search, and commit text.
+ * User config is the trust boundary for embedding destinations.
+ * `transform_mode` may come from project config, but Rust activation also requires user-tier consent.
+ * A project `transform_mode` selection can opt that project's runtime into the Rust pipeline.
+ * Rust activation requires user-level `transform_mode` or trusted user-level `subc` configuration.
+ * Rust can demand-start the managed native-host lifecycle only after user-tier consent.
+ * Only user config may set `historian.model` or `historian.fallback_models` to prevent repositories from forcing compaction cost.
+ * Only user config may set `mural.model` so repositories cannot select a provider for project memory.
+ * Project config must not set `pi.subagent_extensions` because it controls extensions loaded by Pi child processes.
+ * A repository may select a reviewed `prompt_surface` preset but may not set arbitrary prompt text.
+ * A repository may select a reviewed `prompt_surface` preset but may not inject arbitrary guidance or tool-description text.
+ * Project config must not set hidden-agent `prompt`, `permission`, or `tools`.
  */
 export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknown>): string[] {
     const warnings: string[] = [];
@@ -251,11 +223,6 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
-    // compaction.enabled is USER-tier only: a cloned repo must never silently
-    // disable the user's context management (it changes how the window is
-    // owned and interacts with native compaction state). Field-scoped, not
-    // block-scoped: a sibling key in a project `compaction` block survives the
-    // strip, so a future project-tier compaction knob can still land.
     const compaction = projectRaw.compaction;
     if (isPlainObject(compaction) && "enabled" in compaction) {
         delete compaction.enabled;
@@ -294,9 +261,6 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
-    // storage.enforce_private_permissions is USER-tier only because disabling it
-    // changes the confidentiality of the process-global shared store. Field-scoped
-    // stripping preserves future project-tier storage settings in the same block.
     const storage = projectRaw.storage;
     if (isPlainObject(storage) && "enforce_private_permissions" in storage) {
         delete storage.enforce_private_permissions;
@@ -305,9 +269,6 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
-    // Repositories may select preset routing, but project settings cannot add
-    // guidance or tool-description text to the provider-visible prompt; those
-    // user-only fields are removed before project settings are merged.
     const promptSurface = projectRaw.prompt_surface;
     if (isPlainObject(promptSurface)) {
         const removed: string[] = [];
@@ -383,9 +344,6 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
-    // Keep the same trust boundary while accepting the pre-graduation spelling.
-    // This must run before the in-memory migration moves experimental.mural.model
-    // to mural.model, otherwise an untrusted project could bypass the user-only
     // model check.
     const experimental = projectRaw.experimental;
     const legacyMural = isPlainObject(experimental) ? experimental.mural : undefined;
@@ -418,10 +376,6 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
 }
 
 /**
- * Clamp project-tier compaction thresholds after merge so a cloned repository
- * may only DELAY compaction relative to the trusted user/default settings. A
- * repo may never lower thresholds in a way that forces earlier historian work
- * or cloned-repo cost escalation on the user's account.
  */
 export function constrainProjectThresholdOverrides(args: {
     mergedRaw: Record<string, unknown>;
@@ -576,23 +530,8 @@ export function constrainProjectThresholdOverrides(args: {
 }
 
 /**
- * After the project config has been merged over the user config, drop the
- * user's inherited `embedding.api_key` when the project redirected the embedding
- * `endpoint` without supplying its own key.
  *
- * Threat: a malicious repo overrides only `embedding.endpoint` → an attacker
- * server, inheriting the user's `embedding.api_key`, which is then sent as
- * `Authorization: Bearer …` to that server. The victim did nothing but clone the
- * repo. Dropping the inherited key means a redirected endpoint never receives
- * the user's secret; a project that genuinely points at a different endpoint
- * must supply its own key.
  *
- * `projectRaw` is the raw project config (pre-merge, so we can see what the
- * project itself declared). `mergedRaw` is the post-merge result, mutated in
- * place. `userRaw` is the trusted user config; when supplied, the key is dropped
- * only when the project endpoint ACTUALLY differs from the user's endpoint — a
- * project repeating the user's own endpoint (e.g. only to change `model`) is not
- * a redirect and must keep the inherited key. Returns warnings.
  */
 function normalizeEndpoint(value: unknown): string | undefined {
     if (typeof value !== "string") return undefined;
@@ -608,17 +547,9 @@ export function dropInheritedEmbeddingKeyOnRedirect(
     const projectEmbedding = projectRaw.embedding;
     if (!isPlainObject(projectEmbedding)) return [];
 
-    // Only an ENDPOINT redirect changes WHERE the bytes (and the Authorization
-    // header) are sent. A provider-only change keeps the user's endpoint, so it
-    // is not an exfiltration vector.
     const redirectsEndpoint = "endpoint" in projectEmbedding;
     if (!redirectsEndpoint) return [];
 
-    // A project that merely repeats the user's OWN endpoint (e.g. to override
-    // `model` while keeping the same server) is not a redirect — the key was
-    // always destined for that endpoint. Only drop when the destination
-    // actually changed. When userRaw is absent we cannot tell, so fall back to
-    // the conservative presence-based drop.
     const userEmbedding = userRaw?.embedding;
     if (isPlainObject(userEmbedding)) {
         const projectEndpoint = normalizeEndpoint(projectEmbedding.endpoint);

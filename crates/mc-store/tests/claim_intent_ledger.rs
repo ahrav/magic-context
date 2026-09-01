@@ -8,10 +8,8 @@ use serde_json::{json, Value};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 const PROJECT: &str = "git:claim-intent-test";
-/// Deliberately not `INCARNATION`. Production mints the context store UUID
-/// (`randomUUID()`) separately from the format marker's 32-hex database
-/// incarnation, so a fixture that reuses one value for both cannot observe a
-/// fence that keys `mc_authority` by the wrong identifier.
+/// The context store UUID must differ from `INCARNATION` so tests detect fences that key `mc_authority` by the wrong identifier.
+/// An authority fence must not key `mc_authority` by the database incarnation.
 const STORE_UUID: &str = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
 const ROUTE_ROOT: &str = "/repo/claim-intent-test";
 
@@ -39,9 +37,8 @@ fn request(value: i64) -> Value {
     json!({"operation":"create","value":value})
 }
 
-/// Bind this route and drive memories authority to MODULE, returning the live
-/// generation. Staging resolves authority through the bound route, so a test that
-/// stages without this setup is correctly refused.
+/// Staging requires authority resolved through a route bound to the project.
+/// Staging without a route-bound authority is refused.
 fn module_authority(store: &McStore) -> u64 {
     store
         .bind_authority_route(STORE_UUID, PROJECT, ROUTE_ROOT)
@@ -168,8 +165,7 @@ fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
     let preparing = store
         .authority_begin_prepare(STORE_UUID, PROJECT, "memories")
         .unwrap();
-    // PREPARING is not MODULE, so the route-resolved fence refuses the stage on the
-    // authority row itself rather than relying on the transition-control row.
+    // A `PREPARING` authority is not `MODULE`, so the route-resolved fence refuses staging.
     assert!(matches!(
         store.stage_claim_intent(ROUTE_ROOT, &binding(preparing.generation), &command("preparing"), &request(0), 0),
         Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "PREPARING"
@@ -225,9 +221,8 @@ fn staging_fails_closed_without_route_resolved_module_authority() {
     let dir = tempfile::tempdir().unwrap();
     let store = McStore::open(&descriptor(dir.path())).unwrap();
 
-    // No route binding and no authority row. The binding alone must never be
-    // sufficient: keying the authority lookup by the caller-supplied marker
-    // incarnation previously matched no row and fell through to the insert.
+    // A binding alone cannot stage without a route binding and authority row.
+    // The authority lookup must use the route-bound identifier rather than the caller-supplied marker incarnation.
     assert!(matches!(
         store.stage_claim_intent(ROUTE_ROOT, &binding(1), &command("unowned"), &request(0), 1),
         Err(McStoreError::ClaimIntentRouteNotManaged)
@@ -236,8 +231,8 @@ fn staging_fails_closed_without_route_resolved_module_authority() {
 
     let generation = module_authority(&store);
 
-    // The route owns the project vocabulary, so a binding naming another project
-    // cannot borrow this route's authority.
+    // A binding naming another project cannot borrow the route's authority.
+    // A binding naming another project cannot borrow the route's authority.
     let mut foreign = binding(generation);
     foreign.authority_project = "git:someone-else".to_string();
     assert!(matches!(
@@ -248,7 +243,7 @@ fn staging_fails_closed_without_route_resolved_module_authority() {
         })
     ));
 
-    // A generation that does not match the live authority row is refused.
+    // The stage rejects a generation that differs from the live authority row.
     assert!(matches!(
         store.stage_claim_intent(
             ROUTE_ROOT,
@@ -327,14 +322,10 @@ fn store_rebuild_is_refused_until_intents_drain_then_freezes_new_stages() {
     );
 }
 
-/// Replaying a `staged` intent revalidates live authority instead of trusting the
-/// binding stored when the row was written.
+/// Replaying a `staged` intent revalidates live authority rather than trusting the stored binding.
 ///
-/// A replay goes on to execute the same context mutation. If a drain committed
-/// after the row was staged, the authority is already DRAINING at a higher
-/// generation, so returning the stored record would commit a claim under the
-/// obsolete one. Recovery reads of terminal or already-committed rows must stay
-/// idempotent, so only `staged` is fenced.
+/// A replay executes the same context mutation.
+/// Recovery reads of terminal or committed rows remain idempotent; only `staged` rows are fenced.
 #[test]
 fn replaying_a_staged_intent_refuses_after_authority_begins_draining() {
     let dir = tempfile::tempdir().unwrap();
@@ -359,8 +350,7 @@ fn replaying_a_staged_intent_refuses_after_authority_begins_draining() {
     let active_binding = binding(active.generation);
     let identity = command("replay-fence");
 
-    // The first attempt stages under MODULE authority and leaves the row staged,
-    // as a crash before the context commit would.
+    // The first attempt simulates a crash before context commit by leaving the intent staged.
     let staged = store
         .stage_claim_intent(ROUTE_ROOT, &active_binding, &identity, &request(1), 1)
         .unwrap();
@@ -372,8 +362,7 @@ fn replaying_a_staged_intent_refuses_after_authority_begins_draining() {
         .unwrap();
     assert!(draining.generation > active.generation);
 
-    // The retry presents the same identity, digest, and stored binding, so only a
-    // live authority read can refuse it.
+    // The retry's identity, digest, and binding match the stored intent; a live authority read must reject it.
     assert!(matches!(
         store.stage_claim_intent(ROUTE_ROOT, &active_binding, &identity, &request(1), 3),
         Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "DRAINING"

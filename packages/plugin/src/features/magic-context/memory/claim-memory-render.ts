@@ -25,13 +25,7 @@ export function readAuthorizedClaimMemorySnapshot(
         sharedCategories: readonly string[];
         workspaceEpoch: string;
         /**
-         * Identities `workspaceEpoch` and the authorization were derived from.
-         * Automatic injection is the surface with the least recourse — nothing
-         * downstream re-checks it — so the provider must recompute the
-         * fingerprint at publication time rather than echo the value above. A
-         * workspace mutation bumps `project_memory_epoch`, not the claim
-         * generation tracked in the vector, so the fingerprint is the only
-         * signal that membership or sharing changed.
+         * `workspaceIdentities` identifies the identities used to derive `workspaceEpoch` and the authorization.
          */
         workspaceIdentities?: readonly string[];
         nowMs?: number;
@@ -68,12 +62,12 @@ export function readAuthorizedClaimMemorySnapshot(
 }
 
 export interface ClaimMemoryRenderOptions {
-    /** Workspace source attribution keyed by public claim ID. */
+    /* */
     sourceNameByClaimId?: ReadonlyMap<string, string>;
 }
 
-/** One compact claim fact line. Importance controls selection but stays off
- * the wire so classification-only updates do not change bytes. */
+/** Importance affects selection but is omitted so classification-only changes preserve rendered bytes.
+ * */
 export function renderClaimMemoryLine(
     item: ProjectMemoryClaimSnapshot,
     sourceName?: string,
@@ -136,10 +130,9 @@ export function renderClaimMemoryBlock(
 }
 
 /**
- * Incremental token accounting for the grouped claim block: measure the
- * wrapper once, each candidate line once, and each category's tags once.
- * BPE merges across newline joins only shrink the whole relative to the sum
- * of its parts, so the additive account is a slight upper bound and trims
+ * Token accounting measures the wrapper, each candidate line, and each category's tags once.
+ * BPE merges across newline joins can only reduce the whole token count relative to the sum of its parts.
+ * The additive account is an upper bound.
  * stay conservative.
  */
 function createClaimBlockAccounting(renderOptions: ClaimMemoryRenderOptions) {
@@ -195,15 +188,15 @@ export function trimClaimSnapshotsToBudget(
 }
 
 export interface ClaimWorkspaceTrimContext {
-    /** Canonical member identities in workspace order. */
+    /** The function returns canonical member identities in workspace order. */
     identities: readonly string[];
-    /** Claim project ID to canonical member identity. */
+    /** The map associates each claim project ID with its canonical member identity. */
     identityByProjectId: ReadonlyMap<number, string>;
 }
 
 /**
- * Workspace-fair trim: each member identity gets an equal token floor before
- * the remainder fills greedily, so one member's pool cannot starve the rest.
+ * The trim reserves an equal token floor for each member identity before greedily allocating the remainder.
+ * Greedy allocation after equal floors cannot let one member's pool starve the others.
  */
 export function trimWorkspaceClaimSnapshotsToBudget(
     items: readonly ProjectMemoryClaimSnapshot[],
@@ -250,7 +243,7 @@ export function trimWorkspaceClaimSnapshotsToBudget(
     return { selected, renderOrder: [...selected].sort(claimRenderOrder) };
 }
 
-/** Canonical project identity per numeric project ID. */
+/** The map associates each numeric project ID with its canonical project identity. */
 export function readProjectIdentityMap(
     db: Database,
     projectIds: readonly number[],

@@ -2,13 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { createEventHandler } from "./event";
 
 /**
- * createEventHandler routes the OpenCode `event` hook to the auto-update checker,
- * the magic-context event handler, and (new) an orderly per-instance cleanup on
- * `server.instance.disposed`. These tests pin the dispose wiring:
- *   1. cleanup fires only on server.instance.disposed, with the disposed directory
- *   2. cleanup does NOT fire on unrelated events
- *   3. a throwing cleanup is swallowed (never propagates into the event loop)
- *   4. magic-context + auto-update handlers still run for every event
  */
 describe("createEventHandler — instance dispose cleanup", () => {
     test("fires onInstanceDisposed with the directory on server.instance.disposed", async () => {
@@ -53,7 +46,6 @@ describe("createEventHandler — instance dispose cleanup", () => {
             },
         });
 
-        // Must resolve, not reject.
         await expect(
             handler({
                 event: {

@@ -46,14 +46,12 @@ describe("buildPiCompactionSummary", () => {
 	it("caps the title list and stays bounded for large compartment counts", () => {
 		const many = Array.from({ length: 545 }, (_, i) => mk(`segment-${i}`));
 		const summary = buildPiCompactionSummary(many);
-		// Bounded: only the first 5 titles appear, plus a remainder count.
 		expect(summary).toContain("Magic Context compacted 545 segments:");
 		expect(summary).toContain(
 			"segment-0; segment-1; segment-2; segment-3; segment-4",
 		);
 		expect(summary).toContain("…and 540 more");
 		expect(summary).not.toContain("segment-5;");
-		// Length must not scale with compartment count.
 		expect(summary.length).toBeLessThan(200);
 	});
 
@@ -519,8 +517,7 @@ describe("runPiHistorian", () => {
 					title: "Initial Pi slice",
 				}),
 			]);
-			// v2 faithful fact lifecycle: facts are NOT written to session_facts
-			// (no REPLACE). They flow to project memory via promotion.
+			// The historian promotes facts to project memory.
 			expect(getSessionFacts(db, "ses-historian")).toEqual([]);
 			const projectPath = resolveProjectIdentity(process.cwd());
 			const promoted = projectClaims(db, projectPath).find(
@@ -686,8 +683,7 @@ describe("runPiHistorian", () => {
 				.get("ses-historian") as { harness: string };
 
 			expect(compartmentHarness.harness).toBe("pi");
-			// v2 faithful facts: no session_facts rows are written anymore;
-			// facts are promoted to project memory instead.
+			// The historian promotes facts to project memory.
 			const factRow = db
 				.prepare("SELECT harness FROM session_facts WHERE session_id = ?")
 				.get("ses-historian");
@@ -822,11 +818,9 @@ describe("runPiHistorian", () => {
 			forceKeepLastCompartment: true,
 		});
 		try {
-			// The downgrade proof is the HEALING: an un-downgraded forced keep
-			// would persist both compartments. The token-capped chunk instead
-			// drops the provisional tail, and discard-last runs skip unanchored
-			// promotion by long-standing design (the discarded range re-reads
-			// next iteration; reworded facts would double-store).
+			// Discard-last runs skip unanchored promotion.
+			// Discard-last runs prevent re-reading discarded messages from storing reworded facts twice.
+			// Discard-last runs prevent re-reading discarded messages from storing reworded facts twice.
 			expect(getCompartments(midLoop.db, "ses-historian")).toHaveLength(1);
 			expect(getCompartments(midLoop.db, "ses-historian")[0]?.endMessage).toBe(
 				2,
@@ -879,10 +873,10 @@ describe("runPiHistorian", () => {
 		it("does NOT run an editor pass when twoPass is false (default)", async () => {
 			const { db, runner } = await runHistorianWith({
 				outputs: [successXml()],
-				// twoPass omitted → defaults to undefined/false
+				// Omitting twoPass runs only the first pass.
 			});
 			try {
-				// One subagent run = first pass only.
+				// One subagent run executes only the first pass.
 				expect(runner.run).toHaveBeenCalledTimes(1);
 			} finally {
 				closeQuietly(db);
@@ -897,13 +891,13 @@ describe("runPiHistorian", () => {
 				twoPass: true,
 			});
 			try {
-				// Two subagent runs = first pass + editor pass.
+				// Two subagent runs execute the first pass and editor pass.
 				expect(runner.run).toHaveBeenCalledTimes(2);
 				expect(runner.run).toHaveBeenNthCalledWith(
 					2,
 					expect.not.objectContaining({ fallbackModels: expect.anything() }),
 				);
-				// Editor output won — the promoted fact is from the editor.
+				// The editor output supplies the promoted fact.
 				const projectPath = resolveProjectIdentity(process.cwd());
 				expect(
 					projectClaims(db, projectPath).map((claim) => claim.content),
@@ -915,19 +909,19 @@ describe("runPiHistorian", () => {
 
 		it("falls back to draft when editor output fails validation", async () => {
 			const draftXml = successXml("Original draft fact.");
-			// Editor returns garbage — validation fails, draft is preserved.
+			// Invalid editor output preserves the draft.
 			const { db, runner } = await runHistorianWith({
 				outputs: [draftXml, "not valid xml at all"],
 				twoPass: true,
 			});
 			try {
 				expect(runner.run).toHaveBeenCalledTimes(2);
-				// Draft fact is promoted despite editor failure (no data loss).
+				// The historian promotes the draft fact when the editor fails.
 				const projectPath = resolveProjectIdentity(process.cwd());
 				expect(
 					projectClaims(db, projectPath).map((claim) => claim.content),
 				).toContain("Original draft fact.");
-				// Compartments still persisted.
+				// The historian persists draft compartments when editor validation fails.
 				expect(getCompartments(db, "ses-historian")).toEqual([
 					expect.objectContaining({ title: "Initial Pi slice" }),
 				]);
@@ -937,14 +931,14 @@ describe("runPiHistorian", () => {
 		});
 
 		it("does NOT run editor pass when first-pass + repair both fail", async () => {
-			// First-pass and repair both invalid → editor pass should be
-			// skipped because there's no draft to refine.
+			// First-pass and repair failures skip the editor pass because no draft exists to refine.
+			// The historian skips the editor pass because no draft exists to refine.
 			const { db, runner } = await runHistorianWith({
 				outputs: ["not xml", "still not xml"],
 				twoPass: true,
 			});
 			try {
-				// Exactly 2 calls: first-pass + repair. NOT 3 (no editor).
+				// First-pass and repair failures make two runner calls; no editor pass runs.
 				expect(runner.run).toHaveBeenCalledTimes(2);
 				expect(getCompartments(db, "ses-historian")).toEqual([]);
 			} finally {

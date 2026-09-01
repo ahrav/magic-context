@@ -208,19 +208,12 @@ async function runHarness(
 
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
-    // Invalidate any previous report BEFORE the run can fail. Validation, digest
-    // construction, and harness setup all abort before either publication call,
-    // and a stale successful report left at `--report` would be collected by an
-    // always-run artifact step or read by local automation as this run's result.
+    // The runner deletes the previous report before validation so validation failures cannot leave a stale report.
     rmSync(args.reportPath, { force: true });
     const files = loadHistorySnapshot(INCIDENTS_DIR, "working");
     const state = validateIncidentHistory(files);
     const registry = builtinIncidentCaseRegistry();
     validateRegistryCatalogCorrespondence(registry, state.catalog);
-    // Fail closed on drifted provenance: a named audit source, mutation
-    // artifact, reciprocal ownership link, or evidence count that no longer
-    // matches the inventory must stop the run here rather than reaching a
-    // published and scored report through a separately invoked test suite.
     validateEvidenceAndSources(state.inventory, state.catalog);
 
     const implementationDigests = new Map<string, string>();
@@ -240,11 +233,6 @@ async function main(): Promise<number> {
             : ["rust"]
         : [args.harness ?? "opencode"];
     const workspaceParentDir = mkdtempSync(join(tmpdir(), "incident-pool-"));
-    // Resolve the direct-host fixture in the PARENT, which still has the real
-    // Cargo state, and publish the path so every case child inherits it through
-    // the environment allowlist. A child that had to fall back to a Cargo build
-    // would run it against the empty per-case `CARGO_HOME` the workspace
-    // relocation creates, and fail offline with no registry cache to reuse.
     if (harnesses.includes("rust")) {
         const prereqs = detectRustPrerequisites({ allowBuild: true });
         if (!prereqs.ok) {

@@ -24,15 +24,8 @@ import { estimateTokens } from "./read-session-formatting";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
 const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
-// Module-scope caches are per-plugin-instance (one plugin process per OpenCode
-// process) and accumulate session entries over the plugin's lifetime. Without
-// cleanup on `session.deleted`, these maps grow unbounded. Exported so hook.ts
-// can register a cleanup callback tied to the session-deleted lifecycle event.
+// The `session.deleted` handler clears cached entries to bound cache growth.
 /**
- * Clear all per-session cache entries the system-prompt handler maintains,
- * including the module-scope user-profile/key-files maps and the per-handler
- * sticky-date/cached-docs maps (the latter passed in via the cleanup handle).
- * Called from the session-deleted event path.
  */
 function clearSystemPromptHashSession(
     sessionId: string,
@@ -46,17 +39,9 @@ function clearSystemPromptHashSession(
 }
 
 /**
- * Detect OpenCode's three native hidden agents by stable signature lines from
- * their built-in prompts (see `~/Work/OSS/opencode/packages/opencode/src/agent/
  * prompt/{title,summary,compaction}.txt`).
  *
- * Magic Context skips ALL injection (guidance, project docs, user profile,
- * key files, sticky date, hash flush) when these agents fire — they don't
- * benefit from any of it and the extra prompt content is wasted spend on
- * what's typically a small/cheap model running a fixed single-shot job.
  *
- * The signature literals live in `internal-agent-signatures.ts`, shared with
- * the e2e cache/oracle analysis so both classifiers stay in lockstep.
  */
 function isInternalOpenCodeAgent(systemPromptContent: string): boolean {
     return INTERNAL_OPENCODE_AGENT_SIGNATURES.some((signature) =>
@@ -65,20 +50,9 @@ function isInternalOpenCodeAgent(systemPromptContent: string): boolean {
 }
 
 /**
- * Detect Magic Context's OWN hidden child agents by their system-prompt
- * openers. These children (historian/dreamer/sidekick/memory-migration) load a
- * fixed agent identity and must NOT receive the MC guidance block — it's wasted
- * spend and a contradictory second identity frame ("You are Historian…" plus
- * "You are the user's long-term partner…").
+ * Hidden child agents use fixed identities, so they must not receive the MC guidance block.
  *
- * This is the timing-independent companion to the `internalChildSessions` flag:
- * the flag is set at `session.created` (may race the very first system.transform
- * by event-delivery latency), whereas this signature is present in the prompt
- * content on pass 1 with zero timing dependency. Memory-migration loads the
- * historian agent prompt, so the historian opener covers it.
  *
- * The signature literals live in `internal-agent-signatures.ts`, shared with
- * the e2e cache/oracle analysis so both classifiers stay in lockstep.
  */
 export function isMagicContextInternalAgent(systemPromptContent: string): boolean {
     return MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES.some((signature) =>
@@ -87,71 +61,44 @@ export function isMagicContextInternalAgent(systemPromptContent: string): boolea
 }
 
 /**
- * Handle system prompt via experimental.chat.system.transform:
  *
- * 1. Inject generic magic-context guidance into the system prompt.
- *    Skips injection if guidance is already present (e.g., baked into the
- *    agent prompt by oh-my-opencode).
  *
- * 2. Detect system-prompt content or prompt-surface preset changes for
- *    cache-flush triggering. The hash transition is the semantic boundary at
- *    which queued operations can ride the same HARD fold.
  */
 export function createSystemPromptHashHandler(deps: {
     db: ContextDatabase;
     protectedTags: number;
     dreamerEnabled: boolean;
-    /** When false (`memory.enabled: false`), the `<project-memory>` block is
-     *  never injected, so ctx_memory guidance is dropped from the prompt and the
-     *  ctx_memory tool is not registered. ctx_search guidance stays (it still
-     *  recalls conversation + git commits). Default true. */
+    /**
+     * `ctx_search` guidance remains because `ctx_search` recalls conversations and Git commits.
+     * */
     memoryEnabled?: boolean;
-    /** Optional language from user config for the main agent's generated text. */
+    /* */
     language?: string;
     promptSurface?: PromptSurfaceConfig;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
-    /** Recover the session's latest model when the transform input omits it. */
+    /** `resolveModel` recovers the session's latest model when the transform input omits it. */
     resolveModel?: (sessionId: string) => { providerID: string; modelID: string } | undefined;
     /**
-     * One-shot signal that disk-backed adjuncts (user profile, key files,
-     * sticky date) need to be re-read on this pass.
-     * Drained at the end of the handler regardless of whether anything
-     * actually refreshed — defer passes after this point MUST hit cached
-     * values to keep the system prompt cache-stable.
      */
     systemPromptRefreshSessions: Set<string>;
     /**
-     * Producer side: when this handler detects a real prompt-content or
-     * prompt-surface-preset hash change, it adds the session to all three sets
-     * so downstream consumers
-     * (transform `prepareCompartmentInjection`, postprocess heuristics)
-     * react on the same cycle. The hash change usually pairs with a new
-     * agent identity, so all three are appropriate.
      */
     historyRefreshSessions: Set<string>;
     pendingMaterializationSessions: Set<string>;
     lastHeuristicsTurnId: Map<string, string>;
     /**
-     * Issue #53: when false, Magic Context skips ALL system-prompt injection
-     * for ALL agents. Global escape hatch for users who don't want Magic
-     * Context guidance / sticky date touching the system prompt. (default: true)
+     * When false, Magic Context skips all system-prompt injection for all agents.
      */
     injectionEnabled?: boolean;
     /**
-     * Issue #53: per-agent opt-out. If the agent's system prompt contains
-     * any of these substrings, skip ALL injection for this call. Lets users
-     * mark specific custom agents (e.g. read-only QA agents that deny our
-     * `ctx_*` tools) as no-injection without having to disable injection
+     * Magic Context skips all injection for a call when the agent's system prompt contains a configured substring.
      * globally.
      */
     injectionSkipSignatures?: string[];
     /**
-     * Process-scoped set of Magic Context's OWN hidden child sessions
-     * (historian/dreamer/sidekick/memory-migration), flagged by title prefix at
-     * `session.created`. When the active session is in this set we skip ALL
-     * injection — these children have their own fixed agent identity/prompt and
-     * never benefit from the MC guidance block. Belt to the prompt-signature
-     * detection below (which is the pass-1 timing-independent suspenders).
+     * `internalChildSessions` contains Magic Context hidden child sessions, which receive no injection.
+     * Internal child sessions receive no injection because they use fixed agent prompts.
+     * Prompt-signature detection skips internal child sessions during pass 1 when session-created tracking has not completed.
      */
     internalChildSessions?: Set<string>;
     /** @deprecated user memories now render in m[0]/m[1], not system prompt. */
@@ -160,10 +107,10 @@ export function createSystemPromptHashHandler(deps: {
     experimentalPinKeyFiles?: boolean;
     /** @deprecated key files now render in m[1], not system prompt. */
     experimentalPinKeyFilesTokenBudget?: number;
-    /** When true, add a temporal-awareness guidance paragraph + surface compartment dates */
+    /** `experimentalTemporalAwareness` adds a temporal-awareness guidance paragraph and surface compartment dates when true. */
     experimentalTemporalAwareness?: boolean;
-    /** When true, inject a "BEWARE: history compression is on" warning so the
-     *  agent doesn't mimic its own caveman-compressed past output. */
+    /** `experimentalCavemanTextCompression` warns the agent when history compression is enabled so the agent does not mimic compressed output.
+     * */
     experimentalCavemanTextCompression?: boolean;
 }): {
     handler: (
@@ -183,9 +130,7 @@ export function createSystemPromptHashHandler(deps: {
         });
     const guidanceEpochs = createPromptSurfaceGuidanceEpochCache(promptSurfaceRuntime);
 
-    // Per-session sticky date: we freeze the date string from the system prompt
-    // and only update it on cache-busting passes. This prevents a midnight date
-    // flip from causing an unnecessary flush + cache rebuild.
+    // Sticky dates change only on cache-busting passes, preventing midnight cache rebuilds.
     const stickyDateBySession = new Map<string, string>();
 
     const handler = async (
@@ -198,30 +143,22 @@ export function createSystemPromptHashHandler(deps: {
         const sessionId = input.sessionID;
         if (!sessionId) return;
 
-        // ── Skip OpenCode's internal hidden agents ──
+        // The handler skips OpenCode's internal hidden agents.
         //
-        // OpenCode invokes `experimental.chat.system.transform` for ALL llm
-        // calls inside a session, including its three native hidden agents:
+        // OpenCode invokes `experimental.chat.system.transform` for every session LLM call, including hidden agents.
         //   - "title": runs once on the first user turn against `small_model`
-        //              (or the small variant of the active model) to generate
-        //              a session title from the first message.
-        //   - "summary": session export / pull-request-style description.
-        //   - "compaction": OpenCode's own auto-compaction summarizer.
+        // The title agent uses `small_model` or the active model's small variant.
+        // The title agent generates a session title from the first user message.
+        // The `summary` agent produces session exports and pull-request-style descriptions.
+        // The `compaction` agent performs OpenCode auto-compaction summarization.
         //
         // These agents:
-        //   1. Don't benefit from magic-context guidance (they have a fixed
-        //      single-shot job — no tools, no `ctx_reduce`, no nudges).
-        //   2. Get hit with our `<project-docs>`, `<user-profile>`,
-        //      `<key-files>`, and the multi-paragraph guidance block, which
-        //      can multiply their input by 10× for a tiny single-line output.
-        //   3. Often run on a smaller/cheaper model where the extra prompt
-        //      content is wasted spend.
+        // These agents have no tools, `ctx_reduce`, or nudges, so Magic Context guidance cannot affect their fixed single-shot tasks.
+        // OpenCode's internal agents receive project and user context irrelevant to their fixed tasks.
+        // OpenCode's internal agents receive Magic Context guidance irrelevant to their fixed tasks.
         //
-        // The hook contract gives us only `{ sessionID, model }`, so we can't
-        // dispatch on agent name. We detect them by signature lines from
-        // their prompts in OpenCode source (`packages/opencode/src/agent/prompt/`).
-        // These signatures are stable across OpenCode releases — they're the
-        // first instruction lines of each internal prompt.
+        // The hook exposes only `{ sessionID, model }`, so detection cannot dispatch by agent name.
+        // These signatures are the first instruction lines of each internal prompt.
         const fullPromptForDetection = output.system.join("\n");
         if (isInternalOpenCodeAgent(fullPromptForDetection)) {
             sessionLog(
@@ -231,12 +168,8 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
 
-        // ── Skip Magic Context's OWN hidden children ──
-        // historian/dreamer/sidekick/memory-migration must not get the MC
-        // guidance block (wasted spend + contradictory identity frame). Two
-        // signals: the title-prefix flag (set at session.created) and the
-        // prompt-signature (timing-independent, reliable on pass 1). Either
-        // match skips ALL injection + hash tracking.
+        // Magic Context's historian, dreamer, sidekick, and memory-migration sessions must not receive Magic Context injection.
+        // A Magic Context internal-agent match skips injection and hash tracking.
         if (
             deps.internalChildSessions?.has(sessionId) ||
             isMagicContextInternalAgent(fullPromptForDetection)
@@ -248,23 +181,12 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
 
-        // ── Issue #53: user-controlled per-agent opt-out ──
         //
-        // Two layers, both honored here:
-        //   1. Global: `system_prompt_injection.enabled: false` → skip
-        //      injection for every agent. Useful when a user wants Magic
-        //      Context to manage history but never touch the system prompt.
-        //   2. Per-agent: `system_prompt_injection.skip_signatures` →
-        //      substring opt-out. The user adds the signature (default
-        //      `<!-- magic-context: skip -->`) inside their custom agent's
-        //      prompt; whenever that agent fires, we skip injection for
-        //      that call only.
+        // `system_prompt_injection.enabled: false` disables injection globally.
+        // `system_prompt_injection.skip_signatures` disables injection for matching prompt signatures.
+        // A matching signature skips injection only for the current call.
         //
-        // Both paths skip ALL injection (guidance, project docs, user
-        // profile, key files, sticky date) AND skip hash tracking — like
-        // the internal-agent skip above. Hash tracking is intentionally
-        // skipped so a deny-listed agent's system prompt doesn't compete
-        // with the main agent's hash, which would cause cross-agent
+        // Skipping hash tracking prevents matching prompts from causing cross-agent hash-change flushes.
         // hash-change flushes.
         const injectionEnabled = deps.injectionEnabled !== false;
         const skipSignatures = deps.injectionSkipSignatures ?? [];
@@ -280,11 +202,9 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
 
-        // ── Step 1: Inject magic-context guidance ──
-        // Subagents with callable ctx_reduce get only the minimal drop mechanics
-        // guidance. Subagents without the tool get no Magic Context guidance,
-        // because the primary-session no-reduce block would incorrectly describe
-        // memory/search/note behavior for a bounded, parent-driven child task.
+        // Subagents that can call `ctx_reduce` receive only drop-mechanics guidance.
+        // `ctx_reduce`-disabled subagents receive no Magic Context guidance.
+        // The primary-session no-reduce block describes memory, search, and note behavior that does not apply to bounded, parent-driven child tasks.
         let sessionMetaEarly: import("../../features/magic-context/types").SessionMeta | undefined;
         try {
             sessionMetaEarly = getOrCreateSessionMeta(deps.db, sessionId);
@@ -292,21 +212,12 @@ export function createSystemPromptHashHandler(deps: {
             sessionLog(sessionId, "system-prompt-hash session meta load failed:", error);
         }
         const isSubagentSession = sessionMetaEarly?.isSubagent === true;
-        // A session whose spawn tools map filters ctx_reduce out (parent
-        // allow-lists) must be treated like ctx_reduce-disabled: reduce
-        // guidance for an uncallable tool is overhead + cargo-cult risk.
-        // The verdict freezes on the session's first user message; before that
-        // exists it is a PROVISIONAL fail-open default. Guidance still renders
-        // from the provisional value (a prompt must go out), but the hash write
-        // below is gated on `frozen` so a provisional reduce-enabled prompt is
-        // never persisted as the session's baseline — if the first user message
-        // then denies the tool, the variant settles BEFORE any hash existed,
-        // instead of flipping a persisted hash and busting the prompt cache.
+        // `ctx_reduce` is disabled for sessions whose spawn-tool map excludes it because guidance for an uncallable tool would direct the subagent to an unavailable action.
+        // `resolveCtxReduceAvailability` freezes the reduce-enabled verdict on the first user message to avoid changing a persisted hash and busting the prompt cache.
         const availability = resolveCtxReduceAvailability(sessionId);
         const ctxReduceCallable = availability.callable;
         const subagentReduceMode = isSubagentSession && ctxReduceCallable;
         const effectiveCtxReduceEnabled = isSubagentSession ? false : ctxReduceCallable;
-        // A subagent without callable ctx_reduce gets no MC guidance.
         const skipGuidanceForDisabledSubagent = isSubagentSession && !ctxReduceCallable;
         const inputModel = input.model;
         const liveModel =
@@ -337,13 +248,7 @@ export function createSystemPromptHashHandler(deps: {
                 promptSurface.preset,
                 promptSurface.primaryOverride,
             );
-            // OpenAI-compatible serializers emit one wire message per array entry,
-            // and strict chat templates reject a second system message. Keep the host
-            // prompt and guidance in the original entry instead. Anthropic preserves
-            // separate entries as separate content blocks, so old and new wire bytes
-            // necessarily differ. The blank line keeps the two sections distinct and
-            // changes the persisted hash from the previous newline-joined format, causing
-            // the frozen cache prefix to rebuild once through its existing hash-change path.
+            // OpenAI-compatible templates append guidance to the host entry because they allow only one system message.
             output.system[0] = `${output.system[0]}${SYSTEM_PROMPT_GUIDANCE_SEPARATOR}${guidance}`;
             sessionLog(
                 sessionId,
@@ -351,24 +256,16 @@ export function createSystemPromptHashHandler(deps: {
             );
         }
 
-        // ── Step 1.5: m[0]/m[1]-resident adjuncts ──
-        // Project docs, user profile, and key files intentionally do NOT
-        // enter the system prompt in cache architecture v2.0. Project docs
-        // and baseline user profile are materialized into m[0]; key files
-        // are the volatile resident at m[1]. Keep only guidance + sticky
-        // date in system so BP1 remains stable.
         const isCacheBusting = deps.systemPromptRefreshSessions.has(sessionId);
 
-        // ── Step 2: Coalesce content/preset and date changes into one bust ──
         const DATE_PATTERN = /Today's date: .+/;
         const DATE_PATTERN_ALL = /Today's date: .+/g;
         const liveSystemContent = output.system.join("\n");
         if (liveSystemContent.length === 0) return;
         const previousHash = sessionMetaEarly?.systemPromptHash ?? "";
         const hasPersistedHash = previousHash !== "" && previousHash !== "0";
-        // Every element carrying a date line participates in freezing. Only MC
-        // injects the line today, but a host prompt carrying the same format
-        // must not leave a second live date that busts the hash at midnight.
+        // Every element containing a date line participates in freezing.
+        // A host prompt with a matching date line must freeze that line too; otherwise its hash changes at midnight.
         const dateElementIndexes: number[] = [];
         let currentDate: string | undefined;
         for (let i = 0; i < output.system.length; i++) {
@@ -411,27 +308,17 @@ export function createSystemPromptHashHandler(deps: {
             }
         }
 
-        // ── Step 3: Persist only after all routing identities are frozen ──
         const systemContent = output.system.join("\n");
 
-        // The first stable ctx_reduce verdict and resolved model jointly own the
-        // baseline. A provisional tool verdict or unknown model can render a
-        // prompt, but neither may persist a hash that the settled route would flip.
+        // A provisional tool verdict or unknown model may render a prompt but must not persist its hash.
         if (!availability.frozen || !modelKey) return;
 
-        // Use hex digest — numeric strings get coerced by SQLite INTEGER column affinity,
-        // causing precision loss on read-back and infinite hash-change flushes.
-        // node:crypto MD5 produces identical digests to Bun.CryptoHasher("md5"),
-        // so persisted hashes remain stable across the Bun→Node runtime swap.
+        // The code uses a hex digest to prevent SQLite INTEGER coercion from losing hash precision on read-back and causing infinite hash-change flushes.
         const currentHash = createHash("md5")
             .update(promptSurfaceHashMaterial(systemContent, promptSurface.preset))
             .digest("hex");
 
-        // Reuse sessionMetaEarly from Step 1 — no code path between that read
-        // and here mutates session_meta for this session, so a second DB read
-        // would return identical data. If Step 1's read failed (sessionMetaEarly
-        // is undefined), bail rather than re-attempting: we already logged the
-        // error and can't make an informed hash-change decision without the
+        // The function returns after a failed Step 1 read because hash-change detection requires prior metadata.
         // previous hash.
         if (!sessionMetaEarly) {
             return;
@@ -442,10 +329,7 @@ export function createSystemPromptHashHandler(deps: {
                 sessionId,
                 `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), triggering flush`,
             );
-            // Real prompt-content or preset change: signal all three independent
-            // refresh lifetimes. The semantic prompt epoch changed on this turn,
-            // so history rebuild, adjunct refresh, and materialization should ride
-            // the same cycle.
+            // A prompt-content or preset change must refresh history, adjuncts, and materialization together.
             deps.historyRefreshSessions.add(sessionId);
             deps.systemPromptRefreshSessions.add(sessionId);
             deps.pendingMaterializationSessions.add(sessionId);
@@ -457,16 +341,9 @@ export function createSystemPromptHashHandler(deps: {
             );
         }
 
-        // Estimate system prompt tokens for dashboard visibility only when
-        // the prompt hash changed; unchanged prompts keep the stored count.
         //
-        // FAIL-OPEN (per-turn handler rule): the prompt has ALREADY been mutated
-        // in place above (guidance + sticky date). estimateTokens can throw on a
-        // pathological tokenizer input and updateSessionMeta can throw on a busy/
-        // failing DB — neither must propagate into the prompt path (a throw here
-        // would fail the LLM call instead of just losing a telemetry write). Persist
-        // the hash even if token estimation fails, so the next pass doesn't re-detect
-        // a phantom hash change and re-flush.
+        // Token-estimation and metadata-write failures must not abort the LLM call.
+        // The handler attempts to persist currentHash after token-estimation failure to avoid re-flushing on the next pass.
         if (currentHash !== previousHash) {
             let systemPromptTokens = sessionMeta.systemPromptTokens;
             try {
@@ -488,27 +365,12 @@ export function createSystemPromptHashHandler(deps: {
             }
         }
 
-        // ── Step 4: Drain systemPromptRefreshSessions (one-shot semantics) ──
-        // We've consumed the signal: adjuncts have been re-read or kept
-        // cached as appropriate, sticky date has been updated or frozen,
-        // and the hash has been re-evaluated. Future defer passes within
-        // the same TTL window MUST hit cached adjunct values to keep the
-        // system-prompt cache prefix stable.
+        // Later passes within the TTL must reuse cached adjuncts to preserve the system-prompt cache prefix.
         //
-        // CRITICAL: drain conditionally on the value captured at the top
-        // of the handler (`isCacheBusting` from line 201). Two distinct
-        // cases hinge on this:
         //
-        // 1. Flag was already set when handler started → adjuncts were
-        //    refreshed in Step 1.5 above using the live `isCacheBusting`
-        //    value. Signal consumed; drain it.
         //
-        // 2. Flag was added LATER in Step 3 by hash-change detection
-        //    (lines 401-403) → adjuncts in Step 1.5 used STALE cache
-        //    because `isCacheBusting` was captured before the add.
-        //    The just-added flag must survive to the NEXT pass so
-        //    adjuncts can finally refresh. An unconditional drain here
-        //    would silently drop that signal, leaving adjuncts stale
+        // A hash change can add isCacheBusting after adjuncts have already been read.
+        // The handler retains a flag added after the adjunct read for the next pass.
         //    forever.
         //
         // Early returns at lines 375 / 388 also benefit: they preserve

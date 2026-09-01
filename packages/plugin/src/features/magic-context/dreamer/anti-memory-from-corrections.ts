@@ -20,17 +20,12 @@ import { validateRetrospectiveLearningText } from "./retrospective-learnings";
 const CORRECTION_CONSUMER = "dreamer-correction-harvest-v1";
 
 /**
- * Per-run event budget. Bounds the single write transaction the harvest runs
- * inside (a first deploy can face months of unreceipted backlog); the receipt
- * filter keeps the remainder pending, so the backlog drains across scheduled
- * runs instead of holding the SQLite write lock for one giant drain.
+ * MAX_CORRECTION_EVENTS_PER_RUN bounds the harvest's single write transaction.
  */
 const MAX_CORRECTION_EVENTS_PER_RUN = 50;
 
 /**
- * Minimum normalized word count before an evidence quote can corroborate a
- * user correction. A short common phrase appearing anywhere in the user's
- * messages must not be able to mint `explicit_user` trust for an otherwise
+ * MIN_CORROBORATION_WORDS requires at least five normalized words before an evidence quote can corroborate a user correction.
  * model-authored record.
  */
 const MIN_CORROBORATION_WORDS = 5;
@@ -44,11 +39,6 @@ export interface CorrectionHarvestResult {
 export function countPendingCorrectionEvents(db: Database, projectIdentity: string): number {
     const row = db
         .prepare(
-            // Joined on harness as well as session id, matching
-            // getProjectCompartmentEvents: `session_projects` is keyed
-            // `(session_id, harness)`, so session id alone counts another
-            // harness's project events as pending for this project. The gate and
-            // the reader must agree, or the scheduler reopens work the harvest
             // cannot drain.
             `SELECT COUNT(DISTINCT events.id) AS count
                FROM compartment_events events
@@ -70,20 +60,9 @@ export function countPendingCorrectionEvents(db: Database, projectIdentity: stri
 function mappedPayload(event: ProjectCompartmentEvent): AntiMemoryPayload | null {
     const trigger = event.fields.summary?.trim();
     const rejectedStrategy = event.fields.before_strategy?.trim();
-    // Only `reason_for_change` carries WHY the approach was rejected, so it is
-    // the sole source for the durable rejection reason.
     //
-    // The two obvious alternatives are both wrong. `evidence` is contractually a
-    // quote or paraphrase proving the pivot happened, so falling back to it
-    // records statements like "the final implementation now uses X" as the
-    // reason a strategy was unsafe — proof of the pivot, not its cause.
-    // `correction_signal` is contractually a quote of the trigger, which is
-    // frequently the user's own words; persisting those is forbidden outright,
-    // and the privacy gate is not a safe filter for telling a quote from a
     // paraphrase.
     //
-    // An event carrying no causal reason therefore yields no anti-memory: it is
-    // skipped as `missing_warning_core` and receipted, so it is not retried.
     const rejectionReason = event.fields.reason_for_change?.trim();
     if (!trigger || !rejectedStrategy || !rejectionReason) return null;
     const saferAlternative = event.fields.after_strategy?.trim() || null;
@@ -91,10 +70,6 @@ function mappedPayload(event: ProjectCompartmentEvent): AntiMemoryPayload | null
 }
 
 /**
- * Run every persisted payload field through the retrospective privacy gate,
- * including the source-overlap ("distill, don't transcribe") check against the
- * event span's own user messages. Deriving the field set from the normalized
- * payload means a future payload field cannot silently bypass the gate.
  */
 function validationReason(
     payload: AntiMemoryPayload,
@@ -117,10 +92,7 @@ function normalizedEvidence(text: string): string {
 }
 
 /**
- * Message-ordinal window for host corroboration. The compartment bounds are the
- * host-recorded authority; the historian's optional `ord_span` may only narrow
- * them. An event whose compartment bounds are unknown gets no window (and so no
- * trust upgrade): the model-authored span must never choose its own search
+ * Host-recorded compartment bounds define the corroboration window.
  * range.
  */
 function eventSpan(event: ProjectCompartmentEvent): [number, number] | null {
@@ -149,20 +121,9 @@ function spanUserTexts(
     span: [number, number] | null,
 ): string[] {
     if (!span) return [];
-    // `message_history_fts` carries the text but has no harness column, while
-    // `message_history_source` carries harness but only a content hash. Joining
-    // them on (session_id, message_id) is what makes the text harness-scoped.
     //
-    // Session id alone is not enough here for the same reason the event-to-project
-    // join needs harness: one session id can be bound to a different project per
-    // harness. Reading the other harness's messages would corrupt both consumers
-    // of this list — an unrelated message could trigger `source_overlap` and
-    // permanently skip a valid correction, or satisfy the evidence match in
-    // `hostCorroboratesUserCorrection` and mint `explicit_user` trust for a
     // model-authored record.
     //
-    // Both tables are written together by `message-index.ts`, so the join does
-    // not drop rows the FTS index legitimately holds.
     const rows = db
         .prepare(
             `SELECT fts.content AS content
@@ -179,11 +140,6 @@ function spanUserTexts(
 }
 
 /**
- * True when the historian's evidence quote is a substantial (≥
- * MIN_CORROBORATION_WORDS words) verbatim run of an in-span user message.
- * Corroboration reads the `evidence` field — the quote proving the correction —
- * not the persisted payload: the persisted reason must be a distillation, and
- * the privacy gate rejects it when it transcribes the user.
  */
 function hostCorroboratesUserCorrection(
     event: ProjectCompartmentEvent,
@@ -222,24 +178,11 @@ export function harvestAntiMemoriesFromCorrections(args: {
         const expiresAt = event.createdAt + ANTI_MEMORY_DEFAULT_TTL_MS;
         const payload = expiresAt > nowMs ? mappedPayload(event) : null;
         const span = payload ? eventSpan(event) : null;
-        // A span only bounds a trustworthy search if the message index has
-        // actually reached it. `message_history_fts` is filled asynchronously and
-        // can be re-indexed from a dirty floor, so a valid span whose rows are not
-        // yet indexed yields an empty `userTexts` and makes the source-overlap
-        // check pass vacuously — the same silent bypass as a missing span.
-        // `isMessageIndexReconciledThrough` is the authoritative predicate: the
-        // watermark covers the span AND no dirty floor is outstanding.
         const spanIsSearchable =
             span !== null && isMessageIndexReconciledThrough(args.db, event.sessionId, span[1]);
         const userTexts = spanIsSearchable ? spanUserTexts(args.db, event, span) : [];
-        // With no searchable span there are no source texts, and
-        // `validateRetrospectiveLearningText` silently loses its source-overlap
-        // arm against an empty list: the quote, date, and frustration checks
-        // still run, but a field copied verbatim from a user message without
-        // quote marks passes. `compartment_id` is null for an unresolved anchor
-        // and dangles after compartment recomp, so this is reachable in normal
-        // operation, not just on malformed input. Skip rather than persist a
-        // payload whose transcription check could not run.
+        // The harvester skips payloads without a searchable span because it cannot run the transcription check.
+        // The harvester skips payloads without a searchable span because it cannot run the transcription check.
         const reason = !payload
             ? expiresAt > nowMs
                 ? "missing_warning_core"
@@ -277,9 +220,9 @@ export function harvestAntiMemoriesFromCorrections(args: {
                     producer: CORRECTION_CONSUMER,
                     operationKey,
                     // Digest inputs must be derivable from the immutable event row
-                    // alone. Values derived from mutable state (message index rows,
-                    // compartment recomputation, project identity) would make a
-                    // replay compute a different digest and throw
+                    // Digest inputs must not use mutable message-index rows.
+                    // Mutable message-index state and `projectId` must not affect the digest because recomputation would change it on replay.
+                    // Mutable digest inputs make replays compute a different digest and throw `ClaimOperationKeyReuseError`.
                     // ClaimOperationKeyReuseError.
                     requestDigest: computeClaimOperationRequestDigest({
                         eventId: event.id,
@@ -304,9 +247,9 @@ export function harvestAntiMemoriesFromCorrections(args: {
                                 sourceTrustClass,
                             },
                             actor: args.actor ?? CORRECTION_CONSUMER,
-                            // Anchor expiry to the event, not the harvest clock:
-                            // backfilling old history must not re-animate stale
-                            // corrections as fresh warnings.
+                            // `expiresAt` is measured from the event time, not the harvest time.
+                            // Backfills must not reanimate stale corrections as fresh warnings.
+                            // Backfills must not reanimate stale corrections as fresh warnings.
                             expiresAt,
                             nowMs,
                         },
@@ -319,10 +262,10 @@ export function harvestAntiMemoriesFromCorrections(args: {
                 consumed += 1;
             }
         } catch (error) {
-            // A stored receipt whose digest no longer matches marks the event as
-            // already consumed under different derived inputs. Treat it as done
-            // rather than aborting the transaction: an uncaught throw here would
-            // deterministically fail every future retrospective run.
+            // A stored receipt with a mismatched digest means the event was already consumed with different derived inputs.
+            // The harvester treats a stored receipt with a mismatched digest as consumed rather than aborting the transaction.
+            // The harvester treats `ClaimOperationKeyReuseError` as consumed because rethrowing it makes every later retrospective run fail on the same event.
+            // The harvester treats `ClaimOperationKeyReuseError` as consumed because rethrowing it makes every later retrospective run fail on the same event.
             if (error instanceof ClaimOperationKeyReuseError) continue;
             throw error;
         }

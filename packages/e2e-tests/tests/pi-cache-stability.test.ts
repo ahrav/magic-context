@@ -102,7 +102,6 @@ function requestMessages(request: { body: { messages?: unknown } }): unknown[] {
 }
 
 /**
- * Concatenate the system field plus every message's text content.
  *
  * v2 moves <project-docs>/<user-profile>/<key-files> out of the system
  * prompt and into the m[0]/m[1] messages (prepended as the first two user
@@ -421,8 +420,7 @@ describe("pi cache stability", () => {
                 expect(tagNumber).toBeGreaterThan(0);
 
                 // Simulate the execute pass that escalated this tag to lite/depth 2.
-                // The assertion below verifies subsequent low-pressure Pi turns replay
-                // from the pristine source row, not from already-compressed text.
+                // Subsequent low-pressure Pi turns replay from the pristine source row, not already-compressed text.
                 writeDb(h, (db) => {
                     db.prepare(
                         "UPDATE tags SET caveman_depth = 2 WHERE session_id = ? AND tag_number = ?",
@@ -469,12 +467,10 @@ describe("pi cache stability", () => {
             },
             async (h) => {
                 h.mock.script([
-                    // Warm-up turn. A fresh Pi session starts at stable-id
-                    // scheme 0; the FIRST pass that resolves real SessionEntry
-                    // ids performs the one-time v25 cutover, which forces an
-                    // execute+materialize regardless of pressure. We burn that
-                    // here so the defer-survival assertion below isn't drained
-                    // by the cutover instead of by a real execute decision.
+                    // A fresh Pi session starts with stable-ID scheme 0.
+                    // The first pass that resolves real `SessionEntry` IDs changes the stable-ID scheme to 1 and forces execute and materialize.
+                    // The first pass that resolves real SessionEntry IDs performs the one-time v25 cutover, forcing execute and materialize.
+                    // Run this turn before the defer assertion because the v25 cutover forces execute+materialize on first SessionEntry-ID resolution.
                     {
                         text: "warm-up: absorb the one-time stable-id cutover",
                         usage: {
@@ -731,8 +727,6 @@ describe("pi cache stability", () => {
                 // System field stays byte-identical across defer turns 2..N.
                 expect(new Set(systems.slice(1)).size).toBe(1);
                 // v2: <project-docs> moved from system → m[0]/m[1] messages.
-                // Assert the content reaches the model on the wire (system +
-                // messages), not the legacy system-only location.
                 const lastWire = wireText(requests.at(-1)!);
                 expect(lastWire).toContain("<project-docs>");
                 expect(lastWire).toContain(
@@ -848,46 +842,35 @@ describe("pi cache stability", () => {
         });
     }, 180_000);
 
-    // FIXME(pi-cache-stability): expected to fail until Pi gets OpenCode v10-style
-    // history injection cache parity for background publication during defer passes.
+    // TODO: Verify that background publication during defer passes preserves history-injection cache parity.
+    // TODO: Verify that background publication during defer passes preserves history-injection cache parity.
     it.skip("does not rebuild <session-history> after historian publishes during a defer pass", () => {});
 
-    // FIXME(pi-cache-stability): pi --print exits immediately after the parent turn;
-    // existing Pi smoke tests document that async historian completion is out of scope
-    // for print-mode until Pi exposes a durable single-shot drain surface.
+    // TODO: Add a print-mode harness that waits for async historian completion after the parent turn.
     it.skip("fires historian on commit cluster trigger and publishes harness='pi' compartments", () => {});
 
-    // FIXME(pi-cache-stability): depends on the same print-mode historian child drain;
-    // keep as durable coverage target for fallback model retry once that lands.
+    // TODO: Verify fallback-model retries after the print-mode historian child drains.
     it.skip("publishes historian output through fallback_models after primary 503", () => {});
 
-    // FIXME(pi-cache-stability): Pi --print reloads the extension between user turns,
-    // so in-memory adjunct caches do not currently preserve the design invariant that
-    // ctx_memory writes wait for an explicit /ctx-flush before refreshing the system prompt.
+    // TODO: Test that ctx_memory writes refresh the system prompt only after /ctx-flush across Pi --print user turns.
     it.skip("refreshes system-prompt memory adjuncts only after explicit /ctx-flush", () => {});
 
-    // FIXME(pi-cache-stability): sticky reminder anchor persistence is wired through
-    // session_meta, but Pi --print cannot yet synthesize the exact multi-turn nudge
-    // anchor/restart sequence without interactive process control.
+    // TODO: Test sticky reminder anchor persistence through session_meta across restarts.
+    // TODO: Add a harness scenario for multi-turn sticky-reminder anchor recovery across restart.
     it.skip("keeps sticky reminder anchored at the same message across defer passes and restart", () => {});
 
-    // FIXME(pi-cache-stability): native compaction is cancelled by session_before_compact,
-    // but the current e2e harness has no hook to force Pi's native compact event in print mode.
+    // TODO: Add an e2e harness hook that triggers Pi's native compact event in print mode.
     it.skip("cancels native Pi compaction and lets Magic Context own compaction", () => {});
 
-    // FIXME(pi-cache-stability): requires reliable print-mode historian publication and
-    // inspection of Pi's JSONL compaction entry after appendCompaction(...).
+    // TODO: Verify historian publication writes a Pi compaction marker and resumes after it.
     it.skip("writes a Pi compaction marker at the historian boundary and resumes after it", () => {});
 
-    // FIXME(pi-cache-stability): /ctx-aug subagent runs need a print-mode command/tool
-    // harness that can wait for the child Pi process and inspect its session rows.
+    // TODO: Add a print-mode harness that waits for the child Pi process and inspects its session rows during /ctx-aug subagent runs.
     it.skip("marks Pi subagents isolated and skips historian/project-docs/user-profile/key-files", () => {});
 
-    // FIXME(pi-cache-stability): same subagent command harness gap as above; target is
-    // cross-session memory visibility via ctx_search from a Pi subagent.
+    // TODO: Add a print-mode subagent command harness to verify cross-session memory visibility through ctx_search.
     it.skip("allows Pi subagents to search parent-written project memory", () => {});
 
-    // FIXME(pi-cache-stability): simulating SIGKILL mid-historian in print mode currently
-    // races Pi process shutdown; keep as the restart-recovery target for stale state cleanup.
+    // TODO: Add a print-mode scenario that kills the historian mid-publication and verifies stale-state cleanup after restart.
     it.skip("clears stale compartment_in_progress after Pi restart", () => {});
 });

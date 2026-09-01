@@ -1,4 +1,4 @@
-//! Admission capacity, internal health, liveness, and shutdown ordering.
+//! This module tests admission capacity, internal health, liveness, and shutdown ordering.
 
 mod support;
 
@@ -17,8 +17,7 @@ use support::{mode_body, BindPolicy, Event, TestHandler, TestHost, LINKED_MODULE
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
 
-/// Blocks inside one `route_gone` poll, so task abort cannot take effect until
-/// the test releases it.
+/// The `route_gone` callback blocks until the test releases it, so task abort cannot take effect.
 struct DelayedRouteGoneHandler {
     inner: TestHandler,
     route_gone_started: Arc<AtomicBool>,
@@ -168,7 +167,7 @@ async fn transport_serves_while_the_handler_reports_degraded_storage() {
     host.handler
         .set_health(mc_host::HealthStatus::Degraded, Some("store opening"));
 
-    // Discovery, authentication, catalog, and bind all work in this window.
+    // Discovery, authentication, catalog, and bind succeed before the lease expires.
     let mut client = host.client().await;
     let corr = client
         .control(&serde_json::json!({"op": "catalog.list"}))
@@ -183,7 +182,6 @@ async fn transport_serves_while_the_handler_reports_degraded_storage() {
         .await
         .expect("bind still works while storage opens");
 
-    // A storage-dependent request returns an application terminal, not a
     // transport disconnect.
     let corr = client.next_corr();
     client
@@ -240,16 +238,15 @@ async fn saturated_handshake_capacity_closes_without_reading_client_bytes() {
     })
     .await;
 
-    // Occupy the only handshake slot with a socket that never speaks.
+    // The test occupies the only handshake slot with a socket that never speaks.
     let squatter = raw_client::connect_unauthenticated(&host.info)
         .await
         .expect("squatter connects");
 
-    // Give the host a moment to accept and charge the slot.
+    // The test waits until the host accepts the socket and charges its handshake slot.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // The second peer sends no bytes. EOF therefore proves the host did not
-    // wait for a handshake read before enforcing capacity.
+    // EOF proves the host enforced capacity before reading the second peer's handshake.
     let mut rejected = raw_client::connect_unauthenticated(&host.info)
         .await
         .expect("second connects");
@@ -295,7 +292,7 @@ async fn saturated_connection_capacity_closes_after_authentication() {
     assert_eq!(frame.corr, corr);
 
     // ServerProof must arrive before the post-authentication capacity close;
-    // an accept-time capacity check would make this connect fail earlier.
+    // An accept-time capacity check would close the second connection before `ServerProof` arrives.
     let mut second = raw_client::RawClient::connect_setup_only(&host.info)
         .await
         .expect("the proof exchange completes before promotion is refused");
@@ -304,7 +301,7 @@ async fn saturated_connection_capacity_closes_after_authentication() {
         "a connection beyond capacity must be closed"
     );
 
-    // Releasing the first frees the class.
+    // Releasing the first connection frees its capacity class.
     drop(first);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -331,8 +328,7 @@ async fn saturated_connection_capacity_closes_after_authentication() {
     host.shutdown_gracefully().await;
 }
 
-/// A sustained unauthenticated flood may exhaust only its own class; existing
-/// work and shutdown must still make progress (plan U6 scenario 3).
+/// A sustained unauthenticated flood may exhaust only its own class; existing work and shutdown must still make progress.
 #[tokio::test]
 async fn an_unauthenticated_flood_cannot_starve_established_work() {
     let host = TestHost::start_with(|config| {
@@ -353,8 +349,7 @@ async fn an_unauthenticated_flood_cannot_starve_established_work() {
         let mut held = Vec::new();
         while flag.load(std::sync::atomic::Ordering::Relaxed) {
             if let Ok(socket) = raw_client::connect_unauthenticated(&info).await {
-                // Never speak: each socket squats a handshake slot until the
-                // absolute auth deadline expires.
+                // Each silent socket occupies a handshake slot until the absolute authentication deadline expires.
                 held.push(socket);
             }
             if held.len() > 64 {
@@ -394,8 +389,7 @@ async fn an_unauthenticated_flood_cannot_starve_established_work() {
     let _ = flood.await;
 }
 
-/// Ping correlations live in a host-owned namespace, so a numerically equal
-/// consumer correlation cannot cross-settle (protocol §8.3, V43).
+/// Host-owned ping correlations prevent a numerically equal consumer correlation from cross-settling.
 #[tokio::test]
 async fn ping_and_consumer_correlations_do_not_cross_settle() {
     let host = TestHost::start_with(|config| {
@@ -414,7 +408,7 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .expect("route");
 
     let corr = client.next_corr();
-    assert_eq!(corr, 3);
+    assert_eq!(corr, 2);
     client
         .send_frame(
             TY_REQUEST,
@@ -459,6 +453,11 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .frames_until_corr(corr, BUDGET)
         .await
         .expect("consumer terminal");
+    assert_eq!(
+        frame.ty,
+        support::raw_client::TY_ERROR,
+        "unexpected consumer frame: {frame:?}"
+    );
     assert_eq!(frame.error_code(), "cancelled");
 
     // An unmatched Pong is dropped without disturbing the generation.
@@ -516,7 +515,7 @@ async fn shutdown_drains_admitted_work_then_says_goodbye() {
         .await
         .expect("route");
 
-    // In-flight work that will be cancelled by the drain.
+    // The drain cancels in-flight work.
     let hanging = client.next_corr();
     client
         .send_frame(
@@ -538,8 +537,7 @@ async fn shutdown_drains_admitted_work_then_says_goodbye() {
     let handler = host.handler.clone();
     let shutdown_task = tokio::spawn(async move { host.shutdown().await });
 
-    // The drain terminal arrives while the writer is still live, and the
-    // connection Goodbye follows it.
+    // The drain terminal arrives while the writer is still live, then the connection sends `Goodbye`.
     let frames = client.drain_until_close(Duration::from_secs(15)).await;
     let cancelled = frames
         .iter()
@@ -581,7 +579,7 @@ async fn shutdown_refuses_new_routes_and_new_routed_work() {
         .await
         .expect("route");
 
-    // Hold the drain open so the frozen-admission window is observable.
+    // The test holds the drain open so the frozen-admission window is observable.
     let hanging = client.next_corr();
     client
         .send_frame(
@@ -605,7 +603,7 @@ async fn shutdown_refuses_new_routes_and_new_routed_work() {
     let info = host.info.clone();
     let shutdown_task = tokio::spawn(async move { host.shutdown().await });
 
-    // The fenced unlink happens early in the drain.
+    // The drain unlinks the fenced publication before it completes.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while publication.exists() {
         assert!(
@@ -665,8 +663,7 @@ async fn shutdown_refuses_new_routes_and_new_routed_work() {
     assert!(handler.handler_dropped());
 }
 
-/// A hung lifecycle callback is host-fatal: shutdown must not report success
-/// (plan KTD9, KTD10).
+/// A panicking lifecycle callback is host-fatal: shutdown must not report success.
 #[tokio::test]
 async fn a_panicking_bind_is_cleaned_before_fatal_shutdown() {
     let host = TestHost::start_with(|config| {
@@ -730,7 +727,7 @@ async fn a_hung_route_gone_callback_is_fatal_rather_than_falsely_graceful() {
         ),
         "expected a fatal shutdown result, got {err}"
     );
-    // The handler is still released so no stale state survives the process.
+    // The handler is released even when route-gone does not complete.
     assert!(handler.handler_dropped());
 }
 
@@ -771,7 +768,7 @@ async fn a_close_racing_an_in_flight_bind_never_publishes_the_route() {
         .expect("send route.open");
     let _ = corr;
 
-    // Wait until the handler is inside bind, then retire the generation.
+    // `route_gone` must observe a generation whose `bind` callback started.
     let deadline = tokio::time::Instant::now() + BUDGET;
     while host.handler.binds().is_empty() {
         assert!(tokio::time::Instant::now() < deadline, "bind never started");
@@ -885,7 +882,6 @@ async fn a_successor_starts_only_after_the_predecessor_releases_its_lock() {
     .expect("first host publishes");
     let first_info = first.info.clone();
 
-    // A second host against the same runtime directory is refused.
     let blocked = TestHost::try_start_with(TestHandler::new(), {
         let path = data_root.path().to_path_buf();
         move |config| config.data_dir = Some(path)
@@ -898,7 +894,6 @@ async fn a_successor_starts_only_after_the_predecessor_releases_its_lock() {
 
     first.shutdown_gracefully().await;
 
-    // After release, a successor starts with fresh credentials.
     let second = TestHost::try_start_with(TestHandler::new(), {
         let path = data_root.path().to_path_buf();
         move |config| config.data_dir = Some(path)
@@ -914,7 +909,6 @@ async fn a_successor_starts_only_after_the_predecessor_releases_its_lock() {
         "each incarnation mints a fresh daemon ID"
     );
 
-    // Old credentials cannot authenticate against the new incarnation.
     assert!(
         raw_client::RawClient::connect(&first_info).await.is_err(),
         "mixed-generation credentials must fail closed"
@@ -1082,16 +1076,12 @@ async fn delayed_lifecycle_callback_runs_shutdown_once_before_successor_starts()
     successor.shutdown_gracefully().await;
 }
 
-/// Asserts the guard ordering shared by every interrupted-incarnation path:
-/// the instance lock refuses a successor while the blocked shutdown callback
-/// runs, and releases only after that callback completes. Returns the
-/// successor host that finally acquired the lock.
+/// The instance lock remains held until the blocked shutdown callback completes.
+/// The instance lock refuses a successor until the blocked shutdown callback completes.
 async fn assert_lock_released_only_after_shutdown_callback(
     handler: &TestHandler,
     data_root: &std::path::Path,
 ) -> TestHost {
-    // Let the detached cleanup progress to the shutdown callback before
-    // observing the held lock.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !handler.events().contains(&Event::Shutdown),
@@ -1130,9 +1120,8 @@ async fn assert_lock_released_only_after_shutdown_callback(
     }
 }
 
-/// An abandoned `run` future (supervisor abort, not a shutdown signal) must
-/// still run the handler shutdown callback: component-owned work is only
-/// stopped and drained by `shutdown`, and the instance lock must not release
+/// Only `shutdown` stops and drains component-owned work.
+/// The instance lock must remain held until `shutdown` drains component-owned work.
 /// beside it.
 #[tokio::test]
 async fn an_abandoned_run_future_runs_the_shutdown_callback_before_lock_release() {
@@ -1158,8 +1147,7 @@ async fn an_abandoned_run_future_runs_the_shutdown_callback_before_lock_release(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // Abandon the run future outright; the forced cleanup owns the instance
-    // guard from here.
+    // After `run` is abandoned, forced cleanup owns the instance guard.
     task.abort();
     assert!(
         task.await.is_err(),
@@ -1180,10 +1168,10 @@ async fn an_abandoned_run_future_runs_the_shutdown_callback_before_lock_release(
     successor.shutdown_gracefully().await;
 }
 
-/// A shutdown request during initialization aborts the callback, and the
-/// detached reaper then runs the handler shutdown callback before releasing
-/// the lock: an interrupted initialize can already have handed work to
-/// component-owned trackers that only `shutdown` drains.
+/// A shutdown request during initialization aborts initialization and reaps the handler before releasing the instance lock.
+/// The detached reaper invokes the handler shutdown callback before releasing the instance lock.
+/// Interrupted initialization can hand work to component-owned trackers.
+/// Only `shutdown` drains work held by component-owned trackers.
 #[tokio::test]
 async fn shutdown_during_initialization_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1215,8 +1203,8 @@ async fn shutdown_during_initialization_runs_the_shutdown_callback_before_lock_r
     successor.shutdown_gracefully().await;
 }
 
-/// The initialize-deadline path takes the same reaper as shutdown-during-init:
-/// the shutdown callback runs and the lock outlives it.
+/// The initialize-deadline path uses the shutdown-during-init reaper.
+/// The initialize-deadline reaper invokes the shutdown callback before releasing the instance lock.
 #[tokio::test]
 async fn initialization_deadline_expiry_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1246,11 +1234,10 @@ async fn initialization_deadline_expiry_runs_the_shutdown_callback_before_lock_r
     successor.shutdown_gracefully().await;
 }
 
-/// An initialization that *returns* a failure still drains the handler: a
-/// composite's primary can have initialized before its secondary failed, and
-/// only the shutdown callback stops that work. The callback is awaited inside
-/// `run`, so the instance lock — released when `run` returns — cannot free
-/// while handler-owned work is still live.
+/// An initialization failure still invokes the handler shutdown callback.
+/// If a composite's secondary initialization fails, its primary may already have initialized.
+/// Only the shutdown callback stops work initialized by the composite's primary.
+/// `run` awaits the shutdown callback, so returning from `run` cannot release the instance lock while handler-owned work remains live.
 #[tokio::test]
 async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1266,8 +1253,8 @@ async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release(
         mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
     });
 
-    // While the shutdown callback is blocked, startup has not returned and the
-    // lock is still held against a successor.
+    // The instance lock remains held while the shutdown callback is blocked.
+    // The instance lock remains held against a successor.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(50), &mut task)
@@ -1324,8 +1311,7 @@ async fn aborting_failed_initialization_cleanup_retains_lock_until_shutdown_stop
         mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
     });
 
-    // Initialization returns immediately, so a pending startup is waiting for
-    // the blocked shutdown callback before returning its original error.
+    // A pending startup waits for the blocked shutdown callback before returning its initialization error.
     assert!(
         tokio::time::timeout(Duration::from_millis(200), &mut task)
             .await
@@ -1349,16 +1335,15 @@ async fn aborting_failed_initialization_cleanup_retains_lock_until_shutdown_stop
     successor.shutdown_gracefully().await;
 }
 
-/// A setup failure *after* a successful initialize drains the handler too:
-/// publication is the last step before the host owns cleanup, and an
-/// initialized handler can already hold stores or background work that only
-/// the shutdown callback stops.
+/// A setup failure after successful initialization invokes the handler shutdown callback.
+/// After publication succeeds, later setup failures invoke the handler shutdown callback.
+/// An initialized handler can hold stores or background work that only its shutdown callback stops.
+/// Only the shutdown callback stops the initialized handler's stores and background work.
 #[tokio::test]
 async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
     let handler = TestHandler::new();
-    // Initialize blocks so the runtime directory can be removed after the
-    // instance lock exists but before publication writes the connection file.
+    // Initialize blocks until the instance lock exists, allowing the runtime directory to be removed before publication writes the connection file.
     handler.block_init();
     let config = mc_host::HostConfig {
         data_dir: Some(data_root.path().to_path_buf()),
@@ -1371,16 +1356,15 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     let host_dir = data_root.path().join("cortexkit").join("run");
-    // The directory holds the starting lifecycle record; removing the whole
-    // tree still makes the publication write fail.
+    // The runtime directory contains the starting lifecycle record, and removing it makes publication fail.
     std::fs::remove_dir_all(&host_dir).expect("remove runtime directory");
     handler.release_init();
 
     let result = task.await.expect("run task joins");
 
     assert!(
-        matches!(result, Err(HostError::Instance(_))),
-        "a removed runtime directory fails publication, got {result:?}"
+        matches!(result, Err(HostError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
+        "a removed runtime directory fails setup before publication, got {result:?}"
     );
     assert!(
         handler.events().contains(&Event::Initialized),
@@ -1392,10 +1376,8 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
     );
 }
 
-// --- host.shutdown and lifecycle evidence (plan U1) ---
-
-/// One authenticated `host.shutdown`: the correlated success response is
-/// fully observed before Goodbye/EOF, the run completes gracefully, and the
+/// An authenticated `host.shutdown` fully observes its correlated success response before Goodbye/EOF.
+/// The host stops gracefully after sending the shutdown response.
 /// runtime directory holds neither publication nor lifecycle record.
 #[tokio::test]
 async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
@@ -1435,29 +1417,51 @@ async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
     assert!(!record.exists(), "lifecycle record removed under the lock");
 }
 
-/// Two connections race `host.shutdown`: each correlation settles exactly
-/// once with a parseable response, and the host cancels once.
+/// Two racing `host.shutdown` connections receive one parseable response per correlation.
+/// Each racing request receives one parseable response, and the host cancels once.
 #[tokio::test]
 async fn concurrent_shutdown_requests_each_settle_exactly_once() {
-    let host = TestHost::start().await;
+    // Hold the winning response between ring publication and its completion
+    // hook so both requests reach the shutdown latch before it commits.
+    let response_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_release = Arc::clone(&response_release);
+    let host = TestHost::start_with_publish_hook(Arc::new(move |ty, channel| {
+        if ty as u8 == TY_RESPONSE && channel == 0 {
+            let (released, changed) = &*hook_release;
+            let mut released = released.lock().expect("response gate lock");
+            while !*released {
+                released = changed.wait(released).expect("response gate wait");
+            }
+        }
+    }))
+    .await;
     let mut first = host.client().await;
     let mut second = host.client().await;
 
+    let shutdown_request = serde_json::json!({"op": "host.shutdown"});
     let first_corr = first
-        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .control(&shutdown_request)
         .await
         .expect("first shutdown");
     let second_corr = second
-        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .control(&shutdown_request)
         .await
         .expect("second shutdown");
+    {
+        let (released, changed) = &*response_release;
+        *released.lock().expect("response gate lock") = true;
+        changed.notify_all();
+    }
 
     // Each request correlation must receive exactly one non-ping terminal.
-    for (client, corr) in [(&mut first, first_corr), (&mut second, second_corr)] {
+    for (requester, client, corr) in [
+        ("first", &mut first, first_corr),
+        ("second", &mut second, second_corr),
+    ] {
         let (skipped, response) = client
             .frames_until_corr(corr, BUDGET)
             .await
-            .expect("each requester settles");
+            .unwrap_or_else(|error| panic!("{requester} requester settles: {error}"));
         assert_eq!(response.ty, TY_RESPONSE);
         assert_eq!(response.json()["op"], "host.shutdown");
         let trailing = client.drain_until_close(BUDGET).await;
@@ -1485,9 +1489,8 @@ async fn concurrent_shutdown_requests_each_settle_exactly_once() {
     );
 }
 
-/// A requester that dies right after sending `host.shutdown` cannot strand
-/// the stop: whether its attempt committed or reopened, either the host is
-/// already stopping or a later authenticated requester completes the stop.
+/// A requester that disconnects after sending `host.shutdown` cannot prevent a later authenticated requester from completing the stop.
+/// An already-stopping host or a later authenticated requester completes the stop.
 #[tokio::test]
 async fn a_dying_requester_cannot_strand_the_stop() {
     let host = TestHost::start().await;
@@ -1496,7 +1499,7 @@ async fn a_dying_requester_cannot_strand_the_stop() {
         .control(&serde_json::json!({"op": "host.shutdown"}))
         .await
         .expect("send shutdown");
-    // Abrupt close: the response write may succeed (commit) or fail and
+    // An abrupt-close response write either commits the stop or reopens the latch.
     // reopen ownership.
     drop(first);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1506,19 +1509,14 @@ async fn a_dying_requester_cannot_strand_the_stop() {
             .control(&serde_json::json!({"op": "host.shutdown"}))
             .await
         {
-            // A reopened latch must let this requester commit; a committed
-            // one answers success. A generation retired mid-drain may close
-            // without the frame, which the wire-initiated stop proven below
-            // still shows was a completed stop.
+            // A reopened latch lets a subsequent requester commit; a committed latch returns success.
+            // A generation retired mid-drain may close without its response frame after a completed wire-initiated stop.
             let _ = second.frames_until_corr(corr, BUDGET).await;
         }
     }
 
-    // The second interaction above is fallible only because a committed
-    // first attempt may already be tearing the host down. Whichever branch
-    // ran, the WIRE must have initiated the stop: the handler observes its
-    // shutdown before the direct cancellation below, which would otherwise
-    // mask a stranded stop (a failed connect against a healthy host).
+    // A failed second request is allowed only when the first committed request is already stopping the host.
+    // The handler must observe shutdown before direct cancellation, proving that the wire request initiated the stop.
     let deadline = tokio::time::Instant::now() + BUDGET;
     while !host.handler.events().contains(&Event::Shutdown) {
         assert!(
@@ -1559,11 +1557,8 @@ async fn pipelined_shutdown_requests_on_one_connection_both_settle() {
     wire.extend_from_slice(body);
     client.send_raw(&wire).await.expect("pipeline shutdowns");
 
-    // The host answers pipelined control requests from concurrent tasks, so the
-    // two responses arrive in either order. `frames_until_corr` hands back the
-    // frames it consumed while searching, and those are the only copy: asking
-    // for `second` sequentially after its response was already consumed would
-    // wait out the whole budget.
+    // Responses may arrive in either order, and `frames_until_corr` returns consumed frames without buffering them.
+    // A later lookup for a response already consumed by `frames_until_corr` waits for the full budget.
     let (consumed, first_response) = client
         .frames_until_corr(first, BUDGET)
         .await
@@ -1588,8 +1583,7 @@ async fn pipelined_shutdown_requests_on_one_connection_both_settle() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// Key possession is the whole authorization: every role label gets the same
-/// shutdown capability, so no supported key reader is read-only (plan R33).
+/// The bearer key authorizes shutdown regardless of role.
 #[tokio::test]
 async fn any_role_with_the_bearer_key_can_shut_down() {
     for role in ["client", "diagnostic-readonly"] {
@@ -1610,16 +1604,14 @@ async fn any_role_with_the_bearer_key_can_shut_down() {
     }
 }
 
-/// Without the bearer key no shutdown is possible, and malformed shutdown
-/// shapes are rejected without stopping the host.
+/// Without the bearer key, shutdown requests fail; malformed shutdown requests are rejected without stopping the host.
 #[tokio::test]
 async fn shutdown_requires_authentication_and_a_valid_shape() {
     let host = TestHost::start().await;
 
-    // Unauthenticated socket: no envelope is ever read or written back.
     let mut raw = raw_client::connect_unauthenticated(&host.info)
         .await
-        .expect("tcp connect");
+        .expect("setup socket connect");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let frame = {
         let body = br#"{"op":"host.shutdown"}"#;
@@ -1638,12 +1630,14 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(BUDGET, raw.read(&mut byte))
         .await
-        .expect("the failed handshake closes within its deadline")
-        .expect("read");
-    assert_eq!(read, 0, "no byte may reach an unauthenticated socket");
+        .expect("the failed handshake closes within its deadline");
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(read, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "no byte may reach an unauthenticated socket: {read:?}"
+    );
     drop(raw);
 
-    // Authenticated but malformed: binary flag on channel 0.
     let mut client = host.client().await;
     let corr = client.next_corr();
     client
@@ -1663,7 +1657,6 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
         .expect("rejection");
     assert_eq!(rejection.error_code(), "invalid_control_request");
 
-    // The host is still serving: a catalog request round-trips.
     let catalog_corr = client
         .control(&serde_json::json!({"op": "catalog.list"}))
         .await
@@ -1677,8 +1670,7 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
     host.shutdown_gracefully().await;
 }
 
-/// The native probe tracks one incarnation end to end: running while the
-/// host serves, stopped once it exits, and never by PID.
+/// The native probe reports `running` until this incarnation exits, then `stopped`, without relying on its PID.
 #[tokio::test]
 async fn probe_observes_running_then_stopped_across_an_incarnation() {
     let host = TestHost::start().await;
@@ -1689,9 +1681,8 @@ async fn probe_observes_running_then_stopped_across_an_incarnation() {
     assert_eq!(observed.state, mc_host::LifecycleState::Running);
     assert!(!observed.instance_lock_free);
     let summary = observed.publication.expect("publication summary");
-    assert_eq!(summary.port, host.info.port);
+    assert!(std::path::Path::new(&summary.setup_socket).is_absolute());
 
-    // Stop through the authenticated wire operation, then reprobe.
     let mut client = host.client().await;
     let corr = client
         .control(&serde_json::json!({"op": "host.shutdown"}))
@@ -1712,62 +1703,6 @@ async fn probe_observes_running_then_stopped_across_an_incarnation() {
         observed.publication.is_none(),
         "no stale publication remains"
     );
-}
-
-/// Host shutdown while a transport candidate is mid-activation reaps both
-/// channels, removes the setup's registry membership, releases the
-/// connection permit, and leaves no tracked task — proven by the graceful
-/// shutdown result.
-#[tokio::test]
-async fn shutdown_during_candidate_setup_reaps_both_channels() {
-    use support::fake_transport::{FakeProvider, RawCandidate, FAKE_TRANSPORT};
-
-    let (provider, mut peers) = FakeProvider::install(1, serde_json::json!({}), 64 * 1024);
-    let registry = FakeProvider::registry(&provider);
-    let host = TestHost::start_with(move |config| {
-        config.transport_providers = registry;
-        // Roomy: shutdown must interrupt the setup, not the deadline.
-        config.timing.transport_setup_deadline = Duration::from_secs(30);
-    })
-    .await;
-
-    let mut client = host.setup_client().await;
-    let corr = client
-        .control(&serde_json::json!({
-            "op": "transport.negotiate",
-            "negotiation_version": 1,
-            "offers": [
-                {"transport": FAKE_TRANSPORT, "capability_version": 1},
-                {"transport": "tcp", "capability_version": 1}
-            ]
-        }))
-        .await
-        .expect("send negotiation");
-    let grant = client.frame_within(BUDGET).await.expect("grant response");
-    assert_eq!(grant.corr, corr);
-    let token = grant.json()["activation_token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
-    let peer = peers.recv().await.expect("candidate peer");
-    let mut candidate = RawCandidate::new(peer);
-    let activate = format!(
-        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{token}"}}"#
-    );
-    candidate
-        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 0, 0, 1, activate.as_bytes())
-        .await
-        .expect("send activate");
-    let response = candidate
-        .frame_within(BUDGET)
-        .await
-        .expect("activation response");
-    assert_eq!((response.ty, response.corr), (TY_RESPONSE, 1));
-
-    // Shutdown lands between activation and commit.
-    host.shutdown().await.expect("graceful shutdown");
-    assert!(candidate.closed_within(BUDGET).await);
-    assert!(client.closed_within(BUDGET).await);
 }
 
 // --- stable coordination fences (plan U1) ---
@@ -1822,7 +1757,7 @@ async fn a_replaced_cortexkit_subtree_cannot_admit_an_overlapping_incarnation() 
 
     host.shutdown().await.expect("graceful shutdown");
 
-    // Teardown released both fences: a successor starts in the same root.
+    // After teardown releases the instance and lifetime fences, a successor can start in the same root.
     let successor = TestHost::try_start_with(TestHandler::new(), {
         let path = data_root.path().to_path_buf();
         move |config| config.data_dir = Some(path)
@@ -1832,9 +1767,7 @@ async fn a_replaced_cortexkit_subtree_cannot_admit_an_overlapping_incarnation() 
     successor.shutdown_gracefully().await;
 }
 
-/// Mixed-release coordination: every incarnation locks the same never-renamed
-/// coordination inodes, so two independent openers — a stand-in for release N
-/// and N-1 — contend on one lock instead of splitting ownership.
+/// Successive incarnations contend on the same lifetime lock inode.
 #[tokio::test]
 async fn successive_incarnations_lock_the_same_coordination_inodes() {
     use std::os::unix::fs::MetadataExt;

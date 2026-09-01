@@ -1,11 +1,5 @@
 /**
- * Configure tui.json with the magic-context TUI plugin entry.
  *
- * Called ONLY from the CLI setup wizard and `doctor` (via the core export) —
- * never at plugin startup. Startup injection would re-add the entry on every
- * launch, so a user who deliberately removed the sidebar could never keep it
- * removed; opting in/out of the sidebar is the user's call, made explicitly
- * through setup or doctor.
  */
 
 import {
@@ -67,21 +61,12 @@ function resolveTuiConfigPath(configDirOverride?: string): string {
     const jsoncPath = join(configDir, "tui.jsonc");
     const jsonPath = join(configDir, "tui.json");
 
-    // OpenCode loads BOTH tui.json and tui.jsonc and merges them (tui.json first,
-    // tui.jsonc second, so .jsonc wins overlapping keys; plugin origins are
-    // deduped). So an existing tui.jsonc is the higher-precedence, user-facing
-    // file — write into it when present. Otherwise update an existing tui.json.
-    // For a fresh install create tui.jsonc, not tui.json: it lets the user add
-    // comments later and avoids leaving a second, lower-precedence config file
-    // alongside a tui.jsonc they create afterward (#176).
     if (existsSync(jsoncPath)) return jsoncPath;
     if (existsSync(jsonPath)) return jsonPath;
     return jsoncPath;
 }
 
 /**
- * Ensure the selected TUI config has the magic-context plugin entry.
- * Creates tui.jsonc if neither TUI config exists. Silently skips if already present.
  */
 export function ensureTuiPluginEntry(options: { configDir?: string } = {}): boolean {
     try {

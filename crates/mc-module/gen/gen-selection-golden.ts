@@ -1,30 +1,22 @@
 /**
- * Generate the differential SELECTION golden for the Rust mc-module port.
+ * This script generates a differential selection golden for mc-module.
  *
- * Drives the REAL OpenCode TS selectors (supersession, edit-supersession, two-pass,
- * emergency) over tag fixtures, extracts the DECISION set (which tool → drop vs
- * edit_marker), and emits (a) the equivalent flat typed-CK tail (SelItem[]) and (b)
- * the expected ARC-LEVEL decisions. The Rust `selection_golden` test runs
- * `select_reductions` over the same tail, projects its per-block output back to
- * arc-level, and asserts equality — proving the SELECTOR logic (keep-N, tier
- * ordering, reserve, headroom, watermark, file-supersession, ctx_note actions) is
- * bit-faithful to TS.
+ * The generator records whether each tool is dropped or receives `edit_marker`.
+ * The generator emits equivalent `SelItem[]` tails and expected arc-level decisions.
+ * The Rust `selection_golden` test runs `select_reductions` on the generated tail.
+ * The test projects per-block output to arc-level decisions.
+ * The test compares projected arc-level decisions with the expected decisions.
  *
- * SCOPE: the golden is DECISION-LEVEL (which arcs, what intent) — that is the
- * TS-faithfulness-critical logic. The CK-model ADDITIONS (arc expansion into
- * call/result/reasoning blocks, skeleton-window shaping, payload purity, the
- * cross-selector merge, and the frozen_keys/provider_executed filters) have no TS
- * equivalent and are proven by separate Rust unit tests in selection.rs.
  *
- * TS→CK mapping: one TS tool tag → one CK arc. tag.byteSize → ToolResult bytes,
- * tag.inputByteSize → ToolCall bytes, tag.reasoningByteSize → a Reasoning block.
- * tag.tagNumber → the block ordinal (age key). FlatBlock ids use the ingress
- * `mid#block_index` vocabulary for every block: ToolCall = `<mid>#0`, ToolResult =
- * `<mid>#1`, Reasoning = `<mid>#2`. arc_id is the paired ToolCall FlatBlock id, so
+ * Each TS tool tag maps to one CK arc; `tag.byteSize` maps to ToolResult bytes.
+ * The generator maps `tag.inputByteSize` to ToolCall bytes and `tag.reasoningByteSize` to a Reasoning block.
+ * `n` maps the tag number to the block ordinal used as the age key.
+ * The generator assigns ToolCall, ToolResult, and Reasoning IDs as `${id}#0`, `${id}#1`, and `${id}#2`.
+ * The generator sets `arc_id` to the paired ToolCall FlatBlock id.
  * the arc's reclaim bytes (call+result+reasoning) == the TS tagReclaimBytes exactly.
  *
- * Run:  bun crates/mc-module/gen/gen-selection-golden.ts
- * (resolves the TS selectors from packages/plugin, like the tokenizer generators).
+ * The generator runs with `bun crates/mc-module/gen/gen-selection-golden.ts`.
+ * The command resolves TypeScript selectors from `packages/plugin`.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,27 +36,26 @@ const { openDatabase, closeDatabase, insertTag } = storage as {
     insertTag: (...a: unknown[]) => number;
 };
 
-// --- fixture types ---
 
 interface TagFixture {
-    /** Fixture `mid`; the generated ToolCall id and arc_id are `${id}#0`. */
+    /** The generator derives the ToolCall id and `arc_id` from `id` as `${id}#0`. */
     id: string;
     toolName: string;
-    /** age key (tag number → block ordinal). */
+    /** `n` maps the tag number to the block ordinal used as the age key. */
     n: number;
-    /** ToolResult (output) bytes. */
+    /** `byteSize` provides ToolResult output bytes. */
     byteSize: number;
-    /** Persisted ToolResult token estimate; undefined models an unsized legacy row. */
+    /** Undefined omits the persisted ToolResult token estimate. */
     tokenCount?: number;
-    /** ToolCall (input) bytes. */
+    /** `inputByteSize` provides ToolCall input bytes. */
     inputByteSize?: number;
-    /** Persisted ToolCall input-token estimate. */
+    /* */
     inputTokenCount?: number;
-    /** Reasoning bytes (0 = no reasoning block). */
+    /** A `reasoningByteSize` of `0` omits the Reasoning block. */
     reasoningByteSize?: number;
-    /** ToolCall.input JSON (filePath / action / diff keys / edit content). */
+    /** `input` supplies ToolCall JSON fields such as `filePath`, `action`, diffs, and edit content. */
     input?: Record<string, unknown>;
-    /** Mark this arc's blocks server-side (provider_executed=true → never targeted). */
+    /** `providerExecuted` prevents selectors from targeting this arc's blocks. */
     providerExecuted?: boolean;
 }
 
@@ -74,10 +65,10 @@ interface CaseSpec {
     label: string;
     selector: SelectorKind;
     tags: TagFixture[];
-    /** pass class for the Rust ctx. */
+    /** passClass sets the Rust context pass class. */
     passClass: "Execute" | "EmergencyForce";
     smartDrops: boolean;
-    /** two_pass: the watermark ordinal. */
+    /** lastExecuteOrdinal sets the two_pass watermark ordinal. */
     lastExecuteOrdinal?: number;
     /** emergency inputs. */
     emergency?: {
@@ -87,11 +78,10 @@ interface CaseSpec {
         priorInputSample?: number;
         hasPriorDrop?: boolean;
     };
-    /** ids already frozen (excluded). Flat block ids (e.g. "c2#1"). */
+    /** frozen excludes the listed FlatBlock IDs, such as "c2#1". */
     frozen?: string[];
 }
 
-// --- the CK tail + expected decisions the Rust test consumes ---
 
 interface SelItemJson {
     id: string;
@@ -109,11 +99,11 @@ interface GoldenCase {
     ctx: Record<string, unknown>;
     smart_drops: boolean;
     frozen: string[];
-    /** arc_id → "drop" | "edit_marker" (the TS selector's decision). */
+    /** `arc_id` maps each arc to the TS selector's `drop` or `edit_marker` decision. */
     expected: Record<string, string>;
 }
 
-/** A droppable target; readInput surfaces the arc's input (ctx_note action / filePath). */
+/** `readInput` exposes a droppable target's input, including `ctx_note` action and `filePath`. */
 function makeTarget(input: Record<string, unknown> | undefined) {
     return {
         setContent: () => true,
@@ -171,7 +161,7 @@ function assertDecisionSetIdentity(
     }
 }
 
-/** Build the flat CK tail from the fixture: each tag → a ToolCall + ToolResult (+ Reasoning). */
+/* */
 function buildItems(tags: TagFixture[]): SelItemJson[] {
     const items: SelItemJson[] = [];
     for (const t of tags) {
@@ -200,7 +190,6 @@ function buildItems(tags: TagFixture[]): SelItemJson[] {
             token_count: reclaimableTokens,
             arc_id: callBlockId(t.id),
         });
-        // optional Reasoning block adjacent to the call
         if ((t.reasoningByteSize ?? 0) > 0) {
             items.push({
                 id: reasoningBlockId(t.id),
@@ -216,15 +205,13 @@ function buildItems(tags: TagFixture[]): SelItemJson[] {
     return items;
 }
 
-/** Run the real TS selector for the case → {arc_id → "drop"|"edit_marker"}. */
+/* */
 function runTsSelector(spec: CaseSpec): Record<string, string> {
     const expected: Record<string, string> = {};
     const targets = new Map<number, ReturnType<typeof makeTarget>>();
-    // tagNumber → arc id, so we can map dropped tagIds back to arc ids.
     const tagNumberToArc = new Map<number, string>();
 
     if (spec.selector === "emergency") {
-        // planEmergencyDrop is PURE — build the tag array directly.
         const tags = spec.tags.map((t) => ({
             tagNumber: t.n,
             type: "tool" as const,
@@ -254,7 +241,7 @@ function runTsSelector(spec: CaseSpec): Record<string, string> {
         return expected;
     }
 
-    // DB-backed selectors: seed an isolated in-memory DB.
+    // Tests for DB-backed selectors seed an isolated database.
     process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "sel-golden-"));
     const db = openDatabase();
     if (!db) throw new Error("db open failed");
@@ -333,7 +320,6 @@ function buildCtx(spec: CaseSpec): Record<string, unknown> {
     };
 }
 
-// --- the corpus (each case exercises one selector's branches) ---
 
 const cases: CaseSpec[] = [
     {
@@ -500,8 +486,7 @@ const cases: CaseSpec[] = [
         tags: [{ id: "c1", toolName: "bash", n: 1, byteSize: 80000 }],
     },
     {
-        // current just above ceiling with a small tail → reclaim <= EMERGENCY_REARM_MIN
-        // (2000 tok) → no drop (not worth the cache bust).
+        // The emergency selector does not drop when reclaiming at most EMERGENCY_REARM_MIN tokens.
         label: "emergency: reclaim below min → noop",
         selector: "emergency",
         smartDrops: false,

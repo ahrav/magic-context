@@ -1,20 +1,7 @@
 /**
- * Shared bounded prompt extraction for automatic (auto-search) queries.
  *
- * OpenCode and Pi both feed the user's prompt through this module before any
- * lexical, embedding, or shadow work, so the two harnesses always derive the
- * same bounded query from the same message (R35, AE2).
  *
- * One shared markup policy: plugin-owned blocks (system reminders, prior
- * ctx-search hints, sidekick augmentations, instruction wrappers, HTML
- * comments) are dropped WITH their content — they are injected noise that
- * would distort embeddings; user-pasted markup keeps its inner text because
- * `<thing>important data</thing>` still means "important data" to the user.
  *
- * The stripper is a single-pass streaming state machine that stops emitting
- * once MAX_QUERY_BYTES of stripped text is retained, so leading plugin markup
- * cannot erase later user text and no unbounded intermediate string is built
- * from markup-heavy prompts.
  */
 
 import type { SearchSource } from "../../features/magic-context/search";
@@ -24,25 +11,20 @@ import {
     prepareAutomaticQuery,
 } from "../../features/magic-context/search-bounds";
 
-/** Sources the automatic (transform-time) search path queries. Primers and
- *  notes are cache-neutral in v1: they surface via explicit ctx_search and
- *  the dashboard only, never auto-search prompt hints. Compartment chunks
- *  ride the "message" lane. The runner and the benchmark contract both
- *  derive from this value so an automatic scenario cannot positively judge
- *  a document the production automatic path never searches. */
+/**
+ * */
 export const AUTO_SEARCH_SOURCES = [
     "memory",
     "message",
     "git_commit",
 ] as const satisfies readonly SearchSource[];
 
-/** Result limit the automatic path always requests. The runner and the
- *  benchmark contract both derive from this value so an automatic scenario
- *  cannot declare a cutoff production never executes. */
+/**
+ * */
 export const AUTO_SEARCH_RESULT_LIMIT = DEFAULT_SEARCH_RESULT_LIMIT;
 
-/** Tags whose whole block (content included) is plugin-owned noise. The
- *  system-reminder entry legitimately nests, so all entries track depth. */
+/**
+ * */
 const CONTENT_DROP_TAGS = [
     "system-reminder",
     "ctx-search-hint",
@@ -51,14 +33,8 @@ const CONTENT_DROP_TAGS = [
     "instruction",
 ] as const;
 
-/** Index of the tag-closing `>` at or after `start`, scanning only until the
- *  next `<` — a nested `<` means the candidate span is plain text, not a tag
- *  body. A `>` inside a quoted attribute value (`data=">"`) is part of the
- *  value, not the terminator. The `<` bail applies even inside quotes: it is
- *  what keeps the whole stripper linear, because candidate spans can never
- *  overlap and a prompt full of `<` characters (or unterminated quotes) with
- *  no later `>` cannot trigger an end-of-string scan per candidate. Returns
- *  -1 when the span is not a tag body. */
+/**
+ * */
 function findTagClose(text: string, start: number): number {
     let quote: "'" | '"' | null = null;
     for (let i = start; i < text.length; i += 1) {
@@ -77,15 +53,14 @@ function findTagClose(text: string, start: number): number {
     return -1;
 }
 
-/** Whitespace XML permits between a tag name and its attributes or closing
- *  delimiter. Newlines matter: injected blocks are often pretty-printed with
- *  attributes on their own line. */
+/** XML permits whitespace between a tag name and its attributes or closing delimiter.
+ * */
 function isTagWhitespace(char: string | undefined): boolean {
     return char === " " || char === "\t" || char === "\n" || char === "\r";
 }
 
-/** `<name ...>` / `</name>` at `index`, returning the tag end and whether it
- *  closes or self-closes, or null when `text` does not carry that tag here. */
+/**
+ * */
 function matchDropTag(
     text: string,
     index: number,
@@ -101,25 +76,22 @@ function matchDropTag(
     cursor += name.length;
     if (text[cursor] === ">") return { end: cursor + 1, closing, selfClosing: false };
     if (closing) {
-        // `</instruction >` is a valid closing tag; without this the generic
-        // matcher would strip it while `dropStack` stays open, discarding all
-        // following user text. The scan stops at the first non-whitespace
-        // character, so it stays linear.
+        // `matchDropTag` accepts whitespace before `>` in closing tags so `</instruction >` closes `dropStack`.
+        // The whitespace scan stops at the first non-whitespace character, preserving linear time.
         while (isTagWhitespace(text[cursor])) cursor += 1;
         if (text[cursor] !== ">") return null;
         return { end: cursor + 1, closing: true, selfClosing: false };
     }
-    // Opening tags may carry attributes (`<instruction context="...">`), but a
+    // `matchDropTag` permits attributes on opening tags but rejects name prefixes.
     // name prefix (`<instructions>`) is a different tag.
     if (!isTagWhitespace(text[cursor])) return null;
     const close = findTagClose(text, cursor);
     if (close === -1) return null;
-    // `<instruction .../>` is a complete, empty block: it must not open a
-    // content-drop span, or everything after it would be silently discarded.
+    // `matchDropTag` treats `<instruction .../>` as self-closing so it does not open a content-drop span.
     return { end: close + 1, closing: false, selfClosing: text[close - 1] === "/" };
 }
 
-/** Generic `<...>` markup span at `index`, or null when the `<` is plain text. */
+/* */
 function matchGenericTag(text: string, index: number): number | null {
     const first = text[index + 1];
     const isTagStart =
@@ -135,22 +107,19 @@ function matchGenericTag(text: string, index: number): number | null {
 }
 
 /**
- * Strip plugin markup and retain at most MAX_QUERY_BYTES of the result. The
- * returned prefix is surrogate-safe: emission stops before a code point that
- * would cross the byte budget.
+ * `collectStrippedPromptPrefix` returns plugin-markup-free output no longer than `MAX_QUERY_BYTES`.
+ * `collectStrippedPromptPrefix` never emits a code point that would exceed `MAX_QUERY_BYTES`.
  *
- * Whitespace runs are withheld and normalized (one space, or the newline
- * structure of the run capped at a blank line) before they are emitted, so
- * separators between stripped plugin blocks cannot consume the byte budget
- * that exists for user text. Leading and trailing runs never emit at all.
+ * The function normalizes withheld whitespace to one space or at most one blank line before emission.
+ * Withholding separators preserves the byte budget for user text.
+ * Leading and trailing whitespace runs never emit.
  */
 export function collectStrippedPromptPrefix(raw: string): string {
     let out = "";
     let outBytes = 0;
-    // Stack of open content-drop tags; text is dropped while any is open. The
-    // per-name depth map makes orphan-closer rejection constant-time: without
-    // it, each orphan `lastIndexOf` scans the whole stack, and n openers
-    // followed by n mismatched closers turns the stripper quadratic.
+    // `dropStack` holds open content-drop tags; the stripper drops text while `dropStack` is nonempty.
+    // `openDepth` rejects orphan closers in constant time.
+    // `n` open tags followed by `n` mismatched closers make repeated `dropStack` scans quadratic.
     const dropStack: string[] = [];
     const openDepth = new Map<string, number>();
     // -1: no withheld run; 0: spaces/tabs only; 1-2: newline count in the run.
@@ -169,10 +138,8 @@ export function collectStrippedPromptPrefix(raw: string): string {
                 const tag = matchDropTag(raw, i, name);
                 if (!tag) continue;
                 if (tag.closing) {
-                    // Orphan closers drop silently so a leaked closing tag from
-                    // malformed input cannot bleed into the embedded text. The
-                    // depth check keeps that rejection O(1); a found closer's
-                    // scan cost is amortized by the entries it pops.
+                    // The stripper drops orphan closers so malformed input cannot leak closing tags into embedded text.
+                    // Each scan for a matching closer is amortized by the entries it pops.
                     if ((openDepth.get(name) ?? 0) > 0) {
                         const openIndex = dropStack.lastIndexOf(name);
                         for (let k = openIndex; k < dropStack.length; k += 1) {
@@ -197,10 +164,9 @@ export function collectStrippedPromptPrefix(raw: string): string {
             }
         }
         if (char === "§") {
-            // `§N§` line markers are plugin-injected and unconditionally
-            // removed by the cleanup pass; skipping them while streaming keeps
-            // them out of the byte budget (a marker-heavy prefix would
-            // otherwise exhaust it) and stops the cap from splitting a marker.
+            // `§N§` line markers are removed unconditionally.
+            // Skipping markers excludes them from the byte budget.
+            // Skipping a complete marker prevents `MAX_QUERY_BYTES` from splitting it.
             let cursor = i + 1;
             while (raw[cursor] >= "0" && raw[cursor] <= "9") cursor += 1;
             if (cursor > i + 1 && raw[cursor] === "§") {
@@ -215,7 +181,7 @@ export function collectStrippedPromptPrefix(raw: string): string {
         const codePoint = raw.codePointAt(i) ?? 0;
         const charText = String.fromCodePoint(codePoint);
         if (/\s/.test(charText)) {
-            // Withhold the run; leading whitespace (empty `out`) never pends.
+            // `collectStrippedPromptPrefix` discards leading whitespace instead of buffering it.
             if (out.length > 0) {
                 if (pendingNewlines === -1) pendingNewlines = 0;
                 if (charText === "\n" && pendingNewlines < 2) pendingNewlines += 1;
@@ -241,10 +207,6 @@ export function collectStrippedPromptPrefix(raw: string): string {
 }
 
 /**
- * Full automatic-query pipeline: bounded streaming strip, tag-prefix and
- * whitespace cleanup, then deterministic truncation to the token and atom
- * caps. Callers apply their minimum-prompt-length gate to the returned query
- * and pass it unchanged to search, embedding, and shadow measurement.
  */
 export function extractBoundedAutoSearchQuery(raw: string): string {
     const cleaned = collectStrippedPromptPrefix(raw)

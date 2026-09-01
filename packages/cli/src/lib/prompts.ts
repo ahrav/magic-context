@@ -1,13 +1,6 @@
 /**
- * Unified prompts wrapper around @clack/prompts.
  *
- * Maintains backward-compatible API surface for both the previous OpenCode
- * plugin CLI (`selectOne(message, [{label, value, recommended}])`) and Pi
- * plugin CLI (`PromptIO`/`SelectOption` interfaces with `recommended` flag).
  *
- * The CLI ships with `#!/usr/bin/env node` and is invoked via `npx`, which
- * runs it on Node. `install.sh` redirects stdin from `/dev/tty` so Clack's
- * raw-mode `select()` prompt still works under `curl | bash`.
  */
 import {
     autocomplete as clackAutocomplete,
@@ -27,9 +20,9 @@ import {
 export interface SelectOption {
     label: string;
     value: string;
-    /** Mark this option as the recommended default; rendered as " (recommended)". */
+    /** The wrapper renders recommended options with ` (recommended)`. */
     recommended?: boolean;
-    /** Optional Clack hint string. Mutually exclusive with `recommended`. */
+    /** `recommended` overrides `hint`; the wrapper omits Clack's `hint` to avoid displaying the suffix twice on the active row. */
     hint?: string;
 }
 
@@ -66,10 +59,7 @@ export interface PromptIO {
     selectOne(message: string, options: SelectOption[]): Promise<string>;
     selectMany(message: string, options: SelectOption[], initial?: string[]): Promise<string[]>;
     /**
-     * Scrollable list you can also narrow by typing (type-ahead filter). Used
-     * for long lists like the full model catalog: the user sees options AND can
-     * type a fragment (e.g. "sonnet") to filter. `placeholder` shows before any
-     * input. Returns the selected `value`.
+     * `selectAutocomplete` lets users scroll and filter options by typing and returns the selected value.
      */
     selectAutocomplete(
         message: string,
@@ -92,8 +82,7 @@ export function isPromptCancelledError(error: unknown): error is PromptCancelled
 function handleCancel(value: unknown, cancelMessage = "Cancelled."): void {
     if (isCancel(value)) {
         clackCancel(cancelMessage);
-        // Let the command unwind normally so setup can avoid later writes and
-        // close any resources it owns instead of terminating the process here.
+        // Prompt cancellation throws so callers can avoid later writes and close owned resources.
         throw new PromptCancelledError(cancelMessage);
     }
 }
@@ -176,16 +165,11 @@ export async function text(
     return result as string;
 }
 
-// Clack's Option<T> is a distributed conditional that resolves differently
-// for primitive vs object values; the structural shape we build is correct
-// at runtime, so we cast at the boundary. See toClackOption below.
-// biome-ignore lint/suspicious/noExplicitAny: structural cast at clack boundary.
+// `Option<T>` resolves differently for primitive and object values, so the wrapper casts the structurally correct option at the Clack boundary.
 type ClackOptionsArray = any;
 
 function toClackOption(opt: SelectOption): { label: string; value: string; hint?: string } {
-    // `recommended` renders as a label suffix ONLY. It must NOT also set the
-    // clack `hint`, or the active row shows "(recommended)" twice (label suffix +
-    // hint). `recommended` and `hint` are mutually exclusive (see SelectOption).
+    // `recommended` appends a label suffix and must not set Clack's `hint`, which would display the suffix twice on the active row.
     const label = opt.recommended ? `${opt.label} (recommended)` : opt.label;
     const hint = opt.recommended ? undefined : opt.hint;
     return hint === undefined ? { label, value: opt.value } : { label, value: opt.value, hint };
@@ -230,7 +214,7 @@ export async function selectAutocomplete(
     return result as string;
 }
 
-/** Default PromptIO implementation backed by @clack/prompts. */
+/* */
 export const promptIO: PromptIO = {
     intro,
     outro,

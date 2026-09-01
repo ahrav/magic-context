@@ -208,8 +208,6 @@ describe("commit indexer embedding through versioned receipts", () => {
         const db = useTempDb();
         const projectIdentity = "git:indexer-empty-message";
         const host = new DetailedSynapseTestHost();
-        // The empty-message commit is the newest, so an unfiltered selection
-        // puts it in every batch the drain takes.
         const withMessage = makeGitCommit("fff", 6000);
         const empty = makeGitCommit("999", 7000, "");
         const oversized = makeGitCommit("888", 8000, "x".repeat(1025));

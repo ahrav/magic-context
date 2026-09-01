@@ -7,7 +7,7 @@ export const MAINTAIN_DOCS_SNAPSHOT_FILES = ["ARCHITECTURE.md", "STRUCTURE.md"] 
 
 export type MaintainDocsDocSnapshot = Map<string, string>;
 
-/** Read canonical pre-task bytes for maintain-docs enforcement. */
+/* */
 export function snapshotMaintainDocsFiles(docsDir: string): MaintainDocsDocSnapshot {
     const snapshot = new Map<string, string>();
     for (const name of MAINTAIN_DOCS_SNAPSHOT_FILES) {
@@ -24,8 +24,6 @@ export function snapshotMaintainDocsFiles(docsDir: string): MaintainDocsDocSnaps
 }
 
 /**
- * After maintain-docs, re-read on-disk docs and restore protected regions from the pre-task snapshot.
- * Best-effort: read/write failures are logged, not thrown.
  */
 export function enforceMaintainDocsProtectedRegions(args: {
     docsDir: string;

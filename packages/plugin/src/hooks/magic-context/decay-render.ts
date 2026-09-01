@@ -1,32 +1,21 @@
 /**
- * Shared deterministic decay renderer (v2). Used by BOTH OpenCode
- * (inject-compartments.ts) and Pi (inject-compartments-pi.ts) so the two
- * harnesses render compartment history byte-identically from the same validated
- * decay curve. This is the single render-side implementation of the curve in
- * `decay-curve.ts`; neither harness may keep a private/approximate copy.
  *
  * Responsibilities:
- *  - Pick a tier per compartment from age + importance + budget pressure
- *    (decay-curve.ts), with budget pressure computed ONCE per pass.
- *  - Render the chosen paraphrase tier (P1..P4); P5 = archived (omitted).
- *  - Legacy (pre-v2, flat-content) compartments: no paraphrase columns, so the
- *    initial tier is P3 when the body has a `U:` line else P4, and the body is
+ * Legacy compartments use flat `content` and start at P3 when `content` has a line beginning `U:`, otherwise P4.
  *    truncated `content`.
- *  - Demote oldest-first under a hard token budget (the curve already fits the
- *    budget, but this guards against estimate drift / very tight budgets).
+ * The renderer demotes the oldest compartments first when rendered output exceeds the token budget.
+ * Demotion protects against token-estimate drift.
  *
- * v2 faithful facts: this renderer NEVER emits a <session_facts> block. Facts
- * are promoted to project memory and render via <project-memory>. Callers pass
- * the memory block separately; session facts are not a render input.
+ * The renderer never emits `<session_facts>`.
  */
 
 import { computeBudgetPressure, renderedTier, TIER_COST, type Tier } from "./decay-curve";
 import { estimateTokens } from "./read-session-formatting";
 
-/** Default history budget when a caller doesn't supply one. */
+/* */
 export const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 
-/** Minimal compartment shape the renderer needs (subset of Compartment). */
+/* */
 export interface DecayRenderCompartment {
     startMessage: number;
     endMessage: number;
@@ -54,8 +43,7 @@ function formatDateRange(startDate?: string | null, endDate?: string | null): st
 }
 
 function sanitizeCompartmentTitle(title: string): string {
-    // Historian-authored titles are untrusted: Cc, line-separator, and paragraph-
-    // separator runs must collapse or they can forge a visually multiline heading.
+    // `sanitizeCompartmentTitle` collapses `Cc`, line-separator, and paragraph-separator runs to prevent multiline-heading forgery.
     return escapeXmlContent(title.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " "));
 }
 
@@ -66,26 +54,19 @@ function compartmentHeading(c: DecayRenderCompartment): string {
 }
 
 function guardCompartmentBody(body: string): string {
-    // A rendered body cannot open a new compartment; indent heading-like lines so
-    // the next unindented `## ` line remains an unambiguous compartment boundary.
+    // `guardCompartmentBody` indents body lines beginning with `## ` so only unindented headings delimit compartments.
     return body.replace(/^## /gm, " ## ");
 }
 
 /**
- * A row is v2-tiered ONLY when `p1` is a non-empty string. This matches the
- * compartment parser's contract (compartment-parser.ts: a row is tiered iff
- * `p1.length > 0`) and the NEEDS_UPGRADE predicate (`legacy=1 OR p1 IS NULL OR
- * p1=''`). Rows with empty/null `p1` — legacy rows, or the malformed pseudo-v2
- * state left by an interrupted upgrade (`legacy=0` but tiers never populated) —
- * must render via flat `content`, never as an empty tier body. Note a VALID v2
- * row can still have an empty `p4` (a legitimate title-only heading); that's
- * handled by the tier-body path, not here, because such a row has a non-empty `p1`.
+ * The renderer uses flat `content`, not a tier body, when `p1` is empty or null.
+ * A tiered row may have an empty `p4`; render it as a title-only heading.
  */
 function isTieredRow(c: DecayRenderCompartment): boolean {
     return typeof c.p1 === "string" && c.p1.length > 0;
 }
 
-/** v2 paraphrase tier body with denser-tier and content fallbacks. */
+/* */
 function tierBody(c: DecayRenderCompartment, tier: number): string {
     const tiers = [c.p1, c.p2, c.p3, c.p4];
     const requested = tiers[tier - 1];
@@ -97,7 +78,7 @@ function tierBody(c: DecayRenderCompartment, tier: number): string {
     return (c.content ?? "").trim();
 }
 
-/** Legacy flat-content tier rendering (no paraphrase columns). */
+/* */
 function legacyBodyForTier(content: string, tier: number): string {
     if (tier <= 1) return content;
     if (tier === 2)
@@ -105,15 +86,13 @@ function legacyBodyForTier(content: string, tier: number): string {
     return content.length > 420 ? `${content.slice(0, 420).trimEnd()}…` : content;
 }
 
-/** Legacy compartments start at P3 (has a `U:` line) or P4 (otherwise). */
+/* */
 function legacyTier(c: DecayRenderCompartment): Tier {
     return /^U:/m.test(c.content) ? 3 : 4;
 }
 
 /**
- * Render a single compartment at an explicit tier. Exposed for the m[1]
- * "new compartments" block, which always renders newest compartments at P1
- * (full fidelity — no decay applies to brand-new deltas).
+ * The decay curve assigns P1 to the newest compartment without decay.
  */
 export function renderCompartmentAtTier(c: DecayRenderCompartment, tier: number): string {
     return renderOneCompartment(c, tier);
@@ -123,10 +102,6 @@ function renderOneCompartment(c: DecayRenderCompartment, tier: number): string {
     if (tier >= 5) return ""; // archived
     const heading = compartmentHeading(c);
 
-    // Legacy rows AND malformed pseudo-v2 rows (legacy=0 but no usable p1, e.g.
-    // an interrupted upgrade) render via flat `content` — never as an empty
-    // title-only heading. Without this, a `legacy=0, p1=''` row silently drops
-    // the compartment body from m[0]/m[1].
     if (c.legacy === 1 || !isTieredRow(c)) {
         const flat = (c.content ?? "").trim();
         if (tier >= 4 || flat.length === 0) return heading;
@@ -140,9 +115,8 @@ function renderOneCompartment(c: DecayRenderCompartment, tier: number): string {
 }
 
 /**
- * Compute the rendered tier for each compartment, given budget pressure derived
- * once from the whole set. `compartments` are in chronological order (oldest
- * first); the decay curve indexes from newest (1 = newest).
+ * The decay curve indexes chronological `compartments` from newest (`1`).
+ * `compartments` are ordered oldest first.
  */
 function computeTiers(
     compartments: DecayRenderCompartment[],
@@ -154,9 +128,7 @@ function computeTiers(
     const v2Total = v2Compartments.length;
     const v2IndexByOriginalIndex = new Map<number, number>();
 
-    // Legacy rows are governed by deterministic truncation, not the decay
-    // curve. Including them would let non-rendered curve cost from unrelated
-    // rows demote v2 paraphrases, breaking budget honesty for mixed sessions.
+    // Legacy rows do not contribute to the decay curve, so they cannot demote v2 paraphrases in mixed sessions.
     const curveInputs = v2Compartments.map(({ c, originalIndex }, v2Ordinal) => {
         const curveIndex = v2Total - v2Ordinal; // 1-based from newest v2 row
         v2IndexByOriginalIndex.set(originalIndex, curveIndex);
@@ -180,9 +152,7 @@ function computeTiers(
 }
 
 /**
- * Render the decayed compartment history block. Optionally prefixes a memory
- * block. Never renders session facts (v2 faithful). Returns the joined body
- * (no <session-history> wrapper — callers add their own framing).
+ * The renderer returns the joined compartment body without a `<session-history>` wrapper.
  */
 export function renderDecayedCompartments(args: {
     compartments: DecayRenderCompartment[];
@@ -222,8 +192,7 @@ export function renderDecayedCompartments(args: {
     let body = render();
     if (historyBudgetTokens <= 0) return body;
 
-    // Sum memoized compartment counts while selecting tiers. A final joined-body
-    // check below accounts for separators and tokenizer effects at boundaries.
+    // The final joined-body check accounts for separator and boundary tokenization costs.
     let runningTokens = 0;
     for (let i = 0; i < tiers.length; i++) {
         runningTokens += tokensAt(i, tiers[i]);
@@ -262,16 +231,10 @@ export function renderDecayedCompartments(args: {
 }
 
 /**
- * Extract a top-level m[0] block slice (e.g. "session-history", "project-docs",
- * "user-profile") for budget measurement and token attribution. Returns the
- * full `<tag>…</tag>` slice or null. `tag` must be a literal block name (the
- * caller controls it), so the constructed RegExp is safe.
+ * The extractor uses the top-level `m[0]` block for budget measurement and token attribution.
+ * `tag` must be a literal block name.
  *
- * Shared so the materialize tightening loop measures ONLY the session-history
- * slice against the history budget (not the whole m[0], which also carries
- * project-docs / user-profile / project-memory — those have their own budgets),
- * and so the sidebar/status token attribution reads the same slices both
- * harnesses actually render.
+ * Both render harnesses use identical block slices so token budgets and attribution match rendered blocks.
  */
 export function extractM0Block(m0Text: string, tag: string): string | null {
     const m = m0Text.match(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`));

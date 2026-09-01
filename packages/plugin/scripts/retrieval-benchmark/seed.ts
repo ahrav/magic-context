@@ -1,15 +1,12 @@
 /**
- * Deterministic production-shaped fixture seeder (KTD4, R46-R48; AE2).
  *
- * Seeds the reviewed corpus and optional synthetic scale documents through
- * PRODUCTION storage and indexing helpers into an isolated on-disk SQLite
- * database, verifies every approved physical locator was emitted exactly,
- * validates positive-target reachability at seed time, then snapshots the
- * completed database with `VACUUM INTO` for read-only measured workers.
+ * This module seeds the reviewed corpus and optional synthetic scale documents through production storage and indexing helpers.
+ * The seeder verifies that every approved physical locator is emitted exactly once.
+ * The seeder validates positive-target reachability before creating the snapshot.
+ * The seeder uses `VACUUM INTO` to create the read-only worker snapshot.
  *
- * This module is runner-side: it owns the one-way import from benchmark
- * scripts into production adapters (KTD16). Production code must never
- * import it, and the pure facade (`index.ts`) must never import this module.
+ * This module is runner-side: it owns the one-way import from benchmark scripts into production adapters.
+ * Production code and the pure `index.ts` facade must never import this module.
  */
 
 import { existsSync, mkdirSync, statSync } from "node:fs";
@@ -52,17 +49,17 @@ import { iterateSyntheticDocuments } from "./synthetic";
 
 export const SEED_MANIFEST_VERSION = "retrieval-benchmark-seed/v1";
 
-/** Model id recorded for every deterministic fixture vector. Runners must
- *  return this id from their `embedQuery` contract so production lanes match
- *  the seeded BLOBs. */
+/** The seeder records this model ID for every deterministic fixture vector.
+ * Runners must return `BENCHMARK_EMBEDDING_MODEL_ID` from `embedQuery` so production lanes match the seeded BLOBs.
+ * */
 export const BENCHMARK_EMBEDDING_MODEL_ID = "benchmark:deterministic/v2";
 
-/** Fixed epoch for every seeded wall-clock column, so fixture bytes never
- *  depend on the time the seeder ran. */
+/** The seeder writes `SEED_EPOCH_MS` to every seeded wall-clock column, so fixture bytes do not depend on execution time.
+ * */
 export const SEED_EPOCH_MS = 1_755_000_000_000;
 
-/** Bounded write batches for synthetic scale streams: one transaction per
- *  batch keeps memory flat while avoiding per-row commit overhead. */
+/** The seeder commits each 500-document synthetic batch in one transaction to bound memory and avoid per-row commit overhead.
+ * */
 export const SEED_BATCH_SIZE = 500;
 
 const SEED_DB_FILE = "seed.sqlite";
@@ -110,13 +107,12 @@ export function deterministicVector(key: string, dims: number): Float32Array {
     return vector;
 }
 
-/** Deterministic text embedding: the normalized sum of per-token hash
- *  vectors weighted by corpus IDF (rare tokens dominate, ubiquitous tokens
- *  vanish), so cosine similarity reflects discriminative-content overlap
- *  between texts. Weights derive from document CONTENT only — never from
- *  relevance judgments — so the quality gate measures retrieval against
- *  labels the embeddings have never seen. Synthetic filler keeps per-id
- *  random vectors: noise distractors are its job. */
+/**
+ * The corpus IDF weights emphasize rare tokens and assign ubiquitous tokens zero weight.
+ * Cosine similarity emphasizes discriminative content shared by two texts.
+ * The seeder derives token weights only from document content, never relevance judgments.
+ * The embedding weights exclude relevance labels, so evaluation labels cannot influence the embeddings.
+ * Synthetic filler uses deterministic per-ID vectors as noise distractors. */
 export function deterministicTextVector(
     text: string,
     dims: number,
@@ -129,8 +125,7 @@ export function deterministicTextVector(
             .filter((token) => token.length > 0),
     );
     if (tokens.size === 0) return deterministicVector(`text:${text}`, dims);
-    // Unseen tokens are maximally rare by definition; weight 1 matches the
-    // upper end of the IDF scale buildCorpusTokenWeights produces.
+    // The unseen-token weight of 1 is the maximum value that `buildCorpusTokenWeights` produces.
     const weightFor = (token: string): number => tokenWeights?.get(token) ?? 1;
     const vector = new Float32Array(dims);
     for (const token of tokens) {
@@ -142,8 +137,8 @@ export function deterministicTextVector(
     return vector;
 }
 
-/** Per-token IDF weights over the reviewed corpus documents, normalized to
- *  (0, 1]. Content-only: judgments and queries never contribute. */
+/** The seeder normalizes reviewed-corpus per-token IDF weights to `(0, 1]`.
+ * Judgments and queries never contribute to the token weights. */
 export function buildCorpusTokenWeights(
     documents: readonly { semanticPayload: { title: string; body: string } }[],
 ): Map<string, number> {
@@ -171,15 +166,15 @@ export function buildCorpusTokenWeights(
 export interface SeedManifestEntry {
     documentId: string;
     kind: DocumentKind;
-    /** Frozen physical locator string, e.g. `memory:9101`. */
+    /** This field stores a frozen physical locator such as `memory:9101`. */
     locator: string;
     projectScope: string;
     sessionScope: string | null;
-    /** Physical session the row lives in, or null for project-scoped stores. */
+    /** This field identifies the physical session containing the row, or is null for project-scoped stores. */
     physicalSessionId: string | null;
-    /** Message ordinal or compartment end ordinal; null for other kinds. */
+    /** This field stores a message ordinal or compartment end ordinal, and is null for other kinds. */
     ordinal: number | null;
-    /** Stored embedding BLOB bytes for this row (0 = FTS-only lane). */
+    /** This field stores the row's embedding BLOB bytes; `0` selects the FTS-only lane. */
     vectorBytes: number;
 }
 
@@ -206,11 +201,11 @@ export interface SeedManifest {
 
 export interface SeedResult {
     manifest: SeedManifest;
-    /** Deterministic fingerprint over the manifest (no wall time, no paths). */
+    /** The fingerprint excludes wall time and paths from the manifest. */
     manifestFingerprint: string;
     databasePath: string;
     snapshotPath: string;
-    /** Run-specific evidence, deliberately OUTSIDE the fingerprint (R57). */
+    /** `manifestFingerprint` excludes `evidence` because `evidence` varies by run. */
     evidence: {
         indexBuildMs: number;
         snapshotBytes: number;
@@ -224,22 +219,22 @@ export interface SeedReleaseInput {
 }
 
 export interface SeedFixtureOptions {
-    /** Directory for the working database and snapshot. Must not already
-     *  contain fixture files (fail closed instead of mixing runs). */
+    /** fixtureDir stores the working database and snapshot.
+     * fixtureDir must not contain fixture files; seeding fails rather than mixes runs. */
     fixtureDir: string;
-    /** Declared vector dimension for every deterministic embedding. */
+    /* */
     dims: number;
-    /** Optional deterministic scale stream seeded after the reviewed corpus. */
+    /** synthetic optionally adds a deterministic scale stream after the reviewed corpus. */
     synthetic?: {
         profile: SyntheticProfile;
-        /** Seed only the first N stream documents (tests / small profiles). */
+        /* */
         documentLimit?: number;
     };
     clock?: () => number;
 }
 
-/** Physical session for aliases without a session scope: derived from the
- *  project scope only, so two seed runs of one release agree byte-for-byte. */
+/**
+ * Using only projectScope makes the fallback session ID identical for the same project scope. */
 export function fixtureSessionId(projectScope: string, sessionScope: string | null): string {
     return sessionScope ?? `bench:${projectScope}`;
 }
@@ -251,10 +246,10 @@ const NUMERIC_LOCATOR_KINDS: ReadonlySet<DocumentKind> = new Set([
     "note",
 ]);
 
-/** Aliases the CURRENT production search path can emit: production namespace
- *  spelling, and a canonical-decimal numeric locator for row-id stores
- *  (one shared predicate with corpus validation, so the authoring gate and
- *  this seeding gate always agree on producibility). */
+/** producibleAliases returns only aliases the production search path can emit.
+ * For row-id stores, producibleAliases requires a canonical-decimal numeric locator.
+ * producibleAliases and corpus validation use the same predicate.
+ * The shared predicate keeps the authoring and seeding gates consistent. */
 export function producibleAliases(document: CorpusDocument): StructuredAlias[] {
     const namespace = SOURCE_LOCATOR_KIND[document.kind];
     return document.aliases.filter((alias) => {
@@ -264,9 +259,8 @@ export function producibleAliases(document: CorpusDocument): StructuredAlias[] {
     });
 }
 
-/** AUTOINCREMENT id-cursor advance: the sqlite_sequence row is bookkeeping,
- *  not document content — the approved locator row itself is still emitted
- *  by the production helper, whose result is verified against the alias. */
+/** advanceIdCursor updates sqlite_sequence without treating it as document content.
+ * */
 function advanceIdCursor(db: Database, table: "memories" | "notes" | "primers" | "compartments", nextIdMinusOne: number): void {
     const row = db
         .prepare("SELECT seq FROM sqlite_sequence WHERE name = ?")
@@ -328,10 +322,8 @@ function seedCompartmentRow(
             p1: args.body,
         },
     ]);
-    // Indexed point lookup via UNIQUE(session_id, sequence). All synthetic
-    // compartments share one session, so re-reading the whole session per
-    // insert (getCompartments + find) is O(C^2) over the seed and pushes
-    // 1M-scale fixtures past any workflow timeout.
+    // Synthetic compartments share one session.
+    // Calling getCompartments and find for each insert causes O(C²) work over C compartments.
     const compartment = db
         .prepare("SELECT id FROM compartments WHERE session_id = ? AND sequence = ?")
         .get(args.sessionId, args.sequence) as { id: number } | undefined;
@@ -357,8 +349,8 @@ function seedCompartmentRow(
 }
 
 /**
- * Seed one reviewed release (plus an optional deterministic synthetic scale
- * stream) into an isolated production-shaped database and snapshot it.
+ * seedFixture seeds one reviewed release and an optional deterministic synthetic scale stream.
+ * seedFixture writes the release to an isolated database and snapshots it.
  */
 export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptions): SeedResult {
     const clock = options.clock ?? (() => performance.now());
@@ -366,9 +358,8 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         throw new SeedError(["seed: invalid dims"]);
     }
     for (const judgment of release.judgments.judgments) {
-        // Synthetic ids can never be graded: quality truth comes only from
-        // reviewed documents (R48), and a graded synthetic id here would let
-        // scale filler enter quality aggregation downstream.
+        // Synthetic IDs are excluded from grading because quality truth comes only from reviewed documents.
+        // Grading a synthetic ID would allow scale filler into downstream quality aggregation.
         if (judgment.documentId.startsWith("syn:")) {
             throw new SeedError([`seed: synthetic document graded (${judgment.queryId})`]);
         }
@@ -428,10 +419,8 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         const numericAscending = (a: PlannedAlias, b: PlannedAlias) =>
             Number(a.alias.locator) - Number(b.alias.locator);
 
-        // Reviewed-document embeddings derive from document CONTENT only,
-        // IDF-weighted over the corpus. Judgments never contribute: an
-        // embedding built from the labels it is scored against would make
-        // the quality gate self-fulfilling and blind to retrieval
+        // Reviewed-document embeddings derive only from document content and corpus IDF weights.
+        // Using scored labels in embeddings would make the quality gate self-fulfilling.
         // regressions.
         const tokenWeights = buildCorpusTokenWeights(release.corpus.documents);
         const documentVector = (document: CorpusDocument): Float32Array =>
@@ -468,17 +457,12 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
 
         for (const plan of byKind("memory").sort(numericAscending)) {
             advanceIdCursor(db, "memories", Number(plan.alias.locator) - 1);
-            // Identical seeds must produce identical row bytes, so the
-            // fixture insert stamps the deterministic seed epoch.
+            // The fixture insert stamps a deterministic seed epoch so identical seeds produce identical row bytes.
             const memory = insertBenchmarkMemory(db, {
                 projectPath: plan.alias.projectScope,
                 category: "ARCHITECTURE_DECISIONS",
                 content: documentText(plan.document.semanticPayload),
                 nowMs: SEED_EPOCH_MS + Number(plan.alias.locator),
-                // The benchmark measures retrieval quality over eligible
-                // rows, not the trust ladder: the default historian origin
-                // is CANDIDATE under the claim trust policy and invisible
-                // to the automatic lane.
                 sourceType: "user",
             });
             verifyEmittedId(plan, memory.id);
@@ -547,22 +531,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             record(plan, sessionId, ordinal, 0);
         }
 
-        // Reviewed compartments reserve their ordinal slots from the shared
-        // counter BEFORE the synthetic filler runs, so they sit just past
-        // the reviewed messages — below any explicit-query cutoff — and the
-        // filler cannot shift them. Each reserved slot is backed by a
-        // message carrying the compartment's own content: production
-        // compartments summarize real messages, message ordinals must stay
-        // contiguous 1..N per session for the production indexer, and a
-        // backing message keeps fusion's message-in-range coalescing
-        // pointed at the SAME identity instead of merging an unrelated
-        // filler message into the reviewed compartment.
-        // Keyed by the planned alias, not the document id: a document with
-        // several producible aliases seeds one physical compartment per
-        // alias, and each needs its own reserved slot and backing message.
-        // Ascending locator order because advanceIdCursor only ever raises
-        // the id cursor — out-of-order writes would emit the wrong
-        // autoincrement ids, exactly as in the other kind loops.
+        // Callers must write locators in ascending order: advanceIdCursor never lowers the ID cursor, so out-of-order writes receive incorrect autoincrement IDs.
         const compartmentPlans = byKind("compartment").sort(numericAscending);
         const reservedCompartmentOrdinals = new Map<PlannedAlias, number>();
         for (const plan of compartmentPlans) {
@@ -634,9 +603,6 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             ensureMessagesIndexed(db, sessionId, () => messages);
         }
 
-        // Production helpers stamp wall-clock bookkeeping columns that the
-        // seed manifest does not represent; pin them so identical seeds
-        // produce identical snapshot bytes under one manifest fingerprint.
         db.prepare("UPDATE git_commits SET indexed_at = ?").run(SEED_EPOCH_MS);
         db.prepare("UPDATE git_commit_embeddings SET created_at = ?").run(SEED_EPOCH_MS);
         db.prepare("UPDATE message_history_index SET updated_at = ?").run(SEED_EPOCH_MS);
@@ -722,8 +688,7 @@ function seedSyntheticStream(
             for (const write of work) write();
         })();
     };
-    // ponytail: per-document production-helper writes; bulk row streaming if
-    // the 1M scale seed time ever matters before U5 lands.
+    // TODO: Replace per-document production-helper writes with bulk row streaming for 1M-scale seeds.
     for (const document of iterateSyntheticDocuments(args.profile)) {
         if (seeded >= limit) break;
         seeded += 1;
@@ -746,8 +711,6 @@ function seedSyntheticStream(
                     category: "ARCHITECTURE_DECISIONS",
                     content: documentText(document),
                     nowMs: SEED_EPOCH_MS,
-                    // Eligible under the claim trust policy; see the memory
-                    // seeding loop above.
                     sourceType: "user",
                 });
                 saveMemoryVector(
@@ -821,10 +784,8 @@ function seedSyntheticStream(
 }
 
 /**
- * Seed-time reachability validation for every positively judged target
- * (AE2): source filters, automatic-lane membership, visible-memory rules,
- * scenario scope, and the INCLUSIVE ordinal cutoff against the ordinal the
- * seeder actually emitted. Diagnostics carry regex-bounded ids only.
+ * The seeder must validate every positively judged target against source filters, automatic-lane membership, visible-memory rules, scenario scope, and the inclusive emitted-ordinal cutoff.
+ * Diagnostics contain only regex-bounded IDs.
  */
 function validatePositiveTargets(
     release: SeedReleaseInput,
@@ -876,10 +837,6 @@ function validatePositiveTargets(
 
         const cutoff = query.visibleState.messageOrdinalCutoff;
         if (cutoff !== null && (document.kind === "message" || document.kind === "compartment")) {
-            // Inclusive maximum: an ordinal equal to the cutoff stays
-            // reachable; one beyond it can never be returned by the
-            // production lanes, so measuring would record a structural miss
-            // as a ranking miss.
             const reachable = inScope.some(
                 (entry) => entry.ordinal !== null && entry.ordinal <= cutoff,
             );
@@ -891,7 +848,7 @@ function validatePositiveTargets(
     if (diagnostics.length > 0) throw new SeedError(diagnostics.sort());
 }
 
-/** Open a completed snapshot read-only; measured workers must not mutate it. */
+/** Measured workers must open completed snapshots read-only to prevent mutation. */
 export function openFixtureSnapshot(path: string): Database {
     return new Database(path, { readonly: true });
 }
@@ -908,9 +865,6 @@ export interface SelectivityObservation {
 }
 
 /**
- * Observed pre-filter and eligible cardinalities for a message-lane
- * selectivity predicate, measured against the production message index the
- * fixture actually serves queries from.
  */
 export function measureMessageSelectivity(
     db: Database,

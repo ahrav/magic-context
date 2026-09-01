@@ -18,13 +18,8 @@ export const DEFAULT_SEARCH_LIMIT = 10;
 export const GET_MAX_CLAIMS = 20;
 
 /**
- * Shape of a claim-local mutation token for reduced-argument decoding, shared by
- * every adapter so no adapter's decode schema can drift from the token contract.
- * Revise, archive, restore, and merge all require a token, so a decode schema that
- * omits it rejects the whole imitated call and loses the action.
+ * A decode schema must include the token required by revise, archive, restore, and merge.
  *
- * Shape only: value-level checks (public-ID format, tokenVersion) already fail
- * closed in storage-claim-operations and surface as ClaimOperationInputError.
  */
 export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
     type: "object",
@@ -40,11 +35,6 @@ export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
 };
 
 /**
- * Shape of a rejected-approach payload for reduced-argument decoding, shared by
- * every adapter so no adapter's decode schema can drift from the advertised
- * antiMemory schema. Must list every field the tool schemas advertise: a decode
- * rule that omits an optional field (e.g. saferAlternative) rejects the whole
- * imitated call and loses the action.
  */
 export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
     type: "object",

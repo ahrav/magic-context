@@ -1,9 +1,8 @@
-//! CK#1 ingress/egress wire types and the block-granular projection used inside MC.
 //!
-//! The transform receives full CK messages, but the cache machinery reasons about stable
-//! block identities. This module owns that seam: parse the small CK typed core, flatten
-//! each content block to a session-stable `mid#block_index` item, and retain the original
-//! message objects so an unreduced response can pass them back without rebuilding them.
+//! The cache machinery uses stable block identities instead of full CK messages.
+//! This module bridges full CK messages and stable block identities.
+//! The module assigns each content block a session-stable `mid#block_index` identity.
+//! The module retains original messages so unreduced responses can pass them through without rebuilding.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
@@ -15,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-// The re-exported CK message/block serializers retain the original serde_json::Value
-// for pass-through. That must remain a Value-level replay path, not a typed-struct
-// round-trip, so harmless future CK fields are not silently dropped.
+// The re-exported CK serializers retain the original `serde_json::Value` for pass-through.
+// Pass-through must replay the retained `Value`, not round-trip through typed structs.
+// Value-level replay preserves harmless future CK fields that typed round-trips could drop.
 pub use mc_store::{
     CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, HarnessMeta, MediaBlock,
     MediaKind, MessageOrigin, OpaqueBlock, ProviderExtras, ResultBlock, ResultBlockKind,
@@ -30,9 +29,9 @@ pub struct CkIngressMessage {
     pub ck: CkWireMessage,
 }
 
-/// The internal block item consumed by the cache-stability core. `bytes` is the
-/// reduction-accounting basis, not provider-wire bytes; provider rendering is owned by
-/// the producer after MC returns CK messages.
+/// `FlatBlock` is the cache-stability core's internal block item.
+/// `FlatBlock.bytes` measures reduction accounting, not provider-wire size.
+/// The producer renders provider-wire bytes after MC returns CK messages.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FlatBlock {
     pub id: String,
@@ -51,7 +50,7 @@ pub struct FlatBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_id: Option<String>,
     pub bytes: Arc<str>,
-    /// SHA-256 of the serialized block bytes, retained so consumers can verify that the block content has not changed.
+    /// `content_hash` stores the SHA-256 of the serialized block bytes so consumers can detect content changes.
     #[serde(skip_serializing)]
     pub content_hash: [u8; 32],
     pub synthetic: bool,
@@ -81,8 +80,8 @@ impl CkItem for FlatBlock {
     }
 }
 
-/// Projector state at one message boundary. Tail deltas resume from this exact frontier so a
-/// tool result in the changed suffix can still pair with a call in the cached prefix.
+/// `ProjectionState` captures projector state at each message boundary.
+/// Resuming tail deltas at the saved frontier lets changed-suffix tool results pair with cached-prefix calls.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ProjectionState {
     pending_calls: BTreeMap<String, VecDeque<String>>,
@@ -103,14 +102,14 @@ struct ProjectionMessageMeta {
 pub struct FlatProjection {
     pub blocks: Vec<FlatBlock>,
     pub identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
-    /// Message shells retain the identity and message-level metadata needed to rebuild an
-    /// acknowledged delta prefix. Block payloads remain single-owned by `blocks`.
+    /// Message shells retain the identity and message metadata needed to rebuild an acknowledged delta prefix.
+    /// Block payloads remain single-owned by `blocks`.
     message_meta: Vec<ProjectionMessageMeta>,
-    /// Flat block end after each ingress message; maps the transport's message frontier without
-    /// walking or serializing the cached payload.
+    /// `message_block_ends` maps each transport message frontier to its flat-block end.
+    /// This mapping avoids walking or serializing cached payloads.
     message_block_ends: Vec<usize>,
-    /// Shared boundary states make prefix reconstruction proportional in small Arc copies rather
-    /// than cloning pending tool-arc maps for every retained message.
+    /// Shared boundary states reconstruct prefixes with small `Arc` copies.
+    /// Shared boundary states avoid cloning pending tool-arc maps for every retained message.
     states_after_messages: Vec<Arc<ProjectionState>>,
 }
 
@@ -202,8 +201,8 @@ impl FlatProjection {
                                 ARC_ALLOCATION_OVERHEAD_BYTES
                                     .saturating_add(value_retained_bytes(input))
                             }))
-                            // The cloned wire owns typed fields, its retained original block JSON,
-                            // and an `Arc` allocation independently of the canonical block string.
+                            // The cloned wire owns typed fields and retained original block JSON independently of the canonical block string.
+                            // The cloned wire allocates an independent `Arc` from the canonical block string.
                             .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
                             .saturating_add(ck_wire_block_retained_bytes(&block.wire))
                     })
@@ -365,10 +364,8 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
     project_messages_from_state(messages, FlatProjectionBuilder::default())
 }
 
-/// Reuse an acknowledged message prefix and project only its replacement suffix.
 ///
-/// The caller validates the session fingerprint and context before supplying `cached`; malformed
-/// or out-of-range local metadata falls back to a full projection rather than trusting a partial
+/// Malformed or out-of-range local metadata triggers a full projection.
 /// result.
 pub(crate) fn project_messages_incremental(
     messages: &[CkIngressMessage],
@@ -474,13 +471,10 @@ fn project_messages_from_state(
             builder.blocks.push(flat);
         }
 
-        // A tool arc ends at the next non-tool-carrying turn, but the clear must run
-        // AFTER this message's own blocks consume their pending calls: on the Anthropic
-        // wire a tool_result may ride inside a USER message together with the user's
-        // next text (Claude Code emits this when input arrives while a tool runs).
-        // Clearing before the block walk made that legal shape unpairable — and because
-        // ingress errors precede any state commit, one such message in the history
-        // rejected every subsequent pass for the session's lifetime.
+        // A tool arc ends at the next non-tool-carrying turn only after that message consumes pending calls.
+        // The message's blocks must consume pending calls before the tool arc is cleared.
+        // On the Anthropic wire, a `tool_result` can share a `USER` message with user text.
+        // Ingress errors occur before state commit.
         if role != "assistant" && role != "tool" {
             builder.state.pending_calls.clear();
         }
@@ -709,11 +703,11 @@ pub(crate) fn fingerprint(bytes: &str) -> String {
     fingerprint_digest(&content_hash)
 }
 
-/// Hex fingerprint + serialized length when `served` is still the projected block wire.
+/// The function returns the projected fingerprint and serialized length only when `served` matches the projected wire.
 ///
-/// Projection stores SHA-256 of the same `serde_json::to_string(CkWireBlock)` basis that
-/// divergence attribution uses. Reuse that digest only when the served wire is still
-/// identical (including retained ingress bytes); modified/reduced/overlaid blocks must
+/// Projection stores the SHA-256 digest of `serde_json::to_string(CkWireBlock)`.
+/// Divergence attribution uses the same serialized `CkWireBlock` digest.
+/// The helper reuses the digest only when `served == flat.wire`.
 /// re-hash.
 pub(crate) fn fingerprint_from_projected_wire(
     served: &CkWireBlock,
@@ -833,7 +827,7 @@ mod tests {
                 HarnessMeta::default(),
             ),
         };
-        // Reparse through the wire so both CkWireMessage and CkWireBlock own original JSON.
+        // Reparsing through the wire gives both `CkWireMessage` and `CkWireBlock` ownership of the original JSON.
         let message: CkIngressMessage =
             serde_json::from_value(serde_json::to_value(constructed).unwrap()).unwrap();
         let projection = project_messages(&[message]).unwrap();
@@ -1053,10 +1047,9 @@ mod tests {
         );
     }
 
-    // Claude Code emits the tool_result INSIDE the next user message (alongside the
-    // user's queued text) when input arrives while a tool is still running. The result
-    // must pair against the prior assistant's call even though the carrying role is
-    // "user"; the arc-window clear runs after the message's own blocks are walked.
+    // A `tool_result` may appear in the next user message beside queued user text while a tool runs.
+    // A `tool_result` carried by a user message must pair with the prior assistant `ToolCall` despite the carrying role.
+    // The projector clears the arc window after walking blocks so user-carried `tool_result`s pair with the preceding assistant `ToolCall`.
     #[test]
     fn user_carried_tool_result_pairs_with_prior_assistant_call() {
         let user_with_result = CkIngressMessage {
@@ -1098,7 +1091,7 @@ mod tests {
             Some("m1#1"),
             "result pairs to the prior assistant's call block"
         );
-        // The user message still ends the arc window: a later stray result must fail.
+        // A user message ends the arc window; a later stray result must fail.
         let mut with_stray = messages.clone();
         with_stray.push(CkIngressMessage {
             mid: "m3".to_string(),
@@ -1122,8 +1115,6 @@ mod tests {
         assert!(matches!(err, CkWireError::UnpairedToolResult { .. }));
     }
 
-    // A genuinely orphaned result in a user message (no prior assistant call) still
-    // fails loud — the fix moved the arc-window clear, it did not weaken pairing.
     #[test]
     fn user_carried_tool_result_without_prior_call_still_rejects() {
         let messages = vec![
@@ -1149,8 +1140,6 @@ mod tests {
         assert!(matches!(err, CkWireError::UnpairedToolResult { .. }));
     }
 
-    // Opaque and Media carriers inside tool_result content blocks are first-class
-    // pass-through values, matching their top-level treatment.
     #[test]
     fn opaque_and_media_inside_tool_result_content_are_accepted_and_projected() {
         let result_with_opaque = CkIngressMessage {

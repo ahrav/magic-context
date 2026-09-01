@@ -1,10 +1,7 @@
-//! Secure instance lifecycle: runtime-directory validation, single-instance
-//! lock, credential minting, and connection-file publication/cleanup.
 //!
-//! Every mutation is anchored to one validated directory descriptor opened
-//! with `O_NOFOLLOW`; path-based operations never cross the security boundary,
-//! so a concurrent path/symlink swap cannot redirect a create, rename, or
-//! unlink outside that directory (plan KTD4, protocol §4.2).
+//! All mutations use one validated directory descriptor opened with `O_NOFOLLOW`.
+//! Path-based operations remain inside the validated directory.
+//! A concurrent path or symlink swap cannot redirect create, rename, or unlink outside the validated directory.
 
 use std::fmt;
 use std::io;
@@ -16,17 +13,16 @@ use rustix::fs::{
     flock, fsync, mkdirat, openat, renameat, unlinkat, AtFlags, FlockOperation, Mode, OFlags, CWD,
 };
 
-use crate::connection_file::{ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
+use crate::connection_file::{ConnectionInfo, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
 
-/// Canonical publication name inside the runtime directory (protocol §4.1).
+/// `CONNECTION_FILE_NAME` names the canonical publication file inside the runtime directory.
 pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 
-/// Stale-sweep age threshold for abandoned publication temp files
+/// `STALE_TEMP_AFTER` removes abandoned publication files after 600 seconds.
 /// (protocol §4.2).
 const STALE_TEMP_AFTER: Duration = Duration::from_secs(600);
 
-/// Fresh per-incarnation bearer key. Its `Debug` implementation redacts the
-/// bytes, and the type intentionally has no `Display` implementation
+/// `ConnectionKey` redacts diagnostic output to prevent credential disclosure.
 /// (protocol V24).
 pub struct ConnectionKey(pub(crate) [u8; KEY_LEN]);
 
@@ -42,8 +38,7 @@ impl ConnectionKey {
     }
 }
 
-/// Errors from the instance lifecycle. Variants carry paths and operation
-/// names but never key bytes.
+/// `InstanceError` never stores key bytes.
 #[derive(Debug)]
 pub enum InstanceError {
     UnsupportedPlatform,
@@ -60,16 +55,13 @@ pub enum InstanceError {
     },
     /// Another live host instance holds the lock.
     AlreadyRunning,
-    /// The supplied payload-manifest digest is not the canonical release
-    /// digest shape (64 lowercase hex characters).
+    /// The supplied payload-manifest digest must contain 64 lowercase hexadecimal characters.
     InvalidPayloadDigest,
-    /// A persisted lifecycle record carries an unknown schema. The bytes are
-    /// quarantined: never interpreted, migrated, overwritten, or removed.
+    /// Unknown-schema lifecycle-state bytes are never interpreted, migrated, overwritten, or removed.
     UnsupportedStateSchema {
         path: PathBuf,
     },
-    /// A retained managed-namespace descriptor no longer matches the identity
-    /// its name resolves to; the holder must abort its named-namespace result.
+    /// `NamespaceDrift` requires the holder to abort its named-namespace result when a retained descriptor no longer matches the identity resolved by its name.
     NamespaceDrift {
         path: PathBuf,
     },
@@ -133,16 +125,10 @@ pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -
     }
 }
 
-/// Resolves the data root: the override, an absolute `$XDG_DATA_HOME`, or an
-/// absolute `$HOME/.local/share`, in that order.
 ///
-/// Relative or empty `XDG_DATA_HOME`/`HOME` values are ignored rather than
-/// used, so a poisoned `XDG_DATA_HOME=./x` cannot select a cwd-dependent
+/// The resolver ignores relative or empty `XDG_DATA_HOME` and `HOME` values to prevent cwd-dependent data roots.
 /// lifecycle root.
 ///
-/// Public so out-of-crate launchers can name the same data root this crate
-/// uses instead of reconstructing it by walking parents off a derived path;
-/// that inversion silently breaks whenever the managed layout gains or loses
 /// a level.
 pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     fn absolute(value: std::ffi::OsString) -> Option<PathBuf> {
@@ -150,6 +136,11 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
         path.is_absolute().then_some(path)
     }
     match data_dir_override {
+        // The setup socket path uses this directory; `ConnectionInfo::validate` rejects relative `setup_socket` paths.
+        Some(dir) if !dir.is_absolute() => Err(InstanceError::Insecure {
+            what: "data directory override is not absolute",
+            path: dir.to_path_buf(),
+        }),
         Some(dir) => Ok(dir.to_path_buf()),
         None => match std::env::var_os("XDG_DATA_HOME").and_then(absolute) {
             Some(dir) => Ok(dir),
@@ -161,9 +152,7 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
     }
 }
 
-/// The single managed subtree segment under the data root. Every managed
-/// path derives from this one definition so a rename cannot leave part of
-/// the tree behind.
+/// The managed-subtree constant defines the only managed segment; every managed path derives from it so a rename cannot leave part of the tree behind.
 pub const MANAGED_DIR_NAME: &str = "cortexkit";
 
 /// The runtime-directory segment under the managed subtree, holding the
@@ -176,21 +165,19 @@ pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Ins
     Ok(data_dir_path(data_dir_override)?.join(MANAGED_DIR_NAME))
 }
 
-/// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, an
-/// absolute `$XDG_DATA_HOME`, or an absolute `$HOME/.local/share`, in that
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     Ok(managed_dir_path(data_dir_override)?.join(RUNTIME_DIR_NAME))
 }
 
-/// One secured host incarnation: validated directory descriptor, held lock,
-/// fresh credentials, and (after `publish`) the retained publication identity.
+/// An `InstanceGuard` represents one secured host incarnation.
+/// An `InstanceGuard` retains validated directory, lock, credentials, and publication identity after `publish`.
 ///
-/// Dropping the guard removes its own publication (best-effort, fenced) and
-/// releases the lock; callers must keep it alive through handler drop
-/// (protocol §12 step 8). The `Drop` cleanup covers abnormal exits — a
-/// cancelled or aborted `run` future must not leave a stale connection file
-/// advertising a listener that no longer exists.
+/// Dropping the guard best-effort removes its fenced publication.
+/// Dropping the guard releases the lock; callers must retain it until handlers drop.
+/// `Drop` best-effort removes this guard's publication when a `run` future is cancelled or aborted.
+/// `Drop` best-effort removes this guard's publication when `run` is cancelled or aborted.
+/// `Drop` best-effort removes the canonical file only when it still names this guard's publication.
 pub struct InstanceGuard {
     dir: OwnedFd,
     dir_path: PathBuf,
@@ -199,15 +186,14 @@ pub struct InstanceGuard {
     launch_id: [u8; 16],
     payload_manifest_digest: String,
     publication: Option<PublicationIdentity>,
+    setup_socket: Option<PathBuf>,
     /// The stable incarnation fence, declared after `dir` so the runtime
     /// lock releases first and the lifetime fence outlives every
     /// descriptor-relative cleanup step.
     _lifetime: crate::lifecycle::LifetimeLock,
 }
 
-/// Identity retained at publish time for the best-effort check that the
-/// canonical file still names our publication before cleanup unlinks it
-/// (protocol §4.2, V7).
+/// Cleanup checks that the canonical file still names this publication before unlinking it.
 struct PublicationIdentity {
     dev: u64,
     ino: u64,
@@ -215,7 +201,7 @@ struct PublicationIdentity {
 
 impl fmt::Debug for InstanceGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Key bytes stay out by construction; only the directory is named.
+        // Errors name only the directory, never key bytes.
         f.debug_struct("InstanceGuard")
             .field("dir", &self.dir_path)
             .finish_non_exhaustive()
@@ -223,15 +209,11 @@ impl fmt::Debug for InstanceGuard {
 }
 
 impl InstanceGuard {
-    /// Takes the stable lifetime fence, secures the runtime directory,
-    /// acquires the runtime-directory lock, and mints fresh credentials — in
-    /// that order, so credentials never exist for an incarnation that lost a
-    /// lock race (protocol §8.1) and replacing the managed subtree can never
-    /// admit an overlapping incarnation while this guard lives.
+    /// Credentials are minted only after the runtime-directory lock is acquired, so a lost lock race cannot create credentials.
+    /// The lifetime fence prevents managed-subtree replacement from admitting an overlapping incarnation while this guard lives.
     ///
-    /// `payload_manifest_digest` is required identity for every persisted
-    /// lifecycle record: exactly the canonical release digest shape
-    /// (64 lowercase hex characters), rejected otherwise.
+    /// `payload_manifest_digest` must contain exactly 64 lowercase hexadecimal characters.
+    /// `payload_manifest_digest` must contain exactly 64 lowercase hexadecimal characters.
     pub fn acquire(
         data_dir_override: Option<&Path>,
         payload_manifest_digest: &str,
@@ -242,25 +224,20 @@ impl InstanceGuard {
         if !crate::lifecycle::is_canonical_payload_digest(payload_manifest_digest) {
             return Err(InstanceError::InvalidPayloadDigest);
         }
-        // The lifetime fence comes first: it lives outside the replaceable
-        // `cortexkit` subtree, so it is the authority that survives `run` or
-        // whole-subtree replacement. The runtime-directory lock below remains
-        // the publication/cleanup fence for descriptor-relative evidence.
+        // The lifetime fence survives replacement of the `cortexkit` subtree.
+        // The lifetime fence is the authority that survives replacement of the `run` directory or the managed subtree.
+        // The runtime-directory lock fences descriptor-relative publication and cleanup.
         let lifetime = crate::lifecycle::LifetimeLock::acquire(data_dir_override)?;
         let dir_path = runtime_dir_path(data_dir_override)?;
         let dir = secure_runtime_dir(&dir_path)?;
         lock_instance(&dir, &dir_path)?;
-        // An unknown lifecycle schema at the record name is quarantined:
-        // starting here would overwrite it, so refuse before any mutation.
-        // The gate fails closed: an undecidable record blocks the start.
+        // An unknown lifecycle schema at the record name blocks startup to prevent overwrite.
         if crate::lifecycle::quarantined_record_present(&dir, &dir_path)? {
             return Err(InstanceError::UnsupportedStateSchema {
                 path: dir_path.join(crate::lifecycle::LIFECYCLE_RECORD_NAME),
             });
         }
-        // Sweep under the freshly held lock rather than at publish: an
-        // incarnation that crash-loops before ever publishing still reclaims
-        // its predecessors' stale temp files on each start.
+        // Startup removes stale predecessor files left by incarnations that crashed before publication.
         sweep_stale_temps(&dir, &dir_path);
 
         let mut key = [0u8; KEY_LEN];
@@ -278,6 +255,7 @@ impl InstanceGuard {
             launch_id,
             payload_manifest_digest: payload_manifest_digest.to_owned(),
             publication: None,
+            setup_socket: None,
             _lifetime: lifetime,
         })
     }
@@ -306,18 +284,25 @@ impl InstanceGuard {
         &self.dir_path
     }
 
+    pub(crate) fn register_setup_socket(&mut self, path: PathBuf) {
+        self.setup_socket = Some(path);
+    }
+
     /// Atomically publishes the schema-1 connection file for this incarnation
     /// (protocol §4.1, §4.2). The owner-only `O_EXCL` temp file and the rename
     /// over the canonical name both stay relative to the pinned directory
     /// descriptor, so the swap cannot cross filesystems or follow links.
-    pub fn publish(&mut self, port: u16, daemon_ver: &str) -> Result<(), InstanceError> {
+    pub fn publish(&mut self, setup_socket: &Path, daemon_ver: &str) -> Result<(), InstanceError> {
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: crate::wire::PROTOCOL_VERSION,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port,
-            }],
+            setup_socket: setup_socket
+                .to_str()
+                .ok_or_else(|| InstanceError::Insecure {
+                    what: "non-UTF-8 setup socket path",
+                    path: setup_socket.to_path_buf(),
+                })?
+                .to_owned(),
             key: self.key.0.to_vec(),
             daemon_id: self.daemon_id,
             pid: std::process::id(),
@@ -327,8 +312,7 @@ impl InstanceGuard {
             serde_json::to_vec_pretty(&info).expect("connection info serialization cannot fail");
 
         let stat = write_atomic_owner_only(&self.dir, &self.dir_path, CONNECTION_FILE_NAME, &json)?;
-        // `Stat` field types vary by platform (macOS `st_dev` is `i32`); the
-        // casts are no-ops on Linux but load-bearing elsewhere.
+        // `Stat` field types vary by platform; macOS defines `st_dev` as `i32`, so the casts are required there and are no-ops on Linux.
         #[allow(clippy::unnecessary_cast)]
         let identity = PublicationIdentity {
             dev: stat.st_dev as u64,
@@ -338,20 +322,17 @@ impl InstanceGuard {
         Ok(())
     }
 
-    /// Best-effort identity fencing before removing the canonical publication:
-    /// no-follow open, secure regular file, matching retained (dev, ino), and
-    /// matching daemon ID (protocol §4.2, V7). A mismatch leaves the path
-    /// alone. Verification and pathname unlink are separate operations, so
-    /// replacement between the final check and unlink cannot be excluded.
+    /// Cleanup verifies the canonical publication's retained identity before attempting removal.
+    /// Cleanup requires a no-follow open of a secure regular file whose retained `(dev, ino)` matches.
+    /// Cleanup also requires the daemon ID to match; a mismatch leaves the path unchanged.
+    /// Cleanup cannot exclude replacement between the final identity check and unlink.
     pub fn remove_publication(&mut self) {
         let Some(identity) = self.publication.take() else {
             return;
         };
-        // Transient failures (EMFILE while connection descriptors are live)
-        // must not consume the identity: `Drop` retries after those
-        // descriptors close, or the file would keep advertising a dead
-        // endpoint and its bearer key. Only success or a definitive identity
-        // mismatch clears it.
+        // Transient failures must retain `identity` so `Drop` can retry.
+        // Drop retries after connection descriptors close.
+        // Only successful unlink or a definitive identity mismatch clears `self.publication`.
         let Ok(fd) = openat(
             &self.dir,
             CONNECTION_FILE_NAME,
@@ -368,14 +349,13 @@ impl InstanceGuard {
         if !is_secure_regular(&stat) {
             return;
         }
-        // `Stat` field types vary by platform (macOS `st_dev` is `i32`); the
-        // casts are no-ops on Linux but load-bearing elsewhere.
+        // `Stat` field types vary by platform; macOS defines `st_dev` as `i32`.
         #[allow(clippy::unnecessary_cast)]
         if stat.st_dev as u64 != identity.dev || stat.st_ino as u64 != identity.ino {
             return;
         }
         let Ok(bytes) = read_all_fd(&fd, 65_536) else {
-            // Transient read failure: keep the identity for the Drop retry.
+            // A transient read failure retains `identity` for `Drop` retry.
             self.publication = Some(identity);
             return;
         };
@@ -385,8 +365,7 @@ impl InstanceGuard {
         if info.daemon_id != self.daemon_id {
             return;
         }
-        // A transient unlink failure must leave the identity retained so
-        // `Drop` retries; otherwise the dead endpoint and its bearer key stay
+        // A transient unlink failure retains `identity` so `Drop` can retry removal.
         // published.
         if unlinkat(&self.dir, CONNECTION_FILE_NAME, AtFlags::empty()).is_err() {
             self.publication = Some(identity);
@@ -396,6 +375,9 @@ impl InstanceGuard {
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
+        if let Some(path) = self.setup_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
         // Idempotent: the graceful path already removed the publication and
         // took the retained identity, making this a no-op. The same
         // best-effort identity checks run before unlink on the drop path.
@@ -404,17 +386,13 @@ impl Drop for InstanceGuard {
     }
 }
 
-/// Traverses an existing managed directory path without following symlinks
-/// and without creating anything. `Ok(None)` means a component is absent, so
-/// the subtree has not been created yet; an `Err` means a component that does
-/// exist is not replacement-proof or not ours.
+/// `open_secure_dir_existing` traverses an existing managed directory path without following symlinks.
+/// `Ok(None)` means a component is absent and the subtree does not yet exist.
+/// `Err` means a component is insecure, unreadable, or does not belong to this instance.
 ///
-/// Observational callers need this distinction: mapping an insecure or
-/// unreadable component onto the same answer as an absent one would let
-/// hostile persisted state be reported as "nothing installed yet", which
-/// prescribes the wrong remediation and hides the shape that caused it. Every
-/// component is resolved relative to the previous pinned descriptor, so no
-/// intermediate symlink can redirect the traversal after the anchor is taken.
+/// Observational callers must distinguish absent components from insecure or unreadable components.
+/// Mapping an insecure component to absence would report hostile persisted state as "nothing installed yet".
+/// Resolving each component through the previous pinned descriptor prevents intermediate symlinks from redirecting traversal.
 pub(crate) fn open_secure_dir_existing(dir_path: &Path) -> Result<Option<OwnedFd>, InstanceError> {
     let mut current = open_safe_anchor(dir_path)
         .map_err(|e| io_err("open_anchor", dir_path, e))?
@@ -445,9 +423,9 @@ pub(crate) fn open_secure_dir_existing(dir_path: &Path) -> Result<Option<OwnedFd
             Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(e) => return Err(io_err("open_component", &walked, e)),
         };
-        // Same intermediate rule as the creating traversal: a component another
-        // principal can rename or swap can redirect the pathname after we pin
-        // ours. The final component is left to the caller's own predicate.
+        // Traversal must not resolve later components through a replaceable pathname.
+        // A principal that can rename or swap an intermediate component can redirect later pathname resolution.
+        // The caller validates the final component.
         if index != last {
             let stat =
                 rustix::fs::fstat(&next).map_err(|e| io_err("fstat_component", &walked, e))?;
@@ -463,9 +441,9 @@ pub(crate) fn open_secure_dir_existing(dir_path: &Path) -> Result<Option<OwnedFd
     Ok(Some(current))
 }
 
-/// Traverses and validates the runtime path without following symlinks,
-/// normalizing newly created components to 0700. Returns a pinned descriptor
-/// for the final directory after validating its ownership and mode.
+/// `secure_runtime_dir` traverses and validates `dir_path` without following symlinks.
+/// `secure_runtime_dir` normalizes newly created components to mode 0700.
+/// `secure_runtime_dir` returns a pinned descriptor for the final directory after validating its ownership and mode.
 pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
     let flags = HARDENED_DIR_FLAGS;
     let mut current = open_safe_anchor(dir_path)
@@ -479,10 +457,8 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
     } else {
         PathBuf::new()
     };
-    // Collected first so the traversal knows which component is final: every
-    // INTERMEDIATE must already be replacement-proof (we must not chmod
-    // directories we do not own, such as /tmp or $HOME), while the final
-    // directory is validated and then tightened to 0700 through its pinned
+    // `secure_runtime_dir` must not chmod ancestor directories such as `/tmp` or `$HOME`.
+    // `secure_runtime_dir` validates and tightens the final directory to mode 0700 through its pinned descriptor.
     // descriptor below.
     let names = normal_components(dir_path).ok_or_else(|| InstanceError::Insecure {
         what: "runtime directory path",
@@ -501,10 +477,9 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
                     Err(rustix::io::Errno::EXIST) => false,
                     Err(e) => return Err(io_err("mkdir_component", &walked, e)),
                 };
-                // mkdir modes are filtered by umask. Restore owner access
-                // before reopening a component that a restrictive umask may
-                // have created as 0000; the subsequent no-follow open and
-                // descriptor chmod validate and pin the actual directory.
+                // umask filters `mkdirat` modes; `chmodat` restores owner access before reopening.
+                // The traversal restores owner access before reopening a component created with mode 0000 by a restrictive umask.
+                // The subsequent no-follow open pins the reopened directory.
                 if created {
                     rustix::fs::chmodat(
                         &current,
@@ -524,13 +499,8 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
             }
             Err(e) => return Err(io_err("open_component", &walked, e)),
         };
-        // Intermediates must be replacement-proof: a principal who can rename
-        // or swap one can redirect the pathname to a tree of their choosing
-        // after we pin ours, so clients and successors would resolve their
-        // publication and lock inode while this host keeps using the hidden
-        // original (protocol §4.1 threat model). The final component is
-        // validated and tightened after the loop instead — we own it, so it
-        // can be repaired rather than rejected.
+        // Replacing an intermediate component can make clients and successors resolve different inodes.
+        // The final component is validated and tightened after the loop because ownership validation permits repair.
         if index != last {
             let next_stat =
                 rustix::fs::fstat(&next).map_err(|e| io_err("fstat_component", &walked, e))?;
@@ -565,22 +535,17 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
     Ok(current)
 }
 
-/// Atomically installs `bytes` at `name` inside the pinned `dir` descriptor:
-/// unique owner-only `O_EXCL` temp, exact-mode `fchmod`, full write, fsync,
-/// then rename over the canonical name. Failure removes only this attempt's
-/// temp file; a predecessor's or successor's canonical file is untouched.
-/// Returns the installed file's stat, taken through the still-open temp
-/// descriptor before the rename.
+/// The function atomically installs `bytes` at `name` through the pinned `dir` descriptor.
+/// Rename publishes only a fully written and synced file.
+/// On failure, cleanup removes only this attempt's temp file; canonical files remain untouched.
 pub(crate) fn write_atomic_owner_only(
     dir: &OwnedFd,
     dir_path: &Path,
     name: &str,
     bytes: &[u8],
 ) -> Result<rustix::fs::Stat, InstanceError> {
-    // The stale-temp sweep reclaims this writer's crashed attempts by name
-    // prefix, so a name it does not know about would leak one temp file per
-    // crashed write with nothing to reclaim it. The assertion makes an
-    // unregistered name fail the first test that writes it.
+    // The stale-temp sweep reclaims temp files from crashed writes for this name.
+    // `ATOMIC_WRITE_NAMES` must include every `name` used here so stale-temp sweeping reclaims crashed writes.
     debug_assert!(
         ATOMIC_WRITE_NAMES.contains(&name),
         "{name} is not registered in ATOMIC_WRITE_NAMES; its crashed temps would never be swept"
@@ -588,8 +553,7 @@ pub(crate) fn write_atomic_owner_only(
     let mut suffix = [0u8; 16];
     getrandom::getrandom(&mut suffix).map_err(|_| InstanceError::Random)?;
     let temp_name = format!(".{name}.{}.{}.tmp", std::process::id(), hex(&suffix));
-    // Errors carry the full path so a failure names which runtime directory
-    // it happened in; the syscalls themselves stay anchored to `dir`.
+    // Directory-relative operations remain anchored to `dir`.
     let temp_path = dir_path.join(&temp_name);
 
     let fd = openat(
@@ -601,10 +565,8 @@ pub(crate) fn write_atomic_owner_only(
     .map_err(|e| io_err("create_temp", &temp_path, e))?;
 
     let result = (|| -> Result<rustix::fs::Stat, InstanceError> {
-        // The create mode is filtered by the process umask (a 0o777-style
-        // umask can strip owner bits and leave the file 0o000); force the
-        // exact owner-only mode so the installed bytes stay readable by the
-        // owning principal and fenced cleanup can reopen the file.
+        // umask can reduce the requested `0o600` mode to `0o000`; `fchmod` restores `0o600`.
+        // Under Unix mode-bit checks, `0o600` grants read access only to the file owner.
         rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))
             .map_err(|e| io_err("chmod_temp", &temp_path, e))?;
         write_all_fd(&fd, bytes).map_err(|source| InstanceError::Io {
@@ -625,26 +587,21 @@ pub(crate) fn write_atomic_owner_only(
     result
 }
 
-/// Takes the nonblocking exclusive advisory lock that makes this process the
-/// publication owner for `dir`.
+/// The nonblocking exclusive advisory lock makes this process the publication owner for `dir`.
 ///
-/// One attempt, no waiting: contention is reported as `AlreadyRunning` so the
-/// caller decides how to wait. `run` retries on its own async timer rather
-/// than sleeping an executor thread; synchronous callers use
+/// `run` retries on an async timer; synchronous callers use `flock_exclusive_bounded`.
 /// [`flock_exclusive_bounded`].
 ///
-/// The lock is held on the runtime-directory descriptor and fences
-/// descriptor-relative publication and evidence cleanup only. The directory
-/// is replaceable, so this lock alone does not prevent replacement-induced
-/// overlap: renaming `run` or `cortexkit` away lets a successor anchor a
-/// fresh inode under the same name. Overlap across replacement is refused by
-/// `crate::lifecycle::LifetimeLock`, acquired before this lock on the
-/// never-renamed coordination file — but only among coordination-aware
-/// releases: a rollback to a release that predates the lifetime fence
-/// reinstates the replacement-overlap hazard unless the daemon is fully
-/// stopped first, and an external rename of `.mc-host-coordination` itself
-/// (out of contract) splits the fence the same way.
-/// commentlint: allow(JUDGE)
+/// The lock on `dir` fences only descriptor-relative publication and evidence cleanup.
+/// Replacing the runtime directory can bypass this lock and allow overlap.
+/// Renaming `run` or `cortexkit` away lets a successor lock a new inode at the same path.
+/// `crate::lifecycle::LifetimeLock` fences coordination-aware processes against directory-replacement overlap.
+/// `crate::lifecycle::LifetimeLock` is acquired before this lock on `.mc-host-coordination`.
+/// The lifetime fence works only between coordination-aware releases.
+/// A release without the lifetime fence can overlap after directory replacement.
+/// Do not run a release without the lifetime fence while another release may hold the coordination lock.
+/// Renaming `.mc-host-coordination` externally splits the lifetime fence.
+/// `.mc-host-coordination` must not be renamed externally.
 fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
     match flock(dir, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(()),
@@ -654,25 +611,21 @@ fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
     }
 }
 
-/// How long a caller should tolerate transient exclusive-lock contention.
+/// Callers should tolerate exclusive-lock contention until the bounded lock timeout expires.
 ///
-/// An observer holds a lifecycle lock only long enough to read it — a probe
-/// tests instance-lock freedom with a shared lock, and holds the
-/// coordination transaction lock shared for one sample — but shared still blocks
-/// exclusive, so an unlucky mutator can collide with one. Retrying briefly
-/// keeps that from being reported as a live holder. These are the single
-/// definition of that policy: [`flock_exclusive_bounded`] applies them
-/// synchronously, and `run` applies them on an async timer.
+/// An observer holds the lifecycle lock only while reading it.
+/// A probe tests instance-lock freedom with a shared lock.
+/// A probe holds the coordination transaction lock shared for one sample; that shared lock blocks exclusive acquisition.
+/// A mutator's exclusive lock acquisition can contend with a probe's shared lock.
+/// Brief retries prevent probe contention from being reported as a live holder.
 pub(crate) const LOCK_RETRY_ATTEMPTS: u32 = 4;
 pub(crate) const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Bounded nonblocking advisory lock: `Ok(true)` means locked, `Ok(false)`
-/// means a holder outlasted every attempt; the caller decides what
-/// exhaustion means (a mutator reports `AlreadyRunning`, a probe degrades to
+/// `Ok(true)` means the lock was acquired; `Ok(false)` means every attempt returned `WOULDBLOCK`.
+/// The caller defines the consequence of exhausted retries.
 /// evidence-only).
 ///
-/// Blocking: the retry sleeps the calling thread, so this is for synchronous
-/// callers only. Async callers must not park an executor thread here.
+/// `flock_bounded` sleeps the calling thread between retries; async callers must not use it.
 pub(crate) fn flock_bounded(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -694,9 +647,6 @@ pub(crate) fn flock_bounded(
     Ok(false)
 }
 
-/// Takes a nonblocking exclusive advisory lock, tolerating the brief hold a
-/// concurrent observer may take, per [`LOCK_RETRY_ATTEMPTS`]. A real holder
-/// still yields `AlreadyRunning` after the last attempt.
 pub(crate) fn flock_exclusive_bounded(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -705,7 +655,6 @@ pub(crate) fn flock_exclusive_bounded(
     if flock_bounded(dir, dir_path, op, FlockOperation::NonBlockingLockExclusive)? {
         Ok(())
     } else {
-        // Every attempt observed the lock held.
         Err(InstanceError::AlreadyRunning)
     }
 }
@@ -730,22 +679,16 @@ pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
     stat.st_mode
 }
 
-/// Open flags for every hardened directory traversal: a directory, never
-/// following a link, read-only, close-on-exec.
 ///
-/// Shared so a traversal cannot be hardened in one caller and not the other.
+/// All anchor opens must use `HARDENED_DIR_FLAGS` to prevent symlink traversal.
 pub(crate) const HARDENED_DIR_FLAGS: OFlags = OFlags::DIRECTORY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::RDONLY)
     .union(OFlags::CLOEXEC);
 
-/// The path components a hardened traversal may walk.
 ///
-/// `RootDir` and `CurDir` are the anchor, already opened, so they are skipped.
-/// Everything else — `ParentDir`, `Prefix` — is refused rather than resolved:
 /// walking `..` would let a pathname climb out of the tree the anchor pinned.
-/// Single-sourced because a missed variant here is a path-traversal hole, and
-/// two copies of this rule can drift apart silently.
+/// Rejecting `ParentDir` and `Prefix` prevents traversal outside the anchored tree.
 pub(crate) fn normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
     let mut names = Vec::new();
     for component in path.components() {
@@ -758,13 +701,11 @@ pub(crate) fn normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
     Some(names)
 }
 
-/// Opens the anchor a hardened traversal starts from and proves it is not
+/// The function rejects anchors that another principal can replace.
 /// replaceable.
 ///
-/// The anchor is part of the resolved path: for a relative path it is the
-/// process working directory, which another principal may control and could use
-/// to replace an otherwise secure first component. `Ok(None)` means the anchor
-/// opened but is unsafe, which each caller reports in its own error type.
+/// For relative paths, `open_safe_anchor` validates the process working directory before resolving path components.
+/// `open_safe_anchor` returns `Ok(None)` when the opened anchor fails `is_safe_ancestor`.
 pub(crate) fn open_safe_anchor(path: &Path) -> Result<Option<OwnedFd>, rustix::io::Errno> {
     let anchor = openat(
         CWD,
@@ -776,9 +717,9 @@ pub(crate) fn open_safe_anchor(path: &Path) -> Result<Option<OwnedFd>, rustix::i
     Ok(is_safe_ancestor(&stat).then_some(anchor))
 }
 
-/// A directory no other principal can replace: owned by us or by root, and
-/// not group/other-writable unless sticky (a sticky directory forbids
-/// renaming entries you do not own, which is what `/tmp` relies on).
+/// A safe directory is owned by us or root and is not group- or other-writable unless sticky.
+/// A sticky directory restricts who may rename or remove its entries.
+/// A sticky directory allows only the entry owner, directory owner, or root to rename an entry.
 pub(crate) fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
     let mode = mode_bits(stat);
     if (mode & S_IFMT) != S_IFDIR {
@@ -791,7 +732,6 @@ pub(crate) fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
     mode & 0o022 == 0 || mode & S_ISVTX != 0
 }
 
-/// Regular file, single hard link, owned by us, no group/other bits.
 pub(crate) fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
     let mode = mode_bits(stat);
     (mode & S_IFMT) == S_IFREG
@@ -800,21 +740,16 @@ pub(crate) fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
         && mode & 0o077 == 0
 }
 
-/// Every canonical name installed through [`write_atomic_owner_only`]. The
-/// stale-temp sweep derives its reclaim prefixes from this list, and the
-/// writer asserts membership, so a new atomically written file cannot be
-/// added without also becoming sweepable.
+/// `ATOMIC_WRITE_NAMES` lists the names accepted by `write_atomic_owner_only`.
+/// The writer asserts membership, so every newly atomically written file is sweepable.
 pub(crate) const ATOMIC_WRITE_NAMES: [&str; 2] = [
     CONNECTION_FILE_NAME,
     crate::lifecycle::LIFECYCLE_RECORD_NAME,
 ];
 
-/// Best-effort removal of stale temp pathnames left by `write_atomic_owner_only`.
-/// Candidates and metadata come from a path-based directory iterator with
-/// metadata fetched per entry, while deletion is descriptor-relative; the
-/// metadata check and unlink are not atomic. Age is the sole predicate,
-/// failures do not prevent startup (protocol §4.2). The scan examines at
-/// most 1024 successfully read entries.
+/// The sweep ignores removal failures so startup can continue.
+/// The sweep unlinks descriptor-relatively, but metadata checks and unlinking are not atomic.
+/// The sweep ignores failures and examines at most 1024 successfully read entries.
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     const MAX_SWEEP_ENTRIES: usize = 1024;
     let prefixes = ATOMIC_WRITE_NAMES.map(|name| format!(".{name}."));
@@ -885,12 +820,13 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     const TEST_DIGEST: &str = "3d7f9a1c5b2e8f0a6d4c7b9e1f3a5c8d2b4e6f0a1c3d5e7f9b0d2f4a6c8e0b1d";
 
-    /// `runtime_dir_path` reads process-global environment, so the tests that
-    /// mutate it cannot run concurrently with each other.
+    /// Tests that mutate `runtime_dir_path`'s process-global environment cannot run concurrently.
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn temp_root() -> tempfile::TempDir {
@@ -945,8 +881,7 @@ mod tests {
             PathBuf::from("/home-root/.local/share/cortexkit/run")
         );
 
-        // A relative HOME is equally ignored: with no absolute root at all,
-        // the result is exactly NoDataDir.
+        // A relative `HOME` is ignored; without an absolute root, the result is exactly `NoDataDir`.
         std::env::set_var("HOME", "relative-home");
         assert!(matches!(
             runtime_dir_path(None),
@@ -973,7 +908,9 @@ mod tests {
     fn permissive_umask_still_yields_owner_only_dir_and_file() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         assert_eq!(mode_of(guard.dir_path()), 0o700);
         let file = published(&guard);
@@ -984,11 +921,24 @@ mod tests {
     }
 
     #[test]
+    fn publication_rejects_non_utf8_setup_socket_path() {
+        let root = temp_root();
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/mc-host-\xff.sock".to_vec()));
+        assert!(matches!(
+            guard.publish(&path, "mc-host/test"),
+            Err(InstanceError::Insecure {
+                what: "non-UTF-8 setup socket path",
+                ..
+            })
+        ));
+        assert!(!published(&guard).exists());
+    }
+
+    #[test]
     fn world_writable_intermediate_is_rejected() {
         let root = temp_root();
-        // An intermediate another principal could rename cannot be repaired
-        // by us the way the final directory can, so acquisition must refuse
-        // rather than pin a tree whose pathname can be redirected.
+        // Acquisition refuses an intermediate directory another principal can rename because we cannot repair it like the final directory.
         let loose = root.path().join("loose");
         std::fs::create_dir_all(&loose).expect("create intermediate");
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777))
@@ -1019,18 +969,25 @@ mod tests {
     }
 
     #[test]
-    fn publication_matches_schema_1_shape() {
+    fn publication_matches_schema_2_shape() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         let bytes = std::fs::read(published(&guard)).expect("read publication");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert_eq!(json["schema"], 1);
+        assert_eq!(json["schema"], 2);
         assert_eq!(json["wire_version"], 2);
-        assert_eq!(json["endpoints"].as_array().expect("endpoints").len(), 1);
-        assert_eq!(json["endpoints"][0]["host"], "127.0.0.1");
-        assert_eq!(json["endpoints"][0]["port"], 43123);
+        assert_eq!(
+            json["setup_socket"],
+            guard
+                .dir_path()
+                .join("setup.sock")
+                .to_string_lossy()
+                .as_ref()
+        );
         assert_eq!(json["key"].as_array().expect("key").len(), 32);
         assert_eq!(json["daemon_id"].as_array().expect("daemon_id").len(), 16);
         assert_eq!(json["pid"], std::process::id());
@@ -1042,7 +999,9 @@ mod tests {
         let root = temp_root();
         let mut first =
             InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
-        first.publish(1111, "mc-host/first").expect("publish");
+        first
+            .publish(&first.dir_path().join("setup.sock"), "mc-host/first")
+            .expect("publish");
         let before = std::fs::read(published(&first)).expect("read first");
 
         let err =
@@ -1058,14 +1017,15 @@ mod tests {
         let root = temp_root();
         let mut first =
             InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
-        first.publish(1111, "mc-host/first").expect("publish");
+        first
+            .publish(&first.dir_path().join("setup.sock"), "mc-host/first")
+            .expect("publish");
         let before = std::fs::read(published(&first)).expect("read first");
 
         let moved = root.path().join("cortexkit").join("run-moved");
         std::fs::rename(first.dir_path(), &moved).expect("rename runtime dir");
 
-        // Ownership belongs to the locked inode, not to the pathname: the
-        // renamed directory is still locked by the holder.
+        // Lock ownership belongs to the inode rather than its pathname; renaming the directory does not release the holder's lock.
         let reopened = openat(
             CWD,
             &moved,
@@ -1081,9 +1041,8 @@ mod tests {
             "the holder must still own the renamed directory's lock"
         );
 
-        // A successor would anchor a fresh runtime inode, but the stable
-        // lifetime fence — held for the incarnation, outside the replaceable
-        // subtree — refuses a second incarnation.
+        // A successor anchors a fresh runtime inode, but the lifetime fence outside the replaceable subtree rejects a second incarnation.
+        // The lifetime fence is held for the incarnation outside the replaceable subtree.
         let successor = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST);
         assert!(
             matches!(successor, Err(InstanceError::AlreadyRunning)),
@@ -1095,12 +1054,12 @@ mod tests {
             "the holder's publication must be untouched"
         );
 
-        // The open directory handle lets `first` remove its publication after
+        // The open directory handle lets `first` remove its publication after the runtime directory is renamed.
         // the rename.
         first.remove_publication();
         assert!(!moved.join(CONNECTION_FILE_NAME).exists());
 
-        // Teardown of the displaced holder frees both fences for a successor.
+        // Tearing down the displaced holder releases the runtime and lifetime fences, allowing a successor.
         drop(first);
         let second =
             InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("successor acquires");
@@ -1136,12 +1095,14 @@ mod tests {
         let root = temp_root();
         let dir = runtime_dir_path(Some(root.path())).expect("resolve");
         std::fs::create_dir_all(&dir).expect("create dir");
-        // A directory sitting at the publication name cannot be renamed over,
-        // so publication must fail closed rather than clobber it.
+        // A directory at the publication name prevents rename(2) from replacing it.
+        // Publication must fail closed rather than clobber a directory at the publication name.
         std::fs::create_dir(dir.join(CONNECTION_FILE_NAME)).expect("plant directory");
 
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        assert!(guard.publish(4321, "mc-host/test").is_err());
+        assert!(guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .is_err());
         assert!(
             std::fs::symlink_metadata(dir.join(CONNECTION_FILE_NAME))
                 .expect("stat")
@@ -1162,7 +1123,9 @@ mod tests {
         symlink(&victim, dir.join(CONNECTION_FILE_NAME)).expect("plant symlink");
 
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(2222, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         // rename(2) replaces the link itself, so the outside target is intact.
         assert_eq!(
@@ -1180,7 +1143,9 @@ mod tests {
     fn cleanup_removes_only_our_own_publication() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(3333, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
         assert!(file.exists());
         guard.remove_publication();
@@ -1191,7 +1156,9 @@ mod tests {
     fn replaced_inode_prevents_unlink() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(4444, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
 
         // A successor publishes over the path: same name, different inode.
@@ -1208,11 +1175,12 @@ mod tests {
     fn mismatched_daemon_id_prevents_unlink() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(5555, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
 
-        // Same inode, rewritten daemon ID: an old incarnation must not delete
-        // a credential it no longer owns.
+        // Same inode, rewritten daemon ID: an old incarnation must not delete a credential it no longer owns.
         let bytes = std::fs::read(&file).expect("read");
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
         json["daemon_id"] = serde_json::json!(vec![0u8; DAEMON_ID_LEN]);
@@ -1229,7 +1197,9 @@ mod tests {
     fn hard_linked_publication_prevents_unlink() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(6666, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
         std::fs::hard_link(&file, guard.dir_path().join("extra-link")).expect("hard link");
 
@@ -1244,17 +1214,27 @@ mod tests {
     fn publication_survives_and_replaces_across_republish() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(7777, "mc-host/test").expect("first publish");
+        guard
+            .publish(&guard.dir_path().join("setup-1.sock"), "mc-host/test")
+            .expect("first publish");
         let first: serde_json::Value =
             serde_json::from_slice(&std::fs::read(published(&guard)).expect("read"))
                 .expect("parse");
-        guard.publish(8888, "mc-host/test").expect("second publish");
+        guard
+            .publish(&guard.dir_path().join("setup-2.sock"), "mc-host/test")
+            .expect("second publish");
         let second: serde_json::Value =
             serde_json::from_slice(&std::fs::read(published(&guard)).expect("read"))
                 .expect("parse");
 
-        assert_eq!(first["endpoints"][0]["port"], 7777);
-        assert_eq!(second["endpoints"][0]["port"], 8888);
+        assert!(first["setup_socket"]
+            .as_str()
+            .unwrap()
+            .ends_with("setup-1.sock"));
+        assert!(second["setup_socket"]
+            .as_str()
+            .unwrap()
+            .ends_with("setup-2.sock"));
         // Credentials belong to the incarnation, not the publish call.
         assert_eq!(first["key"], second["key"]);
         guard.remove_publication();
@@ -1264,8 +1244,7 @@ mod tests {
     #[test]
     fn stale_temps_are_swept_and_fresh_ones_spared() {
         let root = temp_root();
-        // A first incarnation creates the runtime directory, then "crashes"
-        // (drop releases the lock), stranding the temps a predecessor would.
+        // Dropping the first guard releases the lock so its successor can acquire the directory.
         let dir = {
             let guard =
                 InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
@@ -1293,14 +1272,15 @@ mod tests {
             .set_modified(SystemTime::now() - Duration::from_secs(3600))
             .expect("backdate");
 
-        // The successor sweeps at lock acquisition — before any publish — so
-        // a crash-loop that never reaches publish still reclaims temps.
+        // The successor sweeps staged files at lock acquisition, before publishing, so a crash loop that never reaches publish still reclaims temps.
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
 
         assert!(!stale.exists(), "a stale temp must be swept");
         assert!(fresh.exists(), "an in-flight temp must be spared");
         assert!(unrelated.exists(), "age alone must not condemn other files");
-        guard.publish(9999, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         assert!(published(&guard).exists(), "publication must still land");
     }
 
@@ -1308,7 +1288,9 @@ mod tests {
     fn no_temp_files_remain_after_a_successful_publish() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(1234, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         let prefix = format!(".{CONNECTION_FILE_NAME}.");
         let leftovers: Vec<_> = std::fs::read_dir(guard.dir_path())
@@ -1343,7 +1325,6 @@ mod tests {
         for rendered in [format!("{:?}", guard.key()), format!("{guard:?}")] {
             assert!(!rendered.contains(&key_hex), "{rendered}");
             assert!(!rendered.contains(&key_decimals), "{rendered}");
-            // Any 8-byte window of the key would already be a disclosure.
             for window in key_hex.as_bytes().windows(16) {
                 let window = std::str::from_utf8(window).expect("hex is ASCII");
                 assert!(!rendered.contains(window), "{rendered} leaked {window}");

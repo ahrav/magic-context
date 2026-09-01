@@ -1,10 +1,6 @@
 /**
- * Spawn an isolated `opencode serve` process with:
- * - its own config/data directories (no pollution of the user's real setup)
- * - a custom mock-anthropic provider pointed at our mock server
- * - the magic-context plugin loaded from local source via `file://` spec
+ * The test environment uses separate config and data directories to avoid modifying the user's setup.
  *
- * Returns the server URL and a handle with `kill()` for test cleanup.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -24,28 +20,13 @@ import {
 } from "../rust-runner/hermetic-mc-host";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-// Prefer the built bundle over raw `src/index.ts`. The bundle is one file with
-// all imports inlined and loads fast even on a cold runner, while the TS-source
-// path triggers Bun's runtime transpile and dynamic resolution across hundreds
-// of submodule imports — enough on a slow CI runner to make `opencode serve`
-// look hung when it is only blocked in plugin load. Production never loads from
-// src/, so the source path also tests a slowness users never see.
+// Use the bundle: loading `src/index.ts` can delay startup enough to exhaust readiness polling on slow CI.
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
 const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
 /**
- * Resolved per spawn, not once at module load.
  *
- * A module-level constant snapshots mutable filesystem state at import time, and
- * the import happens before any caller code runs — a caller that builds the
- * bundle and then spawns in the same process got the pre-build answer. That is
- * not merely stale bytes: with no bundle present the entry latched to `src/`
- * permanently, so the same process could load a different plugin entrypoint than
- * a caller that prebuilt, while reporting the same identity. Since the two paths
- * have materially different startup behaviour, and production never loads from
- * `src/`, the choice has to be made when it is used.
+ * Resolve the entrypoint at spawn time so a bundle built after import is selected.
  *
- * Semantics are unchanged for every caller that does not create or remove the
- * bundle between import and spawn: the answer is the same, just computed later.
  */
 export function pluginEntryPath(): string {
     return existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
@@ -78,14 +59,10 @@ export interface IsolatedEnv {
 }
 
 /**
- * Listen addresses the fixed loopback client URL can reach.
+ * `ServeHostname` permits only addresses reachable at `http://127.0.0.1:${port}`.
  *
- * The set is closed on purpose. Readiness polling and the returned handle both
- * target `http://127.0.0.1:${port}`, so an address that URL cannot reach — an
- * IPv6-only `::1`, or a single non-loopback interface — would bind a socket no
- * client ever connects to and burn the whole readiness timeout instead of
- * failing with the reason. Admitting another value means deriving the client
- * URL from it in the same change, including IPv6 bracket form.
+ * Otherwise readiness polling times out because the fixed client URL cannot reach the listener.
+ * Adding another address requires deriving the client URL from it, including IPv6 brackets.
  */
 export type ServeHostname = "0.0.0.0" | "127.0.0.1";
 
@@ -101,11 +78,11 @@ export interface SpawnedOpencode {
 }
 
 export interface SpawnOptions {
-    /** URL of the mock Anthropic server, e.g. "http://127.0.0.1:12345" */
+    /* */
     mockProviderURL: string;
     /** Port for opencode serve. Default: random available */
     port?: number;
-    /** magic-context.jsonc overrides. Defaults keep most features on. */
+    /* */
     magicContextConfig?: Record<string, unknown>;
     /** Extra opencode.json provider/model config, merged with defaults. */
     openCodeConfigExtra?: Record<string, unknown>;
@@ -118,32 +95,26 @@ export interface SpawnOptions {
     /** `projectMagicContextConfig` is written to `<workdir>/.cortexkit/magic-context.jsonc` when set. */
     projectMagicContextConfig?: Record<string, unknown>;
     /**
-     * Extra environment variables for the opencode child (e.g.
-     * MAGIC_CONTEXT_LOG_PATH to redirect the plugin diagnostic log to a
-     * per-suite file). Merged last, overriding inherited values.
+     * extraEnv overrides inherited environment variables.
      */
     extraEnv?: Record<string, string>;
     /**
-     * Listen address for `opencode serve`. Defaults to "0.0.0.0" because
-     * GitHub-hosted runners sometimes time out Bun's `fetch()` against a
-     * 127.0.0.1-bound server. The serve HTTP API is unauthenticated, so any
-     * spawn that places a real credential in the child env must pass
-     * "127.0.0.1" to keep the API off non-loopback interfaces.
+     * hostname defaults to "0.0.0.0".
+     * Bind to `0.0.0.0` so readiness polling can reach the server.
+     * The serve HTTP API is unauthenticated.
+     * Spawns with real child-environment credentials must use "127.0.0.1".
+     * Using "127.0.0.1" keeps the unauthenticated API off non-loopback interfaces.
      */
     hostname?: ServeHostname;
     /**
-     * Waive the loopback requirement for a secret-shaped `extraEnv` key. Set it
-     * only when the value is a fake fixture credential, and say why at the call
-     * site: it re-permits publishing an unauthenticated serve API on all
-     * interfaces alongside something named like a secret.
+     * allowSecretEnvOffLoopback permits non-loopback serving only for fake fixture credentials.
      */
     allowSecretEnvOffLoopback?: boolean;
-    /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+    /** Omitting `releaseRoot` initializes `context.db` from the active checkout. */
     releaseRoot?: VerifiedReleaseRoot;
 }
 
 /**
- * Pick a random free port by asking the OS for one. Uses Bun.serve + immediate stop.
  */
 async function pickFreePort(): Promise<number> {
     const server = Bun.serve({ port: 0, fetch: () => new Response() });
@@ -154,12 +125,9 @@ async function pickFreePort(): Promise<number> {
 }
 
 /**
- * Create isolated config/data/cache dirs under a unique temp subdir.
  *
- * Exported so the Rust-mode harness can allocate the env up front: it needs the
- * concrete `dataDir` before OpenCode boots so direct host can publish its
- * connection file, and it reuses the same env across a
- * serve restart so opencode.db + context.db survive the restart.
+ * The direct host needs dataDir before OpenCode starts to publish its connection file.
+ * Reusing the environment preserves opencode.db and context.db across serve restarts.
  */
 export function createIsolatedEnv(): IsolatedEnv {
     const unique = `opencode-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -175,13 +143,8 @@ export function createIsolatedEnv(): IsolatedEnv {
 }
 
 /**
- * Write opencode.json + magic-context.jsonc + tui.json into config/workdir.
  *
- * - opencode.json: registers our plugin via file:// spec, defines a mock-anthropic
- *   provider and a mock model, sets provider.mock-anthropic.options.baseURL to the
- *   mock server's URL.
  * - magic-context.jsonc: starts with small thresholds so tests trigger historian
- *   deterministically with modest scripted token counts.
  */
 function writeConfigs(
     env: IsolatedEnv,
@@ -196,11 +159,10 @@ function writeConfigs(
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
         plugin: [pluginSpec],
-        // Disable telemetry-style checks that could reach out.
+        // `autoupdate: false` disables telemetry-style checks that make network requests.
         autoupdate: false,
-        // Match what `setup`/`doctor` writes for real users. OpenCode compaction
-        // defaults to enabled; if we leave it on, magic-context's conflict
-        // detector disables itself and the plugin becomes a no-op.
+        // OpenCode enables compaction by default; magic-context disables its conflict detector when compaction is enabled.
+        // When compaction is enabled, magic-context disables its conflict detector and the plugin does nothing.
         compaction: { auto: false, prune: false },
         provider: {
             "mock-anthropic": {
@@ -218,10 +180,9 @@ function writeConfigs(
                         name: "Mock Sonnet",
                         cost: { input: 0, output: 0 },
                         limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
-                        // Advertise image + pdf input support so OpenCode does
-                        // not substitute inline file parts with "this model
-                        // does not support X input" text messages. Matches the
-                        // real Sonnet capabilities this mock is standing in for.
+                        // The mock advertises image and PDF input so OpenCode preserves inline file parts.
+                        // OpenCode replaces inline file parts for unsupported inputs with text error messages.
+                        // The mock mirrors Sonnet's image and PDF input capabilities.
                         modalities: {
                             input: ["text", "image", "pdf"],
                             output: ["text"],
@@ -234,7 +195,6 @@ function writeConfigs(
         ...(opts.openCodeConfigExtra ?? {}),
     };
 
-    // User-tier thresholds stay below project-security raise-only clamps.
     const magicContext: Record<string, unknown> = {
         $schema:
             "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
@@ -252,13 +212,8 @@ function writeConfigs(
 
     writeFileSync(join(env.configDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
 
-    // The plugin's loadPluginConfig() looks for magic-context.jsonc under
-    // ${XDG_CONFIG_HOME}/opencode/magic-context.jsonc (user config) or
-    // <workdir>/magic-context.jsonc (project root).
     //
-    // We set XDG_CONFIG_HOME=env.configDir in the child env, so the user
-    // config path resolves to env.configDir/opencode/magic-context.jsonc.
-    // Put the file there; a sibling one in env.configDir is never read.
+    // The child environment sets XDG_CONFIG_HOME to env.configDir, so user configuration resolves under env.configDir/opencode.
     const userConfigDir = join(env.configDir, "opencode");
     mkdirSync(userConfigDir, { recursive: true });
     writeFileSync(
@@ -283,28 +238,16 @@ function writeConfigs(
         );
     }
 
-    // tui.json: not needed for headless serve, but harmless to emit nothing for now.
 }
 
 /**
- * Wait until the opencode server responds to GET /doc (an endpoint that exists in
- * OpenCode's server). Polls for up to `timeoutMs`.
  *
- * Implementation note — Bun fetch timeout flake:
- *   Bun's default `fetch()` has a hardcoded ~5 minute timeout that ignores
- *   AbortSignal.timeout values longer than the limit
- *   (https://github.com/oven-sh/bun/issues/16682). If we don't bound each
- *   fetch attempt explicitly, a single hung request can hold the loop for
- *   the entire ~5 minute window, blowing past our overall deadline before
- *   we get any chance to retry. Pass a short AbortSignal.timeout on every
- *   attempt so one bad fetch can't starve the deadline.
+ * Bun limits fetch to about five minutes even when AbortSignal.timeout is longer; bound each attempt so retries can honor the overall deadline.
+ * Each fetch attempt uses a timeout so a hung fetch cannot consume the overall retry deadline.
  */
-// Default bumped from 30s → 300s. GitHub-hosted runners can take much longer
-// than 30s for `opencode serve` to bind its port + finish plugin init + complete
-// opencode's own one-time SQLite migration (which opencode itself warns "may
-// take a few minutes" on first boot per fresh CI XDG_DATA_HOME). Local hardware
-// finishes in <2s. The bump to 300s covers CI cold-start without papering over
-// genuine readiness failures — 5 minutes is still far above any realistic boot.
+// OpenCode readiness allows up to 300 seconds for first-run initialization in CI.
+// GitHub-hosted runners can delay OpenCode readiness while the server initializes plugins and first-run state.
+// OpenCode can perform a one-time SQLite migration when CI uses a fresh XDG_DATA_HOME.
 async function waitForReady(
     url: string,
     timeoutMs = 300_000,
@@ -325,7 +268,7 @@ async function waitForReady(
                 signal: cancellation ? AbortSignal.any([timeout, cancellation]) : timeout,
             });
             if (res.ok || res.status === 404 || res.status === 401) {
-                // Server is responding — any HTTP response means it booted.
+                // A 2xx, 401, or 404 response confirms that the server is reachable.
                 return;
             }
         } catch (err) {
@@ -349,11 +292,8 @@ interface RustSpawnResources {
 }
 
 /**
- * Reject when the child fails to spawn or exits before readiness. A child that
- * starts and then dies (bad flag, unusable config, taken port) emits no
- * `error`, so without the `exit` arm the startup race only ends when
- * `waitForReady` burns its whole timeout. Every settle path detaches both child
- * listeners, so a child that outlives the race retains neither.
+ * The readiness wait rejects when the child fails to spawn or exits before readiness.
+ * A child can start and then die without emitting `error`; handling `exit` prevents the startup race from waiting for its timeout.
  */
 function rejectOnSpawnError(child: ChildProcess, cancellation?: AbortSignal): Promise<never> {
     return new Promise((_, rejectSpawn) => {
@@ -399,7 +339,7 @@ async function stopChild(child: ChildProcess, timeoutMs = 3_000): Promise<void> 
     }
 }
 
-/** Provision direct host before OpenCode so it can publish its connection file. */
+/** The direct host is provisioned before OpenCode so OpenCode can publish its connection file. */
 async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<RustSpawnResources> {
     const prereqs = detectRustModePrereqs(releaseRoot);
     if (!prereqs.ok) {
@@ -413,16 +353,14 @@ async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<Rus
         const mcHost = await HermeticMcHostStack.start({ dataDir: env.dataDir, fixtureBin });
         return { env, connectionFile: mcHost.connectionFile, mcHost };
     } catch (error) {
-        // This env has no other owner yet: `cleanup()` only runs for a stack
-        // that started, and the process reaper only kills recorded PIDs. A
-        // surviving dataDir is the stack's record that its own teardown could
-        // not reclaim it — the leaked fixture's PID file lives there and is the
-        // next run's only handle on that process — so the tree stays put then.
+        // A surviving `dataDir` records failed teardown because it contains the leaked fixture's PID file.
+        // The next run uses the leaked fixture's PID file as its only handle on that process.
+        // Preserving `dataDir` lets the next run reclaim the leaked process from its PID file.
         if (!existsSync(env.dataDir)) {
             try {
                 rmSync(dirname(env.dataDir), { recursive: true, force: true });
             } catch {
-                // Temp litter never masks the startup failure.
+                // Preserving a leaked `dataDir` does not mask the startup failure.
             }
         }
         throw new Error(
@@ -432,88 +370,44 @@ async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<Rus
 }
 
 /**
- * Whether a parent-environment variable is handed to the serve child.
  *
- * The child otherwise inherits the runner's environment wholesale, and it is an
- * unauthenticated server that binds all interfaces by default, so this list is
- * what stands between the runner's environment and anything that can reach the
+ * The explicit environment list prevents the child from inheriting runner variables.
  * port.
  */
 function isInheritableEnvKey(key: string): boolean {
-    // Our tests run unsecured on a random localhost port, and inherited auth
-    // would force every SDK request to carry Basic auth headers we don't set.
+    // Tests run unsecured on a random localhost port; inherited auth would require Basic headers that SDK requests do not set.
     if (key === "OPENCODE_SERVER_PASSWORD" || key === "OPENCODE_SERVER_USERNAME") return false;
-    // Bun's test runner sets NODE_ENV=test automatically and the plugin's logger
-    // (src/shared/logger.ts) silences all output when it is set. The subprocess
-    // should behave like a real install so the log file populates for diagnostics.
+    // Exclude `NODE_ENV` because Bun sets it to `test`, which silences the plugin logger.
+    // Exclude `NODE_ENV` so the subprocess writes diagnostic logs.
     if (key === "NODE_ENV") return false;
-    // Strip any inherited supervised-launch identity. These are still the live
-    // variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
-    // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
-    // `consumer_module_id`/`consumer_launch_nonce` on every route identity. When
-    // the test process is itself launched under a supervisor that sets them, the
-    // plugin would present THAT identity to our hermetic host, which rejects it
-    // as not matching a supervised launch nonce. A real install is never launched
-    // under a supervised identity, so clearing them matches production. Harmless
-    // for TS-mode suites, which never reach the Rust client.
+    // The harness clears `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` because an inherited supervisor identity makes the plugin send a nonce the hermetic host rejects.
+    // The hermetic host rejects an inherited supervisor identity whose nonce does not match a supervised launch.
     if (key === "SUBC_MODULE_ID" || key === "SUBC_LAUNCH_NONCE") return false;
-    // Ambient secrets are never forwarded. A CI job's GITHUB_TOKEN or NPM_TOKEN,
-    // or an exported cloud or provider credential, would otherwise be served by
-    // the unauthenticated API to anything that can reach the port. None of it is
-    // needed: the child talks to the mock provider, and a spawn that genuinely
-    // needs a credential passes it through `extraEnv`, where
-    // `assertSecretsBoundToLoopback` governs it. Dropping them here is what
-    // makes that guard total, by leaving `extraEnv` as the only channel a caller
-    // secret can arrive on. The predicate covers vendor-prefixed names as well as
-    // secret-shaped suffixes, so `OPENAI_KEY` and `GCP_SA_KEY` are dropped too;
-    // `assertSafeExtraEnv` shares that one definition.
+    // Ambient secrets are never forwarded.
+    // Ambient secrets would be exposed through the unauthenticated API to any process that reaches the port.
+    // The child uses the mock provider; credentialed spawns pass credentials through `extraEnv`.
+    // Dropping ambient secrets leaves `extraEnv` as the only caller-secret channel, so `assertSecretsBoundToLoopback` covers all caller secrets.
     if (isSensitiveEnvKey(key)) return false;
     return true;
 }
 
 /**
- * Refuse to publish an unauthenticated serve API on a non-loopback interface
- * while a caller-supplied secret reaches the child.
+ * The spawn path rejects caller-supplied secrets on non-loopback interfaces.
  *
- * Scope is exactly `extraEnv`, and that is the whole effective *environment*
- * surface rather than a narrower slice of it: the inherited `process.env` copy
- * below drops secret-shaped names outright, so ambient runner credentials never
- * reach the child on any interface, and the fake `ANTHROPIC_API_KEY` default it
- * sets is a fixture value. `extraEnv` is therefore the only channel a real
- * credential can arrive on as a variable. Checking the assembled child env
- * instead would refuse every default spawn, since that fake default is always
- * present and is shaped like a secret.
+ * The spawned environment's default `ANTHROPIC_API_KEY` is a fixture value.
+ * Checking the assembled environment would reject every default spawn because it contains the fake `ANTHROPIC_API_KEY`.
  *
- * It does not cover a credential written directly into `openCodeConfigExtra`,
- * which lands in the generated `opencode.json` rather than the environment.
- * `liveModelSpawnOptions()` deliberately keeps the value in `extraEnv` and has
- * the provider block reference it by name, so the sanctioned path stays covered;
- * a caller that inlines an `apiKey` into the provider map instead is outside this
- * guard. Extending to it needs a separate predicate, since config keys are
- * camelCase and match none of the environment-name shapes.
+ * `assertSecretsBoundToLoopback` does not inspect credentials embedded in `openCodeConfigExtra`.
+ * Matching credentials in `openCodeConfigExtra` requires a separate predicate because config keys are camelCase.
  *
- * The pairing this enforces was previously a convention: `liveModelSpawnOptions()`
- * returns the credential and `hostname: "127.0.0.1"` together, and a comment
- * asked callers to keep them together. Nothing held it. The recipe is a
- * `Pick<SpawnOptions>`, so any partial merge that forwards `extraEnv` without
- * `hostname` falls back to the all-interfaces default — and neither
- * `TestHarnessOptions` nor `RustTestHarnessOptions` carries `hostname`, so
- * routing a real key through a harness instead of raw `spawnOpencode` drops the
- * pin silently. The serve API has no authentication, so the failure publishes a
- * live credential to anything that can reach the port for the process lifetime.
+ * `Pick<SpawnOptions>` permits forwarding `extraEnv` without `hostname`.
+ * Omitting `hostname` uses the all-interfaces default.
+ * `extraEnv` secrets reach the unauthenticated serve API when `hostname` falls back to `0.0.0.0`.
  *
- * Fail closed on the name, and at the top of the spawn path: Rust mode builds a
- * Cargo fixture and starts a hermetic host subprocess before the ordinary spawn
- * work begins, so a later check would pay for both before refusing.
- * Names are matched rather than values because a fake test credential is shaped
- * like a real one, so a value check would guess per vendor and would pull the
- * secret into the diagnostic. A spawn that genuinely wants a secret-shaped
- * variable off loopback — the fake-key config assertions, which need the
- * all-interfaces default to dodge a Bun `fetch()` flake on GitHub-hosted
- * runners — says so with `allowSecretEnvOffLoopback`. Requiring the waiver to be
- * written down keeps the unsafe combination reviewable instead of reachable by
- * omission. `assertSafeExtraEnv` applies the same predicate to refuse secrets
- * from incident cases outright.
+ * `assertSecretsBoundToLoopback` runs before provisioning to avoid creating Rust resources for rejected spawns.
+ * `isSensitiveEnvKey` matches names because fake credentials cannot be distinguished from real credentials by value.
+ * `allowSecretEnvOffLoopback` permits explicitly waived sensitive environment variables off loopback.
+ * `assertSafeExtraEnv` rejects sensitive environment variables with the same predicate.
  */
 function assertSecretsBoundToLoopback(
     resolvedOpts: SpawnOptions,
@@ -533,17 +427,10 @@ async function spawnOpencodeWithProvision(
     opts: SpawnOptions,
     provision: () => Promise<RustSpawnResources>,
 ): Promise<SpawnedOpencode> {
-    // Ahead of provisioning: Rust mode builds a Cargo fixture and starts a real
-    // hermetic host subprocess, so checking later would do that work before
-    // refusing. `resolvedOpts` below only overrides the env, connection file, and
-    // project config, leaving `hostname`, `extraEnv`, and the waiver identical to
-    // `opts`, so the earlier check decides the same way.
     const hostname = opts.hostname ?? "0.0.0.0";
     assertSecretsBoundToLoopback(opts, hostname);
 
-    // MC_E2E_MODE is intentionally read only at this shared spawn seam. Rust
-    // suites that already supplied a host connection keep their existing
-    // stack; ordinary suites get one provisioned here for the rust invocation.
+    // `MC_E2E_MODE` is evaluated at this shared spawn path so Rust suites share provisioning behavior.
     const rustMode = process.env.MC_E2E_MODE === "rust";
     const resources = rustMode && !opts.userMcHostConnectionFile ? await provision() : null;
 
@@ -584,8 +471,6 @@ async function spawnOpencodeWithProvision(
               }
             : opts;
 
-        // Reuse a caller-provided env for the Rust-mode harness (connection file
-        // pre-placed, data dir shared across a serve restart); otherwise allocate.
         const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
         const port = resolvedOpts.port ?? (await pickFreePort());
 
@@ -605,26 +490,12 @@ async function spawnOpencodeWithProvision(
         childEnv.XDG_CONFIG_HOME = env.configDir;
         childEnv.XDG_DATA_HOME = env.dataDir;
         childEnv.XDG_CACHE_HOME = env.cacheDir;
-        // Ensure anthropic doesn't bail for missing env vars — we use a fake key.
         childEnv.ANTHROPIC_API_KEY = "test-key-not-real";
-        // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
-        // per-suite file so Rust-mode scenarios can assert on transform decisions).
-        // Merged last so an explicit override wins over the inherited value.
         for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
             childEnv[key] = value;
         }
 
-        // Bind to 0.0.0.0 (all interfaces) by default instead of 127.0.0.1 —
-        // empirically on GitHub-hosted runners, opencode binding to 127.0.0.1
-        // sometimes results in Bun's `fetch()` timing out even though `curl`
-        // succeeds. Binding all interfaces removes any loopback-specific
-        // stack-resolution edge case (IPv4-only AF_INET vs IPv4-mapped IPv6,
-        // AF_UNSPEC name resolution, etc.). Clients still connect to
-        // `127.0.0.1:${port}` — only the listen socket changes. Safe for the
-        // default fake-credential spawns: process is short-lived, port is
-        // random. Spawns carrying a real credential pass `hostname` to pin the
-        // unauthenticated API to loopback, which
-        // `assertSecretsBoundToLoopback` enforces above rather than trusting.
+        // Sensitive `extraEnv` requires `hostname: "127.0.0.1"` unless `allowSecretEnvOffLoopback` is true.
         child = spawn(
             "opencode",
             [

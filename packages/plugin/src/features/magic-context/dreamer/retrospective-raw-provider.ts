@@ -6,9 +6,9 @@ import { openOpenCodeDb } from "./open-opencode-db";
 
 export const RETROSPECTIVE_MAX_MESSAGES_PER_SESSION = 80;
 export const RETROSPECTIVE_MAX_MESSAGES_PER_RUN = 240;
-// Cap the number of oldest eligible sessions scanned per run. The first run
-// (watermark=0) would otherwise fan out over the project's entire session
-// history; this bounds the scan/IO regardless of how many sessions exist.
+// The `watermark=0` run scans at most 20 oldest eligible sessions to bound I/O.
+// Without the cap, `watermark=0` scans the project's entire session history.
+// The cap bounds scan I/O regardless of session count.
 export const RETROSPECTIVE_MAX_SESSIONS_PER_RUN = 20;
 
 export type RetrospectiveMessageRole = "user" | "assistant" | "tool";
@@ -29,11 +29,11 @@ export interface RetrospectiveRawMessage {
     ts: number;
 }
 
-/** A per-session since-read. `truncated` is the EXACT saturation signal (the
- *  underlying read hit `capPerSession` with more rows available) — never inferred
- *  from `messages.length`, because normalization both drops rows (assistant/empty)
- *  and adds rows (one assistant message → many tool rows), so a length-based guess
- *  can false-NEGATIVE and lose data. */
+/** `truncated` is true only when the read reaches `capPerSession` with additional rows available.
+ * The provider must not infer `truncated` from `messages.length`.
+ * Normalization can drop assistant and empty rows.
+ * Normalization can expand one assistant message into multiple tool rows.
+ * */
 export interface RetrospectiveSinceRead {
     messages: RetrospectiveRawMessage[];
     truncated: boolean;
@@ -48,28 +48,27 @@ export interface RetrospectiveRawProvider {
         sinceMs: number,
         capPerSession: number,
     ): RetrospectiveSinceRead | Promise<RetrospectiveSinceRead>;
-    /** Oldest raw message timestamp still pending per session. Providers with an
-     *  indexed store use this to order the bounded session scan by true backlog
-     *  frontier, not by coarse session updated_at. */
+    /** Indexed providers use each session's oldest pending raw-message timestamp to order bounded scans.
+     * The pending-message frontier is more precise than session `updated_at`. */
     readOldestMessageTimesSince?(
         sessionIds: readonly string[],
         sinceMs: number,
     ): Map<string, number> | Promise<Map<string, number>>;
-    /** The ~`count` most recent typed USER messages at or before `beforeMs` — the
-     *  run-boundary overlap so friction spanning two runs isn't missed. */
+    /** `readUserMessagesBefore` returns up to `count` typed user messages at or before `beforeMs`.
+     * The overlap prevents missing friction that spans two runs. */
     readUserMessagesBefore(
         sessionId: string,
         beforeMs: number,
         count: number,
     ): RetrospectiveRawMessage[] | Promise<RetrospectiveRawMessage[]>;
-    /** Release any reused resources (e.g. a pooled DB handle) after a run. */
+    /** `dispose` releases reused resources after a run. */
     dispose?(): void;
 }
 
 interface OpenCodeRetrospectiveRawProviderDeps {
     contextDb: Database;
     openOpenCodeDb?: () => Database | null;
-    /** Test-only shortcut: when provided, this connection is not closed by the provider. */
+    /** The provider does not close a test-supplied `opencodeDb`. */
     opencodeDb?: Database;
 }
 
@@ -91,10 +90,9 @@ interface OpenCodePartRow {
 
 export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvider {
     private readonly openDb: () => Database | null;
-    // One read-only opencode.db handle reused across the run's per-session reads
-    // (opened lazily on the first read, closed via dispose()). Avoids opening +
-    // closing the DB once per session, which on a large project meant many
-    // open/close cycles per scheduled run.
+    // `sharedDb` reuses one read-only OpenCode database handle for per-session reads.
+    // `sharedDb` opens on the first read and closes in `dispose`.
+    // Reusing the handle avoids one open/close cycle per session.
     private sharedDb: Database | null = null;
     private sharedDbOpened = false;
 
@@ -103,14 +101,8 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
     }
 
     listProjectSessions(projectIdentity: string): RetrospectiveProjectSession[] {
-        // ROOT sessions only. The retrospective learns from USER friction, but a
-        // subagent child (oracle / mason / historian / dreamer) has no user — its
-        // "user messages" are agent-authored task prompts whose audit/spec wording
-        // ("fail", "error", "wrong", "no padding") trips the frustration regex and
-        // whose tool fan-out trips repeated-tool-call. In a delegation-heavy period
-        // children also outnumber roots ~30:1, so a bounded session scan can be
-        // entirely consumed by them and the real user session is never scanned.
-        // is_subagent lives in session_meta (same DB); missing meta → treat as root.
+        // Only root sessions are eligible.
+        // `is_subagent` is stored in same-database `session_meta`; the provider treats missing metadata as root.
         const rows = this.deps.contextDb
             .prepare<[string], SessionProjectRow>(
                 `SELECT sp.session_id, sp.updated_at
@@ -173,7 +165,7 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
         }
     }
 
-    /** Close the reused read-only handle. Safe to call multiple times. */
+    /** `dispose` may be called multiple times without throwing. */
     dispose(): void {
         if (this.sharedDb && !this.deps.opencodeDb) {
             closeQuietly(this.sharedDb);
@@ -184,22 +176,17 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
 }
 
 export interface RetrospectiveScanWindow {
-    /** All scanned messages (user rows + tool metadata), oldest→newest, ordinals
-     *  reassigned globally. Includes the pre-watermark overlap (user-only). */
+    /** All scanned messages, including user rows and tool metadata, are ordered oldest to newest and assigned global ordinals.
+     * `messages` includes the user-only pre-watermark overlap. */
     messages: RetrospectiveRawMessage[];
-    /** The max message ts ACTUALLY scanned this run (the content watermark to
-     *  persist on completion). Never less than `watermarkMs` (overlap rows are
-     *  ≤ watermark and cannot pull it back). */
+    /** The persisted content watermark never falls below `watermarkMs`; when messages are scanned, it is their largest timestamp.
+     * */
     maxScannedTs: number;
 }
 
 /**
- * The retrospective scan window for one run: everything new since the content
- * watermark, PLUS the ~`overlapUserCount` user lines immediately before the
- * watermark for sessions that have kept new rows (so friction straddling a run
- * boundary isn't missed).
- * The since portion carries user rows + tool metadata (the deepen context); the
- * overlap portion is user-only (gate context). Ordinals are reassigned globally.
+ * A run includes messages newer than `watermarkMs` and the preceding `overlapUserCount` user messages for sessions with new rows, so friction spanning runs remains visible.
+ * The since portion contains user rows and tool metadata for deepening context; the overlap portion contains only user rows for gate context. The provider reassigns ordinals globally.
  */
 export async function readRetrospectiveScanWindow(
     provider: RetrospectiveRawProvider,
@@ -267,13 +254,11 @@ export async function readRetrospectiveScanWindow(
             );
         }
 
-        // A TRUNCATED session read hit its per-session cap with more rows
-        // available — it may hold newer (unseen) messages beyond what we got.
-        // Each batch is oldest-first, so everything ≤ its last-kept ts is seen;
-        // advancing the watermark past that ts would skip the unseen tail. Record
-        // a safe frontier (lastKept.ts − 1, so same-ms siblings re-read next run).
-        // `truncated` is the EXACT SQL-level signal — never inferred from
-        // messages.length, which normalization distorts in both directions.
+        // A truncated read reached its per-session cap and has additional rows.
+        // A truncated read can leave messages at `lastKept.ts` unread.
+        // Advancing the watermark past lastKept.ts would skip unread messages.
+        // The provider uses `lastKept.ts - 1` to reread same-millisecond messages.
+        // Only read.truncated signals SQL-level truncation.
         let saturatedFrontier = Number.POSITIVE_INFINITY;
         for (const read of sinceReads) {
             const lastKept = read.truncated ? read.messages[read.messages.length - 1] : undefined;
@@ -281,28 +266,24 @@ export async function readRetrospectiveScanWindow(
                 saturatedFrontier = Math.min(saturatedFrontier, lastKept.ts - 1);
             }
         }
-        // Cap the SINCE portion OLDEST-first (so a backlog drains from the front,
-        // one bounded chunk per run). Reading/capping newest-first dropped the
-        // oldest friction while the watermark jumped to the newest → permanent
-        // loss of the gap.
+        // The global cap keeps the oldest allSince messages so a backlog drains from the front.
+        // Newest-first capping would skip older rows when the watermark advances to the newest kept timestamp.
         const allSince = sinceReads
             .flatMap((read) => read.messages)
             .sort((a, b) => a.ts - b.ts || a.ordinal - b.ordinal);
         const keptSince = allSince.slice(0, maxMessages);
         const droppedSince = allSince.slice(maxMessages);
 
-        // Watermark = newest KEPT ts, clamped below any INCOMPLETELY-scanned
-        // frontier so the exclusive `> watermark` next-run filter can never skip
-        // pending work. Three truncation sources can split the eligible backlog:
-        //   • global maxMessages cap → never advance into the FIRST dropped row's
-        //     ts (droppedSince[0].ts − 1); if it's strictly newer than newestKept
-        //     the min() is a no-op (clean boundary).
-        //   • per-session saturation → saturatedFrontier (computed above).
-        //   • session cap → first excluded session's oldest pending message − 1
-        //     (falling back to updated_at when a provider has no indexed frontier).
-        //     The scan is oldest-frontier first, so clamping cannot starve the
-        //     excluded session on the next run.
-        // Take the tightest; never move backward.
+        // The next watermark is the newest kept timestamp, clamped below incomplete frontiers.
+        // The exclusive > watermark filter must not skip pending work.
+        // Three truncation sources can split the eligible backlog.
+        // The global maxMessages cap limits the watermark to droppedSince[0].ts - 1.
+        // This limit is a no-op when droppedSince[0].ts is newer than the newest kept timestamp.
+        // Per-session saturation limits the watermark to saturatedFrontier.
+        // The session cap limits the watermark to the first excluded session's oldest pending timestamp minus 1.
+        // When no indexed pending frontier exists, the session cap falls back to firstExcludedSession.updatedAt - 1.
+        // Oldest-frontier-first scanning prevents the watermark clamp from starving an excluded session.
+        // The watermark uses the tightest frontier and never decreases.
         let maxScannedTs = watermarkMs;
         for (const row of keptSince) {
             if (row.ts > maxScannedTs) maxScannedTs = row.ts;
@@ -336,8 +317,7 @@ export async function readRetrospectiveScanWindow(
                   )
                 : [];
 
-        // Merge kept-since + overlap (context only, bounded by sessions with kept
-        // messages × overlapUserCount), dedupe by stable identity, oldest-first.
+        // The overlap reads at most kept-session count × overlapUserCount rows.
         // Overlap rows are ≤ watermark so they never affect maxScannedTs.
         const seen = new Set<string>();
         const merged: RetrospectiveRawMessage[] = [];
@@ -361,12 +341,9 @@ function readOpenCodeMessagesSince(
     capPerSession: number,
 ): RetrospectiveSinceRead {
     const limit = Math.max(1, Math.floor(capPerSession));
-    // OLDEST-first: the cap must keep the OLDEST post-watermark messages so the
-    // watermark advances forward through a backlog one bounded chunk per run.
-    // Reading newest-first (the old behavior) dropped the oldest friction while
-    // the watermark jumped to the newest → permanent loss of the gap.
-    // Read limit+1 so a FULL limit is distinguishable from "exactly limit rows
-    // exist" — the (limit+1)th row's existence is the exact truncation signal.
+    // The cap keeps the oldest post-watermark messages so the watermark advances through a backlog in bounded chunks.
+    // Reading newest-first skips older rows when the watermark advances to the newest row.
+    // Reading limit + 1 distinguishes truncation from exactly limit rows.
     const rows = db
         .prepare<[string, number, number], OpenCodeMessageRow>(
             `SELECT id, data, time_created
@@ -408,11 +385,9 @@ function readOpenCodeOldestMessageTimesSince(
 }
 
 /**
- * The ~N most recent typed USER messages at or before `beforeMs` (the run
- * overlap). Lets the next run re-see friction that straddles the watermark
- * boundary. Over-reads a window of mixed rows (user/assistant/tool) then keeps
- * the newest `count` USER rows. Returns user-only — it feeds the gate's U-line
- * overlap, nothing else.
+ * Returns up to `want` most recent typed USER messages at or before `beforeMs`.
+ * The overlap read over-reads mixed row types before retaining USER messages.
+ * The friction gate consumes only USER-message overlap.
  */
 function readOpenCodeUserMessagesBefore(
     db: Database,
@@ -443,9 +418,7 @@ function normalizeOpenCodeRows(
 ): RetrospectiveRawMessage[] {
     if (rows.length === 0) return [];
 
-    // Restrict the part read to the capped message ids we actually kept, rather
-    // than every part in the session — a long session has far more parts than
-    // the newest-`capPerSession` messages we render.
+    // The query restricts part reads to retained message IDs; long sessions contain parts for other messages.
     const messageIds = rows.map((row) => row.id);
     const placeholders = messageIds.map(() => "?").join(", ");
     const partRows = db
@@ -489,14 +462,10 @@ function normalizeOpenCodeMessage(args: {
     ts: number;
 }): RetrospectiveRawMessage[] {
     const rows: RetrospectiveRawMessage[] = [];
-    // PRIVACY: retrospective reads OTHER sessions' raw history. Only genuine
-    // typed USER text may carry its content into the friction window — that is
-    // the friction the user expressed. Assistant text and raw tool OUTPUT can
-    // contain file contents / secrets / paths from prior sessions, so we never
-    // emit them. Tool rows carry metadata ONLY (name + error flag), which is all
-    // the friction detectors need (repeated-call / error-burst); their `text`
-    // stays empty so no raw output can reach the prompt. (Pi already returns
-    // user-only — this keeps the two providers aligned.)
+    // Retrospective reads access raw history from other sessions.
+    // Only typed USER text may enter the friction window.
+    // Assistant text and raw tool output never enter the friction window.
+    // Tool rows emit only name and error metadata.
     if (args.role === "user") {
         const text = extractGenuineUserText(args.parts);
         if (text) {

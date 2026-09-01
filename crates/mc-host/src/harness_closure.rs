@@ -1,8 +1,7 @@
-//! Immutable, content-addressed runtime closures for managed Broca harnesses.
+//! Managed Broca harnesses use immutable, content-addressed runtime closures.
 //!
-//! A closure preserves the qualified package layout under `files/`. Its
-//! canonical manifest commits every launch root, dependency edge, extension
-//! position, source identity, file mode, size, and hash.
+//! A closure preserves the qualified package layout under `files/`.
+//! The canonical manifest commits every launch root, dependency edge, extension position, source identity, file mode, size, and hash.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
@@ -32,7 +31,7 @@ const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_ISVTX: u32 = 0o1000;
 
-/// A strict schema-1 harness runtime closure.
+/// `ClosureManifest` accepts only schema-1 harness closures.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureManifest {
@@ -49,7 +48,6 @@ pub struct ClosureManifest {
     pub nodes: Vec<ClosureNode>,
 }
 
-/// One qualified file in a closure.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureNode {
@@ -63,7 +61,6 @@ pub struct ClosureNode {
     pub dependencies: Vec<ClosureDependency>,
 }
 
-/// A qualified dependency edge from one closure node to another.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureDependency {
@@ -71,7 +68,6 @@ pub struct ClosureDependency {
     pub kind: DependencyKind,
 }
 
-/// Closed file roles accepted by the runtime closure.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -96,14 +92,14 @@ pub enum DependencyKind {
     Native,
 }
 
-/// Qualified source roots paired with one exact closure manifest.
+/// `ClosureCandidate` pairs qualified source roots with one exact closure manifest.
 #[derive(Debug, Clone)]
 pub struct ClosureCandidate {
     pub manifest: ClosureManifest,
     pub source_roots: BTreeMap<String, PathBuf>,
 }
 
-/// A validated immutable closure retained by an open directory descriptor.
+/// `ValidatedHarnessClosure` retains an open directory descriptor after validation.
 pub struct ValidatedHarnessClosure {
     digest: String,
     manifest: ClosureManifest,
@@ -133,14 +129,12 @@ impl ValidatedHarnessClosure {
         &self.path
     }
 
-    /// Opens one listed node and re-proves its cheap identity invariants.
+    /// The node-opening method re-proves cheap identity invariants for one listed node.
     ///
-    /// This runs on the per-request launch path, so it re-checks regular-file
-    /// shape, owner-only single-link mode, and manifest size. Content hashes
-    /// were proven when the closure was validated; the retained descriptor and
-    /// no-follow traversal preserve the validated object against path swaps.
-    /// The returned descriptor is rewound for platforms where descriptor paths
-    /// share its file offset.
+    /// The per-request launch path re-checks the regular-file shape, owner-only single-link mode, and manifest size.
+    /// Validation proved the regular-file shape, owner-only single-link mode, and manifest size.
+    /// The retained descriptor and no-follow traversal preserve the validated object against path swaps.
+    /// The duplicated descriptor shares the original descriptor's file offset.
     pub fn resolve_node_descriptor(
         &self,
         node_path: &str,
@@ -168,16 +162,11 @@ impl ValidatedHarnessClosure {
     }
 }
 
-/// Builds the descriptor-rooted pathname naming an open descriptor's object.
 ///
-/// Linux `/proc/self/fd/N` is a magic symlink: opening it performs a fresh
-/// open of the underlying inode at offset 0, and a loader that resolves
-/// symlinks recovers the object's real pathname. macOS `/dev/fd/N` provides
-/// neither property. `open("/dev/fd/N", ...)` is equivalent to
-/// `fcntl(N, F_DUPFD, 0)`, so it shares the descriptor's file offset, and the
-/// entry is not a symlink, so a loader cannot walk back to the containing
-/// directory. Both platforms support exec through this path, which the release
-/// contract declares as `procfs_self_fd_exec` and `dev_fd_exec`.
+/// Opening Linux `/proc/self/fd/N` performs a fresh open of the underlying inode at offset 0, and symlink resolution recovers the object's real pathname.
+/// macOS `/dev/fd/N` neither opens the inode at offset 0 nor resolves to the object's real pathname.
+/// On macOS, the `/dev/fd/N` entry is not a symlink, so a loader cannot walk back to the containing directory.
+/// `/proc/self/fd/N` and `/dev/fd/N` both support exec.
 #[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
 pub fn descriptor_path(fd: RawFd) -> PathBuf {
     let root = if cfg!(target_os = "macos") {
@@ -188,8 +177,6 @@ pub fn descriptor_path(fd: RawFd) -> PathBuf {
     PathBuf::from(root).join(fd.to_string())
 }
 
-/// Whether a descriptor-rooted path behaves like the file it names for data
-/// reads and module resolution, not only for exec. See [`descriptor_path`].
 #[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
 pub const DESCRIPTOR_PATHS_ARE_FILE_LIKE: bool = !cfg!(target_os = "macos");
 
@@ -202,15 +189,12 @@ pub struct ResolvedHarnessNode {
 
 #[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
 impl ResolvedHarnessNode {
-    /// Path for an exec target: always descriptor-rooted, so the pathname
-    /// cannot be replaced between validation and exec.
+    /// The exec target path is always descriptor-rooted.
     pub fn path(&self) -> &Path {
         &self.descriptor_path
     }
 
-    /// Path for a file the child reads as data or resolves sibling modules
-    /// against. Descriptor-rooted only where that resolves like the file
-    /// itself; otherwise the closure pathname, which every platform can walk.
+    /// `module_path` is descriptor-rooted only when that path resolves like the file itself; otherwise it uses the closure pathname.
     pub fn module_path(&self) -> &Path {
         if DESCRIPTOR_PATHS_ARE_FILE_LIKE {
             &self.descriptor_path
@@ -219,7 +203,6 @@ impl ResolvedHarnessNode {
         }
     }
 
-    /// The closure-owned pathname of the verified node.
     pub fn closure_path(&self) -> &Path {
         &self.closure_path
     }
@@ -228,14 +211,13 @@ impl ResolvedHarnessNode {
         self.fd.as_raw_fd()
     }
 
-    /// The descriptor a child must inherit to use [`Self::module_path`], which
-    /// is `None` when that path is an ordinary pathname needing no descriptor.
+    /// The child must inherit this descriptor to use [`Self::module_path`].
+    /// The inherited descriptor is `None` when `module_path` uses an ordinary pathname.
     pub fn module_inherited_fd(&self) -> Option<RawFd> {
         DESCRIPTOR_PATHS_ARE_FILE_LIKE.then(|| self.fd.as_raw_fd())
     }
 }
 
-/// Closed failure from manifest validation, copying, or retained revalidation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessClosureError {
     detail: &'static str,
@@ -259,7 +241,7 @@ fn invalid(detail: &'static str) -> HarnessClosureError {
     HarnessClosureError { detail }
 }
 
-/// Returns the SHA-256 of the validated canonical manifest encoding.
+/// `digest` returns the SHA-256 of the validated canonical manifest encoding.
 pub fn manifest_digest(manifest: &ClosureManifest) -> Result<String, HarnessClosureError> {
     validate_manifest(manifest)?;
     let bytes = canonical_manifest(manifest)?;
@@ -302,8 +284,6 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Validates schema, paths, launch roots, graph edges, reachability, modes,
-/// hashes, source-root identifiers, and deterministic node ordering.
 pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosureError> {
     if manifest.schema != CLOSURE_SCHEMA {
         return Err(invalid("unsupported manifest schema"));
@@ -374,14 +354,7 @@ pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosur
         if previous_path.is_some_and(|previous| previous >= node.path.as_str()) {
             return Err(invalid("manifest nodes are not uniquely sorted by path"));
         }
-        // Every ancestor, not just the immediately preceding entry. Paths sort
-        // by code point, so any sibling whose next byte after the parent
-        // prefix sorts below `/` (`.` 0x2E, `-` 0x2D, `+` 0x2B) lands between
-        // a parent file and its nested child: `bin/app`, `bin/app.dat`,
-        // `bin/app/main.js` puts `bin/app.dat` in `previous_path`, and the
-        // collision with the regular file `bin/app` goes unseen. Every
-        // ancestor of this path sorts strictly before it, so all of them are
-        // already in `by_path`.
+        // The validator checks every ancestor because path ordering can place sibling files between a parent and child.
         let mut ancestor = node.path.as_str();
         while let Some((parent, _)) = ancestor.rsplit_once('/') {
             if by_path.contains_key(parent) {
@@ -396,12 +369,7 @@ pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosur
         let mut previous_dependency: Option<&str> = None;
         for dependency in &node.dependencies {
             validate_relative_path(&dependency.path)?;
-            // Compared on path alone. `ClosureDependency`'s derived ordering is
-            // `(path, kind)`, so two edges to the same target under different
-            // kinds — `(p, Static)` then `(p, Native)` — are strictly
-            // increasing as tuples and passed, while the qualifier's
-            // `dependencyPaths` set rejects them. The runtime must not admit a
-            // manifest the qualifier refuses.
+            // Dependency validation rejects duplicate `path` values regardless of `kind`.
             if previous_dependency.is_some_and(|previous| previous >= dependency.path.as_str()) {
                 return Err(invalid(
                     "node dependencies are not uniquely sorted by target path",
@@ -438,10 +406,7 @@ pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosur
         roots.push(path);
     }
 
-    // Mirrors the qualification-side rule set exactly: a `native` edge and a
-    // `native_addon` target imply each other, and every native addon must be
-    // named by at least one explicit `native` edge. A weaker rule on either
-    // side lets one lane bless a manifest the other refuses.
+    // Each `native` edge must target a `native_addon`, and each `native_addon` must have a `native` edge.
     let mut native_targets = BTreeSet::new();
     for node in &manifest.nodes {
         for dependency in &node.dependencies {
@@ -547,7 +512,7 @@ fn validate_hash(hash: &str) -> Result<(), HarnessClosureError> {
     Ok(())
 }
 
-/// A store whose direct children are canonical manifest digests.
+/// The store's direct children are canonical manifest digests.
 pub struct HarnessClosureStore {
     root: PathBuf,
     root_fd: OwnedFd,
@@ -562,8 +527,7 @@ impl std::fmt::Debug for HarnessClosureStore {
 }
 
 impl HarnessClosureStore {
-    /// Opens or creates an owner-only store without following a symlink in
-    /// any path component.
+    /// The operation opens or creates an owner-only store without following symlinks in any path component.
     pub fn open(root: &Path) -> Result<Self, HarnessClosureError> {
         let root_fd = open_or_create_store_path(root)?;
         Ok(Self {
@@ -572,8 +536,6 @@ impl HarnessClosureStore {
         })
     }
 
-    /// Materializes a qualified candidate or reuses an already valid closure
-    /// with the same digest.
     pub fn materialize(
         &self,
         candidate: &ClosureCandidate,
@@ -605,11 +567,7 @@ impl HarnessClosureStore {
                 fsync(&self.root_fd).map_err(|_| invalid("closure store fsync failed"))?;
             }
             Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => {
-                // Reclaim the staging tree before judging the incumbent. With
-                // the order reversed, a corrupt winner made `validate` return
-                // through `?` and stranded an entire staged harness runtime —
-                // hundreds of megabytes — in the user's data root, where
-                // nothing but the next `prune` would ever find it.
+                // Deleting `temp_name` before `validate` prevents validation errors from leaving the staging tree behind.
                 remove_tree(&self.root_fd, &temp_name)?;
                 return self.validate(&digest);
             }
@@ -621,20 +579,11 @@ impl HarnessClosureStore {
         self.validate(&digest)
     }
 
-    /// Removes every retained closure whose digest is not protected, plus
-    /// any staging directory left by an interrupted materialization. Each
-    /// closure holds an entire harness runtime (hundreds of megabytes), so
-    /// unreferenced digests otherwise accumulate without bound in the user
-    /// data root. Callers serialize pruning against materialization through
-    /// the launcher's start transaction.
     pub fn prune(&self, protected: &BTreeSet<String>) -> Result<(), HarnessClosureError> {
         for name in list_names(&self.root_fd)? {
             if protected.contains(&name) {
                 continue;
             }
-            // Only entries this store creates are eligible: digest-named
-            // closures and `.tmp-` staging directories. Anything else is
-            // foreign and left untouched.
             if !name.starts_with(TEMP_PREFIX) && validate_hash(&name).is_err() {
                 continue;
             }
@@ -643,7 +592,6 @@ impl HarnessClosureStore {
         fsync(&self.root_fd).map_err(|_| invalid("closure store fsync failed"))
     }
 
-    /// Fully revalidates one retained closure before returning it.
     pub fn validate(&self, digest: &str) -> Result<ValidatedHarnessClosure, HarnessClosureError> {
         validate_hash(digest)?;
         let dir_fd = open_owned_dir(&self.root_fd, digest)?;

@@ -11,11 +11,6 @@ import { closeDatabase, openDatabase } from "../../features/magic-context/storag
 import { parseCompartmentOutput } from "./compartment-parser";
 
 /**
- * E1.7 end-to-end round-trip: a faithful v8.7.3 historian output (the real
- * envelope: <output><compartments> + tiers + importance + episode_type +
- * <facts> 5-cat + <events> + <meta>) must survive parse → store → load →
- * render-per-tier with every v2 field intact. This is the non-live proof that
- * the produce→store→consume data path is wired coherently before E7 live
  * verification.
  */
 
@@ -36,8 +31,6 @@ afterEach(() => {
     rmSync(tempHome, { recursive: true, force: true });
 });
 
-// A realistic v8.7.3 output envelope with two compartments: one full 4-tier,
-// one with a self-closing <p4/>. Facts use the 5-cat taxonomy; one event.
 const V873_OUTPUT = `<output>
 <compartments>
 <compartment start="3" end="18" title="Wire SSE reconnect with jittered backoff" episode_type="feature" importance="72">
@@ -102,7 +95,6 @@ describe("v2 historian output round-trip (E1.7)", () => {
         expect(parsed.unprocessedFrom).toBe(25);
 
         const [c1, c2] = parsed.compartments;
-        // Full 4-tier compartment
         expect(c1.startMessage).toBe(3);
         expect(c1.endMessage).toBe(18);
         expect(c1.title).toBe("Wire SSE reconnect with jittered backoff");
@@ -112,21 +104,17 @@ describe("v2 historian output round-trip (E1.7)", () => {
         expect(c1.p2).toContain("jittered exponential backoff");
         expect(c1.p3).toContain("capped at 8 attempts");
         expect(c1.p4).toContain("src/stream/client.ts");
-        // content mirrors P1 (fullest) for v2 rows
         expect(c1.content).toBe(c1.p1);
 
-        // Self-closing <p4/> compartment
         expect(c2.importance).toBe(8);
         expect(c2.episodeType).toBe("infra");
         expect(c2.p1).toContain("Renamed the STREAM_KEY");
-        // p4 self-closed → empty string (the three valid P4 shapes)
+        // A self-closing <p4/> may parse as an empty string or be omitted.
         expect(c2.p4 === "" || c2.p4 === undefined).toBe(true);
 
-        // 5-cat facts (no 9-cat leakage)
         const cats = parsed.facts.map((f) => f.category).sort();
         expect(cats).toEqual(["ARCHITECTURE", "CONFIG_VALUES", "NAMING"]);
 
-        // events extracted (stored-not-rendered), kind-agnostic
         expect(parsed.events).toHaveLength(1);
         expect(parsed.events[0].kind).toBe("causal_incident");
         expect(parsed.events[0].atCompartment).toBe(1);
@@ -164,14 +152,10 @@ describe("v2 historian output round-trip (E1.7)", () => {
         expect(l1.p2).toContain("jittered exponential backoff");
         expect(l1.p3).toContain("capped at 8 attempts");
         expect(l1.p4).toContain("src/stream/client.ts");
-        // v2 row: not flagged legacy
         expect(l1.legacy).toBeFalsy();
 
         const l2 = loaded[1];
         expect(l2.importance).toBe(8);
         expect(l2.episodeType).toBe("infra");
     });
-    // Render-path coverage lives in inject-compartments tests + the E1.5
-    // renderer test (bodyForTier per tier); prepareCompartmentInjection wiring
-    // is exercised there. This file proves the produce→store→load contract.
 });

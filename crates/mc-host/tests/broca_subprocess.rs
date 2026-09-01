@@ -1,13 +1,13 @@
-//! U3 harness-boundary tests (plan `broca_subprocess` scope): exact adapter
-//! argv/env/stdin contracts, private file modes, closed parser
-//! vocabularies, bounded/redacted failures, and process-group reaping.
+//! These tests verify adapter harness-boundary contracts.
+//! These tests verify argv, environment, stdin, and private-file-mode contracts.
+//! These tests verify closed parser vocabularies, bounded redacted failures, and process-group reaping.
 //!
-//! `harness = false`: this binary re-executes itself as the OpenCode and Pi
-//! stand-in executables. `MC_BROCA_FIXTURE_MODE` in the environment routes
-//! `main` into a fixture behavior (argv capture, scripted NDJSON
-//! transcripts, floods, hangs, signal handling, forked grandchildren, and
-//! cleanup sabotage) instead of the test list — argv is fully owned by the
-//! adapter under test, which the default libtest harness cannot survive.
+//! `harness = false` lets this binary re-execute as OpenCode and Pi fixture executables.
+//! `MC_BROCA_FIXTURE_MODE` routes `main` to fixture behavior.
+//! Fixture mode supports argv capture and scripted NDJSON transcripts.
+//! Fixture mode also supports floods, hangs, signal handling, and forked grandchildren.
+//! Fixture mode runs instead of the test list.
+//! The adapter must own argv, so the default libtest harness cannot run these fixtures.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -279,7 +279,7 @@ fn install_fixture_controls() {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture side: the re-executed binary standing in for opencode/pi.
+// The re-executed binary stands in for the `opencode` and `pi` executables.
 // ---------------------------------------------------------------------------
 
 mod fixture {
@@ -297,9 +297,9 @@ mod fixture {
         }
     }
 
-    /// Stands in for a host that crashes after spawning: records the given
-    /// leader's group in the crash registry and exits WITHOUT running
-    /// destructors, so the record survives like it would a real crash.
+    /// The fixture simulates a host crash after spawning.
+    /// The fixture records the leader's process group in the crash registry.
+    /// The fixture exits without destructors so the registry record survives the simulated crash.
     fn record_group() {
         let leader: i32 = std::env::var(GROUP_PID_ENV)
             .ok()
@@ -336,10 +336,10 @@ mod fixture {
         fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
     }
 
-    /// Records everything the adapter handed this child: argv, environment,
-    /// stdin, cwd, pid, and copies + stat facts for the private
-    /// system-prompt and bundled-hook files (they are deleted after the
-    /// run, so the child's view is the only observable one).
+    /// The fixture records the child's argv, environment, stdin, cwd, and PID.
+    /// The fixture copies and stats the private system-prompt and bundled-hook files.
+    /// The fixture records private-file facts before cleanup deletes the files.
+    /// Only the child can observe the private files before cleanup.
     fn capture(out: &Path, stdin: &[u8]) {
         let args = argv();
         fs::write(
@@ -393,9 +393,9 @@ mod fixture {
         .expect("write stats");
     }
 
-    /// Makes the adapter's private dir undeletable: a populated directory
+    /// The fixture removes owner write permission from a populated private directory.
     /// with no owner write bit fails `remove_dir_all` (children cannot be
-    /// unlinked), which is the cleanup-failure injection the tests use.
+    /// The resulting `remove_dir_all` failure injects a cleanup failure.
     fn sabotage_cleanup(args: &[String]) {
         let Some(private_file) = flag_value(args, "--system-prompt") else {
             return;
@@ -422,7 +422,7 @@ mod fixture {
         std::process::exit(code);
     }
 
-    /// The Pi print-mode shutdown gap: the complete transcript is written
+    /// The fixture writes and flushes a complete transcript but leaves its pipes open and does not exit.
     /// and flushed, but the leader neither closes its pipes nor exits.
     fn print_transcript_then_hang() -> ! {
         if let Some(path) = std::env::var_os(TRANSCRIPT_FILE_ENV) {
@@ -434,7 +434,7 @@ mod fixture {
         hang();
     }
 
-    /// A child that answers without the question: stdin is replaced with
+    /// The fixture replaces stdin with `/dev/null` before printing a complete valid transcript.
     /// /dev/null (closing the prompt pipe's read end) before a complete,
     /// valid transcript is printed and the process exits cleanly.
     fn ignore_stdin_print_transcript() -> ! {
@@ -443,9 +443,9 @@ mod fixture {
         print_transcript_and_exit();
     }
 
-    /// Models credentials that live under the canonical provider rather
-    /// than the subscription alias: the first invocation fails with a
-    /// credential error and the retry (marker present) succeeds.
+    /// The fixture models credentials under the canonical provider rather than the subscription alias.
+    /// The first invocation fails with a credential error.
+    /// The retry succeeds only when its marker is present.
     fn alias_auth_retry(out: PathBuf) -> ! {
         let marker = out.join("alias-attempted");
         let lines: Vec<serde_json::Value> = if marker.exists() {
@@ -471,11 +471,8 @@ mod fixture {
         std::process::exit(0);
     }
 
-    /// Like `alias_auth_retry`, but the failed alias attempt LINGERS after
-    /// its error terminal instead of exiting — Pi's print-mode shutdown gap
-    /// on the failure path. Without a drain armed by that terminal the
-    /// attempt burns the whole run budget and returns a timeout, whose class
-    /// is not `AuthRequired`, so the canonical retry never happens.
+    /// Pi must drain the lingering failed invocation after its error terminal.
+    /// The failed alias invocation exhausts the run budget.
     fn alias_auth_retry_lingering(out: PathBuf) -> ! {
         let marker = out.join("alias-attempted");
         if marker.exists() {
@@ -497,25 +494,18 @@ mod fixture {
         hang();
     }
 
-    /// A self-retrying harness: the failed turn's terminal is followed
-    /// immediately by `auto_retry_start`, then a pause LONGER than the drain
-    /// grace, then the retry's own successful terminal. The drain armed by
-    /// the error must be revoked by the retry announcement, or this child is
-    /// killed mid-retry and its answer is lost.
+    /// The host must cancel the error drain on `auto_retry_start` to preserve the retry answer.
     fn error_then_retry_after_grace() -> ! {
         let pause = std::env::var(RETRY_PAUSE_MS_ENV)
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(600);
-        // Flushed ALONE, so the host really arms its drain on this terminal;
-        // batching the retry announcement into the same read would make the
-        // arming never happen and the test prove nothing.
+        // The fixture emits the error terminal before `auto_retry_start` so the host can arm its drain.
         emit_lines(&[
             serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
             serde_json::json!({"type": "agent_start"}),
             serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "provider overloaded", "content": []}}),
         ]);
-        // Inside the grace: the revocation must land before the drain fires.
         std::thread::sleep(Duration::from_millis(
             std::env::var(RETRY_ANNOUNCE_MS_ENV)
                 .ok()
@@ -523,7 +513,6 @@ mod fixture {
                 .unwrap_or(50),
         ));
         emit_lines(&[serde_json::json!({"type": "auto_retry_start"})]);
-        // Longer than the grace: only a restored budget survives this.
         std::thread::sleep(Duration::from_millis(pause));
         emit_lines(&[
             serde_json::json!({"type": "auto_retry_end"}),
@@ -556,8 +545,7 @@ mod fixture {
                 break;
             }
         }
-        // The pipe died under us: stay alive so only a group signal ends
-        // the run, which is exactly what the flood tests assert.
+        // After a write fails, `flood` remains alive until a signal terminates it.
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -576,9 +564,8 @@ mod fixture {
             .expect("fixture runtime")
     }
 
-    /// Leader that ignores SIGTERM forever: proves the SIGKILL escalation
-    /// path. Writes `term-armed` once the handler is live and `got-sigterm`
-    /// on each delivery.
+    /// The process ignores SIGTERM, forcing the parent to escalate to SIGKILL.
+    /// `term-armed` confirms that SIGTERM handling is installed; each handler invocation writes `got-sigterm`.
     fn hang_ignore_term(out: Option<PathBuf>) -> ! {
         let rt = tokio_rt();
         rt.block_on(async move {
@@ -598,10 +585,9 @@ mod fixture {
         unreachable!("ignore-term loop never returns");
     }
 
-    /// Leader that forks a grandchild into the same process group and then
-    /// hangs; group termination must take both (AE6).
+    /// Group termination must kill both processes.
     fn spawn_grandchild_then_hang(out: PathBuf) -> ! {
-        // The leader outlives the grandchild's exit so the SIGKILL sweep cannot race the grandchild's marker write. commentlint: allow(JUDGE)
+        // The leader outlives the grandchild's exit so the SIGKILL sweep cannot race the grandchild's marker write.
         let rt = tokio_rt();
         rt.block_on(async move {
             let mut term =
@@ -627,8 +613,7 @@ mod fixture {
     }
 
     fn harness() {
-        // Checked before the stdin drain below: this behavior models a child
-        // that produces its transcript without ever consuming the prompt.
+        // The transcript-only mode must bypass stdin draining because it never consumes the prompt.
         if std::env::var(BEHAVIOR_ENV).as_deref() == Ok("ignore_stdin_print_transcript") {
             ignore_stdin_print_transcript();
         }
@@ -659,8 +644,6 @@ mod fixture {
                 alias_auth_retry_lingering(out.expect("alias fixture needs an out dir"));
             }
             Ok("error_then_retry_after_grace") => error_then_retry_after_grace(),
-            // "ignore_stdin_print_transcript" is dispatched before the stdin
-            // drain at the top of this function.
             Ok("hang_ignore_term") => hang_ignore_term(out),
             Ok("grandchild_hang") => {
                 spawn_grandchild_then_hang(out.expect("grandchild fixtures need an out dir"));
@@ -669,9 +652,7 @@ mod fixture {
         }
     }
 
-    /// The grandchild: signals readiness, then converts one SIGTERM into a
-    /// marker file so tests can prove the graceful signal reached the whole
-    /// group, not only the leader.
+    /// The marker distinguishes group-wide SIGTERM delivery from delivery to only the leader.
     fn grandchild() {
         let out = PathBuf::from(std::env::var_os(OUT_ENV).expect("grandchild out dir"));
         let rt = tokio_rt();
@@ -866,9 +847,6 @@ fn fixture_closure_uncached(
     )
 }
 
-/// A daemon-startup snapshot carrying a fake provider credential (must
-/// reach the child) and host launch-identity variables (must not), plus the
-/// fixture control variables for this run.
 fn fixture_snapshot(extra: &[(&str, &str)]) -> EnvSnapshot {
     let controls = serde_json::to_string(&serde_json::json!({
         "credential": CREDENTIAL_SENTINEL,
@@ -952,9 +930,7 @@ fn pi_success_lines(text: &str, stop_reason: &str) -> Vec<serde_json::Value> {
         serde_json::json!({"type": "message_start", "message": {"role": "assistant", "content": []}}),
         serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": stop_reason, "content": [{"type": "text", "text": text}]}}),
         serde_json::json!({"type": "turn_end"}),
-        // No agent_end: Pi print mode does not emit it on stdout (that event
-        // is internal-channel only), so the fixture ends where a real
-        // transcript ends — at the terminal assistant message_end.
+        // Pi print-mode stdout ends at the terminal assistant `message_end`; it emits no `agent_end`.
     ]
 }
 
@@ -1107,9 +1083,7 @@ fn assert_process_gone(pid: u32) {
     panic!("process {pid:?} is still alive");
 }
 
-/// Zero-retry leader probe: polling would also pass when the leader is
-/// reaped after the lifecycle call returned. A recycled PID would make the
-/// probe succeed spuriously.
+/// A zero-retry probe avoids treating a reaped leader's recycled PID as alive.
 fn assert_leader_already_reaped(pid: u32) {
     let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits")) else {
         return;
@@ -1136,8 +1110,7 @@ fn wait_for_file(path: &Path, budget: Duration) {
     }
 }
 
-/// Restores the process umask on drop so a panicking test cannot poison the
-/// sequential tests that follow it.
+/// The guard restores the process umask on drop so a panicking test cannot affect later sequential tests.
 struct UmaskGuard {
     previous: rustix::fs::Mode,
 }
@@ -1165,8 +1138,7 @@ impl Drop for UmaskGuard {
     }
 }
 
-/// Un-sabotages and removes the private dir a cleanup-failure test left
-/// behind, located through the captured `--system-prompt` argv value.
+/// The cleanup-failure test leaves the private directory inaccessible; recover it through the captured `--system-prompt` value.
 fn repair_sabotaged_dir(setup: &RunSetup) {
     let args = setup.argv();
     let private_file = args
@@ -1181,7 +1153,6 @@ fn repair_sabotaged_dir(setup: &RunSetup) {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode adapter contract (R15, R17, R19; KTD7).
 // ---------------------------------------------------------------------------
 
 fn opencode_argv_env_stdin_contract() {
@@ -1341,8 +1312,7 @@ fn opencode_hostile_project_untouched() {
     let (terminal, _) = execute(&backend, request);
     assert!(matches!(terminal, BackendTerminal::Completed { .. }));
 
-    // The hostile project state is byte-identical and the child was pointed
-    // entirely elsewhere (AE11).
+    // The child uses isolated paths, leaving the hostile project state byte-identical.
     assert_eq!(
         fs::read(&hostile_config).expect("config"),
         br#"{"agent":{"evil":{}}}"#
@@ -1367,8 +1337,7 @@ fn opencode_hostile_project_untouched() {
             .map(String::as_str),
         Some("1")
     );
-    // No system prompt: the zero-tool agent config must omit the key
-    // rather than carry an empty role.
+    // Without a system prompt, the zero-tool agent config omits the `prompt` key.
     let config: serde_json::Value =
         serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("config"))
             .expect("config parses");
@@ -1378,7 +1347,6 @@ fn opencode_hostile_project_untouched() {
 }
 
 // ---------------------------------------------------------------------------
-// Pi adapter contract (R16, R17, R19; KTD8).
 // ---------------------------------------------------------------------------
 
 fn pi_argv_privacy_contract() {
@@ -1429,12 +1397,12 @@ fn pi_argv_privacy_contract() {
             "--no-approve",
         ]
     );
-    // The entrypoint and provider extensions are modules Node reads as data and
-    // resolves siblings against, so they travel as `module_path`: the
-    // descriptor path only where opening it reopens the named object and a
-    // loader can walk back to its directory, and the closure pathname
-    // otherwise. macOS `/dev/fd/N` is a `dup`, not a symlink, so it satisfies
-    // neither property and the closure tree supplies the name instead.
+    // Node resolves extension siblings relative to each extension's `module_path`.
+    // The adapter passes entrypoint and provider extensions as `module_path` values so Node resolves their siblings correctly.
+    // The loader uses a descriptor path only if reopening the path names the same object and exposes its directory.
+    // The loader uses the closure pathname when reopening a descriptor path changes the object or hides its directory.
+    // On macOS, `/dev/fd/N` is a duplicate descriptor rather than a symlink.
+    // On macOS, the loader uses the closure pathname because `/dev/fd/N` does not expose the extension's directory.
     let assert_module_arg = |arg: &str, node: &str| {
         if DESCRIPTOR_PATHS_ARE_FILE_LIKE {
             assert!(
@@ -1450,7 +1418,7 @@ fn pi_argv_privacy_contract() {
     };
     assert_module_arg(&args[0], "node_modules/pi/entry.mjs");
     assert_eq!(args[10], "--no-extensions");
-    // Descriptor extensions in order, bundled hook LAST (R16, KTD8).
+    // Descriptor extensions preserve their order; the bundled hook is last.
     let extensions: Vec<&String> = args
         .iter()
         .enumerate()
@@ -1462,8 +1430,7 @@ fn pi_argv_privacy_contract() {
     assert_module_arg(extensions[1], "node_modules/provider/1.mjs");
     assert_ne!(extensions[0], extensions[1]);
     assert!(extensions[2].ends_with(PI_BROCA_EXTENSION_FILE));
-    // Known provider alias translation happens at the argv edge (openai ->
-    // openai-codex), never in the canonical request.
+    // The argv boundary translates known provider aliases and preserves canonical requests.
     let model_index = args
         .iter()
         .position(|arg| arg == "--model")
@@ -1474,14 +1441,12 @@ fn pi_argv_privacy_contract() {
         .position(|arg| arg == "--thinking")
         .expect("thinking flag");
     assert_eq!(args[thinking_index + 1], "low");
-    // The prompt rides stdin only: no positional message may follow the
-    // final flag value.
+    // The adapter sends the prompt only on stdin and appends no positional message after the final flag value.
     assert_eq!(args.last().map(String::as_str), Some("low"));
     assert!(!args.iter().any(|arg| arg.contains(PROMPT_SENTINEL)));
     assert_eq!(setup.stdin(), PROMPT_SENTINEL.as_bytes());
 
-    // The private system prompt and materialized hook are the compiled-in
-    // bytes at owner-only modes (R17, KTD8).
+    // The private system prompt and materialized hook use compiled-in bytes and owner-only modes.
     assert_eq!(
         fs::read(setup.out.path().join("system-prompt.copy")).expect("system copy"),
         SYSTEM_SENTINEL.as_bytes()
@@ -1517,7 +1482,6 @@ fn pi_argv_privacy_contract() {
     assert!(!env.contains_key("SUBC_MODULE_ID"));
     assert!(!env.contains_key("SUBC_LAUNCH_NONCE"));
 
-    // The private dir is gone after the run.
     let private_dir = PathBuf::from(extensions[2])
         .parent()
         .expect("dir")
@@ -1541,8 +1505,6 @@ fn pi_provider_alias_mapping() {
     assert_eq!(pi_model_ref("acme", "foo"), "acme/foo");
     assert_eq!(pi_model_ref("anthropic", "claude"), "anthropic/claude");
 
-    // Prove the translated and preserved forms reach argv, not only the
-    // pure mapping helper.
     for (model, expected) in [
         ("google/gemini-x", "google-antigravity/gemini-x"),
         ("anthropic/claude", "anthropic/claude"),
@@ -1597,8 +1559,7 @@ fn pi_project_pi_resources_ignored() {
     assert!(matches!(terminal, BackendTerminal::Completed { .. }));
 
     let args = setup.argv();
-    // Discovery stays disabled and no project-owned path is loaded (AE12):
-    // the only --extension value is the bundled hook.
+    // Extension discovery stays disabled; no project-owned path is loaded.
     assert!(args.iter().any(|arg| arg == "--no-extensions"));
     assert!(args.iter().any(|arg| arg == "--no-approve"));
     let extensions: Vec<&String> = args
@@ -1612,13 +1573,11 @@ fn pi_project_pi_resources_ignored() {
     assert!(!args
         .iter()
         .any(|arg| arg.contains(&*setup.project.path().join(".pi").to_string_lossy())));
-    // Project files stay byte-identical.
     assert_eq!(
         fs::read(&hostile_settings).expect("settings"),
         br#"{"extensions":["hostile.js"]}"#
     );
     assert_eq!(fs::read(&hostile_extension).expect("ext"), b"// hostile");
-    // The Magic Context guard is set, so full plugin startup cannot run.
     assert_eq!(
         setup
             .env()
@@ -1628,21 +1587,17 @@ fn pi_project_pi_resources_ignored() {
     );
 }
 
-/// Runs the bundled hook's `before_provider_request` logic under a real
-/// JavaScript runtime (node, falling back to bun) with a fixture provider
-/// extension registered FIRST — mirroring Pi's load-ordered handler chain —
-/// and asserts the hook rewrites, preserves, and rejects as specified.
+/// The launcher selects Bun only when Node is unavailable.
+/// Pi invokes `before_provider_request` handlers in registration order.
 fn pi_broca_hook_owns_generation_controls() {
     let scratch = tempfile::tempdir().expect("scratch");
     let hook_path = scratch.path().join(PI_BROCA_EXTENSION_FILE);
     fs::write(&hook_path, PI_BROCA_EXTENSION_BYTES).expect("materialize hook");
     let driver_path = scratch.path().join("driver.mjs");
-    // The apply() chain below models the docs-specified handler semantics (returned value replaces the payload, undefined keeps it) from packages/pi-plugin/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md#before_provider_request. commentlint: allow(JUDGE)
     let driver = format!(
         r#"import hook from "file://{hook}";
 const handlers = [];
 const pi = {{ on(name, fn) {{ if (name === "before_provider_request") handlers.push(fn); }} }};
-// Fixture provider extension: registered first, rewrites the payload first.
 handlers.push((event) => ({{ ...event.payload, temperature: 9, providerTouched: true }}));
 hook(pi);
 function apply(payload) {{
@@ -1681,8 +1636,6 @@ try {{ apply({{ foo: "bar" }}); console.log("ACCEPTED"); }} catch {{ console.log
     let stdout = String::from_utf8(output.stdout).expect("driver output");
     let mut lines = stdout.lines();
 
-    // OpenAI-style shape: the hook replaces the provider extension's values
-    // and preserves every unrelated field.
     let openai: serde_json::Value =
         serde_json::from_str(lines.next().expect("openai line")).expect("openai json");
     assert_eq!(openai["max_tokens"], 32_000);
@@ -1691,8 +1644,6 @@ try {{ apply({{ foo: "bar" }}); console.log("ACCEPTED"); }} catch {{ console.log
     assert_eq!(openai["model"], "m");
     assert_eq!(openai["providerTouched"], true);
 
-    // Gemini-style shape: replacement happens inside generationConfig,
-    // sibling config fields survive.
     let gemini: serde_json::Value =
         serde_json::from_str(lines.next().expect("gemini line")).expect("gemini json");
     assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 32_000);
@@ -1700,20 +1651,18 @@ try {{ apply({{ foo: "bar" }}); console.log("ACCEPTED"); }} catch {{ console.log
     assert_eq!(gemini["generationConfig"]["topK"], 3);
     assert_eq!(gemini["keep"], "g");
 
-    // Ambiguous shape: every recognized spelling is capped, so no earlier
-    // extension's larger limit survives in the field the provider honors.
+    // The hook caps every recognized spelling, so an earlier extension's larger limit cannot survive in the provider-honored field.
     let mixed: serde_json::Value =
         serde_json::from_str(lines.next().expect("mixed line")).expect("mixed json");
     assert_eq!(mixed["max_completion_tokens"], 32_000);
     assert_eq!(mixed["max_tokens"], 32_000);
     assert_eq!(mixed["temperature"], 0.25);
 
-    // Unknown shape: rejected, never silently uncapped.
+    // The hook rejects unknown shapes instead of silently leaving them uncapped.
     assert_eq!(lines.next(), Some("REJECTED"));
 }
 
 // ---------------------------------------------------------------------------
-// Parser vocabulary and canonical metadata (R18).
 // ---------------------------------------------------------------------------
 
 fn success_transcripts_align_across_harnesses() {
@@ -1760,7 +1709,6 @@ fn success_transcripts_align_across_harnesses() {
         ),
     );
 
-    // Identical canonical text and completion metadata from both harness
     // wire families.
     assert_eq!(oc_terminal, pi_terminal);
     assert_eq!(&oc_events[1..], &pi_events[1..]);
@@ -1824,7 +1772,7 @@ fn run_pi_transcript(lines: &[serde_json::Value]) -> (BackendTerminal, Vec<Backe
 }
 
 fn provider_error_metadata_preserved() {
-    // Transient rate limit with an explicit retry delay (AE13).
+    // A transient rate limit includes an explicit retry delay.
     let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
         "type": "error",
         "timestamp": 1,
@@ -1835,8 +1783,8 @@ fn provider_error_metadata_preserved() {
     assert_eq!(error.class, ErrorClass::Transient);
     assert_eq!(error.retry_after_secs, Some(120));
     assert_eq!(error.provider_code.as_deref(), Some("APIError"));
-    // Provider text steers classification but never rides the wire (R19):
-    // the emitted message is host-authored and structural.
+    // Provider text steers classification but never rides the wire.
+    // The adapter emits a host-authored structural message instead of provider text.
     assert!(
         !error.message.contains("Rate limit exceeded"),
         "provider text must not be forwarded: {:?}",
@@ -1844,14 +1792,14 @@ fn provider_error_metadata_preserved() {
     );
     assert!(error.message.contains("status 429"));
 
-    // Authentication failure by status code.
+    // The parser classifies the response status as an authentication failure.
     let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
         "type": "error",
         "error": {"name": "APIError", "data": {"message": "Invalid credentials", "statusCode": 401}},
     })]);
     assert_eq!(failed(&terminal).class, ErrorClass::AuthRequired);
 
-    // Permanent provider rejection.
+    // The parser classifies the response as a permanent provider rejection.
     let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
         "type": "error",
         "error": {"name": "BadRequestError", "data": {"message": "model does not exist"}},
@@ -1860,8 +1808,7 @@ fn provider_error_metadata_preserved() {
     assert_eq!(error.class, ErrorClass::Permanent);
     assert_eq!(error.retry_after_secs, None);
 
-    // A length-capped completion is a completion, not an error (AE13); the
-    // exact length-class spelling survives.
+    // The parser treats a `length` finish reason as `FinishReason::Length`, not an error.
     let (terminal, events) = run_opencode_transcript(&[
         serde_json::json!({"type": "text", "part": {"type": "text", "text": "truncated"}}),
         serde_json::json!({"type": "step_finish", "part": {"type": "step-finish", "reason": "length"}}),
@@ -1874,8 +1821,7 @@ fn provider_error_metadata_preserved() {
     );
     assert_eq!(events.len(), 2);
 
-    // Pi length cap: the unit carries the length-class step reason the
-    // producer's `length_capped` detection reads.
+    // The Pi unit carries the length-class step reason read by `length_capped` detection.
     let (terminal, events) = run_pi_transcript(&pi_success_lines("truncated", "length"));
     assert_eq!(
         terminal,
@@ -1896,13 +1842,13 @@ fn provider_error_metadata_preserved() {
         ]
     );
 
-    // Pi context overflow classified from the provider message.
+    // The classifier identifies Pi context overflow from the provider message.
     let (terminal, _) = run_pi_transcript(&pi_error_lines(
         "prompt is too long: maximum context exceeded",
     ));
     assert_eq!(failed(&terminal).class, ErrorClass::ContextOverflow);
 
-    // Pi transient failure with parsed retry delay.
+    // The parser classifies the Pi failure as transient and extracts its retry delay.
     let (terminal, _) = run_pi_transcript(&pi_error_lines(
         "provider overloaded, retry after 45 seconds",
     ));
@@ -1910,15 +1856,10 @@ fn provider_error_metadata_preserved() {
     assert_eq!(error.class, ErrorClass::Transient);
     assert_eq!(error.retry_after_secs, Some(45));
 
-    // Pi auth failure classified from the provider message.
     let (terminal, _) = run_pi_transcript(&pi_error_lines("No API key found for openai-codex"));
     assert_eq!(failed(&terminal).class, ErrorClass::AuthRequired);
 
-    // A numeric status code only counts as a standalone number: digits
-    // inside an unrelated identifier must not classify the failure, because
-    // a false AuthRequired is fatal for every remaining model of that
-    // provider on the historian path and burns a canonical-provider retry
-    // on the Pi path.
+    // A numeric status code must appear as a standalone number; digits inside identifiers do not classify the failure.
     let (terminal, _) = run_pi_transcript(&pi_error_lines(
         "upstream refused the call (request id req-40123, trace 5031)",
     ));
@@ -1933,8 +1874,7 @@ fn provider_error_metadata_preserved() {
     assert_eq!(failed(&terminal).class, ErrorClass::Transient);
 }
 
-/// Provider-supplied retry delays clamp to 3600 seconds: the text and the
-/// `retryAfter` field are untrusted inputs.
+/// Provider-supplied retry delays from text and `retryAfter` clamp to 3600 seconds.
 fn hostile_retry_delays_are_clamped() {
     let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
         "type": "error",
@@ -1953,26 +1893,21 @@ fn hostile_retry_delays_are_clamped() {
     ));
     assert_eq!(failed(&terminal).retry_after_secs, Some(3600));
 
-    // A sane delay under the ceiling passes through unclamped.
     let (terminal, _) = run_pi_transcript(&pi_error_lines("overloaded, retry after 45 seconds"));
     assert_eq!(failed(&terminal).retry_after_secs, Some(45));
 
-    // A number that merely follows the word "retry" without an explicit
-    // delay form is a request id or status reference, never a durable
+    // A number following `retry` without an explicit delay form does not create a retry delay.
     // backoff.
     let (terminal, _) = run_pi_transcript(&pi_error_lines(
         "temporarily overloaded, please retry. request id 8412345",
     ));
     assert_eq!(failed(&terminal).retry_after_secs, None);
 
-    // Units convert: minutes scale to seconds.
     let (terminal, _) = run_pi_transcript(&pi_error_lines("rate limited, retry in 2 minutes"));
     assert_eq!(failed(&terminal).retry_after_secs, Some(120));
 }
 
-/// A contract-valid send can carry a `system` prompt whose inline OpenCode
-/// config exceeds Linux's per-env-string MAX_ARG_STRLEN; the adapter must
-/// reject it with a structured message before any child exists.
+/// The adapter rejects a `system` prompt whose inline OpenCode config exceeds Linux's per-environment-string `MAX_ARG_STRLEN` before spawning a child.
 fn opencode_oversized_inline_config_rejected_before_spawn() {
     let setup = RunSetup::new();
     let transcript = write_transcript(
@@ -2036,7 +1971,7 @@ fn malformed_outputs_one_bounded_failure() {
         assert!(error.message.len() < 300, "diagnostic is unbounded");
     };
 
-    // Malformed JSON after valid text (AE10).
+    // The adapter rejects malformed JSON after valid text.
     let setup = RunSetup::new();
     let path = setup.scratch.path().join("malformed.ndjson");
     fs::write(
@@ -2065,11 +2000,11 @@ fn malformed_outputs_one_bounded_failure() {
     );
     assert_bounded(&terminal, "non-utf8 output at line 1");
 
-    // Early EOF: a clean exit with no terminal event.
+    // The adapter rejects a clean exit with no terminal event.
     let (terminal, _) = run_pi_transcript(&pi_success_lines("hi", "stop")[..4]);
     assert_bounded(&terminal, "without a terminal event");
 
-    // Nonzero exit beats even a complete transcript.
+    // A nonzero exit rejects even a complete transcript.
     let setup = RunSetup::new();
     let transcript = write_transcript(
         setup.scratch.path(),
@@ -2089,7 +2024,7 @@ fn malformed_outputs_one_bounded_failure() {
     );
     assert_bounded(&terminal, "exited with status 3");
 
-    // Contradictory terminals: success then error.
+    // The adapter rejects a transcript that emits success followed by error.
     let mut lines = opencode_success_lines("ok");
     lines.push(serde_json::json!({
         "type": "error",
@@ -2098,7 +2033,7 @@ fn malformed_outputs_one_bounded_failure() {
     let (terminal, _) = run_opencode_transcript(&lines);
     assert_bounded(&terminal, "contradictory terminal");
 
-    // Content after the terminal: a settled run cannot grow its answer.
+    // The adapter rejects content after the terminal event.
     let mut lines = opencode_success_lines("ok");
     lines.push(serde_json::json!({
         "type": "text",
@@ -2109,7 +2044,7 @@ fn malformed_outputs_one_bounded_failure() {
     let (terminal, _) = run_opencode_transcript(&lines);
     assert_bounded(&terminal, "text event after the terminal at line 4");
 
-    // A tool invocation in a zero-tool run is a contract failure, not
+    // The adapter rejects tool invocations when the run declares zero tools.
     // lifecycle metadata.
     let mut lines = opencode_success_lines("ok");
     lines.insert(
@@ -2124,12 +2059,11 @@ fn malformed_outputs_one_bounded_failure() {
     let (terminal, _) = run_opencode_transcript(&lines);
     assert_bounded(&terminal, "tool_use event in a tool-less run at line 2");
 
-    // Unknown event types fail closed (risk table: JSON vocabulary drift).
+    // The adapter rejects unknown event types to prevent accepting JSON vocabulary drift.
     let (terminal, _) = run_pi_transcript(&[serde_json::json!({"type": "wire_novelty"})]);
     assert_bounded(&terminal, "unknown event type at line 1");
 
-    // Pi tool activity in a zero-tool run is a contract failure, matching
-    // the OpenCode tool_use rule.
+    // Pi tool activity in a zero-tool run is a contract failure, matching the OpenCode `tool_use` rule.
     let mut lines = pi_success_lines("tooled", "stop");
     lines.insert(
         2,
@@ -2178,13 +2112,13 @@ fn output_flood_stopped_and_redacted() {
         );
         assert!(!error.message.contains(FLOOD_SECRET));
         assert!(!error.message.contains(PROMPT_SENTINEL));
-        // The leader is reaped before execute resolves.
+        // The adapter reaps the leader before `execute` resolves.
         assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Process-group lifecycle (R10, R17; KTD6).
+// Process-group lifecycle.
 // ---------------------------------------------------------------------------
 
 fn timeout_reaps_leader_and_grandchild() {
@@ -2214,9 +2148,6 @@ fn timeout_reaps_leader_and_grandchild() {
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
 }
 
-/// A Pi child that finishes its transcript but never closes its pipes (the
-/// print-mode shutdown gap) ends as a drain kill carrying the completed
-/// answer, not a run-timeout failure that discards it.
 fn pi_lingering_child_drained_after_terminal() {
     let setup = RunSetup::new();
     let transcript = write_transcript(
@@ -2261,9 +2192,7 @@ fn pi_lingering_child_drained_after_terminal() {
     assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
 }
 
-/// Pi's documented auxiliary print-mode events (thinking, retry, queue,
-/// tool, compaction, and session-state notifications) ride alongside the
-/// decisive transcript on ordinary runs and must not fail it.
+/// Pi auxiliary print-mode events (thinking, retry, queue, tool, compaction, and session-state notifications) must not fail ordinary runs.
 fn pi_auxiliary_events_ignored() {
     let mut lines = pi_success_lines("aux answer", "stop");
     lines.insert(
@@ -2303,10 +2232,6 @@ fn pi_auxiliary_events_ignored() {
     ));
 }
 
-/// An older Pi delivers its final assistant state only in `agent_end`'s
-/// authoritative messages array; the parser accepts that compatibility
-/// shape, and when both spellings appear the `agent_end` decision replaces
-/// the provisional `message_end` one.
 fn pi_agent_end_compatibility_terminal() {
     let (terminal, events) = run_pi_transcript(&[
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
@@ -2324,7 +2249,7 @@ fn pi_agent_end_compatibility_terminal() {
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "compat answer")
     ));
 
-    // Both spellings, differing final state: agent_end is authoritative.
+    // `agent_end` is authoritative when both `agent_end` and `agent-end` occur.
     let mut lines = pi_success_lines("provisional answer", "stop");
     lines.push(serde_json::json!({"type": "agent_end", "messages": [
         {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "authoritative answer"}]},
@@ -2342,9 +2267,7 @@ fn pi_agent_end_compatibility_terminal() {
     ));
 }
 
-/// Co-loaded provider extensions write plain-text banners to Pi's stdout;
-/// lines that do not claim to be JSON are noise, while a line that starts
-/// with `{` but fails to parse still fails the run closed.
+/// Co-loaded provider extensions write plain-text banners to Pi's stdout.
 fn pi_extension_stdout_noise_skipped() {
     let setup = RunSetup::new();
     let mut bytes = Vec::new();
@@ -2374,7 +2297,7 @@ fn pi_extension_stdout_noise_skipped() {
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "noisy answer")
     ));
 
-    // A malformed line that claims to be a JSON event is corruption, not
+    // A malformed line beginning with `{` is corruption, not noise.
     // noise.
     let setup = RunSetup::new();
     let mut bytes = Vec::new();
@@ -2403,10 +2326,7 @@ fn pi_extension_stdout_noise_skipped() {
     );
 }
 
-/// A credential failure under the subscription alias retries the canonical
-/// provider once (`subagent-runner.ts`'s alias-then-canonical order), so a
-/// user authenticated through the direct API-key provider still completes
-/// Rust-mode historian and classify runs.
+/// A credential failure under the subscription alias retries the canonical provider once.
 fn pi_alias_credential_failure_retries_canonical_provider() {
     let setup = RunSetup::new();
     let backend = pi_backend(
@@ -2426,20 +2346,15 @@ fn pi_alias_credential_failure_retries_canonical_provider() {
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "canonical answer")
     ));
-    // The retry's argv capture carries the canonical reference, not the
-    // alias the first attempt used.
+    // The retry's argv contains the canonical reference, not the alias.
     let args = setup.argv();
     assert!(args.iter().any(|arg| arg == "openai/m"), "{args:?}");
     assert!(!args.iter().any(|arg| arg == "openai-codex/m"), "{args:?}");
     assert!(setup.out.path().join("alias-attempted").exists());
 }
 
-/// The credential fallback must survive Pi's shutdown gap on the FAILURE
-/// path. An aliased attempt that reports "no API key" and then lingers has
-/// produced a complete transcript; if the run instead burned its whole
-/// budget and came back as a timeout, the classification would no longer be
-/// `AuthRequired` and the canonical retry — the entire point of the alias
-/// order — would never fire.
+/// `AuthRequired` received during Pi's shutdown gap must trigger the canonical retry.
+/// `AuthRequired` must be preserved so the canonical retry runs.
 fn pi_lingering_credential_failure_still_retries_canonical_provider() {
     let setup = RunSetup::new();
     let limits = SubprocessLimits {
@@ -2476,11 +2391,10 @@ fn pi_lingering_credential_failure_still_retries_canonical_provider() {
     assert!(setup.out.path().join("alias-attempted").exists());
 }
 
-/// A harness that retries a failed turn ITSELF keeps its full budget. The
-/// error terminal arms the drain (so a FINAL error does not idle to the run
-/// timeout), but the retry announcement revokes that arming, so a retry
-/// slower than the two-second grace is not killed mid-flight — which the
-/// runner's one-shot latch cannot do.
+/// A harness that retries a failed turn keeps its full run budget.
+/// An error terminal arms the drain so FINAL errors do not wait for `run_timeout`.
+/// A retry announcement revokes the drain arming.
+/// A retry that exceeds `drain_grace` is not killed mid-flight.
 fn pi_self_retry_revokes_the_drain_arming() {
     let setup = RunSetup::new();
     let grace = Duration::from_millis(200);
@@ -2526,11 +2440,9 @@ fn pi_self_retry_revokes_the_drain_arming() {
     );
 }
 
-/// A completion that still carries a `toolCall` block is an intermediate
-/// turn shape, never this tool-less run's terminal: text beside an
+/// A completion containing `toolCall` is intermediate, not terminal for this tool-less run.
 /// unexecuted tool request must not be published as the answer.
 fn pi_tool_requesting_stop_is_not_terminal() {
-    // Followed by a real terminal: the run completes with the final text.
     let mut lines = vec![
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
         serde_json::json!({"type": "agent_start"}),
@@ -2553,7 +2465,7 @@ fn pi_tool_requesting_stop_is_not_terminal() {
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "let me check")
     ));
 
-    // Alone: no terminal ever arrives, so the run fails closed.
+    // A completion containing only an unexecuted `toolCall` has no terminal answer and fails closed.
     let (terminal, _) = run_pi_transcript(&[
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
         serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [
@@ -2568,9 +2480,7 @@ fn pi_tool_requesting_stop_is_not_terminal() {
     );
 }
 
-/// A child that emits a valid transcript without consuming the prompt (its
-/// stdin closes before delivery completes) answered a question it never
-/// received; the run must fail rather than accept the transcript.
+/// A process that answers after stdin closes before prompt delivery fails rather than accepting the transcript.
 fn undelivered_prompt_rejects_clean_transcript() {
     let setup = RunSetup::new();
     let transcript = write_transcript(
@@ -2587,8 +2497,7 @@ fn undelivered_prompt_rejects_clean_transcript() {
         Vec::new(),
         None,
     );
-    // The prompt must exceed the pipe buffer so an unread prompt cannot be
-    // absorbed by the kernel and counted as delivered.
+    // The prompt must exceed the pipe buffer so the kernel cannot absorb an unread prompt and count it as delivered.
     let mut request = request(setup.project.path(), Harness::Pi, "anthropic/m", None);
     request.prompt = "p".repeat(1024 * 1024);
     let (terminal, _) = execute(&backend, request);
@@ -2614,8 +2523,7 @@ fn cancel_reaps_group_with_sigterm_first() {
     let runtime = rt();
     let (sink, _store) = collecting_sink();
     let terminal = runtime.block_on(async {
-        // Spawning `backend.execute` starts the child before this task
-        // waits for `grandchild-ready`.
+        // Waiting for `grandchild-ready` before starting `backend.execute` can deadlock.
         let run = tokio::spawn(backend.execute(request, sink, cancel.clone()));
         let waiter = {
             let ready = setup.out.path().join("grandchild-ready");
@@ -2628,8 +2536,7 @@ fn cancel_reaps_group_with_sigterm_first() {
     assert!(matches!(terminal, BackendTerminal::Failed(_)));
     assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
-    // The grandchild observed SIGTERM: the graceful signal went to the
-    // whole group, not only the direct child (AE6).
+    // The grandchild observed SIGTERM, so the graceful signal reached the whole group rather than only the direct child.
     wait_for_file(
         &setup.out.path().join("grandchild-sigterm"),
         Duration::from_secs(5),
@@ -2713,8 +2620,7 @@ fn supervisor_delete_reaps_group() {
         tokio::task::spawn_blocking(move || wait_for_file(&ready, Duration::from_secs(10)))
             .await
             .expect("grandchild readiness");
-        // Delete resolves only after the backend future finished, which the
-        // runner ties to a reaped leader (R10).
+        // Delete resolves only after the backend future finishes, which requires the leader to be reaped.
         supervisor.delete(&key).await.expect("delete succeeds");
     });
     assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
@@ -2750,7 +2656,7 @@ fn supervisor_shutdown_reaps_group() {
 }
 
 // ---------------------------------------------------------------------------
-// Private files, umask independence, and cleanup observability (R17, R19).
+// The store creates private files independently of the process umask and exposes cleanup failures.
 // ---------------------------------------------------------------------------
 
 fn private_paths_forced_modes_under_umask() {
@@ -2800,7 +2706,7 @@ fn private_dir_contract() {
     assert!(file_meta.file_type().is_file());
     assert!(!file_meta.file_type().is_symlink());
     assert_eq!(file_meta.permissions().mode() & 0o7777, 0o600);
-    // A second write to the same name is refused: files are fresh-only.
+    // A second write to the same name is refused.
     assert!(dir.write_private("secret.txt", b"again").is_err());
 
     let path = dir.path().to_path_buf();
@@ -2809,8 +2715,7 @@ fn private_dir_contract() {
 }
 
 fn cleanup_failure_never_unqualified_success() {
-    // Success path: the run completed, cleanup failed — the result must not
-    // be an unqualified success and must name both facts (R19).
+    // If cleanup fails after a run completes, the result reports both the completed run and the cleanup failure.
     let setup = RunSetup::new();
     let transcript = write_transcript(
         setup.scratch.path(),
@@ -2849,8 +2754,7 @@ fn cleanup_failure_never_unqualified_success() {
     assert!(error.message.len() < 300);
     repair_sabotaged_dir(&setup);
 
-    // Failure path: the primary classified error survives with the cleanup
-    // evidence appended, not masked (risk table: cleanup masking).
+    // The primary classified error remains the result, with cleanup evidence appended.
     let setup = RunSetup::new();
     let transcript = write_transcript(
         setup.scratch.path(),
@@ -2875,8 +2779,7 @@ fn cleanup_failure_never_unqualified_success() {
     let (terminal, _) = execute(&backend, request_failure);
     let error = failed(&terminal);
     assert_eq!(error.class, ErrorClass::AuthRequired);
-    // The provider text steered classification (AuthRequired above) but is
-    // redacted from the wire message (R19).
+    // Provider text can classify an error as `AuthRequired` but is redacted from the wire message.
     assert!(!error.message.contains("No API key found"));
     assert!(error.message.contains("stopped with reason \"error\""));
     assert!(
@@ -2901,16 +2804,8 @@ fn env_snapshot_strips_launch_identity() {
     assert_eq!(names, vec!["KEEP_ME"]);
 }
 
-/// The snapshot ceiling bounds every spawn representation, not just the
-/// character data: each variable also costs `OsString` headers, heap
-/// allocations, a `Command` map node, and an exec-array pointer per entry,
-/// so admission charges a per-entry overhead. An environment of many short
-/// variables must fail even though its raw string bytes sit far under the
-/// ceiling — string bytes alone would admit ~500k three-byte entries whose
-/// container costs multiply across the 25 declared representations.
+/// The environment snapshot limit includes per-entry allocation and container overhead, so many short variables can exceed it despite low string-byte usage.
 fn env_snapshot_admission_charges_per_entry_overhead() {
-    // ~16k tiny variables: ~176 KB of string bytes (well under the 1.5 MiB
-    // ceiling) but ~2.2 MiB once each entry's overhead is charged.
     let flood: Vec<(OsString, OsString)> = (0..16_384)
         .map(|n| (os(&format!("V{n:05}")), os("x")))
         .collect();
@@ -2928,8 +2823,6 @@ fn env_snapshot_admission_charges_per_entry_overhead() {
         "the rejection names the limit: {error}"
     );
 
-    // An ordinary environment is unaffected: a hundred realistic variables
-    // charge ~20 KB and admit cleanly.
     let ordinary: Vec<(OsString, OsString)> = (0..100)
         .map(|n| (os(&format!("ORDINARY_VAR_{n}")), os("some value")))
         .collect();
@@ -2992,13 +2885,10 @@ fn provider_rows_exclude_ambient_credentials_and_enforce_caps() {
     );
 }
 
-/// A harness line's JSON node count is bounded before any DOM is built: an
-/// array of tiny values amplifies far past its byte length, which the
-/// capture budget does not model. Prose commas inside strings are content,
-/// not structure, and must never trip the bound.
+/// The parser enforces the JSON node limit before building a DOM, so many small values cannot bypass the limit.
+/// The capture budget does not limit JSON node count.
+/// Commas inside JSON strings do not count toward the structural-node bound.
 fn oversized_json_structure_rejected_without_capping_prose() {
-    // Node flood: ~40k array elements in an otherwise-ignored lifecycle
-    // event, well past the 32_768 bound but only ~80 KB of bytes.
     let flood = format!(
         "{{\"type\":\"session\",\"id\":\"s\",\"pad\":[{}]}}",
         vec!["0"; 40_000].join(",")
@@ -3024,8 +2914,7 @@ fn oversized_json_structure_rejected_without_capping_prose() {
     );
     assert!(error.message.len() < 300, "diagnostic is unbounded");
 
-    // The same comma count as prose inside an assistant message: content,
-    // not structure — this must still parse and deliver its text.
+    // Commas inside assistant text must not prevent parsing or publication.
     let prose = "a,".repeat(40_000);
     let (terminal, events) = run_pi_transcript(&pi_success_lines(&prose, "stop"));
     assert!(
@@ -3037,20 +2926,15 @@ fn oversized_json_structure_rejected_without_capping_prose() {
         .any(|event| matches!(event, BackendEvent::AssistantText { text, .. } if text == &prose)));
 }
 
-/// Pi's automatic retry emits a terminal `message_end` for the failed
-/// attempt and another for the retry, so `message_end` decisions are
-/// provisional: the last one wins and only its text is published. Treating
-/// them as committed terminals rejected a legitimately retried run as a
+/// A later retry `message_end` supersedes the failed attempt's terminal decision and text.
 /// contradictory transcript.
 fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
     let mut lines = vec![
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
         serde_json::json!({"type": "agent_start"}),
-        // Failed attempt: a terminal error message_end...
         serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "provider overloaded", "content": [{"type": "text", "text": "PARTIAL-DISCARDED"}]}}),
         serde_json::json!({"type": "auto_retry_start"}),
         serde_json::json!({"type": "auto_retry_end"}),
-        // ...then the retry's own terminal.
         serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "retried answer"}]}}),
     ];
     let (terminal, events) = run_pi_transcript(&lines);
@@ -3071,7 +2955,7 @@ fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
         "only the winning attempt's text may be published"
     );
 
-    // The authoritative agent_end still overrides the last provisional one.
+    // The authoritative `agent_end` overrides the last provisional `message_end`.
     lines.push(serde_json::json!({"type": "agent_end", "messages": [{"role": "assistant", "stopReason": "error", "errorMessage": "final state failed", "content": []}]}));
     let (terminal, _) = run_pi_transcript(&lines);
     assert!(
@@ -3080,12 +2964,8 @@ fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
     );
 }
 
-/// A retry announcement supersedes the failed attempt's provisional
-/// terminal even when the retry's own terminal never arrives: the
-/// transcript must fail as one missing its terminal, never resurrect the
-/// superseded failure — an obsolete authentication failure would drive the
-/// canonical-provider fallback, and other stale classes would advance the
-/// model chain for a run whose real outcome was never observed.
+/// An `auto_retry_start` supersedes a failed `message_end`; without a later terminal, the transcript fails as unterminated.
+/// Resurrecting a superseded authentication failure would incorrectly trigger canonical-provider fallback.
 fn pi_retry_announcement_without_a_new_terminal_fails_as_missing() {
     for continuation in ["auto_retry_start", "message_start"] {
         let (terminal, events) = run_pi_transcript(&[
@@ -3109,22 +2989,16 @@ fn pi_retry_announcement_without_a_new_terminal_fails_as_missing() {
     }
 }
 
-/// A run's private directory holds its hidden prompt and transcript, and a
-/// crash skips both `PrivateDir::cleanup` and its `Drop`. Startup removes
-/// directories whose recorded owner is provably gone, and never a live
+/// A crash bypasses `PrivateDir::cleanup` and `Drop`; startup removes only directories whose recorded owner is provably gone.
 /// host's.
 fn crash_orphaned_run_dirs_swept_only_for_dead_owners() {
     use mc_host::broca::subprocess::group_registry::{private_run_root, sweep_orphaned_run_dirs};
 
-    // A live owner's directory: this process is alive during the sweep.
+    // The sweep must retain a directory owned by the running process.
     let mine = PrivateDir::create("mc-broca-test-live").expect("create live");
     let mine_path = mine.path().to_path_buf();
 
-    // A dead owner's directory: pid 1's start time can never match a
-    // process this test could own, so it stands in for a crashed host.
     let root = private_run_root().expect("run root");
-    // A foreign boot tag: unconditionally stale, and it also proves the
-    // cross-boot pid/start-reuse case cannot preserve the directory.
     let orphan = root.join("mc-broca-test-orphan-ffffffffffffffff-2-1-000000000000dead");
     fs::create_dir(&orphan).expect("create orphan dir");
     fs::write(orphan.join("prompt.txt"), b"SENSITIVE-PROMPT").expect("seed orphan");
@@ -3145,9 +3019,7 @@ fn merge_cleanup_contract() {
     let completed = BackendTerminal::Completed {
         finish_reason: FinishReason::Completed,
     };
-    // Clean cleanup: the terminal passes through untouched.
     assert_eq!(merge_cleanup(completed.clone(), Ok(())), completed);
-    // Failed cleanup after success: no unqualified success survives.
     let failure = CleanupFailure {
         kind: std::io::ErrorKind::PermissionDenied,
     };
@@ -3158,10 +3030,7 @@ fn merge_cleanup_contract() {
     assert!(error.message.contains("cleanup failed"));
 }
 
-/// The crash sweep kills a recorded group only when its recording host is
-/// dead and its leader is provably the recorded process; records owned by
-/// a live host survive untouched, so concurrent hosts never sweep each
-/// other's live runs.
+/// The crash sweep kills a recorded group only when its host is dead and its leader matches the recorded process; it never sweeps a group recorded by a live host.
 fn group_registry_sweep_kills_only_dead_owner_groups() {
     use std::os::unix::process::CommandExt;
 
@@ -3186,8 +3055,7 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
         assert_eq!(status.signal(), Some(9), "{what} must die by SIGKILL");
     }
 
-    // Orphan: recorded by a stand-in host (the record_group fixture) that
-    // exits without cleanup, exactly like a crashed host.
+    // The fixture exits without cleanup, emulating a crashed host.
     let mut orphan = spawn_leader();
     let status = std::process::Command::new(std::env::current_exe().expect("current exe"))
         .env(FIXTURE_MODE_ENV, "record_group")
@@ -3196,7 +3064,6 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
         .expect("run record_group fixture");
     assert!(status.success(), "fixture host failed: {status:?}");
 
-    // Survivor: recorded by THIS process, which is alive during the sweep.
     let mut survivor = spawn_leader();
     let survivor_record =
         GroupRecord::record(i32::try_from(survivor.id()).expect("pid fits")).expect("record");
@@ -3216,9 +3083,9 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
     let _ = survivor.kill();
     let _ = survivor.wait();
 
-    // Zombie owner: the recording host exited but stays unreaped — a
-    // crashed host can linger as a zombie while its supervisor already
-    // runs the replacement. The sweep must treat it as dead.
+    // A zombie recording host has exited but remains unreaped.
+    // A crashed host can remain a zombie until the system reaps it.
+    // The sweep treats a zombie recording host as dead.
     let mut zombie_orphan = spawn_leader();
     let mut recorder = std::process::Command::new(std::env::current_exe().expect("current exe"))
         .env(FIXTURE_MODE_ENV, "record_group")
@@ -3249,9 +3116,7 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
     wait_sigkilled(&mut zombie_orphan, "the zombie-owned leader");
     let _ = recorder.wait();
 
-    // Leaderless orphan: the leader exits after forking a grandchild into
-    // its group — the shape pdeathsig leaves behind when it kills only the
-    // leader. The sweep must still kill the surviving group member.
+    // Killing a group leader can leave group members running.
     let mut leader = std::process::Command::new("/bin/sh");
     leader.args(["-c", "sleep 30 & echo $!; sleep 2"]);
     leader.process_group(0);
@@ -3265,8 +3130,6 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
             .expect("read grandchild pid");
         line.trim().parse().expect("grandchild pid")
     };
-    // Record while the leader is still alive (its `sleep 2` window), from
-    // a stand-in host that then dies.
     let status = std::process::Command::new(std::env::current_exe().expect("current exe"))
         .env(FIXTURE_MODE_ENV, "record_group")
         .env(GROUP_PID_ENV, leader.id().to_string())
@@ -3283,7 +3146,6 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        // Killed and reaped by init: /proc entry gone (or briefly zombie).
         let state = fs::read_to_string(format!("/proc/{grandchild}/stat"))
             .ok()
             .and_then(|stat| {

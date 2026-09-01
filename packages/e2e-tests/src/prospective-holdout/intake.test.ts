@@ -52,9 +52,7 @@ describe("privacy-first prospective intake", () => {
             sanitizedIntakeFixture().submittedAt,
             sanitizedIntakeFixture().deletionEvidence,
         ).reasonCode).toBe("privacy-rejected");
-        // The privacy-rejected path has no sanitized intake to bound its deletion
-        // completions, so the instant it carries is what rejects evidence for a retention
-        // run that finished before the report existed.
+        // Privacy rejections reject deletion evidence completed before their carried submission instant.
         expect(() => staticPrivacyRejection(
             `intake-${"e".repeat(32)}`,
             "2026-09-04T00:00:00Z",
@@ -63,15 +61,12 @@ describe("privacy-first prospective intake", () => {
     });
 
     it("rejects a submission before the frozen window opens and admits one at the opening", () => {
-        // A freeze published before its window opens leaves a span in which a report is
-        // prospective relative to publication and still outside the declared window, so
-        // the lower bound the freeze published is what rejects it.
+        // A submission after freeze publication but before `intakeOpensAt` is rejected.
         expect(() => reviewSanitizedIntake(sanitizedIntakeFixture(), {
             ...reviewOptions,
             intakeOpensAt: "2026-09-03T00:00:00Z",
         })).toThrow(/before-frozen-opening/);
-        // The opening instant is inside the window, and the fixture is still strictly
-        // after publication, so both lower bounds admit this submission.
+        // A submission at `intakeOpensAt` and after freeze publication is admitted.
         expect(reviewSanitizedIntake(sanitizedIntakeFixture(), {
             ...reviewOptions,
             intakeOpensAt: sanitizedIntakeFixture().submittedAt,
@@ -80,8 +75,7 @@ describe("privacy-first prospective intake", () => {
 
     it("rejects deletion evidence completed before the submission it belongs to", () => {
         const early = sanitizedIntakeFixture();
-        // Every store stays inside its own deadline, so the deadline test admits this
-        // evidence and the submission bound is the only rule that rejects it.
+        // Deletion evidence completed before its submission is rejected.
         for (const evidence of early.deletionEvidence) evidence.completedAt = "2026-09-01T00:00:00Z";
         expect(() => reviewSanitizedIntake(early, reviewOptions)).toThrow(/before-submission/);
         const atSubmission = sanitizedIntakeFixture();
