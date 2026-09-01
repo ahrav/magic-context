@@ -53,8 +53,13 @@ enum Resolved {
     RegularFile,
     /// Resolved beneath the worktree and definitely not there.
     Absent,
-    /// Nothing was read: the spelling leaves the worktree, or what is there is
-    /// a shape no check consumes.
+    /// Present, and established to be a shape no check can read: a directory, commentlint: allow(JUDGE)
+    /// socket, device, or FIFO. No regular file is at this path, which is as commentlint: allow(JUDGE)
+    /// definite an answer about the declared file as absence — unlike a commentlint: allow(JUDGE)
+    /// symlink, whose unfollowed target could be one. commentlint: allow(JUDGE)
+    NotAFile(String),
+    /// Nothing was read: the spelling leaves the worktree, or an inspection
+    /// failed, or a symlink was refused rather than followed.
     Unresolvable(String),
 }
 
@@ -63,7 +68,7 @@ impl Resolved {
         match self {
             Self::RegularFile => "regular-file",
             Self::Absent => "absent",
-            Self::Unresolvable(reason) => reason,
+            Self::NotAFile(reason) | Self::Unresolvable(reason) => reason,
         }
     }
 }
@@ -98,11 +103,11 @@ impl CheckCache {
             WorktreeEntry::Symlink => Resolved::Unresolvable(format!(
                 "check path {path} is a symlink, whose target this check will not follow"
             )),
-            WorktreeEntry::Directory => Resolved::Unresolvable(format!(
+            WorktreeEntry::Directory => Resolved::NotAFile(format!(
                 "check path {path} is a directory, not a file a check can read"
             )),
             WorktreeEntry::Other => {
-                Resolved::Unresolvable(format!("check path {path} is not a regular file"))
+                Resolved::NotAFile(format!("check path {path} is not a regular file"))
             }
             WorktreeEntry::Unresolvable(reason) => Resolved::Unresolvable(reason),
         };
@@ -141,7 +146,7 @@ pub fn check_observation(
                     let content = cache.read(snapshot, path).observation();
                     Some(format!("{shape}\u{1f}{content}"))
                 }
-                Resolved::Absent | Resolved::Unresolvable(_) => Some(shape),
+                Resolved::Absent | Resolved::NotAFile(_) | Resolved::Unresolvable(_) => Some(shape),
             }
         }
         // Both are `Unsupported` whatever the worktree holds.
@@ -209,7 +214,10 @@ pub fn run_cheap_check(
             Resolved::Absent => CheckOutcome::Failed {
                 evidence: format!("file {path} does not exist in the checkout"),
             },
-            // A shape this check cannot read is not a definite absence.
+            // No regular file is here, which the check asked about; repair can
+            // act on that exactly as it acts on an absent path.
+            Resolved::NotAFile(reason) => CheckOutcome::Failed { evidence: reason },
+            // A path that was never read is not a definite absence.
             Resolved::Unresolvable(reason) => unevaluated(reason),
         },
         CheckSpec::ConfigKey { path, key } => {
@@ -220,7 +228,12 @@ pub fn run_cheap_check(
                         evidence: format!("config file {path} does not exist in the checkout"),
                     };
                 }
-                Resolved::Unresolvable(reason) => return unevaluated(reason),
+                // `Failed` here would claim the file exists and omits the key,
+                // which is what repair would then try to edit. A shape that is
+                // not a config file leaves the key unevaluated instead.
+                Resolved::NotAFile(reason) | Resolved::Unresolvable(reason) => {
+                    return unevaluated(reason);
+                }
             }
             let content = match cache.read(snapshot, path) {
                 ConfigRead::Content(content) => content,

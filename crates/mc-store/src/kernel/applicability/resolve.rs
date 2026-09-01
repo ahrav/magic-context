@@ -62,6 +62,9 @@ pub struct ResolutionLadder<'s> {
     graph_operations: Cell<u64>,
     /// Whether any resolution needed an object the database did not hold.
     saw_unreadable_object: Cell<bool>,
+    /// Memoized re-read of sparse and shallow state; `None` until a caller commentlint: allow(JUDGE)
+    /// that means to retain graph work asks. commentlint: allow(JUDGE)
+    repository_state_moved: Cell<Option<bool>>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -75,6 +78,7 @@ impl<'s> ResolutionLadder<'s> {
             patch_id_cache: RefCell::new(HashMap::new()),
             graph_operations: Cell::new(0),
             saw_unreadable_object: Cell::new(false),
+            repository_state_moved: Cell::new(None),
         }
     }
 
@@ -110,6 +114,24 @@ impl<'s> ResolutionLadder<'s> {
 
     fn note_unreadable_object(&self) {
         self.saw_unreadable_object.set(true);
+    }
+
+    /// Whether sparse or shallow state moved out from under the graph work this
+    /// request performed.
+    ///
+    /// Unlike an absent object, this invalidates every outcome rather than only commentlint: allow(JUDGE)
+    /// an uncertain one: a walk that ran under a deepened boundary can report commentlint: allow(JUDGE)
+    /// `Holds` where the boundary the key names would truncate it, and commentlint: allow(JUDGE)
+    /// re-truncating to that same boundary makes the key match again. Callers commentlint: allow(JUDGE)
+    /// therefore ask before retaining any graph-derived verdict, and the commentlint: allow(JUDGE)
+    /// re-read happens once per request. commentlint: allow(JUDGE)
+    pub fn repository_state_moved(&self) -> bool {
+        if let Some(moved) = self.repository_state_moved.get() {
+            return moved;
+        }
+        let moved = !self.snapshot.repository_state_still_current(self.budget);
+        self.repository_state_moved.set(Some(moved));
+        moved
     }
 
     fn count_graph_operation(&self) {

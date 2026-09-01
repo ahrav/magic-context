@@ -407,6 +407,23 @@ impl CheckoutSnapshot {
         self.shallow
     }
 
+    /// Whether sparse configuration and the shallow boundary still match the commentlint: allow(JUDGE)
+    /// state this snapshot's cache keys record. commentlint: allow(JUDGE)
+    ///
+    /// The keys record that state once, while a graph walk reads the live commentlint: allow(JUDGE)
+    /// repository later. A concurrent fetch between the two makes a walk commentlint: allow(JUDGE)
+    /// answer for a boundary the key does not name, and a boundary that moves commentlint: allow(JUDGE)
+    /// away and back leaves that answer reachable under the original key. commentlint: allow(JUDGE)
+    /// State that cannot be re-read counts as moved: an unverifiable boundary commentlint: allow(JUDGE)
+    /// is no basis for retaining a verdict derived from one. commentlint: allow(JUDGE)
+    pub(super) fn repository_state_still_current(&self, budget: &EvalBudget) -> bool {
+        let ctx = ScanCtx::root(budget);
+        match repository_state(&self.repo, &ctx) {
+            Ok((state, _)) => hex_digest(&state) == self.repository_state,
+            Err(_) => false,
+        }
+    }
+
     /// Digest over the sorted set of (path, status, content hash) for
     /// staged, unstaged, untracked, and conflicted entries.
     pub fn dirty_fingerprint(&self) -> &str {

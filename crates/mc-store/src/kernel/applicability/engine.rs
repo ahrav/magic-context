@@ -349,11 +349,17 @@ impl ApplicabilityEngine {
                 budget,
             );
             stats.graph_operations += ladder.graph_operations() - graph_ops_before;
+            // Only graph-derived verdicts depend on the sparse and shallow commentlint: allow(JUDGE)
+            // boundary, so a candidate that touched no graph stays cacheable commentlint: allow(JUDGE)
+            // and is not charged the re-read. commentlint: allow(JUDGE)
+            let cacheable = classification.cacheable
+                && !(ladder.graph_operations() > graph_ops_before
+                    && ladder.repository_state_moved());
             // An uncacheable verdict has no cache entry, so its token could
             // never be confirmed; claiming a pending append would make read
             // repair re-append it on every request forever.
-            let mut append_pending = classification.cacheable && !classification.query_local;
-            if classification.cacheable {
+            let mut append_pending = cacheable && !classification.query_local;
+            if cacheable {
                 // The guard is scoped so it releases before `evicted` drops:
                 // locals drop in reverse declaration order, so binding the
                 // displaced generation alongside the guard would free up to a
@@ -502,11 +508,22 @@ impl ApplicabilityEngine {
             PayloadDecode::Present(spec) => Some(spec),
         };
         if let Some(spec) = &spec {
-            if let Some(path) = dirty_overlap(snapshot, &spec.affected_paths) {
-                return Classification::terminal(
-                    ApplicabilityState::DirtyTreeUncertain,
-                    format!("uncommitted path {path} overlaps affected paths"),
-                );
+            match dirty_gate(snapshot, &spec.affected_paths) {
+                DirtyGate::Clear => {}
+                DirtyGate::Overlap(path) => {
+                    return Classification::terminal(
+                        ApplicabilityState::DirtyTreeUncertain,
+                        format!("uncommitted path {path} overlaps affected paths"),
+                    );
+                }
+                // Unplaceable is a property of the declaration, which the key
+                // covers, so this verdict is as stable as the payload.
+                DirtyGate::Unplaceable(declared) => {
+                    return Classification::terminal(
+                        ApplicabilityState::Uncertain,
+                        format!("affected path {declared} does not resolve inside this checkout"),
+                    );
+                }
             }
             gates_ran |= !spec.affected_paths.is_empty() || !spec.checks.is_empty();
             for check in &spec.checks {
@@ -618,7 +635,12 @@ impl ApplicabilityEngine {
                     // so retaining either would pin a degraded verdict to this
                     // (HEAD, anchor) until eviction.
                     let transient = ladder.budget_was_exhausted() || ladder.saw_unreadable_object();
-                    if outcome != GitConditionOutcome::Uncertain || !transient {
+                    // A moved boundary voids every outcome, uncertain or not: commentlint: allow(JUDGE)
+                    // the reachability this walk saw is not the reachability commentlint: allow(JUDGE)
+                    // the key names. commentlint: allow(JUDGE)
+                    let retain = !ladder.repository_state_moved()
+                        && (outcome != GitConditionOutcome::Uncertain || !transient);
+                    if retain {
                         let _evicted = lock(&self.anchor_cache).insert(key, outcome);
                     }
                     outcome
@@ -744,12 +766,27 @@ fn finished(
     }
 }
 
+enum DirtyGate {
+    Clear,
+    /// An uncommitted path overlaps a declared path.
+    Overlap(String),
+    /// A declared path this comparison cannot place inside the checkout. commentlint: allow(JUDGE)
+    Unplaceable(String),
+}
+
 /// A dirty path overlaps an affected path when they are equal or one is a
 /// directory prefix of the other (untracked directories are recorded as a
 /// single collapsed entry).
-fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Option<String> {
-    if affected_paths.is_empty() {
-        return None;
+///
+/// Placement is decided before any entry is examined. A path leaving the commentlint: allow(JUDGE)
+/// worktree is unobservable whatever the worktree currently holds, so leaving commentlint: allow(JUDGE)
+/// it to the scan would report it only while some unrelated entry happens to commentlint: allow(JUDGE)
+/// be dirty, and call the object current on a clean checkout. commentlint: allow(JUDGE)
+fn dirty_gate(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> DirtyGate {
+    for affected in affected_paths {
+        if let DeclaredPath::Unplaceable = declared_path(affected) {
+            return DirtyGate::Unplaceable(affected.clone());
+        }
     }
     for entry in snapshot.dirty_entries() {
         // An index bookkeeping entry is recorded for the fingerprint's sake and
@@ -757,14 +794,13 @@ fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Opti
         if !entry.is_uncommitted_change() {
             continue;
         }
-        let dirty_path = entry.path.as_str();
         for affected in affected_paths {
             if entry_overlaps(entry, affected) {
-                return Some(dirty_path.to_string());
+                return DirtyGate::Overlap(entry.path.clone());
             }
         }
     }
-    None
+    DirtyGate::Clear
 }
 
 /// A poisoned cache mutex means some other request panicked, not that this
@@ -783,27 +819,38 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `None` marks a spelling this comparison cannot interpret. Callers treat commentlint: allow(JUDGE)
 /// that as overlapping every dirty path, since a declaration the engine commentlint: allow(JUDGE)
 /// cannot read is no evidence that the entry is unrelated. commentlint: allow(JUDGE)
-fn canonical_declared_path(path: &str) -> Option<Cow<'_, str>> {
+enum DeclaredPath<'a> {
+    /// Canonical and comparable against a dirty path.
+    Path(Cow<'a, str>),
+    /// The worktree root, which covers the whole checkout rather than nothing,
+    /// so it overlaps every dirty entry and none on a clean checkout.
+    WorktreeRoot,
+    /// A spelling this comparison cannot place beneath the worktree. commentlint: allow(JUDGE)
+    Unplaceable,
+}
+
+fn declared_path(path: &str) -> DeclaredPath<'_> {
     let trimmed = path.trim_end_matches('/');
     let mut needs_rewrite = trimmed.starts_with('/');
     for segment in trimmed.split('/') {
         match segment {
             // Resolving `..` needs the real tree; refuse instead of guessing.
-            ".." => return None,
+            ".." => return DeclaredPath::Unplaceable,
             "" | "." => needs_rewrite = true,
             _ => {}
         }
     }
     if !needs_rewrite {
-        return Some(Cow::Borrowed(trimmed));
+        return DeclaredPath::Path(Cow::Borrowed(trimmed));
     }
     let segments: Vec<&str> = trimmed
         .split('/')
         .filter(|segment| !segment.is_empty() && *segment != ".")
         .collect();
-    // No segment survives only for the worktree root, which covers the whole
-    // checkout rather than nothing.
-    (!segments.is_empty()).then(|| Cow::Owned(segments.join("/")))
+    if segments.is_empty() {
+        return DeclaredPath::WorktreeRoot;
+    }
+    DeclaredPath::Path(Cow::Owned(segments.join("/")))
 }
 
 /// `dirty` arrives from the status scan already canonical; only the declared
@@ -836,11 +883,14 @@ fn trim_trailing_slashes(mut path: &[u8]) -> &[u8] {
 /// directions exactly, so neither twin needs conservative treatment: a commentlint: allow(JUDGE)
 /// declared path — always valid UTF-8 — matches only the bytes it really is. commentlint: allow(JUDGE)
 fn entry_overlaps(entry: &DirtyEntry, declared: &str) -> bool {
-    // An unreadable declaration is no evidence the entry is unrelated.
-    let Some(declared) = canonical_declared_path(declared) else {
-        return true;
-    };
-    paths_overlap(&entry.raw_path, declared.as_ref().as_bytes())
+    match declared_path(declared) {
+        DeclaredPath::Path(declared) => {
+            paths_overlap(&entry.raw_path, declared.as_ref().as_bytes())
+        }
+        // The root contains every entry, and an unplaceable declaration is no
+        // evidence this entry is unrelated to it.
+        DeclaredPath::WorktreeRoot | DeclaredPath::Unplaceable => true,
+    }
 }
 
 /// Digest over every non-snapshot input that can change the verdict, so a

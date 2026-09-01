@@ -2591,3 +2591,168 @@ fn a_payload_with_many_checks_keeps_its_cache_contract_across_budgets() {
     );
     assert_eq!(again.stats.object_cache_hits, 1);
 }
+
+/// A declared path that leaves the worktree is unobservable whatever the
+/// worktree holds, so its verdict must not depend on whether some unrelated
+/// entry happens to be dirty. The worktree root is the opposite case: it
+/// genuinely covers everything, so a clean checkout has nothing to report.
+#[test]
+fn an_unplaceable_affected_path_is_uncertain_on_a_clean_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let clean = checkout(&fixture, tip);
+    assert!(
+        clean
+            .dirty_entries()
+            .iter()
+            .all(|entry| !entry.is_uncommitted_change()),
+        "the premise is a checkout with no uncommitted change"
+    );
+
+    for spelling in ["../outside", "src/../../outside", ".."] {
+        let declared = ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(vec![spelling.to_string()], vec![]).encode(),
+            ),
+            ..candidate("object-unplaceable")
+        };
+        let batch = engine_batch(&clean, &declared);
+        assert_eq!(
+            batch.objects[0].state,
+            ApplicabilityState::Uncertain,
+            "affected path {spelling:?} was called current on a clean checkout"
+        );
+    }
+
+    // The root covers the checkout, so it reports nothing while nothing is
+    // dirty and reports an overlap once something is.
+    for spelling in ["", "/"] {
+        let declared = ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(vec![spelling.to_string()], vec![]).encode(),
+            ),
+            ..candidate("object-root")
+        };
+        assert_eq!(
+            engine_batch(&clean, &declared).objects[0].state,
+            ApplicabilityState::Current,
+            "root spelling {spelling:?} reported an overlap on a clean checkout"
+        );
+    }
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let dirty = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let declared = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec![String::new()], vec![]).encode()),
+        ..candidate("object-root")
+    };
+    assert_eq!(
+        engine_batch(&dirty, &declared).objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+}
+
+/// A directory or other non-file at a `FileExists` path settles the question the
+/// check asked: no regular file is there. Reporting that unevaluated leaves the
+/// object uncertain and hands read repair nothing to act on.
+#[test]
+fn a_non_file_at_an_existence_check_path_is_a_failed_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    std::fs::create_dir_all(fixture.root.join("adir")).unwrap();
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let declared = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "adir".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-dir-exists")
+    };
+    let batch = engine_batch(&snapshot, &declared);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+    assert!(
+        batch.objects[0].failed_check.is_some(),
+        "a definite non-file must reach read repair as a failed check"
+    );
+}
+
+/// Cache keys record the sparse and shallow state once, while a graph walk
+/// reads the live repository later. A boundary that moves in between makes the
+/// walk answer for a repository the key does not name, and a boundary that
+/// moves back leaves that answer reachable under the original key.
+#[test]
+fn a_graph_verdict_is_not_retained_when_the_shallow_boundary_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let shallow_file = fixture.repo.git_dir().join("shallow");
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let snapshot = checkout(&fixture, tip);
+
+    // Deepen after the snapshot fixed the key, as a concurrent fetch would.
+    std::fs::remove_file(&shallow_file).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let anchored = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        ..candidate("object-boundary-moved")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&anchored),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.anchor_cache_misses, 1);
+
+    // Restore the boundary the key names. Nothing may be served from either
+    // cache, since neither verdict was formed under it.
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let again = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&anchored),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        again.stats.anchor_cache_hits, 0,
+        "an anchor verdict walked under a different boundary was retained"
+    );
+    assert_eq!(
+        again.stats.object_cache_hits, 0,
+        "an object verdict walked under a different boundary was retained"
+    );
+
+    // A stable boundary still caches, so the rule above did not disable graph
+    // caching wholesale. The object cache answers first, so a sibling candidate
+    // sharing the anchor row is what shows the anchor verdict was retained too.
+    let stable = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&anchored),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(stable.stats.object_cache_hits, 1);
+    let sibling = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        ..candidate("object-sharing-the-anchor")
+    };
+    let shared = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[sibling],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(shared.stats.object_cache_hits, 0);
+    assert_eq!(shared.stats.anchor_cache_hits, 1);
+}
