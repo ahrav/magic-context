@@ -273,8 +273,21 @@ impl ApplicabilityEngine {
         // around it, so a concurrent evaluation can record one in between. An
         // unchanged tip proves no commit landed since the reduction; a moved tip
         // is re-reduced, and an object blocked by what landed is demoted.
+        //
+        // A bound reached before the check completes cannot prove the reduction
+        // current, so every verdict that would auto-inject reports uncertain,
+        // matching the initial reduction's deadline path.
+        const UNFENCED: &str = "durable applicability state could not be rechecked";
         for _ in 0..BLOCK_FENCE_ATTEMPTS {
-            if store.applicability_tip()? == reduced_as_of || budget.is_exhausted() {
+            let tip = match store.applicability_tip(budget) {
+                Ok(tip) => tip,
+                Err(KernelError::Deadline) => {
+                    demote_unfenced(&mut objects, UNFENCED);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if tip == reduced_as_of {
                 break;
             }
             let injectable: Vec<usize> = objects
@@ -286,14 +299,22 @@ impl ApplicabilityEngine {
             if injectable.is_empty() {
                 break;
             }
-            let (as_of, refreshed) = store.applicability_block_states_as_of_tip(
+            let refreshed = store.applicability_block_states_as_of_tip(
                 &injectable
                     .iter()
                     .map(|index| objects[*index].object_id.as_str())
                     .collect::<Vec<_>>(),
                 snapshot.identity(),
                 budget,
-            )?;
+            );
+            let (as_of, refreshed) = match refreshed {
+                Ok(refreshed) => refreshed,
+                Err(KernelError::Deadline) => {
+                    demote_unfenced(&mut objects, UNFENCED);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             for index in injectable {
                 let state = refreshed.get(objects[index].object_id.as_str()).cloned();
                 demote_if_blocked(
@@ -308,6 +329,18 @@ impl ApplicabilityEngine {
             objects,
             stats: batch.stats,
         })
+    }
+}
+
+/// Every verdict that would auto-inject reports uncertain, for a bound reached
+/// before the durable state could be rechecked. Without that recheck no current
+/// verdict can be shown unblocked.
+fn demote_unfenced(objects: &mut [ObjectApplicability], reason: &str) {
+    for object in objects {
+        if !object.state.blocks_auto_injection() {
+            object.state = ApplicabilityState::Uncertain;
+            object.evidence = format!("durable applicability block not cleared: {reason}");
+        }
     }
 }
 

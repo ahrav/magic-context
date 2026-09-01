@@ -1316,10 +1316,13 @@ fn a_held_reader_pool_does_not_outlast_the_evaluation_deadline() {
     let store_dir = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let store = seed_store(store_dir.path());
-    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
     let query = QueryContext::default();
     let scope = ScopeMatchContext::new();
-    let candidates = [failing_candidate()];
+    // A passing candidate, so the verdict is current and the durable state is
+    // what decides whether it may auto-inject.
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    let candidates = [feature_candidate(TARGET_OBJECT)];
 
     let started = Instant::now();
     let (report, elapsed) = std::thread::scope(|threads| {
@@ -1346,6 +1349,13 @@ fn a_held_reader_pool_does_not_outlast_the_evaluation_deadline() {
     // A deadline is a domain outcome: the batch still carries labels.
     assert_eq!(report.objects.len(), 1);
     assert!(report.appends().next().is_none());
+    // Without the durable record no verdict can be shown unblocked. The fence
+    // applies the same policy when its own recheck cannot complete.
+    assert!(
+        report.auto_injectable().next().is_none(),
+        "an unread durable state leaves nothing auto-injectable, got {:?}",
+        report.objects[0].state
+    );
 }
 
 /// Alignment is derived from `implements` dependencies alone, and an
@@ -2544,7 +2554,7 @@ fn the_reduction_reports_the_sequence_it_read_at() {
         )
         .unwrap();
     assert_eq!(
-        store.applicability_tip().unwrap(),
+        store.applicability_tip(&EvalBudget::unbounded()).unwrap(),
         as_of,
         "an unchanged tip proves the reduction is still current"
     );
@@ -2565,7 +2575,7 @@ fn the_reduction_reports_the_sequence_it_read_at() {
         })
         .unwrap();
     assert!(
-        store.applicability_tip().unwrap() > as_of,
+        store.applicability_tip(&EvalBudget::unbounded()).unwrap() > as_of,
         "a commit makes the reduction stale, which is what the fence detects"
     );
 }

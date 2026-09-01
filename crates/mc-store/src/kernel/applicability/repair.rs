@@ -605,8 +605,13 @@ impl KernelStore {
     }
 
     /// The committed tip, for fencing a decision taken from a reduction.
-    pub fn applicability_tip(&self) -> Result<i64, KernelError> {
-        let reader = self.lock_reader()?;
+    pub fn applicability_tip(&self, budget: &EvalBudget) -> Result<i64, KernelError> {
+        // Bounded like every other read on this path: an occupied pool must not
+        // outlast the caller's own bound.
+        if budget.is_exhausted() {
+            return Err(KernelError::Deadline);
+        }
+        let reader = self.lock_reader_within(&budget.acquire_limit())?;
         reader
             .query_row(
                 "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
