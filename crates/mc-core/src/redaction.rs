@@ -10,6 +10,14 @@ use mc_secret_scanner::{
 
 pub const DETECTOR_ID: &str = "mc-secret-scanner";
 
+/// Longest text `redact_durable_text` can inspect.
+///
+/// Above this the scan fails and the whole value is replaced by one placeholder,
+/// because text that cannot be inspected cannot be shown to be secret-free. A
+/// caller that must preserve its content has to reject the value at this length
+/// instead of redacting it, since the placeholder is not recoverable.
+pub const MAX_REDACTABLE_BYTES: usize = mc_secret_scanner::MAX_INPUT_BYTES;
+
 const LABEL_WORDS: &[&str] = &[
     "key",
     "token",

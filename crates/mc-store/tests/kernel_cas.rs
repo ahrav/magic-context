@@ -171,13 +171,39 @@ fn payload_limit_is_inclusive() {
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
 
+    let limit = mc_core::redaction::MAX_REDACTABLE_BYTES;
     store
-        .ingest_artifact(request("limit", vec![b'x'; 64 * MIB]))
+        .ingest_artifact(request("limit", vec![b'x'; limit]))
         .unwrap();
     let error = store
-        .ingest_artifact(request("over-limit", vec![b'x'; 64 * MIB + 1]))
+        .ingest_artifact(request("over-limit", vec![b'x'; limit + 1]))
         .unwrap_err();
     assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+}
+
+#[test]
+fn payload_too_large_to_inspect_is_rejected_rather_than_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    // Redaction cannot inspect text this long, so it replaces the whole value with one
+    // placeholder. Accepting that would store the placeholder as the artifact and
+    // classify a payload holding no secret as one that does, both without an error.
+    let limit = mc_core::redaction::MAX_REDACTABLE_BYTES;
+    assert!(MIB > limit);
+    let error = store
+        .ingest_artifact(request("unscannable", vec![b'x'; MIB]))
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+
+    // At the limit the payload is stored whole, so the rejection above is a size
+    // boundary rather than a placeholder standing in for the artifact.
+    let payload = vec![b'x'; limit];
+    let handle = store
+        .ingest_artifact(request("scannable", payload.clone()))
+        .unwrap();
+    assert_eq!(store.read_artifact(&handle).unwrap(), payload);
 }
 
 #[test]

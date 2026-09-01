@@ -120,6 +120,16 @@ impl PreparedArtifact {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
 
+        // Redaction fails closed by replacing text it cannot inspect, so the payload
+        // has to be measured before that happens. Measuring the redacted bytes instead
+        // sees the placeholder's length, which passes any cap and stores the
+        // placeholder in place of the artifact.
+        if request.payload.len() > MAX_PAYLOAD_BYTES
+            || request.payload.len() > mc_core::redaction::MAX_REDACTABLE_BYTES
+        {
+            return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
+        }
+
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
                 let redaction = redact(text);
