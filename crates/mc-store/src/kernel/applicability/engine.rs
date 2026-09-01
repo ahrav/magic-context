@@ -5,6 +5,7 @@
 //! snapshot taken once, a typed query context, and the candidate batch;
 //! distinct anchors resolve once per batch, never once per candidate.
 
+use std::cell::OnceCell;
 use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -343,7 +344,7 @@ impl ApplicabilityEngine {
     ) -> BatchEvaluation {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
-        let scope_context = scope_context.clone().with_head_commit(snapshot.head());
+        let resolved_scope_context = OnceCell::new();
         let snapshot_hash = self.cache_hasher.hash_one((
             snapshot.identity(),
             snapshot.head(),
@@ -357,7 +358,7 @@ impl ApplicabilityEngine {
                 dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
             })
         });
-        let mut digest_prefixes = InputDigestPrefixes::new(query, &scope_context);
+        let mut digest_prefixes = InputDigestPrefixes::new(query, scope_context);
         let mut batch_input_digests = (candidates.len() > 1).then(HashMap::new);
         let mut last_input_digest = None;
         // Distinct anchors and repeated payloads resolve once per batch.
@@ -439,9 +440,11 @@ impl ApplicabilityEngine {
             let key = Arc::new(key);
             let token = ClassificationToken(Arc::clone(&key));
             batch_memos.key = inputs_digest;
+            let scope_context = resolved_scope_context
+                .get_or_init(|| scope_context.clone().with_head_commit(snapshot.head()));
             let classification = self.classify(
                 query,
-                &scope_context,
+                scope_context,
                 &ladder,
                 &mut batch_memos,
                 &mut stats,

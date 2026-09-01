@@ -28,3 +28,15 @@ problem. Pursue bounded commit-graph walks or shared batch reachability before l
 
 Raw profiles are under `/tmp/mc-scope-perf/ancestry-kernel-{199,997}.data`.
 
+## Near ancestry after iteration 33
+
+The corrected `ancestry-near` mode starts its ten-second window after building the 10,000-commit
+fixture. A 199 Hz profile captured 2,001 samples with zero loss. Loose-object zlib inflate still
+owns 28.5% self cycles; commit parsing, object lookup, mmap/open/close, and loose-object path
+construction own most of the remainder. No `ResolutionLadder` local loop is material.
+
+Decision: retain the request-local graph. Further near/far gains require a commit-graph-equipped
+repository or persistent index; neither can be synthesized from timestamps or hidden durable state.
+
+Raw profile: `/tmp/mc-scope-perf/ancestry-near-isolated-iter33-199.data`; report:
+`/tmp/mc-scope-perf/ancestry-near-isolated-iter33.report`.
