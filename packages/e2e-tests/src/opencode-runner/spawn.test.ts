@@ -331,6 +331,17 @@ describe("opencode child lifecycle", () => {
                 delete process.env.PAIRED_DELTA_BUILD_ID;
             }
 
+            // `extraEnv` overrides the ambient value, so it is what the child resolves.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    extraEnv: { PAIRED_DELTA_TRACE: "sk-ant-abcdefghijklmnopqrstuv" },
+                    openCodeConfigExtra: {
+                        trace: { buildId: "{env:PAIRED_DELTA_TRACE}" },
+                    },
+                })
+            ).toThrow(/references PAIRED_DELTA_TRACE .* Anthropic-style key value/);
+
             // `typeof [] === "object"`, so an array would spread into the provider map as
             // numeric keys rather than being ignored.
             __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {

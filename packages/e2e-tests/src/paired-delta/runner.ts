@@ -713,6 +713,27 @@ export async function runPairedDelta(
                 );
             }
         }
+        /** An observed cost claims to be `tokenCostUsd` of the counters beside it, so the two are checked against each other: every other rule here reads the fields in isolation, which a record with valid counters and a falsified total passes intact, and the total is what restores spend and admits later paid arms. A relative comparison rather than equality because the value survived a JSON round trip. commentlint: allow(JUDGE) */
+        if (record.costSource === "observed") {
+            /** The loop above refuses a missing or non-integer counter, so the four are numbers by the time this runs; `Partial` is the declared shape only because the record is untrusted on arrival. commentlint: allow(JUDGE) */
+            const priced = tokenCostUsd({
+                input: usage.input as number,
+                output: usage.output as number,
+                cacheCreation: usage.cacheCreation as number,
+                cacheRead: usage.cacheRead as number,
+            }, options.pricesPerMillionTokens);
+            if (
+                !Number.isFinite(priced) ||
+                Math.abs(priced - record.costUsd) > Math.max(1e-9, Math.abs(priced) * 1e-9)
+            ) {
+                releaseBeforeThrowing(options.store);
+                throw new Error(
+                    `records file observed cost does not price its usage at ` +
+                        `${coordinateKey(record)}; the pricing table may have changed since ` +
+                        "the record was written; point at a fresh records path",
+                );
+            }
+        }
         /** The reserve is the expected price of the next single call, so it takes the dearest attempt this coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit. commentlint: allow(JUDGE) */
         reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;

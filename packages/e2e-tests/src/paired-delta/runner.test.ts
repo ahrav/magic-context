@@ -221,7 +221,9 @@ describe("paired-delta runner", () => {
         const first = await runPairedDelta(options(firstStore), dependencies());
         const stored = first.records[0];
         if (!stored) throw new Error("missing fixture record");
-        stored.costUsd = 2;
+        // The dearest prior attempt, not the observed cost: an observed cost has to keep
+        // pricing its own counters, and the reserve reads this field for exactly this case.
+        stored.maxAttemptCostUsd = 2;
         const store = new MemoryStore([stored]);
         const events: string[] = [];
 
@@ -1420,6 +1422,21 @@ describe("paired-delta runner", () => {
         await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
             /replicate index 0 is not a non-negative safe integer/,
         );
+    });
+
+    it("refuses an observed cost that does not price its own usage", async () => {
+        // Counters that price to a real amount, with the total falsified to zero: every
+        // field-by-field rule passes, and the total is what restores spend.
+        const firstStore = new MemoryStore();
+        const first = await runPairedDelta(options(firstStore), dependencies());
+        const stored = first.records.find(({ costSource }) => costSource === "observed");
+        if (!stored) throw new Error("missing observed fixture record");
+        expect(stored.costUsd).toBeGreaterThan(0);
+        stored.costUsd = 0;
+
+        await expect(
+            runPairedDelta(options(new MemoryStore([stored])), dependencies()),
+        ).rejects.toThrow(/observed cost does not price its usage/);
     });
 
     it("refuses a non-integer replicate index from a store that does not validate", async () => {

@@ -190,11 +190,17 @@ function writeConfigs(
         }
     }
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
-    const extra = canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra") ?? {};
-    const magicContextConfig = canonicalConfig(opts.magicContextConfig, "magicContextConfig");
+    const extra =
+        canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra", opts.extraEnv) ?? {};
+    const magicContextConfig = canonicalConfig(
+        opts.magicContextConfig,
+        "magicContextConfig",
+        opts.extraEnv,
+    );
     const projectMagicContextConfig = canonicalConfig(
         opts.projectMagicContextConfig,
         "projectMagicContextConfig",
+        opts.extraEnv,
     );
     const contributedProviders = extra.provider;
     const extraWithoutProvider = { ...extra };
@@ -296,11 +302,20 @@ function writeConfigs(
 function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
     return {
         ...opts,
-        openCodeConfigExtra: canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra"),
-        magicContextConfig: canonicalConfig(opts.magicContextConfig, "magicContextConfig"),
+        openCodeConfigExtra: canonicalConfig(
+            opts.openCodeConfigExtra,
+            "openCodeConfigExtra",
+            opts.extraEnv,
+        ),
+        magicContextConfig: canonicalConfig(
+            opts.magicContextConfig,
+            "magicContextConfig",
+            opts.extraEnv,
+        ),
         projectMagicContextConfig: canonicalConfig(
             opts.projectMagicContextConfig,
             "projectMagicContextConfig",
+            opts.extraEnv,
         ),
     };
 }
@@ -354,6 +369,7 @@ function parsedUrlPairs(value: string): Array<[string, string]> {
 function canonicalConfig(
     value: Record<string, unknown> | undefined,
     label: string,
+    extraEnv?: Record<string, string>,
 ): Record<string, unknown> | undefined {
     if (value === undefined) return undefined;
     /** A spread copies own enumerable fields whatever `toJSON()` reported, so the scan and the write must read one representation; `writeConfigs` assembles every file from this return value. commentlint: allow(JUDGE) */
@@ -363,7 +379,7 @@ function canonicalConfig(
         throw new Error(`${label} must serialize to a JSON object`);
     }
     const canonical = serialized as Record<string, unknown>;
-    assertConfigHasNoCredentials(canonical, label);
+    assertConfigHasNoCredentials(canonical, label, extraEnv);
     return canonical;
 }
 
@@ -384,7 +400,11 @@ const ENV_PLACEHOLDER = /^\{env:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}$/;
  * `opencode.json` — `extraEnv` remains the only channel that is governed by shape rather
  * than by recognition.
  */
-function assertConfigHasNoCredentials(value: unknown, label: string): void {
+function assertConfigHasNoCredentials(
+    value: unknown,
+    label: string,
+    extraEnv?: Record<string, string>,
+): void {
     const seen = new WeakSet<object>();
     const visit = (current: unknown, path: string): void => {
         if (current === null || typeof current !== "object" || seen.has(current)) return;
@@ -397,7 +417,10 @@ function assertConfigHasNoCredentials(value: unknown, label: string): void {
                 const name = placeholder[1] as string;
                 if (isSensitiveEnvKey(name)) continue;
                 /** A name the sensitive-key rule does not recognize is the case the exemption cannot cover by name alone: `substituteConfigVariables` expands every `{env:NAME}` without consulting that rule, and `isInheritableEnvKey` only strips names it recognizes, so an ambient variable holding a real token under an innocuous label would resolve into the written config. The resolved value is read here so the shape rules judge what the placeholder will become. commentlint: allow(JUDGE) */
-                const resolvedFormat = credentialValueFormat(process.env[name] ?? "");
+                /** `extraEnv` is what the child is actually given and it overrides the ambient value, so reading `process.env` alone judged a variable the child will never see. The forwarded value is consulted first for that reason. commentlint: allow(JUDGE) */
+                const resolvedFormat = credentialValueFormat(
+                    extraEnv?.[name] ?? process.env[name] ?? "",
+                );
                 if (resolvedFormat !== null) {
                     throw new Error(
                         `config references ${name} at ${childPath}, which holds a ` +
