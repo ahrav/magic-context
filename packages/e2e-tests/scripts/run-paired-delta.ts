@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, type Stats } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, type Stats } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import { canonicalFingerprint } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -30,7 +30,7 @@ import {
     type FamilyDeltaObservation,
     type FamilyNoiseFloor,
 } from "../src/paired-delta/estimator";
-import { pluginEntryPath } from "../src/opencode-runner/spawn";
+import { PLUGIN_BUNDLE_ENTRY, pluginEntryPath } from "../src/opencode-runner/spawn";
 import { assertFrozenPool, buildPairedDeltaRegistry } from "../src/paired-delta/registry";
 import { claimsCompletion } from "../src/paired-delta/completion-claim";
 import { validSuccess } from "../src/paired-delta/scoring";
@@ -300,12 +300,6 @@ function hostRuntimeParts(): Uint8Array[] {
 }
 
 /**
- * The bytes of the plugin bundle the harness will load.
- *
- * `pluginEntryPath` prefers an existing `dist` build, which is ignored, so no git-based digest can
- * see it — `--exclude-standard` skips ignored paths by design.
- */
-/**
  * The OpenCode executable the harness will launch.
  *
  * A direct invocation resolves a bare `opencode` from `PATH`, so the workflow's pinned version says
@@ -362,15 +356,37 @@ function installedDependencyParts(): Uint8Array[] {
 /** The modules whose behaviour the measurement is made of, rather than every installed dependency. */
 const MEASUREMENT_RUNTIME_MODULES = ["@opencode-ai/sdk"] as const;
 
+/**
+ * The bytes of the plugin bundle the harness will load.
+ *
+ * `pluginEntryPath` prefers an existing `dist` build, which is ignored, so no git-based digest can
+ * see it — `--exclude-standard` skips ignored paths by design. The build runs `bun build
+ * --splitting`, so the entry imports sibling chunk files and OpenCode executes those too; hashing
+ * the entry alone kept one digest across a stale or edited chunk. The whole output directory is
+ * hashed, which also covers the agent and config files the plugin reads from beside its code. A
+ * source entry is tracked and reaches both bindings through git, so only its own bytes are added. commentlint: allow(JUDGE)
+ */
 function loadedBundleParts(root: string): Uint8Array[] {
     const entry = pluginEntryPath();
     const parts = [Buffer.from(`${relative(root, entry)}\0`, "utf8")];
-    try {
-        parts.push(readFileSync(entry));
-    } catch {
-        parts.push(Buffer.from("<unreadable>", "utf8"));
+    const files = entry === PLUGIN_BUNDLE_ENTRY ? bundleFiles(dirname(entry)) : [entry];
+    for (const file of files) {
+        parts.push(Buffer.from(`${relative(root, file)}\0`, "utf8"));
+        try {
+            parts.push(readFileSync(file));
+        } catch {
+            parts.push(Buffer.from("<unreadable>", "utf8"));
+        }
     }
     return parts;
+}
+
+/** Every regular file under the bundle directory in code-unit order, so the digest is independent of directory enumeration order. */
+function bundleFiles(directory: string): string[] {
+    return readdirSync(directory, { recursive: true, withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => join(entry.parentPath, entry.name))
+        .sort(compareCodeUnits);
 }
 
 function worktreeRoot(): string {
@@ -952,7 +968,8 @@ async function settledSessionUsage(
     let last: SessionUsage | null = null;
     for (let attempt = 0; attempt < settle.attempts; attempt++) {
         /** Checked every pass, not once: the plugin buffers its log for 500 ms, so the marker can appear after the first read. */
-        if (settle.incomplete === "reject" && historianAbandoned(logPath, sessionId)) {
+        const abandoned = historianAbandoned(logPath, sessionId);
+        if (abandoned && settle.incomplete === "reject") {
             throw new Error(
                 "live paired-delta cannot price this rollout: the plugin resumed the parent with " +
                 "a historian still running, so the ledger is incomplete by construction",
@@ -960,7 +977,8 @@ async function settledSessionUsage(
         }
         const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
         const signature = JSON.stringify(reading);
-        if (signature === previous) return reading;
+        /** A running historian can append rows after two identical reads; charged incomplete ledgers wait for all attempts. */
+        if (signature === previous && !abandoned) return reading;
         previous = signature;
         last = reading;
         await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);

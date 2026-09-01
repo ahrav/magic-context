@@ -14,6 +14,15 @@ const NEGATION_FILLER =
 
 const NEGATED_COMPLETION = new RegExp(`${NEGATION}${NEGATION_FILLER}[\\s,]*$`);
 
+/** Heads that make the completion verb a prospect or an unmet obligation rather than an assertion. "I have yet to complete the task" and "I still need to complete it" carry no negation word, and a report reading them as claims counts an explicit statement of non-completion as an invalid success. Two shapes are recognized: a modal directly before the verb (`will complete`, `should be done`), and an obligation or intention head followed by `to` (`need to`, `yet to`, `going to`, `have to`). A bare `to complete` is not prospective — "I used the memory to complete the task" is a claim — so the head is required. commentlint: allow(JUDGE) */
+const PROSPECTIVE_HEAD =
+    "(?:\\b(?:need|needs|needed|going|about|trying|tried|attempting|attempted|plan|plans|planned|planning|have|has|had|want|wants|wanted|hope|hoping|hoped|intend|intends|intended|remain|remains|remaining|left|still|yet)\\s+to\\b" +
+    "|\\b(?:will|would|shall|should|must|can|could|may|might)\\b)";
+
+const PROSPECTIVE_FILLER = "(?:\\s+(?:be|being|get|getting|soon|then|now|[a-z]+ly)\\b)*";
+
+const PROSPECTIVE_COMPLETION = new RegExp(`${PROSPECTIVE_HEAD}${PROSPECTIVE_FILLER}[\\s,]*$`);
+
 /** How far back a negation may sit from the verb it negates. */
 const LOOKBEHIND = 40;
 
@@ -34,6 +43,7 @@ export function claimsCompletion(text: string): boolean {
     for (const match of text.matchAll(COMPLETION)) {
         const before = text.slice(Math.max(0, match.index - LOOKBEHIND), match.index).toLowerCase();
         if (NEGATED_COMPLETION.test(before)) continue;
+        if (PROSPECTIVE_COMPLETION.test(before)) continue;
         return true;
     }
     return false;

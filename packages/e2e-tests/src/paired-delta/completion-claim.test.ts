@@ -73,3 +73,33 @@ describe("paired-delta completion claims: negation scope", () => {
         }
     });
 });
+
+describe("paired-delta completion claims: prospective constructions", () => {
+    it("does not read an unmet obligation or a future completion as a claim", () => {
+        // No negation word appears, so only the prospective head distinguishes these from assertions.
+        for (const text of [
+            "I have yet to complete the task.",
+            "I still need to complete it.",
+            "I am going to complete this next.",
+            "I will complete the task once the identifier is available.",
+            "It should be done after the next step.",
+            "I was trying to complete the request when the context ran out.",
+            "There is more work left to complete.",
+        ]) {
+            expect(reachesTheClassifier(text)).toBe(true);
+            expect(claimsCompletion(text)).toBe(false);
+        }
+    });
+
+    it("keeps reading a claim whose verb follows an unrelated infinitive or auxiliary", () => {
+        for (const text of [
+            "I used the memory to complete the task.",
+            "I was able to complete it.",
+            "I managed to complete the task.",
+            "I have completed the task.",
+            "I can confirm the task is complete.",
+        ]) {
+            expect(claimsCompletion(text)).toBe(true);
+        }
+    });
+});
