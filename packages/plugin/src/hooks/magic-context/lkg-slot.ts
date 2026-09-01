@@ -6,7 +6,7 @@ export interface LkgSlot {
     jsonPrefix: string;
     inputIdSeq: string[];
     inputContentDigests: string[];
-    /** Cheap content signatures aligned with `inputIdSeq`, used to reuse digests. */
+    /** `inputContentSignatures` stores cheap content signatures aligned with `inputIdSeq` to reuse digests. */
     inputContentSignatures?: string[];
     lastInputMessageId: string;
     modelKey: string | null;
@@ -49,7 +49,7 @@ export const LKG_SNAPSHOT_BOOLEAN = Symbol("boolean");
 export const LKG_SNAPSHOT_NULL = Symbol("null");
 export const LKG_SNAPSHOT_UNDEFINED = Symbol("undefined");
 
-/** Flatten a value into typed tokens while retaining strings without deep copies. */
+/** `lkgContentFields` tokenizes values without deep-copying strings. */
 export function lkgContentFields(value: unknown): LkgContentField[] | null {
     const fields: LkgContentField[] = [];
     const seen = new WeakSet<object>();
@@ -113,8 +113,8 @@ export interface LkgDigestPrior {
 }
 
 /**
- * Reuse prior digests for the unchanged id+signature prefix and hash only from
- * the first changed entry. Digest values must match a full recompute.
+ * The digest computation reuses prior digests for the unchanged ID-and-signature prefix and hashes entries from the first changed entry onward.
+ * Digest reuse must match a full recomputation after any ID or signature change.
  */
 export function incrementalLkgContentDigests(
     entries: readonly LkgDigestEntry[],
@@ -147,7 +147,7 @@ export function incrementalLkgContentDigests(
     return { digests, reusedPrefix };
 }
 
-/** Digest the full message tree to detect input drift before an LKG replay. */
+/** The LKG replay check digests the full message tree to detect input drift. */
 export function lkgContentDigest(message: MessageLike): string | null {
     const fields = lkgContentFields(message);
     return fields ? lkgContentDigestFromFields(fields) : null;

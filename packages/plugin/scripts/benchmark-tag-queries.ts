@@ -1,39 +1,22 @@
 /**
- * Benchmark: P0 storage helper proposal vs current `getTagsBySession`.
  *
- * Measures the actual cost of three different approaches for the per-pass
- * tag queries in `transform.ts`, using the live SQLite database read-only
- * with a real production session as the data source.
+ * The benchmark measures three per-pass tag-query approaches.
  *
  * Three paths:
  *
- *   A) CURRENT — single `SELECT ... FROM tags WHERE session_id = ?` that
- *      loads every tag (status active|dropped|compacted), then JS-side
- *      iterates to find:
- *        - dropped rows whose tag_number is in `targets`
- *        - the maximum dropped tag_number (watermark)
- *        - active rows for cleanup/nudger
  *
- *   B) P0 ONLY — three targeted SQL helpers:
- *        - getTagsByNumbers(targets.keys())  → for applyFlushedStatuses
- *        - getMaxDroppedTagNumber()          → for watermark
- *        - getActiveTagsBySession()          → for cleanup/nudger
- *      Uses only the existing index `(session_id, tag_number)` which
- *      covers `WHERE session_id = ?` but NOT the status predicate.
+ * `getMaxDroppedTagNumber()` supplies the watermark.
+ * `getActiveTagsBySession()` supplies cleanup and nudger tags.
+ * The P0-only path uses the `(session_id, tag_number)` index.
+ * The `(session_id, tag_number)` index covers `WHERE session_id = ?` but not the status predicate.
  *
- *   C) P0 + PARTIAL INDEXES — same queries as B, but with two new
- *      partial indexes on `WHERE status = 'active'` and `WHERE status =
- *      'dropped'` so the active-only and dropped-only queries become
+ * Partial indexes for `status = 'active'` and `status = 'dropped'` make active-only and dropped-only queries index-only scans.
  *      index-only scans.
  *
- * Why a temp DB copy:
- *   - We don't want to mutate the user's live DB by adding indexes for
- *     the benchmark. Copy to /tmp, attach indexes there, dispose at end.
- *   - SQLite page cache is stable across queries within a process, so we
- *     warm the cache once and time many iterations to get reliable mean.
+ * The isolated copy prevents benchmark indexes from mutating the live database.
+ * The benchmark warms SQLite's page cache once before timed iterations.
  *
  * Run:
- *   cd packages/plugin && bun run scripts/benchmark-tag-queries.ts
  */
 
 import { Database, type Statement } from "bun:sqlite";
@@ -52,13 +35,8 @@ const LIVE_DB_PATH =
         "context.db",
     );
 
-// AFT session — 48,949 tags total, 399 active (0.8%). Worst-case for the
-// current scan-everything approach, best-case for partial indexes.
 const SESSION_ID = process.env.BENCH_SESSION_ID ?? "ses_331acff95fferWZOYF1pG0cjOn";
 
-// Iterations per phase. With 48k rows the current path is ~70ms so
-// 200 iters = ~14s per phase, ~45s total. Tweak if you want tighter
-// or looser stats.
 const ITERATIONS = 200;
 const WARMUP_ITERS = 20;
 
@@ -82,13 +60,10 @@ function setupTempDb(): { db: DB; tempDir: string; path: string } {
         throw new Error(`Live DB not found at ${LIVE_DB_PATH}`);
     }
 
-    // Copy to a temp dir so we can experiment with index changes without
-    // touching the user's live DB.
     const tempDir = mkdtempSync(join(tmpdir(), "mc-bench-tags-"));
     const tempDbPath = join(tempDir, "context.db");
     copyFileSync(LIVE_DB_PATH, tempDbPath);
 
-    // Also copy WAL/SHM files if present to ensure consistent snapshot.
     for (const suffix of ["-wal", "-shm"]) {
         const sidecar = LIVE_DB_PATH + suffix;
         if (existsSync(sidecar)) {
@@ -96,7 +71,7 @@ function setupTempDb(): { db: DB; tempDir: string; path: string } {
         }
     }
 
-    // Need write access for ANALYZE / index creation in path C.
+    // Path C creates indexes and runs `ANALYZE`, so it requires write access.
     const db = new Database(tempDbPath, { readwrite: true });
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA synchronous = NORMAL");
@@ -108,12 +83,6 @@ function pickRealTargets(
     sessionId: string,
     n: number,
 ): Map<number, { tagNumber: number; status: string }> {
-    // Targets in production are tag_numbers for tags currently visible in
-    // the post-injection message array. The visible window is roughly the
-    // tail of the session, so picking the highest N tag_numbers is a fair
-    // approximation. Mix in some active and some dropped to mirror real
-    // pass behavior (most active are at the tail, most dropped are older
-    // but some recent visible tags are also dropped).
     const rows = db
         .prepare(
             `SELECT tag_number, status FROM tags
@@ -138,7 +107,6 @@ interface PathResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Path A — current single-query approach (matches getTagsBySession)
 // ─────────────────────────────────────────────────────────────────────────
 
 function pathA_current(
@@ -155,7 +123,6 @@ function pathA_current(
         )
         .all(sessionId) as BenchTagEntry[];
 
-    // Mimic applyFlushedStatuses + watermark + active filter loops
     let flushedDroppedCount = 0;
     let flushedTruncatedCount = 0;
     let maxDroppedTagNumber = 0;
@@ -182,14 +149,12 @@ function pathA_current(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Path B — three targeted helpers, no new indexes
 // ─────────────────────────────────────────────────────────────────────────
 
 interface PreparedB {
     activeStmt: Stmt;
     maxDroppedStmt: Stmt;
-    // tagsByNumbers can't be a single prepared statement because the IN
-    // list size varies. We build it per call.
+    // `tagsByNumbers` builds SQL per call because the `IN` list size varies.
 }
 
 function preparePathB(db: DB): PreparedB {
@@ -212,7 +177,6 @@ function pathB_targeted(
     sessionId: string,
     targets: Map<number, unknown>,
 ): PathResult {
-    // 1. Active tags for heuristic cleanup, nudger, caveman replay scope.
     const activeTags = prep.activeStmt.all(sessionId) as Array<{
         tag_number: number;
         message_id: string;
@@ -222,11 +186,9 @@ function pathB_targeted(
     }>;
     const activeCount = activeTags.length;
 
-    // 2. Watermark (single-row aggregate).
     const watermarkRow = prep.maxDroppedStmt.get(sessionId) as { max_dropped: number | null };
     const maxDroppedTagNumber = watermarkRow.max_dropped ?? 0;
 
-    // 3. Dropped/truncated rows for current targets only.
     const targetNumbers = [...targets.keys()];
     let flushedDroppedCount = 0;
     let flushedTruncatedCount = 0;
@@ -258,7 +220,6 @@ function pathB_targeted(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Path C — P0 + partial indexes (active and dropped)
 // ─────────────────────────────────────────────────────────────────────────
 
 function addPartialIndexes(db: DB) {
@@ -271,8 +232,6 @@ function addPartialIndexes(db: DB) {
         ON tags(session_id, tag_number)
         WHERE status = 'dropped';
     `);
-    // ANALYZE helps the planner pick the partial index when there's a
-    // choice between the existing compound index and the new partial one.
     db.exec("ANALYZE tags;");
 }
 
@@ -400,8 +359,6 @@ function main() {
             `Tag distribution: total=${totalRow.c}  active=${activeRow.c}  dropped=${droppedRow.c}  compacted=${compactedRow.c}`,
         );
 
-        // Pick a realistic target set: 565 most-recent tags (matches the
-        // ~565 transform targets the user observed in the live log).
         const targets = pickRealTargets(db, SESSION_ID, 565);
         const droppedInTargets = [...targets.values()].filter((t) => t.status === "dropped").length;
         const activeInTargets = [...targets.values()].filter((t) => t.status === "active").length;
@@ -412,7 +369,6 @@ function main() {
         console.log("");
 
         // ──────────────────────────────────────────────────────────────
-        // Path A — current single-query
         // ──────────────────────────────────────────────────────────────
         console.log("Path A — current `getTagsBySession` (loads ALL tags)");
         const resA = bench("path A: SELECT * + JS filter", ITERATIONS, () =>
@@ -425,7 +381,6 @@ function main() {
         console.log("");
 
         // ──────────────────────────────────────────────────────────────
-        // Path B — P0 helpers, no new indexes
         // ──────────────────────────────────────────────────────────────
         console.log("Path B — P0 targeted helpers (existing indexes only)");
         const prepB1 = preparePathB(db);
@@ -443,7 +398,6 @@ function main() {
         console.log("");
 
         // ──────────────────────────────────────────────────────────────
-        // Path C — P0 helpers + partial indexes
         // ──────────────────────────────────────────────────────────────
         console.log("Path C — P0 targeted helpers + partial indexes");
         addPartialIndexes(db);

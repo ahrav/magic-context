@@ -4,11 +4,7 @@ import * as bootQuiet from "./plugin/boot-quiet";
 import * as dreamTimer from "./plugin/dream-timer";
 import * as rpcServer from "./shared/rpc-server";
 
-// The Broca-child guard must return from the plugin entry BEFORE the first
-// side effect. Config migration is that first side effect, so its mock
-// throws a sentinel: the guard-on path must never reach it, and the
-// guard-off path must hit it immediately — proving ordinary startup still
-// proceeds past the guard.
+// MAGIC_CONTEXT_BROCA_CHILD="1" returns before config migration.
 const MIGRATION_SENTINEL = "MIGRATION-SIDE-EFFECT";
 const migrationSpy = mock((): string[] => {
     throw new Error(MIGRATION_SENTINEL);
@@ -88,9 +84,7 @@ describe("Broca-child guard in the plugin entry", () => {
         delete process.env.MAGIC_CONTEXT_BROCA_CHILD;
         const server = await freshPluginServer();
 
-        // Ordinary startup reaches the boot-quiet marker and then the first
-        // real side effect (the throwing migration mock), proving the guard
-        // did not short-circuit a normal load.
+        // Unguarded startup reaches migration rather than returning at the child guard.
         await expect(server(minimalCtx())).rejects.toThrow(MIGRATION_SENTINEL);
         expect(bootQuietSpy).toHaveBeenCalledTimes(1);
         expect(migrationSpy).toHaveBeenCalledTimes(1);

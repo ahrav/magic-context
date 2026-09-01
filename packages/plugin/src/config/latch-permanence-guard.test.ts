@@ -14,9 +14,7 @@ type KnownSlot = {
 };
 
 /**
- * Every module-level mutable slot whose name says it can retain a capability,
- * absence, or failure verdict. A new matching slot must be classified here so
- * a negative cache cannot quietly become permanent.
+ * KNOWN_SLOTS classifies module-level mutable slots that can retain a capability, absence, or failure verdict.
  */
 const KNOWN_SLOTS: Record<string, KnownSlot> = {
     "packages/plugin/src/features/magic-context/compaction-marker.ts:cachedSchemaCompatible": {
@@ -158,16 +156,12 @@ function sourceFiles(directory: string): string[] {
 }
 
 function declaredOneShotSlots(source: string): string[] {
-    // `let` is deliberate: this targets mutable module state, not constant lookup
-    // tables or prepared-statement handles. The initializer restriction excludes
-    // ordinary counters and per-call scratch values.
     const declarations =
         /^(?:export\s+)?let\s+([A-Za-z_$][\w$]*)\b[^\n]*(?:=\s*(?:null|false|true)|Promise<)/gm;
     const verdictName =
         /(?:attempted|availability|compatible|cooldown|disabled|failed|failure|latch|missing|permission|promise|registered|unavailable)/i;
     const moduleSlots = [...source.matchAll(declarations)].map((match) => match[1]);
-    // A provider-local permanent failure has the same operational effect as a
-    // module slot: every later provider call short-circuits without re-probing.
+    // Provider-local permanent failures short-circuit later provider calls without re-probing.
     const providerLatches = [
         ...source.matchAll(/^\s*private\s+(permanentFailure)\s*=\s*false;/gm),
     ].map((match) => match[1]);

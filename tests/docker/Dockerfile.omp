@@ -39,13 +39,16 @@ COPY packages/pi-plugin/dist/ /test/mc-pi/dist/
 COPY tests/docker/.generated/subagent-runner-e2e.mjs /test/e2e/subagent-runner-e2e.mjs
 COPY packages/pi-plugin/package.json /test/mc-pi/package.json
 COPY packages/pi-plugin/README.md /test/mc-pi/README.md
+COPY packages/mc-shm-native/package.json packages/mc-shm-native/index.js packages/mc-shm-native/index.ts /test/mc-shm-native/
 RUN cd /test/mc-pi && \
+    npm pkg set 'dependencies.@cortexkit/mc-shm-native=file:/test/mc-shm-native' && \
     npm install --omit=dev --no-audit --no-fund --workspaces=false \
         --no-package-lock --legacy-peer-deps
 
 COPY packages/cli/dist/ /test/mc-cli/dist/
 COPY packages/cli/package.json /test/mc-cli/package.json
 RUN cd /test/mc-cli && \
+    npm pkg set 'dependencies.@cortexkit/mc-shm-native=file:/test/mc-shm-native' && \
     npm install --omit=dev --no-audit --no-fund --workspaces=false \
         --no-package-lock --legacy-peer-deps
 RUN chmod +x /test/mc-cli/dist/index.js && \

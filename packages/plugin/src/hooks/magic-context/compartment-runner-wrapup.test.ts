@@ -299,12 +299,7 @@ describe("runCompartmentAgent wrapup controls", () => {
                 });
             });
 
-            // The downgrade proof is the HEALING, not promotion: an un-downgraded
-            // forced keep would persist BOTH compartments; the token-capped chunk
-            // instead drops the provisional tail (discard-last), and the discarded
-            // range re-reads next iteration. Promotion is skipped on discard-last
-            // runs by long-standing design (unanchored facts would double-store on
-            // the re-read), so no memories may appear here.
+            // discard-last skips promotion to avoid double-storing unanchored facts on reread.
             expect(getCompartments(db, sessionId)).toHaveLength(1);
             expect(getCompartments(db, sessionId)[0]?.endMessage).toBe(2);
             expect(projectClaims(db, project)).toHaveLength(0);

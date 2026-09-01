@@ -100,14 +100,7 @@ describe("cross-runtime direct-format vocabulary", () => {
         expect(computeSchemaManifestDigest(manifest)).toBe(vocabulary.goldens.manifestDigest);
     });
 
-    // The Rust dashboard verifier cannot compose TypeScript components, so it
-    // reads this golden inventory as its expected object set. `provides` lists
-    // owning tables only, which leaves indexes, triggers, and views outside the
-    // manifest digest above — so nothing else here would notice an index or
-    // trigger being added, renamed, or dropped. Without this assertion the
-    // golden silently rots and the dashboard eventually refuses every valid
-    // database. Regenerate the fixture's `goldens.schemaObjectNames` from
-    // `computeExpectedDirectFormat()` whenever the registered schema changes.
+    // The Rust verifier uses `goldens.schemaObjectNames` because `provides` omits indexes, triggers, and views from the manifest digest.
     it("pins the golden schema-object inventory the Rust verifier consumes", () => {
         expect(vocabulary.goldens.schemaObjectNames).toEqual([...EXPECTED.schemaObjectNames]);
     });
@@ -371,12 +364,8 @@ describe("reset marker and interrupted quarantine", () => {
             ]);
 
             const walDestination = join(quarantineDirPath, "context.db-wal");
-            // Identity is dev+inode, so a replacement must land on a DIFFERENT
-            // inode for this to test anything. Deleting first and recreating
-            // leaves that to the filesystem, which recycles the just-freed inode
-            // often enough that CI saw the replacement classified as a clean
-            // move. Staging a sibling file while the original still holds its
-            // inode forces a distinct one, then renaming it into place keeps it.
+            // Deleting first can recycle the just-freed inode and classify the replacement as a clean move.
+            // Renaming the staged sibling into place preserves its distinct inode.
             const replacement = `${walDestination}.replacement`;
             writeFileSync(replacement, "replacement");
             expect(statSync(replacement).ino).not.toBe(statSync(walDestination).ino);
@@ -390,12 +379,7 @@ describe("reset marker and interrupted quarantine", () => {
     });
 
     it("keeps a same-identity family file whose size drifted from the record", () => {
-        // The marker records sizes before the final holder inspection, so a
-        // holder writing in that window changes any family file's size in place
-        // while dev/inode stay fixed. Size is therefore not an identity input:
-        // comparing it would refuse a genuine family, and a pending marker
-        // blocks database initialization. A same-dev/same-inode replacement can
-        // only be caught by content identity, which this marker does not record.
+        // Size is not an identity input: a holder can change a family file's size after recording while its dev/inode remain fixed.
         const dir = mkdtempSync(join(tmpdir(), "mc-reset-size-drift-"));
         try {
             const dbPath = join(dir, "context.db");
@@ -415,8 +399,7 @@ describe("reset marker and interrupted quarantine", () => {
             const walDestination = join(quarantineDirPath, basename(walSource));
             renameSync(walSource, walDestination);
 
-            // Grow at the source, grow at the quarantine destination, and
-            // truncate at the source: all three keep dev/inode.
+            // Growing either file or truncating the source preserves dev/inode identity.
             appendFileSync(databaseFamilyFilePath(dbPath, "main"), " appended by a live holder");
             appendFileSync(walDestination, " appended through a pre-rename descriptor");
             writeFileSync(databaseFamilyFilePath(dbPath, "shm"), "");
@@ -471,7 +454,7 @@ describe("reset marker and interrupted quarantine", () => {
             throw Object.assign(new Error(`injected ${code} on ${call}`), { code });
         }
 
-        /** Cap every write at `limit` bytes, so the marker needs several calls. */
+        /* */
         function cappedWrite(limit: number): ResetMarkerPublicationFs["writeSync"] {
             return ((fd: number, buffer: Buffer, offset: number, _length: number) =>
                 writeSync(
@@ -501,8 +484,7 @@ describe("reset marker and interrupted quarantine", () => {
         }
 
         /**
-         * The bootstrap refusal in storage-db keys on the `reset-marker`
-         * artifact, so this is the exact predicate a leftover marker trips.
+         * The bootstrap refusal in `storage-db` keys on the `reset-marker` artifact; a leftover marker satisfies that predicate.
          */
         function familyOpensAsCurrent(dbPath: string, incarnation: string): void {
             expect(listDatabaseFamilyArtifacts(dbPath)).not.toContain("reset-marker");
@@ -526,8 +508,7 @@ describe("reset marker and interrupted quarantine", () => {
 
         it("removes the file it created when publication fails, leaving the database openable", () => {
             const failures: Array<[string, Partial<ResetMarkerPublicationFs>, RegExp]> = [
-                // A short write plus a failed fsync is the finding's exact shape:
-                // without cleanup the fsynced prefix reads back as malformed.
+                // Cleanup prevents the fsynced prefix from being read as a malformed marker.
                 [
                     "short write then fsync failure",
                     {
@@ -542,8 +523,7 @@ describe("reset marker and interrupted quarantine", () => {
                     { chmodSync: () => failWith("EPERM", "chmod") },
                     /EPERM on chmod/,
                 ],
-                // A write that stops making progress must fail closed rather
-                // than spin, and must not leave the written prefix behind.
+                // A write that stops making progress must fail without retrying or leaving the written prefix.
                 [
                     "write that stops making progress",
                     { writeSync: (() => 0) as ResetMarkerPublicationFs["writeSync"] },
@@ -573,8 +553,8 @@ describe("reset marker and interrupted quarantine", () => {
         });
 
         it("blocks the database once publication actually succeeds", () => {
-            // Control for the test above: the assertions there only mean
-            // something because a published marker does refuse the family.
+            // A published reset marker causes bootstrap to refuse its database family.
+            // A published reset marker causes bootstrap to refuse its database family.
             const dir = mkdtempSync(join(tmpdir(), "mc-reset-publish-ok-"));
             try {
                 const { dbPath } = seedCurrentFamily(dir);
@@ -615,8 +595,7 @@ describe("reset marker and interrupted quarantine", () => {
             try {
                 const { dbPath } = seedCurrentFamily(dir);
                 const path = databaseResetMarkerPath(dbPath);
-                // O_EXCL: the marker below belongs to a concurrent or prior
-                // reset, so the open fails and cleanup must never run.
+                // An existing marker prevents exclusive creation without cleanup.
                 writeFileSync(path, "another reset's marker\n", { mode: 0o600 });
                 expect(() =>
                     writeDatabaseResetMarker(markerFor(dbPath), {
@@ -652,7 +631,6 @@ describe("reset marker and interrupted quarantine", () => {
                 expect(message).toContain("injected EACCES on unlink");
                 expect(message).toContain("remove it manually");
                 expect((thrown as Error).cause).toMatchObject({ code: "EIO" });
-                // The marker really does remain, which is what the message says.
                 expect(existsSync(databaseResetMarkerPath(dbPath))).toBe(true);
             } finally {
                 rmSync(dir, { recursive: true, force: true });

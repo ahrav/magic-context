@@ -1,11 +1,5 @@
 /**
- * Pure effective-policy evaluator (claim-trust-policy plan: U4; KTD7).
  *
- * One versioned, table-driven decision for every current agent surface
- * (R18-R23). Dependency-light on purpose: no database imports, so the U1
- * seeder, SQL projection writer, hydration/render recheck, and harness
- * renderers all share exactly this module — a second evaluator would be a
- * trust bypass (KTD10 rationale).
  */
 
 import {
@@ -19,22 +13,12 @@ import {
 export { CLAIM_POLICY_VERSION };
 
 /**
- * Agent-facing and host-only surfaces (R18).
  *
- * `review` is evaluated but NOT yet persisted or read: the projection stores
- * only `auto_eligible`/`explicit_eligible`, and `MemoryPolicySurface` has no
- * `review` member, so no host review channel consumes it today. It stays in
- * the matrix so the evaluator remains the single place a surface decision is
- * defined; treat `review_audit` as a reserved shape, not a live audit path.
  */
 export const POLICY_SURFACES = ["auto_inject", "auto_search", "explicit_search", "review"] as const;
 export type PolicySurface = (typeof POLICY_SURFACES)[number];
 
 /**
- * Active epistemic facts, orthogonal to maturity (R14). `contradicted` and
- * `superseded` derive from claim_conflicts; `stale`/`disputed` from
- * verification events or explicit disposition events; `rejected` and
- * `quarantined` from explicit disposition events only.
  */
 export interface ActiveDispositions {
     readonly stale: boolean;
@@ -54,24 +38,24 @@ export const NO_DISPOSITIONS: ActiveDispositions = {
     quarantined: false,
 };
 
-/** Current-support facts the reducer selects the effective rung from (R15). */
+/* */
 export interface PolicySupport {
     /** Head of the append-only maturity stream; null when never asserted. */
     readonly historicalMaturity: MaturityLevel | null;
-    /** Currently effective host-recorded approve action (R10). */
+    /** Whether an effective host-recorded approval exists. */
     readonly approved: boolean;
-    /** Currently valid passing enforcement artifact (R11). */
+    /** Whether a valid passing enforcement artifact exists. */
     readonly enforcedArtifact: boolean;
     /** Currently effective exact-revision positive verification. */
     readonly verified: boolean;
-    /** Exact explicit-user origin evidence also supports VERIFIED (R25). */
+    /** Exact explicit-user origin evidence supports `VERIFIED`. */
     readonly explicitUserEvidence: boolean;
-    /** Independently rooted evidence groups (R6). */
+    /** Number of independently rooted evidence groups. */
     readonly independentGroups: number;
 }
 
 export interface PolicySubjectState {
-    /** False when the revision has no policy subject row (R26). */
+    /** False when the revision has no policy-subject row. */
     readonly present: boolean;
     readonly originTaint: FineTaint | null;
     readonly policyVersion: number | null;
@@ -103,9 +87,6 @@ export interface SurfaceDecision {
 }
 
 /**
- * Complete decision for one revision snapshot (R18). `agentLabel` is the only
- * text an agent surface may render: sanitized maturity/taint/disposition
- * words, never locators, hashes, identities, or conflict details.
  */
 export interface PolicyDecision {
     readonly effectiveMaturity: MaturityLevel;
@@ -117,7 +98,7 @@ export interface PolicyDecision {
     readonly policyVersion: number;
 }
 
-/** Highest rung the current support carries (R15). */
+/* */
 export function supportedMaturity(support: PolicySupport): MaturityLevel {
     if (support.approved && support.enforcedArtifact) return "ENFORCED";
     if (support.approved) return "APPROVED";
@@ -126,13 +107,10 @@ export function supportedMaturity(support: PolicySupport): MaturityLevel {
     return "CANDIDATE";
 }
 
-/** Effective rung: the currently supported rung, never above history (R7, R15). */
+/** The effective rung never exceeds historical maturity. */
 export function effectiveMaturity(support: PolicySupport): MaturityLevel {
     const historical = support.historicalMaturity ?? "CANDIDATE";
     const supported = supportedMaturity(support);
-    // MATURITY_LEVELS is rank-ordered by construction and MATURITY_RANK indexes
-    // into it, so the ladder ordering exists exactly once (a local copy could
-    // silently map a rank to the wrong rung, and `>= VERIFIED` gates automatic
     // visibility).
     return MATURITY_LEVELS[Math.min(MATURITY_RANK[historical], MATURITY_RANK[supported])];
 }
@@ -149,8 +127,6 @@ function activeDispositionNames(dispositions: ActiveDispositions): string[] {
 }
 
 /**
- * The visibility matrix (product contract). One pure function; every surface
- * integration consumes this decision instead of deriving policy (R18-R22).
  */
 export function evaluateClaimPolicy(input: PolicyEvaluationInput): PolicyDecision {
     const { subject, support, dispositions } = input;
@@ -168,9 +144,6 @@ export function evaluateClaimPolicy(input: PolicyEvaluationInput): PolicyDecisio
         (subject.policyVersion == null || subject.policyVersion > CLAIM_POLICY_VERSION);
     if (policyMissing) reasonCodes.push("policy_state_missing");
     if (versionUnsupported) reasonCodes.push("policy_version_unsupported");
-    // An unsupported revision's stored taint was written under a scheme this
-    // evaluator does not understand; surfacing it raw would leak identifiers
-    // the storage path (`storage-claim-visibility.ts`) maps to `unknown`.
     const taint =
         subject.present && !versionUnsupported && subject.originTaint != null
             ? subject.originTaint
@@ -185,8 +158,8 @@ export function evaluateClaimPolicy(input: PolicyEvaluationInput): PolicyDecisio
     const matureEnough = MATURITY_RANK[maturity] >= MATURITY_RANK.VERIFIED;
     if (!matureEnough) reasonCodes.push("maturity_below_automatic");
 
-    // Automatic surfaces (R19): effective VERIFIED+ with no disposition and a
-    // present, supported policy subject. Anything else fails closed.
+    // Automatic surfaces require effective `VERIFIED` maturity, a supported policy subject, and no dispositions.
+    // Automatic surfaces are hidden unless maturity is `VERIFIED` or higher, the policy subject is present and supported, and no disposition is set.
     const autoEligible =
         !hardHidden &&
         !softHiding &&
@@ -195,10 +168,10 @@ export function evaluateClaimPolicy(input: PolicyEvaluationInput): PolicyDecisio
         !versionUnsupported &&
         matureEnough;
 
-    // Explicit search (R17, R20): hard-hidden and rejected rows never appear;
-    // missing/unsupported policy appears only as a labeled unknown on the
-    // TypeScript compatibility path; everything else appears, labeled unless
-    // it is a clean effective-VERIFIED+ row.
+    // `explicit_search` excludes hard-hidden and rejected rows.
+    // `explicit_search` labels eligible rows that are not auto-eligible.
+    // `explicit_search` labels every eligible row that is not auto-eligible.
+    // `explicit_search` renders normal only for auto-eligible rows.
     const explicitEligible = !hardHidden && !dispositions.rejected;
     const explicitLabeled =
         explicitEligible && (!autoEligible || !matureEnough || softHiding || policyMissing);
@@ -212,9 +185,8 @@ export function evaluateClaimPolicy(input: PolicyEvaluationInput): PolicyDecisio
         explicit_search: explicitEligible
             ? { eligible: true, renderMode: explicitLabeled ? "labeled" : "normal" }
             : hiddenSurface,
-        // Host-only review would always include the row, with hard-hidden rows
-        // carrying audit context there and nowhere else (R16-R17). Nothing
-        // persists or reads this decision yet — see POLICY_SURFACES.
+        // `review` is eligible for every row.
+        // `review` uses `review_audit` for hard-hidden rows.
         review: { eligible: true, renderMode: hardHidden ? "review_audit" : "normal" },
     };
 
@@ -230,13 +202,8 @@ export function evaluateClaimPolicy(input: PolicyEvaluationInput): PolicyDecisio
 }
 
 /**
- * Sanitized agent-facing label for explicit-search rendering (R18, R20).
- * Deliberately excludes locators, hashes, identities, reviewer identity, and
  * conflict details.
  *
- * This is the ONLY label entry point: the shipped reader
- * (`storage-claim-visibility.decideMemoryPolicy`) calls it with the projected
- * columns, so there is no second label path that could drift from it.
  */
 export function explicitSearchLabelFromFields(fields: {
     effectiveMaturity: string;

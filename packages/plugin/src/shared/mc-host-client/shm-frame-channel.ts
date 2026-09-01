@@ -1,10 +1,10 @@
 import {
     NativeChannel,
-    type NativeDescriptor,
     type NativeProducerReservation,
     type NativeReceiveLease,
+    type NativeSetupOptions,
     type ProducerCursor,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import type { Deadline } from "./deadline";
 import { McHostCallError } from "./errors";
 import {
@@ -16,38 +16,69 @@ import {
     type FrameChannelStats,
     type FrameSendHooks,
     type FrameSendTicket,
+    headerViolation,
     type OutboundFrame,
     type ProducerFrameHeader,
     ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
-import { decodeHeader, type EnvelopeHeader, encodeHeader, HEADER_LEN } from "./protocol";
+import {
+    decodeHeader,
+    type EnvelopeHeader,
+    encodeHeader,
+    HEADER_LEN,
+    PROTOCOL_VERSION,
+} from "./protocol";
+
+class InboundFrameError extends Error {
+    constructor(
+        readonly reason: "protocol_violation" | "role_violation",
+        message: string,
+    ) {
+        super(message);
+    }
+}
 
 export interface ShmFrameChannelOptions {
-    descriptor?: NativeDescriptor;
+    /** Injected only by unit tests; production attaches through `setup`. */
     nativeChannel?: NativeChannel;
+    setup?: NativeSetupOptions;
     budget: ByteBudget;
     maxBodyLen: number;
     handlers: FrameChannelHandlers;
 }
 
+// Explicit reservations have no published frame and may make one bounded capacity probe.
+const MAX_RESERVATION_BLOCK_MS = 5;
+
+/** A full ring is backpressure, so callers may retry rather than fail the route. */
+function ringFullError(cause: unknown): McHostCallError {
+    return new McHostCallError(
+        "not_sent",
+        "shared-memory ring has no capacity for this frame",
+        "ring_full",
+        cause,
+    );
+}
+
+function isRingFull(error: unknown): boolean {
+    return error instanceof Error && error.message === "shared-memory ring is full";
+}
+
 export class ShmFrameChannel implements SetupFrameChannel {
     private native: NativeChannel | null;
     private readonly copies = new CopyCounter();
-    private timer: ReturnType<typeof setInterval> | null = null;
+    private readinessStarted = false;
+    private drainScheduled = false;
     private closed = false;
     private readonly receiveLeases = new Set<ReceiveLease>();
     private quarantinedBytes = 0;
     private heldBytes = 0;
 
     constructor(private readonly options: ShmFrameChannelOptions) {
-        if (!options.nativeChannel && !options.descriptor) {
+        if (!options.nativeChannel && !options.setup) {
             throw new Error("shared-memory channel requires an attachment");
         }
-        // Attachment I/O (fd opens, grant validation, mappings) belongs in
-        // the deadline-raced start() phase per the provider contract, so a
-        // descriptor is only recorded here; a pre-attached channel carries
-        // no attachment I/O and is adopted directly.
         this.native = options.nativeChannel ?? null;
     }
 
@@ -56,16 +87,27 @@ export class ShmFrameChannel implements SetupFrameChannel {
             throw new McHostCallError("not_sent", "shared-memory channel closed");
         }
         if (!this.native) {
+            const setup = this.options.setup;
+            if (!setup) throw new Error("shared-memory setup is missing");
             if (deadline.remainingMs() <= 0) {
                 throw new McHostCallError("not_sent", "shared-memory setup deadline expired");
             }
-            this.native = NativeChannel.attach(this.options.descriptor as NativeDescriptor);
+            this.native = await NativeChannel.connectSetup({
+                ...setup,
+                timeoutMs: Math.max(1, Math.ceil(deadline.remainingMs())),
+            });
+            if (this.closed) {
+                this.native.close();
+                this.native = null;
+                throw new McHostCallError("not_sent", "shared-memory channel closed");
+            }
         }
     }
 
     beginFrames(): void {
-        if (this.timer !== null) return;
-        this.timer = setInterval(() => this.poll(), 0);
+        if (this.readinessStarted) return;
+        this.readinessStarted = true;
+        this.attached().startReadiness(() => this.drainReady());
     }
 
     produce(
@@ -78,7 +120,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.assertBodyBounds(body.byteLength);
         // The native ring's fixed capacity is not the configured aggregate
         // cap: admission consults the shared budget so an over-cap body is
-        // refused with `memory_cap`, exactly like the TCP channel. The
+        // refused with `memory_cap`. The
         // charge covers the synchronous publication window and is returned
         // once the ring owns the bytes.
         const reservedBytes = HEADER_LEN + body.byteLength;
@@ -103,9 +145,10 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.admitPublication(reservedBytes);
         let reservation: NativeProducerReservation;
         try {
-            reservation = this.attached().reserve(capacity);
+            reservation = this.attached().reserve(capacity, MAX_RESERVATION_BLOCK_MS);
         } catch (error) {
             this.releasePublication(reservedBytes);
+            if (isRingFull(error)) throw ringFullError(error);
             throw error;
         }
         let held = true;
@@ -184,8 +227,6 @@ export class ShmFrameChannel implements SetupFrameChannel {
     close(): void {
         if (this.closed) return;
         this.closed = true;
-        if (this.timer !== null) clearInterval(this.timer);
-        this.timer = null;
         let quarantineError: unknown;
         for (const lease of [...this.receiveLeases]) {
             try {
@@ -215,7 +256,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
             queuedDataFrames: 0,
             queuedControlFrames: 0,
             readPaused: false,
-            activeTimers: this.timer === null ? 0 : 1,
+            activeTimers: 0,
             activeReceiveLeases: this.receiveLeases.size,
             quarantinedBytes: this.quarantinedBytes,
             ownedAdapterCopies: this.copies.copies,
@@ -249,24 +290,29 @@ export class ShmFrameChannel implements SetupFrameChannel {
         header: ProducerFrameHeader,
         body: DirectFrameBody,
         hooks?: FrameSendHooks,
-        deadline?: Deadline,
+        _deadline?: Deadline,
     ): FrameSendTicket {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         let published = false;
-        this.attached().produce(
-            encodeHeader({ ...header, len: body.byteLength }),
-            body.byteLength,
-            (cursor: ProducerCursor) => body.fill(cursor),
-            () => {
-                published = true;
-                try {
-                    hooks?.onPublish?.();
-                } catch {
-                    // Send hooks cannot change publication.
-                }
-            },
-            deadline?.remainingMs() ?? 0,
-        );
+        try {
+            this.attached().produce(
+                encodeHeader({ ...header, len: body.byteLength }),
+                body.byteLength,
+                (cursor: ProducerCursor) => body.fill(cursor),
+                () => {
+                    published = true;
+                    try {
+                        hooks?.onPublish?.();
+                    } catch {
+                        // Send hooks cannot change publication.
+                    }
+                },
+                0,
+            );
+        } catch (error) {
+            if (isRingFull(error)) throw ringFullError(error);
+            throw error;
+        }
         try {
             hooks?.onComplete?.();
         } catch {
@@ -292,51 +338,86 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.options.budget.release(bytes);
     }
 
-    private poll(): void {
+    private drainReady(): void {
         if (this.closed) return;
         try {
-            // Drains until the native side reports no progress. Consumer
-            // backpressure (retained leases at the ring's lease bound) is
-            // reported by `native.poll()` as `false`, not an error, so the
-            // drain pauses at the bound and the interval resumes delivery
-            // after a lease release; only genuine failures reach the catch.
-            while (
-                this.attached().poll((nativeLease: NativeReceiveLease) => {
-                    const header = decodeHeader(nativeLease.header);
-                    const segments = Array.from({ length: nativeLease.segmentCount }, (_, index) =>
-                        nativeLease.segment(index),
-                    );
-                    let lease: ReceiveLease;
-                    lease = new ReceiveLease(
-                        segments,
-                        (outcome) => {
-                            this.receiveLeases.delete(lease);
-                            if (outcome === "quarantined") this.quarantinedBytes += header.len;
-                            this.options.handlers.onLeaseReleased?.();
-                        },
-                        this.copies,
-                        () => {
+            for (let frames = 0; frames < 64; frames += 1) {
+                if (
+                    !this.attached().drainOne((nativeLease: NativeReceiveLease) => {
+                        const header = decodeHeader(nativeLease.header);
+                        const violation = headerViolation(header);
+                        const structuralError =
+                            header.ver !== PROTOCOL_VERSION
+                                ? "unsupported protocol version"
+                                : header.len !== nativeLease.byteLength
+                                  ? "ring frame length mismatch"
+                                  : header.len > this.options.maxBodyLen
+                                    ? "ring frame exceeds configured body limit"
+                                    : null;
+                        if (structuralError !== null || violation !== null) {
                             nativeLease.release();
-                            return "released";
-                        },
-                    );
-                    this.receiveLeases.add(lease);
-                    try {
-                        this.options.handlers.onFrame({ header, body: lease });
-                    } catch (error) {
-                        lease.release();
-                        throw error;
+                            throw new InboundFrameError(
+                                violation?.reason ?? "protocol_violation",
+                                structuralError ?? violation?.detail ?? "invalid ring frame",
+                            );
+                        }
+                        const segments = Array.from(
+                            { length: nativeLease.segmentCount },
+                            (_, index) => nativeLease.segment(index),
+                        );
+                        let lease: ReceiveLease;
+                        lease = new ReceiveLease(
+                            segments,
+                            (outcome) => {
+                                this.receiveLeases.delete(lease);
+                                if (outcome === "quarantined") this.quarantinedBytes += header.len;
+                                this.options.handlers.onLeaseReleased?.();
+                            },
+                            this.copies,
+                            () => {
+                                nativeLease.release();
+                                return "released";
+                            },
+                        );
+                        this.receiveLeases.add(lease);
+                        try {
+                            this.options.handlers.onFrame({ header, body: lease });
+                        } catch (error) {
+                            lease.release();
+                            throw error;
+                        }
+                    })
+                ) {
+                    // Readiness includes setup-socket closure. Check only after an empty drain so graceful Goodbye reaches dispatcher first.
+                    if (this.attached().peerClosed()) {
+                        this.options.handlers.onClosed("eof", undefined);
+                        try {
+                            this.close();
+                        } catch {
+                            // close() rethrows on quarantined leases; readiness callback has no caller.
+                        }
                     }
-                })
-            ) {}
+                    return;
+                }
+            }
+            if (!this.drainScheduled) {
+                this.drainScheduled = true;
+                queueMicrotask(() => {
+                    this.drainScheduled = false;
+                    if (!this.closed) this.drainReady();
+                });
+            }
+            return;
         } catch (error) {
-            this.options.handlers.onClosed("protocol_violation", error);
+            this.options.handlers.onClosed(
+                error instanceof InboundFrameError ? error.reason : "protocol_violation",
+                error,
+            );
             try {
                 this.close();
             } catch {
-                // close() rethrows on quarantined leases and has already
-                // reported that outcome; an interval callback has no caller
-                // to observe the throw, so it must not escape here.
+                // close() already reported a quarantined lease. Readiness
+                // callbacks have no caller to observe the repeated throw.
             }
         }
     }

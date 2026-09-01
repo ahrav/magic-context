@@ -36,7 +36,7 @@ export interface ToolArc {
     resOrdinal: number | null;
 }
 
-/** True when a tail beginning at `boundary` would retain a completed result without its call. */
+/** `completedToolArcCrossesBoundary` returns true when a tail beginning at `boundary` retains a completed result without its call. */
 export function completedToolArcCrossesBoundary(
     invOrdinal: number,
     resOrdinal: number,
@@ -48,27 +48,21 @@ export function completedToolArcCrossesBoundary(
 export interface TrueRawTokenIndexBuildOptions extends TrueRawEstimateOptions {
     cacheNamespace: string;
     /**
-     * Durable per-message token source. When provided and it returns a non-null
-     * value for a message, that value is used as the message's total instead of
-     * live-tokenizing its parts — this is how the protected-tail boundary reads
-     * the precomputed `tags.token_count` store (restart-durable) rather than
-     * re-tokenizing the whole raw session every cold pass. Returning null falls
-     * back to live tokenization for that message (untagged / legacy-NULL rows),
-     * which converges to the stored path once the tagger backfills.
+     * A non-null return value supplies the message's total token count.
+     * A non-null return value replaces live tokenization for that message.
+     * The protected-tail boundary uses stored totals instead of live-tokenizing message parts.
+     * A null return value falls back to live tokenization for that message.
      */
     storedTotalForMessage?: (message: RawMessage) => number | null;
     /**
-     * Absolute total message count for the session, when `messages` is a
-     * TAIL-ONLY slice carrying absolute ordinals (e.g. only messages after the
-     * last compartment boundary). The prefix/suffix machinery is sized to this
-     * count and ordinals outside the supplied slice contribute zero tokens —
-     * which is exactly correct for every offset-forward query the protected-tail
-     * boundary makes (its candidate, suffix, range, and head-cap reads never
-     * cross below the eligible offset). Lets the boundary resolve from only the
-     * eligible tail instead of reading the whole session every pass.
+     * Tail-only callers must set `absoluteMessageCount` to the absolute session count when `messages` retains absolute ordinals.
+     * `messages` may contain only the tail while retaining absolute ordinals.
+     * `absoluteMessageCount` sizes the prefix and suffix structures.
+     * Messages outside the supplied slice contribute zero tokens.
+     * Protected-tail queries never read below the eligible offset.
+     * The boundary can resolve from the eligible tail without reading the whole session.
      *
-     * Omitted for whole-session callers: defaults to `messages.length`, and with
-     * contiguous 1..N ordinals the result is byte-identical to the prior
+     * `absoluteMessageCount` defaults to `messages.length` for whole-session callers.
      * index-positional fill.
      */
     absoluteMessageCount?: number;
@@ -511,17 +505,9 @@ export function fenceBoundaryForToolArcs(
             }
             continue;
         }
-        // Open arc (a tool invocation with no matching result in the window).
-        // Only an open arc inside the live protected-tail window
-        // (invOrdinal >= recentOpenArcCutoff, the size-walk start) is treated as
-        // the current in-flight call and protected. An open arc OLDER than the
-        // window is an interrupted/abandoned invocation whose result will never
-        // arrive — protecting it would let one dead call at the eligible-head
-        // edge fence off the entire eligible region and freeze the historian
-        // indefinitely. Compacting it is safe: OpenCode mutates the tool part in
-        // place on completion (no later standalone tool_result to orphan), and
-        // the historian replaces the whole raw range with narration, so no
-        // dangling tool_use survives on the wire.
+        // The historian protects only open arcs inside the live protected-tail window.
+        // Protecting stale open arcs can block compaction of the eligible region.
+        // Compaction emits no dangling `tool_use`.
         if (arc.invOrdinal < recentOpenArcCutoff) continue;
         if (arc.invOrdinal >= lastCompartmentEndOrdinal + 1 && arc.invOrdinal < boundary) {
             return arc.invOrdinal;
@@ -551,21 +537,15 @@ export function buildTrueRawTokenIndex(
     options: TrueRawTokenIndexBuildOptions,
 ): TrueRawTokenIndex {
     const ordered = [...messages].sort((a, b) => a.ordinal - b.ordinal);
-    // `rawMessageCount` is the ABSOLUTE session message count. When the caller
-    // passes a tail-only slice it supplies the real total via
-    // absoluteMessageCount; otherwise it equals the slice length (whole-session
-    // path — unchanged). The prefix array is sized to the absolute count and
-    // filled BY ORDINAL (not by array position), so a tail slice with absolute
-    // ordinals base+1..N leaves the pre-base prefix flat at 0. Every
-    // offset-forward query (the only kind the boundary makes) is byte-identical
-    // because the pre-offset prefix term cancels in the suffix/range subtraction.
+    // `rawMessageCount` is the absolute session message count.
+    // Tail-only callers supply `rawMessageCount` through `absoluteMessageCount`.
+    // For whole-session callers, `rawMessageCount` equals `messages.length`.
     const sliceCount = ordered.length;
     const firstOrdinal = ordered.length > 0 ? ordered[0].ordinal : 1;
     const terminalOrdinal = ordered.length > 0 ? ordered[ordered.length - 1].ordinal : 0;
-    // Keep the public count compatible with absolute-session callers, but index token sums
-    // over the represented ordinal span. A continued lineage can begin at prior_last+1;
-    // treating its absolute ordinal as an array index would clamp every tail lookup to the
-    // same final element and silently collapse boundary token math.
+    // Public counts use absolute ordinals; token-sum indexing uses the represented ordinal span.
+    // A tail beginning at `prior_last + 1` must index token sums by its represented ordinal span.
+    // Using a tail message's absolute ordinal as an array index clamps its lookup to the final element.
     const rawMessageCount = Math.max(
         sliceCount,
         terminalOrdinal,
@@ -576,10 +556,6 @@ export function buildTrueRawTokenIndex(
     const idsByOrdinal = new Map<number, string>();
     const prefix = new Array<number>(ordinalSpan + 1).fill(0);
     for (const message of ordered) {
-        // Prefer the durable stored total (tags.token_count) when available; it
-        // equals the live tokenization of the same content (the tagger stores
-        // estimateTokens of each part), so the prefix sums and cut point are
-        // identical to the live path while skipping per-message tokenization.
         const stored = options.storedTotalForMessage?.(message);
         const total =
             stored !== undefined && stored !== null
@@ -587,14 +563,11 @@ export function buildTrueRawTokenIndex(
                 : tokenForMessage(message, options).total;
         tokensByOrdinal.set(message.ordinal, total);
         idsByOrdinal.set(message.ordinal, message.id);
-        // Park the token in the dense span while retaining its absolute ordinal key.
         const relative = message.ordinal - firstOrdinal + 1;
         if (relative >= 1 && relative <= ordinalSpan) {
             prefix[relative] = total;
         }
     }
-    // Convert the per-ordinal tokens into a cumulative prefix sum. O(N) integer
-    // adds (no I/O, no parse) — negligible versus the avoided full-session read.
     for (let k = 1; k <= ordinalSpan; k += 1) {
         prefix[k] += prefix[k - 1];
     }
@@ -667,19 +640,9 @@ export function buildTrueRawTokenIndex(
 }
 
 /**
- * Content-stable part fingerprint for the boundary-staleness check.
  *
- * Deliberately hashes ONLY the content-bearing fields the tokenizer counts
- * (text / thinking / tool input+output text), NOT the JSON envelope or
- * updated-at metadata. The same logical message is observed through two
- * different views — the DB rows (`readRawSession*FromDb`) and the transform's
- * in-memory `args.messages` (which carries extra runtime fields and no
- * timestamps) — and the fingerprint computed at trigger time from one view
- * must match the one recomputed at historian-start from the other, or every
- * memory-derived snapshot would be rejected as stale. Content edits and
- * message insertion/removal still change the fingerprint (content hashes/ids/
- * ordinals), which is exactly the staleness the check exists to catch;
- * metadata-only drift never affects the historian's chunk content.
+ * The fingerprint hashes only the content-bearing fields counted by the tokenizer.
+ * The fingerprint excludes the JSON envelope and `updated-at` metadata.
  */
 function partContentFingerprint(part: unknown): string {
     if (!isRecord(part)) return `${typeof part}:${recursiveByteLength(part)}`;

@@ -14,7 +14,7 @@
  * bind this contract's digest instead.
  *
  * Generation is gated on `release/mc-host-registry-gate.json`, the local evidence
- * file release engineering populates after the real npm R50 checks (six-name
+ * file release engineering populates after the real npm R50 checks (five-name
  * ownership/reservation, trusted publishers, revoked bootstrap credential, and one
  * synchronized unpublished version). No registry call happens here; an absent or
  * failing gate file blocks generation.
@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
 // Contract literal: the single pre-build source of truth.
 // ---------------------------------------------------------------------------
 
-/** The synchronized release version, unpublished across all six package names (R50). */
+/** Synchronized release version (R50). */
 const RELEASE_VERSION = "0.38.0";
 
 const PARENT_PACKAGES = [
@@ -42,11 +42,15 @@ const PARENT_PACKAGES = [
     "@cortexkit/pi-magic-context",
 ] as const;
 
-const PAYLOAD_PACKAGES = [
-    "@cortexkit/mc-host-darwin-arm64",
-    "@cortexkit/mc-host-darwin-x64",
-    "@cortexkit/mc-host-linux-x64-gnu",
-] as const;
+const PAYLOAD_PACKAGES = ["@cortexkit/mc-host-linux-x64-gnu"] as const;
+
+/**
+ * The shared-memory addon is a non-optional dependency of every parent, so an
+ * unpublished or unowned name breaks `npm install` outright rather than
+ * degrading one capability. It is not a payload: it carries the loader, not a
+ * daemon binary.
+ */
+const ADDON_PACKAGES = ["@cortexkit/mc-shm-native"] as const;
 
 const CONTRACT = {
     schema: "magic-context.mc-host-release/v1",
@@ -57,6 +61,7 @@ const CONTRACT = {
     packages: {
         parents: [...PARENT_PACKAGES],
         payloads: [...PAYLOAD_PACKAGES],
+        addons: [...ADDON_PACKAGES],
         version: RELEASE_VERSION,
     },
     versions: {
@@ -148,40 +153,6 @@ const CONTRACT = {
     platforms: {
         supported: [
             {
-                target: "darwin-arm64",
-                os_min: "13.5",
-                synapse: "unsupported",
-                synapse_reason: "synapse_unsupported",
-                capabilities: {
-                    dev_fd_exec: true,
-                    filesystem: [
-                        "atomic_same_filesystem_replacement",
-                        "cross_process_locks",
-                        "file_and_directory_fsync",
-                        "local_filesystem",
-                        "no_follow_link_semantics",
-                        "retained_object_execution",
-                    ],
-                },
-            },
-            {
-                target: "darwin-x64",
-                os_min: "13.5",
-                synapse: "unsupported",
-                synapse_reason: "synapse_unsupported",
-                capabilities: {
-                    dev_fd_exec: true,
-                    filesystem: [
-                        "atomic_same_filesystem_replacement",
-                        "cross_process_locks",
-                        "file_and_directory_fsync",
-                        "local_filesystem",
-                        "no_follow_link_semantics",
-                        "retained_object_execution",
-                    ],
-                },
-            },
-            {
                 target: "linux-x64-gnu",
                 kernel_min: "4.18",
                 glibc_min: "2.28",
@@ -207,10 +178,7 @@ const CONTRACT = {
         id: "gte-modernbert-base-f16",
         execution_provider: "cpu",
         platforms: ["linux-x64-gnu"],
-        unsupported: {
-            "darwin-arm64": "synapse_unsupported",
-            "darwin-x64": "synapse_unsupported",
-        },
+        unsupported: {},
     },
     // Stable version-neutral coordination names (KTD2). Supported code never
     // renames or unlinks these.
@@ -660,10 +628,9 @@ export function validateContractSchema(contract: any): void {
     if (!SEMVER_RE.test(contract.release.version))
         fail("release.version must be exact semver");
 
-    // Packages: three parents, three payloads, one synchronized version.
     assertExactKeys(
         contract.packages,
-        ["parents", "payloads", "version"],
+        ["addons", "parents", "payloads", "version"],
         "packages",
     );
     if (contract.packages.version !== contract.release.version) {
@@ -671,12 +638,17 @@ export function validateContractSchema(contract: any): void {
     }
     if (
         contract.packages.parents.length !== 3 ||
-        contract.packages.payloads.length !== 3
+        contract.packages.payloads.length !== 1 ||
+        contract.packages.addons.length !== 1
     ) {
-        fail("exactly three parent and three payload packages are required");
+        fail("exactly three parent, one payload, and one addon package are required");
     }
     assertUnique(
-        [...contract.packages.parents, ...contract.packages.payloads],
+        [
+            ...contract.packages.parents,
+            ...contract.packages.payloads,
+            ...contract.packages.addons,
+        ],
         "package names",
     );
 
@@ -872,11 +844,9 @@ export function validateContractSchema(contract: any): void {
     );
     if (
         JSON.stringify([...targets].sort()) !==
-        JSON.stringify(["darwin-arm64", "darwin-x64", "linux-x64-gnu"])
+        JSON.stringify(["linux-x64-gnu"])
     ) {
-        fail(
-            "supported platform targets are fixed to linux-x64-gnu, darwin-arm64, darwin-x64",
-        );
+        fail("supported platform target is fixed to linux-x64-gnu");
     }
     for (const platform of contract.platforms.supported) {
         if (platform.target === "linux-x64-gnu") {
@@ -891,22 +861,6 @@ export function validateContractSchema(contract: any): void {
             }
             if (platform.synapse !== "certified_cpu")
                 fail("linux synapse lane must be certified_cpu");
-        } else {
-            if (!DOTTED_FLOOR_RE.test(platform.os_min))
-                fail(`${platform.target} os floor must be exact`);
-            if (
-                platform.synapse !== "unsupported" ||
-                platform.synapse_reason !== "synapse_unsupported"
-            ) {
-                fail(
-                    `${platform.target} synapse must be exactly unsupported / synapse_unsupported`,
-                );
-            }
-            if (platform.capabilities.dev_fd_exec !== true) {
-                fail(
-                    `${platform.target} requires /dev/fd execution capability`,
-                );
-            }
         }
         assertUniqueSorted(
             platform.capabilities.filesystem,
@@ -1210,10 +1164,11 @@ export function validateRegistryGateShape(
         );
     }
     if (!Array.isArray(g.packages)) gateFail("gate packages must be an array");
-    const expected = new Map<string, "parent" | "payload">();
+    const expected = new Map<string, "parent" | "payload" | "addon">();
     for (const name of contract.packages.parents) expected.set(name, "parent");
     for (const name of contract.packages.payloads)
         expected.set(name, "payload");
+    for (const name of contract.packages.addons) expected.set(name, "addon");
     const seen = new Set<string>();
     for (const pkg of g.packages) {
         const kind = expected.get(pkg.name);
@@ -1318,9 +1273,7 @@ export interface PlatformProbe {
     libc?: "gnu" | "musl";
     kernel?: string;
     glibc?: string;
-    osVersion?: string;
     procfsSelfFdExec?: boolean;
-    devFdExec?: boolean;
 }
 
 /**
@@ -1446,42 +1399,6 @@ export function evaluatePlatform(
             supported: true,
             target: linux.target,
             synapse: linux.synapse,
-        };
-    }
-    if (probe.os === "darwin") {
-        const target =
-            probe.arch === "arm64"
-                ? "darwin-arm64"
-                : probe.arch === "x64"
-                  ? "darwin-x64"
-                  : undefined;
-        if (target === undefined) return unsupported;
-        const mac = contract.platforms.supported.find(
-            (p) => p.target === target,
-        );
-        if (mac === undefined || !("os_min" in mac)) return unsupported;
-        if (!meetsDottedFloor(probe.osVersion, mac.os_min)) {
-            return unsupported;
-        }
-        // Each macOS row requires `capabilities.dev_fd_exec`, the Darwin
-        // counterpart of the Linux `procfs_self_fd_exec` gate: the retained
-        // native payload is executed through a descriptor, so a host that
-        // cannot do that must read as unsupported here rather than failing at
-        // exec time. Absent evidence is not proof of the capability, so an
-        // omitted probe field is unsupported, exactly as on Linux.
-        if (
-            "capabilities" in mac &&
-            "dev_fd_exec" in mac.capabilities &&
-            mac.capabilities.dev_fd_exec === true &&
-            probe.devFdExec !== true
-        ) {
-            return unsupported;
-        }
-        return {
-            supported: true,
-            target,
-            synapse: mac.synapse,
-            synapseReason: mac.synapse_reason,
         };
     }
     return unsupported;
@@ -1672,7 +1589,7 @@ pub const RELEASE_CONTRACT_JSON: &str = "${escapeRustString(canonical)}";
 /// SHA-256 hex digest of \`RELEASE_CONTRACT_JSON\`.
 pub const RELEASE_CONTRACT_SHA256: &str = "${digest}";
 
-/// Synchronized release version, unpublished across all six package names at freeze.
+/// Synchronized release version at freeze.
 pub const RELEASE_VERSION: &str = "${contract.release.version}";
 
 /// Bounded daemon version string authenticated by ServerProof.

@@ -64,7 +64,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
@@ -81,8 +81,7 @@ function useTempDataHome(prefix: string): void {
 }
 
 function resolveContextLimit(): number {
-    // Tests don't specify providerID/modelID in most events, so the real
-    // resolveContextLimit falls through to DEFAULT_CONTEXT_LIMIT = 128_000.
+    // Tests omit providerID/modelID, so resolveContextLimit uses DEFAULT_CONTEXT_LIMIT (128_000).
     return 128_000;
 }
 
@@ -418,7 +417,7 @@ describe("createEventHandler", () => {
             internalChildSessions,
         });
 
-        // A magic-context child (historian/dreamer/sidekick/migration title).
+        // Historian, dreamer, sidekick, and migration-title children are magic-context children.
         await handler({
             event: {
                 type: "session.created",
@@ -431,7 +430,7 @@ describe("createEventHandler", () => {
                 },
             },
         });
-        // A generic OpenCode subagent (task() child) — NOT ours.
+        // The filter excludes generic OpenCode task() children.
         await handler({
             event: {
                 type: "session.created",
@@ -440,7 +439,7 @@ describe("createEventHandler", () => {
                 },
             },
         });
-        // A root session — never flagged.
+        // Root sessions are never flagged.
         await handler({
             event: {
                 type: "session.created",
@@ -452,7 +451,7 @@ describe("createEventHandler", () => {
 
         expect(internalChildSessions.has("ses-hist")).toBe(true);
         expect(internalChildSessions.has("ses-task")).toBe(false);
-        // parentID empty → not a child, never flagged even with our title.
+        // Sessions with an empty parentID are not children and are never flagged, even when their title matches a magic-context child.
         expect(internalChildSessions.has("ses-root2")).toBe(false);
     });
 
@@ -518,9 +517,8 @@ describe("createEventHandler", () => {
                 },
             },
         });
-        // Regress to a smaller (wrong) but still SANE limit — a sub-20k value is
-        // now rejected outright by the limit resolver's sanity floor, so the
-        // regression scenario must use a value inside [20k, 3M].
+        // The test uses a 30,000-token limit because the resolver accepts it while the model accepted more tokens.
+        // The regression scenario requires a value inside [20k, 3M].
         await refreshModelLimitsFromApi(providersClient(30_000));
 
         await handler({
@@ -552,10 +550,8 @@ describe("createEventHandler", () => {
         await refreshModelLimitsFromApi(providersClient(100_000));
         const prompt = mock(async () => ({}));
         const deps = createDeps(contextUsageMap);
-        // A wrong-but-still-SANE small limit (30k): sub-20k values are now rejected
-        // by the resolver's sanity floor, so the "stays wrong after refresh"
-        // scenario uses a limit inside [20k, 3M] that is still smaller than the
-        // tokens the model successfully accepted.
+        // The test uses a 30,000-token limit because the resolver accepts it while the model accepted more tokens.
+        // The test uses 30,000 tokens, below the model's accepted token count.
         deps.client = providersClient(30_000, prompt);
         const handler = createEventHandler(deps);
 
@@ -759,8 +755,6 @@ describe("createEventHandler", () => {
             },
         });
 
-        // Context-limit resolution is covered by event-resolvers.test.ts; here we
-        // validate that per-model cache_ttl is applied via the shared event path.
         expect(getOrCreateSessionMeta(openDatabase(), "ses-model").cacheTtl).toBe("1m");
     });
 
@@ -801,7 +795,6 @@ describe("createEventHandler", () => {
         incrementHistorianFailure(deps.db, "ses-historian-failure", "429 rate limit");
         const handler = createEventHandler(deps);
 
-        // Use tokens that put usage well below 90% of 128K default context limit
         await handler({
             event: {
                 type: "message.updated",
@@ -974,8 +967,8 @@ describe("createEventHandler", () => {
                 toolOwnerMessageId: null,
             },
         ]);
-        // The removal path clears synchronously. Async reconciliation is scheduled
-        // separately, so searches during this tiny rebuild window see no message hits.
+        // The removal path clears synchronously and schedules asynchronous reconciliation.
+        // Until asynchronous reconciliation completes, searches return no message hits.
         expect(countIndexedMessages("ses-removed", "msg-removed")).toBe(0);
         expect(countIndexedMessages("ses-removed", "msg-keep")).toBe(0);
         expect(countMessageIndexRows("ses-removed")).toBe(0);
@@ -1158,8 +1151,8 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
         const state = readOverflowState("ses-off");
         // The latch machinery is gated off — native compaction owns recovery.
         expect(state.needsEmergencyRecovery).toBe(0);
-        // The provider-reported limit stays useful for the raw-usage % the
-        // sidebar renders in this mode.
+        // The sidebar uses the provider-reported limit to render the raw-usage percentage.
+        // The sidebar uses the provider-reported limit to render the raw-usage percentage.
         expect(state.detectedContextLimit).toBe(120000);
     });
 
@@ -1191,9 +1184,9 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
         // Session errors lack a model identity. A stale session value is not evidence.
         expect("provider_id" in report).toBe(false);
         expect("model_id" in report).toBe(false);
-        // Absent = unknown routing (refuses promotion); the reporter never
-        // asserts false — an explicit false would PERMIT promotion, a claim
-        // the one-directional forwarder detector cannot support.
+        // The reporter treats an absent value as unknown routing and refuses promotion.
+        // The reporter never asserts false because explicit false permits promotion.
+        // The one-directional forwarder detector cannot establish an explicit false.
         expect("path_may_forward" in report).toBe(false);
     });
 

@@ -1,18 +1,6 @@
-//! The `<project-docs>` m0 sub-block: read the repo's ARCHITECTURE.md + STRUCTURE.md,
-//! canonicalize, render the block, and hash the canonical content.
 //!
-//! Faithful port of `project-docs-hash.ts`. The rendered block is part of the trusted
-//! m0 baseline, so the security guards are load-bearing and ported verbatim:
-//!  - the docs are read with a NON-following stat (`symlink_metadata`) and must be a
-//!    regular file (a symlinked doc — e.g. pointed at ~/.ssh/id_rsa to exfiltrate it
-//!    into the prompt — fingerprints as absent and is skipped),
-//!  - a size cap rejects an oversized doc before it can blow up the prompt,
-//!  - the regular-file + size check is RE-DONE at read time to close the TOCTOU gap
-//!    between fingerprint and read.
+//! The second metadata check immediately precedes reading to narrow the path-swap window.
 //!
-//! The canonical hash drives a deferred-HARD on docs edits (the trigger wiring is the
-//! slice-4d integration question, Q1); the read + render + hash here are independent of
-//! that and fork-free.
 
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -22,16 +10,13 @@ const PROJECT_DOC_FILES: [&str; 2] = ["ARCHITECTURE.md", "STRUCTURE.md"];
 const PROJECT_DOCS_DELIMITER: &str = "\n\n---\n\n";
 const MAX_PROJECT_DOC_BYTES: u64 = 256 * 1024;
 
-/// The rendered `<project-docs>` block (empty when no readable doc) + the canonical
-/// content hash (empty hash string when no readable doc).
+/// Both fields are empty when neither configured document is included.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectDocs {
     pub rendered_block: String,
     pub canonical_hash: String,
 }
 
-/// Canonicalize a doc body for stable hashing/rendering: strip a leading BOM, normalize
-/// CRLF→LF, strip per-line trailing spaces/tabs, strip trailing blank lines.
 fn canonicalize_doc_content(raw: &str) -> String {
     let no_bom = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let lf = no_bom.replace("\r\n", "\n");
@@ -56,16 +41,15 @@ fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Read a doc safely: a regular file (NOT a symlink) within the size cap, re-checked at
-/// read time. Returns the canonical content, or None if absent/unsafe/oversized.
+/// Returns `None` unless both metadata checks identify a regular file no larger than `MAX_PROJECT_DOC_BYTES`; a path swap can still change the file read.
 fn read_safe_canonical(path: &Path) -> Option<String> {
-    // symlink_metadata does NOT follow a symlink (matches the TS lstat guard).
+    // `symlink_metadata` does not follow symlinks.
     let meta = fs::symlink_metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_PROJECT_DOC_BYTES {
         return None;
     }
-    // Re-check at read time to close the TOCTOU gap (a path swapped to a symlink after
-    // the first stat). std::fs::read follows symlinks, so the re-check is what protects.
+    // A second metadata check narrows the interval in which a path swap can bypass the initial check.
+    // `fs::read_to_string` follows symlinks, so the second metadata check only narrows the race window.
     let meta2 = fs::symlink_metadata(path).ok()?;
     if !meta2.is_file() || meta2.len() > MAX_PROJECT_DOC_BYTES {
         return None;
@@ -74,9 +58,6 @@ fn read_safe_canonical(path: &Path) -> Option<String> {
     Some(canonicalize_doc_content(&raw))
 }
 
-/// Read + render + hash the project docs in `project_directory`. Pure over the
-/// filesystem (no caching — the daemon holds the rendered block in the m0 frozen unit;
-/// re-read only happens on a docs-change-driven HARD).
 pub fn read_project_docs_canonical(project_directory: &str) -> ProjectDocs {
     let dir = Path::new(project_directory);
     let mut hash_pieces: Vec<String> = Vec::new();
@@ -171,7 +152,7 @@ mod tests {
         write_doc(dir.path(), "secret.txt", "TOP SECRET");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&secret, dir.path().join("ARCHITECTURE.md")).unwrap();
-        // a symlinked ARCHITECTURE.md must NOT be read (exfil guard); STRUCTURE.md still renders
+        // A symlinked `ARCHITECTURE.md` is skipped; a regular `STRUCTURE.md` is included only when it is no larger than `MAX_PROJECT_DOC_BYTES` and can be read as UTF-8.
         write_doc(dir.path(), "STRUCTURE.md", "real struct");
         let docs = read_project_docs_canonical(dir.path().to_str().unwrap());
         #[cfg(unix)]
@@ -194,8 +175,6 @@ mod tests {
         assert!(!docs.rendered_block.contains(&big));
         assert!(docs.rendered_block.contains("small"));
     }
-
-    // --- differential golden: the canonical hash + render must match the TS reference ---
 
     #[derive(Deserialize)]
     struct DocCase {

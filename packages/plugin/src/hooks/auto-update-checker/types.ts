@@ -26,22 +26,12 @@ export interface AutoUpdateCheckerOptions {
     fetchTimeoutMs?: number;
     signal?: AbortSignal;
     /**
-     * Storage directory used for cross-process check coordination. The
-     * checker writes `last-update-check.json` here so concurrent plugin
-     * instances (multi-project TUI launches) only hit npm once per
-     * `checkIntervalMs`. Pass `null`/omit for fail-open behavior — the
-     * check still runs, just without dedup. Recommended: pass the
-     * plugin's existing storage path (e.g. `getMagicContextStorageDir()`).
      */
     storageDir?: string | null;
     /**
-     * Minimum interval between checks across all plugin instances on
-     * this machine. Default: 1 hour.
      */
     checkIntervalMs?: number;
     /**
-     * Delay before the post-init check fires. Lets OpenCode finish boot
-     * before the npm round-trip starts. Default: 5000ms.
      */
     initDelayMs?: number;
 }

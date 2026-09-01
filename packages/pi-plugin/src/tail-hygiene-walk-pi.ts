@@ -316,9 +316,6 @@ function attributeTags(
 			for (const arc of ownerArcs) arc.tag = orphan;
 		}
 	}
-	// Pi writes the tag number into rendered tool-result text. This remains the
-	// authoritative attribution fallback when a late post-process cloned the
-	// message object and the real SessionEntry owner id is no longer ref-resolvable.
 	for (const arc of arcs) {
 		if (arc.tag) continue;
 		for (const part of arc.parts) {
@@ -381,8 +378,6 @@ function finalizeParts(
 			tokens,
 			uTokens,
 			tagNumber: draft.tag?.tagNumber ?? null,
-			// Pi derives liveness from rendered sentinels. A visible attributed part is
-			// active for baseline/delta purposes regardless of the durable row's status.
 			tagStatus: draft.tag ? "active" : null,
 			protected: protectedPart,
 		};

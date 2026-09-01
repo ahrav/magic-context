@@ -298,8 +298,8 @@ describe("applyPiHeuristicCleanup", () => {
 			const transcript = createPiTranscript(messages, sessionId);
 			const { targets } = tagTranscript(sessionId, transcript, tagger, db);
 
-			// Stale-reduce cutoff is now the protected-tail window (maxTag -
-			// protectedTags); protectedTags:2 reproduces the old age-2 cutoff.
+			// The stale-reduce cutoff is maxTag - protectedTags.
+			// protectedTags: 2 preserves the two newest tags.
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 2,
 				staleReduceStripEnabled: true,
@@ -345,12 +345,8 @@ describe("applyPiHeuristicCleanup", () => {
 			applyFlushedStatuses(sessionId, db, replay.targets);
 			replayTranscript.commit();
 
-			// Aggregate target uses tagId in sentinel (matches OpenCode parity in
-			// apply-operations.ts:43 — `[dropped §<tagId>§]`). Tag allocation
-			// order across the transcript: user "older request" (#1), assistant
-			// text "I will reduce now." (#2), assistant toolCall reduce-1 (#3),
-			// user toolResult reuses #3, user "next request" (#4), assistant
-			// "newer answer" (#5), user "latest request" (#6). reduce-1 = #3.
+			// The aggregate drop sentinel contains the target's tagId.
+			// The `reduce-1` call and result share tag 3.
 			expect(textOf(replayTranscript.getOutputMessages()[2] as never)).toBe(
 				"[dropped §3§]",
 			);
@@ -363,11 +359,8 @@ describe("applyPiHeuristicCleanup", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-reduce-collision";
-			// Two assistant turns both invoke ctx_reduce with the SAME callId
-			// "reduce-1" (callId counters repeat across turns). The OLD one is stale
-			// (tag age < cutoff); the FRESH one is recent (must survive). Composite
-			// (owner, callId) identity must distinguish them — a bare-callId match
-			// would wrongly drop both.
+			// The two `ctx_reduce` calls reuse `callId` `reduce-1`; cleanup must distinguish them by `(owner, callId)`.
+			// The older reduce-1 is stale; the newer reduce-1 must remain.
 			const messages = [
 				userMessage("old request", 1),
 				{
@@ -387,7 +380,6 @@ describe("applyPiHeuristicCleanup", () => {
 					...toolResultMessage("reduce-1", "reduced old", 3),
 					toolName: "ctx_reduce",
 				},
-				// …several turns later…
 				userMessage("a", 4),
 				assistantMessage("b", 5),
 				userMessage("c", 6),
@@ -419,19 +411,18 @@ describe("applyPiHeuristicCleanup", () => {
 			const transcript = createPiTranscript(messages, sessionId);
 			const { targets } = tagTranscript(sessionId, transcript, tagger, db);
 
-			// The fresh reused call and two newer calls are the three exemplars;
-			// the old owner-qualified arc with the same callId remains reclaimable.
+			// The reused fresh call and the two newer calls remain.
+			// Only the older (owner, callId) pair is reclaimable.
 			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
 				protectedTags: 3,
 				staleReduceStripEnabled: true,
 			});
 			transcript.commit();
 
-			// Exactly ONE stale ctx_reduce dropped (the old turn), NOT both.
+			// Only the older `(owner, callId)` pair is stale.
 			expect(result.droppedStaleReduceCalls).toBe(1);
 
-			// The two ctx_reduce tool tags share callId "reduce-1" but have
-			// DISTINCT owners; exactly one must be dropped, the fresher preserved.
+			// The two `ctx_reduce` tool tags share `callId` `reduce-1` but have distinct owners; cleanup must drop only the older tag.
 			const reduceTags = getTagsBySession(db, sessionId)
 				.filter((tag) => tag.type === "tool" && tag.messageId === "reduce-1")
 				.map((tag) => tag.status);

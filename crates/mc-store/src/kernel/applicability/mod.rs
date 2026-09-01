@@ -18,24 +18,27 @@ use super::anchor::QueryContext;
 use super::scope::ScopeMatchContext;
 use super::{KernelError, KernelStore};
 
-pub use checkout::{snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, SnapshotError};
-pub use checks::{run_cheap_check, CheckOutcome};
+pub use checkout::{
+    open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, PathEncoding,
+    SnapshotError,
+};
+pub use checks::{run_cheap_check, CheckCache, CheckOutcome, MAX_CONFIG_BYTES};
 pub use engine::{
     ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityState, BatchEvaluation,
     ClassificationToken, EvaluationStats, FailedCheck, ObjectApplicability,
 };
-pub use payloads::PayloadDecodeError;
 pub use payloads::{
-    ApplicabilityObservationPayload, CheckSpec, ObjectApplicabilitySpec, DEPENDENCY_KIND_TARGET,
-    OBJECT_APPLICABILITY_SCHEMA, OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT,
-    OBSERVATION_KIND_HISTORICAL, OBSERVATION_KIND_STALE, OBSERVATION_KIND_UNCERTAIN,
+    checkout_identity_digest, ApplicabilityObservationPayload, CheckSpec, ObjectApplicabilitySpec,
+    PayloadDecode, DEPENDENCY_KIND_TARGET, OBJECT_APPLICABILITY_SCHEMA,
+    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT,
+    OBSERVATION_KIND_DIRTY_TREE_UNCERTAIN, OBSERVATION_KIND_HISTORICAL,
+    OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
+    OBSERVATION_KIND_UNCERTAIN,
 };
-pub use repair::{
-    commit_read_repair, AppendOutcome, InjectionBlock, PriorBlockState, RepairIntent,
-};
+pub use repair::{commit_read_repair, AppendOutcome, InjectionBlock, RepairIntent};
 pub use resolve::{
     capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,
-    CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
+    ResolveObstacle, CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
 };
 
 /// One batch evaluation request against a checkout path.
@@ -45,8 +48,6 @@ pub struct ApplicabilityRequest<'a> {
     pub query: &'a QueryContext,
     pub scope_context: &'a ScopeMatchContext,
     pub candidates: &'a [ApplicabilityCandidate],
-    /// Domain owning the applicability observations repair appends.
-    pub domain_id: &'a str,
     /// Actor recorded on repair commits.
     pub actor: &'a str,
     /// Observation timestamp in UTC milliseconds.
@@ -94,6 +95,10 @@ impl ApplicabilityEngine {
     /// A checkout that cannot be snapshotted (unreadable, unborn HEAD,
     /// budget exhausted) classifies every candidate uncertain — that is a
     /// domain outcome, not a store failure.
+    ///
+    /// An object whose durable block this request could not clear reports commentlint: allow(JUDGE)
+    /// uncertain rather than current: the block still stands for every other commentlint: allow(JUDGE)
+    /// reader, so a current label here would auto-inject a blocked object. commentlint: allow(JUDGE)
     pub fn evaluate(
         &self,
         store: &KernelStore,
@@ -117,54 +122,131 @@ impl ApplicabilityEngine {
             request.candidates,
             budget,
         );
+        let mut objects = batch.objects;
+        // Every stale or current classification is reconciled against the
+        // durable record, not against the engine's append-confirmed flag. That
+        // flag records only that some earlier append landed; a clearing
+        // observation since then makes the confirmation stale, and a cached
+        // stale verdict would otherwise skip repair and leave the block lifted.
+        let repair_indices: Vec<usize> = objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| {
+                matches!(
+                    object.state,
+                    ApplicabilityState::Stale | ApplicabilityState::Current
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        // Reducing per object took the reader lock and re-derived the committed
+        // tip once per object, and deriving that tip walks the live registry.
+        let blocks = match store.applicability_block_states_at_tip(
+            &repair_indices
+                .iter()
+                .map(|index| objects[*index].object_id.as_str())
+                .collect::<Vec<_>>(),
+            snapshot.identity(),
+            budget,
+        ) {
+            Ok(blocks) => blocks,
+            // A deadline is a domain outcome, not a store failure. Without the
+            // durable record no current verdict can be shown unblocked, so
+            // every one of them reports uncertain.
+            Err(KernelError::Deadline) => {
+                for index in &repair_indices {
+                    if objects[*index].state == ApplicabilityState::Current {
+                        objects[*index].state = ApplicabilityState::Uncertain;
+                        objects[*index].evidence =
+                            "durable applicability block unread: evaluation deadline expired"
+                                .to_string();
+                    }
+                }
+                return Ok(ApplicabilityReport {
+                    objects,
+                    stats: batch.stats,
+                    appends: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let mut appends = Vec::new();
-        // One committed tip for the whole batch: every block-state read in
-        // this request sees the same snapshot of the observation log.
-        let tip = store.known_as_of(0)?.tip;
-        for object in &batch.objects {
-            // Only stale classifications and current re-evaluations earn
-            // durable appends; the other states are recomputable in-request
-            // vetoes.
-            if !matches!(
-                object.state,
-                ApplicabilityState::Stale | ApplicabilityState::Current
-            ) {
-                continue;
+        let mut remaining = repair_indices.as_slice();
+        while let Some((index, rest)) = remaining.split_first() {
+            let index = *index;
+            // The repair pass commits, so it polls the budget per object rather
+            // than running a whole batch past an expired deadline. Objects it
+            // never reaches still need their labels reconciled: one whose block
+            // stands cannot stay current just because the pass stopped early.
+            if budget.is_exhausted() {
+                for index in remaining {
+                    let block = blocks.get(objects[*index].object_id.as_str()).cloned();
+                    demote_if_blocked(
+                        &mut objects[*index],
+                        block.as_ref(),
+                        "evaluation deadline expired before the clearing append",
+                    );
+                }
+                break;
             }
-            let prior_block =
-                store.applicability_block_state(&object.object_id, snapshot.identity(), tip)?;
-            let durably_blocked = prior_block.as_ref().is_some_and(|block| block.blocked);
-            let appends_durably = match object.state {
-                // A stale verdict appends when its own append is pending or
-                // when the durable record disagrees (a clear landed since
-                // the cached classification confirmed its append).
-                ApplicabilityState::Stale => object.append_pending || !durably_blocked,
-                // A current verdict appends only to clear a recorded block.
-                ApplicabilityState::Current => durably_blocked,
-                _ => false,
-            };
-            if !appends_durably {
-                continue;
-            }
+            remaining = rest;
+            let block = blocks.get(objects[index].object_id.as_str());
+            let object = &objects[index];
             let Some(intent) = RepairIntent::for_classification(
                 &snapshot,
                 object,
-                request.domain_id,
+                block,
                 request.actor,
                 request.observed_at,
-                PriorBlockState(prior_block.and_then(|block| block.latest_clear_commit_seq)),
             ) else {
                 continue;
             };
+            // Matching the kind is not enough: a stale record from an earlier
+            // HEAD or dirty fingerprint describes a checkout state this repair
+            // does not, and deep verification needs evidence for the current
+            // one. The dedup identity covers the whole snapshot, so comparing
+            // it skips only a repair the record already is.
+            if block.is_some_and(|block| block.repair_identity == intent.operation_key()) {
+                continue;
+            }
+            // Nothing recorded means nothing to clear.
+            if object.state == ApplicabilityState::Current && block.is_none() {
+                continue;
+            }
             let outcome = commit_read_repair(store, self, &snapshot, object, &intent, budget)?;
-            appends.push((object.object_id.clone(), outcome));
+            let unresolved = match outcome {
+                AppendOutcome::Landed { .. } => None,
+                AppendOutcome::Discarded => Some("checkout moved before the clearing append"),
+                AppendOutcome::DeadlineMissed => {
+                    Some("evaluation deadline expired before the clearing append")
+                }
+            };
+            if let Some(reason) = unresolved {
+                let block = block.cloned();
+                demote_if_blocked(&mut objects[index], block.as_ref(), reason);
+            }
+            appends.push((objects[index].object_id.clone(), outcome));
         }
         Ok(ApplicabilityReport {
-            objects: batch.objects,
+            objects,
             stats: batch.stats,
             appends,
         })
     }
+}
+
+/// A current classification whose durable block still stands cannot be
+/// auto-injected: the block applies to every reader, not just this request.
+fn demote_if_blocked(
+    object: &mut ObjectApplicability,
+    block: Option<&InjectionBlock>,
+    reason: &str,
+) {
+    if object.state != ApplicabilityState::Current || !block.is_some_and(|block| block.blocked) {
+        return;
+    }
+    object.state = ApplicabilityState::Uncertain;
+    object.evidence = format!("durable applicability block not cleared: {reason}");
 }
 
 fn uncertain_batch(

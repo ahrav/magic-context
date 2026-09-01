@@ -1,53 +1,22 @@
 /**
- * Harness-agnostic transcript interface.
  *
- * Magic Context's transform pipeline operates on messages in a specific
- * shape: ordered messages with role-tagged parts (text, tool, reasoning,
- * tool_result, image), where tagging, sentinel stripping, and queued-drop
- * application MUTATE part content in-place. OpenCode's plugin transform
- * receives a `{ info, parts: unknown[] }[]` array and the AI SDK reads
- * those mutations directly. Pi's `pi.on("context", ...)` event delivers a
- * `AgentMessage[]` and accepts a fully-replaced array as the result.
  *
- * Rather than building a bidirectional `MessageLike[] ↔ AgentMessage[]`
- * adapter (Oracle's rejected Q1 alternative — too much round-trip
- * complexity, double-conversion bugs), this module defines a small
- * adapter contract that:
  *
- *   1. Exposes ordered messages with a *uniform* part-level mutation
- *      surface, regardless of underlying shape.
- *   2. Is owned by the harness — OpenCode's adapter mutates `parts[]`
- *      directly (zero copies), Pi's adapter rebuilds an `AgentMessage[]`
- *      from the mutated transcript only at commit time.
- *   3. Lets the shared transform code (tagging, stripping, drops)
- *      operate on `TranscriptPart` interface instances without caring
- *      whether they're wrapping `Part` from `@opencode-ai/sdk` or
- *      `TextContent | ToolCall | ThinkingContent` from `@earendil-works/pi-ai`.
+ * The transcript exposes ordered messages through a uniform part-level mutation API.
+ * OpenCode mutates `parts[]` directly; Pi rebuilds `AgentMessage[]` at `commit()`.
+ * Shared transforms operate on `TranscriptPart`, not harness-specific part types.
  *
- * What this interface deliberately does NOT do:
  *
- * - **No data round-trip.** The transcript is a *view* over harness data;
- *   it doesn't define a third canonical message shape. There's no JSON
- *   serialization, no normalization to a common DTO. Round-trip-free
- *   adapters are 10x simpler and faster.
+ * The transcript views harness data and defines no canonical message shape.
  *
- * - **No mutation semantics divergence.** Both adapters expose the same
- *   in-place mutation API (`setText`, `setOutput`, `replaceWithSentinel`).
- *   Whether mutation flushes to the source array immediately (OpenCode)
- *   or accumulates until `commit()` (Pi) is the adapter's concern.
+ * OpenCode flushes mutations immediately; Pi flushes them at `commit()`.
  *
- * - **No session-storage abstraction.** Compartment storage, ordinals,
- *   raw-history reads — those live in feature modules, not here. The
+ * Feature modules own compartment storage, ordinals, and raw-history reads.
  *   transcript only models the *current turn's* live message buffer.
  *
- * Step 4b.1 ships ONLY the interface and OpenCode adapter migration.
- * Pi adapter implementation lands in 4b.2 alongside the Pi context-event
- * wire-up, since the two are co-designed (the Pi adapter has to satisfy
- * the same operations the tagging code calls). 4b.3 wires the Pi
- * compartment trigger and historian invocation. 4b.4 nudges + auto-search.
  */
 
-/** Categorical kind of a transcript part, useful for filter predicates. */
+/** Filter predicates use `TranscriptPartKind`. */
 export type TranscriptPartKind =
     | "text"
     | "thinking"
@@ -59,73 +28,61 @@ export type TranscriptPartKind =
     | "unknown";
 
 /**
- * A single content fragment within a transcript message.
  *
- * The interface is intentionally narrow: it exposes the operations Magic
- * Context's transform code performs (read kind, read text, mutate text,
- * mutate tool output, drop, replace with sentinel) and nothing more. Each
- * harness adapter implements these against its native part type.
+ * Magic adapters implement `TranscriptPart` against their native part types.
  *
- * IMPORTANT: implementations are stateful proxies over the live source
- * data. Calling `setText("...")` on an OpenCode part mutates the
- * underlying `Part.text`; calling it on a Pi part flips a dirty flag and
- * the adapter's `commit()` rebuilds the affected `AgentMessage`. Either
- * way, the transcript code reads back consistent values via `getText()`.
+ * Implementations proxy live source data.
+ * OpenCode's `setText()` mutates `Part.text`; Pi marks the message dirty.
+ * Pi's `commit()` rebuilds each affected `AgentMessage`.
+ * `getText()` returns the updated text after `setText()` in both adapters.
  */
 export interface TranscriptPart {
-    /** Discriminator for filter logic. Stable across mutations. */
+    /** The `kind` value remains stable across mutations. */
     readonly kind: TranscriptPartKind;
 
     /**
-     * Best-effort identifier for cross-pass tracking. May be:
-     * - OpenCode part ID (e.g. "prt_..."), stable across passes.
-     * - Pi tool-call ID for tool_use/tool_result parts.
-     * - undefined for synthetic/structural parts.
+     * `id` tracks a part across passes when the harness provides a stable identifier.
+     * OpenCode IDs such as `prt_...` remain stable across passes.
+     * Pi `tool_use` and `tool_result` parts use the tool-call ID.
+     * Synthetic and structural parts have no `id`.
      *
-     * Pure parts without a stable ID return undefined and are tracked
-     * positionally within their containing message instead.
+     * Parts without a stable ID are tracked positionally within their containing message instead.
      */
     readonly id: string | undefined;
 
     /**
-     * The user-/agent-visible text payload, if this part has one. Returns
-     * undefined for parts that have no text representation (image, file,
-     * structural-only). For thinking parts returns the thinking text. For
-     * tool_use returns the JSON-stringified arguments (so size accounting
-     * reflects what the model sees). For tool_result returns the
-     * concatenated text content of the result.
+     * `getText()` returns the user- or agent-visible text when the part has text.
+     * `getText()` returns `undefined` for `image`, `file`, and structural-only parts.
+     * `getText()` returns thinking text for `thinking` parts.
+     * `getText()` JSON-stringifies `tool_use` arguments for size accounting.
+     * `getText()` concatenates text content from `tool_result` results.
      */
     getText(): string | undefined;
 
     /**
-     * Replace the visible text payload. Applies only to text and thinking
-     * parts; throws for kinds where mutation isn't meaningful (the caller
-     * should check `kind` first).
+     * `setText()` changes only `text` and `thinking` parts.
+     * `setText()` throws unless `kind` is `text` or `thinking`.
      *
-     * Returns true if the underlying source data actually changed (so
-     * deduplication helpers can short-circuit). Returns false when the
-     * new text equals the existing text byte-for-byte.
+     * `setText` returns true only when the underlying source data changes.
+     * `setText` returns false when `newText` equals the existing text byte-for-byte.
      */
     setText(newText: string): boolean;
 
     /**
-     * For tool_result parts: replace the text content of the result.
-     * For tool_use parts: replace JSON-serialized arguments.
-     * For everything else: throws — caller should check `kind` first.
+     * `setToolOutput` replaces text content in `tool_result` parts.
+     * `setToolOutput` replaces JSON-serialized arguments in `tool_use` parts.
+     * `setToolOutput` throws for parts other than `tool_result` and `tool_use`.
      */
     setToolOutput(newText: string): boolean;
 
     /**
-     * Tool-specific metadata exposed for tagging/drop accounting:
-     * - toolName: tool identifier (e.g. "bash", "ctx_search"). undefined
-     *   for non-tool parts.
-     * - inputByteSize: serialized argument size; used by historian
-     *   pressure projection to estimate post-drop savings.
-     * - inputTokenCount: real-tokenizer count of the same serialized
-     *   argument, stored on the tag so token-budget consumers SUM stored
-     *   counts instead of re-tokenizing. 0 for non-tool parts.
+     * `getToolMetadata` exposes metadata for tagging and drop accounting.
+     * `toolName` is undefined for non-tool parts.
+     * `inputByteSize` is the serialized argument size used to estimate post-drop savings.
+     * `inputTokenCount` is the real-tokenizer count of the serialized argument.
+     * `inputTokenCount` is stored on tags so token-budget consumers can sum it without re-tokenizing.
      *
-     * For non-tool parts both byte fields are undefined/0.
+     * For non-tool parts, `inputByteSize` and `inputTokenCount` are 0.
      */
     getToolMetadata(): {
         toolName: string | undefined;
@@ -134,116 +91,99 @@ export interface TranscriptPart {
     };
 
     /**
-     * Non-mutating read of this tool invocation's input object, or null for
-     * non-tool parts / parts without an input. Used by smart-drops supersession
-     * selection (read `ctx_note`'s action, an edit's `filePath`) without
-     * touching the wire. Returns the live object reference; callers must NOT
+     * `getToolInput` returns the invocation input object, or null for non-tool parts and parts without input.
+     * Smart-drops supersession selection reads tool inputs without modifying wire data.
+     * Supersession selection reads `ctx_note.action` and edit `filePath` values.
+     * `getToolInput` returns a live object reference; callers must not mutate it.
      * mutate it.
      */
     getToolInput?(): Record<string, unknown> | null;
 
     /**
-     * Replace this tool invocation's input object with `input`. Used by the
-     * smart-drops edit_marker path to write back a filePath-preserving,
-     * region-hint-clamped copy of an edit's arguments. Returns true if the part
-     * carried a writable tool input. No-op (false) for non-tool parts.
+     * The smart-drops `edit_marker` path uses `setToolInput` to preserve `filePath` while clamping region hints.
+     * `setToolInput` returns true only when the part has writable tool input.
      */
     setToolInput?(input: Record<string, unknown>): boolean;
 
     /**
-     * Replace this part with a sentinel placeholder. Sentinels look like
-     * `[dropped §N§]` or `[truncated §N§]` and survive cache-busting
-     * cycles by carrying their original tag number. Used by the
-     * apply-operations flow when a queued drop fires.
+     * `[dropped §N§]` and `[truncated §N§]` sentinels survive cache-busting.
+     * The apply-operations flow invokes `replaceWithSentinel` when a queued drop fires.
      *
-     * Implementations replace the part *in place* in the parent message's
-     * part array. The replaced part's `kind` shifts to "structural" so
-     * subsequent transform passes don't double-process it.
+     * `replaceWithSentinel` replaces the part in place in its parent message's part array.
+     * The replaced part's `kind` becomes `structural`.
+     * `kind: "structural"` prevents later transform passes from processing the replacement twice.
      *
-     * Returns true on success; returns false if the part can't be
-     * replaced (e.g. it's already a sentinel, or it's an image part).
+     * `replaceWithSentinel` returns false for sentinel and image parts.
      */
     replaceWithSentinel(sentinelText: string): boolean;
 
     /**
-     * Optional: serialized byte size of the part's REAL payload, including
-     * non-text content (images, structured data) that `getText()` can't
-     * surface. Used by emergency-drop reclaim accounting so an image-only
-     * tool result is sized by its actual payload, not treated as ~0 bytes.
-     * Adapters that can compute this (e.g. Pi's tool_result proxy, which
-     * closes over the raw content array) should implement it; callers fall
-     * back to the text/JSON estimate when it's absent.
+     * `rawByteSize` returns the serialized size of the real payload, including non-text content.
+     * Emergency-drop accounting uses `rawByteSize` so image-only tool results are not counted as approximately zero bytes.
+     * Adapters that can compute `rawByteSize` should implement it.
+     * Size estimation falls back to the text/JSON estimate when `rawByteSize` is absent.
      */
     rawByteSize?(): number;
 }
 
 /**
- * A single message in the transcript, exposing role + ordered parts.
  *
- * Lifetime: a TranscriptMessage is valid only within a single transform
- * pass. Adapters do not guarantee identity across passes — callers must
- * use `info.id` for cross-pass correlation, never the message reference.
+ * A `TranscriptMessage` is valid only within one transform pass.
+ * Adapters do not preserve `TranscriptMessage` identity across passes.
+ * Callers must use `info.id` for cross-pass correlation, never the message reference.
  */
 export interface TranscriptMessage {
     /**
-     * Lightweight metadata exposed for tagging, sentinel persistence, and
-     * cross-pass correlation. Adapters fill these from harness-native
+     * `info` supports tagging, sentinel persistence, and cross-pass correlation.
+     * Adapters populate `info` from harness-native fields.
      * fields:
      *
-     * - id: provider-stable message ID (OpenCode `msg_...`, Pi entryId).
-     * - role: "user" | "assistant" | "system" | "tool" | other custom roles.
-     * - sessionId: session identifier, used to scope DB writes.
+     * `info.id` identifies a provider-stable message (`msg_...` in OpenCode; `entryId` in Pi).
+     * `info.sessionId` scopes DB writes.
      *
-     * IMPORTANT for Pi: Pi's `ToolResultMessage` has role "toolResult"
-     * which the OpenCode-derived transform code expects to NOT be present
+     * Pi `ToolResultMessage` entries have role `"toolResult"`.
+     * The transform pipeline must not receive the `"toolResult"` role.
      * (OpenCode folds tool results into the next user message's parts).
-     * The Pi adapter therefore exposes tool-result messages as parts of a
-     * synthetic "user" message in the transcript view, even though the
-     * underlying Pi storage has them as separate top-level entries. This
-     * is the *only* shape normalization the adapter performs.
+     * The Pi adapter exposes tool-result messages as parts of a synthetic `"user"` message.
+     * Pi stores tool-result messages as separate top-level entries.
+     * The Pi adapter performs no other shape normalization.
      */
     readonly info: { id?: string; role: string; sessionId?: string };
 
-    /** Ordered parts. Same ordering invariants as the underlying source. */
+    /* */
     readonly parts: TranscriptPart[];
 }
 
 /**
- * Adapter contract: everything the transform pipeline calls on a
- * harness-specific transcript implementation.
+ * `Transcript` defines the adapter contract for the transform pipeline.
  *
- * Adapters are owned by the harness adapter layer (OpenCode's
- * messages-transform.ts, Pi's context-event handler). The shared
- * transform code receives a Transcript and operates only through this
- * interface — it never imports from `@opencode-ai/sdk` or
+ * Harness adapter layers own `Transcript` adapters.
+ * The shared transform code accesses transcripts only through `Transcript`.
+ * The shared transform code never imports harness SDKs.
  * `@earendil-works/pi-ai`.
  */
 export interface Transcript {
-    /** Ordered messages in the current pass. */
+    /* */
     readonly messages: TranscriptMessage[];
 
     /**
-     * Adapter identification. Useful for:
-     * - Logging (`magic-context[opencode]` vs `magic-context[pi]`).
-     * - Per-harness behaviors gated at adapter level (e.g. opencode-only
-     *   compaction marker injection).
-     * - Test assertions confirming the right adapter ran.
+     * `harness` selects the logging label (`magic-context[opencode]` or `magic-context[pi]`).
+     * `harness` gates compaction marker injection to OpenCode.
      */
     readonly harness: "opencode" | "pi";
 
     /**
-     * Commit accumulated mutations to the underlying source array.
+     * `commit` applies accumulated mutations to the underlying source array.
      *
-     * For OpenCode: no-op — parts are mutated directly in `Part.text`/
-     * `Part.state.output` and OpenCode reads them back from the same
-     * array, so changes are already visible.
+     * `commit` is a no-op for OpenCode because mutations update `Part.text` and `Part.state.output` directly.
+     * `OpenCode` reads the same source array after direct mutations.
      *
-     * For Pi: rebuilds a new `AgentMessage[]` from the dirty messages
-     * and stores it on the adapter so `pi.on("context", ...)` can return
-     * `{ messages }` to Pi. Idempotent: calling twice is safe.
+     * `commit` rebuilds an `AgentMessage[]` from dirty messages for Pi.
+     * `commit` stores the rebuilt messages on the adapter so `pi.on("context", ...)` can return `{ messages }`.
+     * `commit` is idempotent.
      *
-     * Always called exactly once per pass, after the transform pipeline
-     * finishes. Adapters that don't need it implement it as a no-op.
+     * The transform pipeline calls `commit` exactly once per pass after it finishes.
+     * `Adapters that do not need commit implement it as a no-op.`
      */
     commit(): void;
 }

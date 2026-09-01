@@ -1,10 +1,54 @@
-//! Shared secret vocabulary and deterministic text redaction.
+//! Deterministic secret redaction backed by the in-tree scanner.
 
-use std::sync::LazyLock;
+mod scanner;
 
-use regex::Regex;
+use std::{fmt, sync::LazyLock};
 
-pub const DETECTOR_ID: &str = "redaction-vocabulary-v1";
+use mc_secret_scanner::{
+    ConstructionError, LimitExhausted, ScanError, ScanLimits, ScanProfile, Scanner,
+};
+
+pub const DETECTOR_ID: &str = "mc-secret-scanner";
+
+/// Longest text `redact_durable_text` can inspect.
+///
+/// Above this the scan fails and the whole value is replaced by one placeholder,
+/// because text that cannot be inspected cannot be shown to be secret-free. A
+/// caller that must preserve its content has to reject the value at this length
+/// instead of redacting it, since the placeholder is not recoverable.
+pub const MAX_REDACTABLE_BYTES: usize = mc_secret_scanner::MAX_INPUT_BYTES;
+
+const LABEL_WORDS: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "password",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+];
+const LABEL_QUALIFIERS: &[&str] = &[
+    "api",
+    "access",
+    "private",
+    "client",
+    "auth",
+    "authorization",
+    "secret",
+    "bearer",
+    "session",
+    "refresh",
+    "service",
+    "x",
+    "openai",
+    "anthropic",
+    "google",
+    "github",
+    "huggingface",
+    "aws",
+    "azure",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
@@ -20,349 +64,210 @@ pub struct Redaction {
     pub detections: Vec<Detection>,
 }
 
-#[derive(Clone, Copy)]
-enum RuleKind {
-    Static {
-        secret_type: &'static str,
-        replacement: &'static str,
-    },
-    Bearer,
-    Keyed,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedactionErrorKind {
+    Construction,
+    InputLimit,
+    CandidateLimit,
+    WorkLimit,
+    InvalidSpan,
+    UnknownRule,
 }
 
-struct Rule {
-    regex: Regex,
-    kind: RuleKind,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedactionError {
+    pub(crate) kind: RedactionErrorKind,
 }
 
-impl Rule {
-    fn static_pattern(pattern: &str, secret_type: &'static str, replacement: &'static str) -> Self {
+impl RedactionError {
+    #[must_use]
+    pub const fn kind(self) -> RedactionErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for RedactionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.kind {
+            RedactionErrorKind::Construction => "secret redactor construction failed",
+            RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
+            RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
+            RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
+            RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
+            RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
+        })
+    }
+}
+
+impl std::error::Error for RedactionError {}
+
+impl From<ConstructionError> for RedactionError {
+    fn from(_: ConstructionError) -> Self {
         Self {
-            regex: Regex::new(pattern).expect("redaction regex is valid"),
-            kind: RuleKind::Static {
-                secret_type,
-                replacement,
-            },
+            kind: RedactionErrorKind::Construction,
         }
     }
 }
 
-static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
-    vec![
-        Rule::static_pattern(
-            r"\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}",
-            "anthropic_api_key",
-            "<ANTHROPIC_API_KEY_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}",
-            "openai_api_key",
-            "<OPENAI_API_KEY_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\bgithub_pat_[A-Za-z0-9_]{20,}",
-            "github_pat",
-            "<GITHUB_PAT_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}",
-            "github_token",
-            "<GITHUB_TOKEN_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\bhf_[A-Za-z0-9]{30,}",
-            "huggingface_token",
-            "<HUGGINGFACE_TOKEN_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\b(?:AKIA|ASIA)[0-9A-Z]{16}",
-            "aws_access_key_id",
-            "<AWS_ACCESS_KEY_ID_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\bxox[abprsuvc]-[A-Za-z0-9-]{10,}",
-            "slack_token",
-            "<SLACK_TOKEN_REDACTED>",
-        ),
-        Rule::static_pattern(
-            r"\bAIza[A-Za-z0-9_-]{35}",
-            "google_api_key",
-            "<GOOGLE_API_KEY_REDACTED>",
-        ),
-        Rule {
-            regex: Regex::new(
-                r"(?i)\bAuthorization\s*:\s*Bearer\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})",
-            )
-            .expect("bearer regex is valid"),
-            kind: RuleKind::Bearer,
-        },
-        Rule::static_pattern(
-            r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
-            "jwt",
-            "<JWT_REDACTED>",
-        ),
-        Rule {
-            regex: Regex::new(
-                r#"(?i)"(?P<key>[^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)"\s*:\s*"(?P<value>[^"']*)""#,
-            )
-            .expect("double-quoted keyed regex is valid"),
-            kind: RuleKind::Keyed,
-        },
-        Rule {
-            regex: Regex::new(
-                r#"(?i)'(?P<key>[^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)'\s*:\s*'(?P<value>[^"']*)'"#,
-            )
-            .expect("single-quoted keyed regex is valid"),
-            kind: RuleKind::Keyed,
-        },
-        Rule {
-            regex: Regex::new(
-                r#"(?i)"(?P<key>[^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)"\s*:\s*'(?P<value>[^"']*)'"#,
-            )
-            .expect("double-single keyed regex is valid"),
-            kind: RuleKind::Keyed,
-        },
-        Rule {
-            regex: Regex::new(
-                r#"(?i)'(?P<key>[^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)'\s*:\s*"(?P<value>[^"']*)""#,
-            )
-            .expect("single-double keyed regex is valid"),
-            kind: RuleKind::Keyed,
-        },
-        Rule {
-            regex: Regex::new(
-                r#"(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s'"`]+)"#,
-            )
-            .expect("assignment regex is valid"),
-            kind: RuleKind::Keyed,
-        },
-    ]
-});
+impl From<ScanError> for RedactionError {
+    fn from(error: ScanError) -> Self {
+        let kind = match error {
+            ScanError::InputLimitExceeded => RedactionErrorKind::InputLimit,
+            ScanError::InvalidSpan => RedactionErrorKind::InvalidSpan,
+        };
+        Self { kind }
+    }
+}
 
-static SCALAR_VALUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$").expect("scalar diagnostic regex is valid")
-});
+pub struct Redactor {
+    scanner: Scanner,
+}
 
-struct Candidate {
-    start: usize,
-    end: usize,
-    context_start: usize,
-    precedence: usize,
-    secret_type: String,
-    replacement: String,
+impl Redactor {
+    pub fn new() -> Result<Self, RedactionError> {
+        Self::with_limits(ScanLimits::default())
+    }
+
+    fn with_limits(limits: ScanLimits) -> Result<Self, RedactionError> {
+        Ok(Self {
+            scanner: Scanner::with_limits(ScanProfile::Comprehensive, limits)?,
+        })
+    }
+
+    pub fn redact(&self, input: &str) -> Result<Redaction, RedactionError> {
+        let report = self.scanner.scan(input)?;
+        if let Some(limit) = report.limits_hit {
+            return Err(RedactionError {
+                kind: match limit {
+                    LimitExhausted::Candidates => RedactionErrorKind::CandidateLimit,
+                    LimitExhausted::Work => RedactionErrorKind::WorkLimit,
+                },
+            });
+        }
+        scanner::redact(input, &report.findings)
+    }
+}
+
+static REDACTOR: LazyLock<Result<Redactor, RedactionError>> = LazyLock::new(Redactor::new);
+
+pub fn redact_durable_text(input: &str) -> Redaction {
+    match REDACTOR
+        .as_ref()
+        .map_err(|error| *error)
+        .and_then(|redactor| redactor.redact(input))
+    {
+        Ok(redaction) => redaction,
+        Err(_) => Redaction {
+            text: "<REDACTED:secret>".to_owned(),
+            detections: vec![Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: "secret".to_owned(),
+                offset: 0,
+                length: input.len(),
+            }],
+        },
+    }
 }
 
 #[must_use]
-pub fn redact_secret_text(input: &str) -> Redaction {
-    let mut candidates = Vec::new();
-
-    for (precedence, rule) in RULES.iter().enumerate() {
-        for captures in rule.regex.captures_iter(input) {
-            let whole = captures.get(0).expect("every capture has a whole match");
-            let (matched, secret_type, replacement) = match rule.kind {
-                RuleKind::Static {
-                    secret_type,
-                    replacement,
-                } => (whole, secret_type.to_owned(), replacement.to_owned()),
-                RuleKind::Bearer => (
-                    captures
-                        .name("value")
-                        .expect("bearer rule captures its value"),
-                    "bearer".to_owned(),
-                    "<REDACTED:bearer>".to_owned(),
-                ),
-                RuleKind::Keyed => {
-                    let key = captures.name("key").expect("keyed rule captures its key");
-                    let value = captures
-                        .name("value")
-                        .expect("keyed rule captures its value");
-                    if is_non_secret_scalar_value(value.as_str()) {
-                        continue;
-                    }
-                    let secret_type = redaction_type_for_key(key.as_str());
-                    let replacement = format!("<REDACTED:{secret_type}>");
-                    (value, secret_type, replacement)
-                }
-            };
-            candidates.push(Candidate {
-                start: matched.start(),
-                end: matched.end(),
-                context_start: whole.start(),
-                precedence,
-                secret_type,
-                replacement,
-            });
-        }
-    }
-
-    candidates.sort_by_key(|candidate| {
-        (
-            candidate.start,
-            candidate.context_start,
-            candidate.precedence,
-        )
-    });
-
-    let mut text = String::with_capacity(input.len());
-    let mut detections = Vec::new();
-    let mut cursor = 0;
-    for candidate in candidates {
-        if candidate.start < cursor {
-            continue;
-        }
-        text.push_str(&input[cursor..candidate.start]);
-        text.push_str(&candidate.replacement);
-        detections.push(Detection {
-            detector_id: DETECTOR_ID,
-            secret_type: candidate.secret_type,
-            offset: candidate.start,
-            length: candidate.end - candidate.start,
-        });
-        cursor = candidate.end;
-    }
-    text.push_str(&input[cursor..]);
-
-    Redaction { text, detections }
-}
-
-fn is_non_secret_scalar_value(value: &str) -> bool {
-    let value = value.trim();
-    matches!(value, "true" | "false" | "null" | "undefined") || SCALAR_VALUE.is_match(value)
+pub fn contains_redaction_token(text: &str) -> bool {
+    text.contains("_REDACTED>") || text.contains("<REDACTED:")
 }
 
 fn redaction_type_for_key(key: &str) -> String {
-    const SECRET_WORDS: &[&str] = &[
-        "key",
-        "keys",
-        "token",
-        "tokens",
-        "secret",
-        "secrets",
-        "password",
-        "passwords",
-        "auth",
-        "auths",
-        "authorization",
-        "authorizations",
-        "bearer",
-        "bearers",
-        "credential",
-        "credentials",
-    ];
-    const QUALIFIERS: &[&str] = &[
-        "api",
-        "access",
-        "private",
-        "client",
-        "auth",
-        "authorization",
-        "secret",
-        "bearer",
-        "session",
-        "refresh",
-        "service",
-        "x",
-        "openai",
-        "anthropic",
-        "google",
-        "github",
-        "huggingface",
-        "aws",
-        "azure",
-    ];
+    let mut separated = String::with_capacity(key.len() + 8);
+    let mut previous: Option<char> = None;
+    for character in key.chars() {
+        if character.is_ascii_uppercase()
+            && previous
+                .is_some_and(|earlier| earlier.is_ascii_lowercase() || earlier.is_ascii_digit())
+        {
+            separated.push('_');
+        }
+        separated.push(character);
+        previous = Some(character);
+    }
 
-    let normalized = key
-        .chars()
-        .flat_map(char::to_lowercase)
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let vocabulary = normalized
-        .split('_')
-        .filter(|segment| SECRET_WORDS.contains(segment) || QUALIFIERS.contains(segment))
-        .collect::<Vec<_>>();
-    if vocabulary.is_empty() {
+    let label = separated
+        .to_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|segment| is_label_segment(segment))
+        .collect::<Vec<_>>()
+        .join("_");
+    if label.is_empty() {
         "secret".to_owned()
     } else {
-        vocabulary.join("_")
+        label
     }
+}
+
+fn is_label_segment(segment: &str) -> bool {
+    let stem = segment.strip_suffix('s').unwrap_or(segment);
+    LABEL_WORDS.contains(&stem) || LABEL_QUALIFIERS.contains(&segment)
 }
 
 #[cfg(test)]
 mod tests {
-    use serde::Deserialize;
-
     use super::*;
 
-    #[derive(Deserialize)]
-    struct Vocabulary {
-        schema: String,
-        cases: Vec<FixtureCase>,
-        exemptions: Vec<String>,
-        known_misses: Vec<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct FixtureCase {
-        name: String,
-        input: String,
-        expected_redacted: String,
-        detections: Vec<FixtureDetection>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
-    struct FixtureDetection {
-        secret_type: String,
-        offset: usize,
-        length: usize,
-    }
-
-    fn vocabulary() -> Vocabulary {
-        serde_json::from_str(include_str!(
-            "../../../packages/plugin/src/shared/fixtures/redaction-vocabulary-v1.json"
-        ))
-        .expect("shared redaction fixture is valid")
+    #[test]
+    fn scanner_is_the_only_redaction_path() {
+        let redaction = redact_durable_text("π password=hunter-two");
+        assert_eq!(redaction.text, "π password=<REDACTED:password>");
+        assert!(redaction
+            .detections
+            .iter()
+            .all(|detection| detection.detector_id == DETECTOR_ID));
     }
 
     #[test]
-    fn shared_vocabulary_matches() {
-        let vocabulary = vocabulary();
-        assert_eq!(vocabulary.schema, "magic-context.redaction-vocabulary/v1");
-
-        for fixture in vocabulary.cases {
-            let result = redact_secret_text(&fixture.input);
-            assert_eq!(result.text, fixture.expected_redacted, "{}", fixture.name);
-            let actual: Vec<_> = result
-                .detections
-                .iter()
-                .map(|detection| FixtureDetection {
-                    secret_type: detection.secret_type.clone(),
-                    offset: detection.offset,
-                    length: detection.length,
-                })
-                .collect();
-            assert_eq!(actual, fixture.detections, "{}", fixture.name);
-            assert!(result
-                .detections
-                .iter()
-                .all(|detection| detection.detector_id == DETECTOR_ID));
+    fn established_key_labels_remain_stable() {
+        for (key, expected) in [
+            ("x_auth_token", "x_auth_token"),
+            ("client_secret", "client_secret"),
+            ("aws_secret", "aws_secret"),
+            ("apiKey", "api_key"),
+            ("apikey", "secret"),
+        ] {
+            assert_eq!(redaction_type_for_key(key), expected, "{key}");
         }
     }
 
     #[test]
-    fn scalar_exemptions_and_known_misses_remain_unchanged() {
-        let vocabulary = vocabulary();
-        for input in vocabulary
-            .exemptions
-            .into_iter()
-            .chain(vocabulary.known_misses)
-        {
-            assert_eq!(redact_secret_text(&input).text, input);
-        }
+    fn scanner_limits_fail_closed() {
+        let redactor = Redactor::with_limits(ScanLimits {
+            max_work_bytes: 1,
+            ..ScanLimits::default()
+        })
+        .unwrap();
+        assert_eq!(
+            redactor.redact("password=secret").unwrap_err().kind(),
+            RedactionErrorKind::WorkLimit
+        );
+    }
+
+    #[test]
+    fn diagnostics_never_include_input() {
+        let sentinel = "privacy-sentinel-password=secret";
+        let input = format!(
+            "{sentinel}{}",
+            "x".repeat(mc_secret_scanner::MAX_INPUT_BYTES)
+        );
+        let error = Redactor::new()
+            .unwrap()
+            .redact(&input)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(sentinel));
+        assert!(!error.contains("secret="));
+    }
+
+    #[test]
+    fn durable_redaction_hides_the_entire_field_on_scanner_failure() {
+        let input = "password=sentinel".repeat(mc_secret_scanner::MAX_INPUT_BYTES);
+        let redaction = redact_durable_text(&input);
+        assert_eq!(redaction.text, "<REDACTED:secret>");
+        assert_eq!(redaction.detections[0].length, input.len());
+        assert!(!redaction.text.contains("sentinel"));
     }
 }

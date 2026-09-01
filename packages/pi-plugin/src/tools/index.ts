@@ -1,15 +1,9 @@
 /**
- * Pi-side tool registration.
  *
- * Registers `ctx_search`, `ctx_memory`, `ctx_note`, `ctx_expand`, and
- * `ctx_reduce` against the live Pi extension API. The shared guidance block
- * in `system-prompt.ts` advertises these to the LLM only when each is
- * available, so a registration gap surfaces as "tool not found" errors when
- * the agent tries to follow the guidance.
+ * The shared guidance advertises a tool only when Pi registers it.
+ * If guidance advertises an unregistered tool, Pi returns "tool not found" when the agent invokes it.
  *
- * `ctx_reduce` is part of the primary session-scoped surface. It is omitted
- * only for `--no-session` child processes where session-scoped tools would
- * resolve to the hidden ephemeral child session.
+ * `ctx_note` and `ctx_expand` are omitted for `--no-session` child processes because they resolve to the ephemeral child session.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -34,38 +28,36 @@ export interface RegisterToolsOptions {
 	memoryEnabled?: boolean;
 	embeddingEnabled?: boolean;
 	gitCommitsEnabled?: boolean;
-	/** Resolve the current directory's project identity using the user-level home-project setting. */
+	/** The resolver uses the user-level home-project setting to resolve the current directory's project identity. */
 	resolveProjectIdentity?: (ctx: { cwd: string }) => string | undefined;
 	/** When true, ctx_memory exposes dreamer-only actions (update, merge, archive).
-	 *  Set by the subagent extension entry when the parent passes
-	 *  `--magic-context-dreamer-actions`. The main extension entry
-	 *  (./index.ts) leaves this false to match OpenCode's primary-agent surface. */
+	 * The subagent extension enables `allowDreamerActions` when its parent passes `--magic-context-dreamer-actions`.
+	 * The main extension leaves `allowDreamerActions` false to match OpenCode's primary-agent surface. */
 	allowDreamerActions?: boolean;
-	/** Number of recent tags that ctx_reduce should treat as protected
-	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
+	/** `ctx_reduce` defers drops for the most recent `protectedTags` tags.
+	 * `protectedTags` must equal `magic_context.protected_tags`. */
 	protectedTags?: number;
-	/** Resolve protected-tag config from the current cwd at tool-call time. */
+	/** The resolver reads protected-tag config from the current cwd at tool-call time. */
 	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
-	/** When true, ctx_note accepts smart notes (surface_condition) because
-	 *  the dreamer is configured to evaluate them. When false, smart-note
-	 *  writes are rejected to avoid stuck-pending state. */
+	/** `ctx_note` accepts smart notes with `surface_condition` only when the dreamer evaluates them; otherwise it rejects the writes to prevent stuck-pending state.
+	 * `ctx_note` rejects smart-note writes when `dreamerEnabled` is false to prevent stuck-pending state. */
 	dreamerEnabled?: boolean;
-	/** Resolve smart-note enablement from the current cwd at tool-call time. */
+	/** The resolver reads smart-note enablement from the current cwd at tool-call time. */
 	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
-	/** When false, omit ctx_memory from the registered surface. Sidekick only
-	 *  needs read-only ctx_search; dreamer and the main agent keep ctx_memory. */
+	/** `memoryToolEnabled=false` omits `ctx_memory` from the registered surface.
+	 * The sidekick needs read-only `ctx_search`; dreamer and the main agent keep `ctx_memory`. */
 	memoryToolEnabled?: boolean;
-	/** When true, omit session-scoped tools (ctx_note, ctx_expand) from the
-	 *  registered surface. Set by `--no-session` children (sidekick, dreamer):
-	 *  those tools resolve `ctx.sessionManager.getSessionId()` to the EPHEMERAL
-	 *  child session, so ctx_note would write notes orphaned under the hidden
-	 *  child id and ctx_expand would expand the child's empty transcript. */
+	/** `sessionScopedToolsDisabled=true` omits `ctx_note` and `ctx_expand` from the registered surface.
+	 * `--no-session` sidekick and dreamer children set `sessionScopedToolsDisabled`.
+	 * In `--no-session` children, `ctx_note` and `ctx_expand` resolve `ctx.sessionManager.getSessionId()` to the ephemeral child session.
+	 * In `--no-session` children, `ctx_note` writes notes under the hidden ephemeral child ID.
+	 * In `--no-session` children, `ctx_expand` expands the child's empty transcript. */
 	sessionScopedToolsDisabled?: boolean;
-	/** When false, omit Magic Context's Pi todowrite tool entirely. */
+	/* */
 	todowriteEnabled?: boolean;
 	/** Main Pi entry registers /todos; lean subagent entries keep commands off. */
 	todowriteCommandEnabled?: boolean;
-	/** In compaction-off mode, omit ctx_reduce and keep the other Pi tools available. */
+	/** `compactionOff=true` omits `ctx_reduce` while leaving the other Pi tools available. */
 	compactionOff?: boolean;
 	promptSurface?: PromptSurfaceConfig;
 	promptSurfaceRuntime?: PromptSurfaceRuntime;
@@ -85,9 +77,6 @@ export function registerMagicContextTools(
 			warn: (message) =>
 				console.warn(`[magic-context][pi] config warning: ${message}`),
 		});
-	// Pi registers provider tools once when the extension loads. Resolve the
-	// registration default once here; project/model switches may reroute guidance
-	// but cannot mutate the descriptions owned by this ExtensionAPI instance.
 	const registration = promptSurfaceRuntime.resolveRegistration(
 		opts.promptSurface,
 	);
@@ -128,11 +117,10 @@ export function registerMagicContextTools(
 		);
 	}
 
-	// ctx_note and ctx_expand are session-scoped: they resolve the CURRENT
-	// session id at call time. For `--no-session` children that id is the hidden
-	// ephemeral child session, so a note would be orphaned and an expand would
-	// target the child's empty transcript. Omit them for those children; ctx_search
-	// stays available and ctx_memory is controlled above.
+	// `ctx_note` and `ctx_expand` resolve the ephemeral child session in `--no-session` children, so omit them to prevent orphaned notes and expansion of the empty child transcript.
+	// `ctx_note` and `ctx_expand` resolve the ephemeral child session in `--no-session` children, so omit them to prevent orphaned notes and expansion of the empty child transcript.
+	// `ctx_note` and `ctx_expand` resolve the ephemeral child session in `--no-session` children, so omit them to prevent orphaned notes and expansion of the empty child transcript.
+	// `ctx_note` and `ctx_expand` resolve the ephemeral child session in `--no-session` children, so omit them to prevent orphaned notes and expansion of the empty child transcript.
 	if (!opts.sessionScopedToolsDisabled) {
 		pi.registerTool(
 			surfaceTool(
@@ -149,21 +137,12 @@ export function registerMagicContextTools(
 	}
 
 	if (opts.todowriteEnabled !== false) {
-		// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
-		// task list tool, so without this the synthetic-todowrite injector
-		// would never have anything to surface. The tool just captures the
-		// `todos` arg and echoes a pretty-printed JSON ack; `message_end`
-		// in index.ts snapshots `params.todos` into `session_meta.last_todo_state`
-		// for downstream synthesis. See `tools/todowrite.ts` header for rationale.
 		pi.registerTool(createTodowriteTool());
 		if (opts.todowriteCommandEnabled !== false) {
 			registerTodosCommand(pi);
 		}
 	}
 
-	// ctx_reduce is session-scoped just like ctx_note/ctx_expand: it resolves the
-	// CURRENT session id at call time. Omit it for `--no-session` children where
-	// that id points at a hidden ephemeral child session.
 	if (!opts.sessionScopedToolsDisabled && !opts.compactionOff) {
 		pi.registerTool(
 			surfaceTool(

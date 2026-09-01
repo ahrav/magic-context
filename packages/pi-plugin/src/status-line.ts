@@ -34,10 +34,7 @@ type SessionMetaStatus = {
 const lastRenderedBySession = new Map<string, string>();
 
 /**
- * Persistent Magic Context footer status for Pi.
  *
- * Hot path by design: one session_meta row read + ctx.getContextUsage(). No tag
- * or compartment enumeration here; the rich breakdown is reserved for /ctx-status.
  */
 export function registerStatusLine(
 	pi: ExtensionAPI,

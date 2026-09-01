@@ -146,7 +146,7 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
     };
 }
 
-/** Validate the committed manifest against the live test-file inventory. */
+/* */
 export function validateManifestDocument(
     raw: unknown,
     expectedFiles: string[] = enumerateTestFiles(),
@@ -210,10 +210,7 @@ export function validateGreenIncidentWrapperSource(
     catalog: IncidentCatalog,
 ): string[] {
     if (
-        // The extension is optional: an explicit `.ts` specifier resolves to the
-        // same module as the extensionless one, and without `\.tsx?` an import
-        // written that way would slip a known-red-only scenario into the green
-        // suite past this guard.
+        // The pattern matches optional `.ts` or `.tsx` extensions to prevent imports of either known-red-only module from bypassing validation.
         /from\s+["'][^"']*\/(?:parity-pi-todo|parity-synthetic-todo)(?:\.tsx?)?["']/.test(
             source,
         )
@@ -339,6 +336,8 @@ export function validateGreenPackageScripts(raw: unknown): void {
             "bun scripts/run-test-selection.ts --mode rust --timeout 600000 --max-concurrency 1",
         "test:incident-unit":
             "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
+        "test:metamorphic-unit":
+            "bun scripts/run-test-selection.ts --metamorphic-eval-unit --timeout 120000",
     };
     for (const [name, command] of Object.entries(required)) {
         if (raw.scripts[name] !== command) {

@@ -260,9 +260,7 @@ describe("Pi Magic Context commands", () => {
 			projectDir: "/tmp/project",
 			projectIdentity: "/tmp/project",
 		});
-		// Not registered with the dreamer timer in this unit test, so runManual
-		// throws "not registered" → the handler reports the failure. We only
-		// assert the command is wired and emits a /ctx-dream status message.
+		// The mock does not register the dreamer timer.
 		await handlers.get("ctx-dream")?.("", createCtx());
 
 		expect(sent[0]?.customType).toBe("ctx-status");
@@ -526,10 +524,6 @@ describe("Pi Magic Context commands", () => {
 		});
 
 		const ctx = createCtx("ses-budget");
-		// First call shows the confirmation warning; second call confirms and
-		// spawns the DETACHED recomp. The recomp now runs in the background
-		// (parity with OpenCode), so await the in-flight run before asserting
-		// what prompt the historian actually received.
 		await handlers.get("ctx-recomp")?.("", ctx);
 		await handlers.get("ctx-recomp")?.("", ctx);
 		await awaitInFlightRecomps();

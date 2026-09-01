@@ -104,10 +104,6 @@ export function clearCompressionDepth(db: Database, sessionId: string): void {
 }
 
 /**
- * Clear compression depth counters for a specific message range.
- * Used by partial recomp: rebuilt compartments start fresh at depth 0, so
- * depth rows for the rebuilt ordinals must be removed. Existing depth for
- * ordinals outside the range (prior and tail compartments) is preserved.
  */
 export function clearCompressionDepthRange(
     db: Database,

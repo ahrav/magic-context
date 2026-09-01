@@ -1,16 +1,6 @@
 /**
- * verify prompt + manifest parser.
  *
- * verify checks each in-scope project memory against the CURRENT source and
- * emits ONE XML manifest (verified / update / archive). The agent reads code
- * and changes nothing; the HOST parses the manifest and applies the DB writes
- * (so the agent never needs a mutation tool). Calibrated in the shadow harness
- * with planted ground-truth controls (4/4: caught a stale number → update, a
- * wrong tool-count → archive, a same-session change → archive, and kept the
- * correct control verified). See .alfonso/plans/dreamer-v2-rework.md.
  *
- * The DANGEROUS failure mode is WRONG ARCHIVAL (deleting a TRUE memory), so the
- * prompt and the host apply both bias hard toward keeping memories.
  */
 
 import type { ClaimMutationToken } from "../memory/claim-operation-contract";
@@ -112,9 +102,9 @@ function verifyBody(text: string): string {
     }
 }
 
-/** Parse the agent's complete `<verify>` manifest. The root close tag is
- *  mandatory so truncated output cannot apply a partial set of verdicts.
- *  A well-formed root with no recognized entries is a format miss, not success. */
+/**
+ * parseVerifyManifest accepts only complete manifest bodies.
+ * */
 export function parseVerifyManifest(
     text: string,
     allowFilelessClaimIds: ReadonlySet<string> = new Set(),
@@ -156,8 +146,8 @@ export function parseVerifyManifest(
     return out;
 }
 
-/** Retry-time contract: non-empty parse + exact id coverage. Apply still
- *  re-asserts coverage as the final belt. */
+/**
+ * */
 export function validateVerifyManifest(
     text: string,
     expectedIds: ReadonlySet<string>,

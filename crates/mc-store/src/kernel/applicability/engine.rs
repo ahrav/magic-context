@@ -5,6 +5,7 @@
 //! snapshot taken once, a typed query context, and the candidate batch;
 //! distinct anchors resolve once per batch, never once per candidate.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -12,15 +13,23 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use super::super::anchor::{evaluate_non_git, AnchorCondition, AnchorEvaluation, AnchorRowSpec};
+use super::super::anchor::{
+    evaluate_non_git, AnchorCondition, AnchorEvaluation, AnchorKind, AnchorRowSpec,
+    ContextDependency,
+};
 use super::super::scope::{
     scope_matches, CanonicalScope, MatchOutcome, ScopeFormError, ScopeMatchContext, ScopeTermSpec,
 };
 use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
-use super::checkout::{CheckoutSnapshot, EvalBudget};
-use super::checks::{run_cheap_check, CheckOutcome};
-use super::payloads::{CheckSpec, ObjectApplicabilitySpec, PayloadDecodeError};
+use super::checkout::{CheckoutSnapshot, DirtyEntry, EvalBudget};
+use super::checks::{check_observation, run_cheap_check, CheckCache, CheckOutcome};
+use super::payloads::{
+    CheckSpec, ObjectApplicabilitySpec, PayloadDecode, OBSERVATION_KIND_CURRENT,
+    OBSERVATION_KIND_DIRTY_TREE_UNCERTAIN, OBSERVATION_KIND_HISTORICAL,
+    OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
+    OBSERVATION_KIND_UNCERTAIN,
+};
 use super::resolve::{GitConditionOutcome, ResolutionLadder};
 
 /// Applicability state of one object at one checkout. Everything except
@@ -60,6 +69,18 @@ impl ApplicabilityState {
 
     pub fn blocks_auto_injection(self) -> bool {
         self != Self::Current
+    }
+
+    pub fn observation_kind(self) -> &'static str {
+        match self {
+            Self::Current => OBSERVATION_KIND_CURRENT,
+            Self::Historical => OBSERVATION_KIND_HISTORICAL,
+            Self::OutOfScope => OBSERVATION_KIND_OUT_OF_SCOPE,
+            Self::Uncertain => OBSERVATION_KIND_UNCERTAIN,
+            Self::DirtyTreeUncertain => OBSERVATION_KIND_DIRTY_TREE_UNCERTAIN,
+            Self::Stale => OBSERVATION_KIND_STALE,
+            Self::LifecycleInvalidated => OBSERVATION_KIND_LIFECYCLE_INVALIDATED,
+        }
     }
 }
 
@@ -127,9 +148,10 @@ pub struct BatchEvaluation {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AnchorCacheKey {
     checkout_identity: String,
-    anchor_id: String,
-    payload_digest: [u8; 32],
+    row_fingerprint: [u8; 32],
     head: String,
+    repository_state: String,
+    patch_id_algorithm: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +161,8 @@ struct ObjectCacheKey {
     object_id: Box<str>,
     object_revision: i64,
     inputs_digest: [u8; 32],
+    check_observations: [u8; 32],
+    scoped_dirty_fingerprint: [u8; 32],
 }
 
 impl Hash for ObjectCacheKey {
@@ -217,7 +241,7 @@ struct SnapshotCacheValues {
     hash: u64,
     checkout_identity: String,
     head: String,
-    dirty_fingerprint: String,
+    repository_state: String,
 }
 
 impl Hash for SnapshotCacheValues {
@@ -229,6 +253,7 @@ impl Hash for SnapshotCacheValues {
 #[derive(Debug, Clone)]
 struct CachedClassification {
     details: Option<Box<CachedClassificationDetails>>,
+    query_local: bool,
     append_confirmed: bool,
 }
 
@@ -264,8 +289,9 @@ impl<T> LastMemo<T> {
     }
 }
 
-type DecodedPayload = Result<Option<ObjectApplicabilitySpec>, PayloadDecodeError>;
+type DecodedPayload = PayloadDecode;
 type ScopeVerdict = Result<MatchOutcome, ScopeFormError>;
+static ABSENT_PAYLOAD: PayloadDecode = PayloadDecode::Absent;
 
 #[derive(Default)]
 struct PayloadMemo<'c> {
@@ -306,17 +332,17 @@ impl<'c> PayloadMemo<'c> {
     }
 }
 
-/// Per-batch memo state. Payload decode is pure. Repeated cheap checks reuse
-/// the first live-worktree observation in the batch; budget exhaustion is
-/// tested before lookup and is never memoized.
+/// Per-batch memo state. Payload decode is pure. Check observations and
+/// verdicts share one cache so the key and classification use the same read.
 #[derive(Default)]
-struct BatchMemos<'c> {
+struct BatchMemos {
     key: [u8; 32],
     anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
     anchor_verdict: LastMemo<AnchorVerdict>,
-    checks: HashMap<CheckSpec, CheckOutcome>,
-    dirty_path: LastMemo<Option<String>>,
-    payload: PayloadMemo<'c>,
+    check_cache: CheckCache,
+    check_digest: LastMemo<[u8; 32]>,
+    dirty_gate: LastMemo<DirtyGate>,
+    scoped_dirty: LastMemo<[u8; 32]>,
     scope: LastMemo<ScopeVerdict>,
 }
 
@@ -435,14 +461,14 @@ impl ApplicabilityEngine {
         let snapshot_hash = self.cache_hasher.hash_one((
             snapshot.identity(),
             snapshot.head(),
-            snapshot.dirty_fingerprint(),
+            snapshot.repository_state(),
         ));
         let mut cache_context = (candidates.len() > 1).then(|| {
             Arc::new(SnapshotCacheValues {
                 hash: snapshot_hash,
                 checkout_identity: snapshot.identity().to_string(),
                 head: snapshot.head().to_string(),
-                dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+                repository_state: snapshot.repository_state().to_string(),
             })
         });
         let mut digest_prefixes = InputDigestPrefixes::new(query, scope_context);
@@ -450,12 +476,18 @@ impl ApplicabilityEngine {
         let mut last_input_digest = None;
         // Distinct anchors and repeated payloads resolve once per batch.
         let mut batch_memos = BatchMemos::default();
+        let mut payload_memo = PayloadMemo::default();
         let mut objects = Vec::with_capacity(candidates.len());
         self.object_cache
             .lock()
             .expect("cache lock")
             .reserve(candidates.len());
         for candidate in candidates {
+            let payload_decode = match candidate.payload.as_deref() {
+                Some(payload) => payload_memo
+                    .get_or_insert_with(payload, || ObjectApplicabilitySpec::decode(Some(payload))),
+                None => &ABSENT_PAYLOAD,
+            };
             let inputs_digest = if candidates.len() > 1 {
                 let candidate_inputs = CandidateInputs::new(candidate);
                 if let Some((_, digest)) =
@@ -486,12 +518,31 @@ impl ApplicabilityEngine {
             } else {
                 digest_prefixes.for_candidate(candidate)
             };
+            batch_memos.key = inputs_digest;
+            let check_observations =
+                *batch_memos
+                    .check_digest
+                    .get_or_insert_with(inputs_digest, || {
+                        check_observations_digest(
+                            snapshot,
+                            payload_decode,
+                            &mut batch_memos.check_cache,
+                            budget,
+                        )
+                    });
+            let scoped_dirty_fingerprint = *batch_memos
+                .scoped_dirty
+                .get_or_insert_with(inputs_digest, || {
+                    scoped_dirty_fingerprint(snapshot, payload_decode, budget)
+                });
             let key = self.object_cache_key(
                 snapshot,
                 snapshot_hash,
                 cache_context.as_ref(),
                 candidate,
                 inputs_digest,
+                check_observations,
+                scoped_dirty_fingerprint,
             );
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
@@ -501,6 +552,7 @@ impl ApplicabilityEngine {
                         ApplicabilityState::LifecycleInvalidated,
                         "object lifecycle-invalidated before applicability evaluation",
                     ),
+                    false,
                 ));
                 continue;
             }
@@ -512,6 +564,7 @@ impl ApplicabilityEngine {
                         ApplicabilityState::Uncertain,
                         "evaluation budget exhausted before this object",
                     ),
+                    false,
                 ));
                 continue;
             }
@@ -548,7 +601,9 @@ impl ApplicabilityEngine {
                     state,
                     evidence,
                     failed_check,
-                    append_pending: state.blocks_auto_injection() && !cached.append_confirmed,
+                    append_pending: state.blocks_auto_injection()
+                        && !cached.query_local
+                        && !cached.append_confirmed,
                     token: ClassificationToken(key),
                 });
                 continue;
@@ -556,9 +611,9 @@ impl ApplicabilityEngine {
             stats.object_cache_misses += 1;
             let key = Arc::new(key);
             let token = ClassificationToken(Arc::clone(&key));
-            batch_memos.key = inputs_digest;
             let scope_context = resolved_scope_context
                 .get_or_init(|| scope_context.clone().with_head_commit(snapshot.head()));
+            let graph_ops_before = ladder.graph_operations();
             let classification = self.classify(
                 query,
                 scope_context,
@@ -566,8 +621,19 @@ impl ApplicabilityEngine {
                 &mut batch_memos,
                 &mut stats,
                 candidate,
+                payload_decode,
             );
-            if classification.cacheable {
+            let boundary_moved = if ladder.graph_operations() > graph_ops_before {
+                ladder.repository_state_moved()
+            } else {
+                ladder.repository_state_movement_seen()
+            };
+            let cacheable = classification.cacheable
+                && !boundary_moved
+                && !(classification.state == ApplicabilityState::Uncertain
+                    && ladder.saw_unreadable_object())
+                && !budget.is_exhausted();
+            if cacheable {
                 self.object_cache.lock().expect("cache lock").insert(
                     key,
                     CachedClassification {
@@ -578,11 +644,13 @@ impl ApplicabilityEngine {
                                 failed_check: classification.failed_check.clone().map(Box::new),
                             })
                         }),
+                        query_local: classification.query_local,
                         append_confirmed: false,
                     },
                 );
             }
-            objects.push(finished(candidate, token, classification));
+            let append_pending = cacheable && !classification.query_local;
+            objects.push(finished(candidate, token, classification, append_pending));
         }
         // Read the counter once for the whole batch so hit paths cannot hide
         // graph work behind branch placement.
@@ -592,24 +660,28 @@ impl ApplicabilityEngine {
 
     /// Marks the durable applicability append for `token` as landed, so
     /// later cache hits stop retrying it.
-    pub fn confirm_durable_append(&self, token: &ClassificationToken) {
+    #[must_use]
+    pub fn confirm_durable_append(&self, token: &ClassificationToken) -> bool {
         self.object_cache
             .lock()
             .expect("cache lock")
-            .update(token.0.as_ref(), |cached| cached.append_confirmed = true);
+            .update(token.0.as_ref(), |cached| cached.append_confirmed = true)
     }
 
-    fn classify<'c>(
+    #[expect(clippy::too_many_arguments, reason = "internal classify pipeline")]
+    fn classify(
         &self,
         query: &QueryContext,
         scope_context: &ScopeMatchContext,
         ladder: &ResolutionLadder<'_>,
-        memos: &mut BatchMemos<'c>,
+        memos: &mut BatchMemos,
         stats: &mut EvaluationStats,
-        candidate: &'c ApplicabilityCandidate,
+        candidate: &ApplicabilityCandidate,
+        payload_decode: &PayloadDecode,
     ) -> Classification {
         let snapshot = ladder.snapshot();
         let budget = ladder.budget();
+        let mut gates_ran = candidate.scope_terms.is_some() || candidate.anchor.is_some();
         // Scope gate.
         if let Some(terms) = &candidate.scope_terms {
             let outcome = match memos.scope.get_or_insert_with(memos.key, || {
@@ -630,18 +702,31 @@ impl ApplicabilityEngine {
                     return Classification::terminal(
                         ApplicabilityState::OutOfScope,
                         "scope does not match the query context",
-                    );
+                    )
+                    .query_local();
                 }
                 MatchOutcome::Uncertain => {
                     return Classification::terminal(
                         ApplicabilityState::Uncertain,
                         "scope match is unresolvable in this context",
-                    );
+                    )
+                    .query_local();
                 }
             }
         }
         // Anchor gate.
         if let Some(anchor) = &candidate.anchor {
+            let anchor_reads_context = !matches!(
+                AnchorKind::from_stored(&anchor.anchor_kind).map(AnchorKind::context_dependency),
+                Some(ContextDependency::None)
+            );
+            let localize = |classification: Classification| {
+                if anchor_reads_context {
+                    classification.query_local()
+                } else {
+                    classification
+                }
+            };
             let BatchMemos {
                 key,
                 anchors,
@@ -653,17 +738,17 @@ impl ApplicabilityEngine {
             }) {
                 AnchorVerdict::Holds => {}
                 AnchorVerdict::Historical(evidence) => {
-                    return Classification::terminal(
+                    return localize(Classification::terminal(
                         ApplicabilityState::Historical,
                         evidence.clone(),
-                    );
+                    ));
                 }
                 AnchorVerdict::Uncertain(evidence) => {
                     let state = ApplicabilityState::Uncertain;
                     return if budget.is_exhausted() {
-                        Classification::uncacheable(state, evidence.clone())
+                        localize(Classification::uncacheable(state, evidence.clone()))
                     } else {
-                        Classification::terminal(state, evidence.clone())
+                        localize(Classification::terminal(state, evidence.clone()))
                     };
                 }
             }
@@ -672,41 +757,40 @@ impl ApplicabilityEngine {
         // present-but-undecodable payload fails closed: the declared paths
         // and checks are unknowable, so the object is uncertain, never
         // silently current.
-        let spec = match candidate.payload.as_deref() {
-            None => None,
-            Some(payload) => match memos
-                .payload
-                .get_or_insert_with(payload, || ObjectApplicabilitySpec::decode(Some(payload)))
-            {
-                Ok(spec) => spec.as_ref(),
-                Err(_) => {
-                    return Classification::terminal(
-                        ApplicabilityState::Uncertain,
-                        "object applicability payload is undecodable",
-                    );
-                }
-            },
+        let spec = match payload_decode {
+            PayloadDecode::Absent => None,
+            PayloadDecode::Present(spec) => Some(spec),
+            PayloadDecode::Undecodable(evidence) => {
+                return Classification::terminal(ApplicabilityState::Uncertain, evidence.clone());
+            }
         };
         if let Some(spec) = spec {
-            let path = memos
-                .dirty_path
-                .get_or_insert_with(memos.key, || dirty_overlap(snapshot, &spec.affected_paths));
-            if let Some(path) = path {
-                return Classification::terminal(
-                    ApplicabilityState::DirtyTreeUncertain,
-                    format!("uncommitted path {path} overlaps affected paths"),
-                );
+            gates_ran |= !spec.affected_paths.is_empty() || !spec.checks.is_empty();
+            match memos.dirty_gate.get_or_insert_with(memos.key, || {
+                dirty_gate(snapshot, &spec.affected_paths, budget)
+            }) {
+                DirtyGate::Clear => {}
+                DirtyGate::Overlap(path) => {
+                    return Classification::terminal(
+                        ApplicabilityState::DirtyTreeUncertain,
+                        format!("uncommitted path {path} overlaps affected paths"),
+                    );
+                }
+                DirtyGate::Unplaceable(path) => {
+                    return Classification::terminal(
+                        ApplicabilityState::Uncertain,
+                        format!("affected path {path} does not resolve inside this checkout"),
+                    );
+                }
+                DirtyGate::BudgetExhausted => {
+                    return Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted during the dirty-tree gate",
+                    );
+                }
             }
             for check in &spec.checks {
-                let outcome = if budget.is_exhausted() {
-                    CheckOutcome::BudgetExhausted
-                } else {
-                    memos
-                        .checks
-                        .entry(check.clone())
-                        .or_insert_with(|| run_cheap_check(snapshot, check, budget))
-                        .clone()
-                };
+                let outcome = run_cheap_check(snapshot, check, budget, &mut memos.check_cache);
                 match outcome {
                     CheckOutcome::Passed => {}
                     CheckOutcome::Failed { evidence } => {
@@ -718,9 +802,10 @@ impl ApplicabilityEngine {
                             }),
                             evidence,
                             cacheable: true,
+                            query_local: false,
                         };
                     }
-                    CheckOutcome::Unsupported { evidence } | CheckOutcome::Invalid { evidence } => {
+                    CheckOutcome::Unsupported { evidence } => {
                         return Classification::terminal(ApplicabilityState::Uncertain, evidence);
                     }
                     CheckOutcome::BudgetExhausted => {
@@ -732,7 +817,14 @@ impl ApplicabilityEngine {
                 }
             }
         }
-        Classification::terminal(ApplicabilityState::Current, CURRENT_EVIDENCE)
+        Classification::terminal(
+            ApplicabilityState::Current,
+            match (candidate.anchor.is_some(), gates_ran) {
+                (true, _) => CURRENT_EVIDENCE,
+                (false, true) => "scope and declared inputs match this checkout",
+                (false, false) => "no scope, anchor, or declared inputs constrain this object",
+            },
+        )
     }
 
     fn evaluate_anchor(
@@ -765,34 +857,41 @@ impl ApplicabilityEngine {
         };
         let key = AnchorCacheKey {
             checkout_identity: snapshot.identity().to_string(),
-            anchor_id: anchor.anchor_id.clone(),
-            payload_digest: digest_optional(anchor.payload.as_deref()),
+            row_fingerprint: anchor_row_fingerprint(anchor),
             head: snapshot.head().to_string(),
+            repository_state: snapshot.repository_state().to_string(),
+            patch_id_algorithm: super::resolve::PATCH_ID_ALGORITHM,
         };
         let outcome = if let Some(outcome) = batch_anchor_memo.get(&key) {
             *outcome
         } else {
             let cached = self.anchor_cache.lock().expect("cache lock").get(&key);
-            let outcome = match cached {
+            let (outcome, memoizable) = match cached {
                 Some(outcome) => {
                     stats.anchor_cache_hits += 1;
-                    outcome
+                    (outcome, true)
                 }
                 None => {
                     stats.anchor_cache_misses += 1;
                     let outcome = ladder.evaluate(git_condition);
+                    let boundary_moved = ladder.repository_state_moved();
                     // Budget-driven uncertainty is transient; caching it
                     // would pin a degraded verdict to this (HEAD, anchor).
-                    if outcome != GitConditionOutcome::Uncertain || !ladder.budget_was_exhausted() {
+                    if !boundary_moved
+                        && (outcome != GitConditionOutcome::Uncertain
+                            || (!ladder.budget_was_exhausted() && !ladder.saw_unreadable_object()))
+                    {
                         self.anchor_cache
                             .lock()
                             .expect("cache lock")
                             .insert(key.clone(), outcome);
                     }
-                    outcome
+                    (outcome, !boundary_moved)
                 }
             };
-            batch_anchor_memo.insert(key, outcome);
+            if memoizable {
+                batch_anchor_memo.insert(key, outcome);
+            }
             outcome
         };
         match outcome {
@@ -806,6 +905,7 @@ impl ApplicabilityEngine {
         }
     }
 
+    #[expect(clippy::too_many_arguments, reason = "exact cache-key dimensions")]
     fn object_cache_key(
         &self,
         snapshot: &CheckoutSnapshot,
@@ -813,6 +913,8 @@ impl ApplicabilityEngine {
         context: Option<&Arc<SnapshotCacheValues>>,
         candidate: &ApplicabilityCandidate,
         inputs_digest: [u8; 32],
+        check_observations: [u8; 32],
+        scoped_dirty_fingerprint: [u8; 32],
     ) -> ObjectCacheKey {
         let snapshot = match context {
             Some(context) => SnapshotCacheKey::Shared(Arc::clone(context)),
@@ -820,7 +922,7 @@ impl ApplicabilityEngine {
                 hash: snapshot_hash,
                 checkout_identity: snapshot.identity().to_string(),
                 head: snapshot.head().to_string(),
-                dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+                repository_state: snapshot.repository_state().to_string(),
             }),
         };
         ObjectCacheKey {
@@ -829,11 +931,15 @@ impl ApplicabilityEngine {
                 candidate.object_id.as_str(),
                 candidate.object_revision,
                 inputs_digest,
+                check_observations,
+                scoped_dirty_fingerprint,
             )),
             snapshot,
             object_id: candidate.object_id.as_str().into(),
             object_revision: candidate.object_revision,
             inputs_digest,
+            check_observations,
+            scoped_dirty_fingerprint,
         }
     }
 }
@@ -858,11 +964,13 @@ impl ObjectApplicability {
                     hash: 0,
                     checkout_identity: String::new(),
                     head: String::new(),
-                    dirty_fingerprint: String::new(),
+                    repository_state: String::new(),
                 }),
                 object_id: candidate.object_id.as_str().into(),
                 object_revision: candidate.object_revision,
                 inputs_digest: [0; 32],
+                check_observations: [0; 32],
+                scoped_dirty_fingerprint: [0; 32],
             })),
         }
     }
@@ -887,6 +995,7 @@ struct Classification {
     evidence: String,
     failed_check: Option<FailedCheck>,
     cacheable: bool,
+    query_local: bool,
 }
 
 impl Classification {
@@ -896,6 +1005,7 @@ impl Classification {
             evidence: evidence.into(),
             failed_check: None,
             cacheable: true,
+            query_local: false,
         }
     }
 
@@ -905,7 +1015,13 @@ impl Classification {
             evidence: evidence.into(),
             failed_check: None,
             cacheable: false,
+            query_local: false,
         }
+    }
+
+    fn query_local(mut self) -> Self {
+        self.query_local = true;
+        self
     }
 }
 
@@ -913,75 +1029,187 @@ fn finished(
     candidate: &ApplicabilityCandidate,
     token: ClassificationToken,
     classification: Classification,
+    append_pending: bool,
 ) -> ObjectApplicability {
-    // Lifecycle invalidation is a store-side verdict with no checkout
-    // evidence to append; every other blocking state starts append-pending.
-    let append_pending = classification.state.blocks_auto_injection()
-        && classification.state != ApplicabilityState::LifecycleInvalidated;
     ObjectApplicability {
         object_id: candidate.object_id.clone(),
         object_revision: candidate.object_revision,
         state: classification.state,
         evidence: classification.evidence,
         failed_check: classification.failed_check,
-        append_pending,
+        append_pending: append_pending && classification.state.blocks_auto_injection(),
         token,
     }
 }
 
-/// A dirty path overlaps an affected path when they are equal or one is a
-/// directory prefix of the other (untracked directories are recorded as a
-/// single collapsed entry).
-fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Option<String> {
-    if affected_paths.is_empty() {
-        return None;
+#[derive(Clone)]
+enum DirtyGate {
+    Clear,
+    Overlap(String),
+    Unplaceable(String),
+    BudgetExhausted,
+}
+
+fn dirty_gate(
+    snapshot: &CheckoutSnapshot,
+    affected_paths: &[String],
+    budget: &EvalBudget,
+) -> DirtyGate {
+    for affected in affected_paths {
+        if let DeclaredPath::Unplaceable = declared_path(affected) {
+            return DirtyGate::Unplaceable(affected.clone());
+        }
     }
-    affected_paths
-        .iter()
-        .filter_map(|affected| first_dirty_overlap(snapshot, affected))
-        .min()
-        .map(str::to_string)
-}
-
-fn first_dirty_overlap<'a>(snapshot: &'a CheckoutSnapshot, affected_path: &str) -> Option<&'a str> {
-    let entries = snapshot.dirty_entries();
-    let affected_path = affected_path.trim_end_matches('/');
-    if let Some(first) = entries
-        .first()
-        .map(|entry| entry.path.as_str())
-        .filter(|dirty_path| paths_overlap(dirty_path, affected_path))
-    {
-        return Some(first);
+    for entry in snapshot.dirty_entries() {
+        if budget.is_exhausted() {
+            return DirtyGate::BudgetExhausted;
+        }
+        if !entry.is_uncommitted_change() {
+            continue;
+        }
+        if affected_paths
+            .iter()
+            .any(|affected| entry_overlaps(entry, affected))
+        {
+            return DirtyGate::Overlap(entry.path.clone());
+        }
     }
-    let start = entries.partition_point(|entry| entry.path.as_str() < affected_path);
-    let descendant = entries
-        .get(start)
-        .map(|entry| entry.path.as_str())
-        .filter(|dirty_path| paths_overlap(dirty_path, affected_path));
-    affected_path
-        .match_indices('/')
-        .filter_map(|(separator, _)| {
-            let ancestor = &affected_path[..separator];
-            entries
-                .binary_search_by(|entry| entry.path.as_str().cmp(ancestor))
-                .ok()
-                .map(|index| entries[index].path.as_str())
-        })
-        .chain(descendant)
-        .min()
+    DirtyGate::Clear
 }
 
-fn paths_overlap(a: &str, b: &str) -> bool {
-    let a = a.trim_end_matches('/');
-    let b = b.trim_end_matches('/');
-    a == b
-        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
-        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+enum DeclaredPath<'a> {
+    Path(Cow<'a, str>),
+    WorktreeRoot,
+    Unplaceable,
 }
 
-fn digest_optional(payload: Option<&[u8]>) -> [u8; 32] {
+fn declared_path(path: &str) -> DeclaredPath<'_> {
+    let trimmed = path.trim_end_matches('/');
+    let mut needs_rewrite = trimmed.starts_with('/');
+    for segment in trimmed.split('/') {
+        match segment {
+            ".." => return DeclaredPath::Unplaceable,
+            "" | "." => needs_rewrite = true,
+            _ => {}
+        }
+    }
+    if !needs_rewrite {
+        return DeclaredPath::Path(Cow::Borrowed(trimmed));
+    }
+    let segments: Vec<&str> = trimmed
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    if segments.is_empty() {
+        return DeclaredPath::WorktreeRoot;
+    }
+    DeclaredPath::Path(Cow::Owned(segments.join("/")))
+}
+
+fn paths_overlap(dirty: &[u8], declared: &[u8]) -> bool {
+    let dirty = trim_trailing_slashes(dirty);
+    let declared = trim_trailing_slashes(declared);
+    dirty == declared || is_under(dirty, declared) || is_under(declared, dirty)
+}
+
+fn is_under(path: &[u8], ancestor: &[u8]) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+fn trim_trailing_slashes(mut path: &[u8]) -> &[u8] {
+    while let Some(rest) = path.strip_suffix(b"/") {
+        path = rest;
+    }
+    path
+}
+
+fn entry_overlaps(entry: &DirtyEntry, declared: &str) -> bool {
+    match declared_path(declared) {
+        DeclaredPath::Path(declared) => {
+            paths_overlap(&entry.raw_path, declared.as_ref().as_bytes())
+        }
+        DeclaredPath::WorktreeRoot | DeclaredPath::Unplaceable => true,
+    }
+}
+
+fn scoped_dirty_fingerprint(
+    snapshot: &CheckoutSnapshot,
+    payload_decode: &PayloadDecode,
+    budget: &EvalBudget,
+) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(payload.unwrap_or_default());
+    let PayloadDecode::Present(spec) = payload_decode else {
+        return hash.finalize().into();
+    };
+    for affected in &spec.affected_paths {
+        if matches!(declared_path(affected), DeclaredPath::Unplaceable) {
+            hash.update(b"unplaceable\0");
+            hash.update(affected.as_bytes());
+        }
+    }
+    for entry in snapshot.dirty_entries() {
+        if budget.is_exhausted() {
+            break;
+        }
+        if entry.is_uncommitted_change()
+            && spec
+                .affected_paths
+                .iter()
+                .any(|affected| entry_overlaps(entry, affected))
+        {
+            hash.update((entry.raw_path.len() as u64).to_le_bytes());
+            hash.update(&entry.raw_path);
+            hash.update(entry.status.as_bytes());
+            hash.update(entry.content_hash.as_bytes());
+        }
+    }
+    hash.finalize().into()
+}
+
+fn anchor_row_fingerprint(anchor: &AnchorRowSpec) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    digest_field(&mut hash, Some(&anchor.anchor_id));
+    digest_field(&mut hash, Some(&anchor.anchor_kind));
+    digest_field(&mut hash, anchor.exact_value.as_deref());
+    digest_field(&mut hash, anchor.reachable_from_oid.as_deref());
+    digest_field(&mut hash, anchor.reachable_between_start_oid.as_deref());
+    digest_field(&mut hash, anchor.reachable_between_end_oid.as_deref());
+    digest_field(&mut hash, anchor.deployment_revision.as_deref());
+    digest_field(&mut hash, anchor.config_revision.as_deref());
+    digest_field(&mut hash, anchor.platform_version_range.as_deref());
+    digest_i64(&mut hash, anchor.wall_clock_start);
+    digest_i64(&mut hash, anchor.wall_clock_end);
+    match &anchor.payload {
+        Some(payload) => {
+            hash.update([1]);
+            hash.update((payload.len() as u64).to_le_bytes());
+            hash.update(payload);
+        }
+        None => hash.update([0]),
+    }
+    hash.finalize().into()
+}
+
+fn check_observations_digest(
+    snapshot: &CheckoutSnapshot,
+    payload_decode: &PayloadDecode,
+    cache: &mut CheckCache,
+    budget: &EvalBudget,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    let PayloadDecode::Present(spec) = payload_decode else {
+        return hash.finalize().into();
+    };
+    for check in &spec.checks {
+        if budget.is_exhausted() {
+            break;
+        }
+        if let Some(observation) = check_observation(cache, snapshot, check) {
+            hash.update((observation.len() as u64).to_le_bytes());
+            hash.update(observation.as_bytes());
+        }
+    }
     hash.finalize().into()
 }
 
@@ -993,12 +1221,13 @@ enum InputPrefixKind {
     Config,
     Platform,
     WallClock,
+    All,
 }
 
 struct InputDigestPrefixes<'a> {
     query: &'a QueryContext,
     scope_context: &'a ScopeMatchContext,
-    cached: [Option<Sha256>; 6],
+    cached: [Option<Sha256>; 7],
 }
 
 impl<'a> InputDigestPrefixes<'a> {
@@ -1011,18 +1240,18 @@ impl<'a> InputDigestPrefixes<'a> {
     }
 
     fn for_candidate(&mut self, candidate: &ApplicabilityCandidate) -> [u8; 32] {
-        let kind = match candidate
-            .anchor
-            .as_ref()
-            .map(|anchor| anchor.anchor_kind.as_str())
-            .unwrap_or_default()
-        {
-            "exact" => InputPrefixKind::Exact,
-            "deployment_revision" => InputPrefixKind::Deployment,
-            "config_revision" => InputPrefixKind::Config,
-            "platform_version" => InputPrefixKind::Platform,
-            "wall_clock_interval" => InputPrefixKind::WallClock,
-            _ => InputPrefixKind::Default,
+        let kind = match candidate.anchor.as_ref().map(|anchor| {
+            AnchorKind::from_stored(&anchor.anchor_kind)
+                .map(AnchorKind::context_dependency)
+                .unwrap_or(ContextDependency::All)
+        }) {
+            None | Some(ContextDependency::None) => InputPrefixKind::Default,
+            Some(ContextDependency::ExactToken) => InputPrefixKind::Exact,
+            Some(ContextDependency::DeploymentRevision) => InputPrefixKind::Deployment,
+            Some(ContextDependency::ConfigRevision) => InputPrefixKind::Config,
+            Some(ContextDependency::PlatformVersion) => InputPrefixKind::Platform,
+            Some(ContextDependency::QueryInstant) => InputPrefixKind::WallClock,
+            Some(ContextDependency::All) => InputPrefixKind::All,
         };
         let slot = &mut self.cached[kind as usize];
         if slot.is_none() {
@@ -1038,7 +1267,7 @@ fn inputs_digest_prefix(
     kind: InputPrefixKind,
 ) -> Sha256 {
     let mut hash = Sha256::new();
-    hash.update(b"mc-applicability-inputs-v1\0");
+    hash.update(b"mc-applicability-inputs-v4\0");
     // Only the context fields the candidate's anchor kind reads enter the
     // digest, so an unrelated context change (a fresh query instant, say)
     // cannot evict every cached classification.
@@ -1047,30 +1276,28 @@ fn inputs_digest_prefix(
         InputPrefixKind::Deployment => &[query.deployment_revision.as_deref()],
         InputPrefixKind::Config => &[query.config_revision.as_deref()],
         InputPrefixKind::Platform => &[query.platform_version.as_deref()],
+        InputPrefixKind::All => &[
+            query.exact_token.as_deref(),
+            query.deployment_revision.as_deref(),
+            query.config_revision.as_deref(),
+            query.platform_version.as_deref(),
+        ],
         _ => &[],
     };
     for field in relevant {
-        hash.update(field.unwrap_or("<none>").as_bytes());
-        hash.update(b"\0");
+        digest_field(&mut hash, *field);
     }
-    if matches!(kind, InputPrefixKind::WallClock) {
-        hash.update(
-            query
-                .query_instant_ms
-                .map(|instant| instant.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-                .as_bytes(),
-        );
+    if matches!(kind, InputPrefixKind::WallClock | InputPrefixKind::All) {
+        match query.query_instant_ms {
+            Some(instant) => {
+                hash.update([1]);
+                hash.update(instant.to_le_bytes());
+            }
+            None => hash.update([0]),
+        }
     }
-    hash.update(b"\0");
     for dimension in super::super::Dimension::ALL {
-        hash.update(
-            scope_context
-                .value(dimension)
-                .unwrap_or("<none>")
-                .as_bytes(),
-        );
-        hash.update(b"\0");
+        digest_field(&mut hash, scope_context.value(dimension));
     }
     hash
 }
@@ -1131,7 +1358,14 @@ fn finish_inputs_digest(mut hash: Sha256, candidate: &ApplicabilityCandidate) ->
     } else {
         hash.update([0u8]);
     }
-    hash.update(candidate.payload.as_deref().unwrap_or_default());
+    match &candidate.payload {
+        Some(payload) => {
+            hash.update([1]);
+            hash.update((payload.len() as u64).to_le_bytes());
+            hash.update(payload);
+        }
+        None => hash.update([0]),
+    }
     hash.finalize().into()
 }
 

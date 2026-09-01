@@ -9,13 +9,7 @@ import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import { assistantMessage, createTestDb } from "./test-utils";
 
 /**
- * Replicates the function_call / function_call_output pairing the OpenAI
- * Responses (Codex) serializer produces — see pi-mono
- * packages/ai/src/providers/openai-responses-shared.ts: an assistant message
- * emits one `function_call` per `toolCall` content block but is SKIPPED whole
- * when it yields zero output items; a `toolResult` message always emits a
- * `function_call_output`. The wire is invalid when a `function_call_output`
- * has no preceding `function_call` with the same call_id (the live 400 error).
+ * An assistant message is omitted when it yields zero output items; a toolResult message always emits a function_call_output.
  */
 function findOrphanedFunctionCallOutputs(messages: unknown[]): string[] {
 	const seenCallIds = new Set<string>();
@@ -26,9 +20,8 @@ function findOrphanedFunctionCallOutputs(messages: unknown[]): string[] {
 		if (role === "assistant") {
 			const content = (m as { content?: unknown }).content;
 			if (!Array.isArray(content)) continue;
-			// Codex skips an assistant message entirely when it produces no
-			// output items. Of the blocks we model, only `toolCall` and
-			// non-empty `text` yield output items.
+			// Codex omits assistant messages that produce zero output items.
+			// Non-empty `text` blocks yield output items.
 			const blocks = content as Array<Record<string, unknown>>;
 			const producesOutput = blocks.some(
 				(b) =>
@@ -138,12 +131,9 @@ describe("injectSyntheticTodowriteForPi", () => {
 		}
 	});
 
-	// Reproduction of the live Codex 400 on session 019de471 (2026-07-03): the
-	// persisted anchor pointed at an ABORTED assistant (stopReason "aborted",
-	// empty content). Pi's transform-messages skips errored/aborted assistants
-	// wholesale at wire build but forwards toolResult messages unconditionally,
-	// so the synthetic pair's call half vanished while its output half shipped —
-	// an orphaned function_call_output, rejected 400 on every subsequent turn.
+	// Pi omits aborted assistant messages but forwards toolResult messages, so attaching a synthetic pair to an aborted assistant produces an orphaned function_call_output.
+	// An aborted assistant has stopReason "aborted" and empty content.
+	// An orphaned function_call_output is rejected.
 	it("never anchors the synthetic pair to an aborted or errored assistant", () => {
 		const db = createTestDb();
 		try {
@@ -152,8 +142,8 @@ describe("injectSyntheticTodowriteForPi", () => {
 				{ content: "Ship it", status: "in_progress", priority: "high" },
 			]);
 			const callId = computeSyntheticCallId(stateJson);
-			// The anchor persisted on an earlier pass now resolves to an aborted
-			// assistant (the live shape: aborted, content []).
+			// The persisted anchor can resolve to an aborted assistant.
+			// An aborted assistant has empty content.
 			setPersistedTodoSyntheticAnchor(
 				db,
 				sessionId,
@@ -172,8 +162,8 @@ describe("injectSyntheticTodowriteForPi", () => {
 				responseId: "resp_good",
 			});
 
-			// Defer pass: the pair must NOT attach to the aborted anchor (skip
-			// silently, same as an anchor outside the visible window).
+			// Pi omits aborted assistant messages but forwards toolResult messages, so replaying the synthetic pair would orphan the synthetic tool result.
+			// Pi omits aborted assistant messages but forwards toolResult messages, so replaying the synthetic pair would orphan the synthetic tool result.
 			const deferMessages = [aborted, good] as unknown as Parameters<
 				typeof injectSyntheticTodowriteForPi
 			>[0]["messages"];
@@ -188,8 +178,8 @@ describe("injectSyntheticTodowriteForPi", () => {
 			expect(findOrphanedFunctionCallOutputs(deferMessages)).toEqual([]);
 			expect(JSON.stringify(deferMessages)).not.toContain(callId);
 
-			// Cache-busting pass: the pair re-anchors to a REPLAYABLE assistant
-			// instead (never the aborted one, even when it is the newest).
+			// Cache-busting replay re-anchors the synthetic pair to a replayable assistant.
+			// The injector never anchors the synthetic pair to an aborted assistant.
 			const errored = {
 				role: "assistant",
 				content: [],
@@ -218,14 +208,11 @@ describe("injectSyntheticTodowriteForPi", () => {
 		}
 	});
 
-	// Reproduction of the live Codex 400 "No tool call found for function call
-	// output with call_id mc_synthetic_todo_..." on a post-/ctx-recomp Pi tail.
 	//
-	// Proven on-disk shape (JSONL lines 22091/22093/22095 of the bogged session):
-	// a single Codex response is split by Pi into MULTIPLE assistant messages
-	// that all carry the SAME `responseId`, and a trailing reasoning-only segment
-	// has empty content. getMessageId() keys identity on responseId, so the
-	// synthetic anchor id is NON-UNIQUE across those messages.
+	// A Codex response can be split into multiple assistant messages with the same responseId.
+	// Pi can split one Codex response into multiple assistant messages that share a responseId.
+	// Pi can split one Codex response into multiple assistant messages that share a responseId; a trailing reasoning-only message can have empty content.
+	// `responseId` is non-unique across messages from the same Codex response.
 	it("does not orphan the synthetic toolResult when several tail messages share one responseId", () => {
 		const db = createTestDb();
 		try {
@@ -241,8 +228,7 @@ describe("injectSyntheticTodowriteForPi", () => {
 			const sharedResponseId =
 				"resp_040c5c13bbb6f3bc016a2d8705d29c819181a2638024c55a80";
 
-			// The latest-assistant inject path anchored to the LAST message
-			// carrying the shared responseId (the empty reasoning-only segment).
+			// A trailing reasoning-only segment has empty content.
 			setPersistedTodoSyntheticAnchor(
 				db,
 				sessionId,
@@ -256,7 +242,7 @@ describe("injectSyntheticTodowriteForPi", () => {
 				toolResultMsg("a1", 1),
 				thinkingToolCall(sharedResponseId, "a2", 2),
 				toolResultMsg("a2", 2),
-				// Trailing reasoning-only segment of the SAME response: empty content.
+				// A trailing reasoning-only segment has empty content.
 				{
 					role: "assistant",
 					content: [],
@@ -274,7 +260,6 @@ describe("injectSyntheticTodowriteForPi", () => {
 				messages,
 			});
 
-			// The synthetic pair must be injected AND wire-valid: every synthetic
 			// function_call_output must have a matching function_call before it.
 			expect(JSON.stringify(messages)).toContain(callId);
 			const orphans = findOrphanedFunctionCallOutputs(

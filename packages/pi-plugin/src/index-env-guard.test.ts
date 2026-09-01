@@ -27,8 +27,7 @@ function isolateXdgEnv() {
 
 afterEach(() => {
 	restoreEnv();
-	// Clear the process-global init latch so one test's full init does not
-	// leak into the next (the latch lives on globalThis, not module state).
+	// The test helper resets the global initialization latch between tests.
 	__test.clearPiMagicContextActive();
 });
 
@@ -61,9 +60,5 @@ describe("Pi full extension subagent env guard", () => {
 		expect(registrations.events).toContain("before_agent_start");
 		expect(registrations.tools).toContain("ctx_search");
 		expect(registrations.commands).toContain("ctx-status");
-		// This path initializes and migrates a fresh SQLite database before registering
-		// the complete extension. In a 2-CPU Bun 1.3.14 Linux container it took
-		// 0.49-2.59s (0.38-0.74s for SQLite alone), while a loaded 2-core release runner
-		// reached 7.67s. Keep enough headroom for that measured cold-start work.
 	}, 15_000);
 });

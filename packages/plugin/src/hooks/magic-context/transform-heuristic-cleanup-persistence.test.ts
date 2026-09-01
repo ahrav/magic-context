@@ -51,9 +51,7 @@ function buildMessages(): TestMessage[] {
                     type: "tool",
                     callID: "call-1",
                     state: {
-                        // Large enough that the tiered emergency drop reclaims it.
-                        // Realistic content, not a single repeated char (that is a
-                        // ~17s BPE tokenizer pathology under the per-tag token store).
+                        // The 4,200 repetitions make `output` large enough for the tiered emergency drop to reclaim it.
                         output: "const value = compute(input, options); // line\n".repeat(4200),
                         tool: "mcp_read",
                         input: { path: "a.ts" },
@@ -124,7 +122,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* Cleanup ignores removal errors, including Windows `EBUSY`. */
         }
     }
     tempDirs.length = 0;
@@ -141,11 +139,10 @@ describe("createTransform heuristic cleanup persistence", () => {
 
         const schedulerDecision = mock<Scheduler["shouldExecute"]>(() => "defer");
         const scheduler: Scheduler = { shouldExecute: schedulerDecision };
-        // Three-set cache-busting signals replace the old single
-        // `flushedSessions`. To simulate a `/ctx-flush` we add to the
-        // persistent `pendingMaterializationSessions` set (read by
-        // postprocess `isExplicitFlush`). History/system sets are not
-        // needed for this heuristic test.
+        // `pendingMaterializationSessions` simulates an explicit `/ctx-flush` for this heuristic test.
+        // `pendingMaterializationSessions` simulates an explicit `/ctx-flush` for this heuristic test.
+        // `flushedHistorySessions` and `flushedSystemSessions` do not affect this heuristic.
+        // `flushedHistorySessions` and `flushedSystemSessions` do not affect this heuristic.
         const historyRefreshSessions = new Set<string>();
         const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
@@ -154,7 +151,7 @@ describe("createTransform heuristic cleanup persistence", () => {
             contextUsageMap: new Map<string, { usage: ContextUsage; updatedAt: number }>([
                 [
                     "ses-heuristic-persist",
-                    // >=85% so the tiered emergency drop fires on the execute pass.
+                    // Estimated usage of at least 85% triggers the tiered emergency drop during execution.
                     { usage: { percentage: 86, inputTokens: 172_000 }, updatedAt: Date.now() },
                 ],
             ]),
@@ -228,10 +225,9 @@ describe("createTransform heuristic cleanup persistence", () => {
         const executePass = buildInjectionOnlyMessages();
         await transform({}, { messages: executePass });
 
-        // Sentinel-based stripping preserves array length; the injection-only
-        // message is kept in the array but neutralized to a single sentinel.
-        // Test doesn't set providerID → `[dropped]` text (non-anthropic safe).
-        // Anthropic-only optimization (text="") is covered in dedicated tests.
+        // Sentinel-based stripping preserves array length.
+        // The injection-only message remains in the array as a single sentinel.
+        // With no `providerID`, dropped text is `[dropped]`.
         const executeInjection = getMessage(executePass, "m-injection-only");
         expect(executeInjection?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
 
@@ -239,7 +235,7 @@ describe("createTransform heuristic cleanup persistence", () => {
         const deferPass = buildInjectionOnlyMessages();
         await transform({}, { messages: deferPass });
 
-        // Replay on defer: same neutralization persists without re-mutating array.
+        // Deferred replay reuses the neutralized message without mutating the array again.
         const deferredInjection = getMessage(deferPass, "m-injection-only");
         expect(deferredInjection?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
     });

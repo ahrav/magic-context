@@ -103,7 +103,7 @@ function seedUnsupportedDirect(dbPath: string): string {
     return marker.databaseIncarnationId;
 }
 
-/** Same family, checkpointed so the main file alone carries the whole schema. */
+/** Checkpointing stores the schema in the main file before the sidecars are removed. */
 function seedCheckpointedUnsupportedDirect(dbPath: string): string {
     const { db, marker } = createDirectTestDatabase({
         path: dbPath,
@@ -197,11 +197,8 @@ describe("doctor reset-db U11 scenarios", () => {
     });
 
     it("classifies a current family whose rollback journal is still hot", () => {
-        // A process that dies mid-transaction leaves a HOT journal: the main
-        // image is unrecovered until SQLite rolls it back. Classifying without
-        // the journal reads a pre-rollback image, and reading it with the
-        // journal but read-only fails the open outright — either way a
-        // recoverable family can be reported as corrupt and offered for
+        // A hot journal requires SQLite recovery before the main database reflects the rolled-back transaction.
+        // Without recovery, classification can misreport a recoverable family as corrupt.
         // quarantine.
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "hot-journal.db");
@@ -209,20 +206,15 @@ describe("doctor reset-db U11 scenarios", () => {
         const incarnation = created.marker.databaseIncarnationId;
         created.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         created.db.exec("PRAGMA journal_mode=DELETE");
-        // A tiny page cache forces the open transaction to spill dirty pages
-        // into the main file, which is what makes the journal hot rather than
+        // A tiny page cache spills transaction pages into the main file, creating a hot journal that exercises rollback recovery.
         // merely present.
         created.db.exec("PRAGMA cache_size=2");
         created.db.exec("BEGIN IMMEDIATE");
-        // Created INSIDE the transaction, so rollback removes it. That makes
-        // this test discriminate: classifying the pre-rollback image sees an
-        // unregistered schema object and reports `unsupported`, while a probe
-        // that actually recovers sees the clean current family.
+        // The transaction creates an unregistered schema object; before rollback classification reports `unsupported`, but recovery yields the current family.
         created.db.exec("CREATE TABLE hot_journal_probe(a, b)");
         const insert = created.db.prepare("INSERT INTO hot_journal_probe VALUES (?, ?)");
         for (let index = 0; index < 20_000; index += 1) insert.run(index, "x".repeat(200));
-        // Abandon the connection without commit or close, leaving the journal
-        // on disk exactly as a killed process would.
+        // The test abandons the connection without commit or close, leaving the journal on disk as a killed process would.
         expect(existsSync(`${dbPath}-journal`)).toBe(true);
 
         const before = readFileSync(dbPath);
@@ -385,14 +377,7 @@ describe("doctor reset-db U11 scenarios", () => {
                     renameSync(source, destination);
                     if (!replaced && source.endsWith("-journal")) {
                         replaced = true;
-                        // The replacement has to land on a DIFFERENT inode, since
-                        // that is what the identity check compares. Deleting
-                        // first and recreating leaves the new inode to the
-                        // filesystem, which recycles the just-freed one often
-                        // enough that CI saw the replacement keep its recorded
-                        // identity and the quarantine proceed. Staging a sibling
-                        // while the original still holds its inode forces a
-                        // distinct one, and the rename carries it over.
+                        // The reset stages the replacement beside the original, then renames it so open holders retain the original inode while the replacement has a distinct identity.
                         const staged = `${dbPath}-shm.replacement`;
                         writeFileSync(staged, replacement);
                         renameSync(staged, `${dbPath}-shm`);
@@ -493,12 +478,7 @@ describe("doctor reset-db U11 scenarios", () => {
     });
 
     it("refuses when the family becomes current during the confirmation prompt", async () => {
-        // The prompt is an open-ended window. Another process can upgrade the
-        // family in place and exit while it is displayed, after which the holder
-        // check sees nobody. Publishing from the pre-prompt reading would bind a
-        // marker to a family that no longer matches it, and marker verification
-        // compares device and inode while ignoring content — so an in-place
-        // replacement reusing the inode passes and a current family is
+        // The reset re-reads the family after confirmation because another process can upgrade it while the prompt is open.
         // quarantined.
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");
@@ -513,10 +493,7 @@ describe("doctor reset-db U11 scenarios", () => {
             deps: {
                 inspectFamilyState: (path: string) => {
                     reads += 1;
-                    // Reads 1 and 2 are the initial classification and the
-                    // pre-prompt exclusivity re-check; the upgrade lands while
-                    // the confirmation is open, so the post-confirmation read
-                    // must see it.
+                    // Read 1 classifies the family, read 2 rechecks exclusivity before the prompt, and the post-confirmation read observes upgrades made while the prompt was open.
                     if (reads >= 3) {
                         return {
                             state: "current",
@@ -602,11 +579,7 @@ describe("doctor reset-db U11 scenarios", () => {
     });
 
     it("scenario 10: a family that only looks unsupported before exclusivity is preserved", async () => {
-        // Classification probes a copy of the family whose main file and
-        // sidecars are copied separately, so a live writer checkpointing between
-        // those copies makes a supported family read as unsupported. Once the
-        // holder inspection reports no holder, the family must be re-checked:
-        // acting on the earlier reading would quarantine a supported database.
+        // If no holders remain, the reset moves no files and leaves no marker that could block the next open.
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");
         const stash = tempStorage();
@@ -621,8 +594,6 @@ describe("doctor reset-db U11 scenarios", () => {
                 copyFileSync(`${dbPath}${suffix}`, join(stash, `context.db${suffix}`));
             }
         }
-        // Leave the torn shape a mid-copy checkpoint produces: a main file with
-        // no schema plus the sidecars the probe copied after the checkpoint.
         writeFileSync(dbPath, Buffer.alloc(0));
         writeFileSync(`${dbPath}-wal`, Buffer.alloc(0));
         expect(inspectDirectDatabaseFamilyState(dbPath)).toMatchObject({ state: "unsupported" });
@@ -636,8 +607,6 @@ describe("doctor reset-db U11 scenarios", () => {
             deps: {
                 inspectHolders: () => {
                     holderInspections += 1;
-                    // The writer exits: its committed contents are back in the
-                    // family before exclusivity is reported.
                     if (holderInspections === 1) {
                         for (const suffix of ["", "-wal", "-shm"]) {
                             const source = join(stash, `context.db${suffix}`);
@@ -657,8 +626,7 @@ describe("doctor reset-db U11 scenarios", () => {
         for (const [suffix, bytes] of familyBytes) {
             expect(readFileSync(`${dbPath}${suffix}`)).toEqual(bytes);
         }
-        // Aborted before publication, so FINDING 1's cleanup has nothing to do:
-        // no marker may remain to block the next open, and nothing was moved.
+        // The no-holder path leaves no reset marker and moves no files.
         expect(existsSync(databaseResetMarkerPath(dbPath))).toBe(false);
         expect(readdirSync(storageDir).some((name) => name.includes(".mc-quarantine-"))).toBe(
             false,
@@ -666,8 +634,6 @@ describe("doctor reset-db U11 scenarios", () => {
         const output = prompts.messages.join("\n");
         expect(output).toContain("current supported format");
         expect(output).toContain("no reset marker was published");
-        // The operator is never asked to confirm a classification the command
-        // does not act on.
         expect(output).not.toContain("confirm:");
         expect(holderInspections).toBe(1);
     });
@@ -688,9 +654,6 @@ describe("doctor reset-db U11 scenarios", () => {
             deps: {
                 inspectHolders: () => {
                     holderInspections += 1;
-                    // Between the first reading and exclusivity the family is
-                    // replaced by a different unsupported family: still
-                    // resettable, but a different verdict and incarnation.
                     if (holderInspections === 1) {
                         for (const suffix of ["-wal", "-shm", "-journal"]) {
                             rmSync(`${dbPath}${suffix}`, { force: true });
@@ -708,8 +671,6 @@ describe("doctor reset-db U11 scenarios", () => {
         const confirmAt = output.indexOf("confirm:");
         expect(confirmAt).toBeGreaterThan(-1);
         const beforeConfirmation = output.slice(0, confirmAt);
-        // The earlier reading is logged as what it was, then explicitly
-        // superseded -- never silently swapped for a different verdict.
         expect(beforeConfirmation).toContain("State: corrupt unknown format");
         const supersededAt = beforeConfirmation.indexOf(
             "Re-checked with no database holder present: unsupported (unsupported). Acting on this reading, not the earlier one.",
@@ -717,17 +678,13 @@ describe("doctor reset-db U11 scenarios", () => {
         const planAt = beforeConfirmation.indexOf("Database family:");
         expect(supersededAt).toBeGreaterThan(beforeConfirmation.indexOf("State: corrupt"));
         expect(planAt).toBeGreaterThan(supersededAt);
-        // Exactly one plan is reported, and it is the re-checked classification
-        // the command goes on to act upon.
         expect(beforeConfirmation.split("Database family:").length - 1).toBe(1);
         expect(beforeConfirmation).toContain("Database family: unsupported (unsupported)");
         expect(beforeConfirmation).toContain(`Database incarnation: ${incarnation}`);
-        // File identities are re-captured with the classification, so the plan
-        // describes the family that is actually about to move.
         expect(beforeConfirmation).toContain(
             `main: ${dbPath} (dev=${swapped.dev} inode=${swapped.ino}`,
         );
-        // What was quarantined is what the confirmed plan described.
+        // Quarantine moves only files in the confirmed plan.
         const quarantined = readdirSync(quarantineDir(storageDir)).sort();
         expect(quarantined).toEqual(["context.db", "context.db.mc-reset"]);
     });

@@ -166,14 +166,9 @@ export function verifyHistorianFailureDump(
 }
 
 /**
- * Containment against the CANONICAL form of both paths.
  *
- * `resolve` does not follow symlinks, so a workspace reached through one (a
- * symlinked home or temp dir) compares unequal to the same directory named by its
- * real path, and containment fails on a path that is genuinely inside. The
- * sibling check in `support/tool-loop.ts` canonicalizes for the same reason. A
- * path that cannot be canonicalized (it does not exist yet) falls back to
- * `resolve`, so a missing dump is judged as not contained rather than throwing.
+ * `resolve` preserves symlink spelling, so canonicalize both paths before testing containment.
+ * On `realpathSync` failure, `canonical` uses `resolve` for paths that do not exist yet.
  */
 function pathInside(root: string, path: string): boolean {
     const canonical = (value: string): string => {
@@ -205,8 +200,7 @@ export async function driveHistorianFailureDump(
     const invalidOutput = `<output><broken>${contentCanary}${terminalCanary}${shellCanary}</broken>`;
     const dumpPaths: string[] = [];
     const a28DbPath = join(context.storeDir, "a28-context.db");
-    // Bootstrap the registered direct format, then reopen through the shared
-    // helper the rest of this driver uses.
+    // `createDirectTestDatabase` registers the direct format before `openTestDb` reopens the database.
     createDirectTestDatabase({ path: a28DbPath }).db.close();
     const db = openTestDb(a28DbPath);
 
@@ -288,9 +282,7 @@ export async function driveHistorianFailureDump(
             !serializedFacts.includes(contentCanary) &&
             !serializedFacts.includes(terminalCanary) &&
             !serializedFacts.includes(shellCanary) &&
-            // `includes("")` is true for every string, so an absent dump path
-            // would read as a leak. Guarded to match `dumpProjectLocal`, which
-            // already treats an empty path as "nothing to check".
+            // Guard `dumpText.includes` with `dumpPath`: `includes("")` is true when no dump exists.
             (dumpPath.length === 0 || !serializedFacts.includes(dumpPath));
         return staticFacts;
     } finally {
@@ -387,11 +379,7 @@ export function preconditionLeaseLossResidualWrite(
         value.mutationAbsentBeforeRelease,
         value.barrierReleased,
         value.guardedWriteAttempted,
-        // `terminalLeaseLossEvents === 1` is deliberately NOT required here.
-        // `check-a47-single-terminal-lease-event` asserts it, and requiring it
-        // as setup too made that check unfailable: the verifier only ran when it
-        // already held. Production's own lease-loss report stays a precondition
-        // because it IS setup — the lease really was lost.
+        // `terminalLeaseLossEvents === 1` is not required here because `check-a47-single-terminal-lease-event` asserts it.
         value.taskReportedLeaseLoss,
         value.childReleased,
     ].every(Boolean);
@@ -450,12 +438,8 @@ export function verifyLeaseLossResidualWrite(
         check("check-a47-durable-happens-before", durableTrace),
         check(
             "check-a47-single-terminal-lease-event",
-            // The counter is incremented by the harness's own `afterPrompt`
-            // closure, so on its own it measures this test's instrumentation
-            // rather than production behavior. Pairing it with production's
-            // lease-loss report makes the check fail when the executor never
-            // detects the loss, and the trace marker ties the count to the
-            // durable ordering the neighbouring check reads.
+            // The harness's `afterPrompt` closure increments the counter, so the counter alone measures test instrumentation.
+            // The assertion requires the production lease-loss report because the harness counter alone measures test instrumentation.
             value.terminalLeaseLossEvents === 1 &&
                 value.taskReportedLeaseLoss &&
                 value.trace.filter((entry) => entry === "terminal-lease-loss")
@@ -573,11 +557,10 @@ export async function driveLeaseLossResidualWrite(
         if (!seed) throw new Error("A47 seed memory was not persisted");
 
         const dbPath = contextDbPath(context, h.opencode.env.dataDir);
-        // Two writers plus the observer below all hold this one file open while
-        // the plugin writes it too. With the default `busy_timeout = 0` any
-        // overlap fails instantly as SQLITE_BUSY in whichever handle collides,
-        // which reads as a flaky "database is locked" rather than a real defect —
-        // `openTestDb` exists so the timeout can never be forgotten.
+        // The two writers, observer, and plugin can hold the database file open concurrently.
+        // SQLite's default `busy_timeout` is `0`, so concurrent handles return `SQLITE_BUSY` immediately.
+        // A write that encounters a lock returns `SQLITE_BUSY` immediately when `busy_timeout` is `0`.
+        // `openTestDb` configures a nonzero SQLite busy timeout so concurrent handles wait instead of failing immediately with `SQLITE_BUSY`.
         executorDb = openTestDb(dbPath);
         replacementDb = openTestDb(dbPath);
         leaseKey = leaseKeyFor("curate", seed.project_path);
@@ -770,17 +753,14 @@ export async function driveLeaseLossResidualWrite(
             taskResult.status === "failed" &&
             taskResult.error?.includes("lease lost") === true;
         const archiveResultText = findToolResultText(h, toolCallId);
-        // A tool_result block alone proves nothing about WHICH write landed, but
-        // requiring SUCCESS conflates the setup with the behavior under test.
-        // Once the fence is extended to cover the archive itself, the racing
-        // write is correctly rejected and the memory stays active with no
-        // mutation row — the resolution this case exists to detect. Demanding
-        // "Archived " fails the precondition there, so the durable no-write
-        // checks never get to score it. An unrelated failure (validation,
-        // registration, an internal error) leaves the same durable shape, so a
-        // bare `Error:` cannot stand in: the rejection must identify the lease
-        // fence. The attempt itself stays required through
-        // `guardedWriteAttempted`, and an absent invocation still fails here.
+        // A `tool_result` block does not identify which write landed.
+        // The archive fence rejects racing writes without deactivating memory.
+        // A lease-fence rejection leaves the memory active and creates no mutation row.
+        // `Archived ` would reject lease-fence errors before durable no-write checks run.
+        // Durable no-write checks must run after a lease-fence rejection.
+        // Validation, registration, and internal errors can leave no mutation row and the memory active.
+        // `Error:` is insufficient: the rejection must identify the lease-fence failure.
+        // `guardedWriteAttempted` requires an archive invocation.
         const archiveFenceRejected =
             archiveResultText !== null &&
             archiveResultText.startsWith("Error:") &&
@@ -816,9 +796,9 @@ export async function driveLeaseLossResidualWrite(
     } finally {
         promptBarrier.release();
         if (executorPromise && !executorJoined) {
-            // Contain a rejected join: awaiting it bare here would skip the
-            // handle and harness cleanup below and replace the original
-            // failure with the rejection.
+            // Catching `executorPromise` preserves cleanup and the original failure.
+            // Catching `executorPromise` preserves cleanup and the original failure.
+            // Catching `executorPromise` preserves cleanup and the original failure.
             await executorPromise.catch(() => undefined);
         }
         replacementDb?.close();
@@ -834,11 +814,10 @@ const A28_IMPLEMENTATION_FILES = [
     "packages/plugin/src/shared/data-path.ts",
 ];
 
-// The A47 verdict is read straight off two durable writes — the `memories.status`
-// row `archiveMemory` updates and the `memory_mutation_log` row
-// `queueMemoryMutation` emits — so both implementations belong in the bundle.
-// Without them, editing either durable-write path could change the observed
-// residual-write behavior while `implementation_digest` stayed constant.
+// A47 reads `memories.status` written by `archiveMemory`.
+// `implementation_digest` includes both durable-write paths because A47 reads `memories.status` written by `archiveMemory`.
+// `implementation_digest` must include both durable-write paths so a change to either changes the digest.
+// `implementation_digest` must change when either durable-write path changes.
 const A47_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/incident-pool/scenarios/audit-background-lifecycle.ts",
     "packages/e2e-tests/src/incident-pool/support/tool-loop.ts",

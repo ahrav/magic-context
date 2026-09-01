@@ -27,15 +27,8 @@ const EMBEDDING_AFFECTING_KEYS = new Set([
     "embedding.endpoint",
     "embedding.model",
     "embedding.provider",
-    // input_type changes the embedding vector space (it's part of the registry's
-    // identity fingerprint), and truncate changes request behavior — a failed or
-    // untrusted load involving either must keep last-known-good/observation mode,
-    // not let a broken value re-register mid-session.
     "embedding.input_type",
     "embedding.truncate",
-    // max_input_tokens + query_input_type fold into the chunk-embedding identity
-    // (getChunkEmbeddingModelId); a failed substitution on either would otherwise
-    // register as trusted and could drive a bogus chunk identity / GC.
     "embedding.max_input_tokens",
     "embedding.query_input_type",
     "embedding.fallback_provider",
@@ -44,11 +37,6 @@ const EMBEDDING_AFFECTING_KEYS = new Set([
     "shadow_embedding",
 ]);
 
-// A `{env:VAR}` / `{file:path}` token left LITERAL in the resolved config.
-// Project-level config never expands these (security), so a project that puts a
-// token in an embedding field produces a literal string the registry would hash
-// into a BOGUS provider/chunk identity — registering it would clear the untrusted
-// latch and let GC reap the real model's vectors. Detect and treat as untrusted.
 const LITERAL_CONFIG_TOKEN_RE = /\{(?:env|file):[^}]+\}/;
 
 function embeddingConfigHasLiteralTokens(embedding: EmbeddingConfig | undefined): boolean {
@@ -120,10 +108,6 @@ export function isConfigLoadUntrusted(
         }
     }
 
-    // A literal {env:}/{file:} token survived into an embedding field — only
-    // possible from an unexpanded project-config token (user tokens expand). The
-    // string would hash into a bogus identity, so treat the load as untrusted
-    // regardless of how the substitution warning happened to be worded.
     if (embeddingConfigHasLiteralTokens(detailed.config.embedding)) {
         return true;
     }
@@ -181,11 +165,6 @@ export function handleUntrustedLoad(
     directory: string,
     detailed: EmbeddingLoadResultDetailed<{ embedding: EmbeddingConfig }>,
 ): boolean {
-    // Latch the project as untrusted so the stale-identity GC is suppressed for
-    // it until a trusted config re-registers. This holds whether we keep the
-    // prior last-known-good registration or fall through to observation mode —
-    // in both states the on-disk config is broken/mid-migration and must not
-    // drive embedding deletion.
     markProjectLoadUntrusted(projectIdentity);
 
     const prior = getProjectEmbeddingSnapshot(projectIdentity);

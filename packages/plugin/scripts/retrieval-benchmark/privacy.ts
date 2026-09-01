@@ -1,15 +1,7 @@
 /**
- * Rejecting privacy gate for benchmark artifacts.
+ * The gate rejects privacy-sensitive benchmark artifacts.
  *
- * Reject a field (instead of rewriting it) when the host-independent secret
- * or path sanitizers would change it, when it matches a shareability-
- * sensitive pattern, or when it carries a corpus-specific residual signal:
- * normalized query hash, session id, source path, control character, or
- * seeded identifying token. Every check is deterministic across machines —
- * the loader host's username and home directory never participate; the
- * author host's identity enters through `forbiddenTokens` at recovery time.
- * Violations name only the JSON path and a category code — the value itself
- * never reaches any output channel.
+ * The gate rejects rather than rewrites fields changed by portable secret/path sanitizers or matching shareability-sensitive or corpus-specific signals; loader-host identities are excluded, and recovery supplies author-host tokens through `forbiddenTokens`.
  */
 
 import {
@@ -34,8 +26,8 @@ export interface PrivacyViolation {
         | "forbidden-token";
 }
 
-/** String values under these keys skip ONLY the hash-like check so declared
- *  artifact fingerprints pass; every other category still applies to them. */
+/** `FINGERPRINT_FIELDS` values skip only `HASH_LIKE`; all other checks still apply.
+ * */
 const FINGERPRINT_FIELDS = new Set([
     "corpusFingerprint",
     "judgmentsFingerprint",
@@ -84,61 +76,38 @@ const FINGERPRINT_FIELDS = new Set([
     "case_commitment",
     "incident_bytes_fingerprint",
     "subject_fingerprint",
-    // Historian-eval approvals bind to the whole release under this key; it is
-    // a declared artifact fingerprint, so only the hash-like heuristic is
-    // skipped. The operator-authored `approver` beside it stays fully scanned.
     "releaseFingerprint",
 ]);
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control-character rejection is the point
 const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-// Hex-specific boundaries, not \b: underscore is a word character, so
-// `query_hash_<64hex>` would otherwise slip the boundary.
+// `HASH_LIKE` uses hex-specific rather than `\b` boundaries because underscore is a word character, so it detects `query_hash_<64hex>`.
 const HASH_LIKE = /(?:^|[^0-9a-fA-F])[0-9a-fA-F]{64}(?:[^0-9a-fA-F]|$)/;
-// Identifier-alphabet boundary, not \b: `source_session_ses_...` keeps the
-// id behind a word character, which \b cannot cross.
+// `SESSION_ID` uses identifier-alphabet rather than `\b` boundaries because a word character can precede `ses_...`.
 const SESSION_ID = /(?:^|[^A-Za-z0-9])ses[_-][A-Za-z0-9]{8,}/;
-// `~/` counts as a home path unless it directly follows a word character, so
-// quoted ("~/notes"), bracketed ((~/f)), and delimiter-preceded (path=~/x,
-// source:~/dir) spellings are caught, not only start-of-string/whitespace.
-// Case-insensitive with both separators: Windows and macOS paths are
-// case-insensitive and tools emit `c:/users/...` as readily as `C:\Users\`.
+// `~/` matches only at the start or after a character other than a word character, `.` or `-`.
+// `SOURCE_PATH` catches quoted, bracketed, and delimiter-preceded `~/` paths, not only paths at the start of a string or after whitespace.
+// `SOURCE_PATH` is case-insensitive and accepts both separators, detecting `c:/users/...` and `C:\Users\`.
 const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-])~\/)/i;
-// Identifying paths are not only home-rooted: `/workspace/customer-x/src`,
-// `/Client Work/repo`, `/用户/客户/repo`, `D:\Client Work\repo`, or UNC
-// shares in either separator form (`\\server\share\...`,
-// `//server/share/...`) carry the same signal. This is a rejecting gate, so
-// over-matching costs a review, never a leak.
-// No trailing separator required: `D:\customer-x` alone is identifying.
-// The UNC arm accepts either separator at the share boundary
-// (\\server\share and \\server/share are the same path), and a single
-// leading backslash (root-relative `\Client Work\repo`) counts too —
-// path.win32.isAbsolute classifies both as absolute.
+// The gate rejects identifying paths outside home directories, including workspace, client-work, and UNC paths, because it rejects fields rather than rewriting them.
+// `WINDOWS_PATH` matches `D:\customer-x` without a trailing separator.
+// UNC shares accept either separator at the share boundary.
+// Root-relative `\Client Work\repo` is absolute under `path.win32.isAbsolute`.
 const WINDOWS_PATH =
     /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+[\\/][^\\/\r\n]+|(?:^|[^\w\\])\\[^\s\\/][^\\/\r\n]*)/;
-// A file: URI is a local absolute path in URI clothing; the triple-slash
-// form defeats the delimiter-anchored POSIX arm, so name it directly.
+// `FILE_URI` matches `file://` because `file:///...` bypasses the POSIX candidate boundary.
 const FILE_URI = /\bfile:\/\//i;
-// Extended-length Windows prefix (\\?\C:\..., \\?\UNC\server\share):
-// always a path, and the `?` defeats the server-name class above.
+// `EXTENDED_LENGTH_PATH` matches `\\?\` because its `?` prevents `WINDOWS_PATH` from recognizing extended-length paths.
 const EXTENDED_LENGTH_PATH = /\\\\\?\\/;
-// No ":" in this delimiter class: `scheme://host/...` URLs must not read as
-// forward-slash UNC shares.
-// Complement boundary (anything that cannot CONTINUE a token), not a
-// delimiter allowlist: ":" stays excluded so scheme URLs never read as
+// `UNC_FORWARD` excludes `:` from its boundary so `scheme://host/...` does not match a forward-slash UNC path.
 // forward UNC.
 const UNC_FORWARD = /(?:^|[^\w:./])\/\/[\w.-]+\/[^/\s]+/;
-// Absolute POSIX paths (single components included: `/customer-x` is
-// identifying), matched broadly and then verified segment-wise so prose
-// around standalone slashes stays clean. Slash-command spellings
-// (`/like-this`) reject too — a rejecting gate trades a lost candidate for
-// never leaking a workspace name.
-// Complement boundary: any character that cannot continue a token starts a
-// candidate (comma, braces, markup, quotes, ...), instead of an allowlist
-// that keeps missing punctuation. Word chars keep "and/or" clean, "." keeps
-// relative "./x" clean, "*" keeps globs ("**/*.ts") clean, "/" keeps
-// mid-path positions from re-anchoring; URLs stay clean through the
-// empty-first-segment check below.
+// `hasAbsolutePath` treats single-component absolute POSIX paths such as `/customer-x` as identifying.
+// `hasAbsolutePath` verifies every component after broad matching to reject slash-delimited prose with whitespace.
+// Excluding word characters prevents `and/or` from matching as a path.
+// Excluding `.` and `*` prevents `./x` and `**/*.ts` from matching.
+// Excluding `/` prevents re-anchoring within an existing path.
+// A leading empty segment rejects `//host`.
 const POSIX_PATH_CANDIDATE = /(?:^|[^\w./*-])((?:\/[^/\r\n]+)+)/g;
 
 function hasAbsolutePath(value: string): boolean {
@@ -152,8 +121,6 @@ function hasAbsolutePath(value: string): boolean {
     }
     for (const match of value.matchAll(POSIX_PATH_CANDIDATE)) {
         const segments = match[1].split("/").slice(1);
-        // Real path components carry no leading/trailing whitespace; prose
-        // like "either / this / that" does.
         if (segments.every((segment) => segment.length > 0 && segment === segment.trim())) {
             return true;
         }
@@ -174,10 +141,7 @@ function scanString(
     skipHashCheck = false,
 ): void {
     if (CONTROL_CHARS.test(value)) violations.push({ path, category: "control-character" });
-    // Host-independent checks only: the same bytes must pass or fail on every
-    // machine, or release validity would depend on the loader's username and
-    // home directory. Author-host identity is checked at recovery time, where
-    // the operator supplies it through `forbiddenTokens`.
+    // `scanString` uses host-independent checks so identical bytes have identical validation results.
     if (redactSecretText(sanitizePathStringPortable(value)) !== value) {
         violations.push({ path, category: "secret-or-path" });
     } else if (hasPortableSensitiveText(value)) {
@@ -194,9 +158,7 @@ function scanString(
     const tokenHit = forbidden.tokens.some(
         (token) => token.length > 0 && lower.includes(token.toLowerCase()),
     );
-    // Identifiers match as bounded words, not substrings: a username "dev"
-    // must not reject "development" or "device". A username that is itself
-    // an ordinary standalone word still rejects — the safe direction for a
+    // `forbidden.identifiers` matches identifiers as bounded words so `dev` does not match `development` or `device`.
     // rejecting gate.
     if (tokenHit || forbidden.identifiers.some((pattern) => pattern.test(value))) {
         violations.push({ path, category: "forbidden-token" });
@@ -219,9 +181,8 @@ function scanValue(
     }
     if (value !== null && typeof value === "object") {
         for (const [key, child] of Object.entries(value)) {
-            // A sensitive KEY must not be echoed through violation paths
-            // (paths are an output channel), so its own violation and every
-            // descendant path use a redacted segment instead of the literal.
+            // A key that matches `forbidden` uses `<redacted-key>` in its violation path because paths are an output channel.
+            // Every descendant path of a key that matches `forbidden` uses `<redacted-key>`.
             const keyProbe: PrivacyViolation[] = [];
             scanString(key, `${path}.<redacted-key>`, forbidden, keyProbe);
             violations.push(...keyProbe);
@@ -236,16 +197,15 @@ function scanValue(
 }
 
 
-/** Return detected path/category violations; empty means promotable under
- *  this policy version. Defense in depth, not an anonymity proof — human
- *  review still gates promotion. */
+/**
+ * */
 export function scanForSensitiveContent(
     artifact: unknown,
     options: {
-        /** Substring deny list (project codenames, home-directory paths). */
+        /* */
         forbiddenTokens?: readonly string[];
-        /** Word-bounded deny list (usernames): matches only as a standalone
-         *  identifier or path component, never inside a longer word. */
+        /**
+         * */
         forbiddenIdentifiers?: readonly string[];
     } = {},
 ): PrivacyViolation[] {

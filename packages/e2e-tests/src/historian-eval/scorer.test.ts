@@ -38,15 +38,12 @@ interface SnapshotFixture {
 }
 
 /**
- * Build a snapshot DB the way the runner's temp environment would end up:
- * compartments persisted, facts promoted through the production promotion
- * path, and the injected set read through the real injection surface.
  */
 function makeSnapshot(args: {
     facts: MockHistorianFact[];
     compartments?: Array<{ start: number; end: number }>;
     nowMs?: number;
-    /** When set, facts are created with this expiry instead of the promotion path. */
+    /* */
     expiresAt?: number;
     mutate?: (db: Database) => void;
 }): SnapshotFixture {
@@ -54,12 +51,6 @@ function makeSnapshot(args: {
     const dbPath = join(dir, "context-db-snapshot.sqlite");
     const { db } = createDirectTestDatabase({ path: dbPath });
     const nowMs = args.nowMs ?? Date.now();
-    // Rendered-space default: validScenario is shorter than the runner's
-    // MIN_BUILD_TURNS, so six harness-owned filler turns precede its four authored
-    // ones and the authored span is ordinals 13-20. A real run's compartments
-    // cover the chunk from ordinal 1, and the scenario declares two historian
-    // runs each persisting one compartment — the scorer requires every compartment
-    // row to be attributed to a recorded run, so the count matches the runs.
     const compartments = args.compartments ?? [
         { start: 1, end: 12 },
         { start: 13, end: 20 },
@@ -132,26 +123,15 @@ function makeSnapshot(args: {
 }
 
 /**
- * Rewrite a probe's answer together with the response it was extracted from.
  *
- * The scorer reproduces the extraction and requires the two to agree, so editing
- * `answerRaw` alone produces a deliberately-forged record — which is a different
- * test than "the model answered wrongly".
  */
 function withAnswer(exchange: ProbeExchange, answerRaw: string): ProbeExchange {
     return { ...exchange, answerRaw, responseText: `<answer>${answerRaw}</answer>` };
 }
 
 /**
- * Model a claim the injection budget trimmed out of ONE probe turn: drop its
- * locator and the line the captured payload rendered for it.
+ * The fixture models a claim trimmed from one probe turn by removing its locator and rendered payload line.
  *
- * Both, for the same reason `withAnswer` rewrites the response alongside the
- * answer. The plugin writes `memory_block_ids` from exactly the claims it rendered
- * into `<project-memory>`, so a payload that still renders a claim the locator set
- * omits describes no run the runner can produce — and the scorer refuses it as a
- * forged record rather than reading it as a trimmed probe. Editing the locator set
- * alone would therefore test the integrity gate, not trimming.
  */
 function withoutInjectedClaim(exchange: ProbeExchange, claim: InjectedClaimRecord): ProbeExchange {
     const withoutLine = (text: string | null): string | null =>
@@ -167,8 +147,6 @@ function withoutInjectedClaim(exchange: ProbeExchange, claim: InjectedClaimRecor
             (locator) => locator !== claim.revisionLocator,
         ),
         payloadText: withoutLine(exchange.payloadText),
-        // Both payloads, since the per-turn evidence check reads the FINAL request while the
-        // leak gate reads the window. Trimming only one describes a turn no run produces.
         finalRequestPayloadText: withoutLine(exchange.finalRequestPayloadText),
     };
 }
@@ -188,16 +166,10 @@ function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunA
         factsEmitted: 2,
         chunkStartOrdinal: 1,
         chunkEndOrdinal: 20,
-        // A promoting run left promotion evidence; the runner records the delta per
-        // run so a later run's lost promotion is not masked by an earlier one.
         promotionEvidenceAdded: 2,
-        // The output consumed its whole chunk, which is what a healthy run does.
         unprocessedFrom: null,
         ...overrides,
     };
-    // A discarding run emitted one more compartment than it persisted, which is
-    // how the runner derives the field. Deriving it here keeps every override
-    // coherent instead of requiring each call site to remember the pairing.
     return overrides.emittedCompartments !== undefined
         ? run
         : { ...run, emittedCompartments: run.persistedCompartments + (run.discardedLast ? 1 : 0) };
@@ -209,9 +181,6 @@ function makeRecord(
     overrides: Partial<HistorianEvalRunRecord> = {},
 ): HistorianEvalRunRecord {
     const locators = fixture.injectedClaims.map((claim) => claim.revisionLocator);
-    // Ordered ends, so a run's chunk bound can be normalized against the prefix
-    // that existed after IT — the way the runner records the margin — rather than
-    // against the session's final maximum.
     const compartmentEnds = (
         fixture.db
             .prepare("SELECT end_message AS endMessage FROM compartments WHERE session_id = ? ORDER BY sequence ASC")
@@ -229,21 +198,17 @@ function makeRecord(
             answerRaw,
             reAsked: false,
             injectedRevisionLocators: locators,
-            // A scripted run always captures its probe request, and the scorer
-            // reapplies the leak gate to it. Representative content: the prompt
-            // the runner sent plus the injected claim block — compartment-derived
-            // text, never the raw authored transcript the splice removed.
+            // The scorer reapplies the leak gate to every scripted probe request.
+            // `payloadText` excludes the raw authored transcript removed by the splice.
             payloadText: [
                 buildProbePrompt(probe),
                 "<project-memory>",
                 ...fixture.injectedClaims.map((claim) => `${claim.publicClaimId}: ${claim.content}`),
                 "</project-memory>",
             ].join("\n"),
-            // The response the answer was extracted from; the scorer reproduces
-            // the extraction and requires the two to agree.
+            // The scorer extracts the answer from `responseText` and requires it to equal `answerRaw`.
             responseText: `<answer>${answerRaw}</answer>`,
-            // No re-ask in the golden fixture, so nothing was discarded and the only
-            // request IS the final one.
+            // No re-ask occurs, so `finalRequestPayloadText` is the only request.
             discardedResponseTexts: [],
             finalRequestPayloadText: [
                 buildProbePrompt(probe),
@@ -254,17 +219,10 @@ function makeRecord(
         };
     });
     const record = buildRecord();
-    // A real snapshot always carries the `historian_runs` rows the record was
-    // derived from, and the scorer now cross-checks the two. Writing them here
-    // from the record's own runs keeps the fixture representative; `chunkEndOrdinal`
-    // is normalized so each run's `lookaheadMargin` is the margin the snapshot's
-    // compartments actually imply, whatever ranges a test supplies.
+    // The fixture inserts `historian_runs` rows so the scorer can cross-check them against the run record.
+    // The fixture normalizes `chunkEndOrdinal` so `lookaheadMargin` matches the compartment ranges.
     fixture.db.prepare("DELETE FROM historian_runs WHERE session_id = ?").run(SESSION_ID);
-    // A real snapshot links each run to the subagent invocation that produced it, and the
-    // scorer reads `subagent_invocations.status` to tell an attempt that RETURNED malformed
-    // text from one that never executed — the distinction production's `validation: ` prefix
-    // erases. A fixture with no invocation rows carries no such evidence, so writing them is
-    // what makes these records representative rather than merely well-shaped.
+    // `subagent_invocations.status` distinguishes returned malformed text from an invocation that never executed.
     fixture.db.prepare("DELETE FROM subagent_invocations WHERE session_id = ?").run(SESSION_ID);
     const insertInvocation = fixture.db.prepare(
         `INSERT INTO subagent_invocations (session_id, harness, subagent, started_at, status)
@@ -278,9 +236,7 @@ function makeRecord(
          VALUES (?, 'incremental', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const run of record.historianRuns) {
-        // `completed`: the attempt returned text. A validation-failed run in these fixtures
-        // models a model that emitted unusable compartments, which is the case the lane scores
-        // as FAIL:invalid-output; a provider failure would be `failed` and is not model
+        // `completed` records returned model text; `failed` records provider failures.
         // behaviour.
         const invocationId = Number(insertInvocation.run(SESSION_ID, fixture.nowMs).lastInsertRowid);
         insertRun.run(
@@ -304,8 +260,7 @@ function makeRecord(
         schema: RUN_RECORD_SCHEMA,
         scenarioId: scenario.id,
         scenarioFingerprint: scenarioFingerprint(scenario),
-        // Bound separately from the semantic fingerprint, which excludes trigger
-        // pressure; the scorer refuses a record whose recipe is not the scenario's.
+        // The scorer validates the recipe separately because the semantic fingerprint excludes trigger pressure.
         triggerFingerprint: triggerFingerprint(scenario),
         sessionId: SESSION_ID,
         projectIdentity: PROJECT_IDENTITY,
@@ -319,17 +274,11 @@ function makeRecord(
             parserImpl: "ts",
             chunkTokenBudget: null,
         },
-        // Mirror what the runner produces: exactly the declared number of runs,
-        // indexed 1..N. `scoreRunRecord` rejects a record whose own inventory
-        // disagrees with the scenario, so an under-populated fixture would be
-        // testing the integrity gate rather than the verdict under test.
         expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
         historianRuns: Array.from({ length: scenario.trigger.expectedHistorianRuns }, (_, index) =>
             goldenRun({ runIndex: index + 1 }),
         ),
-        // Derived, not hand-written: the scorer validates this against the exact
-        // rendered layout, and a literal here was claiming ordinals the runner
-        // cannot produce for a scenario this short.
+        // The fixture derives the ordinal from the rendered layout because the scorer validates it.
         authoredTurnOrdinals: authoredTurnOrdinalsFor(scenario),
         perGoldPredicate: [],
         injectedClaims: fixture.injectedClaims,
@@ -353,10 +302,6 @@ function makeRecord(
 }
 
 /**
- * `validScenario` with no probes, for tests isolating the facts/structural
- * tier from the probe tier. Expressed as a scenario that declares no probes
- * rather than a record whose exchanges were deleted: `scoreRunRecord` rejects
- * the latter as a truncated artifact.
  */
 function probeFreeScenario(base: HistorianEvalScenario = validScenario()): HistorianEvalScenario {
     return { ...base, probes: [] };
@@ -406,7 +351,7 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         expect(result.score.verdict).toBe("FAIL");
         expect(result.score.failReasons).toContain("false-authoritative");
         expect(result.score.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
-        // Separately reported: recall stays perfect even though the run failed.
+        // Recall remains perfect when the run fails.
         expect(result.score.recall).toBe(1);
     });
 
@@ -446,11 +391,6 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
     });
 
     test("captured artifact replays only against the ordinals the historian actually saw", () => {
-        // The runner prepends filler turns and appends padding, so a real
-        // chunk sits well past the authored transcript's ordinal space. The
-        // authored-only default must reject that output, and the recorded
-        // chunk range must accept it — otherwise a captured
-        // HistorianRunArtifact.rawOutput cannot be replayed or mutated.
         const scenario = validScenario();
         const shifted = buildMockHistorianOutput({
             compartments: [{ start: 21, end: 28, title: "Session cache decision", body: "Chose the in-process LRU cache over Redis; capacity 4096." }],
@@ -460,10 +400,6 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         const againstAuthoredSpace = scoreRawOutput(shifted, scenario);
         expect(againstAuthoredSpace.stage).toBe("validation-rejected");
 
-        // The authored bounds travel with the range: where authored content sits inside
-        // a replayed chunk depends on the filler count of the run that captured it, so
-        // the scorer refuses to guess. A real replay reads them from the record's
-        // `authoredTurnOrdinals`; here the whole chunk is the authored span.
         const againstRecordedChunk = scoreRawOutput(shifted, scenario, {
             chunkStartOrdinal: 21,
             chunkEndOrdinal: 28,
@@ -477,9 +413,6 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
     });
 
     test("a replayed chunk scopes the gold minimum to the authored span, like scoreRunRecord", () => {
-        // Two compartments in the replayed runtime chunk, only one of which
-        // intersects the authored transcript. Both entry points must agree that
-        // gold's minimum of 2 is unmet.
         const base = validScenario();
         const scenario: HistorianEvalScenario = {
             ...base,
@@ -510,10 +443,10 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
 
     test("an output that stops inside the authored span is not scored", () => {
         const base = validScenario();
-        // Gold's minimum is 1 and the early compartment satisfies it; both gold facts are
-        // emitted, so recall would be 1. But the output stops before the epilogue turn
-        // where the hard negative is authored, so the absence check would pass vacuously —
-        // which is a PASS for an artifact never shown the forbidden formation.
+        // The early compartment satisfies Gold's minimum of 1, and both gold facts are emitted.
+        // Both emitted gold facts yield recall 1.
+        // The hard negative is authored only in the epilogue turn.
+        // The absence check would otherwise pass an artifact never shown the forbidden formation.
         const short = buildMockHistorianOutput({
             compartments: [{ start: 1, end: 4, title: "Prefix", body: "Chose the in-process LRU cache over Redis; capacity 4096." }],
             facts: goldFacts(),
@@ -524,8 +457,7 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
     });
 
     test("an output covering the authored span still scores", () => {
-        // The guard must not reject the ordinary case: the golden output covers every
-        // authored message, so it is scoreable.
+        // Golden output covers every authored message, so the guard accepts it.
         const result = scoreRawOutput(goldenRawOutput(), validScenario());
         expect(result.stage).toBe("scored");
     });
@@ -537,9 +469,8 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
     });
 
     test("a chunk range without authored bounds is a caller error, not a filler-counting fallback", () => {
-        // Without the bounds the gold minimum counted every persisted row, so an output
-        // whose compartments sit entirely in harness padding satisfied it here while the
-        // same artifact failed `scoreRunRecord`.
+        // Without authored bounds, the gold minimum counts every persisted row.
+        // Compartments entirely in harness padding can then satisfy the gold minimum.
         expect(() =>
             scoreRawOutput(goldenRawOutput(), validScenario(), { chunkStartOrdinal: 21, chunkEndOrdinal: 40 }),
         ).toThrow(/authoredStartOrdinal and authoredEndOrdinal/);
@@ -571,9 +502,9 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         const result = scoreRawOutput(output, scenario);
         expect(result.stage).toBe("scored");
         if (result.stage !== "scored") return;
-        // Lookahead margin 0 <= healing slack: production discards the tail
-        // and skips unanchored promotion for the pass, so no gold fact may
-        // score as visible.
+        // A lookahead margin of 0 is within healing slack, so production discards the tail.
+        // Production skips unanchored promotion for that pass.
+        // No gold fact may score as visible.
         expect(result.score.recall).toBe(0);
         expect(result.score.failReasons).toContain("recall");
     });
@@ -632,7 +563,7 @@ describe("scoreRunRecord", () => {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
             const score = scoreRunRecord(record, scenario);
-            // Not visible on the injection read, so no false-authoritative match (R3/KTD1).
+            // The injection read cannot see the injected claim, so no false-authoritative match occurs.
             expect(score.falseAuthoritativeMatches).toEqual([]);
             expect(score.verdict).toBe("PASS");
         } finally {
@@ -645,9 +576,8 @@ describe("scoreRunRecord", () => {
             facts: goldFacts(),
             compartments: [
                 { start: 1, end: 5 },
-                // Overlaps the first range, which is the finding under test; extended to 18
-                // so the chunk the runs were handed still spans the authored transcript, as
-                // a lint-clean recipe's does.
+                // The chunk range ends at 18 so it spans the authored transcript.
+                // The chunk range ends at 18, spanning the authored transcript.
                 { start: 4, end: 18 },
             ],
         });
@@ -664,8 +594,8 @@ describe("scoreRunRecord", () => {
     });
 
     test("healing evidence violation (final run kept provisional boundary) scores FAIL:structural", () => {
-        // Three rows, because run 2 persists two: every compartment row must be
-        // attributed to a recorded run.
+        // Every compartment row must be attributed to a recorded run.
+        // Every compartment row must be attributed to a recorded run.
         const fixture = makeSnapshot({
             facts: goldFacts(),
             compartments: [
@@ -726,11 +656,9 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const scenario = probeFreeScenario();
-            // Run 1 publishes and satisfies the golds; run 2 exhausts validation. The
-            // old `every`-based flag was false here, so the scenario reported PASS with
-            // nothing in the score naming the declared pass that produced nothing.
-            // `recordInventoryError` proves a `failed` run is a validation exhaustion,
-            // so it is model evidence (KTD4) whether or not a sibling succeeded.
+            // A validation-exhausted run causes `invalid-output` even when another run satisfies every gold.
+            // A failed validation-exhausted run is model evidence even when another run succeeds.
+            // A failed validation-exhausted run is model evidence even when another run succeeds.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ runIndex: 1, persistedCompartments: 2, emittedCompartments: 2 }),
@@ -743,10 +671,10 @@ describe("scoreRunRecord", () => {
                         emittedCompartments: 0,
                         factsEmitted: 0,
                         promotionEvidenceAdded: 0,
-                        // The snapshot implies zero margin (run 1's compartments already
-                        // reach the chunk end), and the telemetry cross-check compares the
-                        // two — a null here would be refused as a snapshot mismatch before
-                        // the verdict under test is reached.
+                        // Run 1's compartments reach the chunk end, so the snapshot margin is 0.
+                        // The telemetry cross-check compares the snapshot margin with telemetry.
+                        // The scorer rejects a null telemetry margin as a snapshot mismatch before verdict evaluation.
+                        // The scorer rejects snapshot mismatches before evaluating the verdict.
                         lookaheadMargin: 0,
                     }),
                 ],
@@ -754,8 +682,7 @@ describe("scoreRunRecord", () => {
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toContain("invalid-output");
-            // Facts still scored: run 1 published, so unlike the all-failed branch the
-            // rates are meaningful and must not be nulled.
+            // Run 1 published facts, so the rates remain meaningful.
             expect(score.recall).toBe(1);
         } finally {
             fixture.cleanup();
@@ -780,10 +707,8 @@ describe("scoreRunRecord", () => {
     });
 
     test("re-scoring with wall clock advanced past claim expiry yields byte-identical verdicts (pinned nowMs)", () => {
-        // Pin the record's clock two minutes into the past and expire the
-        // claims one minute later: expired against the real wall clock, live
-        // against the pinned clock. A scorer that leaked Date.now() would see
-        // an empty visible set and flunk recall.
+        // The claims are expired against the real wall clock but live against the pinned clock.
+        // A scorer that reads `Date.now()` sees no visible claims and fails recall.
         const pinnedNowMs = Date.now() - 120_000;
         const fixture = makeSnapshot({
             facts: goldFacts(),
@@ -797,16 +722,9 @@ describe("scoreRunRecord", () => {
             const second = scoreRunRecord(record, scenario);
             expect(first.verdict).toBe("PASS");
             expect(JSON.stringify(second)).toBe(JSON.stringify(first));
-            // Boundary twin: the pinned clock is the CAUSE. Advancing the record's
-            // own clock past the expiry changes the outcome, so a scorer
-            // substituting any other clock cannot satisfy both halves.
+            // Using a clock other than `record.nowMs` would make the baseline and advanced records indistinguishable.
             //
-            // The advanced clock now lands on `record-snapshot-mismatch` rather
-            // than FAIL:recall, and that is the correct reading: at that clock the
-            // recorded injected claims are no longer on the snapshot's injection
-            // surface, which for any record the runner produced means the record
-            // and its snapshot disagree. Either way the verdict is clock-derived,
-            // which is what this asserts.
+            // `record-snapshot-mismatch` means the record's injected claims do not match the snapshot injection surface.
             const advanced = scoreRunRecord({ ...record, nowMs: pinnedNowMs + 120_000 }, scenario);
             expect(advanced.verdict).not.toBe("PASS");
             expect(advanced.errorReason).toBe("record-snapshot-mismatch");
@@ -844,9 +762,9 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // Trim the capacity claim out of the injected set and answer its
-            // probe wrongly: without FA priority this would be swallowed as
-            // trimmed-by-injection-budget ERROR and exit 1 instead of 2.
+            // The scorer trims `probe-capacity` because its injected claims omit the capacity claim.
+            // False-authoritative priority prevents the wrong answer from being classified only as `trimmed-by-injection-budget`.
+            // Without false-authoritative priority, the outcome would be `trimmed-by-injection-budget` with exit code 1 instead of 2.
             const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
             if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
             record.probes = record.probes.map((exchange) =>
@@ -886,11 +804,8 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const record = makeRecord(fixture, scenario);
-            // Trim the capacity claim out of the probe's injected set and
-            // answer wrongly (a trimmed probe), while a different gold claim
-            // is missing from the visible set (recall < 1). Recall evidence
-            // comes from the facts read, independent of the probe tier, so
-            // the trimmed probe must not swallow it into an ERROR.
+            // Recall evidence comes from facts read, independent of probe tier.
+            // A trimmed probe must not convert independent recall evidence to ERROR.
             const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
             if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
             record.probes = record.probes.map((exchange) =>
@@ -939,8 +854,6 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // The scenario declares two runs; keep only the first, as a
-            // hand-copied or interrupted artifact would.
             const truncated = { ...record, historianRuns: record.historianRuns.slice(0, 1) };
             const score = scoreRunRecord(truncated, scenario);
             expect(score.verdict).toBe("ERROR");
@@ -996,11 +909,10 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario);
             const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
             if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
-            // probe-capacity is trimmed (its gold claim was promoted but is not
-            // in its injected set) while probe-store fails on its own merits and
-            // is fully injected. `failReasons` collapses both into one "probe"
-            // entry, so a rule keyed on that aggregate converts the whole
-            // scenario to ERROR and drops the real failure.
+            // The scorer trims `probe-capacity` because its injected set lacks a promoted gold claim.
+            // probe-store fails independently with a complete injected set.
+            // failReasons collapses both outcomes into one "probe" entry.
+            // A rule keyed on the aggregated "probe" reason would convert the scenario to ERROR and drop the real failure.
             record.probes = record.probes.map((exchange) => {
                 if (exchange.probeId === "probe-capacity") {
                     return withoutInjectedClaim(withAnswer(exchange, "wrong"), trimmed);
@@ -1021,9 +933,8 @@ describe("scoreRunRecord", () => {
     test("a record that lost its injected-claim evidence is ERROR, not a PASS off the intact snapshot", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
-            // Only exact and multiple-choice probes, whose passing comparisons
-            // never consult record.injectedClaims — so an emptied array would
-            // otherwise go unnoticed while facts score from the snapshot.
+            // Exact and multiple-choice passing comparisons do not read `record.injectedClaims`.
+            // Snapshot facts can still determine scores when `injectedClaims` is empty.
             const base = validScenario();
             const scenario: HistorianEvalScenario = {
                 ...base,
@@ -1045,9 +956,8 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // `typeof x === "string"` accepts "": the record would take an ordinary
-            // verdict and then be grouped as comparable with runs it shares no
-            // runtime with, which is the opposite of why these fields exist.
+            // A runtime discriminator must reject empty strings because `typeof x === "string"` accepts `""`.
+            // An empty runtime field would group a record with runs that do not share its runtime.
             for (const field of ["bunVersion", "opencodeVersion", "repoCommitSha", "historianModelId", "probeModelId"] as const) {
                 for (const empty of ["", "   "]) {
                     const score = scoreRunRecord(
@@ -1067,9 +977,7 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // A real v1/v2 record lacks the system fields v3 requires. Reporting that
-            // as `record-malformed` would call a valid historical artifact damaged and
-            // defeat the schema bump that added those fields.
+            // Classify v1/v2 records lacking v3-required system fields as compatible historical artifacts, not `record-malformed`.
             const { bunVersion: _bun, opencodeVersion: _oc, ...olderSystem } = record.system;
             const older = {
                 ...record,
@@ -1092,8 +1000,7 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario, {
                 error: { reason: "script-drift", detail: "2 scripted turns never consumed" },
             });
-            // Identity precedes the stored-error passthrough, so a foreign or
-            // incompatible artifact cannot enter the report under its own reason.
+            // Identity validation prevents foreign or incompatible artifacts from entering reports under their stored error reasons.
             const wrongSchema = scoreRunRecord(
                 { ...record, schema: "historian-eval-run-record/v0" as typeof RUN_RECORD_SCHEMA },
                 scenario,
@@ -1103,8 +1010,7 @@ describe("scoreRunRecord", () => {
             const wrongScenario = scoreRunRecord({ ...record, scenarioId: "hse-other" }, scenario);
             expect(wrongScenario.errorReason).toBe("record-scenario-mismatch");
 
-            // An ERROR record legitimately carries fewer runs than declared, so
-            // the inventory check must stay behind the passthrough.
+            // Run-inventory validation must follow stored-error passthrough because ERROR records may legitimately omit declared runs.
             const aborted = scoreRunRecord({ ...record, historianRuns: [] }, scenario);
             expect(aborted.errorReason).toBe("script-drift");
         } finally {
@@ -1118,11 +1024,7 @@ describe("scoreRunRecord", () => {
         });
         try {
             const scenario = validScenario();
-            // The runner captures claim state before the probe tier precisely so a
-            // probe abort keeps this evidence. Left to the ordinary stored-error
-            // passthrough, the always-run-fatal outcome came back as a
-            // `runFatal: false` ERROR and the lane exited 1, so aborting after a
-            // forbidden promotion masked it.
+            // The scorer captures claim state before probe-tier execution so probe aborts preserve claim-state evidence.
             const aborted = makeRecord(fixture, scenario, {
                 error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
             });
@@ -1130,11 +1032,9 @@ describe("scoreRunRecord", () => {
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["false-authoritative"]);
             expect(score.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
-            // The abort is still reported, not replaced: only the verdict changes.
+            // The score preserves the abort reason and detail while reporting `FAIL`.
             expect(score.errorReason).toBe("probe-response-leak");
             expect(score.errorDetail).toBe("probe-capacity leaked a claim id");
-            // Nothing here measured recall or precision, so the aggregate rates
-            // must not move.
             expect(score.recall).toBeNull();
             expect(score.precision).toBeNull();
             const report = buildLaneReport([score]);
@@ -1154,13 +1054,7 @@ describe("scoreRunRecord", () => {
             const aborted = makeRecord(fixture, scenario, {
                 error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
             });
-            // Each of these breaks the record-to-snapshot equality in a different
-            // place, and each one used to be scored: the truncated array hid the
-            // promotion, the forged entry invented one, and the two edited
-            // selectors returned an empty visible set indistinguishable from "no
-            // promotion". None of them is a report about the run, so none of them
-            // produces a verdict — the completion path returns the same
-            // `record-snapshot-mismatch` for the identical forgeries.
+            // Each record-snapshot mismatch scores as `ERROR`.
             const forged = {
                 publicClaimId: "clm-forged",
                 revisionLocator: "rev-forged",
@@ -1170,10 +1064,7 @@ describe("scoreRunRecord", () => {
             };
             for (const [label, edited] of [
                 ["truncated claim array", { ...aborted, injectedClaims: [] }],
-                // The shape the runner writes when abort-path claim capture fails but
-                // the best-effort snapshot succeeds: an empty identity resolves to no
-                // project, so the read is vacuous and two empty sets would otherwise
-                // compare equal while the snapshot holds the forbidden claim.
+                // An empty `projectIdentity` must mismatch when the snapshot contains the forbidden claim.
                 ["unresolvable identity with no recorded claims", { ...aborted, projectIdentity: "", injectedClaims: [] }],
                 ["appended forged claim", { ...aborted, injectedClaims: [...aborted.injectedClaims, forged] }],
                 ["edited project identity", { ...aborted, projectIdentity: "no-such-project" }],
@@ -1181,18 +1072,14 @@ describe("scoreRunRecord", () => {
                 const score = scoreRunRecord(edited, scenario);
                 expect(score.verdict, label).toBe("ERROR");
                 expect(score.errorReason, label).toBe("record-snapshot-mismatch");
-                // The abort is still named, so the integrity failure does not erase
-                // what the run was doing when it stopped.
+                // The integrity failure preserves the abort reason in `errorDetail`.
                 expect(score.errorDetail, label).toContain("probe-response-leak");
                 expect(score.failReasons, label).toEqual([]);
             }
 
-            // An edited clock is only a forgery when it MOVES the visible set.
-            // These fixtures carry no validity windows, so the read returns the
-            // same three claims and the record still agrees with its snapshot —
-            // the promotion is genuinely bound to this run and stays run-fatal.
-            // Asserted so the mismatch rule is not mistaken for "any edit is an
-            // ERROR": it rejects disagreement, not tampering it cannot see.
+            // A changed `nowMs` mismatches only when it changes the visible claim set.
+            // With no validity windows, `nowMs: 1` returns the same three claims, so the aborted promotion remains a `FAIL`.
+            // A snapshot mismatch rejects only edits that change the visible claim set.
             const shiftedClock = scoreRunRecord({ ...aborted, nowMs: 1 }, scenario);
             expect(shiftedClock.verdict).toBe("FAIL");
             expect(shiftedClock.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
@@ -1223,9 +1110,8 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const scenario = probeFreeScenario();
-            // The runner rejects these while driving, but an independently
-            // stored record never passes through those guards, and the run keeps
-            // its expected index so the inventory check sees nothing wrong.
+            // Stored records bypass runner validation.
+            // The stored record retains its expected index, so the inventory check accepts it.
             const noop = makeRecord(fixture, scenario, {
                 historianRuns: [goldenRun(), goldenRun({ runIndex: 2, status: "noop" })],
             });
@@ -1266,10 +1152,10 @@ describe("scoreRunRecord", () => {
                     }),
                 ],
             });
-            // Backed by evidence: still FAIL:invalid-output.
+            // `invalid-output` produces `FAIL`.
             expect(scoreRunRecord(record, scenario).failReasons).toEqual(["invalid-output"]);
 
-            // Snapshot gone: the claim about model quality has nothing behind it.
+            // Without the snapshot, the record cannot support a model-quality score.
             const score = scoreRunRecord(
                 { ...record, contextDbSnapshotPath: join(fixture.dbPath, "..", "absent.sqlite") },
                 scenario,
@@ -1301,8 +1187,7 @@ describe("scoreRunRecord", () => {
         });
         try {
             const scenario = probeFreeScenario();
-            // Two runs persisting one compartment each cannot explain three rows,
-            // and structural scoring plus the coverage gate consume every row.
+            // Two runs with one persisted compartment each cannot account for three rows.
             const record = makeRecord(fixture, scenario);
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("ERROR");
@@ -1313,8 +1198,7 @@ describe("scoreRunRecord", () => {
     });
 
     test("a kept provisional boundary does not excuse an uncovered gold range", () => {
-        // Three rows, none reaching the authored span at 13-20, so the gold range
-        // is uncovered while every row is attributed to a run.
+        // No row reaches the authored span 13–20, so the gold range is uncovered.
         const fixture = makeSnapshot({
             facts: goldFacts(),
             compartments: [
@@ -1324,9 +1208,9 @@ describe("scoreRunRecord", () => {
         });
         try {
             const scenario = validScenario();
-            // A KEPT boundary was PERSISTED — hence persistedCompartments 2, not 0 —
-            // so its range is covered and it explains no gap, unlike a discard. The
-            // coverage gate must still fire.
+            // A persisted `KEPT` boundary makes `persistedCompartments` equal 2.
+            // The persisted `KEPT` boundary covers its range and does not explain the gap.
+            // The coverage gate must fail when no row reaches the authored span.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
@@ -1334,10 +1218,9 @@ describe("scoreRunRecord", () => {
                         runIndex: 2,
                         persistedCompartments: 1,
                         emittedCompartments: 1,
-                        // Inside `HISTORIAN_BOUNDARY_HEALING_SLACK`, which is what makes this
-                        // a KEPT provisional boundary; it also puts the chunk end at 18, so
-                        // the runs were handed the authored span even though their
-                        // compartments stop at 16 and leave the capacity claim uncovered.
+                        // A boundary within `HISTORIAN_BOUNDARY_HEALING_SLACK` is `KEPT`.
+                        // A chunk ending at 18 is within `HISTORIAN_BOUNDARY_HEALING_SLACK`.
+                        // Compartments stop at 16, leaving the capacity claim uncovered.
                         lookaheadMargin: 2,
                         factsEmitted: 0,
                     }),
@@ -1352,15 +1235,13 @@ describe("scoreRunRecord", () => {
     });
 
     test("an unhealed discard covering a probe's gold range stays a structural FAIL", () => {
-        // Compartments reach 16, leaving the capacity claim's 17-18 uncovered — which is the
-        // premise — while the chunk the runs were handed still spans the authored transcript.
+        // Compartments reach 16, leaving the capacity claim's 17–18 uncovered.
         const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 16 }] });
         try {
             const scenario = validScenario();
-            // The final run dropped its provisional tail, which is why the probe's
-            // gold range is uncovered. That is a forbidden boundary decision the
-            // scorer classifies as a model failure, so the coverage gate must not
-            // pre-empt it with an infrastructure ERROR.
+            // A dropped provisional tail leaves the probe's gold range uncovered.
+            // Dropping the provisional tail is a forbidden boundary decision.
+            // The scorer classifies a forbidden boundary decision as a model failure, not an infrastructure `ERROR`.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
@@ -1370,8 +1251,8 @@ describe("scoreRunRecord", () => {
                         emittedCompartments: 1,
                         discardedLast: true,
                         factsEmitted: 0,
-                        // Puts this run's chunk end at 18, so the runs were handed the
-                        // authored span even though the discard left its tail uncovered.
+                        // A chunk ending at 18 is within `HISTORIAN_BOUNDARY_HEALING_SLACK`.
+                        // Discarding the provisional tail leaves part of the authored span uncovered.
                         lookaheadMargin: 2,
                     }),
                 ],
@@ -1386,9 +1267,9 @@ describe("scoreRunRecord", () => {
     });
 
     test("one claim satisfying two same-category expectations does not give full recall", () => {
-        // Two expectations, unrelated predicates, same category — legal under the
-        // contract, since neither predicate contains the other. One formed claim states
-        // both, so an independent test per expectation reports 2/2 for a single claim.
+        // The two same-category predicates are unrelated, so the contract permits both expectations.
+        // Neither predicate contains the other, so the contract permits both expectations.
+        // A single claim can satisfy both expectations, so independent matching reports 2/2.
         // Recall must be bounded by the claims actually formed.
         const base = validScenario();
         const scenario: HistorianEvalScenario = {
@@ -1432,8 +1313,8 @@ describe("scoreRunRecord", () => {
     });
 
     test("two claims satisfying two expectations still give full recall", () => {
-        // The pairing must not understate: distinct claims for distinct expectations is
-        // exactly the case recall is meant to reward.
+        // The claim–expectation pairing must not understate recall.
+        // Full recall remains 1 when two claims match two expectations.
         const base = validScenario();
         const scenario: HistorianEvalScenario = { ...base, probes: [] };
         const fixture = makeSnapshot({ facts: goldFacts() });
@@ -1451,10 +1332,10 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // Retuned pressure with the declared run count untouched: the context
-            // limit decides when the historian fires and what the evaluated chunk
-            // contains, but `scenarioFingerprint` excludes it, so nothing else in the
-            // record would notice that this artifact predates the change.
+            // The context limit can change when the historian fires without changing the declared run count.
+            // `modelContextLimit` determines when the historian fires and which chunk it evaluates.
+            // `scenarioFingerprint` excludes `modelContextLimit`.
+            // `scenarioFingerprint` cannot distinguish records that differ only in the context limit.
             const retuned: HistorianEvalScenario = {
                 ...scenario,
                 trigger: { ...scenario.trigger, modelContextLimit: scenario.trigger.modelContextLimit * 2 },
@@ -1471,13 +1352,12 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const scenario = probeFreeScenario();
-            // The fact reached the historian's output and never reached the store, so
-            // the missing claim is a plumbing loss. The live runner aborts on this;
-            // a record scored independently must reach the same verdict rather than
-            // charging the loss to historian recall.
+            // A fact emitted by the historian but absent from the store is a plumbing loss, not a recall miss.
+            // The live runner aborts on plumbing loss; independently scored records must return the same verdict.
+            // The scorer must not charge the loss to historian recall.
             //
-            // Charged to the SECOND run: run 1 promoted, so a scenario-wide total is
-            // non-zero and only the per-run field exposes the loss.
+            // Run 2 must report the loss because run 1 promoted.
+            // Only the per-run field exposes the loss when run 1 promoted facts.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ runIndex: 1 }),
@@ -1497,8 +1377,7 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // `undefined === 0` is false, so an absent field would pass the plumbing
-            // guard vacuously — the omission has to be refused at the shape gate.
+            // An absent field does not equal 0, so the shape gate must reject the omission.
             const stripped = record.historianRuns.map((run) => {
                 const { promotionEvidenceAdded: _dropped, ...rest } = run;
                 return rest as HistorianRunArtifact;
@@ -1518,11 +1397,9 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario);
             const extra = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
             if (extra === undefined) throw new Error("fixture lacks the capacity claim");
-            // The complete final block names the claims the request carried, so a locator
-            // beyond it is an over-claim — and not inert: `compareProbeAnswer` would read that
-            // claim's gold as injected and suppress `error-trimmed` for a guess, or accept its
-            // public id for a claim-id probe. Only the RENDERED line is removed, leaving the
-            // locator behind, which is the shape a hand-edited record has.
+            // A locator beyond the complete final block over-claims a request claim.
+            // A locator beyond the complete final block is not inert: `compareProbeAnswer` treats its claim's gold as injected.
+            // `compareProbeAnswer` can suppress `error-trimmed` for a guess when it treats the claim's gold as injected.
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
@@ -1555,9 +1432,9 @@ describe("scoreRunRecord", () => {
                     goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: provider refused", rawOutput: null }),
                 ],
             });
-            // Production stamps `validation: ` even when the provider never returned output, so
-            // the reason alone cannot say the model was shown the chunk. Marking the linked
-            // invocations `failed` is what an outage looks like in the snapshot.
+            // Production stamps `validation: ` even when the provider returns no output.
+            // `validation:` alone does not prove that the model received the chunk.
+            // Failed linked invocations classify the `validation:` failure as a harness failure.
             fixture.db.prepare("UPDATE subagent_invocations SET status = 'failed' WHERE session_id = ?").run(SESSION_ID);
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("ERROR");
@@ -1574,10 +1451,7 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario);
             const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
             if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
-            // Only the locator set is edited; the captured payload still renders the
-            // claim. That is the shape a hand-edited record has when a wrong answer is
-            // laundered into `error-trimmed` — the plugin writes the locator set from
-            // exactly the claims it rendered, so no real run produces this pair.
+            // The plugin cannot produce a locator set that omits a rendered claim.
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
@@ -1601,11 +1475,10 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // probe-capacity answers correctly, then volunteers probe-store's gold
-            // value outside the envelope. Probe turns are never compartment-covered,
-            // so that prose is raw history for probe-store — whose PASS would then
-            // be a copy. `answerRaw` still matches the extraction, so the
-            // reproducibility check above cannot catch it.
+            // The answer volunteers probe-store's gold outside the probe-capacity envelope.
+            // Probe turns are never compartment-covered, so that prose is raw history for probe-store.
+            // A PASS for probe-store would be a copy from raw history.
+            // `answerRaw` still matches the extraction, so reproducibility cannot detect the copy.
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
@@ -1630,9 +1503,9 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario);
             const lru = fixture.injectedClaims.find((claim) => claim.content.toLowerCase().includes("lru"));
             if (lru === undefined) throw new Error("fixture lacks the LRU claim");
-            // probe-capacity volunteers the public id that probe-claim's answer resolves
-            // to. Probe turns are never compartment-covered, so that id is raw history
-            // for probe-claim, whose PASS would then be a copy.
+            // `probe-capacity` exposes the public ID that `probe-claim`'s answer resolves to.
+            // Probe turns are never compartment-covered, so `probe-claim` can read that public ID from raw history.
+            // A PASS for `probe-claim` would therefore copy raw history.
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
@@ -1657,10 +1530,8 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario);
             const lru = fixture.injectedClaims.find((claim) => claim.content.toLowerCase().includes("lru"));
             if (lru === undefined) throw new Error("fixture lacks the LRU claim");
-            // Same reply, but the claim's locator is absent from probe-claim's injected
-            // set, so `compareProbeAnswer` would never credit that id — copying it
-            // cannot produce a PASS. Resolving against the whole injected surface
-            // instead of that probe's own set turned this valid run into an ERROR.
+            // A locator absent from `probe-claim`'s injected set cannot be credited.
+            // The resolver must resolve public IDs against the answering probe's injected set, not all injected claims.
             record.probes = record.probes.map((exchange) => {
                 if (exchange.probeId === "probe-capacity") {
                     return {
@@ -1684,9 +1555,9 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // The first reply was rejected (two envelopes) and re-asked, so it is not
-            // `responseText` — but it was sent, so probe-store still read it. Replaying
-            // only the survivor left this record scoring clean.
+            // The first reply used two envelopes and was re-asked, so it is absent from `responseText`.
+            // The rejected reply was sent, so `probe-store` read it.
+            // Rejected probe replies remain readable by later probes, so replay detection includes them.
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
@@ -1710,8 +1581,8 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // Preamble and sign-off around the envelope are ordinary model
-            // behaviour; refusing them would convert chattiness into an ERROR.
+            // `responseText` accepts text before and after the envelope.
+            // Rejecting text outside the envelope would turn otherwise valid chatty replies into an ERROR.
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
@@ -1749,8 +1620,7 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // A container check alone leaves this to throw on the first field
-            // dereference inside the inventory check.
+            // `inventory` must be an object before the inventory check dereferences its fields.
             const nested = { ...record, historianRuns: [null] } as unknown as HistorianEvalRunRecord;
             const score = scoreRunRecord(nested, scenario);
             expect(score.verdict).toBe("ERROR");
@@ -1800,8 +1670,6 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // Only the answer is edited, as a forged record would: the response it
-            // was supposedly extracted from still yields the original.
             const forged = {
                 ...record,
                 probes: record.probes.map((exchange, index) =>
@@ -1823,10 +1691,9 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // Existence passes on the reused public id and the entry never appears
-            // in `visible`, so neither the existence nor the divergence check sees
-            // it — but its fabricated locator could then carry gold-matching
-            // content into a probe's locator set.
+            // A reused public ID passes existence validation even when it has no `visible` entry.
+            // The divergence check ignores entries absent from `visible`.
+            // The scorer rejects fabricated locators whose gold-matching content enters a probe's locator set.
             const forged = {
                 ...record,
                 injectedClaims: [
@@ -1847,8 +1714,7 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            // The live runner would have aborted this run; a stored artifact
-            // never passed through that gate.
+            // The live runner rejects payloadText containing gold text; stored artifacts bypass that check.
             const leaked = {
                 ...record,
                 probes: record.probes.map((exchange, index) =>
@@ -1869,19 +1735,14 @@ describe("scoreRunRecord", () => {
     });
 
     test("a probe whose gold range is uncovered in the snapshot is ERROR, not a scored answer", () => {
-        // minCount is satisfied by the filler compartment, but the authored
-        // range 13-20 is not covered, so the splice cannot have removed the raw
-        // gold history the probe is supposed to be blind to.
+        // The filler compartment satisfies minCount, but no compartment covers authored range 13-20, so the splice cannot remove the probe's gold history.
         const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 16 }] });
         try {
             const scenario = validScenario();
-            // One compartment row, so the two declared runs must account for
-            // exactly one between them.
+            // The two declared runs must report one persisted compartment because the snapshot has one compartment row.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
-                    // `lookaheadMargin` puts the chunk end at 18: the runs were handed the
-                    // authored span, and the compartments simply stop short of it.
                     goldenRun({
                         runIndex: 2,
                         persistedCompartments: 0,
@@ -1900,10 +1761,7 @@ describe("scoreRunRecord", () => {
     });
 
     test("a two-run artifact whose later run persists a further compartment is not a mismatch", () => {
-        // Run 1's margin was recorded against the compartments that existed then
-        // (prefix max 12); run 2's against the full set (max 20). Reconstructing
-        // both from the snapshot's FINAL maximum makes run 1's expected margin
-        // -8 and rejects a valid artifact.
+        // Run 1's margin uses prefix maximum 12, whereas run 2's uses final maximum 20; using the final maximum for both yields -8 for run 1 and rejects a valid artifact.
         const fixture = makeSnapshot({
             facts: goldFacts(),
             compartments: [
@@ -1938,8 +1796,7 @@ describe("scoreRunRecord", () => {
             });
             expect(scoreRunRecord(honest, scenario).failReasons).toContain("structural");
 
-            // Flip the discard flag off, as a hand-edited artifact would, to
-            // suppress the unhealed-discard finding. The snapshot still holds the
+            // Clearing the discard flag suppresses the unhealed-discard finding.
             // authoritative row.
             const edited = {
                 ...honest,
@@ -1960,8 +1817,8 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // An undeclared pass — one that fired during the probe phase, after
-            // the inventory was assembled — leaves a row the record cannot name.
+            // An undeclared pass fired after the inventory was assembled.
+            // An undeclared pass leaves a row that the record cannot name.
             fixture.db
                 .prepare(
                     `INSERT INTO historian_runs
@@ -2009,9 +1866,9 @@ describe("scoreRunRecord", () => {
         });
         try {
             const scenario = probeFreeScenario();
-            // Run 1 took the forbidden forced-keep path and PERSISTED that
-            // boundary, so unlike a discard there is nothing for run 2 to
-            // re-derive; a final-run-only check would report nothing.
+            // Run 1 persisted a forbidden forced-keep boundary.
+            // Run 2 cannot re-derive a persisted forced-keep boundary.
+            // Because Run 2 cannot re-derive the boundary, a final-run-only check reports nothing.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 }),
@@ -2033,8 +1890,6 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // Each of these would otherwise widen or disable the authored-span
-            // scoping that decides which compartments count toward gold.
             for (const ordinals of [
                 [] as Array<[number, number]>,
                 [[1, 8]] as Array<[number, number]>,
@@ -2064,9 +1919,7 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // Probe resolution runs matchesGold over the RECORDED claims, so
-            // repointing one at a gold claim's content/category forges an
-            // acceptable claim-id answer while recall stays complete.
+            // Probe resolution runs `matchesGold` over recorded claims, so repointing a claim to a gold claim's content and category forges an acceptable claim-ID answer without reducing recall.
             const forged = {
                 ...record,
                 injectedClaims: record.injectedClaims.map((claim, index) =>
@@ -2084,12 +1937,12 @@ describe("scoreRunRecord", () => {
     });
 
     test("compartments outside the authored transcript do not satisfy the gold minimum", () => {
-        // Gold requires one compartment; the session carries two, but only the
-        // filler/padding one exists outside the authored ordinal span.
+        // Gold requires two authored compartments, but only one persists across the authored transcript.
+        // The filler compartment lies outside the authored ordinal span.
         const fixture = makeSnapshot({
             facts: goldFacts(),
-            // Ordinals 1-12 are the harness-owned filler turns; 13-20 are the
-            // authored transcript. Only the second compartment is authored.
+            // Ordinals 1-12 are harness-owned filler turns; ordinals 13-20 are the authored transcript.
+            // Only the second compartment is authored.
             compartments: [
                 { start: 1, end: 12 },
                 { start: 13, end: 20 },
@@ -2132,7 +1985,6 @@ describe("scoreRunRecord", () => {
     });
 
     test("a record paired with another attempt's snapshot is ERROR, not a verdict off foreign claims", () => {
-        // Same scenario, two attempts: identity and inventory checks pass, but
         // the recorded claims name rows that only exist in the other database.
         const attemptOne = makeSnapshot({ facts: goldFacts() });
         const attemptTwo = makeSnapshot({ facts: goldFacts() });
@@ -2155,10 +2007,7 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const scenario = probeFreeScenario();
-            // Run 1 published while dropping its provisional tail; run 2 then
-            // failed, so the dropped range was never re-derived. The final row
-            // reports no discard of its own, and the record is not
-            // all-attempts-invalid, so only a per-run check catches it.
+            // A failed later run does not re-derive an earlier discarded tail.
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ discardedLast: true }),
@@ -2259,11 +2108,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 
     test("a correct answer on an unavailable claim is error-trimmed, not a PASS", () => {
         const probe = scenario.probes[0];
-        // The capacity claim was promoted but is not in this probe's injected set and no
-        // compartment states it, so the probe had no surface to recover 4096 from — it
-        // guessed. Counting that as a PASS while the same probe answering wrongly is
-        // excluded can only bias the tier upward, and a multiple-choice prompt renders
-        // every option, so a right guess is a 1-in-N event.
+        // The scorer excludes an answer unless an injected claim or permitted compartment summary states its value.
         const verdict = compareProbeAnswer({
             probe,
             exchange: exchange(probe.id, "4096", ["loc-lru01"]),
@@ -2274,10 +2119,8 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
     });
 
     test("an injected claim that satisfies the predicate but not the answer is not availability", () => {
-        // A predicate is a substring matcher and can be broader than the answer. This
-        // claim satisfies "4096"'s expectation only in the sense that it is the same
-        // category and matches a broader predicate — it does not state the value, so the
-        // probe had nothing to read and a correct answer is a guess.
+        // A broader predicate can match a claim without exposing the expected value.
+        // A predicate match without the expected value does not make the value recoverable.
         const broaderScenario: HistorianEvalScenario = {
             ...scenario,
             gold: {
@@ -2308,10 +2151,6 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
     });
 
     test("an escaped answer matches an authored gold with the same character", () => {
-        // The injected block carries the escaped wire form, so a model reading it back can
-        // answer `A&amp;B` for an authored gold of `A&B`. Comparing raw marked that correct
-        // answer wrong, while the availability check one branch up already decoded the same
-        // text — so the two disagreed about what the value is.
         const ampScenario: HistorianEvalScenario = {
             ...scenario,
             gold: {
@@ -2344,8 +2183,8 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 
     test("a correct answer stays a PASS when the claim was injected for the probe", () => {
         const probe = scenario.probes[0];
-        // The gate must not swallow an ordinary PASS: the capacity locator IS in this
-        // probe's injected set, so the answer rests on injected memory.
+        // Locators in `injectedRevisionLocators` make an answer rely on injected memory.
+        // A locator in `injectedRevisionLocators` makes the answer rely on injected memory.
         const verdict = compareProbeAnswer({
             probe,
             exchange: exchange(probe.id, "4096"),
@@ -2357,15 +2196,13 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 
     test("a correct answer stays a PASS when a compartment states the fact", () => {
         const probe = scenario.probes[0];
-        // Trimmed from the claim surface but stated in a compartment summary, which the
-        // prompt tells the probe it may use — so the answer is recoverable and scores.
+        // A permitted compartment summary can make a trimmed claim recoverable.
         const verdict = compareProbeAnswer({
             probe,
             exchange: {
                 ...exchange(probe.id, "4096", ["loc-lru01"]),
                 payloadText:
                     "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
-                // One request in this fixture, so the final request carries the same text.
                 finalRequestPayloadText:
                     "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
             },
@@ -2377,17 +2214,13 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 
     test("a trimmed claim whose fact a compartment still states is a model FAIL, not trimmed", () => {
         const probe = scenario.probes[0];
-        // The claim budget dropped the capacity claim, but the injected compartment
-        // summary states the fact — and the prompt tells the probe it may answer from
-        // session history. The probe was answerable, so a wrong answer is the model's
-        // miss; `error-trimmed` would take it out of scored metrics.
+        // `error-trimmed` applies only when neither injected claims nor permitted compartment summaries state the answer.
         const verdict = compareProbeAnswer({
             probe,
             exchange: {
                 ...exchange(probe.id, "wrong", ["loc-lru01"]),
                 payloadText:
                     "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
-                // One request in this fixture, so the final request carries the same text.
                 finalRequestPayloadText:
                     "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
             },
@@ -2400,19 +2233,13 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
     test("a trimmed claim-id probe stays error-trimmed even when a compartment states the fact", () => {
         const probe = scenario.probes.find((entry) => entry.answerType === "claim-id");
         if (probe === undefined) throw new Error("fixture lacks a claim-id probe");
-        // A claim-id answer is the runtime public id, which is emitted into
-        // `<project-memory>` and nowhere else — a compartment summary is prose about
-        // the transcript and cannot carry an id the store assigned at promotion time.
-        // So the fact being summarised does not make the id recoverable, and falling
-        // through to `fail` would charge the model for a probe with no answer
-        // available (`expected` is `<no injected gold claim>`).
+        // Public claim IDs are recoverable only from `<project-memory>`, not compartment summaries.
         const verdict = compareProbeAnswer({
             probe,
             exchange: {
                 ...exchange(probe.id, "mem-lru01", ["loc-cap01"]),
                 payloadText:
                     "<new-compartments>\nSessions are cached by the in-process LRU cache.\n</new-compartments>",
-                // One request in this fixture, so the final request carries the same text.
                 finalRequestPayloadText:
                     "<new-compartments>\nSessions are cached by the in-process LRU cache.\n</new-compartments>",
             },
@@ -2424,15 +2251,13 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 
     test("a trimmed claim absent from every compartment stays error-trimmed", () => {
         const probe = scenario.probes[0];
-        // Same trim, but no injected surface carries the fact — the probe genuinely
-        // could not answer, which is an injection-budget loss and not model quality.
+        // No injected surface states the fact, so the trim causes an injection-budget loss rather than a model-quality failure.
         const verdict = compareProbeAnswer({
             probe,
             exchange: {
                 ...exchange(probe.id, "wrong", ["loc-lru01"]),
                 payloadText:
  "<new-compartments>\nCache decision: Redis was rejected.\n</new-compartments>",
-                // One request in this fixture, so the final request carries the same text.
                 finalRequestPayloadText:
  "<new-compartments>\nCache decision: Redis was rejected.\n</new-compartments>",
             },
@@ -2444,15 +2269,14 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 
     test("the fact stated only in the claim surface does not make a trimmed probe answerable", () => {
         const probe = scenario.probes[0];
-        // `<project-memory>` is the surface the trim removed the claim FROM. Searching
-        // it would read the block's own contents as proof the trim did not happen.
+        // `<project-memory>` contains the trimmed claim; searching it would treat the removed claim as evidence that the trim failed.
         const verdict = compareProbeAnswer({
             probe,
             exchange: {
                 ...exchange(probe.id, "wrong", ["loc-lru01"]),
                 payloadText:
  "<project-memory>\nmem-cap01: Session cache capacity is 4096 entries.\n</project-memory>",
-                // One request in this fixture, so the final request carries the same text.
+                // The fixture has one request, so the final request has the same text.
                 finalRequestPayloadText:
  "<project-memory>\nmem-cap01: Session cache capacity is 4096 entries.\n</project-memory>",
             },
@@ -2519,8 +2343,7 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: [],
             structuralFindings: [],
             probeVerdicts: [],
-            // Lane scores come from runs, so they carry a system and declare their
-            // source; the report refuses raw-output seam results.
+            // Lane scores come from runs, so the report accepts only scores with both a system and source.
             system: LANE_SYSTEM,
             source: "run-record",
         };
@@ -2539,9 +2362,7 @@ describe("buildLaneReport", () => {
             errorReason: "script-drift",
             precision: null,
             recall: null,
-            // Non-zero counters: if the aggregation summed over ALL
-            // scenarios instead of scored ones, these would drag the rates
-            // below 1 and the assertions below would catch it.
+            // Aggregating all scenarios rather than scored scenarios would lower these nonzero rates below 1.
             expectedClaimsMatched: 0,
             expectedClaimsTotal: 2,
             visibleClaimsMatched: 0,
@@ -2580,11 +2401,9 @@ describe("buildLaneReport", () => {
         };
         const other = { ...system, repoCommitSha: "b".repeat(40) };
 
-        // Derived from the scores, not from the caller's label.
         expect(buildLaneReport([{ ...passScore("hse-a"), system }]).system).toEqual(system);
 
-        // A seam score is refused by SOURCE, not by a null system: an
-        // artifact-integrity ERROR also carries no system and must stay reportable.
+        // The report refuses seam scores by `source`, not a null `system`, because artifact-integrity errors also omit `system` and remain reportable.
         expect(() => buildLaneReport([{ ...passScore("hse-a"), source: "raw-output" }])).toThrow(
             /raw-output seam/,
         );
@@ -2603,8 +2422,7 @@ describe("buildLaneReport", () => {
             /does not match the scored records/,
         );
 
-        // Field order must not matter: a deserialized run-record tuple and a
-        // caller literal never share a construction site.
+        // Field order must not matter because deserialized run-record tuples and caller literals use different construction sites.
         const permuted = {
             chunkTokenBudget: system.chunkTokenBudget,
             probeModelId: system.probeModelId,
@@ -2619,8 +2437,7 @@ describe("buildLaneReport", () => {
     });
 
     test("an empty score set is refused rather than reported green", () => {
-        // `some` is false on an empty list, so this would otherwise be non-red
-        // and exit 0 having evaluated nothing.
+        // An empty list makes `some` false, so the process would exit 0 without evaluating anything.
         expect(() => buildLaneReport([])).toThrow(/empty lane report cannot be green/);
     });
 
@@ -2653,12 +2470,8 @@ describe("buildLaneReport", () => {
 
 describe("scoring database provisioning", () => {
     test("the deserialized scoring connection enforces foreign keys and keeps the busy timeout", () => {
-        // Bun serialization carries database BYTES, not connection state, so a
-        // deserialized handle comes up with SQLite's defaults: foreign keys off
-        // and no busy timeout. Left that way, a scorer write violating a claim
-        // relationship would be accepted and scored here while the
-        // factory-backed connection and production reject it — a storage
-        // regression would score green.
+        // Bun serialization preserves database bytes, not connection state, so deserialized handles use SQLite defaults: foreign keys off and no busy timeout.
+        // Without these PRAGMAs, scoring can accept foreign-key violations.
         const db = freshScoringDatabase();
         try {
             expect(db.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
@@ -2696,11 +2509,7 @@ describe("compareProbeAnswer claim-id availability", () => {
             discardedResponseTexts: [],
         };
         const verdict = compareProbeAnswer({ probe: probe!, exchange, scenario, injectedClaims: injected });
-        // The property the mutation battery depends on: with a candidate present
-        // the verdict is a real comparison against that claim's id, not an
-        // availability outcome. An empty injected set instead yields
-        // "<no injected gold claim>", which fails for want of any candidate and
-        // would stay green under a comparator that accepted the wrong id.
+        // With an injected backing claim, a wrong claim ID must fail rather than report no injected gold claim.
         expect(verdict.outcome).toBe("fail");
         expect(verdict.expected).toBe("mem-backing");
 

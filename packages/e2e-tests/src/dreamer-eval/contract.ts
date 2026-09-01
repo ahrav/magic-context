@@ -52,9 +52,6 @@ export type FailReason = (typeof FAIL_REASONS)[number];
 export const RUN_FATAL_FAIL_REASONS = ["wrong-archival"] as const satisfies readonly FailReason[];
 
 /**
- * Sole decision point for the run-fatal (exit 2) class. Report validation, the
- * scorer, and the mutation battery all route through this, so extending
- * RUN_FATAL_FAIL_REASONS changes every consumer at once.
  */
 export function isRunFatal(status: DreamerRunStatus, reason: ErrorReason | FailReason | null): boolean {
     return (
@@ -140,8 +137,7 @@ const MAX_GIT_COMMIT_SECONDS = 4_102_444_799;
 const MAX_VERIFIED_AT_MS = (MAX_GIT_COMMIT_SECONDS + 1) * 1_000 + 2_000 - 1;
 
 /**
- * `extractCompleteManifestBody` ends the verify body at the first occurrence of
- * this tag and matches the root case-insensitively, so any case variant cuts the
+ * `extractCompleteManifestBody` ends the verify body at the first case-insensitive occurrence of `VERIFY_ROOT_CLOSE_TAG`.
  * body short.
  */
 const VERIFY_ROOT_CLOSE_TAG = "</verify>";
@@ -230,11 +226,6 @@ function boundedInteger(value: unknown, label: string, minimum: number, maximum:
 }
 
 /**
- * Provider bytes verbatim, with `null` reserved for "nothing was captured".
- * `string` rejects a blank value, but a blank or whitespace-only manifest is
- * exactly what every scorer records as `ERROR:provider-failure`, so that
- * evidence has to round-trip through the report instead of collapsing into the
- * absence case and losing the distinction.
  */
 function nullableRawText(value: unknown, label: string): string | null {
     if (value === null) return null;
@@ -280,10 +271,6 @@ export interface VerifyGoldClaim {
     claimId: string;
     verdict: VerifyVerdict;
     /**
-     * Backing set the manifest must report. Verification applies this attribute
-     * as the claim's new exact mapping, so it is scored rather than ignored; it
-     * may differ from the pool's current mapping when a fixture models a file
-     * that moved. An archive verdict carries no mapping.
      */
     expectedFiles: string[];
     requiredUpdateAnchors: string[];
@@ -356,14 +343,10 @@ function parseStringArray(raw: unknown, label: string): string[] {
 }
 
 /**
- * A manifest carries file paths inside a comma-separated, double-quoted
- * attribute, and production splits that attribute on commas and trims each
- * entry. A path holding a comma, a quote, an angle bracket, or edge whitespace
- * therefore decodes as something other than what was authored, so no manifest
- * can ever report this path back and the scenario is unpassable by
- * construction. A NUL is unrepresentable for a different reason: it survives
- * every string check here and `resolve`, then `writeFileSync` rejects it with a
- * raw `TypeError` that escapes the typed fixture-drift path.
+ * Manifest file paths use comma-separated, double-quoted attributes.
+ * Production splits manifest file paths on commas and trims each entry.
+ * Paths containing commas, quotes, angle brackets, or edge whitespace cannot round-trip through the manifest.
+ * A NUL survives validation and `resolve`, but `writeFileSync` throws an untyped `TypeError`.
  */
 const UNREPRESENTABLE_PATH_RE = /[,"<>\0]/;
 
@@ -419,15 +402,12 @@ function parseScenarioClaim(raw: unknown, label: string): ScenarioClaim {
     if (fileIndependent && fixtureFiles.length > 0) fail(`${label}.fixtureFiles: independent-has-files`);
     if (!fileIndependent && fixtureFiles.length === 0) fail(`${label}.fixtureFiles: mapped-claim-has-no-file`);
     const category = string(value.category, `${label}.category`);
-    // The generic claim writer refuses the anti-memory category, and the typed
-    // writer that accepts it needs a structured payload this scenario shape does
-    // not carry, so such a claim fails during seeding rather than at authoring.
+    // Anti-memory claims fail during seeding because no required structured payload is provided.
     if (category === ANTI_MEMORY_CATEGORY) fail(`${label}.category: unsupported`);
     const hygieneVisible = boolean(value.hygieneVisible, `${label}.hygieneVisible`);
-    // Hygiene visibility follows from a claim's dispositions, and no seeding
-    // step produces the dispositions that hide one. A false value would declare
-    // a pool the hygiene lane cannot reproduce: the read returns every active
-    // row, so the task fails its gate assertion instead of running.
+    // No seeding step creates dispositions that hide hygiene-visible claims.
+    // A false `hygieneVisible` value makes the hygiene lane fail its gate assertion before it runs.
+    // The hygiene read returns every active row, so a hidden claim fails the gate assertion.
     if (!hygieneVisible) fail(`${label}.hygieneVisible: unsupported`);
     return {
         id: staticId(value.id, `${label}.id`, CLAIM_ID_RE),
@@ -458,10 +438,7 @@ function parsePreconditions(raw: unknown, label: string, pool: ReadonlyMap<strin
         const poolClaim = pool.get(claimId);
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         const files = parseFilePathArray(item.files, `${itemLabel}.files`);
-        // The seeder applies a mapping only for a path the mapped claim itself
-        // declares and rejects anything else as `fixture-drift`. This is
-        // per-claim, unlike gold: a precondition states the claim's existing
-        // mapping, so it cannot name another claim's file.
+        // Unlike gold mappings, mapping preconditions describe existing claim mappings and cannot name another claim's files.
         const declared = new Set(poolClaim.fixtureFiles.map((file) => file.path));
         for (const [fileIndex, file] of files.entries()) {
             if (!declared.has(file)) fail(`${itemLabel}.files[${fileIndex}]: path-undeclared`);
@@ -491,16 +468,14 @@ function parsePreconditions(raw: unknown, label: string, pool: ReadonlyMap<strin
     for (const [index, claimId] of classifiedClaimIds.entries()) {
         assertKnownClaim(claimId, poolIds, `${label}.classifiedClaimIds[${index}]`);
     }
-    // The seeder applies mappings and verifications only, so a populated value
-    // here would assert database state that no seeding step creates.
+    // `classifiedClaimIds` must be empty because the seeder creates no classifications.
     if (classifiedClaimIds.length > 0) fail(`${label}.classifiedClaimIds: unsupported`);
     return { mappings, verifications, classifiedClaimIds };
 }
 
 /**
- * Every path the seeder writes and commits, collected across the whole pool
- * rather than per claim: a fixture may model a file that moved, so one claim's
- * gold set can legitimately name a path another claim declares.
+ * The declared-path set includes every path the seeder writes and commits across the pool.
+ * Gold mappings may name paths declared by another claim to model moved files.
  */
 function declaredFixturePaths(pool: ReadonlyMap<string, ScenarioClaim>): ReadonlySet<string> {
     const paths = new Set<string>();
@@ -511,12 +486,7 @@ function declaredFixturePaths(pool: ReadonlyMap<string, ScenarioClaim>): Readonl
 }
 
 /**
- * Gold file sets are restricted to declared fixture paths. Production routes
- * manifest paths through `normalizeVerificationFiles`, which canonicalizes
- * tracked paths, drops untracked ones, and rejects the manifest when none
- * survives. Gold naming an untracked path (`src/ghost.ts`) or a noncanonical
- * alias of a tracked one (`src/./file.ts`) would therefore score a green run for
- * output the host cannot apply.
+ * Gold entries must name declared canonical fixture paths because the host drops untracked and noncanonical paths.
  */
 function parseGoldFilePathArray(raw: unknown, label: string, declared: ReadonlySet<string>): string[] {
     const values = parseFilePathArray(raw, label);
@@ -527,21 +497,9 @@ function parseGoldFilePathArray(raw: unknown, label: string, declared: ReadonlyS
 }
 
 /**
- * A sound lower bound on the shortest update body that can contain every
- * required anchor, or null when no bound is provable here.
  *
- * The true minimum is the shortest-common-superstring length, which is NP-hard,
- * so this decides only the case where the anchors provably cannot share
- * characters: anchors contained in another ride along for free and drop out, and
- * if no ordered pair of the rest overlaps — no suffix of one is a prefix of the
- * other — then every occurrence is disjoint and the minimum is exactly the sum.
- * Anchor matching is case-insensitive, so overlap is judged folded.
  */
 function disjointAnchorLength(anchors: readonly string[]): number | null {
-    // Case folding can lengthen a string — `"İ".toLowerCase()` is two code units
-    // — so folded spellings decide identity and overlap while the cost of
-    // carrying an anchor is measured on what a body actually holds: the authored
-    // spelling, or its folded form when that is somehow shorter.
     const cost = new Map<string, number>();
     for (const anchor of anchors) {
         const folded = anchor.toLowerCase();
@@ -585,48 +543,31 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
         }
         const requiredUpdateAnchors = parseStringArray(item.requiredUpdateAnchors, `${itemLabel}.requiredUpdateAnchors`);
         const forbiddenUpdateAnchors = parseStringArray(item.forbiddenUpdateAnchors, `${itemLabel}.forbiddenUpdateAnchors`);
-        // Passing content must contain every required anchor as a substring, so
-        // it is at least as long as the longest one. Production and the scorer
-        // both reject an update body over VERIFY_UPDATE_CONTENT_MAX_LENGTH, which
-        // makes an anchor past that length unsatisfiable by any manifest. The
-        // combined length is deliberately not checked: anchors may overlap
-        // inside one body, so a sum over the cap does not prove impossibility.
+        // A combined anchor length over the cap does not prove impossibility because anchors can overlap in one body.
         for (const [anchorIndex, anchor] of requiredUpdateAnchors.entries()) {
-            // The parser trims the body, so whitespace at an anchor's own edge only
-            // survives with a non-whitespace character outside it on that side.
             const edgePadding =
                 (/^\s/.test(anchor) ? 1 : 0) + (/\s$/.test(anchor) ? 1 : 0);
             if (anchor.length + edgePadding > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-exceeds-content-cap`);
             }
-            // Only the closing root tag is unsatisfiable. Body extraction folds
-            // case, so every spelling of it truncates the body before the entry
-            // parser runs, and no emitted variant can carry the anchor.
             //
-            // The entry constructs — `</update>` and the entry openers — are
-            // matched case-sensitively by the parser while anchor scoring folds
-            // both sides, so emitting `</UPDATE>` or `<VERIFIED` satisfies such an
-            // anchor without terminating the body or minting a sibling entry. The
-            // battery synthesizes that inert spelling; rejecting these here would
-            // refuse satisfiable gold.
+            // The battery synthesizes inert spellings; rejecting them would refuse satisfiable gold.
             if (anchor.toLowerCase().includes(VERIFY_ROOT_CLOSE_TAG)) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-root-close-tag`);
             }
         }
-        // Individually capped anchors can still be jointly impossible: two that
-        // cannot overlap need a body at least as long as their sum.
+        // Individually capped anchors can still be jointly impossible when they cannot overlap.
+        // Two non-overlapping anchors require a body at least as long as their combined length.
         const disjointLength = disjointAnchorLength(requiredUpdateAnchors);
         if (disjointLength !== null && disjointLength > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
             fail(`${itemLabel}.requiredUpdateAnchors: anchors-exceed-content-cap`);
         }
-        // Anchors are scored only for an update verdict, so an anchor on any
-        // other verdict states a requirement nothing enforces.
+        // Anchors require an `update` verdict.
         if (verdict !== "update" && (requiredUpdateAnchors.length > 0 || forbiddenUpdateAnchors.length > 0)) {
             fail(`${itemLabel}: anchors-require-update`);
         }
-        // Anchor checks are case-insensitive substring tests, so content holding
-        // a required anchor also holds any forbidden anchor contained in it. Such
-        // a pair demands content that both contains and omits the same text.
+        // Anchor checks use case-insensitive substring matching.
+        // A required anchor containing a forbidden anchor makes the pair unsatisfiable.
         const unsatisfiable = requiredUpdateAnchors.some((required) =>
             forbiddenUpdateAnchors.some((forbidden) => required.toLowerCase().includes(forbidden.toLowerCase())),
         );
@@ -658,9 +599,6 @@ function parseMapGold(raw: unknown, label: string, pool: ReadonlyMap<string, Sce
         const independent = boolean(item.independent, `${itemLabel}.independent`);
         if (independent !== poolClaim.fileIndependent) fail(`${itemLabel}.independent: pool-mismatch`);
         const files = parseGoldFilePathArray(item.files, `${itemLabel}.files`, declared);
-        // A manifest reports either an independent claim or a file set, never
-        // both, so the opposite pairing describes an outcome no correct model
-        // response can produce.
         if (independent && files.length > 0) fail(`${itemLabel}.files: independent-has-files`);
         if (!independent && files.length === 0) fail(`${itemLabel}.files: mapped-claim-has-no-file`);
         return { claimId, files, independent };
@@ -687,13 +625,7 @@ function parseClassifyGold(raw: unknown, label: string, pool: ReadonlyMap<string
         const max = boundedInteger(importanceValue.max, `${importanceLabel}.max`, 1, 100);
         if (min > max) fail(`${importanceLabel}: range-invalid`);
         const shareable = boolean(item.shareable, `${itemLabel}.shareable`);
-        // `applyClassifications` forces shareable to false before writing the
-        // revision whenever the claim content trips the same predicate — but only
-        // when the entry explicitly reports `true`. An entry that omits the field
-        // preserves the stored value, so gold asking for shareable is achievable
-        // for a sensitive claim already stored that way, and unachievable for one
-        // stored private: the model's "true" would score PASS while the stored
-        // claim came out private.
+        // `applyClassifications` overrides explicit `shareable: true` for sensitive claims but preserves omitted values; gold can require shareable only when the stored claim is already shareable.
         if (shareable && poolClaim.sharing !== "shareable" && hasShareabilitySensitiveText(poolClaim.content)) {
             fail(`${itemLabel}.shareable: shareability-override`);
         }
@@ -709,9 +641,7 @@ function parseClassifyGold(raw: unknown, label: string, pool: ReadonlyMap<string
 }
 
 /**
- * Order- and duplicate-insensitive set equality. Duplicates collapse, so this
- * compares membership rather than sequence; callers that need positional
- * agreement must compare arrays directly.
+ * Set equality ignores order and duplicates; compare arrays for positional equality.
  */
 export function sameSet(left: readonly string[], right: readonly string[]): boolean {
     const leftSet = new Set(left);
@@ -738,14 +668,7 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if ((task === "map-memories" || task === "classify-memories") && expectedResultMode !== null) {
         fail(`${label}.expectedResultMode: task-mode-mismatch`);
     }
-    // Classify reads the hygiene surface, which returns every active row, and
-    // runs only once the pool reaches CLASSIFY_MIN_POOL. Parsing rejects
-    // `hygieneVisible: false` and requires at least ten claims, so the
-    // production gate always selects the whole pool and a scenario skipping any
-    // claim terminates with gate-mismatch at preflight.
-    // Production returns immediately when a gate selects no inputs, so no manifest
-    // is produced — and every scorer validator refuses an empty one while the
-    // report contract demands evidence for a PASS. Such a task cannot yield a
+    // A task whose gate selects no inputs cannot yield a PASS.
     // successful artifact.
     if (expectedInScopeClaimIds.length === 0) {
         fail(`${label}.expectedInScopeClaimIds: scope-empty`);
@@ -757,10 +680,8 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
         fail(`${label}.expectedSkippedClaimIds: classify-skips-nothing`);
     }
     if (task === "classify-memories") {
-        // Recording `stale` or `flagged` sets the claim's stale or disputed
-        // disposition, and the maintenance_hygiene surface admits a claim only
-        // when both are clear. Such a claim leaves the hygiene pool the classify
-        // gate reads, so the whole-pool expectation above can no longer hold.
+        // `stale` and `flagged` dispositions exclude claims from the hygiene pool.
+        // `expectedInScopeClaimIds` cannot equal the full hygiene pool after either disposition.
         for (const [index, entry] of preconditions.verifications.entries()) {
             if (entry.outcome === "stale" || entry.outcome === "flagged") {
                 fail(`${label}.preconditions.verifications[${index}].outcome: classify-hidden-disposition`);
@@ -769,37 +690,18 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     }
     if (task === "verify-broad") {
         if (expectedResultMode !== "broad") fail(`${label}.expectedResultMode: broad-required`);
-        // `seedDreamerEvalTask` cannot construct the broad-cycle watermark
-        // without verification history and rejects such a task as
-        // `fixture-drift`, so accepting one here would admit a scenario that can
         // never run.
         if (preconditions.verifications.length === 0) {
             fail(`${label}.preconditions.verifications: broad-requires-history`);
         }
     }
-    // The seeder always git-inits the workdir, commits, and calls
-    // partitionVerifyScope with forceBroad false. That path returns "broad" only
-    // under forceBroad, never returns "non-git" at all, and returns "full" only
-    // when git change-times are unavailable — which the seeder treats as
-    // fixture drift. "incremental" is the one mode a healthy fixture produces,
-    // so any other value here is a scenario that deterministically terminates
-    // with gate-mismatch at preflight.
     if (task === "verify" && expectedResultMode !== "incremental") {
         fail(`${label}.expectedResultMode: verify-mode-unproducible`);
     }
     if (task === "verify" || task === "verify-broad") {
-        // The gate keeps a normal claim only when it has mapped files, and only
-        // an explicit mapping precondition seeds one — declaring fixtureFiles
-        // does not. The anti-memory category, the one kind admitted without a
-        // mapping, is already refused at the claim level.
         const mappedClaimIds = new Set(
             preconditions.mappings.flatMap((entry) => (entry.files.length > 0 ? [entry.claimId] : [])),
         );
-        // `verifiedAt` reports a timestamp only for a latest outcome of
-        // "verified" and 0 for every other one, and the seeder pins the fixture
-        // commit before every seeded verification with no later file change, so
-        // incremental skips exactly the claims carrying a verified outcome.
-        // Broad re-sweeps all of them, because the seeded watermark sits above
         // every verification.
         const verifiedClaimIds = new Set(
             preconditions.verifications.flatMap((entry) => (entry.outcome === "verified" ? [entry.claimId] : [])),
@@ -814,12 +716,6 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
         }
     }
     if (task === "map-memories") {
-        // `selectMapMemoryInputs` always selects a claim with no baseline, and a
-        // mapping precondition is the only thing that creates one. The converse
-        // holds for a nonempty mapping too: `shouldRequeueIndependentMapping`
-        // requires an empty sentinel, so a claim with mapped files can never be
-        // pulled back in. Only an empty mapping is genuinely ambiguous, because
-        // the requeue heuristic then reads the claim's content and the
         // repository.
         const seededFiles = new Map(preconditions.mappings.map((entry) => [entry.claimId, entry.files]));
         for (const [index, claimId] of expectedSkippedClaimIds.entries()) {
@@ -862,11 +758,6 @@ export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScen
     if (claims.length > MAX_POOL_CLAIMS) fail(`${label}.pool.claims: count-invalid`);
     if (claims.filter((claim) => claim.hygieneVisible).length < MIN_POOL_CLAIMS) fail(`${label}.pool.claims: hygiene-visible-count-invalid`);
     unique(claims.map((claim) => claim.id), `${label}.pool.claims`);
-    // Claim creation dedupes on (project, category, normalized content hash)
-    // among active claims, so two rows whose contents normalize alike collapse
-    // into one and the seeder aborts on its public-id cardinality check. The
-    // production normalizer decides the identity here rather than a local copy
-    // of its rules.
     unique(
         claims.map((claim) => `${claim.category}\u0000${normalizeMemoryContent(claim.content)}`),
         `${label}.pool.claims.content`,
@@ -890,7 +781,7 @@ export function serializeScenario(scenario: DreamerEvalScenario): string {
     return `${JSON.stringify(scenario, null, 2)}\n`;
 }
 
-/** Claims current-state projection retained in pool descriptors and run records. */
+/** Pool descriptors and run records retain current claim state. */
 export interface ClaimSnapshotProjection {
     claimId: string;
     publicClaimId: string;
@@ -951,12 +842,7 @@ export interface DreamerSystemTuple {
 export type DreamerRunStatus = "PASS" | "FAIL" | "ERROR";
 
 /**
- * Parsed-manifest evidence exactly as the task's scorer produced it: verify
- * parses to one record of verdict lists, while map and classify parse to one
- * entry per claim. `object` is the widest compile-time bound that accepts every
- * scorer's interface-typed result without a cast, because an interface carries
- * no implicit index signature; `parseRunReport` is the gate that admits only a
- * non-array record or an array of records.
+ * `object` accepts every scorer result without a cast because interfaces lack implicit index signatures.
  */
 export type ParsedManifestEvidence = object;
 
@@ -1009,12 +895,10 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
     const verificationOutcome = value.verificationOutcome === null
         ? null
         : enumeration(value.verificationOutcome, VERIFICATION_OUTCOMES, `${label}.verificationOutcome`);
-    // Storage identities, checked with the production predicates rather than a
-    // local restatement: a value outside them names a claim that cannot exist,
-    // so a scorer or report would attribute its result to something no run can
-    // reproduce. The locator canonically embeds the claim's own public id, so a
-    // locator naming a different claim is a mismatched pairing even when both
-    // halves are individually well formed.
+    // Production predicates reject storage identities that cannot name existing claims.
+    // A scorer or report using an invalid identity attributes a result to a claim no run can reproduce.
+    // `revisionLocator` canonically embeds `publicClaimId`.
+    // `revisionLocator` and `publicClaimId` must identify the same claim even when each is valid.
     const publicClaimId = string(value.publicClaimId, `${label}.publicClaimId`);
     if (!isValidPublicClaimId(publicClaimId)) fail(`${label}.publicClaimId: id-invalid`);
     const revisionLocator = string(value.revisionLocator, `${label}.revisionLocator`);
@@ -1024,9 +908,8 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
         fail(`${label}.revisionLocator: locator-claim-mismatch`);
     }
     const content = string(value.content, `${label}.content`);
-    // The locator's third segment is the revision's `content_sha256`, which
-    // production computes as `sha256Utf8Hex(content)`. A digest over other bytes
-    // describes a revision whose content is not the one recorded here.
+    // The third `revisionLocator` segment equals `sha256Utf8Hex(content)`.
+    // A digest over bytes other than `content` identifies a different revision.
     if (locator.contentDigest !== sha256Utf8Hex(content)) {
         fail(`${label}.revisionLocator: locator-digest-mismatch`);
     }
@@ -1046,22 +929,12 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
 }
 
 /**
- * Sole snapshot-array parser. Pool descriptors and run reports carry the same
- * projection, so identity uniqueness is enforced here rather than per caller: a
- * repeated claim inflates any consumer that counts rows while a consumer that
- * keys by id silently retains one copy.
  */
 function parseSnapshotArray(raw: unknown, label: string): ClaimSnapshotProjection[] {
     const claims = array(raw, label).map((entry, index) => parseSnapshot(entry, `${label}[${index}]`));
     unique(claims.map((claim) => claim.claimId), label);
     unique(claims.map((claim) => claim.publicClaimId), `${label}.publicClaimId`);
-    // The same ceiling every scenario is held to, so a capture cannot describe a
-    // pool larger than any experiment can declare.
     if (claims.length > MAX_POOL_CLAIMS) fail(`${label}: pool-size-invalid`);
-    // `assertNoLiveDuplicate` keeps two active claims from sharing a
-    // `(category, normalized content)` identity, so a capture holding both
-    // describes a state production refuses — and a ledger built from it would
-    // silently keep one owner and score an unappliable update green.
     unique(
         claims.flatMap((claim) =>
             claim.lifecycleState === "active"
@@ -1113,16 +986,9 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
 }
 
 /**
- * Parsed evidence, validated against the shape the declared task's scorer
  * actually produces.
  *
- * Verify parses to one record of three verdict lists, map and classify to one
- * entry per claim, and each parser refuses a manifest that yielded no entries —
- * so an empty record or array is evidence no scorer could have emitted.
  *
- * `observedPublicIds` is null for an ERROR run, whose pool capture may be
- * partial; for a completed one every public id must name a claim the report
- * captured, since evidence about a claim absent from the pool describes a
  * different experiment.
  */
 function parseManifestEvidence(
@@ -1150,9 +1016,6 @@ function parseManifestEvidence(
         const root = record(value, label);
         exact(root, ["verified", "updated", "archived"], label);
         let entries = 0;
-        // Field sets come straight from `parseVerifyManifest`: a verified entry
-        // carries its backing files, an update adds the replacement body, and an
-        // archive carries the reason instead of files.
         for (const [index, entry] of array(root.verified, `${label}.verified`).entries()) {
             const entryLabel = `${label}.verified[${index}]`;
             const item = record(entry, entryLabel);
@@ -1167,9 +1030,6 @@ function parseManifestEvidence(
             exact(item, ["publicClaimId", "files", "content"], entryLabel);
             entryId(item, entryLabel);
             filesOf(item, entryLabel);
-            // A self-closing update, or one whose body is whitespace, parses to an
-            // empty string and the scorer reports wrong-update-content for it, so
-            // the nonblank `string` primitive would refuse genuine evidence.
             if (typeof item.content !== "string") fail(`${entryLabel}.content: string-invalid`);
             entries += 1;
         }
@@ -1182,8 +1042,6 @@ function parseManifestEvidence(
             entries += 1;
         }
         if (entries === 0) fail(`${label}: evidence-empty`);
-        // `verifyIds` spans all three lists, so the parser's duplicate check is
-        // across them rather than within each.
         if (new Set(collected).size !== collected.length) fail(`${label}: duplicate`);
         return root;
     }
@@ -1197,8 +1055,6 @@ function parseManifestEvidence(
             boolean(item.independent, `${entryLabel}.independent`);
             return item;
         }
-        // `parseClassifyManifest` sets only the attributes the entry carried and
-        // refuses one that carried none, so the key set varies within that bound.
         for (const key of Object.keys(item)) {
             if (!["publicClaimId", "importance", "scope", "shareable"].includes(key)) {
                 fail(`${entryLabel}: fields-invalid`);
@@ -1214,22 +1070,14 @@ function parseManifestEvidence(
     });
     if (entries.length === 0) fail(`${label}: evidence-empty`);
     const covered = new Set(entries.map((entry) => entry.publicClaimId as string));
-    // Every parser calls `assertNoDuplicateManifestIds` before a scorer result
-    // exists, so a repeated id is an artifact no run produces.
     if (covered.size !== entries.length) fail(`${label}: duplicate`);
     if (task === "classify-memories" && observedPublicIds !== null) {
-        // `validateClassifyManifest` demands exact id coverage, and a classify task
-        // takes the whole pool, so a completed run's evidence names every observed
-        // claim exactly once.
         if (covered.size !== observedPublicIds.size) fail(`${label}: coverage-incomplete`);
     }
     return entries;
 }
 
 /**
- * Whether both snapshots carry the same claim identities under the same public
- * bindings. Each array is already unique on both keys, so comparing sorted
- * pairs decides set equality; NUL joins the pair because neither identifier can
  * contain it.
  */
 function sameIdentityBindings(
@@ -1245,7 +1093,7 @@ function sameIdentityBindings(
 }
 
 
-/** Key-order-independent encoding, so evidence is compared by value. */
+/** Canonical encoding compares evidence by value regardless of object key order. */
 function canonicalJson(value: unknown): string {
     if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
     if (value !== null && typeof value === "object") {
@@ -1258,10 +1106,6 @@ function canonicalJson(value: unknown): string {
 }
 
 /**
- * The captured bytes as the task's production parser reads them, or null when it
- * refuses them. The scorers call the validators, which return exactly what these
- * parsers produce — coverage is the only thing the validators add, and it needs
- * an expected-id set the report does not carry.
  */
 function reparseManifest(task: DreamerTask, rawManifest: string): ParsedManifestEvidence | null {
     try {
@@ -1288,9 +1132,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         if (root.reason !== null) fail(`${label}.reason: pass-reason-invalid`);
     } else if (status === "ERROR") {
         const errorReason = enumeration(root.reason, ERROR_REASONS, `${label}.reason`);
-        // Map and classify have no result mode — their scenarios pin
-        // expectedResultMode to null and preflight observes none — so neither can
-        // disagree about one.
+        // Only `verify` and `verify-broad` permit `wrong-result-mode`.
         if (
             errorReason === "wrong-result-mode" &&
             !(task === "verify" || task === "verify-broad")
@@ -1310,18 +1152,10 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     if (runFatal !== isRunFatal(status, reason)) fail(`${label}.runFatal: mapping-invalid`);
     const poolBefore = parseSnapshotArray(root.poolBefore, `${label}.poolBefore`);
     const poolAfter = parseSnapshotArray(root.poolAfter, `${label}.poolAfter`);
-    // No evaluated task creates, deletes, or rekeys a claim — archival shows up
-    // as lifecycleState on the same row — so a completed run observes the same
-    // identities before and after. Drift means the report either omitted an
-    // affected claim or bound one claim's result to another identity, and each
-    // silently corrupts a before/after comparison. An ERROR run is exempt: it
-    // may have failed before capturing the pool, so a partial capture is the
-    // honest record there.
+    // Archival changes `lifecycleState` without changing claim identity.
+    // Completed runs require identical claim identities before and after.
     if (status !== "ERROR") {
-        // Binding equality is vacuous for two empty captures, and every valid
-        // scenario declares at least MIN_POOL_CLAIMS claims, so a completed run
-        // observed at least that many. Without this floor a report can drop the
-        // whole experiment population and still satisfy the comparison.
+        // Without the minimum pool size, a report can omit every claim and still satisfy binding equality.
         if (poolBefore.length < MIN_POOL_CLAIMS) fail(`${label}.poolBefore: pool-capture-incomplete`);
         if (!sameIdentityBindings(poolBefore, poolAfter)) fail(`${label}.poolAfter: identity-drift`);
     }
@@ -1330,9 +1164,8 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         const item = record(entry, itemLabel);
         exact(item, ["claimId", "operation", "outcome"], itemLabel);
         const claimId = staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE);
-        // A receipt records applying this run's manifest, so it cannot name a
-        // claim the run never observed. An ERROR run may hold a partial capture,
-        // so the check follows the same exemption as the rest.
+        // ERROR runs may have partial pool captures.
+        // ERROR runs are exempt from pool-binding equality because their pool capture may be partial.
         if (status !== "ERROR" && !poolBefore.some((claim) => claim.claimId === claimId)) {
             fail(`${itemLabel}.claimId: unobserved-claim`);
         }
@@ -1350,20 +1183,16 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         status === "ERROR" ? null : new Set(poolBefore.map((claim) => claim.publicClaimId)),
     );
     // A scorer reaches PASS only after a nonblank manifest survives validation
-    // and yields parsed evidence, so a PASS carrying blank bytes or no evidence
-    // claims a scored experiment with nothing showing a model was scored. Blank
-    // bytes stay retainable on an ERROR report, which is exactly what
+    // PASS requires parsed evidence.
+    // ERROR:provider-failure may retain blank manifest bytes.
     // ERROR:provider-failure records.
     if (status === "PASS" && (rawManifest === null || rawManifest.trim().length === 0 || parsedManifest === null)) {
         fail(`${label}.parsedManifest: pass-requires-evidence`);
     }
-    // A FAIL is reached the same way: `precheck` admits only a nonblank manifest,
-    // so every scorer failure has raw bytes behind it, and every reason except
-    // `invalid-output` — the one raised when validation itself threw — also
-    // carries parsed evidence.
-    // `precheck` returns these two before a manifest is ever parsed, so evidence
-    // alongside them is impossible. Post-parse errors such as apply-not-applied
-    // may still retain it.
+    // `precheck` admits FAIL only with a nonblank manifest.
+    // `FAIL` reports require parsed evidence unless `reason` is `invalid-output`.
+    // `provider-failure` and `output-length-capped` cannot have parsed evidence; post-parse errors may retain it.
+    // `apply-not-applied` may retain parsed evidence.
     if (
         status === "ERROR" &&
         (reason === "provider-failure" || reason === "output-length-capped") &&
@@ -1371,12 +1200,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     ) {
         fail(`${label}.parsedManifest: prevalidation-error-has-evidence`);
     }
-    // A PASS means the manifest applied: `apply-not-applied` is an ERROR reason and
-    // receipts record each operation's outcome. So an archive the evidence reports
-    // has to show in the after capture as exactly `archived` — production's verify
-    // archive branch stages that state and never retires the claim — or the
-    // captured pool contradicts the success it is filed under. Scoped to PASS and
-    // to archival, the effect that cannot be undone.
+    // An `archived` entry with a matching `poolAfter` claim requires that claim's `lifecycleState` to be `archived`.
     if (status === "PASS" && parsedManifest !== null && !Array.isArray(parsedManifest)) {
         const archived = (parsedManifest as Record<string, unknown>).archived;
         if (Array.isArray(archived)) {
@@ -1394,22 +1218,14 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
             fail(`${label}.rawManifest: fail-requires-evidence`);
         }
         if (reason === "invalid-output") {
-            // The reason is raised from the catch around validation, which returns
-            // before any parse result exists, so evidence alongside it is a
-            // combination no run produces.
             if (parsedManifest !== null) fail(`${label}.parsedManifest: invalid-output-has-evidence`);
         } else if (parsedManifest === null) {
             fail(`${label}.parsedManifest: fail-requires-evidence`);
         }
     }
-    // Bind the evidence to the bytes it claims to come from: evidence exists only
-    // after a nonblank manifest parsed, so it must reproduce from those bytes.
+    // Parsed evidence must equal the manifest parsed from `rawManifest`.
     //
-    // The inverse does not hold for `invalid-output`. That reason is raised from
-    // the catch around the validator, which fails for a structurally fine
-    // manifest whose ids do not cover the expected set — and reproducing that
-    // judgement needs the expected-id set, which the report does not carry. So
-    // parseable bytes beside `invalid-output` are legitimate.
+    // `invalid-output` may contain parseable `rawManifest` bytes without parsed evidence.
     if (parsedManifest !== null) {
         if (rawManifest === null || rawManifest.trim().length === 0) {
             fail(`${label}.rawManifest: evidence-without-bytes`);
@@ -1442,9 +1258,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
 
 export function dreamerEvalExitCode(report: DreamerEvalRunReport | readonly DreamerEvalRunReport[]): 0 | 1 | 2 {
     const reports = Array.isArray(report) ? report : [report];
-    // Every valid scenario carries at least one task, so an empty aggregation
-    // means no evaluation ran. Returning 0 for it would report success for a
-    // selection that silently produced nothing.
+    // An empty report aggregation means no evaluation ran; return 1 rather than reporting success.
     if (reports.length === 0) return 1;
     if (reports.some((entry) => entry.runFatal)) return 2;
     if (reports.some((entry) => entry.status !== "PASS")) return 1;

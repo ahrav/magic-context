@@ -3,21 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Regression coverage for the `/ctx-recomp` post-completion signal contract.
  *
- * Pi `/ctx-recomp` runs DETACHED (background) so the single-process REPL stays
- * responsive — parity with OpenCode's `void runManagedRecomp`. Because it runs
- * in the background (not inside the user's turn), the post-publish signals MUST
- * be the DEFERRED variants (`signalPiDeferredHistoryRefresh` /
- * `signalPiDeferredMaterialization`), exactly like the background historian's
- * `onPublished`. The eager variants would force a materialization on whatever
- * transform pass happens to be running — possibly mid-turn — busting the cache.
- * The deferred signals stage the work so the next cache-busting pass at a turn
- * boundary drains it.
+ * Pi `/ctx-recomp` runs detached to keep the REPL responsive.
  *
- * These signals fire only when the recomp actually published, and they live
- * inside the detached `work()` body (which spawnPiRecompRun owns the try/catch
- * for), not on a failure path.
  */
 
 const PATH = join(import.meta.dir, "ctx-recomp.ts");
@@ -60,13 +48,9 @@ describe("/ctx-recomp post-completion signal contract", () => {
 	});
 
 	test("clears needs_emergency_recovery on a published recomp (parity with OpenCode)", () => {
-		// A successful recomp resolves the overflow that may have armed
-		// needs_emergency_recovery; without clearing it the flag force-bumps
-		// pressure to 95% every later pass even though the session is now small.
 		expect(codeOnly).toContain(
 			"clearEmergencyRecovery(currentDeps.db, sessionId)",
 		);
-		// Must be inside the published branch, before the deferred signals.
 		const publishedGate = codeOnly.indexOf("if (result.published)");
 		const clearCall = codeOnly.indexOf(
 			"clearEmergencyRecovery(currentDeps.db, sessionId)",

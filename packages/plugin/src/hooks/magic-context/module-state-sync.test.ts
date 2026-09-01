@@ -646,7 +646,6 @@ describe("module state sync section deltas", () => {
             },
             async call() {
                 callCount += 1;
-                // Possible-send drops throw; never a typed generation-change result.
                 throw new McHostCallError(
                     "outcome_unknown",
                     "connection dropped after a possible send",

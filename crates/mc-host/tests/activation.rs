@@ -1,6 +1,3 @@
-//! Post-publication activation split: transport publishes before component
-//! activation settles, expected artifact faults stay lane-local, and
-//! invariant failures reach the host-fatal channel (plan KTD5, R11-R13,
 //! R37).
 
 mod support;
@@ -20,8 +17,6 @@ use support::synapse::EchoPrimary;
 
 const BUDGET: Duration = Duration::from_secs(10);
 
-/// Secondary whose bootstrap is instant and whose activation waits for an
-/// external release, then either degrades its own lane or reports an
 /// invariant failure.
 struct GatedState {
     id: &'static str,
@@ -154,14 +149,10 @@ async fn transport_publishes_before_blocked_activation_settles() {
     let publication = support::connection_file(data_root.path());
     let host = tokio::spawn(async move { mc_host::run(composite, config, run_shutdown).await });
 
-    // Publication appears while both activations are still gated.
     wait_for_publication(&publication).await;
     assert!(!synapse_like.activated.load(Ordering::SeqCst));
     assert!(!broca_like.activated.load(Ordering::SeqCst));
 
-    // Transport is fully usable before activation settles: an authenticated
-    // client binds the primary and completes a request, while the gated
-    // secondary rejects retryably.
     let info = support::raw_client::discover(&publication).expect("publication validates");
     let mut client = support::raw_client::RawClient::connect(&info)
         .await
@@ -197,8 +188,6 @@ async fn transport_publishes_before_blocked_activation_settles() {
         .expect_err("gated secondary rejects until activation settles");
     assert_eq!(err, "module_reloading");
 
-    // Releasing one lane settles only that lane: readiness stays
-    // independent per component.
     synapse_like.release.add_permits(1);
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
@@ -226,6 +215,7 @@ async fn transport_publishes_before_blocked_activation_settles() {
     assert!(!broca_like.activated.load(Ordering::SeqCst));
 
     broca_like.release.add_permits(1);
+    drop(client);
     shutdown.cancel();
     let result = host.await.expect("run task joins");
     assert!(result.is_ok(), "graceful shutdown, got {result:?}");
@@ -294,7 +284,6 @@ async fn expected_artifact_faults_degrade_only_their_lane() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The degraded lane never tears the host down: transport keeps serving.
     let info = support::raw_client::discover(&publication).expect("publication validates");
     let mut client = support::raw_client::RawClient::connect(&info)
         .await
@@ -304,14 +293,12 @@ async fn expected_artifact_faults_degrade_only_their_lane() {
         .await
         .expect("primary still binds");
 
+    drop(client);
     shutdown.cancel();
     let result = host.await.expect("run task joins");
     assert!(result.is_ok(), "graceful shutdown, got {result:?}");
 }
 
-/// Primary whose HostInit-consuming bootstrap must run before publication
-/// while its activation runs after: the fixture records publication-file
-/// existence at each callback.
 struct OrderingState {
     publication: PathBuf,
     initialize_saw_publication: AtomicBool,

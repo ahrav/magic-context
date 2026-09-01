@@ -170,9 +170,7 @@ function seedManyCompartmentsWithFts(
 }
 
 /**
- * Seed compartments that can never yield an embeddable window: no FTS rows in
- * their span and no title/p1/content to fall back to, so canonical text is
- * empty and every one lands in the drain's `noWork` set.
+ * Empty canonical text routes these compartments to `noWork`.
  */
 function seedNoWorkCompartmentsWithoutFts(
     db: NonNullable<ReturnType<typeof openDatabase>>,
@@ -198,9 +196,7 @@ function seedNoWorkCompartmentsWithoutFts(
 }
 
 /**
- * Seed one compartment whose single assistant message is huge, so its canonical
- * chunk text is one oversized line that chunkCanonicalText splits into many
- * windows — the #207 batching case.
+ * The oversized assistant message makes `chunkCanonicalText` produce multiple windows.
  */
 function seedOversizedCompartmentWithFts(
     db: NonNullable<ReturnType<typeof openDatabase>>,
@@ -218,8 +214,7 @@ function seedOversizedCompartmentWithFts(
             p1: "P1 content",
         },
     ]);
-    // ~6000 words ≈ thousands of tokens » the default chunk budget, all in one
-    // assistant message → one oversized canonical line.
+    // The 6,000-word assistant message exceeds the default chunk budget and produces one oversized canonical line.
     const huge = Array.from({ length: 6000 }, (_, i) => `word${i}`).join(" ");
     db.prepare(
         "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
@@ -248,7 +243,7 @@ describe("project embedding registry", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
         tempDirs.length = 0;
@@ -294,15 +289,12 @@ describe("project embedding registry", () => {
             "/repo",
         );
 
-        // The embed entry points (memory queue, commit batches, chunk drains,
-        // search) gate on the snapshot; a deferred lane reported as disabled
-        // could never reach the first embed that resolves it or activates the
+        // Embedding entry points gate on the snapshot, so a deferred lane must remain enabled until its first embed resolves or activates it.
         // configured fallback.
         expect(snapshot.enabled).toBe(true);
         expect(snapshot.gitCommitEnabled).toBe(true);
         expect(snapshot.provider).toBe("synapse");
-        // The unresolved lane still exposes no usable identity: stale-identity
-        // GC and chunk search stay gated until the first vector commits it.
+        // An unresolved lane has no usable identity, so stale-identity GC and chunk search remain gated until its first vector commits.
         expect(snapshot.modelId).toBe("off");
         expect(snapshot.chunkModelId).toBe("off");
     });
@@ -364,12 +356,11 @@ describe("project embedding registry", () => {
     });
 
     it("preserves a shadow lane whose first discovery is still in flight", async () => {
-        // Two operations re-registering the same deferred lane before
-        // `models.list` returns is the ordinary case. Replacing the pending
-        // registration disposes the provider whose discovery is in flight, and its
-        // `onSynapseLaneReady` is then dropped by the identity guard in
-        // `commitShadowSynapseLane`, so the lane never commits and the cohort
-        // stays `off`. Only a lane that already failed may be replaced.
+        // A second registration must retain a pending deferred lane because replacing it disposes the provider whose discovery is in flight.
+        // Replacing a pending registration disposes its provider before discovery completes.
+        // `commitShadowSynapseLane` drops callbacks from a disposed provider through its identity guard.
+        // The identity guard prevents the shadow lane from committing and leaves the cohort `off`.
+        // The cohort stays `off`; only a lane that already failed may be replaced.
         const db = useTempDb();
         const projectIdentity = "shadow-pending-lane";
         let releaseCatalog: (() => void) | undefined;
@@ -378,8 +369,7 @@ describe("project embedding registry", () => {
             async call<Response>(_module, method): Promise<Response> {
                 if (method === "models.list") {
                     catalogCalls += 1;
-                    // Hold discovery open so the second registration observes a
-                    // pending lane rather than a resolved or failed one.
+                    // The discovery gate keeps the lane pending until the second registration.
                     await new Promise<void>((resolve) => {
                         releaseCatalog = resolve;
                     });
@@ -415,17 +405,14 @@ describe("project embedding registry", () => {
 
         registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
         const inFlight = embedShadowTextForProject(projectIdentity, "first");
-        // Let the provider reach models.list and park there.
         await new Promise((resolve) => setTimeout(resolve, 20));
         expect(catalogCalls).toBe(1);
 
-        // The re-registration must not replace the pending lane.
         registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
         releaseCatalog?.();
 
         expect(await inFlight).not.toBeNull();
-        // Discovery ran once and committed, so the lane resolved rather than
-        // being torn down and re-demanded.
+        // Discovery commits without tearing down and re-demanding the lane.
         expect(catalogCalls).toBe(1);
         expect(
             db
@@ -437,13 +424,11 @@ describe("project embedding registry", () => {
     });
 
     it("retries a shadow lane whose first discovery failed permanently", async () => {
-        // A lane-wide permanent error (`not_certified`, `artifact_invalid`) ends
-        // discovery with the registration still holding its deferred intent and
-        // no resolved metadata. Matching on that intent alone would resume the
-        // prior lane, dispose the fresh provider, and hand back the latched one
-        // whose `permanentFailure` flag makes `initialize()` refuse to retry — so
-        // the shadow experiment would stay dead for the process lifetime even
-        // after the model is certified.
+        // A lane-wide permanent error retains deferred intent but leaves the lane without resolved metadata.
+        // Matching deferred intent alone would resume the failed lane and dispose a fresh provider.
+        // Matching deferred intent alone would return the latched lane instead of the fresh provider.
+        // The latched lane's `permanentFailure` flag makes `initialize()` refuse retries.
+        // The shadow experiment would remain unavailable for the process lifetime.
         const db = useTempDb();
         const projectIdentity = "shadow-permanent-failure";
         let certified = false;
@@ -487,8 +472,7 @@ describe("project embedding registry", () => {
         expect(await embedShadowTextForProject(projectIdentity, "first")).toBeNull();
         expect(catalogCalls).toBe(1);
 
-        // The model is certified now. Re-registering must build a lane that can
-        // discover again rather than resuming the latched one.
+        // After certification, re-registration must create a lane that retries discovery instead of resuming the permanently failed lane.
         certified = true;
         registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
         const vector = await embedShadowTextForProject(projectIdentity, "second");
@@ -602,10 +586,7 @@ describe("project embedding registry", () => {
         );
         expect(catalogCalls).toBe(1);
 
-        // Every tool call re-registers from the user's configuration, which is
-        // still the deferred one. That must not discard the resolved lane: doing
-        // so tears down a healthy provider and deletes its descriptor per call,
-        // and a transient rediscovery failure would switch to the fallback.
+        // Re-registering the same deferred configuration must preserve a resolved lane; replacing it can discard a healthy provider and switch to fallback after transient rediscovery failure.
         const snapshot = registerProjectEmbedding(
             db,
             "stable-deferred",
@@ -675,9 +656,7 @@ describe("project embedding registry", () => {
         expect(catalogCalls).toBeGreaterThan(0);
         expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe("off");
 
-        // A fallback activation is a demotion, not a resolved lane: a registration
-        // carrying the same deferred intent must rebuild the Synapse provider
-        // instead of copying the demoted config forward.
+        // Re-registering the same deferred intent after fallback activation must rebuild the Synapse provider because fallback is not a resolved lane.
         laneAvailable = true;
         registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
         const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-late");
@@ -730,10 +709,7 @@ describe("project embedding registry", () => {
         } as EmbeddingConfig;
 
         registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
-        // One operation is mid-initialization when a second re-registers from the
-        // same configuration. The provider carried forward announces its lane to
-        // the registration object it was constructed with, so that object has to
-        // stay the one the registry holds.
+        // When initialization overlaps re-registration, the registry must retain the registration object that constructed the preserved provider because the provider announces its lane through that object.
         const inFlight = embedTextForProject("overlapped-deferred", "first");
         registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
         releaseCatalog();
@@ -809,8 +785,7 @@ describe("project embedding registry", () => {
             features,
             "/repo",
         );
-        // Must match the golden local identity from the test above — adding
-        // the local_dtype field must NOT change the default identity string.
+        // Adding `local_dtype` must not change the default local identity string.
         expect(noDtype.providerIdentity).toBe(
             "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
         );
@@ -840,11 +815,8 @@ describe("project embedding registry", () => {
             features,
             "/repo",
         );
-        // A non-default dtype must produce a DIFFERENT identity than the same
-        // model without a dtype — otherwise switching dtype would mix vector
-        // spaces instead of re-embedding.
+        // A non-default dtype must produce a different identity than the same model without a dtype.
         expect(withDtype.providerIdentity).not.toBe(sameModelNoDtype.providerIdentity);
-        // And the dtype must actually participate (identity changes with dtype).
         const withFp32 = registerProjectEmbedding(
             db,
             "golden-local-multilingual-fp32",
@@ -857,7 +829,6 @@ describe("project embedding registry", () => {
             "/repo",
         );
         // fp32 is the default, so an explicit fp32 must match the no-dtype
-        // identity (default behavior preserved exactly).
         expect(withFp32.providerIdentity).toBe(sameModelNoDtype.providerIdentity);
     });
 
@@ -1066,9 +1037,7 @@ describe("project embedding registry", () => {
         const projectIdentity = "git:ledger-prune";
         const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
         const thirteenDaysMs = 13 * 24 * 60 * 60 * 1000;
-        // Both synthetic session keys the embedding lanes use: the primary lane
-        // keys its ledger by the project identity, the shadow lane by
-        // `shadow:<projectIdentity>`. Neither is ever session-deleted.
+        // The primary lane uses `<projectIdentity>` and the shadow lane uses `shadow:<projectIdentity>` as synthetic session keys; neither session is deleted.
         for (const sessionId of [projectIdentity, `shadow:${projectIdentity}`]) {
             const laneRole = sessionId.startsWith("shadow:") ? "shadow" : "primary";
             for (const age of ["old", "fresh"] as const) {
@@ -1140,14 +1109,12 @@ describe("project embedding registry", () => {
             "/tmp/untrusted-gc",
         );
         saveCommitEmbedding(db, sha, new Float32Array([0, 1]), second.modelId);
-        // Age model-a past the grace window so it is a genuine GC candidate.
+        // GC can select `model-a` only after its age exceeds the grace window.
         db.prepare(
             "UPDATE embedding_identity_active SET last_active_at = ? WHERE project_path = ? AND model_id = ?",
         ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, first.modelId);
 
-        // A subsequent untrusted config load latches the project: GC must no-op
-        // even though model-a is a valid stale candidate, because the snapshot it
-        // would delete against is last-known-good rather than a trusted config.
+        // An untrusted config load latches the project, so GC must not remove a valid stale candidate from the prior snapshot.
         markProjectLoadUntrusted(projectIdentity);
         const suppressed = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
         expect(suppressed.commitRowsDeleted).toBe(0);
@@ -1271,16 +1238,14 @@ describe("project embedding registry", () => {
         const embedded = await embedUnembeddedCompartmentChunksForProject(db, "git:huge");
         expect(embedded).toBe(1);
 
-        // The single compartment produced many windows; assert NO provider call
-        // exceeded the per-call window cap (MAX_WINDOWS_PER_EMBED_CALL = 2), i.e.
-        // the windows were sub-batched across calls rather than sent as one
+        // The compartment's windows must be sub-batched to the two-window provider limit.
+        // No provider call may contain more than two windows.
         // enormous payload.
         expect(callSizes.length).toBeGreaterThan(1);
         for (const size of callSizes) {
             expect(size).toBeLessThanOrEqual(2);
         }
 
-        // And the compartment is fully embedded (one row per window, all persisted).
         const rows = loadCompartmentChunkEmbeddingsForSearch(
             db,
             "ses-huge",
@@ -1344,10 +1309,8 @@ describe("project embedding registry", () => {
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
         );
         const db = useTempDb();
-        // Real work first (lower ids), then a whole batch of un-embeddable
-        // compartments. The candidate query is newest-first, so the no-work rows
-        // fill the first batch and the drain must skip past them within the same
-        // pass to reach the older compartments that do have work.
+        // The newest-first candidate query selects unembeddable compartments before older embeddable ones.
+        // The drain must skip unembeddable compartments within the same pass to reach older compartments with work.
         seedManyCompartmentsWithFts(db, "ses-nowork", 3);
         const workIds = getCompartments(db, "ses-nowork").map((compartment) => compartment.id);
         seedNoWorkCompartmentsWithoutFts(db, "ses-nowork", 8, 101);
@@ -1371,7 +1334,6 @@ describe("project embedding registry", () => {
         );
         expect(new Set(rows.map((row) => row.compartmentId))).toEqual(new Set(workIds));
 
-        // One pass was enough: the follow-up finds nothing embeddable left.
         const second = await embedUnembeddedCompartmentChunksForProject(db, "git:nowork");
         expect(second).toBe(0);
     });
@@ -1546,8 +1508,8 @@ describe("project embedding registry", () => {
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
         );
         const db = useTempDb();
-        // Three compartments in the session, plus one in a DIFFERENT session
-        // that must NOT be touched (session-scoped, not project-scoped).
+        // Only the three compartments in the target session may be embedded.
+        // Remaining compartments must not be touched because embedding is session-scoped, not project-scoped.
         seedManyCompartmentsWithFts(db, "ses-embed", 3);
         seedCompartmentWithFts(db, "ses-other");
         registerProjectEmbedding(
@@ -1586,14 +1548,14 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(0);
 
-        // Idempotent: a second run finds nothing.
+        // A second run finds no work.
         const again = await embedSessionCompartmentChunks(db, "git:embed", "ses-embed");
         expect(again.status).toBe("nothing");
         expect(again.total).toBe(0);
     });
 
     it("embedSessionCompartmentChunks reports stalled when the provider returns null vectors", async () => {
-        // Provider that yields null for every text → no compartment can persist.
+        // A provider result of null for every text persists no compartment embeddings.
         _setTestProviderFactoryForProject(
             (config) =>
                 new (class extends FakeEmbeddingProvider {
@@ -1634,9 +1596,8 @@ describe("project embedding registry", () => {
                 })(config.provider === "local" ? config.model : "off"),
         );
         const db = useTempDb();
-        // 20 single-window compartments + a large batchSize so the drain selects
-        // many at once — the per-call WINDOW cap (16) must split them across
-        // multiple provider calls even though they fit in one candidate query.
+        // With 20 one-window compartments and a batchSize above 16, the provider cap requires multiple calls.
+        // The drain must use multiple provider calls even when one candidate query selects all compartments.
         const sessionId = "ses-manycomp";
         seedManyCompartmentsWithFts(db, sessionId, 20);
         registerProjectEmbedding(
@@ -1652,8 +1613,7 @@ describe("project embedding registry", () => {
         });
         expect(outcome.status).toBe("done");
         expect(outcome.embedded).toBe(20);
-        // No single provider call exceeded the window cap, and 20 one-window
-        // compartments required more than one call (20 > 16).
+        // No provider call may contain more than 16 windows.
         expect(callWindowCounts.length).toBeGreaterThan(1);
         expect(Math.max(...callWindowCounts)).toBeLessThanOrEqual(16);
     });
@@ -1749,7 +1709,7 @@ describe("project embedding registry", () => {
     });
 
     it("getShadowBackfillStopReason returns stalled_no_progress when the provider cannot embed", async () => {
-        // Provider that yields null for every text → nothing persists → the
+        // A provider that returns null for every text persists no compartment embeddings.
         // pump sees the same missing ids twice and retires the scope as stalled.
         _setTestProviderFactoryForProject(
             (config) =>
@@ -1895,9 +1855,9 @@ describe("project embedding registry", () => {
     });
 
     it("windows shadow chunks against the shadow provider's advertised token window", async () => {
-        // The shadow provider advertises a far smaller window than the config
-        // default, so honoring it produces strictly more windows than the
-        // primary lane's default-window split.
+        // The shadow provider advertises a smaller window than the primary provider.
+        // Using the shadow provider's smaller window produces more windows than the primary default split.
+        // The shadow split produces more windows than the primary lane's default-window split.
         const shadowWindowTokens = 96;
         _setTestProviderFactoryForProject((config) =>
             config.provider === "local"
@@ -1975,7 +1935,7 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
     });

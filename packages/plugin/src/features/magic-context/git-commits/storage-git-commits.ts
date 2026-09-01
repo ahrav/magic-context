@@ -1,16 +1,9 @@
 /**
- * SQLite storage layer for indexed git commits.
  *
- * Separate from the memory embedding table because:
  *   - Identity is the SHA, not a memory row id
- *   - Lifecycle is managed by git, not by Dreamer review flow
- *   - FTS is also separate so commit queries never pollute memory BM25 ranks
  *
  * Eviction: when `max_commits` is exceeded for a project, we delete the oldest
- * commits by `committed_at ASC` (not by indexed_at — indexed_at can reorder
- * when we catch up after a long absence). ON DELETE CASCADE removes matching
- * embedding rows and FTS triggers remove matching FTS rows, so a single DELETE
- * cleans all three tables.
+ * `indexed_at` can reorder during catch-up after a long absence, so eviction orders by `committed_at`.
  */
 
 import { log } from "../../../shared/logger";
@@ -94,8 +87,8 @@ function getEvictOverflowStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
-/** Batch upsert in a single transaction. Returns the count actually inserted
- *  or updated (skipped unchanged rows don't count). */
+/** Rows skipped because `message` matches do not contribute to `inserted` or `updated`.
+ * */
 export function upsertCommits(
     db: Database,
     projectPath: string,
@@ -139,13 +132,13 @@ export function upsertCommits(
     return { inserted, updated };
 }
 
-/** Return the total count of indexed commits for a project. */
+/* */
 export function getCommitCount(db: Database, projectPath: string): number {
     const row = getProjectCountStatement(db).get(projectPath) as { count: number } | undefined;
     return row?.count ?? 0;
 }
 
-/** Return the most recent committed_at (ms) for this project, or null. */
+/* */
 export function getLatestIndexedCommitTimeMs(db: Database, projectPath: string): number | null {
     const row = getLatestCommitTimeStatement(db).get(projectPath) as
         | { latest: number | null }
@@ -153,16 +146,14 @@ export function getLatestIndexedCommitTimeMs(db: Database, projectPath: string):
     return row?.latest ?? null;
 }
 
-/** Keep at most `maxCommits` rows for this project, evicting oldest overflow.
- *  Returns number of rows evicted. */
+/**
+ * */
 export function enforceProjectCap(db: Database, projectPath: string, maxCommits: number): number {
     if (maxCommits <= 0) return 0;
     const count = getCommitCount(db, projectPath);
     if (count <= maxCommits) return 0;
 
-    // Decide the overflow inside the DELETE statement from the current committed
-    // table state. This avoids a stale count-derived `excess` deleting the next
-    // oldest page if another process already enforced the same cap.
+    // The DELETE computes overflow from the current table state to avoid stale count-derived `excess` values deleting additional commits.
     getEvictOverflowStatement(db).run(projectPath, maxCommits);
     const after = getCommitCount(db, projectPath);
     const evicted = Math.max(0, count - after);

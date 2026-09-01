@@ -305,8 +305,8 @@ describe("doctor OpenCode plugin cache", () => {
             OPENCODE_PLUGIN_NAME,
         );
 
-        // Fail only the second root: the first must still be removed, and the
-        // error must point at the failed root, not the already-removed one.
+        // When the second root removal fails, clearPluginCache still removes the first root.
+        // clearPluginCache reports the failed root, not the root removed before the failure.
         const removed: string[] = [];
         const result = await clearPluginCache(
             { latestVersion: "0.29.1" },

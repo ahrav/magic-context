@@ -1,13 +1,7 @@
 /// <reference types="bun-types" />
 
 /**
- * Compaction-off mode transition tests (issue #266 S3).
  *
- * Covers the mode-record algebra (four record-state cases + matching no-ops),
- * the MC marker-lineage deletion contract against an OpenCode-compatible
- * database (canonical + legacy lineages, stranded-summary and dangling
- * tail_start_id caveats, mixed-ordering fixtures both directions,
- * idempotence), and the exactly-once side effects / at-least-once notice
  * crash protocol.
  */
 
@@ -74,8 +68,6 @@ function useTempDataHome(prefix: string): void {
     process.env.XDG_DATA_HOME = dir;
 }
 
-// ── OpenCode-compatible DB fixture ───────────────────────────────
-
 interface OcMessage {
     id: string;
     role: string;
@@ -133,7 +125,7 @@ function insertPart(db: Database, sessionId: string, part: OcPart): void {
     ).run(part.id, part.messageId, sessionId, 1, 1, JSON.stringify(part.data));
 }
 
-/** Canonical MC marker lineage: compaction part + summary assistant + text part. */
+/* */
 function insertCanonicalMcMarker(
     db: Database,
     sessionId: string,
@@ -162,7 +154,7 @@ function insertCanonicalMcMarker(
     });
 }
 
-/** Native (OpenCode /compact-style) marker: never matched by MC ownership. */
+/** MC ownership never matches native OpenCode `/compact` markers. */
 function insertNativeMarker(
     db: Database,
     sessionId: string,
@@ -231,8 +223,6 @@ function countSummaryMessages(db: Database, sessionId: string): number {
     return row.n;
 }
 
-// ── Marker deletion contract ─────────────────────────────────────
-
 describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
     it("deletes the canonical MC lineage: compaction part + summary rows together, never the boundary user row", () => {
         useTempDataHome("mc-marker-canonical-");
@@ -264,8 +254,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
                 .prepare("SELECT id FROM part WHERE id = 'prt-user-1-text'")
                 .get();
             expect(userTextPart).not.toBeNull();
-            // Stranded-summary caveat: the summary assistant row and its parts
-            // are gone TOGETHER with the compaction part — nothing lingers in
+            // Deletion removes the stranded summary assistant row and its parts with the compaction part.
             // model history.
             expect(countSummaryMessages(db, "ses-1")).toBe(0);
             expect(
@@ -284,7 +273,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
         const db = createOpenCodeDb("ses-1");
         try {
             insertMessage(db, "ses-1", { id: "msg-user-1", role: "user" });
-            // Legacy summary: no providerID, identified by the exact marker text.
+            // The matcher identifies legacy summaries without `providerID` by exact marker text.
             insertMessage(db, "ses-1", {
                 id: "msg-legacy-summary",
                 role: "assistant",
@@ -327,10 +316,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
                 partId: "prt-mc-compaction",
                 summaryPartId: "prt-mc-summary-text",
             });
-            // A native compaction part on a DIFFERENT boundary whose
-            // tail_start_id points at the MC summary row. Deleting the summary
-            // would leave this part's tail target missing (tailIndex=-1 in
-            // OpenCode's reorder), so the lineage must be retained.
+            // The lineage must be retained because a native compaction part on another boundary targets its summary row through `tail_start_id`.
             insertMessage(db, "ses-1", { id: "msg-user-2", role: "user", timeCreated: 5 });
             insertNativeMarker(db, "ses-1", {
                 boundaryMessageId: "msg-user-2",
@@ -351,7 +337,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
             expect(
                 db.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
             ).not.toBeNull();
-            // Native rows untouched.
+            // Deletion leaves native rows untouched.
             expect(
                 db.prepare("SELECT id FROM message WHERE id = 'msg-native-summary'").get(),
             ).not.toBeNull();
@@ -382,8 +368,6 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
 
             const result = removeMcOwnedCompactionMarkers("ses-1", MARKER_SUMMARY_TEXT);
 
-            // Mutation direction: omitting deleted compaction-part IDs from the
-            // preflight makes this lineage disappear and leaves a dangling tail.
             expect(result.verified).toBe(false);
             expect(result.retainedLineages).toBe(1);
             expect(result.removedRows).toBe(0);
@@ -422,8 +406,6 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
             expect(
                 db.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
             ).toBeNull();
-            // Mutation direction: classifying by missing tail_start_id alone
-            // deletes this foreign part and makes the assertion go red.
             expect(
                 db.prepare("SELECT id FROM part WHERE id = 'prt-hand-written-compaction'").get(),
             ).not.toBeNull();
@@ -444,8 +426,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
                 summaryPartId: "prt-mc-summary-text",
             });
             insertMessage(db, "ses-1", { id: "msg-user-2", role: "user", timeCreated: 5 });
-            // Native tail_start_id points at a REAL surviving message, so the
-            // preflight does not retain anything here.
+            // Native `tail_start_id` points to a surviving message, so preflight does not retain the lineage.
             insertNativeMarker(db, "ses-1", {
                 boundaryMessageId: "msg-user-2",
                 summaryId: "msg-native-summary",
@@ -458,7 +439,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
 
             expect(result.removedLineages).toBe(1);
             expect(result.retainedLineages).toBe(0);
-            // Native lineage fully preserved — it still hides its span.
+            // The native compaction part still hides its span.
             expect(
                 db.prepare("SELECT id FROM message WHERE id = 'msg-native-summary'").get(),
             ).not.toBeNull();
@@ -468,7 +449,6 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
             expect(
                 db.prepare("SELECT id FROM part WHERE id = 'prt-native-summary-text'").get(),
             ).not.toBeNull();
-            // MC lineage gone.
             expect(countSummaryMessages(db, "ses-1")).toBe(1); // only the native summary
         } finally {
             closeQuietly(db);
@@ -560,16 +540,13 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
             expect(second.removedLineages).toBe(0);
             expect(second.removedRows).toBe(0);
             expect(second.retainedLineages).toBe(0);
-            // Row-level oracle (NOT whole-file byte identity — WAL/journaling
-            // move without row changes).
+            // The test compares rows rather than database bytes because WAL and journaling can change bytes without changing rows.
             expect(dumpRows(db, "ses-1")).toEqual(afterFirst);
         } finally {
             closeQuietly(db);
         }
     });
 });
-
-// ── Mode-record algebra ──────────────────────────────────────────
 
 describe("reconcileCompactionMode — transition algebra", () => {
     it("keeps an unverified cleanup retry durable until the schema becomes verifiable", () => {
@@ -596,15 +573,13 @@ describe("reconcileCompactionMode — transition algebra", () => {
 
         expect(first.markerCleanup.verified).toBe(false);
         expect(first.recordToWrite).toBeNull();
-        // A failed verification remains durable even when nothing else was
-        // cleared, so a later pass does not depend on record absence to retry.
+        // Failed verification remains durable so later passes retry cleanup.
         expect(getCompactionModeRecord(db, "ses-1")).toBe("off_cleanup_pending");
         expect(
             ocDb.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
         ).not.toBeNull();
 
-        // Simulate the next process/pass after OpenCode restores a compatible
-        // schema. Resetting the probe cache is the process-boundary equivalent.
+        // Resetting the probe cache emulates a process boundary.
         closeCompactionMarkerDb();
         ocDb.exec("ALTER TABLE part ADD COLUMN time_updated INTEGER NOT NULL DEFAULT 0");
         const second = reconcileCompactionMode({
@@ -649,14 +624,11 @@ describe("reconcileCompactionMode — transition algebra", () => {
 
         expect(first.markerCleanup.verified).toBe(false);
         expect(first.notice).toBe(COMPACTION_OFF_FLIP_NOTICE);
-        // Mutation direction: replacing this durable record with null lets a
-        // verified no-op retry commit without ever delivering the flip notice.
+        // Replacing `off_notice_pending` with `null` lets a verified no-op suppress the flip notice.
         expect(getCompactionModeRecord(db, "ses-1")).toBe("off_notice_pending");
         expect(getPendingOps(db, "ses-1")).toEqual([]);
 
-        // Simulate successful notice delivery while marker verification still
-        // fails. The cleanup-only state prevents redelivery from hiding its
-        // independent retry obligation.
+        // The cleanup-only state preserves marker cleanup's retry obligation after notice delivery.
         commitCompactionModeRecord(db, "ses-1", first.recordToWrite!);
         expect(getCompactionModeRecord(db, "ses-1")).toBe("off_cleanup_pending");
 
@@ -696,8 +668,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
             const record = getCompactionModeRecord(db, "ses-1");
             expect(resolveCompactionModeRecord(record)).toBe(resolved);
         }
-        // Existing unknown values remain fail-closed as no record rather than
-        // becoming a new mode or widening the old value domain implicitly.
+        // Unknown values remain fail-closed as no record and do not widen the mode domain.
         db.prepare(
             "UPDATE session_meta SET compaction_mode_record = 'legacy' WHERE session_id = ?",
         ).run("ses-1");
@@ -739,8 +710,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
 
         expect(result.recordToWrite).toBe("off");
         expect(result.clearedSomething).toBe(false);
-        // A fresh install booting off-mode cleans nothing and stays silent —
-        // a spurious notice would claim a transition the user never made.
+        // A fresh off-mode install cleans no markers and emits no notice because no user transition occurred.
         expect(result.notice).toBeNull();
         expect(getPendingOps(db, "ses-1")).toHaveLength(0);
         expect(getOverflowState(db, "ses-1").needsEmergencyRecovery).toBe(false);
@@ -795,8 +765,6 @@ describe("reconcileCompactionMode — transition algebra", () => {
         useTempDataHome("mc-mode-legacy-off-");
         const db = openDatabase();
         getOrCreateSessionMeta(db, "ses-1");
-        // Legacy MC state: pending ops, armed latch, Channel-2 intent, marker
-        // bookkeeping — the lot.
         queuePendingOp(db, "ses-1", 7, "drop");
         recordOverflowDetected(db, "ses-1", 120000);
         setChannel2NudgeState(db, "ses-1", "pending");
@@ -825,14 +793,13 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(result.recordToWrite).toBe("off");
         expect(result.clearedSomething).toBe(true);
         expect(result.notice).toBe(COMPACTION_OFF_FLIP_NOTICE);
-        // pending_ops cleared from a NON-EMPTY starting state.
         expect(getPendingOps(db, "ses-1")).toHaveLength(0);
         expect(getOverflowState(db, "ses-1").needsEmergencyRecovery).toBe(false);
         expect(getChannel2NudgeState(db, "ses-1")).toBe("");
         expect(getPersistedCompactionMarkerState(db, "ses-1")).toBeNull();
         expect(getPendingCompactionMarkerState(db, "ses-1")).toBeNull();
         expect(result.clearedCompartmentInProgress).toBe(true);
-        // The flip-off notice carries the contractual one-cycle warning.
+        // The flip-off notice warns for one cycle.
         expect(result.notice).toContain(
             "the first turn after disabling may trigger one native compaction cycle on long sessions",
         );
@@ -868,8 +835,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         const db = openDatabase();
         const meta = getOrCreateSessionMeta(db, "ses-1");
         setCompactionModeRecord(db, "ses-1", "off");
-        // An off-mode cached baseline (no session-history) must be re-cut on
-        // flip-back BEFORE raw-tail trimming resumes.
+        // Enabling compaction must recut an off-mode baseline without session history.
         expect(meta).not.toBeNull();
 
         const result = reconcileCompactionMode({
@@ -885,7 +851,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(result.historianCatchUpSignaled).toBe(true);
         expect(result.notice).toBe(COMPACTION_ON_WRAPUP_SUGGESTION);
         expect(result.notice).toContain("/ctx-wrapup");
-        // The catch-up signal primes the compartment phase.
+        // A staged notice record survives a crash before delivery or settlement.
         const row = db
             .prepare("SELECT compartment_in_progress FROM session_meta WHERE session_id = 'ses-1'")
             .get() as { compartment_in_progress: number };
@@ -951,8 +917,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         queuePendingOp(db, "ses-1", 5, "drop");
         recordOverflowDetected(db, "ses-1", 120000);
 
-        // First attempt: work succeeds and stages its notice record, then the
-        // process crashes before the caller can deliver or settle it.
+        // Cleanup retries leave pending ops empty and the latch cleared while preserving the notice record.
         const first = reconcileCompactionMode({
             db,
             sessionId: "ses-1",
@@ -964,9 +929,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(first.clearedSomething).toBe(true);
         expect(getCompactionModeRecord(db, "ses-1")).toBe("off_notice_pending");
 
-        // Retry: same logical transition. Cleanup is idempotent — no duplicated
-        // side effect (pending ops stay empty, the latch stays cleared), while
-        // the durable record still asks the caller to deliver the same notice.
+        // `markerCleanup` emits no notice when no marker state remains to clear.
         const second = reconcileCompactionMode({
             db,
             sessionId: "ses-1",
@@ -981,7 +944,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         commitCompactionModeRecord(db, "ses-1", second.recordToWrite!);
         expect(getCompactionModeRecord(db, "ses-1")).toBe("off");
 
-        // A third pass with the record committed is a pure no-op.
+        // reconcileCompactionMode is a no-op after the record is committed.
         const third = reconcileCompactionMode({
             db,
             sessionId: "ses-1",
@@ -1008,7 +971,6 @@ describe("reconcileCompactionMode — transition algebra", () => {
         });
 
         expect(getChannel2NudgeState(db, "ses-1")).toBe("delivered");
-        // Nothing else to clear in this fixture → no notice.
         expect(result.clearedSomething).toBe(false);
         expect(result.notice).toBeNull();
     });

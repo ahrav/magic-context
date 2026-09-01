@@ -1,8 +1,5 @@
 /**
- * Round-trip proof for the historian-eval payload path: what
- * `buildMockHistorianOutput` emits is what the PRODUCTION parser reads back.
- * Guards the format-drift class documented in mock-historian.ts — a validator
- * or parser tightening must fail here, not silently zero the eval lane.
+ * `buildMockHistorianOutput` output must parse with `parseCompartmentOutput`.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -65,10 +62,8 @@ describe("buildMockHistorianOutput", () => {
     });
 
     test("multi-line fact content throws instead of silently changing the fact set", () => {
-        // The production parser reads one bullet line at a time and its `m` flag
-        // honors all four ECMAScript line terminators, so an unprefixed
-        // continuation is dropped and a `* `-prefixed one becomes an extra fact —
-        // either way the parsed set differs from the authored one.
+        // The production parser's `m` flag treats all four ECMAScript line terminators as bullet boundaries.
+        // The parser drops unprefixed continuation lines and parses `* `-prefixed continuation lines as additional facts.
         const separators = ["\n", "\r", "\u2028", "\u2029"];
         for (const separator of separators) {
             for (const content of [`first${separator}second`, `first${separator}* smuggled second fact`]) {
@@ -83,9 +78,9 @@ describe("buildMockHistorianOutput", () => {
     });
 
     test("fact content that is blank or padded throws instead of round-tripping changed", () => {
-        // The parser reads each item as `unescapeXml(match.trim())` and drops
-        // empty results, so padding round-trips shorter than authored and blank
-        // content vanishes from the fact set.
+        // The parser applies `unescapeXml(match.trim())` to each item and drops empty results.
+        // The parser trims each fact item, so leading and trailing padding does not round-trip.
+        // `unescapeXml(match.trim())` omits fact content that is empty after trimming.
         for (const content of ["", " ", "  padded  ", "trailing "]) {
             expect(() =>
                 buildMockHistorianOutput({
@@ -108,10 +103,9 @@ describe("buildMockHistorianOutput", () => {
     });
 
     test("literal entity text throws rather than round-tripping decoded", () => {
-        // The production `unescapeXml` decodes `&amp;` first, so an authored
-        // `&lt;` comes back as `<`. Fixing that needs a change to the production
-        // decoder, so the builder refuses instead of silently handing a test
-        // different content than it asked for.
+        // The production `unescapeXml` decodes `&amp;` before `&lt;`.
+        // `&lt;` cannot round-trip because escaping produces `&amp;lt;`, which `unescapeXml` decodes to `<`.
+        // The builder rejects content whose decoded value differs from the requested content.
         for (const entity of ["&lt;", "&gt;", "&quot;", "&apos;"]) {
             expect(() =>
                 buildMockHistorianOutput({
@@ -120,15 +114,14 @@ describe("buildMockHistorianOutput", () => {
                 }),
             ).toThrow(/cannot round-trip/);
         }
-        // Titles and bodies go through the same escaping, so they are covered too.
+        // The builder permits `&amp;` and `&nbsp;` in titles and bodies because the same escaping preserves them.
         expect(() =>
             buildMockHistorianOutput({ compartments: [{ start: 1, end: 2, title: "a &lt; b", body: "b" }] }),
         ).toThrow(/cannot round-trip/);
     });
 
     test("an ampersand and unknown entities still round-trip", () => {
-        // `&amp;` survives the decoder's ordering, and `&nbsp;` is not one of the
-        // five it decodes, so neither needs to be rejected.
+        // `&amp;` survives the decoder's ordering, and `&nbsp;` is not among the five entities the decoder decodes.
         const content = "keep & and &nbsp; intact";
         const parsed = parseCompartmentOutput(
             buildMockHistorianOutput({
@@ -144,9 +137,8 @@ describe("buildMockHistorianOutput", () => {
             facts: [{ category: "WORKFLOW_RULES", content: "outside taxonomy" }],
         });
         const parsed = parseCompartmentOutput(raw);
-        // The production parser only extracts the 5-category taxonomy, so the
-        // wrong-category mutation manifests as a non-promoted fact — the
-        // payload stays structurally intact.
+        // The production parser promotes only facts in the five-category taxonomy.
+        // An unsupported category leaves the fact payload structurally valid but prevents promotion.
         expect(parsed.facts).toEqual([]);
         expect(parsed.compartments).toHaveLength(1);
         expect(parsed.unprocessedFrom).toBe(3);

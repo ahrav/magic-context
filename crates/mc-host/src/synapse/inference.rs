@@ -1,5 +1,4 @@
-//! CPU-only FastEmbed backend: application-owned dynamic ORT initialization,
-//! structural startup probe, and semantic certification against the bundle
+//! This CPU-only backend owns dynamic ORT initialization and performs a structural startup probe and semantic certification against the bundle corpus.
 //! corpus.
 
 #[cfg(target_os = "linux")]
@@ -16,26 +15,22 @@ use fastembed::{
 use super::bundle::{open_regular_file, validate_sha256_hex, OpenRegularFileError};
 use super::bundle::{Corpus, SelectedOutput, VerifiedBundle};
 
-/// How far a returned vector's L2 norm may sit from 1.0 before the backend
-/// treats it as an invariant failure rather than rounding noise.
+/// `NORM_TOLERANCE` permits a returned vector's L2 norm to differ from 1.0 by at most 1e-3; larger deviations are invariant failures.
 const NORM_TOLERANCE: f32 = 1e-3;
-/// CPU ONNX Runtime is executable code and static runtime tables, not model
-/// weights. A 512 MiB ceiling leaves wide room for monolithic CPU builds while
-/// bounding verification's source buffer plus sealed memfd copy to 1 GiB.
+/// CPU ONNX Runtime contains executable code and static runtime tables, not model weights.
+/// The 512 MiB limit bounds the verification source buffer and sealed memfd copy to 1 GiB.
 const MAX_ORT_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The exact native runtime the owner certified: the library file plus the
-/// SHA-256 of its bytes, so a nominally matching but different build is
-/// refused before `ort` binds to it.
+/// `OrtIdentity` binds a library path to certified SHA-256 bytes, so `ensure_ort` rejects a different build before calling `ort::init_from`.
 #[derive(Debug, Clone)]
 pub struct OrtIdentity {
     pub library: PathBuf,
     pub sha256: String,
 }
 
-/// Backend failures split by blame: `Input` faults reject one request,
-/// `Artifact` faults disable the component, and `Invariant` faults mark it
-/// failing so no suspect vector is ever returned.
+/// `Input` errors reject the affected request.
+/// `Artifact` errors disable the component.
+/// `Invariant` errors mark the component failing and prevent suspect vectors from being returned.
 #[derive(Debug, Clone)]
 pub enum InferenceError {
     Input(String),
@@ -55,10 +50,7 @@ impl std::fmt::Display for InferenceError {
 
 impl std::error::Error for InferenceError {}
 
-/// Committed process-global ORT identity. `ort` dynamic loading is
-/// first-wins for the whole process, so exactly one identity may ever
-/// commit; later callers must present the same one. The mutex serializes
-/// racing initializers so only one of them performs the commit.
+/// `ORT_COMMITTED` permits one process-global ORT identity because dynamic loading is first-wins; its mutex lets only one racing initializer commit.
 static ORT_COMMITTED: Mutex<Option<OrtIdentity>> = Mutex::new(None);
 
 #[cfg(target_os = "linux")]
@@ -77,9 +69,7 @@ impl VerifiedOrtLibrary {
 
 #[cfg(target_os = "linux")]
 fn ensure_ort(identity: &OrtIdentity) -> Result<(), InferenceError> {
-    // Verification precedes the committed-identity comparison, so an
-    // invalid identity reports its verification error even after another
-    // lane commits a different identity.
+    // An invalid `identity` reports a verification error even after another initializer commits a different identity.
     let verified = verify_ort_library(identity)?;
     let mut committed = ORT_COMMITTED
         .lock()
@@ -92,14 +82,10 @@ fn ensure_ort(identity: &OrtIdentity) -> Result<(), InferenceError> {
             "a different ONNX Runtime identity is already committed".to_owned(),
         ));
     }
-    // This is the workspace's only `ort::init_from` call. `ort` is first-wins
-    // and does not expose the winning path, so process composition must keep
-    // ORT initialization behind this owner.
     let builder = ort::init_from(verified.load_path())
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library failed to load".to_owned()))?;
     if !builder.commit() {
-        // Something else already configured the process-global environment,
-        // so the certified library choice can no longer take effect.
+        // `ort` was initialized before the certified library could be selected.
         return Err(InferenceError::Artifact(
             "ONNX Runtime environment was already initialized".to_owned(),
         ));
@@ -174,26 +160,16 @@ fn verify_ort_library(identity: &OrtIdentity) -> Result<VerifiedOrtLibrary, Infe
     Ok(VerifiedOrtLibrary { file })
 }
 
-/// One loaded certified model. `TextEmbedding::embed` needs `&mut`, so the
-/// mutex also serializes native inference; the CPU permit above this type
-/// keeps callers from queueing on it.
+/// The model mutex serializes `TextEmbedding::embed` because it requires `&mut`; the CPU permit prevents callers from queueing on that mutex.
 pub struct Backend {
     model: Mutex<TextEmbedding>,
     dims: usize,
 }
 
 impl Backend {
-    /// Blocking: initializes ORT, builds the FastEmbed model from verified
-    /// bytes, then runs the structural probe and semantic certification
-    /// before returning a usable backend.
     pub fn load(bundle: VerifiedBundle, ort: &OrtIdentity) -> Result<Self, InferenceError> {
         ensure_ort(ort)?;
 
-        // The bundle is consumed so every weight buffer moves into the model
-        // rather than being copied beside a live original. One aggregate
-        // budget of 2 GiB covers the ONNX graph plus all external
-        // initializers, so cloning them here would put the real peak at
-        // twice that bound.
         let VerifiedBundle {
             manifest,
             max_text_bytes: _,
@@ -265,9 +241,8 @@ impl Backend {
         Ok(backend)
     }
 
-    /// Blocking native inference over one ordered page of texts. Every
-    /// returned vector is validated: exact count, exact dimensions, finite
-    /// components, and a unit L2 norm.
+    /// embed blocks while running native inference over one ordered page of texts.
+    /// embed returns one finite, unit-norm vector with `dims` components for each input text.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if texts.is_empty() {
             return Err(InferenceError::Input("no texts to embed".to_owned()));
@@ -284,8 +259,7 @@ impl Backend {
                 .tokenizer
                 .encode(*text, true)
                 .map_err(|_| InferenceError::Input("text failed to tokenize".to_owned()))?;
-            // Zero tokens would make mean pooling divide by an all-zero
-            // attention mask, so the request is refused instead.
+            // embed rejects zero-token inputs because mean pooling would divide by an all-zero attention mask.
             if encoding.get_ids().is_empty() {
                 return Err(InferenceError::Input(
                     "text tokenizes to zero tokens".to_owned(),
@@ -339,10 +313,9 @@ impl Backend {
         Ok(())
     }
 
-    /// Compares live output against the pinned corpus componentwise. The
-    /// corpus is chosen to be sensitive to output selection, pooling, and
-    /// truncation, so a structurally healthy but semantically wrong model
-    /// fails here instead of serving vectors.
+    /// certify uses a corpus that detects incorrect output selection, pooling, and truncation.
+    /// certify rejects structurally healthy models with semantically incorrect output.
+    /// load rejects semantically wrong models before returning a backend that can serve vectors.
     fn certify(&self, corpus: &Corpus) -> Result<(), InferenceError> {
         for item in &corpus.items {
             let got = self.embed(&[item.text.as_str()])?;

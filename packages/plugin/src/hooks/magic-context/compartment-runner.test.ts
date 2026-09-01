@@ -73,19 +73,14 @@ afterEach(() => {
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-        } catch {
-            // Ignore EBUSY on Windows
-        }
+        } catch {}
     }
     tempDirs.length = 0;
 
-    // Clean up historian debug dumps created during tests
     const dumpDir = join(tmpdir(), "magic-context-historian");
     try {
         rmSync(dumpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    } catch {
-        // Ignore EBUSY on Windows
-    }
+    } catch {}
 });
 
 function openTestDb() {
@@ -181,9 +176,7 @@ describe("executeContextRecomp", () => {
                 title: "Recovered history",
             }),
         ]);
-        // v2: recomp is structural only — it does NOT write session_facts
-        // (facts are a promoted-memory concern, and recomp must not re-emit
-        // facts that could degrade curated memories).
+        // Recompilation does not write session_facts.
         expect(getSessionFacts(db, "ses-recomp")).toHaveLength(0);
     });
 
@@ -370,14 +363,8 @@ describe("executeContextRecomp", () => {
         const db = openTestDb();
 
         const prompt = mock(async () => ({}));
-        // Two distinct `session.messages` consumers now share this mock:
-        //  - the HISTORIAN output fetch (targets the agent session, passes
+        // The mock identifies historian fetches by query.directory; resolvePromptContext reads lack directory and return null without incrementing the historian-pass counter.
         //    `query.directory`)
-        //  - notification model-pinning via resolvePromptContext (targets the
-        //    MAIN session, `query.limit` only, NO directory)
-        // Discriminate on `query.directory` so the historian-pass counter only
-        // advances on real historian fetches; prompt-context reads resolve to
-        // null (empty data) → no pin, harmless.
         let historianFetches = 0;
         const messages = mock(async (input: { query?: { directory?: string } }) => {
             if (!input?.query?.directory) return { data: [] };
@@ -588,9 +575,7 @@ describe("executeContextRecomp", () => {
         const db = openTestDb();
 
         const prompt = mock(async () => ({}));
-        // Discriminate historian-output fetches (pass `query.directory`) from
-        // notification model-pinning reads (resolvePromptContext: `query.limit`
-        // only, no directory) so the historian-pass counter is accurate.
+        // The mock identifies historian-output fetches by query.directory; resolvePromptContext reads use query.limit without directory, so only historian fetches increment the counter.
         let historianFetches = 0;
         const messages = mock(async (input: { query?: { directory?: string } }) => {
             if (!input?.query?.directory) return { data: [] };
@@ -640,10 +625,7 @@ describe("executeContextRecomp", () => {
             client,
             db,
             sessionId: "ses-recomp-full-state",
-            // Budget sized so chunking packs ~2 messages per pass with the real
-            // Claude tokenizer (ai-tokenizer). The previous value of 7 relied on
-            // the `/3.5` heuristic fallback and no longer reproduces a 2-pass
-            // split with accurate tokenization.
+            // The budget yields approximately two messages per pass with ai-tokenizer.
             historianChunkTokens: 13,
             directory: "/tmp",
         });
@@ -657,7 +639,7 @@ describe("executeContextRecomp", () => {
             }),
             expect.objectContaining({ startMessage: 3, endMessage: 3, content: "Next summary" }),
         ]);
-        // v2: recomp is structural only — no session_facts written.
+        // Recompilation does not write session_facts.
         expect(getSessionFacts(db, "ses-recomp-full-state")).toHaveLength(0);
     });
 
@@ -805,7 +787,7 @@ describe("executeContextRecomp", () => {
         });
 
         // Both full-size attempts omit narrative ordinal 2, so recomp must shrink
-        // the chunk rather than absorbing the gap.
+        // Recompilation must shrink the chunk rather than absorb the gap.
         expect(result).toContain("## Magic Recomp");
         expect(result).toContain("Covered raw history 1-6");
         expect(getIgnoredNotificationTexts(prompt)).toEqual(
@@ -994,8 +976,8 @@ describe("executeContextRecomp", () => {
             directory: "/tmp",
         });
 
-        // Invalid full-size attempts force a smaller chunk; a successful smaller
-        // pass must not permanently reduce the budget for the following pass.
+        // Invalid full-size attempts force a smaller chunk.
+        // A successful smaller pass must not permanently reduce the budget for the following pass.
         expect(result).toContain("Covered raw history 1-7");
         expect(getIgnoredNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
@@ -1617,8 +1599,8 @@ describe("runCompartmentAgent", () => {
             failureCount: 1,
             lastError: error,
         });
-        // An unusable response records a drain-failure timestamp so emergency drain
-        // retries wait instead of immediately retrying the same broken historian.
+        // An unusable response records a drain-failure timestamp, so emergency-drain retries wait instead of immediately retrying the broken historian.
+        // Emergency-drain retries wait instead of immediately retrying the same broken historian.
         expect(loadProtectedTailMeta(db, sessionId).historianDrainFailureAt).toBeGreaterThan(0);
     });
 
@@ -1802,7 +1784,7 @@ describe("runCompartmentAgent", () => {
         >;
         expect(fallbackPrompts[0]?.[0]?.body?.agent).toBe("historian");
         expect(fallbackPrompts[1]?.[0]?.body?.agent).toBe("historian");
-        // Fallback now includes both agent (for system prompt) and model (for override)
+        // Fallback includes agent for the system prompt and model for the override.
         expect(fallbackPrompts[2]?.[0]?.body?.agent).toBe("historian");
         expect(fallbackPrompts[2]?.[0]?.body?.model).toEqual({
             providerID: "openai",
@@ -1826,10 +1808,7 @@ describe("runCompartmentAgent", () => {
         ]);
         const db = openTestDb();
 
-        // Primary (call 0) + repair (call 1) both return invalid output → escalate.
-        // First configured fallback "anthropic/claude-sonnet-4-6" (call 2) returns
-        // a VALID compartment. The session-model last resort "openai/gpt-4o" must
-        // therefore NEVER be reached.
+        // The runner escalates when primary call 0 and repair call 1 both return invalid output.
         const promptSession = mock(async () => ({}));
         const messages = mock(async () => {
             const callIndex = messages.mock.calls.length;
@@ -1887,15 +1866,12 @@ describe("runCompartmentAgent", () => {
         const calls = promptSession.mock.calls as unknown as Array<
             [{ body?: { model?: { providerID: string; modelID: string } } }]
         >;
-        // Call 0 (primary) + call 1 (repair): no model override (agent default).
         expect(calls[0]?.[0]?.body?.model).toBeUndefined();
         expect(calls[1]?.[0]?.body?.model).toBeUndefined();
-        // Call 2: the FIRST configured fallback (sonnet), not the session model.
         expect(calls[2]?.[0]?.body?.model).toEqual({
             providerID: "anthropic",
             modelID: "claude-sonnet-4-6",
         });
-        // Session-model last resort (gpt-4o) must never be reached.
         const usedGpt4o = calls.some(
             (c) =>
                 c[0]?.body?.model?.providerID === "openai" &&
@@ -1997,14 +1973,13 @@ describe("runCompartmentAgent", () => {
         expect(sentPrompt).toContain("[3] U: two");
         expect(sentPrompt).toContain("[4] A: three");
         expect(sentPrompt).not.toContain("msg_");
-        // v2: the unbounded existing_state dump is gone. Prior compartments now
-        // appear in the bounded <session_references> recency block (last 6),
-        // and facts are no longer dumped/replaced — they dedup against
-        // <project-memory>. The prior compartment is still shown for continuity.
+        // Prior compartments appear only in the six-entry <session_references> recency block.
+        // Prior compartments appear only in the six-entry <session_references> recency block.
+        // Facts deduplicate against <project-memory>.
+        // The prior compartment remains visible for continuity.
         expect(sentPrompt).toContain("<session_references>");
         expect(sentPrompt).toContain('start="1" end="2"');
         expect(sentPrompt).toContain('title="Earlier &quot;work&quot;"');
-        // v2: no existing_state fact-normalization block, no raw session_facts dump.
         expect(sentPrompt).not.toContain(
             "Existing state (read-only context for continuity and fact normalization",
         );
@@ -2113,7 +2088,7 @@ describe("runCompartmentAgent", () => {
     });
 
     it("returns early without calling historian when only protected tail history remains", async () => {
-        //#given: 3 messages, all 3 user turns — protected tail starts at ordinal 1, no eligible prefix
+        // With three user messages, the protected tail begins at ordinal 1, leaving no eligible prefix.
         useTempDataHome("compartment-runner-protected-only-");
         createOpenCodeDb("ses-protected-only", [
             { id: "m-1", role: "user", text: "recent 1" },
@@ -2143,13 +2118,13 @@ describe("runCompartmentAgent", () => {
             directory: "/tmp",
         });
 
-        //#then: historian was never invoked
+        // The runner does not invoke the historian.
         expect(createSession).not.toHaveBeenCalled();
         expect(promptSession).not.toHaveBeenCalled();
     });
 
     it("sends only the eligible prefix (before protected tail) to historian", async () => {
-        //#given: 6 user turns — first is eligible, last 5 are protected
+        // With six user turns, the first is eligible and the last five are protected.
         useTempDataHome("compartment-runner-eligible-prefix-");
         createOpenCodeDb("ses-eligible-prefix", [
             { id: "m-1", role: "user", text: "eligible turn" },
@@ -2200,7 +2175,7 @@ describe("runCompartmentAgent", () => {
             directory: "/tmp",
         });
 
-        //#then: historian prompt only contains the eligible prefix (m-1, m-2)
+        // The historian prompt contains only m-1 and m-2.
         const sentPrompt = promptSession.mock.calls[0]?.[0]?.body.parts[0]?.text ?? "";
         expect(sentPrompt).toContain("eligible turn");
         expect(sentPrompt).not.toContain("protected 1");
@@ -2265,9 +2240,9 @@ describe("runCompartmentAgent", () => {
 
         expect(createSession).not.toHaveBeenCalled();
         expect(getCompartments(db, "ses-invalid-existing")).toHaveLength(2);
-        // First failure on a fresh session → transient/reassuring framing (the
-        // escalated "needs attention" + error detail only appears once failures
-        // persist past HISTORIAN_PERSISTENT_FAILURE_THRESHOLD).
+        // The runner uses transient framing on a fresh session's first failure and shows the needs-attention notice and error detail only after failures exceed HISTORIAN_PERSISTENT_FAILURE_THRESHOLD.
+        // The runner shows the needs-attention notice and error detail only after failures exceed HISTORIAN_PERSISTENT_FAILURE_THRESHOLD.
+        // The runner shows the needs-attention notice and error detail only after failures exceed HISTORIAN_PERSISTENT_FAILURE_THRESHOLD.
         expect(getIgnoredNotificationTexts(promptSession)[0].toLowerCase()).toContain("transient");
     });
 
@@ -2325,7 +2300,7 @@ describe("runCompartmentAgent", () => {
         expect(getSessionFacts(db, "ses-invalid-output")).toEqual([
             expect.objectContaining({ category: "CONSTRAINTS", content: "Existing fact stays." }),
         ]);
-        // First failure → transient framing (no raw error / no action ask yet).
+        // The runner uses transient framing on the first failure and omits the raw error and action request.
         expect(getIgnoredNotificationTexts(promptSession)[0].toLowerCase()).toContain("transient");
     });
 
@@ -2367,10 +2342,9 @@ describe("runCompartmentAgent", () => {
         });
 
         expect(getCompartments(db, "ses-model-failure")).toHaveLength(0);
-        // First failure → transient framing. The raw error ("historian model
-        // unavailable") is still recorded in historian_failure_state for the
-        // escalated notice + doctor diagnostics; it just isn't surfaced to the
-        // user on a single transient blip.
+        // The runner uses transient framing on the first failure, and historian_failure_state still records the raw error.
+        // historian_failure_state records the raw error "historian model unavailable".
+        // The runner retains the raw error for escalated notices but hides it after one transient failure.
         expect(getIgnoredNotificationTexts(promptSession)[0].toLowerCase()).toContain("transient");
     });
 
@@ -2386,7 +2360,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
         const db = openTestDb();
-        // Pre-seed prior failures so this run crosses the persistent threshold.
+        // Prior failures make the test invocation cross HISTORIAN_PERSISTENT_FAILURE_THRESHOLD.
         incrementHistorianFailure(db, "ses-persistent-failure", "earlier failure");
         incrementHistorianFailure(db, "ses-persistent-failure", "earlier failure");
 
@@ -2506,13 +2480,13 @@ describe("runCompartmentAgent", () => {
         expect(loadProtectedTailMeta(db, sessionId).priorBoundaryOrdinal).toBe(8);
     });
 
-    // Regression: production livelock (ses_157f877e2ffepme9doYf3RTnRx). In an
-    // active session the protected tail's newest message changes every turn, so
-    // the trigger-time boundary snapshot fails validation on the "last ordinal
-    // id changed" check by the time the historian runs — even though the eligible
-    // HEAD it would compact is untouched. The runner used to no-op forever while
-    // the trigger refired each turn and queued drop ops starved. It must now
-    // re-resolve the boundary at run time and make real progress.
+    // Changes to the protected tail must not invalidate compaction of an unchanged eligible head.
+    // Changes to the protected tail must not invalidate compaction of an unchanged eligible head.
+    // Changes to the protected tail must not invalidate compaction of an unchanged eligible head.
+    // Changes to the protected tail must not invalidate compaction of an unchanged eligible head.
+    // Changes to the protected tail must not invalidate compaction of an unchanged eligible head.
+    // Changes to the protected tail must not invalidate compaction of an unchanged eligible head.
+    // The runner re-resolves the boundary at run time so an unchanged eligible HEAD can compact.
     it("refreshes a stale-tail boundary snapshot at run time instead of no-op'ing forever", async () => {
         useTempDataHome("compartment-runner-stale-tail-refresh-");
         createOpenCodeDb("ses-stale-tail", [
@@ -2522,8 +2496,7 @@ describe("runCompartmentAgent", () => {
         ]);
         const db = openTestDb();
 
-        // Tag the eligible head so a successful publish also queues drop ops —
-        // proving the stale→refresh→publish chain that feeds drop application.
+        // Tags on the eligible head make publishing queue drop operations.
         tagMessages(
             "ses-stale-tail",
             [
@@ -2540,11 +2513,10 @@ describe("runCompartmentAgent", () => {
             db,
         );
 
-        // Resolve a genuine snapshot (correct fingerprint + ids), then corrupt
-        // ONLY the recorded last-tail id to simulate the live tail advancing
-        // between trigger and run. Every other check (offset, protectedTailStart,
-        // eligibleEnd, eligible-range fingerprint) still passes — exactly the
-        // production failure mode.
+        // Only the recorded last-tail ID fails validation.
+        // The changed last-tail ID simulates the live tail advancing between trigger and run.
+        // Only the recorded last-tail ID fails validation.
+        // The offset, protectedTailStart, eligibleEnd, and eligible-range fingerprint remain valid.
         const realSnapshot = resolveOpenCodeProtectedTailBoundary({
             db,
             sessionId: "ses-stale-tail",
@@ -2595,24 +2567,24 @@ describe("runCompartmentAgent", () => {
             currentContextLimit: 8_000,
         });
 
-        // Re-derived and PUBLISHED rather than no-op'ing: progress is made.
+        // The runner publishes the re-derived compartment instead of returning without work.
         const compartments = getCompartments(db, "ses-stale-tail");
         expect(compartments).toHaveLength(1);
         expect(compartments[0]?.startMessage).toBe(1);
         expect(compartments[0]?.endMessage).toBe(2);
-        // And the published compartment queued drops for its covered tags, so the
-        // accumulated pending ops can finally drain (no starvation).
+        // Publishing a compartment queues drops for its covered tags.
+        // Queued drop operations can then drain.
         expect(getPendingOps(db, "ses-stale-tail").length).toBeGreaterThan(0);
         expect(getOrCreateSessionMeta(db, "ses-stale-tail").compartmentInProgress).toBe(false);
     });
 
-    // Regression: a synchronous runner no-op (stale/empty snapshot, nothing to
-    // compact) must NOT leave the rest of the transform pass believing a historian
-    // is in progress. startCompartmentAgent registers the run in `activeRuns`
-    // BEFORE the (microtask-scheduled) promise.finally can clear it; postprocess
-    // reads `getActiveCompartmentRun` synchronously in the same pass and would
-    // defer queued drop ops for a run that already finished. The no-op must clear
-    // the registration synchronously.
+    // A synchronous no-op must clear its activeRuns registration before postprocess runs.
+    // A synchronous no-op must clear its activeRuns registration before postprocess runs.
+    // startCompartmentAgent registers a run before its promise's finally callback can clear it.
+    // The promise's finally callback clears activeRuns only on a later microtask.
+    // postprocess reads getActiveCompartmentRun synchronously in the same transform pass.
+    // Otherwise, postprocess defers queued drop operations for a run that has already completed.
+    // A synchronous no-op clears its activeRuns registration before postprocess reads it.
     it("clears the active-run registration synchronously when the runner no-ops", async () => {
         useTempDataHome("compartment-runner-sync-noop-clear-");
         createOpenCodeDb("ses-sync-noop", [
@@ -2622,9 +2594,9 @@ describe("runCompartmentAgent", () => {
         ]);
         const db = openTestDb();
 
-        // protectedTailStart === offset (1) → "nothing to compact" no-op, which
-        // returns synchronously before any await. Empty fingerprint skips the
-        // validation branch so we land squarely on the nothing-to-compact path.
+        // When protectedTailStart equals offset (1), the runner returns through the nothing-to-compact path.
+        // The nothing-to-compact path returns before awaiting.
+        // An empty fingerprint bypasses validation and reaches the nothing-to-compact path.
         const noopSnapshot = {
             sessionId: "ses-sync-noop",
             mode: "trigger" as const,
@@ -2674,14 +2646,13 @@ describe("runCompartmentAgent", () => {
             currentContextLimit: 128_000,
         });
 
-        // SYNCHRONOUS assertion (no await): the no-op already cleared the
-        // registration, so the same transform pass sees no active run and can
-        // materialize queued drops instead of deferring them forever.
+        // The synchronous no-op clears its registration before postprocess checks for an active run.
+        // postprocess sees no active run after the synchronous no-op clears its registration.
+        // postprocess can materialize queued drops.
         expect(getActiveCompartmentRun("ses-sync-noop")).toBeUndefined();
         expect(getOrCreateSessionMeta(db, "ses-sync-noop").compartmentInProgress).toBe(false);
 
-        // Let the fire-and-forget promise settle so its finally clears the lease
-        // renewal interval before the db closes.
+        // The fire-and-forget promise must settle before the database closes so its finally callback clears the lease-renewal interval.
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(getActiveCompartmentRun("ses-sync-noop")).toBeUndefined();
     });
@@ -2699,33 +2670,24 @@ describe("registerActiveCompartmentRun", () => {
 
         registerActiveCompartmentRun(sessionId, pending);
 
-        // While the compressor is still running, a later historian-start check
-        // must see the active run and know to bail out. This is the whole
-        // point of the race fix — without registration, historian could start
-        // on top of the compressor and both would write compartments.
+        // A historian-start check must observe an active compressor run and bail out.
+        // Without active-run registration, a historian and compressor can concurrently write compartments.
         expect(getActiveCompartmentRun(sessionId)).toBeDefined();
 
         resolveCompressor?.();
         await pending;
-        // Give the .finally() callback a tick to run.
         await new Promise((r) => setTimeout(r, 0));
 
         expect(getActiveCompartmentRun(sessionId)).toBeUndefined();
     });
 
     it("clears itself when the underlying promise settles (including swallowed failures)", async () => {
-        // Real callers attach their own .catch before handing the promise in
-        // (see transform-compartment-phase.ts: the compressor path ends its
-        // .catch by logging, then registerActiveCompartmentRun receives that
-        // already-resolved-to-undefined promise). So the active-runs map never
-        // sees an unhandled rejection; it just needs to clear on settle.
+        // The registration must clear when the swallowed promise settles.
         const sessionId = "ses-register-active-reject";
         let rejectCompressor: ((err: unknown) => void) | undefined;
         const pending = new Promise<void>((_, reject) => {
             rejectCompressor = reject;
-        }).catch(() => {
-            // Simulate the caller-side swallow (matches real compressor dispatch).
-        });
+        }).catch(() => {});
 
         registerActiveCompartmentRun(sessionId, pending);
         expect(getActiveCompartmentRun(sessionId)).toBeDefined();
@@ -2738,10 +2700,7 @@ describe("registerActiveCompartmentRun", () => {
     });
 
     it("does not delete a replacement run when the original settles", async () => {
-        // Edge case: if two registrations happen back-to-back (which
-        // shouldn't normally occur — caller is expected to check first —
-        // but defensive behavior matters), the second registration must
-        // survive after the first one settles.
+        // The second registration must survive after the first promise settles.
         const sessionId = "ses-register-active-replace";
 
         let resolveFirst: (() => void) | undefined;
@@ -2751,7 +2710,6 @@ describe("registerActiveCompartmentRun", () => {
         registerActiveCompartmentRun(sessionId, first);
 
         const second = new Promise<void>((resolve) => {
-            // Never resolve during test
             void resolve;
         });
         registerActiveCompartmentRun(sessionId, second);
@@ -2760,8 +2718,7 @@ describe("registerActiveCompartmentRun", () => {
         await first;
         await new Promise((r) => setTimeout(r, 0));
 
-        // The second registration must still be surfaced — the first's
-        // finally must not have stomped it.
+        // The first registration must not delete the replacement.
         expect(getActiveCompartmentRun(sessionId)).toBeDefined();
     });
 });

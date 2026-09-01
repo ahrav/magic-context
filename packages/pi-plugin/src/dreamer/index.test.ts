@@ -275,7 +275,7 @@ describe("Pi dreamer wiring", () => {
 		await flushMicrotasks();
 
 		expect(__test.registeredProjectCount()).toBe(1);
-		// Same dir → no rebuild → original timer never cleaned up.
+		// Re-registering the same directory preserves the existing timer.
 		expect(timerCleanup).not.toHaveBeenCalled();
 	});
 
@@ -290,7 +290,6 @@ describe("Pi dreamer wiring", () => {
 			return cleanups.shift() ?? mock(() => {});
 		});
 
-		// Worktree A of the same repo → identity X.
 		registerPiDreamerProject(
 			dreamerOptions({
 				database: db,
@@ -299,7 +298,6 @@ describe("Pi dreamer wiring", () => {
 			}),
 		);
 		await flushMicrotasks();
-		// Worktree B of the SAME repo (same identity, different dir).
 		registerPiDreamerProject(
 			dreamerOptions({
 				database: db,
@@ -309,8 +307,7 @@ describe("Pi dreamer wiring", () => {
 		);
 		await flushMicrotasks();
 
-		// Still one registration, but rebuilt: first timer torn down, second
-		// timer started against worktree B.
+		// Re-registering an identity from a different directory replaces its schedule timer.
 		expect(__test.registeredProjectCount()).toBe(1);
 		expect(firstCleanup).toHaveBeenCalledTimes(1);
 		expect(dirs).toEqual(["/tmp/worktree-A", "/tmp/worktree-B"]);

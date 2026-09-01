@@ -1,5 +1,3 @@
-/// <reference types="bun-types" />
-
 import { describe, expect, test } from "bun:test";
 import {
     getOrCreateSessionMeta,
@@ -315,17 +313,15 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
                 protectedTags: 5,
             });
 
-            // First assistant response on the small-context model.
             await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
-            // Session overflowed on the small model → records a detected limit + arms recovery.
+            // A small-model overflow records a detected limit and arms recovery.
             recordOverflowDetected(db, sessionId, 120_000);
             let overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(120_000);
             expect(overflow.needsEmergencyRecovery).toBe(true);
 
-            // User switches to a 1M-context model mid-session — next assistant event
-            // carries the new model. The handler must clear BOTH the stale detected
-            // limit and the recovery flag so the new model's pressure math is clean.
+            // When an assistant event switches models, the handler clears the stale detected limit and recovery flag so pressure calculations use the new model.
+            // When the model changes, clear the detected limit and recovery flag because they apply only to the previous model.
             await hook(makeAssistantEvent(sessionId, "anthropic", "claude-large"));
             overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(0);
@@ -360,7 +356,7 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
 
             await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
             recordOverflowDetected(db, sessionId, 120_000);
-            // Same model again — detected limit must persist (authoritative on this model).
+            // The detected limit persists when the session remains on the same model.
             await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
             const overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(120_000);
@@ -371,14 +367,10 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
     });
 });
 
-// Variant-change flush must be provider-aware (#257). On providers whose wire
-// renders the thinking config into the prompt (Anthropic family), the
-// provider itself invalidates message blocks on a variant flip, so our flush
-// rides a bust that happens regardless. On implicit-prefix-caching providers
-// (OpenAI-compatible et al.), reasoning_effort/budget is a request parameter
-// outside the cache key, so a variant flip is a full cache HIT and our flush
-// would be the ONLY bust — a gratuitous one that drains queued ops for no
-// provider-side reason. The gate defers the flush on the latter.
+// The gate flushes variant changes only when the provider's thinking configuration affects the prompt cache key.
+// Anthropic variant flips invalidate message blocks independently of the provider-thinking flush.
+// On OpenAI-compatible providers, reasoning_effort and budget are request parameters outside the cache key.
+// OpenAI-compatible reasoning parameters are outside the prompt cache key, so variant changes do not require a flush.
 describe("createChatMessageHook variant-change flush is provider-aware", () => {
     type Sets = {
         historyRefreshSessions: Set<string>;
@@ -414,8 +406,6 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         };
     }
 
-    // Pins current behavior on the Anthropic family. Deleting the predicate
-    // call (so the gate always takes the TRUE arm) must leave this test green.
     test("anthropic provider: variant flip signals all three sets + clears lastHeuristicsTurnId", async () => {
         const sets = freshSets();
         sets.lastHeuristicsTurnId.set("ses", "turn-1");
@@ -487,9 +477,6 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
-    // Mutation-sensitive: this test MUST FAIL if the predicate is hardcoded
-    // true or the gate is removed. We assert the sets are EMPTY (not merely
-    // "not containing extra members") to kill the deleted-effect mutant.
     test("openai provider: variant flip signals NOTHING and leaves lastHeuristicsTurnId untouched", async () => {
         const sets = freshSets();
         sets.lastHeuristicsTurnId.set("ses", "turn-1");
@@ -538,8 +525,7 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
-    // Unknown provider (no model info on the hook input) takes the
-    // conservative TRUE arm = today's behavior.
+    // Without hook model information or a live providerID, the gate takes the conservative true arm.
     test("unknown provider (no model info): variant flip takes the TRUE arm (all three sets signaled)", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
@@ -555,9 +541,7 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
-    // The liveModelBySession fallback: when the hook input has no model but a
-    // prior event recorded the provider, the fallback providerID governs the
-    // gate. An OpenAI-compatible provider recorded earlier must still defer.
+    // When the hook input lacks model information, the gate uses the providerID recorded in liveModelBySession.
     test("liveModelBySession fallback: openai recorded earlier, no model on input → defer (FALSE arm)", async () => {
         const sets = freshSets();
         const liveModelBySession = new Map<string, { providerID: string; modelID: string }>([

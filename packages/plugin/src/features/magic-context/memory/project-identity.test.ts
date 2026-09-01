@@ -159,9 +159,9 @@ describe("resolveProjectIdentity directory fallback", () => {
         const dir = tempDir();
         try {
             mkdirSync(join(dir, ".git"));
-            // Repos merged with --allow-unrelated-histories keep several live root
-            // commits, and git's enumeration order varies by traversal. The identity
-            // must be the lexicographic minimum of the SET, not the first line.
+            // Git may return multiple root commits after unrelated histories are merged.
+            // Git may enumerate those root commits in different orders.
+            // resolveProjectIdentity selects the lexicographically smallest root commit rather than the first result.
             __setProjectIdentityTestHooks({
                 execFileSync: (() => "7e96b9e\n1e394c2\n4058752\n") as typeof execFileSync,
             });

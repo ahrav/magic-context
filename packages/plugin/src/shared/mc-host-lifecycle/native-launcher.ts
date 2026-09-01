@@ -3,8 +3,8 @@
  *
  * Production launch maps the retained verified launcher descriptor to one
  * fixed child fd through Node/Bun stdio numeric mapping and spawns the
- * platform's descriptor exec path (`/proc/self/fd/<n>` on linux,
- * `/dev/fd/<n>` on darwin) with `shell:false`, a minimal environment, and the
+ * Linux descriptor exec path (`/proc/self/fd/<n>`) with `shell:false`, a
+ * minimal environment, and the
  * startup envelope on stdin only. A dev/test injection point spawns an
  * explicit binary path instead (this repo's cargo-built `ck-mc-host`);
  * production callers never take that branch with untrusted input because the
@@ -102,19 +102,8 @@ interface CollectedExit {
     outputCapExceeded: boolean;
 }
 
-/**
- * Resolve the exec path that re-opens the retained launcher descriptor.
- *
- * Linux reaches it through procfs and darwin through `/dev/fd`; the release
- * contract records exactly this split as the `procfs_self_fd_exec` and
- * `dev_fd_exec` platform capabilities. Any other platform has neither, so it
- * gets no path and the caller fails with a real platform reason rather than a
- * spawn error against a path that cannot exist.
- */
 function retainedFdExecPath(platform: NodeJS.Platform): string | null {
-    if (platform === "linux") return `/proc/self/fd/${LAUNCHER_CHILD_FD}`;
-    if (platform === "darwin") return `/dev/fd/${LAUNCHER_CHILD_FD}`;
-    return null;
+    return platform === "linux" ? `/proc/self/fd/${LAUNCHER_CHILD_FD}` : null;
 }
 
 function collectChild(child: ChildProcess, deadlineMs: number): Promise<CollectedExit> {

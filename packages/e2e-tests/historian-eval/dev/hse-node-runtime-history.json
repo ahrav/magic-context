@@ -20,11 +20,19 @@
         "assistant": "Pinned: package manager is pnpm 9 repo-wide."
       },
       {
+        "user": "Unrelated housekeeping: the weekly sync moved to Thursday.",
+        "assistant": "Noted informally; no runtime impact."
+      },
+      {
+        "user": "One more: the changelog template stays as it is.",
+        "assistant": "Understood; the changelog template is unchanged."
+      },
+      {
         "user": "Great, that settles the runtime housekeeping.",
         "assistant": "All noted; closing this thread."
       }
     ],
-    "epilogueStartIndex": 3
+    "epilogueStartIndex": 5
   },
   "trigger": {
     "expectedHistorianRuns": 2,

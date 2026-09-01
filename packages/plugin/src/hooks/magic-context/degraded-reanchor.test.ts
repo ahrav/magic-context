@@ -1,22 +1,12 @@
 /// <reference types="bun-types" />
 
 /**
- * Tests for the two-layer recovery of degraded compartment injection
- * (#263 fork-orphaned compaction markers, #264 degraded-mode re-anchor).
  *
- * Layer A (root cause): OpenCode `/fork` copies the parent's message rows —
- * including magic-context's compaction-marker rows — into the fork, but does
- * NOT inherit magic-context's durable marker state. The fork injects its own
- * marker behind the orphan; `filterCompacted` (which honours the NEWEST
- * marker) stops at the orphan, our boundary falls below the cut, and
- * inject-compartments degrades. `reconcileForkOrphanedCompactionMarkers`
- * removes the foreign marker so the window stops at ours again.
+ * OpenCode `/fork` copies parent marker rows without durable marker state.
+ * `prepareCompartmentInjection` degrades when `filterCompacted` hides its boundary.
+ * `reconcileForkOrphanedCompactionMarkers` removes copied markers so `filterCompacted` reaches the fork's durable marker.
  *
- * Layer B (resilience): when the boundary stays invisible for
- * REANCHOR_MIN_DEGRADED_PASSES consecutive rebuilds, prepareCompartmentInjection
- * re-anchors the splice to the newest durable compartment boundary that IS
- * visible (or requests a fresh materialization when none is), instead of
- * looping. The re-anchor only applies on cache-busting passes so defer passes
+ * `prepareCompartmentInjection` re-anchors only on cache-busting passes; defer passes remain byte-identical.
  * stay byte-identical.
  */
 
@@ -88,7 +78,7 @@ function insertOcPart(
     ).run(id, messageId, sessionId, timeCreated, timeCreated, JSON.stringify(data));
 }
 
-/** Inject a full magic-context marker row-set (compaction part + summary + text). */
+/* */
 function insertMagicContextMarker(
     ocDb: Database,
     sessionId: string,
@@ -160,9 +150,7 @@ afterEach(() => {
 
 describe("Layer A — fork-orphan marker hygiene (#263)", () => {
     it("removes a fork-orphaned marker that outranks ours, keeping our marker", () => {
-        // Our marker at an older boundary (time 1000); orphan copied from the
-        // parent at a newer boundary (time 2000). filterCompacted honours the
-        // newest marker, so the orphan outranks ours.
+        // `filterCompacted` honors the newest marker, so the copied marker outranks the fork marker.
         insertMagicContextMarker(opencodeDb, SESSION_ID, {
             boundaryId: "msg_ours_boundary",
             summaryId: "msg_ours_summary",
@@ -192,7 +180,6 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
         expect(result.removed).toBe(1);
         expect(result.failed).toBe(false);
 
-        // Only our marker remains; the orphan's rows are gone.
         const remaining = listSessionCompactionMarkers(SESSION_ID);
         expect(remaining.length).toBe(1);
         expect(remaining[0].compactionPartId).toBe("prt_ours_compaction");
@@ -200,9 +187,8 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
     });
 
     it("does NOT touch an orphan that is older than ours (harmless) or a native compaction", () => {
-        // Our marker is the NEWEST (time 3000). An older MC-shaped marker (time
-        // 1000) cannot outrank us, so it must be left alone. A native /compact
-        // marker (time 4000, real providerID) is newer but must NEVER be touched.
+        // An older magic-context-shaped marker cannot outrank the session marker and must remain unchanged.
+        // `reconcileForkOrphanedCompactionMarkers` must not remove the time-4000 marker because its summary has a real `providerID`.
         insertMagicContextMarker(opencodeDb, SESSION_ID, {
             boundaryId: "msg_ours_boundary",
             summaryId: "msg_ours_summary",
@@ -217,7 +203,7 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
             summaryPartId: "prt_old_summary_part",
             time: 1000,
         });
-        // Native OpenCode compaction: summary carries a real provider id.
+        // Native OpenCode compaction summaries carry a real `providerID`.
         insertOcMessage(opencodeDb, "msg_native_boundary", SESSION_ID, 4000, { role: "user" });
         insertOcPart(opencodeDb, "prt_native_compaction", "msg_native_boundary", SESSION_ID, 4000, {
             type: "compaction",
@@ -253,7 +239,7 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
     });
 
     it("fork simulation: degraded pass repairs the orphan, next pass exits degraded", () => {
-        // Compartments cover up to msg_comp_end; our marker sits at that boundary.
+        // The marker boundary is `msg_comp_end`, the last message covered by the compartment.
         replaceAllCompartmentState(
             db,
             SESSION_ID,
@@ -294,8 +280,7 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
             targetEndMessageId: "msg_comp_end",
         });
 
-        // Pass 1: the orphan cuts the window above our boundary, so the visible
-        // array does NOT contain msg_comp_end. Injection degrades and runs hygiene.
+        // The visible message array excludes `msg_comp_end`, so injection degrades and reconciles orphaned compaction markers.
         const pass1Messages: MessageLike[] = [
             userMessage("msg_orphan_boundary", "orphan boundary"),
             userMessage("msg_later_1", "later one"),
@@ -303,13 +288,12 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
         ];
         const pass1 = prepareCompartmentInjection(db, SESSION_ID, pass1Messages, true);
         expect(pass1?.compartmentEndMessageId).toBeNull();
-        // Hygiene removed the orphan during this degraded pass.
+        // `reconcileForkOrphanedCompactionMarkers` removed the orphan during the degraded pass.
         const remaining = listSessionCompactionMarkers(SESSION_ID);
         expect(remaining.length).toBe(1);
         expect(remaining[0].compactionPartId).toBe("prt_ours_compaction");
 
-        // Pass 2: with the orphan gone, filterCompacted stops at our marker and
-        // the visible window now includes msg_comp_end. Injection exits degraded.
+        // `prepareCompartmentInjection` exits degraded mode when the visible window includes `msg_comp_end`.
         clearInjectionCache(SESSION_ID);
         const pass2Messages: MessageLike[] = [
             userMessage("msg_ours_boundary", "our boundary"),
@@ -362,40 +346,35 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             userMessage("msg_y", "y"),
         ];
 
-        // Pass 1 (bust): first degraded detection — hygiene no-ops (no marker
-        // state), count=1, no re-anchor yet.
+        // The first cache-busting pass detects degradation; `reconcileForkOrphanedCompactionMarkers` finds no orphaned marker.
+        // The first degraded bust pass records count 1 and does not re-anchor.
         const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
         expect(pass1?.compartmentEndMessageId).toBeNull();
         expect(pass1?.skippedVisibleMessages).toBe(0);
 
-        // Pass 2 (bust): count reaches the threshold — re-anchor splices at the
-        // visible msg_c1_end boundary instead of looping.
+        // The second degraded bust pass reaches the threshold and splices at the visible `msg_c1_end` boundary.
         const pass2Messages = makeVisible();
         const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true);
         expect(pass2?.compartmentEndMessageId).toBe("msg_c1_end");
         expect(pass2?.compartmentEndMessage).toBe(5);
         expect(pass2?.skippedVisibleMessages).toBe(1);
-        // msg_c1_end spliced out; msg_x and msg_y remain.
         expect(pass2Messages.length).toBe(2);
         expect(pass2Messages[0].info.id).toBe("msg_x");
         expect(pass2Messages[1].info.id).toBe("msg_y");
     });
 
     it("does not inherit another database's degraded count for the same session id", () => {
-        // The degraded count gates a byte-CHANGING re-anchor. If it leaks across
-        // stores sharing a session id, store B re-anchors on its FIRST degraded
-        // pass because it inherited store A's episode.
+        // The database-scoped degraded count prevents equal session IDs in separate databases from sharing a re-anchor episode.
         const makeVisible = (): MessageLike[] => [
             userMessage("msg_c1_end", "compartment one end"),
             userMessage("msg_x", "x"),
         ];
 
-        // Store A: one degraded bust pass (count = 1, below the threshold).
+        // Store A's first degraded bust pass records count 1, below the threshold.
         seedTwoCompartments();
         const storeAPass = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
         expect(storeAPass?.compartmentEndMessageId).toBeNull();
 
-        // Store B: independent database, same session id, its FIRST degraded pass.
         const storeA = db;
         const storeB = makeContextDb();
         try {
@@ -403,7 +382,7 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             seedTwoCompartments();
             const messages = makeVisible();
             const storeBPass = prepareCompartmentInjection(storeB, SESSION_ID, messages, true);
-            // Still pass 1 for THIS store: no re-anchor, nothing spliced.
+            // Store B's first degraded pass must not re-anchor or splice messages.
             expect(storeBPass?.compartmentEndMessageId).toBeNull();
             expect(storeBPass?.skippedVisibleMessages).toBe(0);
             expect(messages.length).toBe(2);
@@ -419,7 +398,6 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             userMessage("msg_c1_end", "compartment one end"),
             userMessage("msg_x", "x"),
         ];
-        // A single degraded bust pass must stay degraded (no premature re-anchor).
         const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
         expect(pass1?.compartmentEndMessageId).toBeNull();
         expect(pass1?.skippedVisibleMessages).toBe(0);
@@ -474,9 +452,7 @@ describe("Byte stability — defer passes during degraded mode", () => {
         const bust = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
         expect(bust?.compartmentEndMessageId).toBeNull();
 
-        // Two defer passes: degraded cache forces a rebuild each time, but the
-        // re-anchor must NOT first-apply on a defer pass, and the rendered block
-        // must stay byte-identical.
+        // Two defer passes rebuild from the degraded cache without applying a re-anchor and preserve byte-identical rendered blocks.
         const defer1Messages = makeVisible();
         const defer1 = prepareCompartmentInjection(db, SESSION_ID, defer1Messages, false);
         const defer2Messages = makeVisible();
@@ -484,7 +460,6 @@ describe("Byte stability — defer passes during degraded mode", () => {
 
         expect(defer1?.block).toBe(bust?.block);
         expect(defer2?.block).toBe(bust?.block);
-        // No splice happened on either defer pass (boundary still invisible).
         expect(defer1Messages.length).toBe(2);
         expect(defer2Messages.length).toBe(2);
         expect(defer1?.compartmentEndMessageId).toBeNull();

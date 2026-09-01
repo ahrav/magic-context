@@ -13,8 +13,8 @@ use git_fixtures::{
     write_worktree_file, FixtureRepo,
 };
 use mc_store::kernel::applicability::{
-    run_cheap_check, snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine, CheckSpec,
-    EvalBudget, ObjectApplicabilitySpec, ResolutionLadder,
+    run_cheap_check, snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine, CheckCache,
+    CheckSpec, EvalBudget, ObjectApplicabilitySpec, ResolutionLadder,
 };
 use mc_store::kernel::{
     scope_matches, scope_overlaps, scope_subsumes, CanonicalScope, Dimension, GraphOracle,
@@ -404,7 +404,7 @@ fn payload_decode_benches(c: &mut Criterion) {
             .collect();
         let payload = ObjectApplicabilitySpec::new(affected, checks).encode();
         group.bench_with_input(BenchmarkId::new("decode", size), &payload, |b, payload| {
-            b.iter(|| ObjectApplicabilitySpec::decode(Some(black_box(payload))).unwrap());
+            b.iter(|| black_box(ObjectApplicabilitySpec::decode(Some(black_box(payload)))));
         });
     }
     group.finish();
@@ -443,7 +443,11 @@ fn cheap_check_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("cheap_checks");
     for (name, check) in &checks {
         group.bench_function(BenchmarkId::new("run_cheap_check", name), |b| {
-            b.iter(|| run_cheap_check(&snapshot, black_box(check), &budget));
+            b.iter_batched(
+                CheckCache::new,
+                |mut cache| run_cheap_check(&snapshot, black_box(check), &budget, &mut cache),
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
@@ -901,7 +905,12 @@ fn profile_kernel(kernel: &str) {
             };
             let budget = EvalBudget::unbounded();
             while Instant::now() < until {
-                black_box(run_cheap_check(&snapshot, &check, &budget));
+                black_box(run_cheap_check(
+                    &snapshot,
+                    &check,
+                    &budget,
+                    &mut CheckCache::new(),
+                ));
             }
         }
         "payload-64" => {
@@ -914,7 +923,7 @@ fn profile_kernel(kernel: &str) {
                 .collect();
             let payload = ObjectApplicabilitySpec::new(affected, checks).encode();
             while Instant::now() < until {
-                black_box(ObjectApplicabilitySpec::decode(Some(&payload)).expect("payload"));
+                black_box(ObjectApplicabilitySpec::decode(Some(&payload)));
             }
         }
         other => panic!("unknown MC_SCOPE_PROFILE kernel {other}"),

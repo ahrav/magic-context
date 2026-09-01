@@ -6,26 +6,16 @@ import { PiTestHarness } from "../src/pi-harness";
 import { openTestDb } from "../src/test-db";
 
 /**
- * Pi parity port of `thinking-block-safety.test.ts`.
  *
- * OpenCode protects Anthropic signed thinking blocks from three mutation
- * classes that previously caused provider 400s. Pi differs architecturally:
- * it receives typed `AgentMessage[]` in `pi.on("context")`, adapts them through
- * `transcript-pi.ts`, and returns a replacement array. The mock provider and
- * request inspection are shared with OpenCode, so the assertions below inspect
- * the exact Anthropic wire payload Pi sends.
+ * Pi receives typed `AgentMessage[]` in `pi.on("context")`, adapts them through `transcript-pi.ts`, and returns a replacement array.
+ * The shared mock provider captures the Anthropic wire payload Pi sends.
  *
- * Bug A — Pi nudges are inserted by `nudge-injector.ts` as a separate synthetic
- * assistant message before the latest user, instead of mutating/re-anchoring an
- * existing assistant. A thinking-bearing assistant must stay byte-identical.
+ * Pi inserts nudges as separate synthetic assistant messages before the latest user instead of mutating or re-anchoring an existing assistant.
+ * A thinking-bearing assistant must stay byte-identical.
  *
- * Bug B — Pi uses the shared `apply-operations.ts` drop/truncate path plus
- * Pi-specific `strip-placeholders-pi.ts`. User turn boundaries between signed
- * assistant messages must survive as a `[dropped §N§]` user shell so provider
- * adapters cannot merge adjacent assistants or change thinking block layout.
+ * Pi preserves user boundaries between signed assistant messages as `[dropped §N§]` user shells.
  *
- * Bug C — Pi image prompts arrive as typed `image` parts. Dropping the companion
- * text tag must not delete the image part or remove the user message carrying it.
+ * Dropping an image prompt's companion text tag preserves its image part and user message.
  */
 
 let h: PiTestHarness;
@@ -212,8 +202,6 @@ describe("pi thinking-block safety (Anthropic 400 regression)", () => {
                 .map((block) => block.text ?? "")
                 .join("\n");
             expect(allUserText).toMatch(/\[dropped §\d+§\]/);
-            // Raw paste body is replaced by the canonical placeholder; the
-            // user-text preview was removed for prompt-cache stability.
             expect(allUserText).not.toContain("Here is a Pi log of the failing session");
 
             const signatures = new Set(findThinkingBlocks(lastReq).map((block) => block.signature));

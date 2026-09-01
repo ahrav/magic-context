@@ -85,8 +85,7 @@ export async function validateSmartNoteHttpUrl(
         throw new SmartNoteSecurityError("credentials in URLs are not allowed");
     }
     if (url.hash) {
-        // Fragment never reaches the server. Drop it so Host/path auditing is
-        // canonical and deterministic.
+        // The validator removes fragments because servers never receive them.
         url.hash = "";
     }
 
@@ -113,8 +112,7 @@ export async function guardedSmartNoteHttpGet(
     const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
     const bodyLimitBytes = options.bodyLimitBytes ?? DEFAULT_HTTP_BODY_LIMIT_BYTES;
     const requestAddress = options.requestAddress ?? requestValidatedAddress;
-    // DNS can return long A/AAAA sets. Smart-note checks only sample a few
-    // validated IPs so one hostname cannot fan out unbounded egress.
+    // The request tries at most MAX_HTTP_ADDRESS_CANDIDATES validated IPs to bound per-host egress.
     const candidates = validation.addresses.slice(0, MAX_HTTP_ADDRESS_CANDIDATES);
     let lastError: unknown;
     for (const candidate of candidates) {
@@ -126,9 +124,6 @@ export async function guardedSmartNoteHttpGet(
             });
         } catch (error) {
             lastError = error;
-            // Connection-level failures can try the next validated IP. Once the
-            // target itself is too large or too slow, retrying the rest of the
-            // address list only repeats the same request budget and egress.
             if (
                 error instanceof SmartNoteSecurityError ||
                 options.signal.aborted ||
@@ -158,8 +153,7 @@ async function resolveHostToValidatedGlobalAddresses(
         throw new SmartNoteSecurityError("DNS resolution returned no addresses");
     }
 
-    // Requests are pinned to one validated IPv4 address, so discard IPv6 DNS
-    // answers rather than rejecting an otherwise reachable dual-stack host.
+    // Each request uses one validated IPv4 address, so the resolver discards IPv6 DNS answers to keep dual-stack hosts reachable.
     // IPv6-only destinations remain blocked because no request candidate survives.
     const ipv4Candidates = candidates.filter(
         (candidate) => candidate.family !== 6 && !candidate.address.includes(":"),
@@ -194,18 +188,10 @@ async function resolveHostToValidatedGlobalAddresses(
 }
 
 /**
- * A `net.LookupFunction`-shaped hook that always resolves to the single
- * pre-validated, pinned IP — never re-querying DNS (anti-rebinding). Node may
- * invoke it with `{ all: true }` (Happy-Eyeballs / autoSelectFamily), which
- * expects the ARRAY callback form, or with the legacy single-address form. We
- * honor both: returning the wrong shape made Node's lookupAndConnectMultiple
- * call `results.sort(...)` on `undefined`, which surfaced as
- * "SMART_NOTE_NETWORK: results.sort is not a function" and broke every
- * network-touching smart-note check.
+ * The lookup hook returns only the prevalidated pinned IP and never re-queries DNS.
+ * Node can invoke the lookup hook with `{ all: true }`, which requires the array callback form.
  *
- * Node's `LookupFunction` type only models the legacy 3-arg callback, so the
- * dual-shape dispatch is expressed against a locally-widened callback type and
- * the result is asserted back to `LookupFunction` for `https.request`.
+ * The cast adapts the dual-shape hook to `https.request`'s legacy `LookupFunction` type.
  */
 export function createPinnedLookup(candidate: { address: string; family: 4 | 6 }): LookupFunction {
     const hook = (
@@ -231,8 +217,7 @@ export function requestValidatedAddress(
     candidate: ResolvedSmartNoteAddress,
     options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
 ): Promise<{ status: number; body: string }> {
-    // A request-local agent prevents global keep-alive or proxying agents from
-    // reusing a socket that was not opened through the pinned lookup below.
+    // A request-local agent prevents reuse of sockets not opened through the pinned lookup.
     const agent = createSmartNoteRequestAgent();
     return new Promise<{ status: number; body: string }>((resolve, reject) => {
         const url = validation.url;
@@ -250,13 +235,7 @@ export function requestValidatedAddress(
                     "User-Agent": "magic-context-smart-note-check/1",
                     Accept: "text/plain, application/json;q=0.9, */*;q=0.1",
                 },
-                // Anti-rebinding: DNS was resolved and classified above; the
-                // connector is pinned to that exact pre-validated IP while TLS
-                // still verifies the original hostname via
-                // hostname/servername/Host. The hook honors BOTH callback shapes
-                // — Node 20+ defaults to autoSelectFamily (Happy-Eyeballs), which
-                // drives the lookup with { all: true } and expects the ARRAY
-                // form; returning the wrong shape was the bug that broke every
+                // The connector uses the prevalidated IP while TLS verifies the original hostname.
                 // network-touching check.
                 lookup: createPinnedLookup(candidate),
                 agent,
@@ -269,14 +248,7 @@ export function requestValidatedAddress(
                     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                     bytes += buf.byteLength;
                     if (bytes > options.bodyLimitBytes) {
-                        // Reject FIRST, then destroy WITHOUT an error argument.
-                        // destroy(err) hands the error to the stream machinery,
-                        // which under OpenCode's embedded Bun has been observed
-                        // re-surfacing it through the readable's flow() as an
-                        // UNCAUGHT stderr dump even with 'error' listeners on
-                        // both the request and the response. An errorless
-                        // destroy gives the internals nothing to re-emit; the
-                        // promise is already settled with the typed error.
+                        // Destroying the request without an error avoids an error emitted by `destroy()`.
                         reject(
                             new SmartNoteNetworkError(
                                 "SMART_NOTE_NETWORK: response body too large",
@@ -289,11 +261,6 @@ export function requestValidatedAddress(
                     }
                     chunks.push(buf);
                 });
-                // Genuine transport errors mid-body (connection reset, TLS
-                // failure) surface here. Local aborts (body limit, timeout,
-                // signal) reject the promise directly and destroy errorless,
-                // so this listener only sees real network failures — but it
-                // must exist: an unlistened stream 'error' dumps to stderr.
                 response.on("error", (error) => {
                     reject(toNetworkError(error, "response failed"));
                 });
@@ -312,9 +279,6 @@ export function requestValidatedAddress(
             },
         );
 
-        // Same reject-then-errorless-destroy discipline as the body-limit
-        // branch: passing an Error to destroy() lets stream internals re-throw
-        // it where no listener reaches.
         const onAbort = () => {
             reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
             request.destroy();

@@ -56,7 +56,7 @@ describe("compartment events storage (E2)", () => {
                 fields: { from: "polling", to: "SSE" },
             },
         ];
-        // durable ids for the publish's emitted compartments, in emission order
+        // The array lists emitted compartments' durable IDs in emission order.
         insertCompartmentEvents(db, "ses-ev", events, [101, 202]);
 
         const stored = getCompartmentEvents(db, "ses-ev");

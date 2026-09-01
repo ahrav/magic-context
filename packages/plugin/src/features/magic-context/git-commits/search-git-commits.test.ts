@@ -73,7 +73,6 @@ describe("searchGitCommitsSync", () => {
 
         expect(results).toHaveLength(MAX_LANE_CANDIDATES);
         // Equal similarity everywhere: the bounded pool must keep the newest
-        // commits, matching the final-rank tie-break.
         expect(results.map((result) => result.commit.sha)).toEqual(
             commits
                 .slice(-MAX_LANE_CANDIDATES)

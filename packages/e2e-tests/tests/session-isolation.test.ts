@@ -4,7 +4,6 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 
 /**
- * Lifecycle tests that exercise the plugin's session bookkeeping:
  *
  *  1. Session isolation — tags and session_meta rows stay scoped to their
  *     own session IDs even when two sessions run in the same project.
@@ -75,7 +74,6 @@ describe("session lifecycle", () => {
 
         expect(tagsA).toBeGreaterThan(0);
         expect(tagsB).toBeGreaterThan(0);
-        // Session A saw 2 prompt turns vs B's 1; A should have strictly more.
         expect(tagsA).toBeGreaterThan(tagsB);
 
         const metaRows = h
@@ -103,8 +101,7 @@ describe("session lifecycle", () => {
             await h.sendPrompt(sessionId, "lifecycle turn 1");
             await h.sendPrompt(sessionId, "lifecycle turn 2");
 
-            // Verify tags in the store that owns them for this mode: module
-            // state in Rust mode, or context.db in TypeScript mode.
+            // Rust mode stores tags in module state; TypeScript mode stores them in context.db.
         const tagCountBefore = RUST_MODE
             ? Number((await rustSessionStatus(sessionId)).tag_count ?? 0)
             : h.countTags(sessionId);
@@ -115,19 +112,16 @@ describe("session lifecycle", () => {
                 .get(sessionId) as { n: number };
             expect(metaBefore.n).toBe(1);
 
-            // Delete the session through the SDK. Go direct via fetch so we
-            // don't need to add a delete signature to our SdkClient type.
+            // SdkClient lacks a delete signature, so call fetch directly.
             const del = await fetch(
                 `${h.opencode.url}/session/${encodeURIComponent(sessionId)}`,
                 { method: "DELETE" },
             );
             expect(del.ok).toBe(true);
 
-            // Plugin's session.deleted handler runs asynchronously; allow a
-            // beat for the event to propagate.
+            // The session.deleted handler runs asynchronously.
+            // The delay lets the asynchronous `session.deleted` handler finish before cleanup assertions.
         if (RUST_MODE) {
-            // 20ac0630 moved tag ownership into the module. Deletion must
-            // clear that durable session state before the route is discarded.
             const deadline = Date.now() + 15_000;
             let tagCountAfter = tagCountBefore;
             while (Date.now() < deadline) {

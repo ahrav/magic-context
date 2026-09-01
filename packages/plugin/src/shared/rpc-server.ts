@@ -23,29 +23,28 @@ import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
-/** Max body for an HTTP /rpc call. Matches the previous node:http guard. */
+/* */
 const MAX_BODY_BYTES = 1_048_576;
-/** A WS client that doesn't authenticate within this window is closed. */
+/** The server closes a WS client that does not authenticate within 5,000 ms. */
 const WS_AUTH_TIMEOUT_MS = 5_000;
-/** WS close code for an auth failure (private; client treats every close as
- *  expected and reconnects after rediscovery, so the exact code is advisory). */
+/** The server closes WebSocket authentication failures with code 4401.
+ * */
 const WS_CLOSE_UNAUTHORIZED = 4401;
 
-/** Per-socket state carried on `ServerWebSocket.data`. */
+/** `WsData` stores per-socket state in `ServerWebSocket.data`. */
 interface WsData {
     authed: boolean;
     sessionId?: string;
-    /** Removes this socket's sink from the notification registry. */
+    /** `unregister` removes this socket's sink from the notification registry. */
     unregister?: () => void;
-    /** Fires if the client never sends a valid hello. */
+    /** The auth timer fires if the client never sends a valid hello. */
     authTimer?: ReturnType<typeof setTimeout>;
 }
 
 /**
- * Constant-time bearer-token comparison. `timingSafeEqual` throws on
- * length-mismatched buffers, so guard on length first (the length itself is not
- * secret — the token bytes are). Avoids leaking the token via response-timing on
- * the loopback auth check.
+ * `tokensMatch` checks buffer lengths before calling `timingSafeEqual`, which throws for unequal-length buffers.
+ * Token length is not secret, but token bytes are.
+ * The comparison avoids leaking token bytes through loopback-auth response timing.
  */
 function tokensMatch(presented: string, expected: string): boolean {
     const a = Buffer.from(presented, "utf8");
@@ -62,22 +61,16 @@ function bearerToken(req: Request): string {
 function websocketToken(req: Request): string {
     const headerToken = bearerToken(req);
     if (headerToken) return headerToken;
-    // v0.32 TUI clients put the token in the upgrade URL. Keep this fallback only
-    // for the v0.32→v0.32.1 skew window; remove it when v0.32 clients are unsupported.
     return new URL(req.url).searchParams.get("token") ?? "";
 }
 
 /**
- * Plugin-private localhost RPC server for TUI ↔ server-plugin communication.
+ * `MagicContextRpcServer` provides localhost RPC communication between the TUI and server plugin.
  *
- * Runs on Bun (the OpenCode server runner is a Bun Worker), so it uses
- * `Bun.serve` to host BOTH:
- *  - HTTP request/reply routes (`/health`, `/rpc/<method>`) — the TUI's snapshot
- *    and dialog-result calls, which are event-driven, not idle; and
- *  - a WebSocket endpoint (`/ws`) — a single persistent connection per TUI over
- *    which the server PUSHES notifications (dialog/toast actions). This replaces
- *    the old 500ms HTTP poll, whose new-connection-per-tick cost was the source
- *    of idle TUI CPU (#200). Pi never imports this module, so `Bun.serve` is safe.
+ * The TUI uses `/health` and `/rpc/<method>` for event-driven snapshot and dialog-result requests.
+ * The TUI makes snapshot and dialog-result calls through HTTP routes rather than an idle connection.
+ * The TUI uses `/ws` for a persistent WebSocket connection.
+ * The server pushes dialog and toast actions over `/ws`.
  */
 export class MagicContextRpcServer {
     private server: Server<WsData> | null = null;
@@ -87,13 +80,12 @@ export class MagicContextRpcServer {
     private portDir: string;
     private startedAt = Date.now();
     private readonly instanceId = randomBytes(8).toString("hex");
-    /** Every authenticated WS socket, so dispose can close them all. */
+    /** `sockets` tracks authenticated WebSocket sockets so `dispose` can close them. */
     private sockets = new Set<ServerWebSocket<WsData>>();
-    // Unguessable per-process bearer token, published in the (user-private) port
-    // file and required on every non-health RPC call AND in the WS hello. Defends
-    // side-effecting endpoints (recomp/upgrade/dismiss) and the push channel
-    // against any local process or browser-origin script that merely
-    // discovers/guesses the port.
+    // Each server instance publishes its bearer token in the user-private port file.
+    // The server requires the token on every non-health RPC call and in the WebSocket hello.
+    // The token protects recompilation, upgrade, dismissal, and push-channel endpoints.
+    // The token blocks local processes and browser scripts that discover or guess the port from accessing protected endpoints.
     private readonly token = randomBytes(32).toString("hex");
 
     constructor(storageDir: string, directory: string) {
@@ -101,18 +93,16 @@ export class MagicContextRpcServer {
         this.portDir = rpcPortDir(storageDir, directory);
     }
 
-    /** Register an RPC method handler. */
+    /* */
     handle(method: string, handler: RpcHandler): void {
         this.handlers.set(method, handler);
     }
 
-    /** Start the server on a random port, write port to disk. */
+    /* */
     async start(): Promise<number> {
         if (typeof Bun === "undefined") {
-            // The only RPC consumer is the terminal-TUI sidebar, which exists only
-            // under the Bun runtime (OpenCode CLI). On Node/Electron (Desktop) there
-            // is no consumer, and Bun.serve would throw — skip cleanly instead of
-            // logging a misleading boot error.
+            // The terminal-TUI sidebar is unavailable on Node/Electron.
+            // On Node/Electron, no RPC consumer exists, so start returns without calling Bun.serve.
             log("rpc server skipped: Bun runtime not available (no TUI consumer)");
             return 0;
         }
@@ -126,9 +116,7 @@ export class MagicContextRpcServer {
             },
             websocket: {
                 open(ws) {
-                    // Close the socket if it doesn't authenticate promptly. A
-                    // never-authenticated socket holds no sink and is harmless,
-                    // but we don't want to keep raw connections open forever.
+                    // The server closes unauthenticated sockets after `WS_AUTH_TIMEOUT_MS`.
                     ws.data.authTimer = setTimeout(() => {
                         if (!ws.data.authed) ws.close(WS_CLOSE_UNAUTHORIZED, "auth timeout");
                     }, WS_AUTH_TIMEOUT_MS);
@@ -147,38 +135,32 @@ export class MagicContextRpcServer {
         this.server = server;
         this.port = server.port ?? 0;
 
-        // Write a per-instance port file atomically. Multi-instance OpenCode is
-        // supported: TUI discovery scans all live files and picks the most
-        // recent instead of cross-wiring via one shared project file.
+        // The port-file writer writes each instance's port file atomically so readers never observe a partial file.
         try {
             this.warnIfOtherLiveInstance();
             const dir = dirname(this.portFilePath);
-            // The port file carries the RPC bearer token. The normal policy keeps
-            // it owner-only; a trusted-group deployment explicitly delegates every
-            // storage mode to its operator, so this path must not chmod or supply a
-            // restrictive creation mode in that case.
+            // When private permissions are enforced, the port file has owner-only permissions.
+            // Trusted-group deployments delegate storage-permission policy to the operator.
+            // When trusted-group policy is enabled, the port-file creation path must not call `chmod` or set a restrictive creation mode.
             const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
             if (enforcePrivatePermissions) {
                 mkdirSync(dir, { recursive: true, mode: 0o700 });
                 try {
                     chmodSync(dir, 0o700);
-                } catch {
-                    // Continue RPC startup when directory tightening is rejected.
-                }
+                } catch {}
             } else {
                 mkdirSync(dir, { recursive: true });
             }
             const tmpPath = `${this.portFilePath}.tmp`;
-            // A stale tmp from a crashed write could exist with loose perms;
-            // writeFileSync's mode only applies on create, so remove it first.
+            // The port-file writer must not reuse a stale temporary file with loose permissions after a crashed write.
+            // `writeFileSync` applies `mode` only when creating a file, so remove the stale temporary file first.
             try {
                 rmSync(tmpPath, { force: true });
             } catch {
                 // best-effort
             }
-            // Synchronous write so the renameSync below sees a fully-written file.
             // The private mode keeps the bearer token out of other local accounts;
-            // externally managed storage intentionally leaves its mode to the umask.
+            // When enforcePrivatePermissions is false, writeFileSync leaves the mode to the umask.
             writeFileSync(
                 tmpPath,
                 JSON.stringify({
@@ -197,9 +179,7 @@ export class MagicContextRpcServer {
             if (enforcePrivatePermissions) {
                 try {
                     chmodSync(this.portFilePath, 0o600);
-                } catch {
-                    // Continue RPC startup when port-file tightening is rejected.
-                }
+                } catch {}
             }
             log(`[rpc] server listening on 127.0.0.1:${this.port}`);
         } catch (err) {
@@ -209,7 +189,7 @@ export class MagicContextRpcServer {
         return this.port;
     }
 
-    /** Stop the server: close every socket, stop accepting, remove port file. */
+    /* */
     stop(): void {
         for (const ws of this.sockets) {
             try {
@@ -229,7 +209,7 @@ export class MagicContextRpcServer {
         try {
             unlinkSync(this.portFilePath);
         } catch {
-            // Intentional: port file may already be gone
+            // The port file may already be gone.
         }
     }
 
@@ -244,18 +224,15 @@ export class MagicContextRpcServer {
                 );
                 return;
             }
-        } catch {
-            // No discovery directory yet, or unreadable stale file. Not fatal.
-        }
+        } catch {}
     }
 
-    /** HTTP route handler (Bun fetch). Returns a Response, or undefined when the
-     *  request was upgraded to a WebSocket. */
+    /** Bun fetch returns undefined after upgrading a request to a WebSocket.
+     * */
     private async handleFetch(req: Request, srv: Server<WsData>): Promise<Response | undefined> {
         const url = new URL(req.url);
 
-        // WebSocket upgrade — the persistent push channel. Authenticate before
-        // `srv.upgrade` so an unauthorized request never becomes a live socket.
+        // The handler authenticates the WebSocket request before srv.upgrade so unauthorized requests never become live sockets.
         if (url.pathname === "/ws") {
             if (!tokensMatch(websocketToken(req), this.token)) {
                 return new Response("Unauthorized", { status: 401 });
@@ -265,8 +242,6 @@ export class MagicContextRpcServer {
             return new Response("upgrade failed", { status: 400 });
         }
 
-        // No wildcard CORS: the only legitimate client is the in-process TUI
-        // client, not a browser origin.
         if (req.method === "GET" && url.pathname === "/health") {
             return json({ ok: true, pid: process.pid, instance_id: this.instanceId });
         }
@@ -275,7 +250,7 @@ export class MagicContextRpcServer {
             return new Response("Not Found", { status: 404 });
         }
 
-        // Require the per-process bearer token on every side-effecting call.
+        // Every side-effecting call requires the per-process bearer token.
         if (!tokensMatch(bearerToken(req), this.token)) {
             return json({ error: "Unauthorized" }, 401);
         }
@@ -308,8 +283,8 @@ export class MagicContextRpcServer {
         }
     }
 
-    /** WS message handler: hello (auth + sink registration + backlog delivery) and
-     *  ack (exact removal or legacy cursor pruning). All other messages are ignored. */
+    /**
+     * */
     private handleWsMessage(ws: ServerWebSocket<WsData>, raw: string | Buffer): void {
         let msg: {
             type?: string;
@@ -347,12 +322,12 @@ export class MagicContextRpcServer {
                     ? msg.sessionId
                     : undefined;
 
-            // A session switch re-sends hello on the same socket. Remove the old
-            // sink first so the registry has exactly one live sink per socket.
+            // Before sending another hello, `handleWsMessage` removes the old sink so each socket has exactly one live sink.
+            // `handleWsMessage` registers the replacement sink before sending hello so each socket has exactly one live sink.
             ws.data.unregister?.();
             ws.data.unregister = undefined;
 
-            // Register a live sink so future pushes reach this socket immediately.
+            // `handleWsMessage` registers a live sink so future pushes reach this socket immediately.
             const sink: NotificationSink = {
                 sessionId: ws.data.sessionId,
                 protocol: msg.protocol,
@@ -364,8 +339,7 @@ export class MagicContextRpcServer {
             this.sockets.add(ws);
 
             const usesExactAcknowledgements = msg.protocol === 2;
-            // The epoch arrives before backlog frames so the client can discard
-            // cursors and deduplication entries from a replaced server first.
+            // The server sends the epoch before backlog frames so the client discards cursors and deduplication entries from a replaced server first.
             ws.send(
                 JSON.stringify({
                     type: "hello-ack",
@@ -376,9 +350,8 @@ export class MagicContextRpcServer {
 
             let backlog: ReturnType<typeof drainNotifications>;
             if (usesExactAcknowledgements) {
-                // Protocol 2 never treats a high handled id as proof that lower ids
-                // were consumed. Exact acknowledgements are the only destructive
-                // operation, so declined or interrupted dialogs survive reconnects.
+                // Protocol 2 never treats a high handled ID as proof that lower IDs were consumed.
+                // Only exact acknowledgements remove entries, so declined or interrupted dialogs survive reconnects.
                 backlog =
                     ws.data.sessionId === undefined
                         ? drainNotifications(0, undefined, { globalOnly: true })
@@ -420,8 +393,8 @@ export class MagicContextRpcServer {
                 return;
             }
 
-            // Keep watermark acknowledgements during the one-release skew window.
-            // Scope isolation remains mandatory for these legacy messages.
+            // Legacy clients require watermark acknowledgements.
+            // Legacy acknowledgements apply only to the current socket scope.
             const lastReceivedId = Number(msg.cursor ?? msg.lastReceivedId ?? 0);
             if (Number.isFinite(lastReceivedId) && lastReceivedId > 0) {
                 if (msg.ackScope === "global") {
@@ -429,8 +402,7 @@ export class MagicContextRpcServer {
                 } else if (typeof msg.sessionId === "string" && msg.sessionId.length > 0) {
                     drainNotifications(lastReceivedId, msg.sessionId, { sessionOnly: true });
                 } else {
-                    // Compatibility path for older clients that only know one
-                    // cursor for their current socket scope.
+                    // Older clients use one cursor for their current socket scope.
                     drainNotifications(lastReceivedId, ws.data.sessionId);
                 }
             }
@@ -438,7 +410,7 @@ export class MagicContextRpcServer {
     }
 }
 
-/** JSON Response helper. */
+/* */
 function json(body: unknown, status = 200): Response {
     return new Response(JSON.stringify(body), {
         status,

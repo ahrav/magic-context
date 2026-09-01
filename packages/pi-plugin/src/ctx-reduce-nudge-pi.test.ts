@@ -146,7 +146,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		expect(sent).toBe(0);
 	});
 
-	/** A baseline whose measurement still satisfies the full Channel-2 trigger. */
+	/** armStrongBaseline creates a baseline whose measurement satisfies the full Channel-2 trigger. */
 	function armStrongBaseline(sessionId: string): void {
 		setPiChannel1Baseline(sessionId, {
 			...channel2BaselineFields(75_000, 100_000),
@@ -177,7 +177,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		);
 		expect(delivered).toBe(true);
 		expect(capturedDeliverAs).toBe("followUp");
-		// Hidden from the Pi TUI (agent steer, not a user turn) but still model-visible.
+		// display: false hides agent-steer follow-ups from the Pi TUI without hiding them from the model.
 		expect(capturedDisplay).toBe(false);
 		expect(capturedCustomType).toBe("magic-context:ceiling-nudge");
 		expect(capturedContent).toContain("<system-reminder>");
@@ -201,8 +201,7 @@ describe("maybeDeliverChannel2Pi", () => {
 			db,
 			session,
 		);
-		// An unknown U/T baseline must neither consume the cycle cap nor cancel
-		// the intent; a later agent_end with a real measurement decides.
+		// An unknown U/T baseline must neither consume the cycle cap nor cancel the intent; a later agent_end with a real measurement decides.
 		expect(delivered).toBe(false);
 		expect(sent).toBe(0);
 		expect(getChannel2NudgeState(db, session)).toBe("pending");
@@ -258,7 +257,6 @@ describe("maybeDeliverChannel2Pi", () => {
 		const db = createTestDb();
 		const session = "ses-ch2-pi-stale";
 		setChannel2NudgeState(db, session, "pending");
-		// The 50k floor holds, but severity is only 0.50, below the fourth band.
 		setPiChannel1Baseline(session, {
 			...channel2BaselineFields(50_000, 100_000),
 			reducedSinceRefresh: false,
@@ -276,7 +274,6 @@ describe("maybeDeliverChannel2Pi", () => {
 		);
 		expect(delivered).toBe(false);
 		expect(sent).toBe(0);
-		// Cancelled to '' (re-armable), NOT 'delivered' — cap preserved.
 		expect(getChannel2NudgeState(db, session)).toBe("");
 	});
 
@@ -306,8 +303,8 @@ describe("maybeDeliverChannel2Pi", () => {
 		const delivered = maybeDeliverChannel2Pi(
 			{
 				sendMessage: () => {
-					// A sibling acquired a fresh lease after this delivery attempt lost
-					// its own claim. Its claim must not be returned to pending here.
+					// A delivery attempt must not return the lease to pending when another delivery attempt has acquired a fresh lease.
+					// A delivery attempt must not return the lease to pending when another delivery attempt has acquired a fresh lease.
 					db.prepare(
 						"UPDATE session_meta SET channel2_nudge_state = 'claimed', channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = ? WHERE session_id = ?",
 					).run(Date.now(), "foreign-claim-token", session);
@@ -428,9 +425,7 @@ describe("maybeDeliverChannel2Pi", () => {
 });
 
 describe("Channel 2 delivery wiring (regression)", () => {
-	// The helper is well-tested above, but the bug it guards against is that
-	// `index.ts` never CALLED it — Pi recorded `pending` and never delivered.
-	// Assert the agent_end handler actually invokes the delivery.
+	// The agent_end handler must call maybeDeliverChannel2Pi so pending intents can be delivered.
 	const INDEX_SRC = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
 
 	it("index.ts imports maybeDeliverChannel2Pi", () => {

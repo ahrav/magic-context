@@ -4,15 +4,12 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
 
 /**
- * Pi port of session-isolation.test.ts.
  *
  * Pi has no RPC/API equivalent of OpenCode's `client.session.delete()` and the
  * production extension has no `session.deleted` event. Pi stores sessions as
  * JSONL files; switching sessions fires `session_before_switch`, while process
- * teardown fires `session_shutdown`. Those lifecycle hooks clear in-memory
- * per-session caches, not durable DB rows. Therefore the deletion-cleanup half
- * of the OpenCode test is documented as skipped below until Pi exposes a
- * deletion event/RPC surface that can be asserted end-to-end.
+ * Pi's lifecycle hooks clear only in-memory state.
+ * The Pi harness cannot assert durable deletion cleanup without a deletion RPC/event.
  */
 
 let h: PiTestHarness;
@@ -87,13 +84,8 @@ describe("pi session lifecycle", () => {
   }, 120_000);
 
   it.skip("session deletion clears tags and session_meta (FIXME: Pi exposes no deletion RPC/event)", () => {
-    // FIXME(v0.20 parity): OpenCode emits `session.deleted` from
-    // client.session.delete(), and the OpenCode e2e verifies durable tags +
-    // session_meta rows are removed. Pi currently exposes `new_session`
-    // (session_before_switch) and process teardown (session_shutdown), but no
-    // RPC/API that deletes the JSONL session file and notifies extensions. Once
-    // Pi adds a deletion command/event, port the OpenCode deletion assertion
-    // here instead of silently treating switch/shutdown cache cleanup as durable
+    // TODO: Add a deletion assertion when Pi exposes an RPC/event that deletes a session and notifies extensions.
+    // `session_before_switch` and `session_shutdown` cache cleanup does not prove durable deletion cleanup.
     // delete cleanup.
   });
 });

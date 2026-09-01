@@ -69,15 +69,19 @@ impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Clone> TwoGenerationCache<
     }
 
     /// Mutates a cached value in place wherever it currently lives.
-    pub(super) fn update<Q>(&mut self, key: &Q, apply: impl FnOnce(&mut V))
+    pub(super) fn update<Q>(&mut self, key: &Q, apply: impl FnOnce(&mut V)) -> bool
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         if let Some(value) = self.current.get_mut(key) {
             apply(value);
+            true
         } else if let Some(value) = self.previous.get_mut(key) {
             apply(value);
+            true
+        } else {
+            false
         }
     }
 }

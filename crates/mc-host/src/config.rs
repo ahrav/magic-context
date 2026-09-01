@@ -1,52 +1,22 @@
-//! Finite host configuration and limits.
 //!
-//! Every capacity in the host is bounded by a value here. Defaults are
-//! production-plausible; tests inject smaller values for determinism. CLI or
-//! config-file exposure of these knobs belongs to the spawn/doctor integration
-//! (`magic-context-c50.8`), not this crate.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::auth::{ServerProof, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN};
 use crate::connection_file::{
-    ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, SCHEMA_VERSION,
+    ConnectionInfo, DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, SCHEMA_VERSION,
 };
 use crate::wire::{HEADER_LEN, MAX_BODY_LEN, PROTOCOL_VERSION};
 
-/// One maximum inbound body, one maximum encoded outbound frame, and one
-/// maximum request-scratch reservation must coexist: a handler can stream
-/// before releasing its request body, and it can hold request-derived inputs
-/// while other connections are still admitting frames. Stated as the sum of
-/// the three pools so the admission pool is exactly one maximum body at the
 /// floor.
 pub const MIN_RESIDENT_BYTES: u64 =
     MAX_BODY_LEN as u64 + EGRESS_RESERVED_BYTES + SCRATCH_RESERVED_BYTES;
 
-/// Capacity reserved exclusively for encoded output, preventing an admitted
-/// request from consuming the permits its own terminal needs.
 pub(crate) const EGRESS_RESERVED_BYTES: u64 = MAX_BODY_LEN as u64 + HEADER_LEN as u64;
 
-/// Capacity reserved exclusively for request scratch and request-derived
-/// ownership: parser transients, query text held by a worker, queued batch
-/// items, retained job key and item metadata, and the id/hash copies a
-/// result page holds while its response encodes.
 ///
-/// Separate from the ingress pool because these holders and frame admission
-/// have incompatible lifetimes and failure modes. Frame admission is the
-/// only *blocking* consumer — `read_frame` waits on it bounded by the frame
-/// deadline, and losing that race retires the generation with no error frame
-/// — while a retained job charge can live for the whole retention window.
-/// Sharing one pool let a 15-minute holder time out a blameless connection's
-/// frame read. Reserving separately keeps the limit classes independent, so
-/// exhausting request scratch can only ever produce a typed rejection on the
-/// request that asked for it.
 ///
-/// Sized for Synapse's worst parse reservation, full queued-batch budget,
-/// one admitted maximum query, [`SYNAPSE_WAITER_HEADROOM_BYTES`],
-/// per-item/envelope headroom, and
-/// [`RETAINED_METADATA_RESERVED_BYTES`]. `validate_serving_limits` checks the
-/// same combined bound for configured limits.
 pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 5 / 2)
     + (6 * 1024 * 1024)
     + 256
@@ -54,71 +24,46 @@ pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 5 / 2)
     + SYNAPSE_WAITER_HEADROOM_BYTES
     + RETAINED_METADATA_RESERVED_BYTES;
 
-/// Scratch headroom for bounded query waiting at default Synapse limits:
-/// four waiter slots of `2 * max_text_bytes + 256` bytes each at the default
-/// 1 MiB `max_text_bytes`. Without this slice the pool admits exactly the
-/// default limits with no waiters, so `max_waiting_queries >= 1` — the knob
-/// the bounded-waiting design exists for — would be rejected at startup
-/// unless the operator also shrinks an unrelated queue budget.
-/// `tests/synapse_bundle.rs` pins the resulting feasible boundary.
+/// Startup rejects `max_waiting_queries >= 1` without this headroom.
 pub(crate) const SYNAPSE_WAITER_HEADROOM_BYTES: u64 = 4 * (2 * 1024 * 1024 + 256);
 
-/// Slice of [`SCRATCH_RESERVED_BYTES`] carved out for retained job metadata,
-/// which lives for the whole retention window. Parse and page reservations
-/// are validated against the pool minus this slice, so a full retention set
-/// can never starve the worst-case request the limits advertise — without
-/// it, a completed maximum batch's retained keys and metadata held the pool
-/// a few hundred bytes short of an identical replay's reservation until
-/// expiry. `validate_serving_limits` rejects configurations whose worst
-/// retention set exceeds this slice.
+/// Retained job metadata occupies this slice for the full retention window.
+/// Validation excludes this slice when reserving parse and page capacity.
+/// The reservation prevents a full retention set from starving the worst-case advertised request.
+/// Without this reservation, retained metadata can leave insufficient capacity for an identical maximum-batch replay until expiry.
 pub(crate) const RETAINED_METADATA_RESERVED_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Upper bound for every configured deadline and period. `Instant + Duration`
-/// panics on overflow, so unbounded values such as `Duration::MAX` must be
-/// rejected at validation instead of crashing the published host when a
-/// deadline is armed. One year exceeds any plausible operational deadline
-/// while staying far below overflow range.
+/// `MAX_CONFIG_DURATION` bounds configured deadlines and periods to prevent `Instant + Duration` overflow panics.
+/// Validation rejects unbounded durations such as `Duration::MAX` to prevent `Instant + Duration` overflow panics.
+/// The one-year cap stays below the `Instant + Duration` overflow range.
 pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// The SHA-256 of zero bytes.
 pub const UNSTAGED_PAYLOAD_MANIFEST_DIGEST: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// Capacity limits for one host incarnation. All limits are independent gates:
-/// exhausting one class never consumes another (protocol §5.1, §8.3).
+/// Each `HostLimits` field gates an independent resource class; exhausting one class does not consume another.
 #[derive(Debug, Clone)]
 pub struct HostLimits {
-    /// Sockets admitted but not yet authenticated. Excess accepts are closed
-    /// without reading any client byte.
+    /// The host closes excess unauthenticated sockets without reading client bytes.
     pub max_handshakes: usize,
-    /// Authenticated connection generations.
     pub max_connections: usize,
-    /// Live routes across every connection (also bounded by the u16 channel
+    /// `max_routes` limits live routes across all connections and cannot exceed the `u16` channel namespace.
     /// namespace).
     pub max_routes: usize,
-    /// Consumer requests admitted but not yet settled, across all connections.
+    /// `max_pending_requests` limits consumer requests admitted but not yet settled across all connections.
     pub max_pending_requests: usize,
-    /// Concurrently running handler request tasks.
     pub max_handler_tasks: usize,
-    /// Aggregate bytes simultaneously resident under the host's byte
-    /// budgets. The cap includes inbound bodies, handler-owned request
-    /// bodies, parser scratch, request-derived input ownership (Synapse
-    /// query text, queued batch items, retained job metadata), encoded
-    /// frames, writer queues, and handler-declared retained bytes (plan
-    /// KTD2). An accounting cap over named logical payloads, not an exact
+    /// The cap includes inbound bodies, handler-owned request bodies, parser scratch, request-derived input ownership, encoded frames, writer queues, and handler-declared retained bytes.
+    /// The limit accounts for named logical payloads, not exact process RSS.
     /// process-RSS claim.
     ///
-    /// Split into independent pools: [`EGRESS_RESERVED_BYTES`] for
-    /// encoded output, [`SCRATCH_RESERVED_BYTES`] for request scratch and
-    /// request-derived ownership, and the remainder (less the resident
-    /// catalog and every declared retained-byte reservation) for inbound
-    /// frame admission. Raising this raises only the admission pool, so a
-    /// deployment that needs larger request scratch than the reserved slice
-    /// must be served by a component whose own limits fit it. Must be at
-    /// least [`MIN_RESIDENT_BYTES`]; startup additionally requires the
-    /// catalog and retained reservations to leave one maximum ingress body.
+    /// `max_resident_bytes` reserves [`EGRESS_RESERVED_BYTES`] for output and [`SCRATCH_RESERVED_BYTES`] for scratch; only the remaining capacity admits inbound frames.
+    /// Increasing `max_resident_bytes` enlarges only the inbound admission pool; scratch capacity remains bounded by [`SCRATCH_RESERVED_BYTES`].
+    /// Components that need more request scratch than [`SCRATCH_RESERVED_BYTES`] must declare limits that accommodate that scratch.
+    /// `max_resident_bytes` must be at least [`MIN_RESIDENT_BYTES`].
+    /// Startup requires catalog and retained reservations to leave capacity for one maximum ingress body.
     pub max_resident_bytes: u64,
-    /// Encoded frames queued per connection writer.
     pub writer_queue_frames: usize,
 }
 
@@ -130,13 +75,12 @@ impl Default for HostLimits {
             max_routes: 1024,
             max_pending_requests: 1024,
             max_handler_tasks: 256,
-            // Sized for a host whose components declare no retention. The
-            // runtime subtracts the catalog and every declared
-            // `retained_resident_bytes` from this figure, and a default cannot
-            // know which components a composite links — so a composition site
-            // that links components with real retention must size this itself as
-            // its own floor plus the sum of their declarations. Startup refuses
-            // the composite otherwise rather than silently over-offering ingress.
+            // The default `HostLimits` value assumes no component declares retained bytes.
+            // The runtime subtracts the catalog reservation and each declared `retained_resident_bytes` from the resident-byte budget.
+            // `HostLimits::default` cannot account for the components linked by a composite.
+            // A composition with retained components must set its resident-byte budget explicitly.
+            // The resident-byte budget must include the composition's floor plus all declared `retained_resident_bytes`.
+            // Startup rejects composites whose resident-byte budget is below their floor plus declared retained bytes rather than over-offering ingress.
             max_resident_bytes: MIN_RESIDENT_BYTES + MAX_BODY_LEN as u64,
             writer_queue_frames: 64,
         }
@@ -178,9 +122,7 @@ impl HostLimits {
                 minimum: MIN_RESIDENT_BYTES,
             });
         }
-        // Tokio semaphores hold at most usize::MAX >> 3 permits (below
-        // u32::MAX on 32-bit targets); byte-granular charges must fit so
-        // `ByteBudget::new` cannot panic, and single acquisitions use u32
+        // Tokio semaphores cap permits below `u32::MAX` on 32-bit targets; byte-granular charges must fit in that cap so `ByteBudget::new` cannot panic.
         // counts.
         let max_budget_bytes = (tokio::sync::Semaphore::MAX_PERMITS as u64).min(u32::MAX as u64);
         if self.max_resident_bytes > max_budget_bytes {
@@ -193,27 +135,26 @@ impl HostLimits {
     }
 }
 
-/// Absolute deadlines and periods. Every operation owns exactly one deadline;
-/// stages within it share the same budget (protocol §11).
+/// Each operation owns exactly one absolute deadline or period.
+/// Stages within an operation share its deadline budget.
 #[derive(Debug, Clone)]
 pub struct HostTiming {
-    /// Whole three-message authentication exchange per accepted socket.
+    /// The authentication deadline covers the whole three-message exchange for each accepted socket.
     pub auth_deadline: Duration,
-    /// Remaining header plus body once the first header byte of a frame
-    /// arrives. Idle waiting between frames is unbounded (protocol §6.3).
-    /// Also bounds writing one dequeued frame to the consumer: a peer that
-    /// stops reading is retired rather than allowed to pin shared egress
+    /// The frame deadline covers the remaining header and body after the first header byte arrives.
+    /// Idle waiting between frames is unbounded (protocol §6.3).
+    /// The frame deadline also bounds writing one dequeued frame to the consumer.
+    /// The host retires a peer that stops reading instead of allowing it to pin shared egress budget indefinitely.
     /// budget indefinitely.
     pub frame_deadline: Duration,
-    /// Bind, route-gone, initialization, and health callback budget; expiry is
-    /// host-fatal (plan KTD9).
+    /// The budget covers bind, route-gone, initialization, and health callbacks; expiry is host-fatal.
+    /// host-fatal.
     pub lifecycle_callback_deadline: Duration,
-    /// Settling or cancelling one route's admitted work at route close.
+    /// The route-close budget settles or cancels one route's admitted work.
     pub route_close_budget: Duration,
     pub transport_setup_deadline: Duration,
-    /// Whole graceful-shutdown drain.
+    /// The shutdown deadline covers the whole graceful-shutdown drain.
     pub shutdown_deadline: Duration,
-    /// Period between internal handler health probes.
     pub health_interval: Duration,
 }
 
@@ -231,11 +172,10 @@ impl Default for HostTiming {
     }
 }
 
-/// Consumer liveness probing (host Ping / client Pong).
+/// The host probes consumer liveness with Ping and client Pong.
 ///
-/// `invalidate_on_missed` stays `false` until the raw Rust historian client can
-/// answer Ping (`magic-context-c50.4`); enabling it before then would kill
-/// healthy long-running awaits (protocol §9.3).
+/// Set `invalidate_on_missed` to false for clients that cannot answer Ping to preserve healthy long-running awaits.
+/// Enabling `invalidate_on_missed` for clients that cannot answer Ping kills healthy long-running awaits.
 #[derive(Debug, Clone)]
 pub struct LivenessPolicy {
     pub ping_interval: Duration,
@@ -243,21 +183,20 @@ pub struct LivenessPolicy {
     pub invalidate_on_missed: bool,
 }
 
-/// Host-owned synthetic initialization payload handed to the linked handler
-/// before the listener binds (protocol §8.1 step 3-4).
+/// `HostInit` is a host-owned synthetic initialization payload handed to the linked handler.
+/// The host hands the payload to the linked handler before the listener binds (protocol §8.1 steps 3–4).
 #[derive(Clone, Default)]
 pub struct HostInit {
     pub subc_capabilities: Vec<String>,
-    /// Opaque resolved storage descriptor, when deployment configures managed
-    /// storage. The handler deserializes it; the host never reads it.
+    /// Managed deployments pass an opaque resolved storage descriptor.
+    /// The handler deserializes the descriptor; the host never reads it.
     pub storage: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for HostInit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The storage descriptor can carry credentials or deployment
-        // secrets; diagnostics (including HostConfig's derived Debug) get
-        // presence and bounded structure only (protocol V24).
+        // The storage descriptor can carry credentials or deployment metadata.
+        // presence only.
         f.debug_struct("HostInit")
             .field("subc_capabilities", &self.subc_capabilities)
             .field("storage", &self.storage.is_some())
@@ -267,12 +206,12 @@ impl std::fmt::Debug for HostInit {
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    /// Overrides `${XDG_DATA_HOME:-~/.local/share}` as the data root that
+    /// Diagnostics, including `HostConfig`'s derived `Debug`, report only whether storage is present.
     /// contains `cortexkit/run/subc-connection.json`.
     pub data_dir: Option<PathBuf>,
-    /// Published as `daemon_ver` and echoed in the auth `ServerProof`.
+    /// The host publishes `daemon_ver` and echoes it in the authentication `ServerProof`.
     pub daemon_ver: String,
-    /// Must be 64 lowercase hex characters; defaults to
+    /// `payload_manifest_digest` must contain 64 lowercase hex characters and defaults to `UNSTAGED_PAYLOAD_MANIFEST_DIGEST`.
     /// [`UNSTAGED_PAYLOAD_MANIFEST_DIGEST`].
     pub payload_manifest_digest: String,
     pub init: HostInit,
@@ -280,8 +219,6 @@ pub struct HostConfig {
     pub timing: HostTiming,
     /// `None` sends no Pings at all.
     pub liveness: Option<LivenessPolicy>,
-    #[doc(hidden)]
-    pub transport_providers: crate::transport_provider::TransportProviders,
 }
 
 impl Default for HostConfig {
@@ -294,7 +231,6 @@ impl Default for HostConfig {
             limits: HostLimits::default(),
             timing: HostTiming::default(),
             liveness: None,
-            transport_providers: crate::transport_provider::TransportProviders::default(),
         }
     }
 }
@@ -310,10 +246,8 @@ impl HostConfig {
                 len: self.payload_manifest_digest.len(),
             });
         }
-        // Byte arrays serialize as JSON number arrays whose length depends on
-        // the values ("0" is one char, "255" is three), so sizing must use
-        // worst-case fills or a validated daemon_ver can exceed the caps at
-        // runtime depending on the generated bytes.
+        // JSON serializes byte arrays as number arrays with one to three digits per byte, so sizing must use worst-case fills.
+        // Validation must account for worst-case JSON byte-array encoding so generated bytes cannot exceed the caps at runtime.
         let auth_message_bytes = serde_json::to_vec(&ServerProof {
             daemon_id: [u8::MAX; DAEMON_ID_LEN],
             server_nonce: [u8::MAX; NONCE_LEN],
@@ -325,10 +259,7 @@ impl HostConfig {
         let connection_file_bytes = serde_json::to_vec_pretty(&ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: PROTOCOL_VERSION,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: u16::MAX,
-            }],
+            setup_socket: "/tmp/mc-host.sock".to_owned(),
             key: vec![u8::MAX; KEY_LEN],
             daemon_id: [u8::MAX; DAEMON_ID_LEN],
             pid: u32::MAX,
@@ -402,7 +333,7 @@ pub enum ConfigError {
         name: &'static str,
     },
     EmptyDaemonVer,
-    /// Carries only the offending length so diagnostics stay bounded.
+    /// The error carries only the offending length to keep diagnostics bounded.
     InvalidPayloadDigest {
         len: usize,
     },
@@ -517,12 +448,6 @@ mod tests {
         );
     }
 
-    /// `max_resident_bytes` splits into three pools that never draw on each
-    /// other. Frame admission is the only blocking consumer, so a request
-    /// scratch or retained-input holder must never be able to reduce it —
-    /// that is what "all limits are independent gates" means here, and the
-    /// floor exists to keep the admission pool at one maximum body even when
-    /// the other two are fully reserved.
     #[test]
     fn the_resident_cap_splits_into_three_non_overlapping_pools() {
         let frame = MAX_BODY_LEN as u64;
@@ -531,21 +456,16 @@ mod tests {
             frame + EGRESS_RESERVED_BYTES + SCRATCH_RESERVED_BYTES,
             "the floor must be exactly the sum of the three pools"
         );
-        // At the floor the admission pool is exactly one maximum body: the
-        // interop guarantee survives carving the scratch slice out.
+        // `MIN_RESIDENT_BYTES` leaves one `MAX_BODY_LEN` after reserving the egress and scratch slices.
         let admission_at_floor =
             MIN_RESIDENT_BYTES - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
         assert_eq!(admission_at_floor, frame);
-        // Raising the cap grows only the admission pool; the reserved slices
-        // are fixed, so the largest servable request never varies with
         // deployment tuning.
         let defaults = HostLimits::default();
         assert!(defaults.max_resident_bytes >= MIN_RESIDENT_BYTES);
         let admission_at_default =
             defaults.max_resident_bytes - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
         assert!(admission_at_default > frame);
-        // The catalog and declared retained bytes are subtracted from
-        // admission only (runtime.rs), so they can never eat the scratch or
         // egress guarantees.
         assert!(
             admission_at_default - frame > 0,

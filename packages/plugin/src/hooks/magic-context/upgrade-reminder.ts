@@ -8,21 +8,17 @@ import type { Database } from "../../shared/sqlite";
 import type { NotificationDeliveryDisposition } from "./send-session-notification";
 
 /**
- * E5 — Session upgrade reminder (v2).
  *
- * When a session still holds pre-v2 (legacy) compartments, those render in a
- * degraded title-only/P4 form until the user runs `/ctx-session-upgrade`. This
- * surfaces a bounded, model-invisible reminder pointing at the command.
+ * Legacy compartments render in title-only/P4 form until `/ctx-session-upgrade` runs.
+ * The reminder is model-invisible and directs users to `/ctx-session-upgrade`.
  *
- * Cache-safety (locked design): the reminder is delivered as an IGNORED message
- * (user-visible, never sent to the model), NOT appended to a user message — so it
- * has zero effect on the cacheable prompt prefix. No anchor/replay machinery needed.
+ * The reminder is delivered as an IGNORED message rather than appended to a user message.
+ * IGNORED messages are user-visible and never reach the model, so the reminder does not alter the cacheable prompt prefix.
  *
- * Push reminders are bounded per session. A durable timestamp enforces a 24-hour
- * cooldown, and a durable count caps deliveries at three. Pull surfaces such as
- * `/ctx-status` continue to show upgrade-needed compartments after the cap.
+ * A durable timestamp enforces a 24-hour per-session cooldown.
+ * A durable count limits each session to three deliveries.
  *
- * The in-process set still prevents duplicate delivery before durable metadata is
+ * `remindedThisProcess` prevents duplicate delivery before durable metadata is reread.
  * read back.
  */
 
@@ -31,8 +27,7 @@ export const MAX_UPGRADE_REMINDERS_PER_SESSION = 3;
 
 const remindedThisProcess = new Set<string>();
 
-// Non-TUI (Desktop/Web/headless) reminder text. Mirrors the TUI dialog copy but,
-// since there is no clickable button here, it ends with the explicit slash command.
+// Non-TUI reminders end with `/ctx-session-upgrade` because they have no clickable upgrade button.
 const UPGRADE_REMINDER_TEXT = [
     "🎆 Historian V2 is released!",
     "",
@@ -47,20 +42,12 @@ const UPGRADE_REMINDER_TEXT = [
     "Run `/ctx-session-upgrade` to upgrade now.",
 ].join("\n");
 
-/** A compartment needs upgrading when it lacks usable v2 tiers — either a pre-v2
- *  `legacy=1` row, OR a malformed "pseudo-v2" row flagged `legacy=0` but with no
- *  `p1` tier (e.g. from an interrupted/crashed recomp, or an older partial-v2
- *  build). The `legacy=0 ⟹ has tiers` invariant can break from any partial state,
- *  which would otherwise TRAP the session — the old gate said "already upgraded"
- *  and refused to re-run (dogfood 2026-05-30, AFT session with 541 tierless rows).
- *  Single source of truth shared with the upgrade gate in recomp-orchestrator. */
+/**
+ * Partial upgrades can violate the `legacy = 0` implies usable tiers invariant.
+ * */
 export const NEEDS_UPGRADE_SQL = "(legacy = 1 OR p1 IS NULL OR p1 = '')";
 
 /**
- * Count compartments that still need a v2 upgrade (pre-v2 `legacy=1` rows OR
- * tierless `p1 IS NULL/''` rows from an interrupted/old partial build). Shared
- * with the Pi /ctx-status dialog (Pi has no sidebar, so it surfaces upgrade
- * status here) and the OpenCode upgrade gate. Returns 0 on any error.
  */
 export function countCompartmentsNeedingUpgrade(db: Database, sessionId: string): number {
     try {
@@ -79,14 +66,14 @@ function hasLegacyCompartments(db: Database, sessionId: string): boolean {
     return countCompartmentsNeedingUpgrade(db, sessionId) > 0;
 }
 
-/** Partial recomp staging from an INTERRUPTED upgrade — completed historian
- *  passes are committed to `recomp_compartments` per-pass and only promoted to
- *  the real tables at the very end, so a mid-upgrade close leaves staged progress
- *  there that the next run resumes from (it does NOT restart from scratch). */
+/** Interrupted upgrades retain staged recompartment data for resumption.
+ * Completed historian passes are staged in `recomp_compartments` before final promotion.
+ * A mid-upgrade close leaves staged progress for the next run.
+ * The next upgrade resumes staged progress instead of restarting. */
 export interface ResumeInfo {
-    /** Compartments already rebuilt and staged. */
+    /* */
     stagedCount: number;
-    /** Raw message ordinal the staged work covers through. */
+    /* */
     stagedThrough: number;
 }
 
@@ -106,7 +93,7 @@ function getResumeInfo(db: Database, sessionId: string): ResumeInfo | null {
     }
 }
 
-/** Resume-flavored reminder copy for the non-TUI (Desktop/headless) path. */
+/* */
 function buildResumeReminderText(resume: ResumeInfo): string {
     return [
         "🎆 Resume the interrupted upgrade?",
@@ -120,30 +107,29 @@ function buildResumeReminderText(resume: ResumeInfo): string {
 export interface UpgradeReminderDeps {
     client: unknown;
     db: Database;
-    /** Delivers a model-invisible ignored message to the session (non-TUI path:
-     *  Desktop/headless, where it persists in scrollback). */
+    /** The non-TUI path delivers the reminder as a model-invisible IGNORED message.
+     * */
     sendIgnoredMessage: (
         client: unknown,
         sessionId: string,
         text: string,
         params: Record<string, unknown>,
     ) => Promise<NotificationDeliveryDisposition>;
-    /** Live notification params (model/variant/agent) for the active session. */
+    /* */
     getNotificationParams: (sessionId: string) => Record<string, unknown>;
-    /** True when a TUI client is actively polling FOR THIS SESSION (decides
-     *  dialog vs ignored msg). Must be session-scoped: a TUI on a different
-     *  session in the same process must not make this session take the dialog
-     *  path. Optional: harnesses without an OpenCode-style TUI dialog system
-     *  (e.g. Pi, which delivers via `ctx.ui.notify`) omit this and always take
-     *  the `sendIgnoredMessage` path. */
+    /** isTuiConnected returns true only when a TUI client actively polls the specified session.
+     * A TUI connected to another session must not select the dialog path.
+     * Harnesses without an OpenCode-style TUI dialog system may omit isTuiConnected.
+     * Pi omits isTuiConnected because it delivers through ctx.ui.notify.
+     * Harnesses that omit isTuiConnected always use sendIgnoredMessage. */
     isTuiConnected?: (sessionId?: string) => boolean;
-    /** Enqueue a server→TUI action so the TUI shows an interactive upgrade dialog
-     *  ("Run upgrade now"/"Later") instead of a transient toast. TUI path only;
-     *  omitted on harnesses without a dialog system. When `resume` is set, the
-     *  dialog shows resume-flavored copy. */
+    /** pushTuiDialogAction enqueues an interactive upgrade dialog instead of a transient toast.
+     * pushTuiDialogAction is used only for TUI delivery.
+     * Harnesses without a dialog system omit pushTuiDialogAction.
+     * */
     pushTuiDialogAction?: (sessionId: string, resume?: ResumeInfo) => void;
-    /** Whether delivery persists in scrollback. Default true for OpenCode.
-     *  Pi uses transient toasts, so it ignores the old explicit-dismissal stamp;
+    /** deliveryPersists controls whether delivery persists in scrollback and defaults to true for OpenCode.
+     * Pi uses transient toasts, so it ignores the explicit-dismissal stamp.
      *  both harnesses still persist the shared cooldown and delivery cap. */
     deliveryPersists?: boolean;
 }
@@ -165,8 +151,7 @@ export async function maybeSendUpgradeReminder(
         return;
     }
 
-    // A reminder is warranted only while the session still has legacy/tierless
-    // compartments. Fully upgraded sessions can safely discard orphan staging.
+    // Without legacy or tierless compartments, staged rows are orphaned.
     if (!hasLegacyCompartments(deps.db, sessionId)) {
         const orphan = getResumeInfo(deps.db, sessionId);
         if (orphan) {
@@ -185,8 +170,6 @@ export async function maybeSendUpgradeReminder(
 
     const resume = getResumeInfo(deps.db, sessionId);
     const durableDismissalActive = deps.deliveryPersists !== false;
-    // An explicit OpenCode dialog choice remains a permanent dismissal for the
-    // fresh reminder. Pi ignores old stamps because its toast never persisted.
     if (!resume && durableDismissalActive && meta.upgradeRemindedAt !== null) {
         remindedThisProcess.add(sessionId);
         return;
@@ -212,14 +195,13 @@ export async function maybeSendUpgradeReminder(
                 upgradeReminderCount: meta.upgradeReminderCount + 1,
             });
         } catch {
-            // Best-effort: process-local guard still avoids a same-process loop.
+            // The process-local guard prevents same-process retry loops.
         }
     };
 
     try {
         if (deps.isTuiConnected?.(sessionId) && deps.pushTuiDialogAction) {
-            // A display is not a dismissal: the user may close the dialog without
-            // choosing. It is still a delivered reminder and consumes the cap slot.
+            // Closing the dialog without choosing still consumes a delivery-cap slot.
             deps.pushTuiDialogAction(sessionId, resume ?? undefined);
             recordDelivery();
             sessionLog(sessionId, `upgrade-reminder: TUI dialog action enqueued (${kind})`);
@@ -248,7 +230,7 @@ export async function maybeSendUpgradeReminder(
     }
 }
 
-/** Test-only: reset the per-process guard. */
+/* */
 export function __resetUpgradeReminderProcessGuard(): void {
     remindedThisProcess.clear();
 }

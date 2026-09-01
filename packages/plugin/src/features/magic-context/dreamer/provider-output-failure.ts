@@ -12,7 +12,7 @@ interface AssistantCompletionShape {
     reasoningTokens: number | null;
 }
 
-/** A provider transport failure that arrived as an ordinary assistant completion. */
+/** DreamerProviderOutputFailureError represents a provider transport failure delivered as an assistant completion. */
 export class DreamerProviderOutputFailureError extends Error {
     readonly transient = true;
 
@@ -69,9 +69,9 @@ function latestAssistantCompletion(messages: unknown): AssistantCompletionShape 
 }
 
 /**
- * OpenCode can serialize a provider outage as a successful `finish=stop` assistant
- * message. Only classify that shape after manifest validation has already failed:
- * a real manifest remains authoritative regardless of its token counts.
+ * OpenCode serializes provider outages as assistant completions with `finish=stop`.
+ * The classifier runs only after manifest validation fails.
+ * A valid manifest remains authoritative regardless of its token counts.
  */
 export function providerOutputFailureFromInvalidManifest(
     messages: unknown,

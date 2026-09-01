@@ -61,7 +61,7 @@ export interface SeedDreamerEvalTaskOptions {
     db: Database;
     scenario: DreamerEvalScenario;
     task: DreamerTaskScenario;
-    /** Fresh, run-owned directory also used as the task's project directory. */
+    /** The seeder uses a fresh, run-owned directory as the task's project directory. */
     workdir: string;
     nowMs?: number;
 }
@@ -80,12 +80,10 @@ function fixtureError(detail: string): never {
 }
 
 /**
- * Environment for every fixture git invocation. GIT_DIR, GIT_INDEX_FILE,
- * GIT_WORK_TREE, and GIT_OBJECT_DIRECTORY override repository discovery, so an
- * ambient value (a git hook, `git rebase --exec`, or an outer harness) would
- * redirect these writes at the surrounding repository instead of the run-owned
- * workdir. Neutralizing global and system config additionally keeps
- * `core.hooksPath` from running host scripts during the fixture commit.
+ * `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, and `GIT_OBJECT_DIRECTORY` can redirect repository discovery.
+ * Ambient `GIT_*` values can originate in git hooks, `git rebase --exec`, or outer harnesses.
+ * Ambient `GIT_*` values can redirect writes to the surrounding repository rather than the run-owned workdir.
+ * Neutralizing global and system config prevents `core.hooksPath` from running host scripts during fixture commits.
  */
 export function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     const inherited: NodeJS.ProcessEnv = {};
@@ -122,34 +120,27 @@ function fixturePath(workdir: string, path: string): string {
     if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) {
         fixtureError(`fixture path escapes workdir: ${path}`);
     }
-    // `relative` reports the platform separator, so on Windows the portable
-    // spelling a manifest and `git ls-files` use (`src/file.ts`) comes back as
-    // `src\file.ts`. Compare against a POSIX-normalized copy so forward slashes
-    // stay canonical on every platform; `.` and `..` aliases still differ from
-    // their resolved form and are still rejected.
+    // `relative` returns paths with the platform separator.
+    // On Windows, `relative` returns `src\file.ts` for the portable `src/file.ts` spelling used by manifests and `git ls-files`.
+    // The code compares a POSIX-normalized path so forward slashes remain canonical on every platform.
+    // `.` and `..` aliases differ from their resolved form and are rejected.
     const canonical = sep === "/" ? fromRoot : fromRoot.split(sep).join("/");
-    // Aliases of one target (`src/./a.ts`, `src/sub/../a.ts`) must not reach the
-    // repository. Mapping preconditions, gold file sets, and `git ls-files`
-    // compare the authored string, so two aliases would satisfy every check
-    // while writing one file — the second content silently replacing the first.
+    // Mapping preconditions, gold file sets, and `git ls-files` compare authored path strings.
+    // Two aliases can satisfy every string-based check while targeting one file.
+    // The second alias write silently replaces the first file's content.
     if (canonical !== path) fixtureError(`fixture path is not canonical: ${path}`);
-    // The marker names the scenario that owns this workdir and is written after
-    // fixture content, so a claim declaring it would have its authored content
-    // silently overwritten. The commit and `assertFixtureFilesCommitted` would
-    // still pass — they only check that the path is tracked and clean — leaving
-    // the evaluation to run against evidence the claim never declared. A
-    // descendant is reserved for a blunter reason: writing it creates the marker
-    // as a directory, and the marker write then fails with a raw EISDIR outside
-    // the typed fixture-drift path. Folded like the `.git` check below, because a
-    // case-insensitive filesystem maps `.DREAMER-EVAL-FIXTURE` onto the same
+    // A claim cannot declare the marker because the seeder overwrites it after writing fixture content.
+    // Claims cannot declare the marker because evaluation would use marker content rather than the claim's authored content.
+    // Descendants of the marker are reserved because writing one creates the marker as a directory.
+    // Writing a marker descendant makes the marker write fail with raw `EISDIR`.
+    // Case-insensitive filesystems map `.DREAMER-EVAL-FIXTURE` and its case variants to the same path.
     // name.
     const foldedCanonical = canonical.toLowerCase();
     if (foldedCanonical === FIXTURE_MARKER || foldedCanonical.startsWith(`${FIXTURE_MARKER}/`)) {
         fixtureError(`fixture path is reserved: ${path}`);
     }
-    // The control directory lives inside the workdir but is not fixture
-    // content: a write there steers the seeder's own git invocations, and
-    // `.git/hooks` would execute during the fixture commit.
+    // Writing to `.git` can steer the seeder's Git invocations.
+    // Executable hooks in `.git/hooks` run during fixture commits.
     if (fromRoot.split(PATH_SEGMENT_RE).some((segment) => segment.toLowerCase() === ".git")) {
         fixtureError(`fixture path targets the git control directory: ${path}`);
     }
@@ -160,8 +151,7 @@ function fixtureFiles(workdir: string, scenario: DreamerEvalScenario): Map<strin
     const files = new Map<string, string>();
     for (const claim of scenario.pool.claims) {
         for (const file of claim.fixtureFiles) {
-            // Validate before keying: conflict detection must run on the path
-            // that reaches disk, not on the authored spelling.
+            // Conflict validation uses the path that reaches disk, not the authored spelling.
             fixturePath(workdir, file.path);
             const existing = files.get(file.path);
             if (existing !== undefined && existing !== file.content) {
@@ -170,11 +160,9 @@ function fixtureFiles(workdir: string, scenario: DreamerEvalScenario): Map<strin
             files.set(file.path, file.content);
         }
     }
-    // Windows and default macOS volumes map paths differing only in case onto
-    // one file, so two such declarations would share storage and the second
-    // content would replace the first. Folding refuses the ambiguity on every
-    // platform rather than letting the outcome depend on the filesystem the run
-    // lands on, and it gives the nesting check below the same identity rule.
+    // Case-insensitive filesystems map paths differing only in case onto one file.
+    // Case folding rejects ambiguity on every platform rather than allowing filesystem-dependent replacement.
+    // Case-folded identities prevent filesystem behavior from determining the result.
     const byFoldedPath = new Map<string, string>();
     for (const path of files.keys()) {
         const folded = path.toLowerCase();
@@ -184,12 +172,10 @@ function fixtureFiles(workdir: string, scenario: DreamerEvalScenario): Map<strin
         }
         byFoldedPath.set(folded, path);
     }
-    // A declared file and a declared descendant of it cannot both exist. The
-    // write loop would fail with EEXIST from mkdir or EISDIR from the write
-    // depending on declaration order, and that raw filesystem error escapes
-    // untyped — bypassing the fixture-drift path a caller matches on. Paths are
-    // canonical and POSIX-normalized by fixturePath, so segment prefixes of one
-    // path are exactly its ancestors.
+    // A declared file and a declared descendant cannot coexist.
+    // Nested declarations make the write loop fail with `EEXIST` from `mkdir` or `EISDIR` from the write.
+    // Nested-declaration validation prevents raw filesystem errors from bypassing fixture-drift handling.
+    // Canonical paths make segment-based ancestry checks unambiguous.
     for (const [folded, path] of byFoldedPath) {
         const segments = folded.split("/");
         for (let index = 1; index < segments.length; index += 1) {
@@ -208,9 +194,9 @@ function prepareFixtureRepository(
     task: DreamerTaskScenario,
     nowMs: number,
 ): number {
-    // Only probe a repository the workdir itself owns. `git rev-parse` walks
-    // parent directories, so an unprobed nested workdir resolves the
-    // surrounding repository's HEAD and reports drift that does not exist.
+    // Repository probes must target a repository owned by `workdir`.
+    // `git rev-parse` searches parent directories and can resolve a surrounding repository's HEAD.
+    // `git rev-parse` can resolve the surrounding repository's HEAD and report drift that does not exist.
     if (existsSync(join(workdir, ".git"))) {
         const existingHead = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
             cwd: workdir,
@@ -234,8 +220,8 @@ function prepareFixtureRepository(
     const commitTimeMs = Number.isFinite(firstVerification) ? firstVerification - 2_000 : nowMs - 2_000;
     if (commitTimeMs <= 0) fixtureError("verification timestamps leave no positive fixture commit time");
     const commitDate = new Date(commitTimeMs).toISOString();
-    // Every path here was explicitly authored and has to be committed for the
-    // evaluation to run, so a fixture-local .gitignore must not suppress one:
+    // The fixture commit includes every explicitly authored path required for evaluation.
+    // A fixture-local .gitignore must not suppress authored paths.
     // without --force `git add` exits nonzero on an ignored path.
     git(workdir, ["add", "--force", "--", FIXTURE_MARKER, ...files.keys()]);
     git(
@@ -348,10 +334,10 @@ export async function preflightDreamerEvalTask(args: {
     const skipped = Object.keys(args.publicClaimIds).filter((claimId) => !inScopeSet.has(claimId));
     assertExpectedSet("in-scope claims", inScope, args.task.expectedInScopeClaimIds);
     assertExpectedSet("skipped claims", skipped, args.task.expectedSkippedClaimIds);
-    // The scenario contract pins a mode for every task: a verify mode for
-    // verify, "broad" for verify-broad, and null for map and classify. A gate
-    // that returns the expected candidates under the wrong mode still
-    // invalidates the experiment, because mode decides what a later cycle
+    // The scenario contract requires mode `verify` for `verify`, `broad` for `verify-broad`, and `null` for `map-memories` and `classify`.
+    // The scenario contract requires mode `verify` for `verify`, `broad` for `verify-broad`, and `null` for `map-memories` and `classify`.
+    // The scenario contract requires mode `verify` for `verify`, `broad` for `verify-broad`, and `null` for `map-memories` and `classify`.
+    // The scenario contract requires mode `verify` for `verify`, `broad` for `verify-broad`, and `null` for `map-memories` and `classify`.
     // re-sweeps.
     if (mode !== args.task.expectedResultMode) {
         throw new DreamerEvalSeederError(
@@ -514,12 +500,11 @@ export async function seedDreamerEvalTask(
             (entry) => entry.verifiedAt,
         );
         if (verificationTimes.length === 0) fixtureError("verify-broad requires seeded verification history");
-        // partitionVerifyScope keeps a claim whose verifiedAt precedes the broad
-        // cycle start, so the watermark must sit after every seeded
-        // verification. A watermark below them filters the verified claims out
-        // and collapses broad scope onto the never-verified set that
-        // incremental already selects, which is the one behavior broad exists
-        // to differ on.
+        // partitionVerifyScope retains claims verified before broad-cycle start, so the watermark follows every seeded verification.
+        // The watermark must follow every seeded verification.
+        // The watermark must follow every seeded verification.
+        // Broad scope must differ from the never-verified set that incremental selects.
+        // Broad scope must differ from the never-verified set that incremental selects.
         const lastBroadRunAt = Math.max(...verificationTimes) + 1;
         if (lastBroadRunAt <= 0) fixtureError("verify-broad watermark must be positive");
         seedTaskScheduleState(

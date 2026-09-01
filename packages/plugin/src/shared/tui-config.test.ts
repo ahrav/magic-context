@@ -62,8 +62,7 @@ describe("ensureTuiPluginEntry", () => {
         const { ensureTuiPluginEntry } = await import("./tui-config");
         expect(ensureTuiPluginEntry({ configDir: root })).toBe(true);
 
-        // The new file must be tui.jsonc so a tui.json stub never ends up
-        // sitting next to a tui.jsonc the user writes later (#176).
+        // Creating tui.jsonc avoids leaving a tui.json stub beside a later tui.jsonc.
         expect(existsSync(join(root, "tui.jsonc"))).toBe(true);
         expect(existsSync(join(root, "tui.json"))).toBe(false);
         const parsed = JSON.parse(readFileSync(join(root, "tui.jsonc"), "utf-8")) as {
@@ -75,7 +74,6 @@ describe("ensureTuiPluginEntry", () => {
     it("writes into the existing tui.jsonc when both files exist", async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-tui-both-"));
         roots.push(root);
-        // A real user config in tui.jsonc plus a leftover empty tui.json.
         writeFileSync(
             join(root, "tui.jsonc"),
             `${JSON.stringify({ keybinds: { x: "y" } }, null, 2)}\n`,
@@ -85,8 +83,7 @@ describe("ensureTuiPluginEntry", () => {
         const { ensureTuiPluginEntry } = await import("./tui-config");
         expect(ensureTuiPluginEntry({ configDir: root })).toBe(true);
 
-        // The plugin entry must land in tui.jsonc (higher precedence), and the
-        // user's keybinds must survive; tui.json must be left untouched.
+        // tui.jsonc takes precedence over tui.json.
         const jsonc = JSON.parse(readFileSync(join(root, "tui.jsonc"), "utf-8")) as {
             plugin: unknown[];
             keybinds: Record<string, string>;

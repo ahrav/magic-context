@@ -139,8 +139,6 @@ describe("user-memory candidate decay", () => {
     it("prunes candidates older than the TTL, keeps fresher ones", () => {
         const db = freshDb();
         const now = 1_000_000_000_000;
-        // Insert two candidates, then back-date one past the TTL via direct UPDATE
-        // (insert stamps created_at=Date.now()).
         insertUserMemoryCandidates(db, [
             { content: "stale one-off", sessionId: "s1" },
             { content: "recent observation", sessionId: "s1" },

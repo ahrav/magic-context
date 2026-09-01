@@ -11,9 +11,9 @@ import {
     OPENCODE_VERSION_PROBE_TIMEOUT_MS,
 } from "./opencode-helpers";
 
-// These assert that a RESOLVED absolute binary path is actually invoked (the
-// #196 follow-up: a stock CLI not on PATH must still enumerate). POSIX-only:
-// the test writes an executable shell stub, which CI runs on Linux/macOS.
+// Tests require the resolved absolute binary path to be invoked.
+// Enumeration must work when the stock CLI is outside PATH.
+// Executable shell stubs require POSIX.
 const isPosix = process.platform !== "win32";
 const originalComSpec = process.env.ComSpec;
 const originalPathExpansionProbe = process.env.MC_OPENCODE_TEST_PATH;

@@ -1,12 +1,8 @@
 /**
- * Pi loud fail-closed surface when storage cannot open at boot.
  *
- * Registers the minimum hooks that prevent silent native-compaction fallthrough:
- * - `session_before_compact` always cancels (MC owns compaction when enabled)
- * - `context` throws {@link FailClosedBlockingError} on every primary pass
+ * The surface prevents Pi native compaction from running without Magic Context.
+ * The `context` handler enforces the fail-closed block until storage recovers.
  *
- * Periodically re-probes storage; when open succeeds, invokes `onRecovered` so
- * the full runtime can start without a process restart.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -61,8 +57,7 @@ export function registerPiFailClosedSurface(
 		return recovering;
 	};
 
-	// Keep cancelling native compaction while MC is enabled but inoperable —
-	// otherwise Pi's threshold/overflow compact runs with zero MC signal.
+	// The fail-closed surface cancels Pi compaction to prevent compaction without Magic Context signals.
 	pi.on("session_before_compact", async () => {
 		log(
 			`${PREFIX} session_before_compact: cancelling — magic-context fail-closed (storage unavailable)`,
@@ -75,8 +70,6 @@ export function registerPiFailClosedSurface(
 		try {
 			await controller.enforce({
 				blockingEnabled: true,
-				// Pi subagent children never load this extension (env guard in
-				// index.ts). No additional agent-name exemption is required here.
 				exempt: shouldBypassFailClosedBlock({ isPiSubagentEnv: false }),
 				tryReopen: tryRecover,
 			});
@@ -87,7 +80,6 @@ export function registerPiFailClosedSurface(
 				{ cause: error },
 			);
 		}
-		// enforce() returned without throw only when recovered mid-pass.
 	});
 
 	log(

@@ -63,9 +63,7 @@ function recordStaleFence(
 }
 
 /**
- * Probe the schema fence immediately before a child is created. The hot path uses
- * the process's existing SQLite handle; an already fail-closed main handle has no
- * handle to query, so its recorded rejection is the authoritative verdict.
+ * When no SQLite handle is available, a recorded rejection determines the verdict.
  */
 export function probeChildSpawnFence(db: Database | null): ChildSpawnFenceProbeResult {
     if (!db) {
@@ -85,15 +83,11 @@ export function probeChildSpawnFence(db: Database | null): ChildSpawnFenceProbeR
             return recordStaleFence(persistedVersion, LATEST_SUPPORTED_VERSION);
         }
     } catch {
-        // A failed read cannot prove that this process still matches the shared
-        // schema. Refuse the child rather than allowing one stale spawn across a
-        // migration fence; the surfaced doctor command provides the recovery path.
+        // A schema-version read failure prevents verifying compatibility, so reject the child.
         return recordStaleFence(LATEST_SUPPORTED_VERSION, LATEST_SUPPORTED_VERSION, "read_error");
     }
 
-    // A successful live read re-arms the N-consecutive latch. This is normally
-    // unreachable for a monotonic schema version, but keeps a recovered handle
-    // from suppressing a later, independent stale-build incident.
+    // A successful live read re-arms the consecutive-failure latch so a later stale-schema rejection can surface.
     state.consecutiveFailures = 0;
     state.latched = false;
     state.noticeEmitted = false;
@@ -104,7 +98,7 @@ export function getChildSpawnFenceFailure(): ChildSpawnFenceFailure | null {
     return state.failure;
 }
 
-/** Test seam: child-spawn fence state is process-local by design. */
+/** Child-spawn fence state is process-local. */
 export function __resetChildSpawnFenceProbeForTests(): void {
     state.consecutiveFailures = 0;
     state.totalFailures = 0;

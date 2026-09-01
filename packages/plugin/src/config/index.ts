@@ -45,14 +45,6 @@ export interface MagicContextPluginConfig extends MagicContextConfig {
     >;
 }
 
-// Config is read from the shared CortexKit location. The location migrator
-// (migrate-config-location.ts) runs at plugin init and moves legacy per-harness
-// files to the CortexKit path before the loader runs. When the migration could
-// NOT complete (it refuses on an OpenCode-vs-Pi config that differs, or it never
-// ran in this process), the CortexKit base is absent — in that case the loader
-// reads THIS harness's own legacy file as a non-destructive fallback rather than
-// silently using schema defaults (which would re-enable features the user's real
-// config disabled). See resolveLegacyReadFallback.
 function getUserConfigBasePath(): string {
     return cortexKitUserConfigBasePath();
 }
@@ -62,14 +54,11 @@ function getProjectConfigBasePath(directory: string): string {
 }
 
 interface LegacyReadFallback {
-    /** The legacy file we read, or null if no harness-owned legacy file exists. */
+    /* */
     source: LegacyConfigSource | null;
 }
 
 /**
- * First existing legacy source owned by the OpenCode harness, for the read
- * fallback when the CortexKit base is absent. Pi has its own loader with the
- * symmetric Pi-scoped fallback.
  */
 function resolveLegacyReadFallback(sources: readonly LegacyConfigSource[]): LegacyReadFallback {
     return { source: sources.find((s) => existsSync(s.path)) ?? null };
@@ -77,13 +66,13 @@ function resolveLegacyReadFallback(sources: readonly LegacyConfigSource[]): Lega
 
 interface LoadedConfigFile {
     config: Record<string, unknown>;
-    /** Warnings from {env:} / {file:} substitution, with config-path prefix applied. */
+    /** The loader prefixes {env:} and {file:} substitution warnings with the config path. */
     warnings: string[];
 }
 
 export interface LoadResultDetailed {
     config: MagicContextPluginConfig & { configWarnings?: string[] };
-    /** USER-tier default/overrides captured before project routing is merged. */
+    /** The loader captures USER-tier defaults and overrides before merging project routing. */
     registrationPromptSurface: PromptSurfaceConfig;
     loadOutcome: LoadOutcome;
     sources: {
@@ -161,17 +150,12 @@ function loadConfigFileDetailed(
 }
 
 /**
- * Deep-merge two raw JSON objects. Both inputs must come from BEFORE Zod
- * parsing — otherwise Zod-filled defaults appear as if they were explicit
- * overrides and clobber genuine values from the other source.
+ * The loader merges raw JSON before Zod parsing so defaults do not become overrides.
  *
- * Plain object values merge recursively. Arrays, primitives, and `null` are
- * replaced atomically (override wins). This matches typical config-merge
- * semantics: arrays like `disabled_hooks` should be set whole, not interleaved
+ * The merge recursively merges plain objects and atomically replaces arrays, primitives, and `null`.
+ * The merge union-merges `disabled_hooks` so user and project configs can both contribute hook IDs.
  * element-wise.
  *
- * `disabled_hooks` is the one exception: we union-merge it below so user
- * and project can both contribute hook IDs without one silently losing the
  * other's entries.
  */
 function defineOwnConfigValue(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -215,8 +199,6 @@ function deepMergeRawConfig(
             Array.isArray(baseVal) &&
             Array.isArray(overrideVal)
         ) {
-            // Union-merge so user + project can both disable hooks without
-            // one source erasing the other's entries.
             mergedValue = [...new Set([...baseVal, ...overrideVal])];
         } else {
             mergedValue = overrideVal;
@@ -227,13 +209,9 @@ function deepMergeRawConfig(
 }
 
 /**
- * Render a config value for a warning message in a way that never leaks resolved
- * secrets from `{env:API_KEY}` / `{file:...}` substitution.
+ * Warning rendering never exposes values resolved by `{env:...}` or `{file:...}` substitution.
  *
- * Strings, numbers, booleans, and nulls are shown as type-plus-length so the
- * user can still diagnose the problem ("string, 48 chars", "number 200001") but
- * never see the resolved content. Objects and arrays are shown as their
- * structural shape only. `undefined` / missing values are reported as
+ * The renderer reports string lengths and object and array shapes.
  * `<missing>`.
  */
 function redactConfigValue(value: unknown): string {
@@ -255,14 +233,12 @@ function parsePluginConfig(
     rawConfig: Record<string, unknown>,
     recoveredTopLevelKeys: string[] = [],
 ): MagicContextPluginConfig & { configWarnings?: string[] } {
-    // Pre-Zod shim: reshape legacy experimental.* graduated keys so the user's
-    // opt-in/out state survives upgrades even when they never run `doctor`.
+    // The loader reshapes legacy `experimental.*` keys before Zod parsing to preserve existing opt-in/out values.
+    // `experimental.*` migration preserves users' opt-in/out state even if they never run `doctor`.
     const preMigrationWarnings: string[] = [];
     const migratedExperimental = migrateLegacyExperimental(rawConfig, preMigrationWarnings);
-    // Dreamer v2: convert the legacy v1 dreamer shape (window schedule, tasks
-    // array, user_memories/pin_key_files blocks) into the per-task `tasks` record.
-    // Runs AFTER migrate-experimental so experimental.user_memories (already
-    // relocated to dreamer.user_memories above) is folded into the v2 tasks here.
+    // migrateDreamerV2 converts v1 task arrays, `user_memories`, and `pin_key_files` to per-task `tasks` records.
+    // migrateDreamerV2 runs after migrateLegacyExperimental so it can fold migrated `user_memories` into v2 tasks.
     const migratedDreamer = migrateDreamerV2(migratedExperimental, preMigrationWarnings);
     const migrated = migrateLegacyAgentEnabledInMemory(migratedDreamer, preMigrationWarnings);
     const parsed = MagicContextConfigSchema.safeParse(migrated);
@@ -283,23 +259,14 @@ function parsePluginConfig(
         };
     }
 
-    // Full parse failed — recover field-by-field using defaults for invalid fields.
-    // Agent configs (historian, dreamer, sidekick) are dropped on error rather than defaulted
-    // because wrong model config could run expensive models or fail silently.
     const defaults = MagicContextConfigSchema.parse({});
     const warnings: string[] = [];
 
-    // Build a patched copy of rawConfig, replacing invalid fields with undefined
-    // so Zod fills in defaults on the second parse.
     const errorPaths = new Set<string>();
-    // Collect any custom Zod messages per top-level key so a field with an
-    // explanatory `.max(..., "why")` / `.refine(..., "why")` message surfaces the
-    // reason to the user instead of a bare "invalid value" (e.g. issue #111's
-    // execute_threshold cache-safety explanation). Only non-default Zod messages
-    // are kept — the generic "Too big"/"Invalid input" boilerplate adds nothing.
+    // The validator excludes generic Zod messages so warnings retain actionable validation reasons.
+    // The loader surfaces custom Zod messages as config warnings.
     const customMessagesByKey = new Map<string, string>();
-    // Per top-level key, the set of FULL error paths (e.g. ["memory","auto_search"]).
-    // Used to prune only the invalid nested leaf instead of the whole block.
+    // `issuePathsByKey` lets recovery prune invalid nested leaves without deleting their parent blocks.
     const issuePathsByKey = new Map<string, PropertyKey[][]>();
     const GENERIC_ZOD_PREFIXES = ["Too big", "Too small", "Invalid input", "Invalid", "Expected"];
     for (const issue of parsed.error.issues) {
@@ -324,7 +291,7 @@ function parsePluginConfig(
         recoveredTopLevelKeys.push(key);
         const isAgentConfig = key === "historian" || key === "dreamer" || key === "sidekick";
         if (isAgentConfig) {
-            // Drop agent configs entirely on error — don't default them
+            // Invalid agent configurations are dropped because default model settings could run expensive models or fail silently.
             delete patched[key];
             warnings.push(
                 `"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
@@ -332,12 +299,9 @@ function parsePluginConfig(
             continue;
         }
 
-        // For object-valued keys (e.g. `memory`), prune ONLY the invalid nested
-        // leaves and keep valid siblings, so one bad nested field doesn't wipe the
-        // whole block — which would silently drop already-migrated graduated keys
-        // like memory.auto_search / memory.git_commit_indexing. Falls back to
-        // whole-key deletion when the issue is at the key itself or the value
-        // isn't a prunable object.
+        // Recovery prunes invalid nested leaves from object-valued keys and preserves valid siblings.
+        // Preserving valid siblings retains migrated `memory.auto_search` and `memory.git_commit_indexing` settings.
+        // The recovery code deletes the whole key when the issue targets that key or its value is not a prunable object.
         const issuePaths = issuePathsByKey.get(key) ?? [];
         const rawValue = rawConfig[key];
         const allNested =
@@ -352,10 +316,10 @@ function parsePluginConfig(
             };
             const prunedLeaves: string[] = [];
             for (const p of issuePaths) {
-                // p is the full Zod issue path ([key, ...nested]); prune the
-                // DEEPEST invalid leaf, not just the first child (p[1]), so a
-                // 3-level path like memory.git_commit_indexing.since_days drops
-                // only `since_days` and keeps a sibling `enabled: false`.
+                // `p` is the full Zod issue path; recovery removes its deepest invalid leaf.
+                // Recovery removes the deepest invalid leaf rather than `p[1]`.
+                // For `memory.git_commit_indexing.since_days`, recovery removes only `since_days`.
+                // For `memory.git_commit_indexing.since_days`, recovery preserves sibling fields such as `enabled: false`.
                 const relative = p.slice(1);
                 const result = pruneNestedConfigLeaf(prunedBlock, relative);
                 if (result) {
@@ -371,12 +335,9 @@ function parsePluginConfig(
             continue;
         }
 
-        // Use Zod default for this field.
-        // Intentional: redactConfigValue reports type+length, never the
-        // resolved value itself, because `{env:...}` / `{file:...}`
-        // substitution may have already expanded secrets into rawConfig.
+        // `redactConfigValue` reports type and length, not resolved values, because `{env:...}` and `{file:...}` substitutions may expand secrets into `rawConfig`.
         delete patched[key];
-        // SAFETY: every top-level Zod issue path names a field in defaults.
+        // Every top-level Zod issue path names a field in `defaults`.
         const defaultVal = (defaults as unknown as Record<string, unknown>)[key];
         const reason = customMessagesByKey.get(key);
         warnings.push(
@@ -384,8 +345,7 @@ function parsePluginConfig(
         );
     }
 
-    // Re-run migration on the field-recovered patched config so legacy
-    // experimental + dreamer-v1 blocks still migrate on the recovery path.
+    // The field-recovery path reruns migrations so legacy experimental and dreamer-v1 blocks still migrate.
     const retryMigrated = migrateLegacyAgentEnabledInMemory(
         migrateDreamerV2(
             migrateLegacyExperimental(patched, preMigrationWarnings),
@@ -403,8 +363,6 @@ function parsePluginConfig(
         };
     }
 
-    // If even the patched version fails (shouldn't happen), fall back to full defaults
-    // but keep enabled:true — the user intended to use the plugin.
     warnings.push("Config recovery failed, using all defaults.");
     return {
         ...defaults,
@@ -417,16 +375,6 @@ function parsePluginConfig(
 export function loadPluginConfig(
     directory: string,
 ): MagicContextPluginConfig & { configWarnings?: string[] } {
-    // Delegate to the detailed loader so there is exactly ONE config-resolution
-    // path. The detailed variant owns the read-legacy-on-conflict fallback (when
-    // the shared CortexKit base is absent, read THIS harness's own legacy config
-    // instead of falling to schema defaults), the project-config hardening, and
-    // the embedding-redirect guard. Having a second hand-maintained copy here is
-    // how the read-legacy fallback silently missed the runtime init path
-    // (index.ts calls loadPluginConfig) while only the embedding bootstrap got
-    // it — a config-drop bug. The extra detailed fields (outcome, sources,
-    // substitutionFailures) are simply dropped for callers that only need the
-    // config + warnings.
     return loadPluginConfigDetailed(directory).config;
 }
 
@@ -487,15 +435,9 @@ function combinedOutcome(args: {
 export function loadPluginConfigDetailed(directory: string): LoadResultDetailed {
     const userDetected = detectConfigFile(getUserConfigBasePath());
     const projectDetected = detectConfigFile(getProjectConfigBasePath(directory));
-    // Both-harness sources drive the GC-suppression signal; this-harness sources
-    // (OpenCode) drive the non-destructive read fallback when the base is absent.
     const legacySources = resolveLegacyConfigSources(directory);
     const harnessLegacy = resolveLegacyConfigSourcesForHarness(directory, "opencode");
 
-    // When the CortexKit base is absent (migration refused on a differing
-    // OpenCode/Pi pair, or hasn't run), read THIS harness's own legacy file
-    // instead of falling to schema defaults that would silently re-enable
-    // features the user disabled.
     const userLegacyFallback =
         userDetected.format === "none"
             ? resolveLegacyReadFallback(harnessLegacy.user)
@@ -505,11 +447,6 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
             ? resolveLegacyReadFallback(harnessLegacy.project)
             : { source: null };
 
-    // "Unmigrated" (→ untrusted, GC suppressed) ONLY when the base is absent,
-    // some legacy config exists, AND we did NOT read this harness's own legacy.
-    // If we read our own legacy the config is real → trusted. If only the OTHER
-    // harness's legacy exists we fell to defaults → keep GC suppressed so a
-    // default-config start can't reap the other harness's embedding vectors.
     const legacyUserUnmigrated =
         userDetected.format === "none" &&
         !userLegacyFallback.source &&
@@ -534,9 +471,6 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     const allWarnings: string[] = [];
     let mergedRaw: Record<string, unknown> = {};
-    // Threshold trust boundary is relative to the USER/default effective config:
-    // a cloned repo may delay compaction, but it may not lower thresholds in a
-    // way that forces extra historian work on the user's account.
     const trustedBaseConfig = parsePluginConfig(userLoaded?.config ?? {});
 
     if (userLegacyFallback.source) {

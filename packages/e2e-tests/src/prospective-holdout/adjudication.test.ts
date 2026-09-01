@@ -74,8 +74,7 @@ describe("immutable adjudication", () => {
             authenticationKey: authKey,
             approver: "reviewer-three",
         });
-        // The reviewer's key, not the custodian's: a digest the custodian could reproduce
-        // from the call's own inputs would not evidence a second actor's approval.
+        // The HMAC requires `approvalKey`; a digest of call inputs cannot prove a second actor approved.
         const approvalKey = new Uint8Array(32).fill(9);
         const approvalFingerprint = createHmac("sha256", approvalKey)
             .update(canonicalJson({
@@ -99,8 +98,7 @@ describe("immutable adjudication", () => {
             unblindApprovalKey: approvalKey,
             approvalFingerprint,
         })).toEqual(map);
-        // A custodian holding every other input still cannot produce the fingerprint
-        // without the reviewer's key, which is the property the plain digest lacked.
+        // Only a holder of `unblindApprovalKey` can produce `approvalFingerprint`.
         expect(() => unblindAfterClose({
             close,
             cohortClose,
@@ -200,8 +198,8 @@ describe("immutable adjudication", () => {
             });
             const destination = join(root, "close.json");
             publishAdjudicationClose(close, destination);
-            // A publisher interrupted after the link installed this close retries with the
-            // same close, so the retry must complete rather than report a conflict.
+            // A retry with the same close completes when interruption follows link installation.
+            // A retry with the same close completes when interruption follows link installation.
             expect(() => publishAdjudicationClose(close, destination)).not.toThrow();
             const conflicting = closeAdjudication({
                 close: cohortClose,

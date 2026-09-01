@@ -36,7 +36,7 @@ export function getMural(db: Database, projectPath: string): MuralManifestRow | 
             if (Array.isArray(parsed))
                 memoryIds = parsed.filter((id): id is string => typeof id === "string");
         } catch {
-            // A malformed sidecar must not make m0 injection fail closed.
+            // Malformed memory_ids_json must not prevent manifest lookup from returning a row.
         }
         return {
             projectPath: row.project_path,

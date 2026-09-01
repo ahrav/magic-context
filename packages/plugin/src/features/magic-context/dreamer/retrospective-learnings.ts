@@ -20,8 +20,7 @@ import { insertUserMemoryCandidates } from "../user-memory/storage-user-memory";
 
 /**
  * A durable learning must not preserve session-local anger/friction language
- * verbatim ("distill, don't transcribe"). This catches the strongest correction
- * phrases + repeated no/wrong/again/stop runs + punctuation bursts.
+ * The regex rejects correction phrases, repeated `no`, `wrong`, `again`, or `stop`, and runs of at least three `!` or `?` characters.
  */
 const FRUSTRATION_MARKER_REGEX =
     /\b(?:not what i asked|i already (?:said|told you|explained)|you (?:ignored|missed)|that'?s wrong|this is wrong|stop (?:doing|claiming|using)|(?:no|wrong|again|stop)(?:\W+\b(?:no|wrong|again|stop)\b)+)\b|[!?]{3,}/i;
@@ -37,9 +36,7 @@ export interface RetrospectiveApplyResult {
     observationsDropped: number;
     rejected: Array<{ content: string; reason: string }>;
     /**
-     * Effects of the claim-native creation manifest. Route-`memory` learnings
-     * write only the claim tables, so a caller diffing the legacy `memories`
-     * table sees no change; run telemetry has to come from these instead.
+     * `memory` learnings write only claim tables; use `effects` for telemetry because `memories` remains unchanged.
      */
     effects: readonly ClaimOperationResultEffect[];
 }
@@ -107,13 +104,9 @@ export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLe
 }
 
 /**
- * Extract one child element's text.
  *
- * The open tag tolerates attributes and trailing whitespace (`<trigger >`,
- * `<safer_alternative note="...">`) because a missed match on a REQUIRED field
- * silently discards the whole learning at the caller, turning ordinary model
- * formatting variance into lost memory. `\b` keeps the tolerance from matching a
- * longer tag that merely starts with this name (`recovery` vs `recovery_plan`).
+ * `childText` accepts attributes and whitespace in required tags; otherwise a missed required tag discards the learning.
+ * `\b` excludes longer tag names such as `recovery_plan`.
  */
 function childText(inner: string, tag: string): string | null {
     const match = inner.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, "i"));
@@ -124,15 +117,12 @@ function childText(inner: string, tag: string): string | null {
     return value || null;
 }
 
-// A learning that shares a long verbatim run of words with a source user message
-// is a transcription, not a distillation — reject it. (Privacy: the durable
-// memory must be the third-person LESSON, never the user's own words.)
+// The validator rejects a learning that shares a contiguous run of at least `runCap` words with source user text.
 export const MAX_SOURCE_WORD_RUN = 7;
 export const MAX_SOURCE_WORD_RUN_RATIO = 0.5;
-// The LEARNING is short by nature (a one-line lesson); cap it as defense. The
-// SOURCE is NOT capped — see hasHighSourceOverlap: the n-gram membership check is
-// O(source) time / O(learning) memory, so the whole source is scanned and a
-// verbatim run anywhere in it is caught (no leading-window truncation gap).
+// The learning length cap bounds the overlap check's memory use.
+// The overlap check scans the full source because its n-gram membership test uses O(source) time and O(learning) memory.
+// Scanning the full source catches a verbatim run anywhere in a source user line.
 export const MAX_OVERLAP_LEARNING_WORDS = 200;
 
 function toWords(text: string, cap?: number): string[] {
@@ -145,18 +135,10 @@ function toWords(text: string, cap?: number): string[] {
 }
 
 /**
- * True when `content` reads as a near-transcription of any source user line:
- * it shares a contiguous run of ≥ runCap words (an absolute cap of
- * MAX_SOURCE_WORD_RUN, or half the learning's own length for very short
- * learnings). This is the structural enforcement of "distill, don't transcribe"
- * — the regexes catch quotes/dates/anger; this catches a lightly-reworded user
- * sentence that would otherwise pass.
+ * The n-gram check rejects shared verbatim runs that the quote, date, and frustration checks do not match.
  *
- * Implementation: since runCap ≤ MAX_SOURCE_WORD_RUN (small), "a shared run ≥
- * runCap exists" is equivalent to "some runCap-gram of the learning occurs in the
- * source". We build the learning's runCap-grams once (≤ learning length) and
- * stream each FULL source past them — O(Σ source words) time, O(learning) memory,
- * with NO source truncation (a verbatim run at any offset is caught).
+ * Because runCap ≤ MAX_SOURCE_WORD_RUN, a shared run exists iff a learning runCap-gram occurs in the source.
+ * Streaming source n-grams keeps auxiliary memory proportional to the learning.
  */
 export function hasHighSourceOverlap(content: string, sourceUserTexts: string[]): boolean {
     const learningWords = toWords(content, MAX_OVERLAP_LEARNING_WORDS);
@@ -167,8 +149,7 @@ export function hasHighSourceOverlap(content: string, sourceUserTexts: string[])
     );
     if (learningWords.length < runCap) return false;
 
-    // All runCap-length contiguous grams of the learning (joined on \u0000 so
-    // word boundaries are unambiguous).
+    // The `\u0000` separator prevents ambiguous word boundaries in n-gram keys.
     const learningGrams = new Set<string>();
     for (let i = 0; i + runCap <= learningWords.length; i++) {
         learningGrams.add(learningWords.slice(i, i + runCap).join("\u0000"));
@@ -202,7 +183,7 @@ export function applyRetrospectiveLearnings(args: {
     learnings: ParsedRetrospectiveLearning[];
     identity: AutonomousManifestIdentity;
     userMemoryCollectionEnabled: boolean;
-    /** The raw source user lines, for the near-transcription reject check. */
+    /** sourceUserTexts retains raw source-user lines for near-transcription rejection. */
     sourceUserTexts?: readonly string[];
 }): RetrospectiveApplyResult {
     if (!isInTransaction(args.db)) {
@@ -226,9 +207,9 @@ export function applyRetrospectiveLearnings(args: {
         const dedupeKey = `${learning.route}:${category}:${content}`;
         if (seenContent.has(dedupeKey)) continue;
         seenContent.add(dedupeKey);
-        // Derive the privacy-gated field set from the normalized payload itself:
-        // a hand-kept field list fails OPEN when a payload field is added, letting
-        // unvalidated text reach a durable claim.
+        // Normalized anti-memory payloads determine the fields that require validation.
+        // A hand-kept list does not automatically validate newly added string fields.
+        // Omitting validation lets a claim persist that field's text.
         const fields =
             learning.route === "anti_memory"
                 ? Object.values(normalizeAntiMemoryPayload(learning.payload)).filter(
@@ -262,8 +243,6 @@ export function applyRetrospectiveLearnings(args: {
     for (const learning of args.learnings) {
         if (learning.route === "anti_memory") {
             manifest.push({
-                // Normalization pins every payload field (absent optionals become
-                // null), so the manifest shape cannot drift from the payload type.
                 payload: { ...normalizeAntiMemoryPayload(learning.payload) },
                 route: learning.route,
             });

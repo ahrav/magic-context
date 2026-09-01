@@ -1,17 +1,11 @@
 /**
- * Benchmark-owned canonical JSON (KTD6).
  *
- * `stableStringify` in src/shared documents itself as process-local and
- * explicitly not a cross-runtime canonical serializer, so fingerprints that
- * gate release approval get their own stricter codec instead of widening that
  * contract.
  *
- * Rules: UTF-8 encoding, recursively sorted object keys (UTF-16 code-unit
- * order — deterministic across runtimes, though it differs from code-point
- * order for astral-plane keys), preserved array order, JSON number formatting
- * restricted to finite values, and no undefined anywhere (absent fields must
- * be omitted by the caller, never carried as undefined). Strings pass through
- * JSON.stringify escaping, so newlines are always encoded as \n.
+ * Canonical JSON uses UTF-8 bytes and sorts object keys recursively by UTF-16 code-unit order.
+ * Canonical JSON preserves array order and uses JSON.stringify number formatting.
+ * canonicalize rejects undefined array elements and enumerable string-keyed object fields.
+ * canonicalJson serializes newline characters as `\n`.
  */
 
 import { createHash } from "node:crypto";
@@ -22,9 +16,7 @@ export class CanonicalJsonError extends Error {}
 export type CanonicalJsonFileFailure = "unreadable" | "invalid-json" | "non-canonical-bytes";
 
 /**
- * `JSON.parse` retains only the last duplicate member; the byte comparison
- * rejects input containing duplicate members. commentlint: allow(JUDGE)
- * Use `onFailure` to preserve caller-specific errors.
+ * `JSON.parse` retains only the last duplicate member; the byte comparison rejects input containing duplicate members.
  */
 export function readCanonicalJsonFile(
     path: string,
@@ -65,8 +57,8 @@ function canonicalize(value: unknown, path: string): string {
             throw new CanonicalJsonError(`unsupported ${typeof value} at ${path}`);
     }
     if (Array.isArray(value)) {
-        // Index loop, not .map: map skips holes in sparse arrays and join
-        // would serialize them as empty slots ("[1,,3]" — malformed JSON).
+        // The index loop visits sparse-array holes, which Array.prototype.map skips.
+        // Joining mapped sparse-array values would emit empty JSON array slots such as `[1,,3]`.
         // Indexing a hole yields undefined, which canonicalize rejects.
         const items: string[] = [];
         for (let i = 0; i < value.length; i += 1) {
@@ -91,12 +83,12 @@ function canonicalize(value: unknown, path: string): string {
     return `{${parts.join(",")}}`;
 }
 
-/** Serialize to the benchmark canonical JSON form. Throws on non-JSON input. */
+/** canonicalJson throws CanonicalJsonError for unsupported value types, non-finite numbers, undefined array elements or enumerable string-keyed object fields, and non-plain objects. */
 export function canonicalJson(value: unknown): string {
     return canonicalize(value, "$");
 }
 
-/** SHA-256 hex fingerprint over the UTF-8 bytes of the canonical JSON form. */
+/* */
 export function canonicalFingerprint(value: unknown): string {
     return createHash("sha256").update(Buffer.from(canonicalJson(value), "utf8")).digest("hex");
 }

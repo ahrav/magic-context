@@ -70,8 +70,7 @@ function printReport(report: IdentityMergeReport): void {
 }
 
 function openMergeDatabase(path: string, mutate: boolean): Database {
-    // Do not run schema migrations here: a running OpenCode/Pi process may
-    // enforce an older maximum schema version, so a doctor write must use the current schema or stop.
+    // The opener must not run migrations because a running OpenCode/Pi process may enforce an older maximum schema version.
     const db = mutate
         ? openExistingContextDatabaseForMutation(path)
         : openExistingContextDatabase(path, { readonly: true });

@@ -1,29 +1,28 @@
 /**
- * Benchmark harness runner and matrix lifecycle (U5).
  *
- * Executes one versioned profile against one reviewed release: seeds the
- * production-shaped fixture snapshots, runs every enumerated case through
- * the REAL explicit and automatic retrieval surfaces, and assembles one
- * strict validated report.
+ * The runner executes each profile case against a reviewed release.
+ * The runner seeds production-shaped fixture snapshots before execution.
+ * The runner exercises the explicit and automatic retrieval surfaces for every enumerated case.
+ * The runner produces one strictly validated report.
  *
  * Contract highlights:
- * - Policy latency comes from trace-disabled external root timing only; a
- *   paired trace-enabled pass supplies stage decomposition and never enters
- *   the latency samples (KTD15).
- * - Concurrency is closed-loop: a fixed worker count, each worker with its
- *   own read-only connection, issuing the next query only after the
- *   previous one completes (KTD9).
- * - Cache layers (process-vector, connection/prepared-statement,
- *   SQLite-page, OS-page) are tracked separately with per-sample reset/hit
- *   evidence; any transition inside a case rejects the case (KTD9).
- * - Every completed case is committed as an atomic canonical-JSON
- *   checkpoint; resume requires exact release/config/case-set/build/
- *   instrumentation/host identity and fails closed otherwise (KTD11).
- * - A missing required cell leaves the run incomplete; the matrix is never
+ * Policy latency uses trace-disabled external root timing.
+ * A paired trace-enabled pass provides stage decomposition.
+ * Trace-enabled passes do not contribute latency samples.
+ * Concurrency uses a fixed worker count.
+ * Each worker uses its own read-only connection.
+ * Each worker issues its next query only after its previous query completes.
+ * The runner tracks process-vector, connection/prepared-statement, SQLite-page, and OS-page caches separately.
+ * The runner records reset/hit evidence for every cache layer on every sample.
+ * A cache-layer transition within a case rejects that case.
+ * The runner commits every completed case as an atomic canonical-JSON checkpoint.
+ * Resume requires identical release, config, case-set, build, instrumentation, and host identities.
+ * Resume fails closed when any required identity differs.
+ * A missing required cell leaves the run incomplete.
  *   silently shrunk.
  *
- * Dependency direction (KTD16): only this module and the seeder import
- * production execution adapters; the pure contract modules stay on DTOs.
+ * Only this module and the seeder import production execution adapters.
+ * Pure contract modules use DTOs.
  */
 
 import { createHash } from "node:crypto";
@@ -107,9 +106,8 @@ import { TIMING_POLICY_VERSION, summarizeLatency, traceTimingEvidence } from "./
 export const RUNNER_VERSION = "retrieval-benchmark-runner/v1";
 export const CHECKPOINT_SCHEMA_VERSION = "retrieval-benchmark-checkpoint/v1";
 
-/** Source directories whose contents determine measured behavior: the
- *  harness itself plus every production module the measured path executes.
- *  Over-approximating (whole directories) errs toward fail-closed resume. */
+/**
+ * */
 const BUILD_SOURCE_DIRS = [
     "scripts/retrieval-benchmark",
     "src/features/magic-context",
@@ -118,19 +116,14 @@ const BUILD_SOURCE_DIRS = [
     "src/shared",
 ] as const;
 const BUILD_SOURCE_FILES = ["scripts/benchmark-retrieval.ts"] as const;
-/** Dependency identity, relative to the workspace root: a lockfile change
- *  (tokenizer, sqlite driver) alters measured behavior without touching
- *  any hashed TypeScript path, so it must invalidate checkpoints too. */
+/**
+ * */
 const BUILD_DEPENDENCY_FILES = ["bun.lock", "packages/plugin/package.json"] as const;
 
 let cachedBuildFingerprint: string | null = null;
 
-/** Content identity of the code that produces case evidence (KTD11).
- *  `RUNNER_VERSION` alone is hand-maintained: editing ranking code or the
- *  harness without bumping it would let a resume silently mix stale
- *  checkpointed evidence into one report. Hashing the source surfaces makes
- *  any code change invalidate checkpoints without human discipline. Test
- *  and fixture files are excluded — they cannot change measured behavior. */
+/**
+ * */
 function buildFingerprint(): string {
     if (cachedBuildFingerprint !== null) return cachedBuildFingerprint;
     const packageRoot = new URL("../../", import.meta.url).pathname;
@@ -155,20 +148,12 @@ function buildFingerprint(): string {
     return cachedBuildFingerprint;
 }
 
-/** Fused-ranking evaluation depth (R53). Derived from the production
- *  result-limit ceiling: `normalizeSearchResultLimit` silently clamps
- *  larger limits, so an unlinked literal here would let a production
- *  ceiling change shorten ranked lists while metrics kept evaluating at
- *  the old depth — a manufactured quality regression. */
+/**
+ * */
 export const EVALUATION_DEPTH = MAX_SEARCH_RESULT_LIMIT;
 
-/** Automatic-delivery score threshold calibrated to the deterministic
- *  IDF-weighted hash embedder, whose similarity scale differs from the
- *  production model's (production defaults to 0.6). The gating MECHANISM is
- *  identical — `executeAutoSearchDelivery` compares the top fused score —
- *  and this value separates the fixture's relevant-target scores (0.17+)
- *  from its synthetic-noise ceiling (~0.12). Recorded in the fingerprinted
- *  semantic config, so runs under different thresholds never compare. */
+/**
+ * */
 const DEFAULT_AUTO_SCORE_THRESHOLD = 0.15;
 const DEFAULT_AUTO_TIMEOUT_MS = 3_000;
 const CONSERVATION_TOLERANCE_MS = 1e-6;
@@ -182,7 +167,7 @@ export class RunnerError extends Error {
     }
 }
 
-/** Thrown by test hooks to simulate a host interruption between cases. */
+/* */
 export class RunnerInterrupt extends Error {}
 
 export interface OsPageEvictionOutcome {
@@ -198,30 +183,30 @@ export interface CacheHooks {
 }
 
 export interface RunnerHooks {
-    /** Injected monotonic clock for samples, traces, and seed timing. */
+    /** `now` must be monotonic because samples, traces, and seed timing measure elapsed durations. */
     now?: () => number;
-    /** Injected wall clock for attempt records. */
+    /** `epochNow` records wall-clock attempt timestamps; elapsed measurements use `now`. */
     epochNow?: () => number;
     cache?: Partial<CacheHooks>;
-    /** Called after each case checkpoint commits; tests throw
-     *  `RunnerInterrupt` here to simulate a host stop between cases. */
+    /** Tests throw `RunnerInterrupt` after each case checkpoint commits to simulate a host interruption between cases.
+     * */
     onCaseCheckpointed?: (caseId: string) => void;
-    /** Preflight override; defaults to the actual host. */
+    /** `hostResources` overrides preflight host detection; otherwise the runner uses the actual host. */
     hostResources?: HostResources;
 }
 
 export interface RunBenchmarkOptions {
     release: ReviewedRelease;
     profile: BenchmarkProfile;
-    /** Per-invocation scratch directory for fixture databases. */
+    /** The runner uses `workDir` for per-invocation fixture databases. */
     workDir: string;
-    /** Persistent checkpoint directory; enables atomic case commits and
-     *  compatible resume. Omit for a single-shot run without checkpoints. */
+    /** `checkpointDir` enables atomic case commits and compatible resume; omitting it runs without checkpoints.
+     * */
     checkpointDir?: string;
     autoScoreThreshold?: number;
     autoTimeoutMs?: number;
-    /** Defaults to `profile.host.class !== "ci"`: reference hosts must prove
-     *  OS-page eviction, CI records a not-attempted layer instead. */
+    /** `requireOsPageEvictionProof` defaults to `profile.host.class !== "ci"`; reference hosts require proof and CI records a not-attempted layer.
+     * */
     requireOsPageEvictionProof?: boolean;
     hooks?: RunnerHooks;
 }
@@ -248,7 +233,7 @@ interface CaseResultRecord {
     caseId: string;
     scenarios: ReportScenario[];
     caseEvidence: CaseEvidence;
-    /** Per raw query id: evaluation-depth ranking for the candidate pool. */
+    /** The candidate pool stores an evaluation-depth ranking for each raw query ID. */
     candidateRankings: Array<{ queryId: string; ranked: string[] }>;
 }
 
@@ -268,8 +253,7 @@ function defaultCacheHooks(): CacheHooks {
         primeProcessVector: (db, projectScope, modelId) => {
             primeMemoryVectorCache(db, projectScope, modelId);
         },
-        // No privileged OS cache-eviction mechanism ships with the harness;
-        // controlled hosts must supply one, CI records not-attempted.
+        // Controlled hosts must supply a privileged OS cache-eviction mechanism; CI records the layer as not attempted.
         evictOsPageCache: () => ({ attempted: false, proof: null }),
     };
 }
@@ -281,7 +265,7 @@ function detectHostResources(workDir: string): HostResources {
         const stats = statfsSync(workDir);
         availableDiskBytes = stats.bavail * stats.bsize;
     } catch {
-        // statfs unavailable on this platform: preflight still checks memory.
+        // When `statfs` is unavailable, preflight still checks memory.
     }
     return {
         totalMemoryBytes: totalmem(),
@@ -297,12 +281,9 @@ function hostFingerprint(): string {
         cpuModel: cpus()[0]?.model ?? "unknown",
         cpuCount: cpus().length,
         totalMemoryBytes: totalmem(),
-        // Runs under different runtimes are not latency-comparable, so the
-        // runtime version participates in host identity.
+        // The runtime version participates in host identity because latency results from different runtimes are not comparable.
         runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.version}`,
-        // Hardware-class attributes alone collide across same-spec machines
-        // in a runner group; the hostname pins the actual machine so
-        // exact-host latency checks cannot mix physical hosts.
+        // `hostname` participates in host identity so exact-host latency checks reject reports from different hostnames.
         hostname: hostname(),
     });
 }
@@ -314,7 +295,7 @@ function atomicWrite(path: string, text: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// KTD9 cache-layer lifecycle.
+// Cache-layer lifecycle.
 // ---------------------------------------------------------------------------
 
 interface LayerEvidence {
@@ -330,8 +311,8 @@ class CaseCacheController {
     readonly freshConnectionPerSample: boolean;
     private readonly layers: LayerEvidence[];
     private readonly processVector: LayerEvidence;
-    /** Set by beforeSample for warm-declared cases; consumed by
-     *  warmSampleReady once a connection exists to re-prime against. */
+    /**
+     * */
     private warmVerifyDue = false;
 
     constructor(
@@ -346,26 +327,17 @@ class CaseCacheController {
         },
     ) {
         const state = profileCase.cacheState;
-        // Prepared statements and the SQLite page cache both live on the
-        // connection in this runtime, so their declared states must agree:
-        // a fresh connection resets both or neither.
         if (state.connectionStatement !== state.sqlitePage) {
             throw new RunnerError([
                 `case ${profileCase.id}: connectionStatement and sqlitePage states must agree in-process`,
             ]);
         }
-        // With concurrency > 1, another worker can repopulate the shared processVector cache between invalidation and measurement, so cold samples require one worker (KTD9). commentlint: allow(JUDGE)
-        // The guard applies only when the memory lane can touch that cache;
-        // a case whose lanes exclude memory never reads it, so the race it
-        // prevents cannot occur.
+        // With concurrency > 1, another worker can repopulate the shared processVector cache between invalidation and measurement, so cold samples require one worker.
         if (state.processVector === "cold" && profileCase.concurrency > 1 && ctx.memoryLaneActive) {
             throw new RunnerError([
                 `case ${profileCase.id}: cold processVector requires concurrency 1 (a concurrent worker can re-warm the shared process cache between invalidate and sample)`,
             ]);
         }
-        // Same shared-resource race for the OS page cache: every worker
-        // reads the same snapshot file, so one worker's eviction is undone
-        // by any concurrent worker's read before the measured query runs.
         if (state.osPage === "cold" && profileCase.concurrency > 1) {
             throw new RunnerError([
                 `case ${profileCase.id}: cold osPage requires concurrency 1 (a concurrent worker re-warms the shared page cache between eviction and sample)`,
@@ -422,11 +394,6 @@ class CaseCacheController {
             this.processVector.status !== "not-applicable" &&
             this.processVector.declared === "warm"
         ) {
-            // The process vector cache keys on (projectScope, modelId),
-            // which every fixture shares: without this invalidation a warm
-            // case can inherit the PREVIOUS fixture's vectors (wrong dims)
-            // through the cache TTL and score every cosine at zero. Cold
-            // cases invalidate before every measured sample instead.
             this.cache.invalidateProcessVector(this.ctx.projectScope);
             this.cache.primeProcessVector(db, this.ctx.projectScope, this.ctx.modelId);
             this.verifyWarmProcessVector("case-start");
@@ -449,9 +416,9 @@ class CaseCacheController {
         }
     }
 
-    /** Called once per measured sample, right after its connection opens.
-     *  Warmups, the evaluation pass, and the traced diagnostic pass open
-     *  connections too, but only measured samples are reset evidence. */
+    /** The runner invokes the reset hook once per measured sample, immediately after opening its connection.
+     * Warmups, the evaluation pass, and the traced diagnostic pass also open connections.
+     * The runner records reset evidence only for measured samples. */
     measuredConnectionOpened(): void {
         if (this.freshConnectionPerSample) {
             this.layers[1].resets += 1;
@@ -460,9 +427,9 @@ class CaseCacheController {
     }
 
     beforeSample(queryTouchesMemory: boolean): void {
-        // Warmups and earlier samples repopulate the page cache, so a cold
-        // OS-page declaration requires eviction before EVERY measured
-        // sample, not just at case start.
+        // Warmups and earlier samples repopulate the OS page cache.
+        // Cold osPage cases evict the OS page cache before every measured sample.
+        // Evicting only at case start does not preserve a cold OS page cache.
         this.evictOsPageIfCold();
         if (this.processVector.status === "not-applicable") return;
         if (this.processVector.declared === "cold") {
@@ -473,10 +440,10 @@ class CaseCacheController {
         if (queryTouchesMemory) this.warmVerifyDue = true;
     }
 
-    /** Runs once a connection is available, before the timed section. The
-     *  production embedding cache expires entries by TTL without extending
-     *  on hits, so a case outliving the TTL must re-prime to keep its
-     *  declared warm state instead of failing mid-case. */
+    /** warmSampleReady runs after a connection is available and before timing begins.
+     * The production embedding cache expires entries after TTL without extending expiry on hits.
+     * Cases that outlive TTL must re-prime the embedding cache to preserve warm state.
+     * Without re-priming, the embedding-cache warm-state check can fail mid-case. */
     warmSampleReady(db: Database, queryTouchesMemory: boolean): void {
         if (!this.warmVerifyDue) return;
         this.warmVerifyDue = false;
@@ -515,7 +482,6 @@ class CaseCacheController {
 }
 
 // ---------------------------------------------------------------------------
-// Mode execution through the production surfaces.
 // ---------------------------------------------------------------------------
 
 interface DeliveryOutcome {
@@ -532,8 +498,8 @@ interface QueryExecutionContext {
     dims: number;
     autoScoreThreshold: number;
     autoTimeoutMs: number;
-    /** Corpus-content IDF weights shared with the seeded document vectors;
-     *  queries and documents must embed in one token-weight space. */
+    /** Queries and seeded documents must use the same corpus-content IDF weights to share a token-weight space.
+     * */
     tokenWeights: ReadonlyMap<string, number>;
     observedEmbedPurposes: Set<"query" | "passage">;
 }
@@ -541,9 +507,7 @@ interface QueryExecutionContext {
 function effectiveSources(ctx: QueryExecutionContext): SearchSource[] | undefined {
     const base: readonly SearchSource[] | null =
         ctx.query.mode === "automatic" ? AUTO_SEARCH_SOURCES : ctx.query.sourceFilters;
-    // The case's lane axis and its selectivity predicate both narrow the
-    // executed source set: the preflight validates cardinalities for the
-    // declared predicate, so the measured search must run under it (R58).
+    // The measured search must run under the declared predicate.
     let sources: readonly SearchSource[] | null = base;
     for (const narrower of [
         ctx.profileCase.sourceLanes,
@@ -560,9 +524,8 @@ function effectiveMessageCutoff(ctx: QueryExecutionContext): number | undefined 
     const caseCutoff = ctx.profileCase.selectivity.predicate.messageOrdinalCutoff;
     const queryCutoff = ctx.query.visibleState.messageOrdinalCutoff;
     if (ctx.query.mode === "automatic") {
-        // The production automatic path searches all indexed history; a
-        // case predicate that narrows it could not execute through the
-        // real surface, so it is rejected instead of silently honored.
+        // The production automatic path searches all indexed history.
+        // The runner rejects predicates that narrow indexed history because the production automatic path cannot execute them.
         if (caseCutoff !== null) {
             throw new RunnerError([
                 `case ${ctx.profileCase.id}: automatic mode cannot narrow the message ordinal`,
@@ -589,13 +552,9 @@ function buildSearchOptions(
         measurementDisabled: true,
         embeddingModelIdOverride: BENCHMARK_EMBEDDING_MODEL_ID,
         chunkModelIdOverride: BENCHMARK_EMBEDDING_MODEL_ID,
-        // A raw Float32Array bypasses the generation contract: the benchmark
-        // project is never registered in the project embedding registry, so
-        // a CapturedQueryEmbedding (generation-bearing) would always compare
-        // against a null snapshot and be discarded as stale, silencing every
-        // semantic scoring lane. Model ids come from the overrides above.
-        // The purpose argument never changes the returned vector: reports
-        // that differ only in purpose stay quality-comparable.
+        // A raw Float32Array bypasses the generation contract because the benchmark project is never registered in the project embedding registry.
+        // The purpose argument does not change the returned vector.
+        // Reports that differ only in purpose remain quality-comparable.
         embedQuery: async (text, _signal, purpose) => {
             ctx.observedEmbedPurposes.add(purpose ?? "passage");
             return deterministicTextVector(text, dims, ctx.tokenWeights);
@@ -611,8 +570,8 @@ function buildSearchOptions(
     return options;
 }
 
-/** One production-shaped delivery execution: search plus packing. A search
- *  failure propagates as a thrown error — incomplete evidence (AE8). */
+/**
+ * A search failure propagates as a thrown error. */
 async function executeDelivery(
     db: Database,
     ctx: QueryExecutionContext,
@@ -627,9 +586,7 @@ async function executeDelivery(
             searchOptions: buildSearchOptions(ctx, trace ? { trace } : {}),
             scoreThreshold: ctx.autoScoreThreshold,
             timeoutMs: ctx.autoTimeoutMs,
-            // Pinned pack clock: live Date.now() would render different age
-            // strings (and token counts) for the same fingerprinted scenario
-            // on different days.
+            // `packNowMs` uses `referenceTimeMs` so the same fingerprinted scenario renders identical age strings and token counts on different days.
             packNowMs: ctx.query.referenceTimeMs,
         });
         if (delivery.status === "incomplete") {
@@ -659,8 +616,8 @@ async function executeDelivery(
     return { reason: packed.reason, delivered: packed.delivered, tokenCount: packed.tokenCount };
 }
 
-/** Fused ranking at the evaluation depth through the same surface options,
- *  with only the returned-result limit widened to the production ceiling. */
+/** The evaluation uses fused ranking at the evaluation depth and widens only the returned-result limit to the production ceiling.
+ * */
 async function executeEvaluation(db: Database, ctx: QueryExecutionContext): Promise<string[]> {
     const results = await unifiedSearch(
         db,
@@ -680,8 +637,8 @@ interface RunContext {
     release: ReviewedRelease;
     profile: BenchmarkProfile;
     now: () => number;
-    /** Absolute now()-domain instant when the attempt's wall-time budget
-     *  (seeding included) expires; sample loops check it between samples. */
+    /** The deadline is an absolute now()-domain instant when the attempt's wall-time budget, including seeding, expires; sample loops check it between samples.
+     * */
     deadlineAtMs: number;
     cache: CacheHooks;
     autoScoreThreshold: number;
@@ -726,12 +683,8 @@ function buildScenario(
         scope,
         ctx.release.aliasIndex,
     );
-    // Automatic quality is the thresholded delivery outcome: production
-    // users only ever see what executeAutoSearchDelivery delivers, so a
-    // change that preserves ordering while pushing every score below the
-    // auto threshold must register as a quality regression instead of
-    // passing through the unthresholded evaluation ranking. Explicit mode
-    // keeps evaluation-depth metrics — its users page through results.
+    // Automatic-mode quality uses the thresholded `executeAutoSearchDelivery` outcome.
+    // A score change that pushes every result below `autoScoreThreshold` is a quality regression even when it preserves ranking.
     const metricResolved = query.mode === "automatic" ? deliveredResolved : resolved;
     const queryMetrics = computeQueryMetrics({
         queryId: query.id,
@@ -812,9 +765,8 @@ interface QueryScenarioOutcome {
     tracedSpans: SearchTraceSpan[];
 }
 
-/** Per-query progress owned by exactly one worker at a time: the case
- *  scheduler passes a state between workers one unit (warmup or sample) at a
- *  time, so no lock guards these fields. */
+/** The case scheduler gives each query state to one worker for each warmup or sample, so these fields need no lock.
+ * */
 interface QueryRunState {
     qctx: QueryExecutionContext;
     queryTouchesMemory: boolean;
@@ -844,9 +796,8 @@ function checkCaseDeadline(ctx: RunContext, profileCase: ProfileCase): void {
     }
 }
 
-/** One warmup delivery for the query; returns true when its warmups are
- *  complete. All warmups and connection primers finish behind the phase
- *  barrier in executeCase before any measured sample is scheduled. */
+/**
+ * Warmups and connection primers finish before any measured sample is scheduled. */
 async function executeWarmupUnit(
     ctx: RunContext,
     profileCase: ProfileCase,
@@ -864,12 +815,11 @@ async function executeWarmupUnit(
     return state.warmupsDone >= ctx.profile.runtime.warmups;
 }
 
-/** One measured sample. The case scheduler interleaves queries at this
- *  granularity so every worker stays busy for the whole measurement window
- *  and samples are taken at the declared concurrency; whole-query
- *  scheduling would let the case tail run below the declared load while
- *  still pooling those samples into the concurrency cell. Returns true when
- *  the query's sampling is complete. */
+/**
+ * The case scheduler interleaves queries by sample to maintain declared concurrency until no samples remain.
+ * Whole-query scheduling would let the case tail run below the declared concurrency.
+ * Whole-query scheduling would pool below-load tail samples into the declared concurrency cell.
+ * */
 async function executeSampleUnit(
     ctx: RunContext,
     profileCase: ProfileCase,
@@ -894,9 +844,7 @@ async function executeSampleUnit(
     }
     controller.afterSample(queryTouchesMemory);
     state.lastDelivery = delivery;
-    // Measured samples must agree on the user-visible outcome: keeping
-    // only the last sample's outcome would let a case with intermittent
-    // timeouts report a normal delivery.
+    // Measured samples must have the same delivery reason; otherwise intermittent timeouts could report a normal delivery.
     if (state.firstDelivery === null) {
         state.firstDelivery = delivery;
     } else if (delivery.reason !== state.firstDelivery.reason) {
@@ -907,8 +855,8 @@ async function executeSampleUnit(
     return state.latencySamplesMs.length >= ctx.profile.runtime.samples;
 }
 
-/** Evaluation and traced-diagnostic passes after a query's last measured
- *  sample; neither is a latency-policy sample. */
+/** Evaluation and traced-diagnostic passes run after the last measured sample and are not latency-policy samples.
+ * */
 async function finalizeQueryScenario(
     ctx: RunContext,
     profileCase: ProfileCase,
@@ -916,19 +864,16 @@ async function finalizeQueryScenario(
     conn: ConnectionLease,
     state: QueryRunState,
 ): Promise<QueryScenarioOutcome> {
-    // The wall-time budget bounds the whole attempt; diagnostics are not
-    // exempt or a slow evaluation phase could run arbitrarily far past it.
+    // The wall-time budget applies to diagnostics; otherwise slow evaluation could run arbitrarily beyond it.
     checkCaseDeadline(ctx, profileCase);
     const { qctx, queryTouchesMemory } = state;
     if (!state.lastDelivery) {
         throw new RunnerError([`query ${qctx.query.id}: no measured sample`]);
     }
 
-    // The last measured sample leaves every cache layer warm; a cold cell's
-    // declared state is re-established before EACH diagnostic pass or its
-    // evaluation ranking (selectSemanticCandidates widens from the lexical
-    // subset to every cached embedding on a warm process cache) and its
-    // stage decomposition would describe a warm execution.
+    // Each diagnostic pass re-establishes a cold cell's declared cache state because the last measured sample leaves every cache layer warm.
+    // A warm process cache lets selectSemanticCandidates widen evaluation ranking beyond the lexical subset.
+    // Without re-establishing cold state, stage decomposition would describe a warm execution.
     controller.beforeSample(queryTouchesMemory);
     const evalDb = conn.acquire();
     let ranked: string[];
@@ -939,8 +884,7 @@ async function finalizeQueryScenario(
         conn.release(evalDb);
     }
 
-    // Paired trace-enabled diagnostic pass (KTD15): stage
-    // decomposition only, never a latency-policy sample.
+    // The paired trace-enabled diagnostic pass provides stage decomposition only and is not a latency-policy sample.
     controller.beforeSample(queryTouchesMemory);
     const tracedSpans: SearchTraceSpan[] = [];
     const traceDb = conn.acquire();
@@ -973,8 +917,8 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     const projectScope = primaryScope(ctx.release);
     const predicate = profileCase.selectivity.predicate;
 
-    // Selectivity cells execute through the production message index; the
-    // observed cardinalities must match the declared recipe (R58).
+    // Selectivity cells execute through the production message index.
+    // Observed cardinalities must match the declared recipe.
     let selectivityObserved: { preFilterDenominator: number; eligibleCount: number };
     {
         const db = openFixtureSnapshot(fixture.snapshotPath);
@@ -997,11 +941,9 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     }
 
     const queries = ctx.release.corpus.queries.filter((query) => query.mode === profileCase.mode);
-    // Scope is the one predicate field the executed search cannot merge: a
-    // query runs under its own fixture scope, so a mismatch means the
-    // preflight validated cardinalities for a workload no query executes.
-    // Session scope compares exactly: measureMessageSelectivity resolves a
-    // null scope to the concrete fallback session, never a wildcard.
+    // Each query runs under its own fixture scope because scope is the predicate field the executed search cannot merge.
+    // A scope mismatch means preflight validated cardinalities for a workload that no query executes.
+    // measureMessageSelectivity resolves a null session scope to the concrete fallback session, not a wildcard.
     for (const query of queries) {
         const scopeMismatch =
             predicate.projectScope !== query.fixtureScope.projectScope ||
@@ -1012,10 +954,9 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             ]);
         }
     }
-    // The lane axis and the predicate's sources both narrow execution;
-    // cache setup and evidence must describe the final effective set, or a
-    // warm case would prime (and a cold case would serialize on) a memory
-    // cache no executed search can touch.
+    // The lane axis and predicate sources both narrow the effective execution set.
+    // Cache setup and evidence must describe the final effective set.
+    // Otherwise, a warm case could prime a memory cache that no executed search can touch.
     const lanes = profileCase.sourceLanes;
     const caseSources = profileCase.selectivity.predicate.sources;
     const laneExecutes = (lane: SearchSource): boolean =>
@@ -1043,13 +984,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         }
     }
 
-    // Sample-granularity round-robin across three barriered phases: all
-    // priming and warmups finish before any measured sample, all measured
-    // samples finish before any evaluation or traced diagnostic. A query
-    // re-enters its phase queue after each unit, so all workers stay busy
-    // and measured samples always compete with exactly the declared number
-    // of measured requests — never with warmups, primers, top-50
-    // evaluations, or traced searches.
+    // Barrier phases prevent measured samples from competing with priming, warmups, evaluation, or traced diagnostics.
     const states: QueryRunState[] = queries.map((query) =>
         newQueryRunState({
             query,
@@ -1092,13 +1027,9 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         };
     };
 
-    // One connection set shared across the phases: the connections primed
-    // and warmed in phase 1 are the ones that measure in phase 2.
+    // Workers share one ConnectionLease set across phases; persistent connections retain phase-1 warming for phase 2.
     const workerConns = Array.from({ length: profileCase.concurrency }, () => makeWorkerConn());
-    // allSettled, never all: a worker failing (RunnerInterrupt at the
-    // deadline) must not let the finally below close connections that
-    // sibling workers are still using mid-await. Every worker settles
-    // first; the first failure then propagates.
+    // Promise.allSettled waits for every worker before propagating a rejection, so cleanup cannot close connections still in use.
     const runPhase = async (worker: (conn: ConnectionLease) => Promise<void>): Promise<void> => {
         const results = await Promise.allSettled(workerConns.map(({ conn }) => worker(conn)));
         const failure = results.find(
@@ -1108,10 +1039,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     };
 
     try {
-        // Phase 1: priming and warmups. Query-level warmups prime the
-        // shared process and OS caches; prepared statements and the SQLite
-        // page cache live on each worker's persistent connection, so each
-        // worker also primes its own connection with one untimed delivery.
+        // Query warmups prime shared caches. When connections persist, each worker primes its own connection with one untimed delivery.
         const warming: QueryRunState[] =
             ctx.profile.runtime.warmups > 0 ? [...states] : [];
         await runPhase(async (conn) => {
@@ -1125,8 +1053,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                 }
             }
             for (;;) {
-                // shift/push are synchronous, so a state is owned by exactly
-                // one worker between dequeue and requeue.
+                // Synchronous shift and push give each state exactly one worker owner between dequeue and requeue.
                 const state = warming.shift();
                 if (!state) return;
                 const warmupsComplete = await executeWarmupUnit(ctx, profileCase, conn, state);
@@ -1134,7 +1061,6 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             }
         });
 
-        // Phase 2: measured samples only.
         const sampling: QueryRunState[] = [...states];
         const readyToFinalize: QueryRunState[] = [];
         await runPhase(async (conn) => {
@@ -1156,7 +1082,6 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             }
         });
 
-        // Phase 3: evaluation and traced diagnostics.
         await runPhase(async (conn) => {
             for (;;) {
                 const state = readyToFinalize.shift();
@@ -1184,8 +1109,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     const orderedScenarios = queries
         .map((query) => scenarios.get(query.id))
         .filter((scenario): scenario is ReportScenario => scenario !== undefined);
-    // R27 diagnostic summary over this case's trace-disabled samples; the
-    // regression policy recomputes its percentiles from the raw samples.
+    // The diagnostic summary uses this case's trace-disabled samples; regression percentiles are recomputed from raw samples.
     const caseSamplesMs = orderedScenarios.flatMap((scenario) => scenario.latencySamplesMs);
     let latencySummary: CaseEvidence["latencySummary"] = null;
     if (caseSamplesMs.length > 0) {
@@ -1197,11 +1121,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             p95Ms: summary.p95Ms,
         };
     }
-    // R52: lanes narrower than the mode's full source set stay diagnostic;
-    // report aggregation keeps them out of gate macro-averages. Restriction
-    // is computed from the FINAL effective source set — the predicate's
-    // sources narrow execution exactly like the lane axis, so a case whose
-    // predicate drops lanes must not enter gate aggregates as full-surface.
+    // Lanes narrower than the final effective source set remain diagnostic and are excluded from gate macro-averages.
     const fullLanes: readonly SearchSource[] =
         profileCase.mode === "automatic" ? AUTO_SEARCH_SOURCES : SOURCE_FILTERS;
     const predicateSources = profileCase.selectivity.predicate.sources;
@@ -1241,7 +1161,6 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
 }
 
 // ---------------------------------------------------------------------------
-// Run lifecycle: identity, checkpoints, resume, and report assembly.
 // ---------------------------------------------------------------------------
 
 function seedAllFixtures(
@@ -1261,10 +1180,8 @@ function seedAllFixtures(
             throw new RunnerError([`fixture ${key}: no synthetic profile for scale`]);
         }
         const fixtureDir = join(workDir, "fixtures", key);
-        // Fixtures are deterministic derivations of the release, so a
-        // leftover directory (interrupted run resumed with the same
-        // --work-dir) is safely discarded and re-seeded; seedFixture
-        // refuses to write into a non-empty directory.
+        // Because fixtures are deterministic release derivations, a leftover --work-dir is discarded and re-seeded.
+        // seedFixture rejects non-empty directories.
         rmSync(fixtureDir, { recursive: true, force: true });
         const result: SeedResult = seedFixture(
             {
@@ -1365,8 +1282,6 @@ function loadCheckpoints(
             raw.schemaVersion !== CHECKPOINT_SCHEMA_VERSION ||
             raw.identityFingerprint !== identityFingerprint
         ) {
-            // AE10: resume across a different release, config, case set,
-            // build, instrumentation, or host fails closed.
             throw new RunnerError(["checkpoint: incompatible-resume"]);
         }
         priorAttempts.push(...(raw.attempts ?? []));
@@ -1410,17 +1325,14 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     const preflight = checkHostResources(options.profile, host);
     if (!preflight.ok) throw new RunnerError([...preflight.diagnostics]);
 
-    // The wall-time budget covers the whole attempt, eager fixture seeding
-    // included — setup on a slow host consumes budget the cases no longer
+    // The wall-time budget includes eager fixture seeding.
+    // Setup on a slow host reduces the time available to cases.
     // have.
     const runStartMs = now();
     const deadlineAtMs = runStartMs + options.profile.runtime.maxWallTimeMs;
 
-    // Fixtures are seeded eagerly for the whole case set so the semantic
-    // config carries every deterministic fixture fingerprint regardless of
-    // where a resume picks up.
-    // ponytail: resume re-seeds all fixtures; skip fixtures whose cases are
-    // all checkpointed if reference-scale resume time ever matters.
+    // Fixtures are seeded eagerly so the semantic config includes every fixture fingerprint.
+    // The semantic config includes every deterministic fixture fingerprint regardless of resume position.
     const fixtures = seedAllFixtures(options.release, options.profile, options.workDir, now);
     const semanticConfig = buildSemanticConfig(options, fixtures, autoScoreThreshold, autoTimeoutMs);
 
@@ -1472,9 +1384,8 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     try {
         for (const profileCase of options.profile.cases) {
             if (completed.has(profileCase.id)) continue;
-            // The declared wall-time budget bounds the whole attempt; cases
-            // checkpointed so far stay valid and a compatible resume
-            // continues from here.
+            // Checkpointed cases remain valid for a compatible resume.
+            // A compatible resume runs the remaining cases.
             if (now() > deadlineAtMs) {
                 attemptStatus = "interrupted";
                 diagnostics.push(
@@ -1536,7 +1447,6 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         );
     }
 
-    // Report assembly over profile order, retaining every attempt (R60).
     const expectedQueryIds: string[] = [];
     const scenarios: ReportScenario[] = [];
     const caseEvidences: CaseEvidence[] = [];
@@ -1556,12 +1466,10 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         scenarios.push(...record.scenarios);
         caseEvidences.push(record.caseEvidence);
         for (const entry of record.candidateRankings) {
-            // Candidate pooling unions every eligible case's ranking: later
-            // full-lane cases run different scales, dims, cache states, and
-            // candidate depths, so their top-K can surface identities no
-            // earlier case ranked. A lane-restricted case (R52) only stands
-            // in when no full-lane case ranked the query, so the judged pool
-            // reflects the full source set whenever one exists.
+            // Candidate pooling merges rankings from every eligible case because later full-lane cases can rank candidates that earlier cases did not.
+            // Full-lane cases can use different scales, dimensions, cache states, and candidate depths.
+            // A lane-restricted case contributes only when no full-lane case ranked the query.
+            // The judged pool uses full-lane rankings whenever any full-lane case ranked the query.
             const laneRestricted = record.caseEvidence.laneRestricted;
             const existing = candidateByQuery.get(entry.queryId);
             if (!existing || (existing.laneRestricted && !laneRestricted)) {
@@ -1576,11 +1484,9 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         }
     }
 
-    // Aggregation rule for the merged pool ranking: each eligible case
-    // contributes at most its top-EVALUATION_DEPTH; a locator's pooled rank
-    // is its best rank across cases, tie-broken by earlier case in profile
-    // order, then locator text, so the merge is deterministic and keeps
-    // case provenance meaningful.
+    // Each eligible case contributes at most EVALUATION_DEPTH results to the merged pool.
+    // A locator's pooled rank is its best rank across cases.
+    // Ties use case order, then locator text, making the merge deterministic.
     const pooledByQuery = [...candidateByQuery.values()].map((entry) => {
         const best = new Map<string, { rank: number; caseIndex: number }>();
         entry.rankings.forEach((ranked, caseIndex) => {
@@ -1607,9 +1513,8 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     });
 
     const candidatePool = buildCandidatePool({
-        // The merged rankings are already bounded to per-case top-K unions;
-        // the pool depth must cover the longest union or candidates unique
-        // to later cases would fall back out of the artifact.
+        // The pool depth must cover the longest per-case top-K union.
+        // Otherwise, candidates unique to later cases would be omitted from the artifact.
         topK: Math.max(EVALUATION_DEPTH, ...pooledByQuery.map((entry) => entry.ranked.length)),
         queries: pooledByQuery.map((entry) => {
             const query = options.release.corpus.queries.find(

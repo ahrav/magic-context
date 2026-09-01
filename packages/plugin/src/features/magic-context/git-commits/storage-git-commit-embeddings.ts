@@ -1,10 +1,5 @@
 /**
- * Embedding storage for git commits.
  *
- * Mirrors the memory-embedding storage layout but keyed by commit SHA rather
- * than memory id. Embeddings are byte-equivalent to memory embeddings (Float32
- * serialized via Float32Array.buffer), so the same cosine-similarity helpers
- * apply without conversion.
  */
 
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
@@ -17,8 +12,8 @@ interface CommitEmbeddingRow {
     committed_at: number;
 }
 
-/** `CommitEmbeddingCandidate` carries `committedAtMs` so ranking can complete
- *  before metadata hydration. */
+/**
+ * */
 export interface CommitEmbeddingCandidate {
     vector: Float32Array;
     committedAtMs: number;
@@ -111,8 +106,8 @@ export function hasCommitEmbedding(db: Database, sha: string, modelId: string): 
     );
 }
 
-/** The join to `git_commits` drops embeddings whose commit row is gone, so an
- *  orphan vector can never reach ranking. */
+/** The git_commits join drops embeddings whose commit rows are gone.
+ * */
 export function loadProjectCommitEmbeddings(
     db: Database,
     projectPath: string,
@@ -138,16 +133,7 @@ export function loadProjectCommitEmbeddings(
 }
 
 /**
- * Commits with no embedding row for `modelId`, newest first.
  *
- * A commit created with an empty message carries no embeddable text: the host
- * rejects an empty item, and one rejected item fails every page of the batch's
- * application group. Because such a row is never embeddable, selecting it makes
- * the newest batch fail forever and the drain — which stops as soon as a batch
- * embeds nothing — never reaches the commits behind it. Excluding it in the
- * selection is what retires it: it is permanently not work, so it never enters
- * a batch and never blocks one. The same applies to text above a provider's
- * per-item byte cap.
  */
 export function loadUnembeddedCommits(
     db: Database,

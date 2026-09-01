@@ -72,14 +72,14 @@ interface RunSpec {
     salt: string;
     explicit?: ModeSpec;
     automatic?: ModeSpec;
-    /** Each `cells` entry supplies raw latency samples for that case's
+    /**
      *  explicit scenario. */
     cells?: Record<string, number[]>;
     hostFp?: string | null;
     config?: Record<string, unknown>;
     releaseFp?: string;
-    /** When enabled, automatic scenarios set gated metrics to null,
-     *  leaving automatic mode without a scoreable holdout aggregate. */
+    /**
+     * */
     unscoreableAutomatic?: boolean;
     status?: "complete" | "incomplete";
     embedPurpose?: "query" | "passage" | null;
@@ -169,9 +169,6 @@ function makeRun(spec: RunSpec): BenchmarkReport {
                 selectivityObserved: { preFilterDenominator: 1, eligibleCount: 1 },
                 cacheLayers: [],
                 laneRestricted: false,
-                // Mirrors the runner: a case with samples records their
-                // summary; the A/A mechanical check cross-verifies this
-                // recorded p95 against its own recomputation.
                 latencySummary:
                     (cells[caseId] ?? []).length > 0
                         ? (() => {

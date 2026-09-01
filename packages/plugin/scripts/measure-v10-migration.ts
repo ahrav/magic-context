@@ -1,19 +1,12 @@
 /**
- * Measure v10 migration + backfill timing on a real-size DB,
- * using production code paths (not the playground script).
+ * This script measures v10 migration and backfill timing on a production-size database.
+ * The measurement uses production code paths instead of the playground script.
  *
  * Steps:
- *   1. Lay out a playground at $TMPDIR/v10-measure-<ts>/
- *      with cortexkit/magic-context/context.db and opencode/opencode.db
- *      (both copied from real DBs).
- *   2. Reset the MC copy to pre-v10 state (drop v9/v10 from migrations,
- *      drop the v10 column + indexes, drop backfill_state table).
- *   3. Set XDG_DATA_HOME and call the production openDatabase().
- *   4. Time the run; report per-phase timing + final coverage.
  *
  * Usage:
  *   bun packages/plugin/scripts/measure-v10-migration.ts \
- *     --src ~/.local/share/cortexkit/magic-context/context.db.before-zwsp-cleanup.bak \
+ * --src <pre-v10-backup> \
  *     --oc ~/.local/share/opencode/opencode.db
  */
 
@@ -67,7 +60,7 @@ function fmtBytes(n: number): string {
 async function main() {
     const args = parseArgs();
 
-    // 1. Lay out playground in the structure XDG_DATA_HOME expects.
+    // The storage layer expects this directory layout under XDG_DATA_HOME.
     const playground = join(tmpdir(), `v10-measure-${Date.now()}`);
     const mcDir = storageSubtreePath(playground);
     const ocDir = join(playground, "opencode");
@@ -86,17 +79,14 @@ async function main() {
     console.log(`Source OC size: ${fmtBytes(statSync(args.oc).size)}`);
     console.log(`Playground:    ${playground}\n`);
 
-    // Copy MC DB
     let t0 = Bun.nanoseconds();
     copyFileSync(args.src, mcPath);
     console.log(`Copy MC DB:  ${fmtMs((Bun.nanoseconds() - t0) / 1e6)}`);
 
-    // Copy OC DB (read-only target for backfill)
     t0 = Bun.nanoseconds();
     copyFileSync(args.oc, ocPath);
     console.log(`Copy OC DB:  ${fmtMs((Bun.nanoseconds() - t0) / 1e6)}`);
 
-    // 2. Reset MC copy to pre-v10 state
     console.log("\n--- Resetting MC copy to pre-v10 state ---");
     const resetDb = new Database(mcPath);
     resetDb.exec("PRAGMA journal_mode=WAL");
@@ -108,10 +98,8 @@ async function main() {
     ).c;
     console.log(`Tool tags:   ${beforeTags.toLocaleString()}`);
 
-    // Drop v9 + v10 from migration log
     resetDb.exec("DELETE FROM schema_migrations WHERE version >= 9");
 
-    // Drop v10 column + indexes
     const cols = resetDb.prepare("PRAGMA table_info(tags)").all() as Array<{
         name: string;
     }>;
@@ -121,7 +109,6 @@ async function main() {
         resetDb.exec("ALTER TABLE tags DROP COLUMN tool_owner_message_id");
     }
 
-    // Drop v9 + backfill state
     resetDb.exec("DROP TABLE IF EXISTS tool_owner_backfill_state");
     resetDb.exec("DROP TABLE IF EXISTS tool_definition_measurements");
 
@@ -131,7 +118,6 @@ async function main() {
     const sizeAfterReset = statSync(mcPath).size;
     console.log(`MC size after reset: ${fmtBytes(sizeAfterReset)}`);
 
-    // 3. Run the production openDatabase() path
     console.log("\n--- Production openDatabase() ---");
     process.env.XDG_DATA_HOME = playground;
 
@@ -146,7 +132,6 @@ async function main() {
     console.log(`openDatabase() total: ${fmtMs(totalMs)}`);
     if (!db) throw new Error("openDatabase() returned null (schema fence / storage unavailable)");
 
-    // 4. Verify state
     console.log("\n--- Post-migration state ---");
     const versions = db
         .prepare(

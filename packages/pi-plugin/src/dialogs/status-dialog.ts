@@ -48,8 +48,7 @@ import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
-// Mirror packages/plugin/src/tui/slots/sidebar-content.tsx COLORS so the Pi
-// dialog and the OpenCode sidebar render the same category palette.
+// `COLORS` mirrors `packages/plugin/src/tui/slots/sidebar-content.tsx` so Pi and OpenCode use the same category palette.
 const COLORS = {
 	system: "#c084fc", // Purple
 	docs: "#22d3ee", // Cyan — <project-docs>
@@ -61,7 +60,7 @@ const COLORS = {
 	toolDefs: "#f472b6", // Pink
 };
 
-/** Refresh cadence while dialog is open. */
+/** The dialog refreshes every 1,000 ms while open. */
 const REFRESH_INTERVAL_MS = 1000;
 
 export interface StatusDialogDeps {
@@ -105,11 +104,11 @@ interface StatusDialogDetail {
 	contextLimit: number;
 	windowGeometry?: WindowGeometryResult;
 	executeThreshold: number;
-	/** Which config source produced `executeThreshold` (tokens vs percentage). */
+	/** `executeThresholdMode` identifies whether tokens or a percentage produced `executeThreshold`. */
 	executeThresholdMode: "percentage" | "tokens";
-	/** True when `executeThreshold` was clamped down from a higher configured value (#241). */
+	/** `executeThresholdClamped` is true when `executeThreshold` is lower than its configured value. */
 	executeThresholdClamped?: boolean;
-	/** Raw configured value before clamping, for showing the math in the clamp note. */
+	/** `executeThresholdConfigured` retains the configured value before clamping. */
 	executeThresholdConfigured?: number;
 	protectedTagCount: number;
 	historyBlockTokens: number;
@@ -130,9 +129,9 @@ interface StatusDialogDetail {
 	tailHygiene?: TailHygieneStatus;
 	newWorkTokens: number;
 	totalInputTokens: number;
-	/** Compartments still needing a v2 upgrade (legacy or tierless). */
+	/** `upgradeNeededCount` counts legacy and tierless compartments that require a v2 upgrade. */
 	upgradeNeededCount: number;
-	/** A detached /ctx-recomp or /ctx-session-upgrade is running in background. */
+	/** `recompInFlight` is true while a detached `/ctx-recomp` or `/ctx-session-upgrade` runs. */
 	recompInFlight: boolean;
 }
 
@@ -173,11 +172,7 @@ interface StatusDialogProps {
 }
 
 /**
- * Custom Component implementation:
- *  - implements its own handleInput so Escape / Enter / Ctrl+C close cleanly
- *  - draws a Unicode rounded-corner border using theme borderMuted color
- *  - rebuilds detail and re-renders on a 1s timer so live values stay current
- *  - cleans up timer on close
+ * `handleInput` closes the dialog on Escape, Enter, and Ctrl+C.
  */
 class StatusDialogComponent implements Component {
 	private readonly props: StatusDialogProps;
@@ -204,7 +199,7 @@ class StatusDialogComponent implements Component {
 				);
 				this.props.tui.requestRender();
 			} catch {
-				// best effort; keep previous detail
+				// On refresh failure, retain the previous detail.
 			}
 		}, REFRESH_INTERVAL_MS);
 	}
@@ -230,14 +225,13 @@ class StatusDialogComponent implements Component {
 	}
 
 	invalidate(): void {
-		// stateless render; nothing to invalidate
+		// Rendering is stateless, so no invalidation is required.
 	}
 
 	render(width: number): string[] {
-		// drawBorder reserves 2 chars for left/right border + 1 char padding
-		// each side, leaving width-4 for inner content. Pass this through to
-		// renderInner so the segmented bar can fill the available row width
-		// instead of being capped at a hardcoded 56 chars.
+		// `drawBorder` reserves two columns for borders and one for padding.
+		// `renderInner` receives the remaining width so the segmented bar fills each row.
+		// `renderInner` avoids a fixed 56-character cap so the segmented bar fills the available width.
 		const innerWidth = Math.max(20, width - 4);
 		const inner = renderInner(this.detail, this.props.theme, innerWidth);
 		return drawBorder(inner, width, this.props.theme);
@@ -295,7 +289,6 @@ function renderInner(
 		lines.push(`Hygiene ${formatTailHygiene(s.tailHygiene)}`);
 	}
 
-	// Segmented bar (fills the full inner content width)
 	lines.push(renderBar(s, innerWidth));
 
 	// Legend
@@ -311,8 +304,6 @@ function renderInner(
 	lines.push("* Conversation includes model Reasoning; hygiene excludes it.");
 	lines.push("");
 
-	// Quick counts + historian. v2: facts retired (promoted to memories), so the
-	// facts count is dropped from the line.
 	lines.push(
 		`Counts: ${s.compartmentCount} compartments · ${s.memoryCount} memories (${s.memoryBlockCount} injected) · ${
 			s.sessionNoteCount + s.readySmartNoteCount
@@ -329,9 +320,6 @@ function renderInner(
 				: ""
 		}`,
 	);
-	// Upgrade status — Pi has no sidebar, so the recomp/upgrade state surfaces
-	// here. Shows when a detached recomp/upgrade is running, or when legacy/
-	// tierless compartments still need /ctx-session-upgrade.
 	if (s.recompInFlight) {
 		lines.push(`Upgrade: ${theme.fg("warning", "recomp/upgrade running…")}`);
 	} else if (s.upgradeNeededCount > 0) {
@@ -363,7 +351,6 @@ function renderInner(
 		`Active ${s.activeTags} (~${formatBytes(s.activeBytes)}) · Dropped ${s.droppedTags} · Total ${s.totalTags}`,
 	);
 
-	// Context / thresholds
 	lines.push(theme.fg("muted", "Context"));
 	lines.push(
 		`Execute threshold ${formatThresholdPercent(s.executeThreshold)}%${formatThresholdClampNote(
@@ -395,8 +382,7 @@ function renderInner(
 }
 
 /**
- * Wrap inner lines with a Unicode rounded-corner border. The border uses the
- * theme's borderMuted color so the overlay reads as a distinct surface.
+ * The `borderMuted` border distinguishes the overlay from its background.
  */
 function drawBorder(inner: string[], width: number, theme: Theme): string[] {
 	const innerWidth = Math.max(20, width - 4); // 2 chars border + 1 padding each side
@@ -461,10 +447,6 @@ export function buildPiStatusDetail(
 		null,
 	);
 
-	// v2 m[0] per-block attribution via the SHARED core helper so the Pi dialog
-	// renders byte-identical categories to OpenCode's sidebar (Docs / User
-	// Profile / Memories / Compartments measured from the real cached_m0 slice;
-	// Facts retired → 0). Falls back to Σp1 / on-demand v2 memory render cold.
 	const m0Bytes = metaRow?.cached_m0_bytes;
 	const m0Text =
 		m0Bytes instanceof Uint8Array
@@ -484,10 +466,6 @@ export function buildPiStatusDetail(
 	const docsTokens = m0Blocks.docsTokens;
 	const profileTokens = m0Blocks.profileTokens;
 
-	// On Pi we don't persist system_prompt_tokens (no
-	// experimental.chat.system.transform hook). Compute it on demand from
-	// ctx.getSystemPrompt() when available; fall back to the stored value
-	// so the dialog still has a sensible number outside command context.
 	let systemPromptTokens = meta.systemPromptTokens;
 	try {
 		const sysPrompt =
@@ -497,9 +475,7 @@ export function buildPiStatusDetail(
 		if (typeof sysPrompt === "string" && sysPrompt.length > 0) {
 			systemPromptTokens = estimateTokens(sysPrompt);
 		}
-	} catch {
-		// best effort; fall back to stored
-	}
+	} catch {}
 
 	const tags = getTagsBySession(deps.db, sessionId);
 	const activeTags = tags.filter((tag) => tag.status === "active");
@@ -507,26 +483,10 @@ export function buildPiStatusDetail(
 	const activeBytes = activeTags.reduce((sum, tag) => sum + tag.byteSize, 0);
 	const pendingOps = readPendingOpsCount(deps.db, sessionId);
 
-	// Tool call + conversation tokens: read from session_meta where the
-	// pipeline persists post-tag/post-injection/post-strip totals each
-	// pass (see context-handler.ts:1858-1872 → tokenize-pi-messages.ts).
 	//
-	// IMPORTANT: do NOT walk `ctx.sessionManager.getBranch()` here.
-	// `getBranch()` returns the full leaf-to-root path INCLUDING
-	// pre-compaction-marker entries that were never tagged because they
-	// predate the marker. Tokenizing all of them and trying to subtract
-	// "dropped tool tags" cannot work — there are no tags for the
-	// pre-compaction tool calls at all, so the result over-counts by
-	// the entire pre-marker tool history (we observed Tool Calls = 1.1M
-	// on a 162K context — ~650% impossible). The pipeline-side walk
-	// uses the post-compaction `event.messages` view, which is the
-	// authoritative source for what the LLM receives.
 	const toolCallTokens = meta.toolCallTokens;
 
-	// Tool definition tokens: serialize each registered tool the way Pi sends
-	// them to providers — name + description + JSON-stringified parameter
-	// schema. This is a structural estimate (not the exact wire payload), but
-	// matches OpenCode's calibrated bucket within a reasonable margin.
+	// Provider tool-definition token counts are estimates, not wire-payload counts.
 	let toolDefinitionTokens = 0;
 	try {
 		const tools = pi.getAllTools?.() ?? [];
@@ -695,10 +655,6 @@ function breakdownSegments(s: StatusDialogDetail): Array<{
 		color: string;
 		detail?: string;
 	}> = [];
-	// Category order/labels/colors mirror OpenCode's sidebar
-	// (packages/plugin/src/tui/slots/sidebar-content.tsx) for cross-harness
-	// parity. v2: Facts is retired (promoted to memories); Docs and User Profile
-	// are their own m[0] buckets.
 	if (s.systemPromptTokens > 0)
 		segs.push({
 			label: "System",
@@ -749,9 +705,7 @@ function breakdownSegments(s: StatusDialogDetail): Array<{
 }
 
 function renderBar(s: StatusDialogDetail, innerWidth: number): string {
-	// Fill the full inner content row. Clamp to a sensible minimum so
-	// extremely narrow terminals still render a visible bar instead of
-	// collapsing all segments to width 1.
+	// The 20-column minimum keeps segments visible in narrow terminals.
 	const barWidth = Math.max(20, innerWidth);
 	const segs = breakdownSegments(s);
 	if (segs.length === 0) return "";

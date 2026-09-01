@@ -1,17 +1,10 @@
 /**
- * Transaction-local writers and readers for the v85 claim applicability
- * ledger: first-class immutable streams, gapless append-only assertions,
- * path/symbol selectors, and the derived interval view.
  *
- * Type-only, `node:`, and explicit-`.ts` sibling imports keep this module
- * loadable by the Node SQLite smoke script, whose loader cannot resolve
- * extensionless runtime imports.
  *
  * Write protocol: every writer assumes the caller holds a write transaction
- * (the storage-claims.ts `...InCurrentTransaction` convention). Appends go
- * through the current stream head only; a fork, sequence gap, reused
- * predecessor, or regressing recorded/knowledge time fails before any row is
- * written, with the database triggers as the cross-process backstop.
+ * Appends must extend the current stream head.
+ * An append with a non-head predecessor or regressing recorded or knowledge time fails before any row is inserted.
+ * Database triggers enforce these constraints across processes.
  */
 
 import { createHash } from "node:crypto";
@@ -31,14 +24,12 @@ export class ApplicabilityWriteError extends Error {
 }
 
 /**
- * Positive schema probes memoized per connection: the v85 tables are never
- * dropped outside test fixtures, so `true` is stable for a connection's
- * lifetime. A negative probe re-checks so a migration completing later in
- * the same process is observed.
+ * Positive schema probes are cached for the connection's lifetime.
+ * Negative probes are not cached, so later schema creation is detected.
  */
 const applicabilitySchemaPresent = new WeakSet<Database>();
 
-/** Whether this database migrated to v85. */
+/* */
 export function hasClaimApplicabilitySchema(db: Database): boolean {
     if (applicabilitySchemaPresent.has(db)) return true;
     const present =
@@ -52,8 +43,7 @@ export function hasClaimApplicabilitySchema(db: Database): boolean {
 }
 
 /**
- * Recursively key-sorted clone so the digest is independent of object-key
- * insertion order: semantically identical sources always hash to one value.
+ * `sortKeysDeep` sorts object keys recursively so source digests ignore object-key insertion order.
  */
 interface DigestArray extends Array<DigestValue> {}
 interface DigestObject {
@@ -79,7 +69,7 @@ function sortKeysDeep(value: unknown): DigestValue {
     return undefined;
 }
 
-/** Canonical SHA-256 digest over a JSON-serializable source description. */
+/* */
 export function computeApplicabilitySourceDigest(source: unknown): string {
     return createHash("sha256")
         .update(JSON.stringify(sortKeysDeep(source)) ?? "null", "utf8")
@@ -126,9 +116,7 @@ interface StreamRow {
 }
 
 /**
- * Idempotent stream resolution (KTD3): replay with the stored key verifies
- * the source digest and lineage fields instead of allocating a duplicate
- * stream; a mismatch is a defect, not a new stream.
+ * Replaying a stored key verifies its source digest and lineage fields; mismatches fail instead of creating another stream.
  */
 export function ensureApplicabilityStreamInCurrentTransaction(
     db: Database,
@@ -232,7 +220,7 @@ interface AssertionHeadRow {
     known_from: number | null;
 }
 
-/** Highest non-NULL knowledge time recorded anywhere in the stream. */
+/* */
 function maxStreamKnownFrom(db: Database, streamId: number): number | null {
     const row = db
         .prepare(
@@ -274,11 +262,9 @@ function normalizeSymbols(
 }
 
 /**
- * Append the next assertion at the stream head. Recorded time is clamped
- * forward to the head's recorded time (SQLite wall clocks can regress across
- * processes); an explicitly supplied regressing recorded or knowledge time
- * fails instead. Knowledge time compares against the stream-wide maximum so
- * a NULL known_from gap cannot reopen an older knowledge time.
+ * Recorded time is clamped to the head's recorded time because SQLite wall clocks can regress across processes.
+ * An explicitly supplied recorded or knowledge time that regresses fails.
+ * Knowledge time compares against the stream-wide maximum, so a NULL `known_from` gap cannot reopen an older knowledge time.
  */
 export function appendApplicabilityAssertionInCurrentTransaction(
     db: Database,
@@ -363,7 +349,6 @@ export function appendApplicabilityAssertionInCurrentTransaction(
 }
 
 // ---------------------------------------------------------------------------
-// Revision-scoped composition used by claim writers
 // ---------------------------------------------------------------------------
 
 export interface RevisionApplicabilityInput {
@@ -377,10 +362,6 @@ export interface RevisionApplicabilityInput {
 }
 
 /**
- * One stream plus its opening (or successor) assertion for a just-inserted
- * revision. Claim writers call this between the revision insert and the
- * final pointer CAS so revision, evidence, stream, assertion, and selectors
- * commit or roll back together.
  */
 export function writeRevisionApplicabilityInCurrentTransaction(
     db: Database,
@@ -443,9 +424,6 @@ export interface ApplicabilityAssertionRecord {
 }
 
 /**
- * Current head assertion per stream for one revision. An empty result means
- * the revision has no recorded applicability: readers treat it as `unknown`
- * (R13) rather than failing.
  */
 export function readCurrentApplicabilityAssertions(
     db: Database,
@@ -530,7 +508,6 @@ export function readApplicabilityIntervals(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy-memory lineage helpers
 // ---------------------------------------------------------------------------
 
 function sameSortedValues(left: readonly string[], right: readonly string[]): boolean {
@@ -551,14 +528,6 @@ function pathsStateEquals(
 }
 
 /**
- * Append a successor assertion carrying new path knowledge onto one of a
- * revision's source streams — only when that knowledge differs from the
- * stream head, so a replayed or no-op mapping write appends nothing. Every
- * non-path head field carries into the successor unchanged: readers treat
- * the head as the whole current snapshot, so a path-only update must not
- * erase anchors, dependency or verifier metadata, or symbol selectors.
- * Callers supply the desired path state and knowledge time explicitly; a
- * regressing knowledge time is clamped forward to the stream maximum.
  */
 export function syncRevisionApplicabilityPathsInCurrentTransaction(
     db: Database,

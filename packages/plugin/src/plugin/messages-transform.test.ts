@@ -9,7 +9,6 @@ import {
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { createMessagesTransformHandler } from "./messages-transform";
 
-// Minimal fake message shape — just needs info + parts.
 function makeOutput(overrides?: { agent?: string; sessionID?: string }): any {
     return {
         messages: [
@@ -43,10 +42,8 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         });
 
         const output = makeOutput();
-        // Should NOT throw — wrapper catches all errors.
         await expect(handler({}, output)).resolves.toBeDefined();
 
-        // Messages are left untouched when transform fails.
         expect(output.messages).toHaveLength(1);
         expect(output.messages[0].info.id).toBe("m1");
     });
@@ -248,8 +245,6 @@ describe("createMessagesTransformHandler — compaction-off fail-closed inertnes
         });
 
         const output = makeOutput();
-        // In compaction-off mode fail_closed_blocking is inert BY DESIGN: no
-        // blocking error, no cancelled request — the input comes back as-is.
         await expect(handler({}, output)).resolves.toBeDefined();
         expect(innerCalled).toBe(false);
         expect(output.messages).toHaveLength(1);
@@ -261,8 +256,6 @@ describe("createMessagesTransformHandler — compaction-off fail-closed inertnes
         const handler = createMessagesTransformHandler({
             magicContext: {
                 "experimental.chat.messages.transform": async (_input, out) => {
-                    // Mutate the array in place (as the real transform does),
-                    // then blow up — the wrapper must hand back the INPUT.
                     (out.messages as unknown[]).unshift({
                         info: { id: "injected", role: "user", sessionID: "ses_test" },
                         parts: [{ type: "text", text: "injected head" }],

@@ -1,21 +1,16 @@
 /**
- * v82 authoritative claims-and-evidence DDL (KTD31, KTD33-KTD36).
  *
- * Dependency-light on purpose: this module may only use type-only imports so
- * the Node SQLite smoke (`packages/plugin/scripts/smoke-node-sqlite.ts`) can
- * import it directly under Node's type-stripping loader, which cannot resolve
- * extensionless runtime imports.
+ * This module uses only type-only imports because Node's type-stripping loader cannot resolve extensionless runtime imports.
+ * The Node SQLite smoke imports this module directly.
+ * Node's type-stripping loader imports this module directly.
  *
- * Every object here is migration-owned (created by migration v82, never by
- * `initializeDatabase()`), following the v80 `memory_stats` precedent.
  *
- * Append-only contract (KTD34): episodes, source_spans, observations,
- * claim_revisions, claim_evidence, claim_conflicts, and verification_events
- * reject every UPDATE and DELETE, plus any INSERT that collides with a primary
- * or unique key — so `INSERT OR REPLACE` cannot bypass the delete guard when
- * recursive triggers are disabled. `claims` stays mutable for lifecycle state
- * and the current-revision pointer, but its semantic key columns are frozen and
- * a published pointer can never return to NULL.
+ * The database rejects UPDATE and DELETE on every append-only table.
+ * Append-only tables reject INSERTs that conflict with a primary or unique key.
+ * Conflicting INSERTs are rejected so INSERT OR REPLACE cannot bypass delete guards when recursive triggers are disabled.
+ * `claims` remains mutable for lifecycle state and its current-revision pointer.
+ * `claims` forbids changes to its semantic key columns.
+ * A published current-revision pointer cannot become NULL.
  */
 
 import type { Database } from "../../shared/sqlite";

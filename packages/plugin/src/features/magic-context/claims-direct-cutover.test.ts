@@ -56,10 +56,8 @@ const RETIRED_MODULE_PATHS = [
 
 const SOURCE_ROOTS = [
     "packages/plugin/src",
-    // Executable experiment and benchmark scripts run against a real database,
-    // so retired SQL here corrupts results rather than failing to compile. One
-    // such script wrapped its `memory_fts` query in a catch that returned an
-    // empty array, reporting zero recall instead of a missing table.
+    // Executable experiment and benchmark scripts run against a real database.
+    // Retired SQL in these scripts corrupts results instead of causing compilation failures.
     "packages/plugin/scripts",
     "packages/pi-plugin/src",
     "packages/cli/src",
@@ -68,14 +66,13 @@ const SOURCE_ROOTS = [
 const SOURCE_EXTENSION = /\.(?:ts|tsx|js|mjs|rs)$/;
 
 /**
- * The retrieval-benchmark fixture store, which still creates and writes the
- * retired `memories` and `memory_embeddings` tables.
+ * The retrieval-benchmark fixture store creates and writes the retired `memories` and `memory_embeddings` tables.
  *
- * It is exempt from the retired-SQL rule alone, not from the scan: the corpus it
- * seeds is evaluated through `unifiedSearch`, which runs no memory source, so the
- * fixture cannot be pointed at a claim-backed equivalent until that retrieval
- * path exists. Naming the one path keeps the exemption greppable and keeps every
- * other file under `packages/plugin/scripts` covered.
+ * The retrieval-benchmark fixture is exempt only from the retired-SQL rule, not from the scan.
+ * `unifiedSearch` evaluates the fixture's seeded corpus without a memory source.
+ * The fixture cannot use a claim-backed equivalent because `unifiedSearch` runs no memory source.
+ * Naming the single exempt path keeps the exemption greppable.
+ * All other files under `packages/plugin/scripts` remain covered by the retired-SQL rule.
  */
 const RETRIEVAL_BENCHMARK_MEMORY_FIXTURE =
     "packages/plugin/scripts/retrieval-benchmark/memory-vector-store.ts";

@@ -625,8 +625,8 @@ describe("storage-claims: fail-closed reads and lifecycle", () => {
             });
             if (appended.status !== "applied") throw new Error("appendClaimRevision failed");
 
-            // Direct SQL can move the pointer back to an older same-claim
-            // revision; the clear guard and composite FK both permit it.
+            // The schema does not require `current_revision_id` to target the highest revision.
+            // The composite foreign key allows `current_revision_id` to reference an older revision of the same claim.
             db.prepare("UPDATE claims SET current_revision_id = ? WHERE id = ?").run(
                 created.revisionId,
                 created.claimId,
@@ -641,8 +641,7 @@ describe("storage-claims: fail-closed reads and lifecycle", () => {
                     evidence: [{ observationId: chain.observationId }],
                 }),
             ).toThrow(ClaimGraphCorruptionError);
-            // Ordinary readers refuse to serve the rolled-back revision as
-            // current instead of silently presenting stale history.
+            // Claim read APIs reject a `current_revision_id` that targets an older revision.
             expect(() => getCurrentClaimRevision(db, created.claimId)).toThrow(
                 ClaimGraphCorruptionError,
             );
@@ -753,8 +752,7 @@ describe("storage-claims: transaction composition", () => {
             if (created.status !== "applied") throw new Error("create failed");
 
             db.exec("BEGIN IMMEDIATE");
-            // No nested BEGIN: a plain BEGIN here would throw "cannot start a
-            // transaction within a transaction".
+            // Use a savepoint because this helper may run inside an existing transaction.
             const nested = appendClaimRevision(db, {
                 claimId: created.claimId,
                 expectedCurrentRevisionId: created.revisionId,
@@ -887,7 +885,6 @@ describe("storage-claims: transaction composition", () => {
                 evidence: [{ observationId: chain.observationId }],
             });
             expect(stale).toEqual({ status: "stale" });
-            // The plain-number connection reads the identical graph.
             expect(listClaimRevisions(db, created.claimId).map((r) => r.revision)).toEqual([1, 2]);
             expect(getClaimById(db, created.claimId)?.currentRevisionId).toBe(appended.revisionId);
         } finally {
@@ -1051,7 +1048,6 @@ describe("storage-claims: session cleanup and the claim-memory kernel (U2 scenar
                 Object.fromEntries(claimOwnedTables.map((table) => [table, rowCount(db, table)])),
             ).toEqual(before);
 
-            // The lifetime receipt still replays byte-identically.
             const replay = createProjectMemoryClaim(
                 db,
                 { producer: "test", operationKey: "op-durable" },

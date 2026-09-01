@@ -60,8 +60,6 @@ function parsePackedFilename(stdout: string): string {
         const filename = packed[0]?.filename;
         if (typeof filename === "string" && filename.length > 0) return filename;
     } catch {
-        // npm can print warnings around the JSON on some versions; fall back to
-        // the last tarball-looking line rather than making the smoke version-fragile.
     }
 
     const fallback = stdout

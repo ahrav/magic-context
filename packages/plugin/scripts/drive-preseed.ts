@@ -1,13 +1,6 @@
 #!/usr/bin/env bun
 /**
- * D5 drive round-2 pre-seed: imports 4 synthetic compartments under the drive
- * session's BARE key via the module's state_import op, so the first
- * compaction's descent has real inheritance to demonstrate (drive-card
- * prerequisite for legs 1/4/5/6). Module-mediated — never raw SQLite against
- * a live module's store.
  *
- * Usage: bun run-preseed.ts <bare-session-key> [--conn <connection-file>]
- * Defaults to the ckdev-rig connection file.
  */
 import { homedir } from "node:os";
 import {

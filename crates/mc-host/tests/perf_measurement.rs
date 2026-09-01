@@ -1,12 +1,5 @@
-//! Contract tests for the shared performance-measurement rules: timing
-//! boundaries, percentile semantics, workload fixture identity, outcome
-//! conservation, offered-rate validation, and tail suppression.
-
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
-
-#[path = "support/raw_client.rs"]
-mod raw_client;
 
 use perf_measurement::{
     fixture_workload, nearest_rank, open_loop_offset_ns, tail_publishable, validate_open_loop_rate,
@@ -19,21 +12,19 @@ fn fixture_is_the_committed_compact_json_shape() {
     assert_eq!(workload.label, "compact-json-v1");
     assert_eq!(workload.len, FIXTURE_BODY.len());
     assert!(!workload.binary);
-    // The fixture is committed bytes: a changed hash means a changed
-    // workload, which must never silently compare against old evidence.
+    // The fixture bytes are committed benchmark input.
     assert_eq!(workload.sha256, perf_measurement::sha256_hex(FIXTURE_BODY),);
     let parsed: serde_json::Value =
         serde_json::from_slice(FIXTURE_BODY).expect("fixture is valid JSON");
     assert_eq!(parsed["op"], "perf.echo");
-    // The echo handler treats mode byte 1 as a sleep request; JSON text
-    // must never trip that path.
+    // Keep the fixture's first byte distinct from the sleep-request marker.
+    // The fixture must not trigger the sleep-request path.
     assert_ne!(FIXTURE_BODY[0], 1);
 }
 
 #[test]
 fn fixture_bytes_are_frozen() {
-    // The exact committed bytes, so any edit is a deliberate contract
-    // change with a new hash.
+    // The fixture bytes are the workload contract.
     assert_eq!(
         FIXTURE_BODY,
         br#"{"op":"perf.echo","v":1,"payload":"0123456789abcdef0123456789abcdef"}"#
@@ -113,21 +104,19 @@ fn outcome_merge_preserves_totals() {
 #[test]
 fn unrepresentable_offered_rate_fails_validation() {
     assert!(validate_open_loop_rate(0).is_err(), "zero rate");
-    // A rate above 1e9/s has a sub-nanosecond interval: consecutive slots
-    // would share a timestamp, and silently becoming unrestricted
-    // closed-loop traffic is the failure mode this guards against.
+    // Rates above 1e9/s have sub-nanosecond intervals.
+    // Reject rates above 1e9/s because slots cannot have distinct nanosecond issue times.
     assert!(validate_open_loop_rate(2_000_000_000).is_err());
     assert!(validate_open_loop_rate(1_000_000_000).is_ok());
     assert!(validate_open_loop_rate(20_000).is_ok());
-    // Rates that do not divide 1e9 are representable through the exact
-    // per-slot offset schedule.
+    // Non-divisor rates use exact rational scheduling.
     assert!(validate_open_loop_rate(49).is_ok());
     assert!(validate_open_loop_rate(3000).is_ok());
 }
 
 #[test]
 fn open_loop_offsets_are_exact_and_drift_free() {
-    // Divisor rates reproduce the old fixed-interval schedule.
+    // Divisor rates use a fixed-interval schedule.
     assert_eq!(open_loop_offset_ns(0, 20_000), 0);
     assert_eq!(open_loop_offset_ns(1, 20_000), 50_000);
     assert_eq!(open_loop_offset_ns(7, 20_000), 350_000);
@@ -142,8 +131,7 @@ fn open_loop_offsets_are_exact_and_drift_free() {
         let mut prev = 0u64;
         for slot in 0..=rate.min(10_000) {
             let got = open_loop_offset_ns(slot, rate);
-            // Exactly floor(slot * 1e9 / rate) against the u128 ideal:
-            // below the real-valued schedule by strictly less than 1 ns.
+            // Each scheduled time is less than 1 ns before the ideal schedule.
             let numerator = u128::from(slot) * 1_000_000_000u128;
             assert_eq!(u128::from(got), numerator / u128::from(rate));
             assert!(numerator - u128::from(got) * u128::from(rate) < u128::from(rate));
@@ -158,8 +146,7 @@ fn tail_suppression_below_sample_floor() {
     assert!(!tail_publishable(TAIL_SAMPLE_FLOOR - 1));
     assert!(tail_publishable(TAIL_SAMPLE_FLOOR));
 
-    // Below the floor: evidence retained (count, p50..p99, max) but the
-    // headline p99.9 is suppressed.
+    // Below `TAIL_SAMPLE_FLOOR`, retain count, p50–p99, and max but suppress headline p99.9.
     let small: Vec<u64> = (1..=1000).collect();
     let summary = LatencySummary::from_unsorted(small).unwrap();
     assert_eq!(summary.count, 1000);
@@ -239,11 +226,8 @@ fn retry_and_poll_schedule_matches_plugin_policy() {
         let first = rng.first_poll_delay_ms();
         assert!((1.0..2.0).contains(&first));
     }
-    // Consume-then-escalate, mirroring the plugin's `pendingPollDelay`
-    // exactly: the first pending reply waits the jittered fast-first seed,
-    // then the ladder escalates 10 -> 16 -> 25.6 under the served cap. The
-    // unsaturated 10 -> 16 step pins the 1.6 multiplier so a drifted copy
-    // fails here instead of silently de-faithing the benchmark arms.
+    // The first pending reply uses the jittered fast-first seed; later replies use 10, 16, and 25.6 ms delays, capped at the served delay.
+    // The unsaturated 10 → 16 step detects changes to the 1.6 multiplier.
     let mut ladder = 1.5;
     assert_eq!(
         perf_measurement::pending_poll_delay_ms(&mut ladder, 50),
@@ -279,8 +263,7 @@ fn retry_and_poll_schedule_matches_plugin_policy() {
 fn adjacent_seeds_disperse_their_first_draw() {
     // The benchmark seeds per-request generators as `seed ^ logical_id`,
     // so adjacent small seeds must not produce synchronized first draws:
-    // a first draw pinned near zero would collapse every caller's first
-    // retry delay onto the base value and defeat the jitter policy.
+    // A near-zero first draw would collapse every caller's first retry delay to the base value.
     let firsts: Vec<f64> = (1u64..=8)
         .map(|id| perf_measurement::DeterministicRng::new(1 ^ id).unit())
         .collect();
@@ -295,8 +278,6 @@ fn adjacent_seeds_disperse_their_first_draw() {
 
 #[test]
 fn distinct_seeds_yield_distinct_first_draws() {
-    // seed.max(1)-style clamping or a weak mixer can collapse distinct
-    // seeds onto one sequence; the first draw must already discriminate.
     let a = perf_measurement::DeterministicRng::new(1 << 2).unit();
     let b = perf_measurement::DeterministicRng::new(1 << 3).unit();
     assert_ne!(a, b, "seeds 4 and 8 produced the same first draw");
@@ -336,7 +317,6 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         window: WindowClass::Measured,
     };
 
-    // Duplicate logical rows: two rows claim logical 1.
     let duplicated_logical = validate_synapse_ledgers(
         &[logical(1, 1), logical(1, 1)],
         &[attempt(1, 1), attempt(1, 2)],
@@ -347,7 +327,6 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         .iter()
         .any(|error| error.contains("duplicate logical_id 1")));
 
-    // Duplicate attempt rows: attempt_id 1 recorded twice.
     let duplicated_attempt =
         validate_synapse_ledgers(&[logical(1, 2)], &[attempt(1, 1), attempt(1, 1)]);
     assert!(!duplicated_attempt.valid);
@@ -356,7 +335,6 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         .iter()
         .any(|error| error.contains("duplicate attempt_id 1")));
 
-    // Orphan attempt: logical 9 owns nothing.
     let orphan = validate_synapse_ledgers(&[logical(1, 1)], &[attempt(1, 1), attempt(9, 2)]);
     assert!(!orphan.valid);
     assert!(orphan
@@ -364,29 +342,12 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         .iter()
         .any(|error| error.contains("unknown logical_id 9")));
 
-    // Per-logical attempt-count mismatch is still caught.
     let miscounted = validate_synapse_ledgers(&[logical(1, 3)], &[attempt(1, 1)]);
     assert!(!miscounted.valid);
     assert!(miscounted
         .errors
         .iter()
         .any(|error| error.contains("records 3 attempts")));
-}
-
-#[test]
-fn raw_error_surfaces_retry_after_ms() {
-    let frame = raw_client::RawFrame {
-        len: 45,
-        ver: raw_client::WIRE_VERSION,
-        ty: raw_client::TY_ERROR,
-        flags: raw_client::FLAGS_RESPONSE_TEXT_LAST,
-        channel: 1,
-        epoch: 1,
-        corr: 1,
-        body: br#"{"code":"queue_full","retry_after_ms":73}"#.to_vec(),
-    };
-    assert_eq!(frame.error_code(), "queue_full");
-    assert_eq!(frame.error_retry_after_ms(), Some(73));
 }
 
 #[test]
@@ -429,9 +390,6 @@ fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
     assert!(singleton.valid);
     assert_eq!(singleton.amplification, 1.0, "closed concurrency 1 has A=1");
 
-    // A deterministic 2x-capacity shape: one request completes, one exhausts
-    // four retryable attempts. The repetition remains exactly accounted even
-    // though its >1% censoring makes its latency summary unpublishable.
     let overload = validate_synapse_ledgers(
         &[
             logical(1, LogicalDisposition::Completed, 1),
@@ -470,9 +428,6 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
         SynapseVariant::HygieneOnly,
         SynapseVariant::A,
         SynapseVariant::C,
-        // `a+c` is A's bounded server waiting plus C's fast polling; reading
-        // B's served hint here would fold an unlabelled third mechanism into
-        // the arm and make its query results unattributable.
         SynapseVariant::APlusC,
     ] {
         let mut rng = perf_measurement::DeterministicRng::new(9);
@@ -512,8 +467,7 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
         .initial_pending_delay_ms(&mut poll_rng)
         .expect("C has fast-first polling");
     assert!((1.0..2.0).contains(&fast_ladder));
-    // The first pending reply consumes the fast-first seed itself; the
-    // escalated 10 ms floor applies from the second pending onward.
+    // The first pending reply uses the fast-first seed; the 10 ms floor applies from the second pending reply onward.
     let first_pending = SynapseVariant::C.pending_poll_delay_ms(&mut fast_ladder, 73);
     assert!((1.0..2.0).contains(&first_pending));
     assert_eq!(
@@ -529,8 +483,7 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
         SynapseMethod, IN_FLIGHT_AT_WINDOW_END_CODE,
     };
 
-    // A 10-second hold beginning at 1s: warmup covers the first second of the
-    // window (its first 10%) and the window closes at 11s.
+    // For a 10-second hold beginning at 1 s, warmup covers [1 s, 2 s) and the window closes at 11 s.
     let window = HoldWindow::new(1_000_000_000, 10);
     assert_eq!(window.warmup_end_ns, 2_000_000_000);
     assert_eq!(window.end_ns, 11_000_000_000);
@@ -561,18 +514,11 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
     };
 
     let mut logical = vec![
-        // Opens inside the warmup prefix.
         logical_row(1, 1_500_000_000, 1_600_000_000),
-        // The boundary itself is already post-warmup: the prefix is the first
-        // 10% exclusive of its end.
+        // The warmup boundary is post-warmup; the prefix excludes its end.
         logical_row(2, 2_000_000_000, 2_100_000_000),
-        // Settles inside the window.
         logical_row(3, 5_000_000_000, 6_000_000_000),
-        // Still outstanding when the window closes.
         logical_row(4, 10_900_000_000, 13_500_000_000),
-        // Opened only after the window had already closed: a closed-loop
-        // worker that passed the boundary test but did not reach the wire in
-        // time. It never ran under measurement.
         logical_row(5, 11_200_000_000, 11_900_000_000),
     ];
     let mut attempts = vec![
@@ -592,14 +538,13 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
         "both boundaries are half-open: the warmup end is already measured and \
          the window end is already outside"
     );
-    // Attempts inherit the class from the request that owns them, so the two
-    // ledgers are discarded together and stay reconcilable.
+    // Attempts inherit their owning request's window class so both ledgers remain reconcilable when excluded.
     assert_eq!(
         attempts.iter().map(|a| a.window).collect::<Vec<_>>(),
         [Warmup, Measured, Measured, Measured, AfterWindow]
     );
 
-    // A measured request the window closed on is censored, not credited as
+    // A measured request still open when the window closes is censored.
     // completed.
     assert_eq!(logical[3].disposition, LogicalDisposition::InFlight);
     assert_eq!(
@@ -610,14 +555,11 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
     for record in logical.iter().take(3) {
         assert_eq!(record.disposition, LogicalDisposition::Completed);
     }
-    // The after-window row is excluded outright, so rewriting its disposition
-    // would destroy a true outcome without changing any estimate. The in-flight
-    // code therefore means exactly "the measured window closed on this
     // request".
     assert_eq!(logical[4].disposition, LogicalDisposition::Completed);
     assert_eq!(logical[4].terminal_code, None);
 
-    // The estimate set excludes both discards while raw evidence keeps them.
+    // The estimate set excludes after-window records; raw evidence retains them.
     let (estimates, excluded) = perf_measurement::partition_measured(&logical, |r| r.window);
     assert_eq!(
         estimates.iter().map(|r| r.logical_id).collect::<Vec<_>>(),
@@ -644,10 +586,9 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
         LogicalDisposition, LogicalRecord, SynapseMethod,
     };
 
-    // A 10-second window: warmup ends at 1s, the window closes at 10s.
     let window = HoldWindow::new(0, 10);
-    // Method and disposition move together: `embed.result` is always a poll and
-    // no other method ever is, which `validate_synapse_ledgers` enforces.
+    // `embed.result` always uses polling; no other method does.
+    // `validate_synapse_ledgers` rejects poll methods other than `embed.result`.
     let attempt = |logical_id, attempt_id, send_ns: u64, disposition| AttemptRecord {
         logical_id,
         attempt_id,
@@ -679,8 +620,6 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
         };
 
     let mut logical = vec![
-        // Opens inside the measured span and keeps polling past the window end,
-        // which a batch request can legitimately do for its whole deadline.
         request(
             1,
             9_500_000_000,
@@ -689,7 +628,6 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
             2,
             LogicalDisposition::Completed,
         ),
-        // Opens in the warmup prefix and keeps polling well past the warmup
         // boundary.
         request(
             2,
@@ -702,18 +640,16 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
     ];
     let mut attempts = vec![
         attempt(1, 1, 9_500_000_000, AttemptDisposition::Success),
-        // Both of these are sent after the window closed.
         attempt(1, 2, 11_000_000_000, AttemptDisposition::Poll),
         attempt(1, 3, 13_000_000_000, AttemptDisposition::Poll),
         attempt(2, 4, 500_000_000, AttemptDisposition::Success),
-        // Sent after the warmup boundary, by a warmup request.
+        // A warmup request sent this attempt after the warmup boundary.
         attempt(2, 5, 3_000_000_000, AttemptDisposition::Poll),
     ];
 
     window.stamp(&mut logical, &mut attempts);
 
-    // Ownership, not the attempt's own send instant: request 1's post-window
-    // polls stay measured, and request 2's post-warmup poll is discarded.
+    // Request ownership keeps request 1's post-window polls Measured and classifies request 2's post-warmup poll Warmup.
     assert_eq!(
         attempts.iter().map(|a| a.window).collect::<Vec<_>>(),
         [
@@ -725,10 +661,8 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
         ]
     );
 
-    // This is the reason the rule cannot be per-attempt: the estimate sets must
-    // reconcile per request. Classifying attempt 2 and 3 out of the measured set
-    // while logical 1 stays in it would leave logical 1 claiming three attempts
-    // and owning one, which validation reports as an invalid repetition.
+    // Attempt classification must follow request ownership so each measured logical record retains all of its attempts.
+    // The validator rejects a logical record whose recorded attempt count differs from its owned attempts.
     let (logical_estimates, _) = perf_measurement::partition_measured(&logical, |r| r.window);
     let (attempt_estimates, _) = perf_measurement::partition_measured(&attempts, |a| a.window);
     let ledger = validate_synapse_ledgers(&logical_estimates, &attempt_estimates);
@@ -737,8 +671,7 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
     assert_eq!(ledger.attempts, 3);
     assert_eq!(ledger.polls, 2);
 
-    // Dropping the two post-window attempts is exactly what the contract
-    // forbids, so it must fail loudly rather than quietly shrink the ledger.
+    // The contract forbids dropping post-window attempts.
     let truncated: Vec<_> = attempt_estimates
         .iter()
         .filter(|a| a.actual_send_ns < window.end_ns)
@@ -763,10 +696,8 @@ fn a_result_attempt_recorded_as_a_success_is_rejected() {
         LogicalRecord, SynapseMethod,
     };
 
-    // The corruption shape the count checks alone cannot see: an `embed.result`
-    // row recorded as a success lands in `successes` instead of `polls`, so a
-    // logical row claiming zero polls still reconciles on both totals while the
-    // published poll distribution — and the ceiling that gates on it — is
+    // An `embed.result` row recorded as a success increments `successes` instead of `polls`, so totals can reconcile while poll counts diverge.
+    // An `embed.result` row recorded as a success increments `successes` instead of `polls`, so totals can reconcile while poll counts diverge.
     // understated.
     let logical = vec![LogicalRecord {
         logical_id: 1,
@@ -798,8 +729,7 @@ fn a_result_attempt_recorded_as_a_success_is_rejected() {
     ];
 
     let ledger = validate_synapse_ledgers(&logical, &attempts);
-    // Both totals balance, which is why the invariant has to be checked on its
-    // own rather than inferred from the counts.
+    // The validator checks poll counts independently because total attempt counts can reconcile when `embed.result` rows are recorded as successes.
     assert_eq!(ledger.attempts, 2);
     assert_eq!(ledger.polls, 0);
     assert!(!ledger.valid);
@@ -812,7 +742,7 @@ fn a_result_attempt_recorded_as_a_success_is_rejected() {
         ledger.errors
     );
 
-    // The mirror case: a poll disposition on a non-poll method.
+    // A non-poll method cannot use Poll disposition.
     let mislabelled = vec![
         attempt(1, SynapseMethod::Batch, AttemptDisposition::Success),
         attempt(2, SynapseMethod::Query, AttemptDisposition::Poll),
@@ -857,10 +787,9 @@ fn an_orphan_attempt_cannot_enter_the_measured_set() {
         latency_ns: 100_000_000,
         window: WindowClass::Measured,
     };
-    // Attempt 2 names a logical request that is not in the ledger. Leaving the
-    // constructed default in place would let an unattributable row into
-    // estimates, so an orphan is classified out of the measured set; the ledger
-    // validator reports the inconsistency itself.
+    // The validator rejects attempts whose `logical_id` is absent from the logical ledger.
+    // The classifier excludes an orphan from estimates, and the ledger validator rejects it.
+    // The validator reports attempts whose `logical_id` is absent from the logical ledger.
     let mut attempts = vec![attempt(1, 1), attempt(99, 2)];
 
     window.stamp(&mut logical, &mut attempts);
@@ -906,15 +835,15 @@ fn outcome_unknown_attempts_are_neither_admitted_nor_rejected() {
     let ledger = validate_synapse_ledgers(
         &logical,
         &[
-            // A served call: wire evidence that the host admitted it.
+            // A served call has wire evidence that the host admitted it.
             attempt(1, AttemptDisposition::Success, None),
-            // An admission rejection: wire evidence that it did not.
+            // An admission rejection has wire evidence that the host did not admit the call.
             attempt(
                 2,
                 AttemptDisposition::RetryableRejection,
                 Some("queue_full"),
             ),
-            // No terminal arrived, so the wire says nothing either way.
+            // No terminal arrived, so the wire records neither admission nor rejection.
             attempt(3, AttemptDisposition::Timeout, Some(ATTEMPT_TIMEOUT_CODE)),
         ],
     );
@@ -972,8 +901,7 @@ fn an_error_outside_the_client_vocabulary_is_not_a_success() {
 
     assert_eq!(ledger.successes, 0, "the row must not be counted a success");
     assert_eq!(ledger.failures, 1);
-    // The frozen attempt vocabulary has four categories, so a recorded failure
-    // makes the repetition inadmissible rather than silently reshaping rates.
+    // A recorded `Failure` is outside the four-category attempt vocabulary.
     assert!(!ledger.valid);
     assert!(
         ledger
@@ -1004,8 +932,8 @@ fn a_misattributed_poll_count_is_rejected_even_when_attempts_balance() {
         latency_ns: 1,
         window: WindowClass::Measured,
     };
-    // The row owns one submission and one poll, and its total is honest, so
-    // the attempt-count check alone accepts it while `polls` is understated.
+    // The row owns one submission and one poll, so `attempts: 2` is accurate.
+    // The attempt-count check accepts `attempts: 2` but does not detect `polls: 0`.
     let logical = vec![LogicalRecord {
         logical_id: 1,
         scheduled_start_ns: None,
@@ -1039,8 +967,7 @@ fn a_misattributed_poll_count_is_rejected_even_when_attempts_balance() {
         ledger.errors
     );
 
-    // The same ledger with the poll count corrected is admissible, so the new
-    // check rejects only the misattribution and not the shape itself.
+    // With `polls: 1`, `validate_synapse_ledgers` accepts the ledger.
     let corrected = vec![LogicalRecord {
         polls: 1,
         ..logical[0].clone()

@@ -1,8 +1,8 @@
 /**
- * Generate the differential historian USER-prompt golden for the Rust mc-module port.
+ * This script generates the differential historian USER-prompt golden.
  *
- * Run:        bun crates/mc-module/gen/gen-historian-prompt-golden.ts
- * Drift check: bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
+ * `bun crates/mc-module/gen/gen-historian-prompt-golden.ts` runs the generator.
+ * `bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check` detects generated-output drift.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -265,10 +265,7 @@ const promptCaseSpecs: PromptCaseSpec[] = [
             { id: 4, category: "CONSTRAINTS", content: "Escape \"quotes\" but content leaves them literal" },
             { id: 5, category: "CONFIG_VALUES", content: "timeout_ms=5000 & mode=fast" },
             { id: 6, category: "USER_DIRECTIVES", content: "Legacy user directive survives" },
-            // Two categories outside the five-entry render order, so the golden pins the
-            // alphabetical tie-break both renderers fall back to. Both are allow-listed
-            // project-memory categories: a category outside the allow-list never reaches
-            // either renderer, so pinning one here would assert bytes the surfaces refuse
+            // Only allow-listed project-memory categories reach either renderer.
             // to produce.
             { id: 7, category: "KNOWN_ISSUES", content: "Legacy known issue survives" },
         ],

@@ -128,15 +128,8 @@ import { selectPiHistorianRunBoundarySnapshot } from "./context-handler";
 import { convertEntriesToRawMessages } from "./read-session-pi";
 
 test("protected-tail fingerprints are content-stable: metadata-only drift matches, content drift does not", () => {
-	// The fingerprint deliberately hashes ONLY content-bearing fields (text /
-	// tool input+output lengths), not entry timestamps or version metadata.
-	// The same logical message is observed through different views — Pi's
-	// getBranch() entries, OpenCode DB rows, and OpenCode's in-memory
-	// args.messages (which carries no timestamps) — and a snapshot computed
-	// from one view must revalidate against another. Metadata sensitivity
-	// would falsely reject every cross-view snapshot as stale. Content edits
-	// still change the fingerprint, which is the staleness that matters for
-	// the historian's chunk.
+	// Fingerprint ignores metadata so equivalent content matches across views.
+	// Metadata must not invalidate cross-view snapshots; content changes must invalidate them.
 	const entry = (timestamp: number, text: string) => [
 		{
 			type: "message",
@@ -151,7 +144,6 @@ test("protected-tail fingerprints are content-stable: metadata-only drift matche
 		},
 	];
 
-	// Metadata-only drift (timestamp bump, same content) → SAME fingerprint.
 	expect(
 		computeRawRangeFingerprint(
 			convertEntriesToRawMessages(entry(10, "short")),
@@ -166,7 +158,6 @@ test("protected-tail fingerprints are content-stable: metadata-only drift matche
 		),
 	);
 
-	// Content drift (output text changed) → DIFFERENT fingerprint.
 	expect(
 		computeRawRangeFingerprint(
 			convertEntriesToRawMessages(entry(10, "short")),

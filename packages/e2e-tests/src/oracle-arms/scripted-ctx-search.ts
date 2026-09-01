@@ -3,7 +3,7 @@ import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-c
 import type { TestHarness } from "../harness";
 import { runScriptedToolCall } from "../scripted-tool-call";
 
-/** A claim named either by its public ID or by a snapshot carrying one. */
+/* */
 type GoldMemoryId = string | { readonly publicClaimId: string };
 
 function locatorQuery(claims: readonly GoldMemoryId[]): string {
@@ -29,20 +29,12 @@ function locatorQuery(claims: readonly GoldMemoryId[]): string {
 }
 
 /**
- * Execute one real `ctx_search` tool turn and return its wire `tool_result`
- * text. Claims become one locator-shaped query in caller order — the whole
- * query must be public claim IDs for the exact-locator lane to serve it, so a
- * single non-locator token would demote the turn to an ordinary text search.
- * More than five ids are rejected rather than chunked because chunking would no
- * longer be one tool turn.
  *
- * Candidate rows are searchable. Rows already injected into this session are
- * omitted by the plugin's visible-revision-locator filter. The shared tool
- * driver starts from `mock.reset()`, which wipes every installed matcher and the
- * captured request history; callers must reinstall additional matchers for each
- * subsequent step, and must read any wire observation they need from an earlier
- * turn before scripting this one.
  */
+/** The invariant text this turn adds to the model-visible transcript, independent of the query. Exposed so a gold contract can reject an answer the prompt itself would reveal. commentlint: allow(JUDGE) */
+export const SCRIPTED_SEARCH_PROMPT_PREFIX = "Search project memory for oracle evidence: ";
+export const SCRIPTED_SEARCH_FOLLOW_UP = "oracle search complete";
+
 export async function scriptedCtxSearchTurn(
     harness: TestHarness,
     sessionId: string,
@@ -53,8 +45,8 @@ export async function scriptedCtxSearchTurn(
     const call = await runScriptedToolCall(harness, sessionId, {
         tool: "ctx_search",
         input: { query, sources: ["memory"], limit: 5 },
-        prompt: `Search project memory for oracle evidence: ${query}`,
-        followUpText: "oracle search complete",
+        prompt: `${SCRIPTED_SEARCH_PROMPT_PREFIX}${query}`,
+        followUpText: SCRIPTED_SEARCH_FOLLOW_UP,
     });
     return call.resultText;
 }

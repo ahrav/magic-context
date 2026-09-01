@@ -4,21 +4,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
 
 /**
- * Pi context-overflow detection and pressure correction.
  *
- * Pi shares the same provider-agnostic overflow matcher and Anthropic-shaped
- * MockProvider error responses as OpenCode. When a provider rejects a prompt
- * with a context-overflow error, Pi must parse and persist the reported real
- * limit in `session_meta.detected_context_limit`, then use that lower limit for
- * subsequent pressure math.
  *
- * Pi-specific behavior: Pi sessions do NOT consume the OpenCode emergency
- * recovery path. In production, Pi/subagent overflow handling persists the
- * detected limit but intentionally does not rely on `needs_emergency_recovery`
- * to run and later clear an emergency recovery cycle. Therefore this parity
- * file deliberately does NOT assert that the flag is set, and does NOT assert
- * that a recovery cycle completes or clears it. The durable Pi contract here is
- * limit detection plus corrected pressure on the next pass.
  */
 
 interface SessionMetaRow {
@@ -118,9 +105,6 @@ describe("pi context overflow detection", () => {
         );
 
         expect(afterNext.detected_context_limit).toBe(120_000);
-        // The detected combined window is narrowed before reservation:
-        // 120,000 - min(8,192, 25% of 120,000) = 111,808 usable tokens.
-        // The next pass therefore reports 60,000 / 111,808 * 100 exactly.
         expect(afterNext.last_context_percentage).toBe(53.66342301087579);
     }, 120_000);
 

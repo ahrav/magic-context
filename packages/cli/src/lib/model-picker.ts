@@ -1,13 +1,5 @@
 /**
- * Shared model-selection UX for the setup wizard (both OpenCode and Pi).
  *
- * Replaces the old per-harness `buildModelSelection` recommendation trees, which
- * hardcoded a curated list of "recommended" model ids. That was wrong for two
- * reasons: it surfaced models the user often didn't have, and it buried the
- * user's actual models below a capped tail (issue #144). Instead we now show the
- * user's FULL real model list, sorted, in a scrollable type-ahead picker, with a
- * short explanation of what each background role does and the (important) note
- * that these roles do NOT need a frontier model.
  */
 import type { PromptIO, SelectOption } from "./prompts";
 
@@ -15,7 +7,7 @@ export type ModelRole = "historian" | "dreamer" | "sidekick";
 
 interface RoleCopy {
     title: string;
-    /** What the role does + the "a smaller/cheaper model is fine" guidance. */
+    /* */
     blurb: string;
     pickMessage: string;
     placeholder: string;
@@ -52,8 +44,8 @@ const ROLE_COPY: Record<ModelRole, RoleCopy> = {
     },
 };
 
-/** De-duplicate and sort the model catalog for display (provider-grouped via a
- *  plain lexical sort, since ids are `provider/model`). */
+/**
+ * Model IDs use `provider/model`, so sorting groups them by provider. */
 export function sortModelsForPicker(models: string[]): string[] {
     return [...new Set(models)].sort((a, b) => a.localeCompare(b));
 }
@@ -63,10 +55,7 @@ export function modelOptions(models: string[]): SelectOption[] {
 }
 
 /**
- * Show the role explanation, then let the user pick a model from their full
- * catalog via a scrollable type-ahead list. When no models were detected
- * (fetch failed), fall back to free-text entry so the user can still type an id
- * — never block setup behind an empty list.
+ * Free-text entry prevents an empty catalog from blocking setup.
  */
 export async function pickModel(
     prompts: PromptIO,

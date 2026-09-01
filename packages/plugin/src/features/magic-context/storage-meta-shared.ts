@@ -20,8 +20,7 @@ export interface SessionMetaRow {
     cache_alert_sent: number;
     times_execute_threshold_reached: number;
     compartment_in_progress: number;
-    // Intentional: type is string (MD5 hex digest), but the guard accepts string|number
-    // for backward compatibility with pre-release DBs where the column was INTEGER.
+    // The guard accepts string | number because pre-release databases stored the column as INTEGER.
     system_prompt_hash: string | number;
     system_prompt_tokens: number;
     conversation_tokens: number;
@@ -209,13 +208,11 @@ export const NULL_BIND_META_KEYS = new Set([
     "piStableIdScheme",
 ]);
 
-// Defensive typeof checks: columns may be NULL in DB when a row was seeded
-// before a column was added with ensureColumn (SQLite sets existing rows to
-// NULL, not to the DEFAULT). Treat null as "absent/empty" rather than
-// rejecting the whole row — falling back to defaults silently loses the real
-// lastResponseTime, cacheTtl, lastContextPercentage, etc., causing the
-// scheduler to always return "execute" and pending ops to re-apply across
-// every turn (cache bust cascade).
+// The validator accepts NULL for added columns.
+// Rejecting the row would replace populated fields with defaults.
+// Defaulting lastResponseTime, cacheTtl, or lastContextPercentage makes the scheduler return "execute".
+// An "execute" result reapplies pending operations on every turn.
+// Repeated pending-operation application invalidates the cache on every turn.
 function isStringOrNull(value: unknown): boolean {
     return value === null || typeof value === "string";
 }
@@ -250,10 +247,8 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         typeof r.last_input_tokens === "number" &&
         isNumberOrNull(r.observed_safe_input_tokens) &&
         isNumberOrNull(r.cache_alert_sent) &&
-        // INTEGER columns added via ensureColumn: pre-existing rows get NULL
-        // instead of DEFAULT. Strict typeof "number" would reject those rows
-        // and trigger the scheduler-reset cascade described above. toSessionMeta
-        // falls back to 0 for NULL.
+        // Strict `typeof value === "number"` checks reject rows whose added INTEGER columns are NULL.
+        // Rejecting rows with NULL INTEGER fields resets the scheduler because `toSessionMeta` maps those fields to 0.
         isNumberOrNull(r.times_execute_threshold_reached) &&
         isNumberOrNull(r.compartment_in_progress) &&
         (r.system_prompt_hash === null ||
@@ -362,8 +357,6 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
 
 export function ensureSessionMetaRow(db: Database, sessionId: string): void {
     const defaults = getDefaultSessionMeta(sessionId);
-    // Note-nudge persistence columns rely on session_meta defaults and are updated
-    // through storage-meta-persisted helpers, not SessionMeta writes.
     db.prepare(
         "INSERT OR IGNORE INTO session_meta (session_id, harness, last_response_time, cache_ttl, counter, last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent, last_context_percentage, last_input_tokens, observed_safe_input_tokens, cache_alert_sent, times_execute_threshold_reached, compartment_in_progress, system_prompt_hash, cleared_reasoning_through_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(
@@ -388,12 +381,10 @@ export function ensureSessionMetaRow(db: Database, sessionId: string): void {
 }
 
 /**
- * Increment the session facts version after a wholesale session_facts replacement.
+ * Callers must increment the session facts version after a wholesale session_facts replacement.
  *
- * Transaction contract: callers must invoke this inside the same write transaction
- * that deletes/inserts the session_facts rows. This helper deliberately does not
- * create its own transaction so there is no race window between the data write
- * and the version bump.
+ * Callers must invoke this helper in the transaction that deletes and inserts session_facts rows.
+ * Using the caller's transaction prevents a race between the session_facts write and version bump.
  */
 export function bumpSessionFactsVersion(db: Database, sessionId: string): void {
     ensureColumn(db, "session_meta", "session_facts_version", "INTEGER NOT NULL DEFAULT 0");
@@ -404,8 +395,7 @@ export function bumpSessionFactsVersion(db: Database, sessionId: string): void {
 }
 
 export function toSessionMeta(row: SessionMetaRow): SessionMeta {
-    // Defensive: NULL text columns (e.g. seeded rows pre-ensureColumn) must not
-    // crash with `.length on null`. Treat null/empty as absent and map to the
+    // The mapper treats NULL or empty text columns as absent to avoid calling `.length` on NULL.
     // SessionMeta representation.
     const nudgeBandRaw = typeof row.last_nudge_band === "string" ? row.last_nudge_band : "";
     const transformErrorRaw =
@@ -414,10 +404,8 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         typeof row.cache_ttl === "string" && row.cache_ttl.length > 0 ? row.cache_ttl : "5m";
     const systemPromptHashRaw = row.system_prompt_hash == null ? "" : row.system_prompt_hash;
     const lastTodoStateRaw = typeof row.last_todo_state === "string" ? row.last_todo_state : "";
-    // Defensive numeric fallbacks: when isSessionMetaRow accepts NULL for
-    // INTEGER columns added via ensureColumn, the raw row may have `null`
-    // here. Coerce to 0 so callers see a usable SessionMeta without having
-    // to null-check every scalar field.
+    // Rows accepted by isSessionMetaRow can contain NULL in INTEGER columns added by ensureColumn.
+    // The mapper converts those NULL values to 0 so SessionMeta scalar fields are usable without null checks.
     const numOrZero = (value: unknown): number => (typeof value === "number" ? value : 0);
     const numOrNull = (value: unknown): number | null => (typeof value === "number" ? value : null);
     const stringOrNull = (value: unknown): string | null =>

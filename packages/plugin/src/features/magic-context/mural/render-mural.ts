@@ -22,15 +22,14 @@ export const MURAL_COLUMNS = 3;
 export const MURAL_COLUMN_GAP = 1;
 /** Width bounds keep sparse murals compact without making their columns unreadably narrow. */
 const MURAL_MIN_ROOM_WIDTH = 40;
-/** Keep the historical 72-character maximum so murals remain compatible with the prior single-column layout and its line-width limit. */
+/** The 72-character maximum preserves compatibility with the single-column line-width limit. */
 export const MURAL_ROOM_WIDTH = 72;
 export const MURAL_ROWS = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
 
 export type MuralCategory = string;
 
-/** A flat mural entry to render. No rooms, no merges — resolveMural produces a
- *  pre-ordered flat list (category band → importance DESC → id ASC) and the
- *  renderer packs it deterministically into the capped image. */
+/** MuralRenderEntry represents a flat entry; resolveMural orders entries by category, descending importance, then ascending id.
+ * The renderer packs entries deterministically into the capped image. */
 export interface MuralRenderEntry {
     id: string;
     category: MuralCategory;
@@ -57,10 +56,10 @@ export interface MuralRenderResult {
     /** Entries trimmed because the capped image filled before reaching them. */
     droppedIds: string[];
     categoryLineUsage: Record<string, number>;
-    /** Content lines actually placed in the grid (excludes blank cells). Used to
-     *  assert the three-column fill occupancy. */
+    /** filledLineCount excludes blank cells.
+     * */
     filledLineCount: number;
-    /** PNG dimensions after content cropping and vision-tile snapping. */
+    /** width and height report PNG dimensions after content cropping and vision-tile snapping. */
     width: number;
     height: number;
 }
@@ -89,18 +88,14 @@ function escapeText(value: string): string {
 function banner(category: MuralCategory, roomWidth: number): string {
     const label = ` <${category}> `;
     if (codepoints(label) > roomWidth) {
-        // A category name longer than a column is degenerate; hard-truncate the
-        // banner rather than throw — the deterministic renderer must never fail
-        // the m0 injection over a label width.
         return [...label].slice(0, roomWidth).join("");
     }
     const remaining = roomWidth - codepoints(label);
     return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
 }
 
-/** Hard-break a single token wider than the column into column-width slices, so
- *  a long verbatim path/hash in a cue can never overrun a line (word-wrap alone
- *  can't split an unbreakable token). */
+/** Break tokens wider than width into width-sized slices because word-wrap cannot split unbreakable tokens.
+ * */
 function breakLongToken(token: string, width: number): string[] {
     const chars = [...token];
     if (chars.length <= width) return [token];
@@ -112,9 +107,7 @@ function breakLongToken(token: string, width: number): string[] {
 }
 
 /**
- * Word-wrap one cue into bullet lines that fit the selected column width. The
- * first line is bulleted; continuations are indented two spaces so wrapped
- * cues remain visually distinct from the category bars.
+ * Bullet the first line and indent continuation lines two spaces to distinguish wrapped cues from category bars.
  */
 function wrapCue(cue: string, width: number): string[] {
     const continuationIndent = "  ";
@@ -141,7 +134,7 @@ function wrapCue(cue: string, width: number): string[] {
 
 interface PlannedLine {
     text: string;
-    /** Entry ids whose body starts on this line (two for a shared pair). */
+    /** The line records entry IDs whose bodies start on it; a shared pair records two IDs. */
     entryIds: string[];
     isBanner: boolean;
     category: MuralCategory;
@@ -160,8 +153,8 @@ function canShareCues(cue: string, nextCue: string, roomWidth: number): boolean 
 }
 
 /**
- * Measure the unwrapped lines for a possible width. Category labels participate
- * in the measurement, while their decorative bars are sized to that width.
+ * Width selection measures unwrapped lines, including category labels.
+ * Category labels contribute to width measurement; decorative bars use the measured width.
  */
 function naturalLineLengths(entries: readonly MuralRenderEntry[], roomWidth: number): number[] {
     const lengths: number[] = [];
@@ -188,7 +181,7 @@ function naturalLineLengths(entries: readonly MuralRenderEntry[], roomWidth: num
     return lengths;
 }
 
-/** Choose the smallest bounded width that leaves only the longest ~5% wrapped. */
+/** The width selector chooses the smallest bounded width that wraps at most 5% of lines. */
 function chooseRoomWidth(entries: readonly MuralRenderEntry[]): number {
     for (let width = MURAL_MIN_ROOM_WIDTH; width <= MURAL_ROOM_WIDTH; width++) {
         const lengths = naturalLineLengths(entries, width);
@@ -200,9 +193,7 @@ function chooseRoomWidth(entries: readonly MuralRenderEntry[]): number {
 }
 
 /**
- * Build the flat line plan for the pre-ordered entries: a category banner at
- * each band boundary, then the entries' cue lines with shared-pair packing (two
- * short non-prohibition cues on one line — a density win) and word-wrap for the
+ * Shared-pair packing increases line density.
  * rest.
  */
 function planLines(entries: readonly MuralRenderEntry[], roomWidth: number): PlannedLine[] {
@@ -258,8 +249,7 @@ function splitPlan(plan: readonly PlannedLine[], columnCount: number): PlannedLi
         const remainingColumns = columnCount - column;
         let take = Math.min(MURAL_ROWS, Math.ceil(remainingLines / remainingColumns));
 
-        // Keep a category banner with at least one following body line when a
-        // balanced split would otherwise leave the banner at the bottom.
+        // Keep each category banner with at least one following body line.
         while (
             offset + take < plan.length &&
             take < MURAL_ROWS &&
@@ -267,8 +257,7 @@ function splitPlan(plan: readonly PlannedLine[], columnCount: number): PlannedLi
         ) {
             take++;
         }
-        // If the cap itself lands on a banner, preserve the old behavior: leave
-        // that final row blank instead of rendering an orphaned category header.
+        // If `take === MURAL_ROWS` ends on a banner, leave the row blank to avoid an orphaned category header.
         if (take === MURAL_ROWS && plan[offset + take - 1]?.isBanner) take--;
         if (take <= 0) break;
 
@@ -425,8 +414,8 @@ function encodeRgbPng(pixels: Uint8Array, width: number, height: number): Uint8A
     return output;
 }
 
-/** The generated atlas provides real Spleen pixels; unknown characters use a
- * visible, deterministic replacement glyph rather than random-looking noise. */
+/** The generated atlas uses Spleen glyph pixels; unknown characters use a visible, deterministic replacement glyph.
+ * */
 function glyph(character: string): MuralFontGlyph {
     return MURAL_FONT_GLYPHS[character] ?? MURAL_FONT_REPLACEMENT_GLYPH;
 }
@@ -498,7 +487,7 @@ function fillRect(
     }
 }
 
-/** Round a content extent up to a complete vision tile without exceeding the cap. */
+/** The layout rounds the content extent up to a complete vision tile without exceeding the cap. */
 function snapDimensionToVisionTile(contentPixels: number, maximum: number): number {
     return Math.min(
         maximum,
@@ -510,10 +499,6 @@ function snapDimensionToVisionTile(contentPixels: number, maximum: number): numb
 }
 
 /**
- * Render the deterministic mural from a pre-ordered flat entry list. Zero LLM,
- * pure function of its input — callable any time. Category bands, bullet lines,
- * shared-pair packing, fitted word-wrap, balanced columns, and prohibition ink
- * are all preserved from the author-era renderer; rooms and merges are gone.
  */
 export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderResult {
     const roomWidth = chooseRoomWidth(entries);
@@ -538,9 +523,7 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
         };
     });
 
-    // A smaller canvas must not win by silently dropping entries. When no layout
-    // can fit the full plan under the hard cap, keep as many entries as possible
-    // and then apply the same tile-area optimization.
+    // When no layout fits the full plan under the hard cap, maximize retained entries before minimizing tile area.
     const fittingCandidates = candidates.filter(
         (candidate) => candidate.layout.droppedIds.length === 0,
     );
@@ -621,7 +604,7 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
     };
 }
 
-/** Anthropic charges one visual token per 28x28 image patch. */
+/* */
 export function muralImageTokenEstimateForDimensions(width: number, height: number): number {
     return Math.ceil(width / MURAL_VISION_TILE) * Math.ceil(height / MURAL_VISION_TILE);
 }

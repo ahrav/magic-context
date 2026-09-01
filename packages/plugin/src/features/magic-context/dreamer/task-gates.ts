@@ -28,33 +28,26 @@ import {
 } from "./task-registry";
 
 /**
- * Prefix of the independence key a classify-memories pass stamps on the
- * evidence it writes. `claim-manifest.ts` builds those keys as
- * `<task>:<leaseGeneration>:<publicClaimId>`, so the task name typed against
- * `DreamTaskName` is the whole coupling — a task rename fails to compile here
- * rather than silently zeroing the backlog probe.
+ * `DreamTaskName` makes task renames fail to compile here.
  */
 const CLASSIFY_MEMORIES_TASK: DreamTaskName = "classify-memories";
 
 /**
- * Per-task activity gates (Dreamer v2 A+B). A due task runs ONLY if its gate
- * passes, so cron cadence never burns a 60-turn agentic loop on an unchanged
- * pool. Gates are conservative — allow when uncertain — and cheap (count
- * queries, no full-row loads, no LLM).
+ * A due task runs only when its gate passes.
+ * Gates allow execution when counts are uncertain.
  *
- * `lastRunAt` is the task's own `task_schedule_state.last_run_at` (null = never
- * run → treat "changed since" gates as "is there anything at all").
+ * `lastRunAt = null` makes changed-since gates test whether any work exists.
  */
 
 export interface TaskGateContext {
     db: Database;
     projectIdentity: string;
     lastRunAt: number | null;
-    /** retrospective content watermark (max message ts scanned). Distinct from
-     *  lastRunAt: a session updated mid-run is newer than its scanned content but
-     *  older than the run-completion time, so gating on lastRunAt would skip it. */
+    /** `retrospectiveWatermarkMs` is the maximum scanned message timestamp.
+     * A session updated mid-run can be newer than its scanned content but older than run completion.
+     * Gating on `lastRunAt` would skip such a session. */
     retrospectiveWatermarkMs?: number | null;
-    /** review-user-memories: min candidate observations before a review is worthwhile. */
+    /* */
     promotionThreshold: number;
 }
 
@@ -64,11 +57,6 @@ export function countActiveMemories(db: Database, projectPath: string): number {
     });
 }
 
-// Lifecycle-active is not the same as runnable. `surfaceDecision` drops
-// hard-hidden, contradicted, quarantined, rejected, and expired claims on every
-// surface — maintenance lanes included — so counting only the lifecycle head
-// reported work the runners cannot see: curate would open a child session over an
-// empty pool and the backlog telemetry would never drain.
 const ACTIVE_CLAIM_BASE_SQL = `
     FROM claim_public_ids cpi
     JOIN claims ON claims.id = cpi.claim_id
@@ -78,7 +66,7 @@ const ACTIVE_CLAIM_BASE_SQL = `
      AND NOT ${antiMemoryClaimSql("claims.current_revision_id")}
      AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`;
 
-/** Latest baseline assertion with `paths_state = 'known'` and at least one
+/**
  * path selector. */
 const MAPPED_CLAIM_SQL = `
     EXISTS (
@@ -110,7 +98,6 @@ function countActiveClaimsWhere(
     if (projectIds.length === 0) return 0;
     const row = db
         .prepare(
-            // Interpolation composes compile-time SQL fragments, not caller input.
             // pi-lens-ignore: sql-injection
             `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL} AND ${condition}`,
         )
@@ -118,7 +105,7 @@ function countActiveClaimsWhere(
     return row?.cnt ?? 0;
 }
 
-/** Active claims whose latest baseline assertion has no `paths_state = 'known'`. */
+/* */
 export function countUnmappedActiveMemories(db: Database, projectPath: string): number {
     return countActiveClaimsWhere(
         db,
@@ -153,13 +140,12 @@ export function countCompartmentsSince(db: Database, projectPath: string, since:
 }
 
 /**
- * The watermark the retrospective task should measure "new work" against.
+ * `retrospectiveWatermarkMs` defines the baseline for retrospective new-work checks.
  *
- * A null watermark makes `countProjectSessionsSince` count every session for the
- * project's lifetime, so falling back to the persisted content watermark is what
- * keeps an omitted option from reading as "no watermark". Both the activity gate
- * and the backlog probe resolve it here so they cannot disagree about how much
- * work is pending.
+ * `countProjectSessionsSince` counts every project-lifetime session when given null.
+ * An omitted watermark falls back to the persisted content watermark.
+ * The persisted watermark prevents an omitted option from meaning no watermark.
+ * The activity gate and backlog probe use the same resolved watermark.
  */
 function resolveRetrospectiveWatermark(
     db: Database,
@@ -218,7 +204,6 @@ function countBroadCycleCandidates(
     if (projectIds.length === 0) return 0;
     const row = db
         .prepare(
-            // Interpolation composes compile-time SQL fragments, not caller input.
             // pi-lens-ignore: sql-injection
             `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL} AND ${MAPPED_CLAIM_SQL}
                 AND COALESCE((
@@ -236,7 +221,6 @@ function countCueCandidates(db: Database, projectPath: string): number {
     if (projectIds.length === 0) return 0;
     const row = db
         .prepare(
-            // Interpolation composes compile-time SQL fragments, not caller input.
             // pi-lens-ignore: sql-injection
             `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL}
                 AND NOT EXISTS (
@@ -269,13 +253,7 @@ function countStalePrimers(db: Database, projectPath: string): number {
 }
 
 /**
- * Active claims carrying no classify-memories evidence on their current
- * revision — the same marker `classify.ts` reads to decide what a pass still
- * has to do, so backlog telemetry falls to zero once a pass catches up.
  *
- * A revision is the unit: a revise supersedes the classified revision, and the
- * new one is genuinely unclassified again. The task prefix is bound rather than
- * inlined so the probe's SQL text names only claim tables.
  */
 function countUnclassifiedActiveMemories(db: Database, projectPath: string): number {
     return countActiveClaimsWhere(
@@ -318,8 +296,7 @@ function countActivePrimers(db: Database, projectPath: string): number {
 }
 
 /**
- * Read-only backlog probe for one task. These probes reuse the task selection
- * predicates and never acquire a lease, materialize a prompt cache, or invoke a model.
+ * The backlog probe is read-only and does not acquire a lease, materialize a prompt cache, or invoke a model.
  */
 export function getDreamTaskBacklog(
     db: Database,
@@ -345,9 +322,9 @@ export function getDreamTaskBacklog(
                 projectPath,
                 "verify-broad",
             )?.lastBroadRunAt;
-            // With no open cycle, the next broad run will open one over the whole
-            // mapped pool. Once open, report only the memories not yet verified for
-            // that cycle so run telemetry reflects the resumable backlog.
+            // The next broad run opens a cycle over the mapped pool when no cycle is open.
+            // An open cycle reports only memories not yet verified for that cycle.
+            // Reporting only unverified memories keeps run telemetry aligned with the resumable backlog.
             const pending =
                 cycleStartAt == null
                     ? total
@@ -404,7 +381,7 @@ export function getDreamTaskBacklog(
     }
 }
 
-/** Read the complete backlog breakdown in the caller's requested registry order. */
+/** The function returns backlog entries in registry order. */
 export function getDreamTaskBacklogs(
     db: Database,
     projectPath: string,
@@ -417,63 +394,38 @@ export function getDreamTaskBacklogs(
 }
 
 /**
- * Evaluate a task's activity gate. Returns true if the task has work to do.
- * Throwing DB errors propagate to the caller (a gate that can't read is a real
- * problem, not silently "no work").
+ * Database read errors propagate instead of being treated as no work.
  */
 export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boolean {
     const { db, projectIdentity: project, lastRunAt } = ctx;
     switch (task) {
         case "map-memories":
-            // Runs only while UNMAPPED active memories exist — the one-time-style
-            // backfill that drains the pool then no-ops. Cheap: a single NOT-IN
-            // count against the verification side-table.
+            // The task runs while active unmapped memories remain and no-ops after the backfill drains the pool.
             return countUnmappedActiveMemories(db, project) > 0;
 
         case "verify":
-            // The executor's file gate does the precise incremental partition; the
             // scheduler only avoids taking the memory lease when there is no pool.
             return countActiveMemories(db, project) > 0;
 
         case "verify-broad":
-            // Keep an open cycle runnable even when another task removed the last
-            // active memory; the executor then closes the now-empty cycle. A closed
-            // cycle still needs an active pool before taking the memory lease.
+            // An open cycle remains runnable after another task removes the last active memory.
             return (
                 getTaskScheduleState(db, project, "verify-broad")?.lastBroadRunAt != null ||
                 countActiveMemories(db, project) > 0
             );
 
         case "curate":
-            // Curate is whole-pool hygiene, but still needs an active pool before
-            // taking the shared memory lease.
             return countActiveMemories(db, project) > 0;
 
         case "compress-cues":
-            // Cheap pre-gate: only take the memory lease when a pool exists. The
-            // executor's selectCandidates does the precise NULL/stale-hash cue
-            // partition and no-ops when everything is already compressed.
             return countActiveMemories(db, project) > 0;
 
         case "classify-memories":
-            // Classification scores the active project memory pool directly. It has
-            // no file gate, watermark, or completeness prerequisites.
             return countActiveMemories(db, project) > 0;
 
         case "retrospective":
-            // Cheap pre-gate: any project session updated since the CONTENT
-            // watermark (max message ts actually scanned), not lastRunAt — a
-            // session updated mid-run would otherwise be skipped. The executor's
-            // raw provider does the precise typed-user-message scan and bails
-            // before any child session if empty. Never-run → "sessions exist".
+            // The task runs when pending correction events exist or project sessions changed since the retrospective watermark.
             //
-            // Falls back to the persisted watermark for the same reason
-            // `getDreamTaskBacklog` does: a null watermark makes
-            // `countProjectSessionsSince` count every session for the project's
-            // lifetime, so a caller that omits the field would keep admitting
-            // runs whose executor then finds nothing new. Every current caller
-            // supplies it; resolving it here keeps the gate and the backlog
-            // probe from drifting apart if one ever stops.
             return (
                 countPendingCorrectionEvents(db, project) > 0 ||
                 countProjectSessionsSince(
@@ -484,7 +436,7 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             );
 
         case "maintain-docs":
-            // New compartments since the last maintain-docs run. Never-run → any exist.
+            // When lastRunAt is null, zero admits any existing compartment.
             return countCompartmentsSince(db, project, lastRunAt ?? 0) > 0;
 
         case "evaluate-smart-notes":
@@ -495,24 +447,12 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             );
 
         case "review-user-memories":
-            // Candidate observations are GLOBAL (cross-project user profile).
             return getUserMemoryCandidates(db).length >= ctx.promotionThreshold;
 
         case "promote-primers": {
             if (countPrimerCandidatesForProject(db, project) >= (ctx.promotionThreshold ?? 2)) {
                 return true;
             }
-            // The promotion pass also owns re-embedding primers and candidates
-            // whose vectors were produced under a retired provider identity —
-            // search skips those vectors outright, so a project with active
-            // primers but too few candidates would otherwise keep semantic
-            // primer retrieval disabled indefinitely. Open the gate when stale
-            // rows exist. The check is a pure SQL EXISTS (no BLOB decode) per
-            // this module's cheap-gate contract, and deliberately NARROWER than
-            // reembedStalePrimerEmbeddings' staleness rule: rows with NO
-            // embedding at all stay under the threshold gate above. An
-            // unregistered project has no current identity to compare against
-            // (and nobody searching it); it stays closed until registration.
             const snapshot = getProjectEmbeddingSnapshot(project);
             if (!snapshot?.enabled) return false;
             return hasPrimerRowsWithStaleEmbeddings(db, project, snapshot.modelId);

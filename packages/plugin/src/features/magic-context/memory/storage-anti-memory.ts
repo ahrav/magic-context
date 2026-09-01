@@ -57,9 +57,7 @@ export interface CreateAntiMemoryInput {
     importance?: number;
     requestScope?: string;
     /**
-     * Expiry anchor override. Backfill consumers anchor to the source event's
-     * age so harvesting old history does not re-animate stale warnings; when
-     * absent, expiry starts at the write clock.
+     * When `expiresAt` is absent, expiry starts at the write clock.
      */
     expiresAt?: number;
     nowMs?: number;
@@ -103,31 +101,16 @@ function requiredText(value: unknown, field: string): string {
     if (typeof value !== "string" || value.trim().length === 0) {
         throw new ClaimOperationInputError(`anti-memory ${field} must be non-empty`);
     }
-    // Collapse to one line, not just trim. `renderAntiMemoryContent` emits one
-    // labeled line per field and `parseAntiMemoryContent` reads it back that
-    // way, so an embedded newline would either break the round trip the
-    // verification UPDATE path depends on or let payload text forge a second
-    // field label ("...\nRejection reason: forged").
     return value.replace(/\s+/g, " ").trim();
 }
 
 function optionalText(value: unknown, field: string): string | null {
     if (value === undefined || value === null) return null;
-    // The payload columns are `CHECK (col IS NULL OR length(trim(col)) > 0)`, so
-    // an absent optional field has exactly one legal stored form: NULL. A
-    // blank string is the same absence spelled differently — model-generated
-    // payloads routinely emit `""` for a field they have nothing to say about —
-    // and rejecting it would fail the whole write over a value the schema and
-    // the renderer both treat as "not present".
     if (typeof value === "string" && value.trim().length === 0) return null;
     return requiredText(value, field);
 }
 
 /**
- * Trim and null-normalize a payload, rejecting empty required fields. Exported
- * so consumers that validate or fingerprint payload text can derive the field
- * set from the payload itself instead of hand-enumerating it (a hand-kept list
- * fails open when a field is added).
  */
 export function normalizeAntiMemoryPayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
     return {
@@ -169,11 +152,6 @@ export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
 export function parseAntiMemoryContent(content: string): AntiMemoryPayload {
     const fields = new Map<string, string>();
     for (const line of content.split(/\r?\n/)) {
-        // A blank line carries no field. `renderAntiMemoryContent` never emits
-        // one, but this parser also reads model-authored content from the
-        // verification manifest, where a trailing newline or a blank line
-        // between fields is ordinary formatting rather than corruption. Only a
-        // non-empty line missing a label is malformed.
         if (line.trim().length === 0) continue;
         const separator = line.indexOf(":");
         if (separator <= 0) throw new ClaimOperationInputError("invalid anti-memory content line");
@@ -271,9 +249,6 @@ export function stageCreateAntiMemoryInCurrentTransaction(
             actor: input.actor,
             requestScope: input.requestScope,
             nowMs,
-            // The staging boundary refuses anti-memory category writes that do
-            // not come through this typed path, so every caller reaching the
-            // generic stage from here must carry the writer assertion.
             antiMemoryWriter: true,
         },
         nowMs,
@@ -300,26 +275,20 @@ export function createAntiMemory(
             ...producer,
             requestDigest: computeClaimOperationRequestDigest({
                 actor: input.actor,
-                // A caller-supplied expiry lands in the persisted revision
-                // attributes, so it belongs to the request for the same reason
-                // importance does: without it, a second call reusing the
-                // operation key with a different explicit expiry replays the
-                // first receipt and silently keeps the old TTL.
                 //
-                // Digest what the caller REQUESTED, not the resolved value. The
-                // default is `nowMs + ANTI_MEMORY_DEFAULT_TTL_MS`, which moves
-                // with the clock, so digesting the resolved expiry would make an
-                // honest replay compute a different digest and raise
-                // ClaimOperationKeyReuseError instead of replaying. An omitted
-                // expiry therefore always digests as null.
+                // The digest uses requested `expiresAt`, not the resolved expiry.
+                // The digest represents omitted expiry as null because the resolved default varies with `nowMs`.
+                // The digest represents omitted expiry as null because the resolved default varies with `nowMs`.
+                // The digest represents omitted expiry as null because the resolved default varies with `nowMs`.
+                // The digest represents omitted expiry as null because the resolved default varies with `nowMs`.
                 expiresAt: input.expiresAt ?? null,
-                // Importance lands in the persisted revision attributes, so it
-                // is part of the request: leaving it out lets a second call
-                // that reuses the operation key with a different importance
-                // replay the first receipt and silently drop the new value
-                // instead of raising ClaimOperationKeyReuseError. Digest the
-                // resolved value so an omitted importance and an explicit
-                // default stay one request.
+                // The digest includes resolved importance because reuse with different persisted importance must raise `ClaimOperationKeyReuseError`.
+                // The digest includes resolved importance because reuse with different persisted importance must raise `ClaimOperationKeyReuseError`.
+                // The digest includes resolved importance because reuse with different persisted importance must raise `ClaimOperationKeyReuseError`.
+                // The digest includes resolved importance because reuse with different persisted importance must raise `ClaimOperationKeyReuseError`.
+                // The digest includes resolved importance because reuse with different persisted importance must raise `ClaimOperationKeyReuseError`.
+                // The digest uses resolved importance so omitted importance and an explicit default represent the same request.
+                // The digest uses resolved importance so omitted importance and an explicit default represent the same request.
                 importance: input.importance ?? DEFAULT_MEMORY_IMPORTANCE,
                 operation: "create-anti-memory",
                 payload: payloadDigestShape(payload),
@@ -352,23 +321,18 @@ function reviseWithPayload(
     args: {
         input: Omit<ReviseAntiMemoryInput, "payload">;
         /**
-         * Produces the payload for the new revision. Runs inside the staged
-         * callback, so only after the operation-key receipt lookup misses.
-         * Every read of current state and every check against it belongs here:
-         * a pre-transaction read or comparison would reject an honest replay
-         * whose receipt should short-circuit instead — for a TTL extension the
-         * stored expiry already equals the request's, and the claim may have
-         * moved on or gone away entirely since the first attempt.
+         * `resolvePayload` alone reads and compares current state so receipt lookup can short-circuit replays.
+         * `resolvePayload` alone reads and compares current state so receipt lookup can short-circuit replays.
+         * A replayed TTL extension may already have the requested stored expiry.
+         * The claim may change or be deleted between the first attempt and a replay.
          */
         resolvePayload: () => StoredAntiMemoryPayload;
         /**
-         * The payload as the caller *requested* it, or null for an operation
-         * that supplies none. What gets stored can be state read back from the
-         * current revision; folding that into the request digest would make an
-         * idempotent retry diverge as soon as an unrelated revision changed
-         * the payload in between, raising `ClaimOperationKeyReuseError`
-         * instead of replaying the receipt. The digest describes the request,
-         * never the row.
+         * The digest uses the caller-requested payload rather than payload read from the current revision.
+         * The digest uses the caller-requested payload rather than payload read from the current revision.
+         * The digest uses the caller-requested payload rather than payload read from the current revision.
+         * The digest uses the caller-requested payload rather than payload read from the current revision.
+         * The digest uses the caller-requested payload rather than payload read from the current revision.
          */
         digestPayload: StoredAntiMemoryPayload | null;
         expiresAt?: number;
@@ -421,12 +385,7 @@ function reviseWithPayload(
 }
 
 /**
- * Stage an anti-memory revision inside a transaction the caller already owns.
- * The dreamer applies a whole verification manifest as one transaction, so it
- * needs the staging half of `reviseWithPayload` without the surrounding
- * operation run. Payload resolution and forward-progress checks are the
- * caller's here, because the caller has already refreshed the mutation token
- * against current state.
+ * The staging helper runs inside a transaction the caller already owns.
  */
 function stageAntiMemoryRevisionInCurrentTransaction(
     db: Database,
@@ -460,10 +419,6 @@ function stageAntiMemoryRevisionInCurrentTransaction(
 }
 
 /**
- * Record a verification outcome against an anti-memory claim. Re-exported from
- * the generic operations module so every typed anti-memory write is reachable
- * from one place: the refusal in the generic recorder tells callers to use "the
- * typed anti-memory API", and this is it.
  */
 export { stageAntiMemoryVerificationInCurrentTransaction } from "./storage-claim-operations";
 
@@ -535,19 +490,13 @@ export function extendAntiMemoryTtl(
     }
     return reviseWithPayload(db, producer, {
         input,
-        // An extension carries no payload of its own: it re-states the current
-        // one. Reading it here, inside the stage, keeps both the read and the
-        // forward-progress check off the replay path.
+        // Staging prevents replay from re-reading the payload or rechecking expiry progress.
         resolvePayload: () => {
             const current = readAntiMemory(db, input.token.publicClaimId);
             if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
-            // Judge forward progress only for a caller whose token is still
-            // current. A superseded token means a concurrent extension already
-            // won, and its expiry can legitimately sit beyond this request's —
-            // forward progress from the caller's own snapshot. That race is the
-            // contract's zero-effect `stale` outcome, which the stage below
-            // produces; throwing here would relabel it a caller defect and
-            // record no receipt at all.
+            // A concurrent extension can set an expiry later than this request's snapshot.
+            // The stage returns a zero-effect `stale` outcome when a concurrent extension sets a later expiry.
+            // Throwing before staging would classify a concurrent later-expiry extension as invalid input and omit its receipt.
             if (validateProjectMemoryMutationToken(db, input.token).ok) {
                 if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
                     throw new ClaimOperationInputError(
@@ -593,10 +542,8 @@ type AntiMemoryRow = Omit<
         sharing: string;
     };
 
-/** Payload fields are returned exactly as stored. Normalization is a write-side
- *  contract (`normalizeAntiMemoryPayload` runs in every create and revise path);
- *  re-normalizing at read time would make the returned payload diverge from the
- *  stored `content` and `contentDigest` for a record written under an earlier
+/** Payload fields are returned exactly as stored; normalize only on writes.
+ * Do not normalize reads: returned payload fields must match stored values.
  *  normalization scheme. */
 function antiMemoryRecordFromRow(row: AntiMemoryRow): AntiMemoryRecord {
     if (row.trigger === null) {
@@ -604,9 +551,7 @@ function antiMemoryRecordFromRow(row: AntiMemoryRow): AntiMemoryRecord {
             `anti-memory ${row.publicClaimId} current revision has no payload row`,
         );
     }
-    // Anti-memory is project-private by construction; a stored row that says
-    // otherwise means some path mutated scope or sharing around the typed
-    // writer. Fail closed instead of masking the violated invariant with
+    // Reject rows whose scope or sharing violates the project-private invariant.
     // hardcoded values.
     if (row.memoryScope !== "project" || row.sharing !== "private") {
         throw new ClaimGraphCorruptionError(
@@ -649,7 +594,7 @@ function antiMemoryRecordFromRow(row: AntiMemoryRow): AntiMemoryRecord {
 export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryRecord | null {
     const row = db
         .prepare(
-            // Interpolation is a compile-time column and join list, not caller input.
+            // The interpolation uses fixed column and join fragments, not caller input.
             // pi-lens-ignore: sql-injection
             `SELECT ${ANTI_MEMORY_ROW_COLUMNS}
                ${ANTI_MEMORY_ROW_JOINS}
@@ -660,8 +605,8 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
     return antiMemoryRecordFromRow(row);
 }
 
-/** Batched current-revision payload read for the search lane: one query for the
- *  whole candidate set instead of one `readAntiMemory` per record. */
+/**
+ * The search lane reads all candidate payloads in one query instead of calling `readAntiMemory` for each record. */
 export function readAntiMemories(
     db: Database,
     publicClaimIds: readonly string[],
@@ -670,7 +615,7 @@ export function readAntiMemories(
     if (publicClaimIds.length === 0) return records;
     const rows = db
         .prepare(
-            // Interpolation is a compile-time placeholder list, not caller input.
+            // Interpolation generates only `?` placeholders; values are bound through `.all(...publicClaimIds)`.
             // pi-lens-ignore: sql-injection
             `SELECT ${ANTI_MEMORY_ROW_COLUMNS}
                ${ANTI_MEMORY_ROW_JOINS}
@@ -684,10 +629,8 @@ export function readAntiMemories(
     return records;
 }
 
-/** Bounded candidate listing for the search lane: active, unexpired anti-memory
- *  public ids only, newest claims first. Keeps the current-state hydration that
- *  follows scoped to at most `limit` anti-memory claims instead of the whole
- *  project claim set. */
+/**
+ * */
 export function listActiveAntiMemoryPublicIds(
     db: Database,
     projectIds: readonly number[],
@@ -697,7 +640,7 @@ export function listActiveAntiMemoryPublicIds(
     if (projectIds.length === 0 || limit <= 0) return [];
     const rows = db
         .prepare(
-            // Interpolation is a compile-time placeholder list, not caller input.
+            // Interpolation generates only `?` placeholders; values are bound through `.all(...projectIds)`.
             // pi-lens-ignore: sql-injection
             `SELECT public.public_id AS publicId
                FROM claim_memory_current_heads heads

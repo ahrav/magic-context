@@ -33,9 +33,8 @@ export type LocalEmbeddingDtype =
     | "q1"
     | "q1f16";
 
-// The recipe definitions live in embedding-identity.ts because the recipe
-// participates in the provider identity; re-exported here so provider users
-// keep one import surface for local-embedding concerns.
+// The recipe participates in the provider identity, so its definitions remain in `embedding-identity.ts` and are re-exported here.
+// The re-export preserves a single import surface for local-embedding consumers.
 export {
     getLocalEmbeddingRecipe,
     type LocalEmbeddingPooling,
@@ -43,30 +42,17 @@ export {
 } from "./embedding-identity";
 
 /**
- * Cross-process mutex for embedding-model load. When two OpenCode processes
- * spawn simultaneously (typical Desktop sidecar + TUI + dashboard setup), they
- * can both call onnxruntime-node's `InferenceSession::LoadModel` on the same
- * cached `.onnx` file at the same wall-clock time. Older onnxruntime-node
- * builds (<=1.21.0 / native lib 1.14.0) could double-free an internal
- * `IoBinding` during cleanup when this happened, producing SIGBUS/SIGTRAP
- * crashes inside the worker thread and silently killing the TUI.
+ * `acquireModelLoadLock` serializes embedding-model loading across processes.
+ * When two OpenCode processes spawn simultaneously, they can load the same cached model concurrently.
+ * Two OpenCode processes can call `InferenceSession::LoadModel` on the same cached `.onnx` file simultaneously.
  *
  * See https://github.com/cortexkit/magic-context/issues/21.
  *
- * Transformers v4 / onnxruntime-node 1.24.x ships a much newer native library
- * and is expected to handle this, but we add a belt-and-suspenders file lock
- * so two processes never call `createPipeline()` at the exact same instant.
  *
  * Contract:
- *   - Uses `open(path, "wx")` — atomic-create with exclusive flag on POSIX,
- *     and the equivalent on Windows (ERROR_FILE_EXISTS).
- *   - Writes our PID + timestamp to the lock file for diagnostics.
- *   - If the lock is held by another process, polls every 150ms.
- *   - Treats a lock file older than `STALE_LOCK_MS` as stale (crashed holder)
- *     and takes it over.
- *   - If we cannot acquire the lock within `MAX_LOCK_WAIT_MS`, we log a
- *     warning and proceed without the lock rather than blocking embedding
- *     forever. Model load failures in this case are caught by the retry loop.
+ * `acquireModelLoadLock` uses `open(path, "wx")` for atomic exclusive creation on POSIX.
+ * On Windows, `"wx"` reports an existing lock through the equivalent exclusive-create failure.
+ * The lock acquisition writes the process PID and start timestamp for diagnostics.
  */
 const LOCK_POLL_MS = 150;
 const STALE_LOCK_MS = 3 * 60_000; // 3 minutes — model loads are typically <30s
@@ -77,7 +63,7 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
     while (true) {
         try {
             const handle = await open(lockPath, "wx");
-            // Best-effort write of PID + timestamp for diagnostics.
+            // A failed diagnostic write does not release the acquired lock.
             try {
                 await handle.writeFile(`pid=${process.pid} started=${Date.now()}\n`);
             } catch {
@@ -88,7 +74,7 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
                 try {
                     await unlink(lockPath);
                 } catch {
-                    /* already gone / race — ignore */
+                    /* The release ignores unlink failures because another process may have removed the lock file. */
                 }
             };
         } catch (error) {
@@ -97,7 +83,6 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
             if (code !== "EEXIST" && code !== "EPERM") {
                 throw error;
             }
-            // Lock exists — check if it's stale.
             try {
                 const info = await stat(lockPath);
                 if (Date.now() - info.mtimeMs > STALE_LOCK_MS) {
@@ -107,12 +92,11 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
                     try {
                         await unlink(lockPath);
                     } catch {
-                        /* another process may have cleaned it up — retry acquire */
+                        /* The lock file can disappear after exclusive creation fails; retry acquisition. */
                     }
                     continue;
                 }
             } catch {
-                // Lock disappeared between create-fail and stat — retry acquire.
                 continue;
             }
             if (Date.now() - waitStart > MAX_LOCK_WAIT_MS) {
@@ -135,52 +119,30 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
     }
 }
 
-// Touch the lock file periodically so a long-running model load doesn't get
-// misdetected as stale by another waiting process.
+// The heartbeat updates the lock file during model loading so waiters do not treat it as stale.
 function startLockHeartbeat(lockPath: string): () => void {
     const HEARTBEAT_MS = Math.floor(STALE_LOCK_MS / 3);
     const timer = setInterval(() => {
-        // writeFile with fresh content updates mtime; any error is non-fatal.
+        // The heartbeat timer does not keep the event loop alive.
         writeFile(lockPath, `pid=${process.pid} alive=${Date.now()}\n`).catch(() => {});
     }, HEARTBEAT_MS);
-    // Don't keep the event loop alive solely for the heartbeat.
     timer.unref?.();
     return () => clearInterval(timer);
 }
 
 /**
- * Pre-inject the WASM ONNX runtime so transformers.js skips its native
- * `onnxruntime-node` path entirely.
+ * Electron injects the WASM ONNX runtime before importing transformers.js to bypass onnxruntime-node.
  *
- * Why this exists:
  *   `@huggingface/transformers@4.x` does a top-level static `import "onnxruntime-node"`.
- *   On Electron Desktop (e.g. OpenCode Desktop's main process), that native
- *   `.node` binary fails to load for several environmental reasons — missing
- *   Visual C++ Redistributables on Windows, ASAR archive layout issues,
- *   onnxruntime's own dependency DLLs not being resolvable. The failure
- *   propagates up the import chain and Node reports it as `ERR_MODULE_NOT_FOUND`
- *   targeting `transformers.node.mjs`, even though that file exists.
  *
  *   transformers.js exposes `Symbol.for("onnxruntime")` as an override hook
- *   (added in 3.4.x via PR #1231). If that global symbol is set before the
- *   first `import("@huggingface/transformers")`, the library uses whatever ORT
- *   we provide instead of attempting its own native-or-web backend selection.
  *
- *   `onnxruntime-web` (WASM backend) is already a direct dependency of
- *   `@huggingface/transformers`, so it's installed alongside `onnxruntime-node`
- *   with no extra package needed. WASM is slower than native CPU on Node/Bun
- *   but on Electron Desktop it's the only path that actually loads.
  *
- * Why only Electron:
- *   Plain Node and Bun runtimes (Pi, terminal OpenCode, dashboard backend)
- *   load `onnxruntime-node` correctly. We don't want to regress those to WASM.
- *   `process.versions.electron` is the canonical check — it's only present
- *   inside Electron processes.
+ * Node and Bun load onnxruntime-node instead of WASM.
+ * Only Electron processes define `process.versions.electron`.
  *
  * Refs:
  *   - https://github.com/cortexkit/magic-context/issues/78
- *   - https://github.com/huggingface/transformers.js/pull/1231 (ORT_SYMBOL)
- *   - https://github.com/huggingface/transformers.js/issues/1240 (Electron picks wrong ORT)
  */
 async function injectWasmOrtForElectron(): Promise<boolean> {
     if (typeof process === "undefined" || !process.versions?.electron) {
@@ -198,10 +160,8 @@ async function injectWasmOrtForElectron(): Promise<boolean> {
             default?: unknown;
         };
 
-        // Resolve the actual on-disk location of onnxruntime-web/dist/ so we can
-        // point WASM loading at the local .wasm/.mjs files rather than the
-        // jsdelivr CDN. Without this, the first embedding init would require
-        // network access — and would fail offline or behind corporate proxies.
+        // Local WASM assets avoid jsDelivr and permit offline embedding initialization.
+        // CDN loading requires network access.
         try {
             const { createRequire: createRequireFn } = await import("node:module");
             const requireFn = createRequireFn(import.meta.url);
@@ -217,9 +177,8 @@ async function injectWasmOrtForElectron(): Promise<boolean> {
                 ortWeb.env.wasm.wasmPaths = wasmPathsPrefix;
             }
         } catch (pathError) {
-            // Non-fatal — onnxruntime-web will fall back to its default CDN.
-            // First embedding init may need network, but subsequent ones use
-            // the WASM cache. We log and continue rather than blocking embeddings.
+            // On failure, onnxruntime-web uses its default CDN paths.
+            // Fallback CDN paths require network access for the first embedding initialization.
             log(
                 "[magic-context] could not resolve local onnxruntime-web/dist, falling back to default WASM paths:",
                 pathError instanceof Error ? pathError.message : String(pathError),
@@ -227,20 +186,15 @@ async function injectWasmOrtForElectron(): Promise<boolean> {
         }
 
         // transformers.js does `if (ORT_SYMBOL in globalThis) { ONNX = globalThis[ORT_SYMBOL] }`
-        // at module-evaluation time. Setting this BEFORE the first
-        // `await import("@huggingface/transformers")` (immediately after this
-        // function returns) ensures the library picks up our WASM runtime
-        // instead of its own native selection logic.
+        // transformers.js must see the override before its first import evaluates.
         (globalThis as Record<symbol, unknown>)[Symbol.for("onnxruntime")] = ortWeb;
         log(
             "[magic-context] Electron detected — using onnxruntime-web (WASM) for embeddings (bypasses onnxruntime-node native load)",
         );
         return true;
     } catch (error) {
-        // If onnxruntime-web import itself fails (e.g. it's not installed for
-        // some reason), we fall through and let transformers do its normal
-        // native load. That will likely fail too, but the error will be the
-        // user's actual problem rather than something masked by our shim.
+        // Returning false lets Transformers use its normal backend selection.
+        // Returning false preserves Transformers.js's native-load error.
         log(
             "[magic-context] failed to inject onnxruntime-web for Electron — letting transformers fall back to native:",
             error instanceof Error ? error.message : String(error),
@@ -276,8 +230,7 @@ type CreateEmbeddingPipeline = (
 const DEFAULT_LOCAL_DTYPE: LocalEmbeddingDtype = "fp32";
 
 /**
- * Temporarily redirects console.warn and console.error to the file logger
- * so that @huggingface/transformers and ONNX runtime never leak to the TUI.
+ * The redirect prevents Transformers and ONNX Runtime warnings from reaching the TUI.
  */
 async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {
     const origWarn = console.warn;
@@ -297,11 +250,6 @@ async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Recognizes transient ONNX/transformers load failures that should be retried
- * rather than surfaced to the user. Seen in live logs when multiple plugin
- * processes (Desktop sidecar + TUI + dashboard) initialize the embedding
- * pipeline within the same window. The on-disk model file is intact; the
- * failure mode is ephemeral and resolves on retry.
  */
 /**
  * Recognizes the PERMANENT "native runtime not installed" failure: the plugin's
@@ -313,10 +261,8 @@ async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {
  * not transient — retrying just re-spams the cryptic resolver error every time an
  * embedding is needed. We latch it and degrade cleanly with one actionable line.
  */
-// Process-global latch: once the native ONNX runtime is confirmed missing, every
-// LocalEmbeddingProvider in this process short-circuits initialize() instead of
-// re-importing transformers and re-failing. Process-global (not per-instance)
-// because the missing package affects the whole install, not one model.
+// `nativeRuntimeMissing` is process-global because a missing package affects the entire installation.
+// A process-global latch prevents every provider from re-importing Transformers after a missing-runtime failure.
 let nativeRuntimeMissing = false;
 
 export function isNativeRuntimeMissingError(error: unknown): boolean {
@@ -325,13 +271,7 @@ export function isNativeRuntimeMissingError(error: unknown): boolean {
     const code = (error as { code?: unknown } | null)?.code;
     const name = (error as { name?: unknown } | null)?.name;
 
-    // onnxruntime-node IS installed but its native binary fails to LOAD — e.g.
-    // Windows missing the VC++ runtime throws ERR_DLOPEN_FAILED on the
-    // `onnxruntime_binding.node` file (whose path contains "onnxruntime", not
-    // necessarily the literal "onnxruntime-node"). A failed postinstall can also
-    // surface as MODULE_NOT_FOUND for `onnxruntime_binding.node`. Both are
-    // environmental and permanent, same as the missing-package case: latch and
-    // degrade once instead of re-spamming the load error on every embedding.
+    // Native ONNX binary load failures permanently disable the native runtime.
     if (code === "ERR_DLOPEN_FAILED" && lower.includes("onnxruntime")) {
         return true;
     }
@@ -369,13 +309,11 @@ function isArrayLikeNumber(value: unknown): value is ArrayLike<number> {
     if (typeof arr.length !== "number") {
         return false;
     }
-    // Verify a sample element is numeric (or array is empty)
     return arr.length === 0 || typeof arr[0] === "number";
 }
 
 function toFloat32Array(values: ArrayLike<number>): Float32Array {
-    // Intentional: defensive copy for Float32Array inputs prevents mutation of pipeline output.
-    // The one-time copy cost is negligible compared to inference cost.
+    // The provider copies Float32Array pipeline output to prevent callers from mutating it.
     return values instanceof Float32Array
         ? new Float32Array(values)
         : Float32Array.from(Array.from(values));
@@ -439,11 +377,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         maxInputTokens = 512,
         dtype: LocalEmbeddingDtype = DEFAULT_LOCAL_DTYPE,
     ) {
-        // Normalize ONCE and use the same string for the recipe, the identity,
-        // and the pipeline load. The identity function trims independently, so
-        // an untrimmed direct-construction model would otherwise resolve the
-        // symmetric recipe here while the identity hash folds the bound recipe:
-        // vectors and identity would disagree about the space.
+        // The provider uses normalizedModel for recipe selection and modelId so both identify the same embedding space.
         const normalizedModel = model.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL;
         this.model = normalizedModel;
         this.maxInputTokens = maxInputTokens;
@@ -485,18 +419,14 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                     return;
                 }
 
-                // Pre-inject WASM ORT runtime for Electron Desktop. This MUST run
-                // before the first `await import("@huggingface/transformers")` below
-                // — transformers.js reads `Symbol.for("onnxruntime")` at module
-                // evaluation time and uses whatever we provide instead of doing its
-                // own native-vs-web backend selection. No-op on plain Node/Bun.
+                // Electron must inject the WASM ONNX runtime before importing Transformers.js.
+                // Transformers.js reads `Symbol.for("onnxruntime")` during module evaluation.
+                // Transformers.js uses the injected runtime instead of selecting a backend.
+                // The injection is a no-op on plain Node and Bun.
                 // See: https://github.com/cortexkit/magic-context/issues/78
                 const injectedWasmOrt = await injectWasmOrtForElectron();
 
-                // Non-literal import specifier prevents Bun from eagerly resolving
-                // @huggingface/transformers at plugin load time. Desktop sidecar spawns
-                // hit ENOENT on JSDoc-referenced files inside transformers' webpack dist
-                // when the literal string triggers Bun's static module analysis.
+                // The provider uses a non-literal import specifier so Bun does not eagerly resolve the native runtime.
                 // See: https://github.com/cortexkit/magic-context/issues/4
                 const transformersSpec = `@huggingface/${"transformers"}`;
                 const transformersModule = (await import(transformersSpec)) as Record<
@@ -512,24 +442,21 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                     env.logLevel = LogLevel.ERROR;
                 }
 
-                // Set a stable model cache directory outside of node_modules.
-                // On Windows, the default .cache inside the npm cached install
+                // The provider uses a cache directory outside the npm install because Windows may not allow writes to the default cache.
                 // (e.g. ~\.cache\opencode\packages\...\node_modules\@huggingface\transformers\.cache)
-                // can be inaccessible or non-writable, causing "Unable to get model file path
-                // or buffer" failures. Using our own storage dir survives plugin updates too.
+                // The provider uses a plugin-owned storage directory so cached data survives plugin updates.
                 const modelCacheDir = join(getMagicContextStorageDir(), "models");
                 try {
-                    // Keep the cache owner-only by default because it shares the
-                    // storage tree with memories/history. Trusted-group deployments
-                    // manage this directory externally, so skip both mode creation
-                    // and chmod rather than attempting a different permission change.
+                    // The provider keeps the cache owner-only because it shares a storage tree with memories and history.
+                    // Trusted-group deployments manage the storage directory externally.
+                    // Externally managed storage directories receive neither a creation mode nor chmod.
                     if (shouldEnforcePrivateStoragePermissions()) {
                         mkdirSync(modelCacheDir, { recursive: true, mode: 0o700 });
                         if (process.platform !== "win32") {
                             try {
                                 chmodSync(modelCacheDir, 0o700);
                             } catch {
-                                // Non-fatal — leave default perms if chmod is rejected.
+                                // The cache keeps its default permissions when chmod fails.
                             }
                         }
                     } else {
@@ -537,7 +464,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                     }
                     env.cacheDir = modelCacheDir;
                 } catch {
-                    // Non-fatal — fall back to library default if we can't create the dir
+                    // The library uses its default cache when directory creation fails.
                     log("[magic-context] could not create model cache dir, using library default");
                 }
                 const createPipeline = transformersModule.pipeline as CreateEmbeddingPipeline;
@@ -549,13 +476,8 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 const releaseLock = await acquireModelLoadLock(lockPath);
                 const stopHeartbeat = startLockHeartbeat(lockPath);
                 try {
-                    // Retry loop absorbs transient failures seen when multiple plugin
-                    // processes initialize the ONNX session around the same time:
-                    //   - "Protobuf parsing failed" (onnxruntime-node race on mmap/page cache)
-                    //   - "Unable to get model file path or buffer" (download still in progress)
-                    //   - EBUSY / file lock contention
-                    // Recovery happens within a few hundred ms. The file on disk is fine;
-                    // we verified this on live logs with matching SHA256 vs HuggingFace.
+                    // Concurrent plugin processes can cause transient ONNX-session initialization failures.
+                    // `EBUSY` can indicate file-lock contention.
                     const MAX_ATTEMPTS = 3;
                     let lastError: unknown;
                     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -596,7 +518,6 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                             if (!isTransientLoadError(error) || attempt === MAX_ATTEMPTS) {
                                 break;
                             }
-                            // Jittered backoff: 300ms + random 0-200ms, grows by attempt.
                             const delayMs = 300 * attempt + Math.floor(Math.random() * 200);
                             log(
                                 `[magic-context] embedding model load attempt ${attempt}/${MAX_ATTEMPTS} failed transiently, retrying in ${delayMs}ms`,
@@ -618,10 +539,9 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 }
             } catch (error) {
                 if (isNativeRuntimeMissingError(error)) {
-                    // Permanent, environmental: latch so we degrade once and stop
-                    // re-importing (which would re-spam the cryptic resolver error
-                    // on every embedding). One actionable line; local embeddings
-                    // are disabled for this process until the install is repaired.
+                    // The resolver latches failures to avoid retrying imports.
+                    // The resolver latches failures to avoid logging the resolver error for every embedding.
+                    // Local embeddings remain disabled for the process after a resolver failure.
                     nativeRuntimeMissing = true;
                     log(
                         "[magic-context] local embeddings are disabled because the " +
@@ -667,10 +587,6 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ): Promise<Float32Array | null> {
-        // Local inference is fast (typically <100ms) and can't be cancelled
-        // mid-compute with transformers.js, so we honor `signal` only as a
-        // pre-flight check — callers whose timeout already fired get null
-        // without starting fresh inference work.
         if (signal?.aborted) return null;
         if (this.disposing) return null;
 

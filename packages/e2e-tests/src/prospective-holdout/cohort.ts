@@ -30,10 +30,8 @@ export type StaticPrivacyRejection = {
     intakeId: string;
     reasonCode: "privacy-rejected";
     /**
-     * Instant the rejected report was submitted.
      *
-     * Carried explicitly because this path never builds a `SanitizedIntake`, so nothing
-     * else on it bounds deletion completions from below.
+     * `submittedAt` bounds deletion completions because privacy rejections do not build a `SanitizedIntake`.
      */
     submittedAt: string;
     deletionEvidence: DeletionEvidence[];
@@ -91,9 +89,7 @@ export function parseCustodyEvidence(raw: unknown): CustodyEvidence {
 }
 
 function withLock<T>(root: string, operation: () => T): T {
-    // The store owns its root, so the store creates it: the lock helper takes the
-    // parent directory as given, and 0o700 is the store's own confidentiality
-    // requirement rather than a property of locking.
+    // `0o700` restricts newly created store roots to their owner.
     mkdirSync(root, { recursive: true, mode: 0o700 });
     return withRecoverableLock(join(root, ".lock"), { busyCode: "cohort-store: busy" }, operation);
 }
@@ -104,10 +100,7 @@ function intakeId(disposition: CohortDisposition): string {
 
 function publishFileOnce(storeRoot: string, path: string, bytes: string): void {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    // Staging lives in a store-root directory the readers never scan. A hard kill between
-    // the write and the cleanup leaves the staging file behind, and the readers reject any
-    // name that is not a decision record, so a leftover inside `decisions` or `late` would
-    // wedge every later read and close until an operator removed it by hand.
+    // Staging files stay outside `decisions` and `late` so a crash before cleanup cannot wedge readers.
     const stagingDirectory = join(storeRoot, ".staging");
     mkdirSync(stagingDirectory, { recursive: true, mode: 0o700 });
     const staging = join(stagingDirectory, `${basename(path)}.${randomBytes(8).toString("hex")}`);
@@ -155,8 +148,7 @@ function parseStoredDisposition(raw: unknown): CohortDisposition {
             value.deletionEvidence,
             "cohort-store.record.deletionEvidence",
         );
-        // A stored record is bytes on disk, so the rule the factory applied is re-applied
-        // here rather than assumed of whatever wrote the file.
+        // Revalidate stored records because disk contents can bypass factory validation.
         assertDeletionEvidenceCoversSubmission(
             deletionEvidence,
             submittedAt,
@@ -277,16 +269,7 @@ export function buildCohortClose(input: {
     const late = [...input.late].sort((left, right) => left.intakeId.localeCompare(right.intakeId));
     const closedAtMs = Date.parse(input.closedAt);
     const deletionEvidence = input.decisions.map((entry) => {
-        // A disposition reaching here in memory has only TypeScript's word for its shape:
-        // the store-read path parses, but a caller can hand `buildCohortClose` a
-        // hand-constructed one. Nothing below would catch it, because five distinct bogus
-        // store names satisfy the count and uniqueness test, and every timestamp test is a
-        // `Date.parse` comparison that an unparseable instant passes as NaN, since NaN
-        // compares false in both directions. The malformed evidence would then be covered
-        // by `retentionEvidenceFingerprint` while the close drops the evidence itself,
-        // leaving repository validation no way to discover deletion was never validly
-        // attested. Parsing first rejects the store name and the instant by their own
-        // contracts rather than by comparison.
+        // Parse caller-supplied dispositions because downstream count and timestamp checks do not reject invalid store names or unparseable instants.
         const evidence = parseDeletionEvidence(
             "intake" in entry ? entry.intake.deletionEvidence : entry.deletionEvidence,
             "cohort.deletionEvidence",
@@ -302,19 +285,12 @@ export function buildCohortClose(input: {
         ) {
             throw new HoldoutContractError(["cohort: deletion-evidence-invalid"]);
         }
-        // The deadline and the close are both upper bounds, so on their own they admit
-        // evidence for a retention run that finished before the report existed, which
-        // leaves this report's own copies unaccounted for while the manifest's retention
-        // fingerprint covers it. Submission is the lower bound that closes that, and it
-        // holds for every disposition: the privacy-rejected path carries the instant
-        // itself because it has no sanitized intake to read it from.
+        // `submittedAt` is the lower bound because the deadline and `closedAt` alone allow deletion evidence that predates the report.
+        // Privacy rejections carry `submittedAt` directly because they have no `SanitizedIntake`.
         if (evidence.some((item) => Date.parse(item.completedAt) < Date.parse(submittedAt))) {
             throw new HoldoutContractError(["cohort: deletion-before-submission"]);
         }
-        // A per-store deadline may fall after the cohort closes, so the deadline
-        // test on its own admits evidence for deletion that has not run at close
-        // time. Comparison reads the closed cohort, so every store's deletion must
-        // complete no later than closedAt for the manifest's retention claim to
+        // `closedAt` also bounds deletion evidence because a store deadline can exceed the cohort close time.
         // hold.
         if (evidence.some((item) => Date.parse(item.completedAt) > closedAtMs)) {
             throw new HoldoutContractError(["cohort: deletion-after-close"]);

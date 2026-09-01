@@ -212,9 +212,9 @@ describe("claim operations: revise (scenario 2)", () => {
                 ).hash;
             const hash1 = hashOf(r1.currentRevisionId);
 
-            // Same bytes, same attributes, different dedup preimage: the claim
-            // moves to another (project, category, hash) slot, so the fast path
-            // must not swallow it and leave the stale hash on the head.
+            // Changing a claim's project or category must bypass deduplication even when its bytes and attributes match.
+            // A claim that changes slots must bypass the deduplication fast path.
+            // The deduplication fast path must not retain a stale hash on the head after a claim moves slots.
             const revised = reviseProjectMemoryClaim(
                 ctx.db,
                 { producer: "test", operationKey: "op-dedup-text" },
@@ -374,7 +374,7 @@ describe("claim operations: stale claim-local tokens (scenario 4)", () => {
             expect(attempt.outcome).toBe("stale");
             expect(attempt.result.staleReason).toContain(expectedPart);
             expect(attempt.result.effects).toHaveLength(0);
-            // The stale attempt adds no partial rows; it adds only the
+            // A stale attempt creates no partial rows.
             // zero-effect receipt.
             expect(snapshotSemanticRows(ctx.db)).toEqual(before);
             expect(rowCount(ctx.db, "claim_operation_receipts")).toBe(receiptsBefore + 1);
@@ -543,7 +543,6 @@ describe("claim operations: duplicate statements (scenarios 6-7, R7)", () => {
             expect(rowCount(ctx.db, "claim_evidence")).toBe(2);
             expect(second.result.effects[0].changeKind).toBe("evidence");
 
-            // Replaying either operation adds nothing.
             const counts = snapshotCounts(ctx.db);
             expect(createClaimOp(ctx, "op-first", "Duplicate statement content.").replayed).toBe(
                 true,
@@ -569,12 +568,11 @@ describe("claim operations: duplicate statements (scenarios 6-7, R7)", () => {
     });
 
     test("several attachments to one claim in one receipt carry distinct effect keys", () => {
-        // An autonomous manifest whose entries normalize onto the same live
-        // (project, category, hash) slot creates the claim once and attaches the
-        // rest. Those attachments share a claim AND a revision, so a key built
-        // from those alone repeats — and `claim_operation_effects` enforces
-        // UNIQUE (receipt_id, effect_key) with an append-only trigger, so the
-        // duplicate aborts the whole manifest including its unrelated entries.
+        // A manifest whose entries normalize to one live (project, category, hash) slot must create one claim and attach the remaining entries.
+        // Attachments to the same claim share its revision.
+        // An effect key derived only from claim and revision duplicates for attachments to the same claim revision.
+        // `claim_operation_effects` rejects duplicate `(receipt_id, effect_key)` pairs.
+        // A duplicate effect key aborts the whole manifest, including unrelated entries.
         const ctx = setup();
         try {
             const staged = ctx.db
@@ -597,7 +595,6 @@ describe("claim operations: duplicate statements (scenarios 6-7, R7)", () => {
                 .immediate();
 
             if (staged.kind !== "effects") throw new Error(`unexpected stage kind ${staged.kind}`);
-            // One create plus two attachments.
             expect(staged.effects).toHaveLength(3);
             expect(
                 staged.effects.filter((effect) => effect.changeKind === "evidence"),
@@ -616,8 +613,7 @@ describe("claim operations: duplicate statements (scenarios 6-7, R7)", () => {
             createClaimOp(ctx, "op-b", "converging   DUPLICATE content.");
             expect(rowCount(ctx.db, "claims")).toBe(1);
 
-            // A direct-SQL duplicate live head cannot exist: the partial
-            // unique index is the database-boundary backstop.
+            // The partial unique index prevents duplicate live heads even when SQL bypasses application checks.
             const claimRow = ctx.db
                 .prepare(
                     "SELECT claim_id, project_id, category, normalized_hash, revision_id FROM claim_memory_current_heads",
@@ -823,7 +819,6 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
         createClaimOp(ctx, "op-1", "First claim content.");
         const target = createClaimOp(ctx, "op-2", "Second claim content.");
         const source = createClaimOp(ctx, "op-3", "Third claim content.");
-        // The merge receipt groups two effects.
         mergeProjectMemoryClaims(
             ctx.db,
             { producer: "test", operationKey: "op-merge" },
@@ -880,7 +875,7 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
             expect(pruned.boundary).toBe(2);
             expect(pruned.prunedEffectRows).toBe(2);
             expect(rowCount(ctx.db, "claim_operation_effects")).toBe(3);
-            // Receipts never leave (R20).
+            // Pruning effects does not delete receipts.
             expect(rowCount(ctx.db, "claim_operation_receipts")).toBe(receiptsBefore);
 
             // A consumer with no checkpoint pins the boundary at zero.
@@ -900,9 +895,9 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
     });
 
     test("a project the consumer never checkpointed pins the boundary at zero", () => {
-        // Checkpoints are keyed (consumer, project_id) while the delete is
-        // global over effect ids, so a consumer caught up on one project must
-        // not license pruning another project's unprocessed effects.
+        // Because deletion is global by effect ID, a checkpoint for one `(consumer, project_id)` must not authorize pruning effects another project has not processed.
+        // Because deletion is global by effect ID, a checkpoint for one `(consumer, project_id)` must not authorize pruning effects another project has not processed.
+        // Because deletion is global by effect ID, a checkpoint for one `(consumer, project_id)` must not authorize pruning effects another project has not processed.
         const ctx = setup();
         try {
             const otherProjectId = ensureProject(ctx.db, "git:u2-ops-other");
@@ -952,10 +947,10 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
     });
 
     test("a checkpoint beyond the outbox tail is refused", () => {
-        // A cursor past the tail claims effects that do not exist. The
-        // receipt-split guard cannot see it — there is no pending row beyond
-        // such an id — and once every required consumer holds one, the prune
-        // boundary becomes that future id and later effects are deleted unread.
+        // A cursor past the tail claims effects that do not exist.
+        // The receipt-split guard cannot detect a checkpoint beyond the final effect because no later pending row exists.
+        // Once every required consumer holds a checkpoint beyond the final effect, the prune boundary becomes that future ID and deletes later unread effects.
+        // Once every required consumer holds a checkpoint beyond the final effect, the prune boundary becomes that future ID and deletes later unread effects.
         const ctx = setup();
         try {
             const { maxEffectId } = seedOutbox(ctx);
@@ -971,9 +966,8 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
                     .immediate(),
             ).toThrow("beyond the outbox tail");
 
-            // The tail itself is fine, and re-acknowledging it stays idempotent
-            // after pruning empties the table — those effects are gone because
-            // they were consumed.
+            // Acknowledging the final effect remains idempotent after pruning.
+            // Pruning removes effects only after every required consumer acknowledges them.
             ctx.db
                 .transaction(() => {
                     for (const consumer of [
@@ -1019,8 +1013,7 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
         const ctx = setup();
         try {
             const { maxEffectId } = seedOutbox(ctx);
-            // The merge receipt owns the last two effect ids; acking between
-            // them would expose half an operation.
+            // The merge receipt owns the last two effect IDs; acking between them exposes half an operation.
             expect(() =>
                 ctx.db
                     .transaction(() =>
@@ -1123,7 +1116,7 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
     });
 });
 
-/** Observation IDs linked to one revision, optionally narrowed to one relation. */
+/* */
 function evidenceObservationIds(
     db: Database,
     revisionId: number,
@@ -1148,7 +1141,7 @@ function currentRevisionIdOf(ctx: Ctx, publicClaimId: string): number {
     return claim.currentRevisionId;
 }
 
-/** The single observation a freshly created claim's revision 1 carries. */
+/** A freshly created claim's revision 1 carries one observation. */
 function soleObservationIdOf(ctx: Ctx, publicClaimId: string): number {
     const ids = evidenceObservationIds(ctx.db, currentRevisionIdOf(ctx, publicClaimId));
     if (ids.length !== 1) {
@@ -1215,8 +1208,7 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
             const targetRef = getProjectMemoryClaimByPublicId(ctx.db, targetId);
             expect(targetRef?.revision).toBe(2);
 
-            // Source evidence rows survive untouched and back the new target
-            // revision through merged_from links.
+            // Source evidence rows remain unchanged and link to the new target revision through `merged_from`.
             const mergedEvidence = ctx.db
                 .prepare(
                     `SELECT COUNT(*) AS count FROM claim_evidence
@@ -1247,8 +1239,8 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                 expect(supersedes.count).toBe(1);
             }
 
-            // No trust or approval transfer: the merged revision opens its
-            // own conservative inference-tainted subject with no approvals.
+            // The merge transfers neither trust nor approvals.
+            // The merged revision has an `ASSISTANT_INFERENCE`-tainted subject and no approvals.
             const subject = ctx.db
                 .prepare(
                     `SELECT origin_taint AS originTaint FROM claim_revision_policy_subjects
@@ -1291,15 +1283,14 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
             );
             expect(first.outcome).toBe("applied");
             const firstRevisionId = currentRevisionIdOf(ctx, firstTarget);
-            // A merge-produced revision records its lineage exclusively as
-            // merged_from, so a supports-only lookup finds nothing here.
+            // A merge-produced revision records its lineage exclusively as `merged_from` evidence.
+            // A `supports`-only lookup finds no lineage for a merge-produced revision.
             expect(evidenceObservationIds(ctx.db, firstRevisionId, "supports")).toEqual([]);
             expect(evidenceObservationIds(ctx.db, firstRevisionId, "merged_from")).toEqual(
                 ascending([observationA, observationB]),
             );
 
-            // Mixed sources: the merge-produced source's transitive lineage
-            // survives alongside the plain source's own observation.
+            // A merge carries a merge-produced source's transitive lineage forward.
             const second = mergeOp(
                 ctx,
                 "op-merge-2",
@@ -1338,8 +1329,7 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                 "applied",
             );
 
-            // Neither source holds a supports row, so a supports-only evidence
-            // read would leave this merge with nothing to carry forward.
+            // Neither source has a `supports` row, so a `supports`-only evidence lookup returns no source evidence.
             const final = mergeOp(
                 ctx,
                 "op-final-merge",
@@ -1395,9 +1385,6 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
     });
 
     test("a merge that keeps the target content keeps the target's own evidence", () => {
-        // Built from source observations only, the merged revision dropped the
-        // target's attestation of bytes it still holds — invisible in evidence
-        // summaries, and gone from the chain once this claim is merged again.
         const ctx = setup();
         try {
             const target = createClaimOp(ctx, "op-target", "Target claim content.");
@@ -1413,7 +1400,6 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                 .all(publicIdOf(target)) as Array<{ observationId: number }>;
             expect(targetObservations.length).toBeGreaterThan(0);
 
-            // mergedContent omitted, so the target keeps its bytes.
             const merged = mergeProjectMemoryClaims(
                 ctx.db,
                 { producer: "test", operationKey: "op-merge" },
@@ -1443,10 +1429,6 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
     });
 
     test("a cross-category merge is refused before any claim is retired", () => {
-        // A merge keeps the target's category and terminally retires every
-        // source, so merging across categories destroys the source category's
-        // live fact. The pre-cutover `merge_memories` rejected this before any
-        // store mutation and the curator prompt still promises it.
         const ctx = setup();
         try {
             const target = createClaimOp(ctx, "op-target", "Target claim content.");
@@ -1467,7 +1449,6 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                     },
                 ),
             ).toThrow(/cross-category merge is refused/);
-            // Nothing staged, so the source's distinct fact is still live.
             expect(snapshotCounts(ctx.db)).toEqual(before);
         } finally {
             closeQuietly(ctx.db);
@@ -1475,10 +1456,6 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
     });
 
     test("merged content may keep a source's exact wording", () => {
-        // The sources are still `active` when the duplicate-content guard runs
-        // and only retire later in the same transaction, so a merge that keeps
-        // one source's wording — the common outcome — must not read that source
-        // as the pre-existing owner of the coordinate.
         const ctx = setup();
         try {
             const target = createClaimOp(ctx, "op-target", "Target claim content.");
@@ -1509,8 +1486,6 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                         .get(sourceRef.claimId) as { state: string }
                 ).state,
             ).toBe("retired");
-            // The retired source vacates the coordinate, so exactly one live
-            // claim owns the merged content afterwards.
             expect(
                 (
                     ctx.db
@@ -1570,10 +1545,8 @@ describe("claim operations: mapping and verification (scenario 14)", () => {
                     expect(outcome.result.effects[0].revisionLocator).toBe(locator);
                 }
             }
-            // Baseline stream: opening assertion plus the three appends.
             expect(rowCount(ctx.db, "claim_revision_applicability_assertions")).toBe(4);
 
-            // A mapping computed against a superseded revision is stale.
             const oldToken = computeProjectMemoryMutationToken(ctx.db, publicId);
             reviseProjectMemoryClaim(
                 ctx.db,
@@ -1624,7 +1597,6 @@ describe("claim operations: mapping and verification (scenario 14)", () => {
                 )
                 .all(claim.currentRevisionId) as Array<{ outcome: string }>;
             expect(events.map((event) => event.outcome)).toEqual(["verified", "stale"]);
-            // The latest outcome flows into the effective policy projection.
             const projection = ctx.db
                 .prepare(
                     "SELECT dispositions_json AS dispositions FROM claim_effective_policy WHERE revision_id = ?",

@@ -1,32 +1,15 @@
 /**
- * Pi `context` event handler — the per-LLM-call transform pipeline.
  *
- * Pi fires `pi.on("context", ...)` immediately before each LLM
- * invocation, with the full `AgentMessage[]` that's about to be sent.
+ * Pi invokes this handler immediately before each LLM invocation with the outgoing `AgentMessage[]` array.
  * The handler can return `{ messages }` to replace the array.
  *
- * This handler now mirrors OpenCode's full transform pipeline (see
- * PARITY.md for the deliberate mechanism-level divergences). Per pass it:
- *   1. Wraps the AgentMessage[] in a Transcript via `createPiTranscript`.
- *   2. Tags eligible parts with the shared `Tagger` and injects `§N§ `
- *      prefixes (unless the session has no ctx_reduce tool).
- *   3. Applies queued drops (`pending_ops`) + persisted tag statuses so
- *      cross-session drops survive.
- *   4. Prepares m[0]/m[1] history injection, trims the live tail to the
- *      compartment boundary, and replays reasoning/placeholder/sentinel
- *      strips for cache stability — Pi DOES have prompt-cache-sensitive
- *      providers (Anthropic via the m[0]/m[1] split), so the same
- *      byte-stability discipline as OpenCode applies.
- *   5. Runs the historian/compartment trigger, nudges (rolling,
- *      note-nudge, ctx_reduce reminders), and auto-search hints.
- *   6. Drains deferred compaction markers via Pi's `appendCompaction()`
- *      surface (Pi's analogue of OpenCode's compaction-marker injection).
+ * The handler omits `§N§ ` prefixes when the session has no `ctx_reduce` tool.
+ * Dropped tags persist across sessions.
+ * Prompt-cache-sensitive providers require byte-stable `m[0]`/`m[1]` history injection.
+ * Anthropic prompt caching requires byte-stable `m[0]`/`m[1]` history injection.
+ * The handler drains deferred compaction markers through Pi's `appendCompaction()`.
  *
- * Error handling: ordinary thrown errors are caught and logged, then the
- * original messages pass through unmodified — the same fail-open
- * philosophy as the OpenCode `messages-transform` wrapper (see
- * AUDIT-KNOWN-ISSUES.md for the documented tradeoff). FailClosedBlockingError
- * is rethrown so deterministic inoperability cannot silently degrade to
+ * Ordinary errors are logged and return the original messages; `FailClosedBlockingError` is rethrown to prevent fallback to native compaction.
  * native compaction.
  */
 
@@ -253,34 +236,22 @@ import {
 } from "./tokenize-pi-messages";
 import { createPiTranscript } from "./transcript-pi";
 
-/** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */
+/** The handler blocks when the emergency threshold reaches at least 95%. */
 const EMERGENCY_BLOCK_PERCENTAGE = 95;
 
-// estimateTokens (char-based) under-counts the real provider
-// tokenizer + untagged structural/reasoning parts: the observed overflow was
-// >400K real vs a ~340K forward estimate (~15% gap). Scaling the limit DOWN for
-// the forward percentage reaches the derived force and absolute 95% emergency
-// bands at a real size that corresponds to the window, not the under-counted estimate.
-// 0.85 (not 0.90): 0.90 would make the 95% emergency band fire only at ~360K
-// estimated, still short of the >400K real seen here.
+// Character-based `estimateTokens` omits provider-tokenizer and untagged structural/reasoning costs.
+// The forward limit uses a 0.85 multiplier to reserve capacity for uncounted provider-tokenizer and structural costs.
+// The forward limit uses 0.85 rather than 0.90 because 0.90 would start the 95% emergency band at ~360K.
 const FORWARD_PRESSURE_LIMIT_FACTOR = 0.85;
 
-// Returns { percentage, inputTokens } floored by Pi's FORWARD usage estimate.
-// piUsage.tokens = last assistant usage + estimateTokens of every message after
-// it (pi-mono estimateContextTokens), recomputed from the LIVE array each call —
-// so it catches a mid-turn balloon the message_end-persisted trailing number
-// misses. Keep ONLY .tokens (forward, input-side); .percent is discarded (counts
-// output on Pi's own denominator). Immune to NULL token_count (live array, not
-// our tag store). NEVER lowers (max), so it's never less reactive than today.
+// Pi recomputes the estimate from the live array on each call.
+// The live-array estimate captures messages added during a turn that the persisted trailing count omits.
+// `piUsage.tokens` uses the live array, so null persisted `token_count` values cannot affect it; the code discards `percent` because it includes output tokens.
 function isPiHardCacheExpired(
 	lastResponseTime: number,
 	ttlMs: number,
 	now: number,
 ): boolean {
-	// Strict > matches the Rust scheduler's predicate exactly: at elapsed == ttl
-	// both sides DEFER (one more pass at the boundary is safe; a premature HARD
-	// fold is a paid cache rebuild). Keep the comparators identical — the Rust
-	// doc comment asserts this parity and an audit caught them disagreeing.
 	return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
 }
 
@@ -295,10 +266,9 @@ function applyForwardPressureFloor(
 	if (forwardTokens === 0 || !isSaneLimit(correctedLimit)) {
 		return { percentage: trailingPercentage, inputTokens: trailingInputTokens };
 	}
-	// Scale the LIMIT only for this forward percentage — do NOT mutate the real
-	// usageContextLimit (history-budget + emergency-drop ceiling rely on the true
-	// limit) and do NOT inflate forwardTokens (emergency-drop needs the raw
-	// current assembled size).
+	// Only the forward-percentage calculation scales `LIMIT`; `usageContextLimit` remains unchanged.
+	// `usageContextLimit` remains unscaled because the history budget and emergency-drop ceiling use its true value.
+	// The handler keeps `forwardTokens` raw because emergency drops need the current assembled size.
 	const forwardPressureLimit = correctedLimit * FORWARD_PRESSURE_LIMIT_FACTOR;
 	const forwardPercentage = (forwardTokens / forwardPressureLimit) * 100;
 	return forwardPercentage > trailingPercentage
@@ -390,74 +360,52 @@ export const __test = {
 };
 
 /**
- * Default `clear_reasoning_age` when neither the Pi caller nor the user
- * config specifies one. Matches OpenCode's schema default
- * (`packages/plugin/src/config/schema/magic-context.ts:303` → `.default(50)`).
  */
 const DEFAULT_CLEAR_REASONING_AGE = 50;
 
 /**
- * Current Pi message stable-id scheme version. Bump when the durable message
- * stable-id format changes in a way that re-keys persisted tag/source_contents/
- * caveman/placeholder state. A session whose persisted `pi_stable_id_scheme` is
- * below this triggers a one-time forced execute+materialize cutover.
- *   0 (NULL) = legacy index-based `pi-msg-${index}-...` ids.
- *   1        = real-SessionEntry-id scheme (resolvePiStableId).
+ * The Pi message stable-ID scheme version must increase when a durable stable-ID format change re-keys persisted state.
+ * Sessions whose persisted `pi_stable_id_scheme` is below the current scheme version trigger one forced execute-and-materialize cutover.
+ * Scheme version 0 (`NULL`) uses legacy index-based `pi-msg-${index}-...` IDs.
+ * Scheme version 1 uses the real `SessionEntry.id` scheme (`resolvePiStableId`).
  */
 const PI_STABLE_ID_SCHEME = 1;
 
 /**
- * Per-session emergency-notification dedup. Mirrors OpenCode's
- * `lastEmergencyNotificationCount` map — we only re-notify when the
- * historian failure count grows OR after a long quiet period, so a
- * stuck 95%+ session doesn't spam notifications on every defer pass.
+ * The scheduler waits until the configured quiet period elapses.
+ * A session at ≥95% emits no repeated notification during defer passes.
  */
 const lastEmergencyNotificationAtMs = new Map<string, number>();
 const EMERGENCY_NOTIFICATION_COOLDOWN_MS = 60_000;
 
 /**
- * Per-session "saw a commit on the previous pass" tracker for the
- * note-nudge `commit_detected` trigger. Mirrors OpenCode's
- * `commitSeenLastPass` map in `transform.ts`. The trigger only fires
- * on the rising edge: when this pass detects a recent commit AND the
- * previous pass did NOT (and we have a baseline at all — first-pass
- * detection silently sets the baseline without firing, so a fresh
- * restart over an old session that just committed doesn't surface a
+ * The `commit_detected` trigger fires only when the current pass detects a recent commit and the previous pass did not.
+ * The first pass records the baseline without firing `commit_detected`.
+ * A restart does not emit `commit_detected` for a commit observed only on its first pass.
  * stale trigger).
  *
- * Cleared in `clearContextHandlerSession()` so leaving a session
- * doesn't leave dead state behind.
+ * `clearContextHandlerSession()` removes the session's commit baseline when the session closes.
  */
 const commitSeenLastPass = new Map<string, boolean>();
 
 /**
- * Three independent per-session refresh signals — mirrors OpenCode's
- * three-set split (transform.ts:444 + system-prompt-hash.ts:206 +
- * transform-postprocess-phase.ts:172). Each lifetime is consumed by a
- * different consumer so they cannot share state:
  *
- *  - `historyRefreshSessions`: invalidate the `<session-history>`
- *    injection cache. Set by `/ctx-flush`, historian publish,
- *    compressor publish. Drained inside runPipeline after the rebuild
+ * `historyRefreshSessions` invalidates the `<session-history>` injection cache.
+ * `/ctx-flush`, historian publish, and compressor publish add sessions to `historyRefreshSessions`.
+ * `runPipeline` removes a session from `historyRefreshSessions` after rebuilding its history injection.
  *    completes.
  *
- *  - `systemPromptRefreshSessions`: refresh disk/DB-derived adjuncts
- *    in the system prompt (`<project-docs>`, `<user-profile>`,
- *    `<key-files>`, sticky date). Set by `/ctx-flush`, system-prompt
- *    hash change, dreamer publish, user-memory promotion. Drained
- *    inside the `before_agent_start` handler after adjuncts have been
- *    refreshed (or kept cached).
+ * `systemPromptRefreshSessions` refreshes disk- and database-derived system-prompt adjuncts.
+ * `systemPromptRefreshSessions` refreshes `<project-docs>`, `<user-profile>`, `<key-files>`, and the sticky date.
+ * `/ctx-flush`, system-prompt hash changes, dreamer publish, and user-memory promotion add sessions to `systemPromptRefreshSessions`.
+ * `before_agent_start` removes a session from `systemPromptRefreshSessions` after refreshing or reusing its adjuncts.
  *
- *  - `pendingMaterializationSessions`: pending ops should materialize
- *    on the next execute pass. Set by `/ctx-flush`. Drained inside
- *    runPipeline once materialization runs.
+ * `pendingMaterializationSessions` schedules pending operations for the next execute pass.
+ * `/ctx-flush` adds sessions to `pendingMaterializationSessions`; `runPipeline` removes them after materialization.
  *
- * They get signaled together when a system-prompt hash change is
- * detected (the prefix cache is already busted, so all three caches
- * should rebuild on the same cycle).
+ * A system-prompt hash change adds the session to all three refresh sets.
+ * A system-prompt hash change invalidates the prefix cache.
  *
- * Module-scoped so command handlers, historian, and compressor can
- * write to them without holding a reference to the registerPiContextHandler
  * closure.
  */
 const historyRefreshSessions = new Set<string>();
@@ -522,9 +470,7 @@ function buildPiTextIdentityPlan(
 		if (messageId === undefined) continue;
 		currentSourcesByMessageId.set(
 			messageId,
-			// Temporal gap markers are derived from the current projection. They are
-			// not part of the stored message identity and can disappear when a newly
-			// applied compaction boundary promotes a user message to the wire head.
+			// Temporal gap markers are not part of stored message identity and can disappear when compaction promotes a user message to the wire head.
 			message.parts
 				.filter((part) => part.kind === "text")
 				.map((part) =>
@@ -695,9 +641,8 @@ function convertLocatedPiUserEntry(
 }
 
 /**
- * Mark a Pi session as needing an injection-cache rebuild on its next
- * transform pass. Cheap idempotent set add — multiple callers can
- * signal in the same window and only the next pass will see the
+ * The next transform pass rebuilds the session's injection cache.
+ * Multiple callers can signal before the next transform pass; that pass observes the combined refresh.
  * combined effect.
  */
 export function signalPiHistoryRefresh(sessionId: string): void {
@@ -705,17 +650,14 @@ export function signalPiHistoryRefresh(sessionId: string): void {
 }
 
 /**
- * Mark a Pi session as needing system-prompt adjunct refresh on its
- * next `before_agent_start` event. Used by /ctx-flush, dreamer doc
- * publication, and user-memory promotion.
+ * The next agent start refreshes the session's system-prompt adjuncts.
  */
 export function signalPiSystemPromptRefresh(sessionId: string): void {
 	systemPromptRefreshSessions.add(sessionId);
 }
 
 /**
- * Mark a Pi session as needing pending-op materialization on the next
- * execute pass. Used by /ctx-flush.
+ * The next execute pass materializes the session's pending operations.
  */
 export function signalPiPendingMaterialization(sessionId: string): void {
 	pendingMaterializationSessions.add(sessionId);
@@ -749,22 +691,19 @@ export function consumeDeferredMaterialization(sessionId: string): boolean {
 	return wasSet;
 }
 
-// Upper bound on the number of sessions whose per-session in-memory caches
-// (the ~16 module-scoped Maps/Sets above) we retain. A session normally frees
-// its entries via clearContextHandlerSession on shutdown/switch, but a crashed
-// or force-quit Pi process never fires those, so the entries would leak forever
-// in a long-running host. When the live set grows past this cap we evict the
-// least-recently-tracked session through the SAME cleanup path — safe because
-// every per-session cache is rebuildable from the durable DB on resume (we do
-// NOT touch DB state here, identical to a process restart).
+// A retention cap prevents leaks when session cleanup does not run.
+// A crashed or force-quit Pi process skips `clearContextHandlerSession`, leaving its in-memory entries in a long-running host.
+// The eviction policy removes the least-recently-tracked session when the live set exceeds the cap.
+// Eviction uses `clearContextHandlerSession` to apply normal session cleanup.
+// Eviction clears only in-memory session state.
+// Eviction does not modify DB state.
 const MAX_TRACKED_SESSIONS = 100;
 
 export function trackSessionForProject(
 	projectIdentity: string,
 	sessionId: string,
 ): void {
-	// Move-to-end so iteration order is least-recently-tracked → most-recent
-	// (Set preserves insertion order; re-inserting refreshes recency).
+	// The eviction routine reinserts sessions so Set iteration runs from least- to most-recently tracked.
 	activeContextHandlerSessions.delete(sessionId);
 	activeContextHandlerSessions.add(sessionId);
 	let sessions = sessionsByProject.get(projectIdentity);
@@ -774,9 +713,9 @@ export function trackSessionForProject(
 	}
 	sessions.add(sessionId);
 
-	// Evict the oldest tracked sessions beyond the cap. clearContextHandlerSession
-	// removes the evicted id from activeContextHandlerSessions, so the loop
-	// terminates; never evict the session we just registered.
+	// The eviction routine evicts oldest tracked sessions beyond the cap through `clearContextHandlerSession`.
+	// `clearContextHandlerSession` removes each evicted ID from `activeContextHandlerSessions`, so the eviction loop terminates.
+	// The registration routine never evicts the session being registered.
 	while (activeContextHandlerSessions.size > MAX_TRACKED_SESSIONS) {
 		const oldest = activeContextHandlerSessions.values().next().value;
 		if (oldest === undefined || oldest === sessionId) break;
@@ -801,20 +740,12 @@ function updateSessionProjectTracking(
 		if (prevSessions?.size === 0) sessionsByProject.delete(prev);
 		clearPiSystemPromptSession(sessionId);
 	}
-	// Persist the session→project ownership binding so the project-scoped
 
-	// session's compartments to the right project. ctx.cwd is the authoritative
-	// session directory in Pi (no SDK/launch-dir ambiguity), so every observation
-	// is host-safe. Guarded to the once-per-(session,identity) transition — only
-	// on first sight or an actual identity change — so steady-state passes carry
-	// no per-pass DB write. embedSessionCompartmentChunks also self-records, so
-	// this only widens coverage to passively-published sessions.
+	// The identity-transition guard runs `clearContextHandlerSession` once per `(session, identity)` transition.
 	if (db && prev !== projectIdentity) {
 		try {
 			recordSessionProjectIdentity(db, sessionId, projectIdentity);
-		} catch {
-			// best-effort; backfill re-records on demand from the session command
-		}
+		} catch {}
 	}
 	trackSessionForProject(projectIdentity, sessionId);
 	lastSeenProjectIdentityBySession.set(sessionId, projectIdentity);
@@ -878,32 +809,28 @@ function clearLastTransformErrorIfSet(
 }
 
 /**
- * Read (without draining) the system-prompt refresh signal for a session.
- * The `before_agent_start` handler in `index.ts` calls this at the start
- * of each turn to decide whether adjuncts should refresh, then calls
- * `clearSystemPromptRefresh(...)` only after the rebuild work succeeds.
+ * The refresh check reads `systemPromptRefreshSessions` without draining it.
  */
 export function hasSystemPromptRefresh(sessionId: string): boolean {
 	return systemPromptRefreshSessions.has(sessionId);
 }
 
-/** Drain the system-prompt refresh signal. Called from
- *  `before_agent_start` after `processSystemPromptForCache(...)` succeeds. */
+/**
+ * The `before_agent_start` handler clears the signal only after `processSystemPromptForCache(...)` succeeds. */
 export function clearSystemPromptRefresh(sessionId: string): boolean {
 	const wasSet = systemPromptRefreshSessions.has(sessionId);
 	systemPromptRefreshSessions.delete(sessionId);
 	return wasSet;
 }
 
-/** Read (without draining) the pending-materialization signal. The
- *  runPipeline call drains it. */
+/**
+ * */
 export function hasPendingMaterialization(sessionId: string): boolean {
 	return pendingMaterializationSessions.has(sessionId);
 }
 
-/** Drain the pending-materialization signal. Called from runPipeline
- *  after pending-op materialization completes (or is skipped because
- *  this pass is `defer`). */
+/**
+ * */
 export function consumePendingMaterialization(sessionId: string): boolean {
 	const wasSet = pendingMaterializationSessions.has(sessionId);
 	pendingMaterializationSessions.delete(sessionId);
@@ -911,82 +838,68 @@ export function consumePendingMaterialization(sessionId: string): boolean {
 }
 
 /**
- * Pi's full AgentMessage union (user | assistant | toolResult | custom).
- * Sourced from the live ContextEvent payload so the type stays in sync
- * with @earendil-works/pi-coding-agent without us re-declaring it.
+ * Deriving the union from `ContextEvent` keeps it synchronized with `@earendil-works/pi-coding-agent` without redeclaring it.
  *
- * The nudge / note-nudge / auto-search helpers below operate on this
- * union but only inspect/mutate user and (rarely) assistant messages —
- * `toolResult` and `custom` flow through unchanged. Each helper guards
- * its mutations with role checks so the wider union is safe.
+ * The nudge, note-nudge, and auto-search helpers only inspect or mutate `user` and `assistant` messages.
+ * The helpers leave `toolResult` and `custom` messages unchanged.
  */
 type PiAgentMessage = ContextEvent["messages"][number];
 
 /**
- * Optional historian config. When provided, the context handler checks
- * the compartment trigger after tagging and fires `runPiHistorian`
- * asynchronously (fire-and-forget) when the trigger says shouldFire.
- * When omitted, no historian invocation happens — useful for testing
- * the transform pipeline in isolation or running Pi without a
- * configured historian model.
+ * When `PiHistorianOptions` are provided, the context handler checks the compartment trigger after tagging and asynchronously fires `runPiHistorian` when `shouldFire` is true.
+ * When `PiHistorianOptions` are omitted, the context handler does not invoke the historian.
  */
 export interface PiHistorianOptions {
-	/** SubagentRunner instance (PiSubagentRunner). */
+	/* */
 	runner: SubagentRunner;
-	/** Historian provider/model id (e.g. `anthropic/claude-haiku-4-5`). */
+	/** `model` identifies the historian provider/model (for example, `anthropic/claude-haiku-4-5`). */
 	model: string;
-	/** Optional ordered fallback chain. */
+	/** `fallbackModels` tries fallback models in declaration order. */
 	fallbackModels?: readonly string[];
-	/** Historian context window — used to derive chunk token budget. */
+	/** `historianChunkTokens` derives the chunk token budget. */
 	historianChunkTokens: number;
-	/** Optional per-call timeout (default 120s). */
+	/** `timeoutMs` defaults to 120 seconds per call. */
 	timeoutMs?: number;
-	/** When true, run a second editor pass after a successful first pass to
-	 *  clean low-signal U: lines and cross-compartment duplicates. Mirrors
-	 *  OpenCode's `historian.two_pass` config. */
+	/** When `twoPass` is true, a successful first editor pass is followed by a second pass that removes low-signal `U:` lines and cross-compartment duplicates.
+	 * This option mirrors OpenCode's `historian.two_pass` configuration. */
 	twoPass?: boolean;
-	/** Pi only: explicit thinking level for historian/compressor subagent
-	 *  invocations (passed as --thinking <level>). When unset, Pi's own
-	 *  default resolution applies. See `historian.thinking_level` in config. */
+	/** Pi passes `thinkingLevel` to historian and compressor subagents as `--thinking <level>`.
+	 * When `thinkingLevel` is unset, Pi applies its default thinking-level resolution.
+	 * */
 	thinkingLevel?: string;
-	/** Cross-session memory feature gate (`memory.enabled`). */
+	/** `memoryEnabled` gates cross-session memory through `memory.enabled`. */
 	memoryEnabled?: boolean;
-	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	/** `allowHomeProject` permits sessions started exactly in the canonical home directory only when user-level configuration enables them. */
 	allowHomeProject?: boolean;
-	/** Automatic-promotion gate (`memory.auto_promote`). */
+	/** autoPromote gates automatic promotion through `memory.auto_promote`. */
 	autoPromote?: boolean;
-	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
-	 *  historian user observations are persisted as candidates. */
+	/** userMemoriesEnabled gates persistence of historian user observations as candidates.
+	 * */
 	userMemoriesEnabled?: boolean;
 	language?: string;
-	/** Notify UI/status surfaces after historian state changes. */
+	/** The historian calls onStatusChange after changing state. */
 	onStatusChange?: (ctx: ExtensionContext, sessionId: string) => void;
 	/**
-	 * Execute-threshold percentage used by the trigger logic to compute
-	 * pressure-driven trigger points. Mirrors OpenCode's
-	 * `execute_threshold_percentage` config; defaults to 65 when omitted.
+	 * The trigger logic uses executeThresholdPercentage to compute pressure-driven trigger points.
 	 */
 	executeThresholdPercentage?:
 		| number
 		| { default: number; [modelKey: string]: number };
-	/** Token-based execute-threshold overrides. Mirrors OpenCode `execute_threshold_tokens`. */
+	/** executeThresholdTokens overrides token-based execute thresholds. */
 	executeThresholdTokens?: {
 		default?: number;
 		[modelKey: string]: number | undefined;
 	};
-	/** Commit-cluster trigger config. Mirrors OpenCode `commit_cluster_trigger`. */
+	/* */
 	commitClusterTrigger?: { enabled: boolean; min_clusters: number };
 	protectedTags?: number;
 	clearReasoningAge?: number;
-	/** Fraction of executable context reserved for rendered <session-history>. */
+	/** historyBudgetPercentage reserves executable context for rendered `<session-history>`. */
 	historyBudgetPercentage?: number;
 }
 
 /**
- * Optional auto-search hint config (Step 4b.4). When enabled, runs
- * `unifiedSearch` against new user prompts and appends a compact
- * vague-recall hint to the user message. Cross-harness coherent: hints
- * are computed against the same shared cortexkit DB OpenCode uses.
+ * When enabled, the auto-search handler runs unifiedSearch against new user prompts.
  */
 export interface PiAutoSearchHandlerOptions {
 	enabled: boolean;
@@ -994,7 +907,7 @@ export interface PiAutoSearchHandlerOptions {
 	minPromptChars: number;
 }
 
-/** Heuristic-cleanup config — tiered emergency drop, dedup, strips system injections. */
+/** Heuristic cleanup applies tiered emergency drops, deduplication, and system-injection stripping. */
 export interface PiHeuristicsOptions {
 	caveman?: { enabled: boolean; minChars: number };
 	/**
@@ -1007,20 +920,20 @@ export interface PiHeuristicsOptions {
 	clearReasoningAge?: number;
 }
 
-/** <session-history> injection config — writes compartments+facts+memories into message[0]. */
+/** The injector writes compartments, facts, and memories into message[0]. */
 export interface PiInjectionOptions {
-	/** When false (config `memory.enabled=false`), project memories are NOT read
-	 *  or rendered into m[0]/m[1]. Docs are controlled by injectDocs. */
+	/** When memoryEnabled is false, the injector neither reads nor renders project memories in m[0] or m[1].
+	 * */
 	memoryEnabled?: boolean;
-	/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+	/** When injectDocs is false, the injector omits `<project-docs>` and its hash from m[0]. */
 	injectDocs?: boolean;
 	injectionBudgetTokens: number;
 	temporalAwareness?: boolean;
-	/** mural.enabled — when enabled, generate a deterministic image of memories that did not fit the context budget whenever the system performs a full (HARD) context fold. */
+	/** During a full HARD context fold, muralEnabled renders a deterministic image of memories excluded by the context budget. */
 	muralEnabled?: boolean;
 }
 
-/** Scheduler config — gates cache-busting stages on TTL + threshold. */
+/* */
 export interface PiSchedulerOptions {
 	executeThresholdPercentage:
 		| number
@@ -1033,72 +946,52 @@ export interface PiSchedulerOptions {
 
 export interface PiContextHandlerOptions {
 	db: ContextDatabase;
-	/** Smart-drops (experimental, default off): also reclaim tool output that a
-	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
-	 *  sent to the model are byte-identical to the age-based-only behavior. */
+	/** When enabled, smart drops reclaim tool output superseded by later calls in addition to age-based drops.
+	 * */
 	smartDrops?: boolean;
 	/**
-	 * Heuristic-cleanup config (tiered emergency drop + caveman). When
-	 * omitted, heuristic cleanup is disabled — tagging and queued-drop
-	 * application still run, but the transform won't proactively shrink
-	 * context. Use this only for tests; production always passes this.
+	 * When `heuristics` is configured, cleanup applies tiered emergency drops and caveman processing.
 	 */
 	heuristics?: PiHeuristicsOptions;
 	/**
-	 * `<session-history>` injection config. When omitted, the prepared
-	 * compartment/fact/memory block is NOT written into message[0].
-	 * Production always passes this; tests can omit.
+	 * When `injection` is omitted, the handler does not write the prepared compartment/fact/memory block to `message[0]`.
 	 */
 	injection?: PiInjectionOptions;
 	/**
-	 * Scheduler config — gates heuristic cleanup on TTL/threshold.
-	 * When omitted, defaults to 65% threshold + 5m TTL behavior.
+	 * `scheduler` gates heuristic cleanup when its TTL expires or its threshold is reached.
+	 * `scheduler` defaults to a 65% threshold and 5-minute TTL when omitted.
 	 */
 	scheduler?: PiSchedulerOptions;
 	/**
-	 * Number of most-recent tags treated as protected (mirrors OpenCode
-	 * `protected_tags`). Drops with tag IDs in the protected window are
-	 * deferred — `applyPendingOperations` requeues them as deferred so
-	 * they re-evaluate next pass instead of being lost. Critical for
-	 * keeping the agent's recent working context intact.
+	 * The protected window covers the most recent tags and mirrors OpenCode's `protected_tags`.
+	 * The handler defers drops whose tag IDs fall within the protected window.
+	 * `applyPendingOperations` requeues protected drops as deferred.
+	 * Deferred drops are re-evaluated on the next pass instead of being lost.
+	 * Deferring protected drops preserves recent working context.
 	 *
-	 * Defaults from the schema to 20; can be 1-100. Optional so existing
-	 * test fixtures don't need updating; callers in production (`index.ts`)
-	 * always thread the loaded config value. A previous bug used a
-	 * hardcoded `0` here — the council audit caught that recent turns
-	 * were getting dropped mid-task.
+	 * `protectedTags` defaults to 20 and accepts values from 1 through 100.
 	 */
 	protectedTags?: number;
 	language?: string;
 	/**
-	 * Optional historian wiring (Step 4b.3b). When omitted, the trigger
-	 * check is skipped — context events still tag + drop normally, and
-	 * historian state stays untouched. When provided, the trigger fires
-	 * async after each tagging pass.
+	 * Without `historian`, context events tag and drop without changing historian state; otherwise, its trigger runs asynchronously after each tagging pass.
 	 */
 	historian?: PiHistorianOptions;
 	/**
-	 * Optional auto-search hint wiring (Step 4b.4). When omitted or
-	 * disabled, no hint computation runs. Notes that auto-search shares
-	 * the cortexkit DB with OpenCode, so memories ARE cross-harness.
+	 * When auto-search is omitted or disabled, no hint computation runs.
+	 * Auto-search and OpenCode share the cortexkit DB, so memories are cross-harness.
 	 */
 	autoSearch?: PiAutoSearchHandlerOptions;
 	/**
-	 * Per-project config resolver (Pi `/cd` / multi-root). Pi can switch
-	 * projects mid-process; a switched-into checkout may carry its own
-	 * `.cortexkit/magic-context.jsonc` (different protected_tags, thresholds,
-	 * memory/key-files toggles, historian model). Without this, every
-	 * context pass after a switch would run with the LAUNCH project's
-	 * settings (config bleed). When provided, the handler calls it once per
-	 * pass with the current `ctx.cwd` and uses the returned options for that
-	 * pass; the caller is expected to MEMOIZE per cwd so the hot path stays
-	 * allocation-free after warmup. Returns the base options for the launch
-	 * cwd. Tests omit it (the static options are used directly).
+	 * The checkout's `.cortexkit/magic-context.jsonc` can define different `protected_tags` and thresholds.
+	 * Without a resolver, passes after a project switch use the launch project's settings.
+	 * The handler calls the resolver once per pass with the current `ctx.cwd` and uses the returned options for that pass.
+	 * When `resolveForProject` is omitted, the handler uses the static options.
 	 */
 	resolveForProject?: (projectDir: string) => PiContextHandlerOptions;
-	/** Boot-resolved compaction-off flag. It remains fixed for this Pi process. */
+	/** The compaction-off flag is resolved at boot and remains fixed for this Pi process. */
 	compactionOff?: boolean;
-	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	/** allowHomeProject permits a session started exactly in the canonical home directory only when user-level configuration enables it. */
 	allowHomeProject?: boolean;
 	maybeAutoEmbedSession?: (
 		sessionId: string,
@@ -1108,22 +1001,8 @@ export interface PiContextHandlerOptions {
 }
 
 /**
- * Resolve the active Pi session id for the given context. Pi's
- * ReadonlySessionManager exposes `getSessionId()` (the UUID written
- * into the session file's `SessionHeader`); that's stable across the
- * session's lifetime even when branches are navigated, and matches
- * what Pi itself uses internally to address the session. We prefer
- * the UUID over the file path because:
  *
- *   - It's invariant under file moves (forks create new files but
- *     keep the original session id semantics intact).
- *   - It's the same id Pi uses in its `session_switch` event, so
- *     downstream code can correlate events to magic-context state
- *     without re-deriving from paths.
  *
- * Returns undefined when no session is active — context events should
- * never fire in that state, but defending against it keeps the
- * transform fail-open if Pi's lifecycle changes in future versions.
  */
 function resolveSessionId(ctx: ExtensionContext): string | undefined {
 	const sm = ctx.sessionManager;
@@ -1141,65 +1020,20 @@ function resolveSessionId(ctx: ExtensionContext): string | undefined {
 }
 
 /**
- * Resolve the SessionEntry id for each AgentMessage in `event.messages`.
  *
- * Pi's runtime builds `event.messages` from `sessionManager.getBranch()`
- * by filtering to message-type entries (`type === "message"`) plus
- * synthetic compaction-summary / branch-summary messages. Magic Context
- * needs the underlying SessionEntry id for compartment boundary lookup
- * (historian writes `start_message_id`/`end_message_id` from
- * `read-session-pi.ts` → `RawMessage.id = entry.id`).
  *
- * We replicate the same filter here. Indexes that don't have a real
- * SessionEntry behind them (synthetic compaction summary at index 0
- * when Pi compaction has run; nothing else today) get `undefined` —
- * boundary lookup falls back to a synthesized id which is harmless
- * because no real boundary will ever match it.
  *
- * `expectedLength` is `event.messages.length`. If the resolved entry
- * count diverges from that (e.g. Pi inserted compaction summaries that
- * don't appear as `type==="message"` entries), we return `undefined`
- * — boundary lookup falls through to the synthesized fallback for
- * the whole pass. Better to skip the trim than trim the wrong slice.
+ * The handler skips trimming when boundary lookup uses the synthesized fallback to avoid trimming the wrong slice.
  */
 /**
- * Collect SessionEntry ids that align 1:1 with `event.messages` —
- * the same `AgentMessage[]` Pi's `buildSessionContext()` produces.
+ * `collectMessageEntryIds` returns IDs aligned 1:1 with `event.messages`, the `AgentMessage[]` that Pi's `buildSessionContext()` produces.
  *
- * Critical: `getBranch()` returns the entire path from leaf to root,
- * INCLUDING entries that pre-date the latest compaction. Filtering
- * `getBranch()` for `type === "message"` would yield a much larger
- * array than `event.messages`, breaking the index alignment that
- * `<session-history>` boundary trim relies on. We must replicate
- * `buildSessionContext`'s compaction-aware emission order so the
- * resulting `entryIds[]` lines up with `event.messages` exactly.
+ * `getBranch()` returns the leaf-to-root path, including entries that predate the latest compaction.
+ * After compaction, filtering `getBranch()` for `type === "message"` can yield more entries than `event.messages`, breaking the index alignment required by `<session-history>` boundary trimming.
  *
- * Algorithm — mirrors @earendil-works/pi-coding-agent's
- * `buildSessionContext` implementation (see node_modules/.../core/
- * session-manager.js:108 and our copy of the algorithm in this repo's
- * earlier debug session for `ses_21cba3abaffenqSinaCFbAFF3E`):
  *
- *   1. Find the LATEST compaction entry on the branch (if any).
- *   2. If a compaction exists:
- *      - Emit `undefined` at index 0 for the synthetic compaction
- *        summary message (which has no SessionEntry id).
- *      - Skip every entry before `compaction.firstKeptEntryId`.
- *      - Then emit one id per entry from `firstKeptEntryId` up to
- *        (but not including) the compaction entry itself, plus every
- *        entry AFTER the compaction.
- *      - Each emitted id is the SessionEntry's id for `message` /
- *        `custom_message` / `branch_summary` (the three types that
- *        produce an AgentMessage); other types produce no message
- *        and are simply skipped.
- *   3. If no compaction exists: emit one id per emit-eligible entry
- *      across the full branch path, in path order.
+ * `collectMessageEntryIds` returns `undefined` at index 0 for the synthetic compaction summary message, which has no `SessionEntry` ID.
  *
- * Returns `undefined` only when the SessionManager API is unavailable
- * or throws — those are real "we cannot determine alignment" cases.
- * When we successfully traverse the path, we ALWAYS return an array;
- * if the result length doesn't match `expectedLength` we log the
- * divergence (with diagnostics) and still return our best-effort
- * mapping rather than silently disabling the trim.
  */
 function collectMessageEntryIds(
 	ctx: ExtensionContext,
@@ -1223,8 +1057,6 @@ function collectMessageEntryIds(
 	}
 	if (!Array.isArray(entries)) return undefined;
 
-	// Find the latest compaction entry (walk from end → start; same
-	// algorithm Pi's getLatestCompactionEntry uses).
 	let compactionIndex = -1;
 	let firstKeptEntryId: string | undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
@@ -1243,13 +1075,7 @@ function collectMessageEntryIds(
 
 	const ids: (string | undefined)[] = [];
 
-	// Helper: is this entry type one that produces an AgentMessage in
-	// buildSessionContext? Same three types: message, custom_message,
-	// branch_summary (the latter only when summary is set). Note that
-	// branch_summary entries with `summary === undefined` are skipped
-	// by buildSessionContext but we accept all branch_summary entries
-	// here for robustness — the worst case is we emit an extra id that
-	// never matches a compartment boundary, which is harmless.
+	// `isEmitEligible` matches the entry types that `buildSessionContext` converts to `AgentMessage`s.
 	const isEmitEligible = (entry: unknown): entry is { id: string } => {
 		if (!entry || typeof entry !== "object") return false;
 		const t = (entry as { type?: unknown }).type;
@@ -1265,13 +1091,8 @@ function collectMessageEntryIds(
 	};
 
 	if (compactionIndex >= 0) {
-		// Index 0 = synthetic compaction summary — no SessionEntry id.
 		ids.push(undefined);
 
-		// Pre-compaction: emit ids from firstKeptEntryId (inclusive) up to
-		// compactionIndex (exclusive). If firstKeptEntryId is undefined or
-		// not found, emit nothing for the pre-compaction window (that's
-		// what buildSessionContext does).
 		if (firstKeptEntryId !== undefined) {
 			let foundFirstKept = false;
 			for (let i = 0; i < compactionIndex; i++) {
@@ -1287,8 +1108,6 @@ function collectMessageEntryIds(
 			}
 		}
 
-		// Post-compaction: emit ids for every emit-eligible entry after
-		// the compaction marker.
 		for (let i = compactionIndex + 1; i < entries.length; i++) {
 			const entry = entries[i];
 			if (isEmitEligible(entry)) {
@@ -1296,7 +1115,6 @@ function collectMessageEntryIds(
 			}
 		}
 	} else {
-		// No compaction — emit one id per emit-eligible entry across the
 		// full path.
 		for (const entry of entries) {
 			if (isEmitEligible(entry)) {
@@ -1305,9 +1123,6 @@ function collectMessageEntryIds(
 		}
 	}
 
-	// Length mismatch is a real bug somewhere (probably a SessionEntry
-	// type we're not handling correctly), but we still return our best
-	// guess so the trim is robust. Log so future divergence shows up.
 	if (ids.length !== expectedLength) {
 		const sm2 = sm as {
 			getBranch?: (fromId?: string) => unknown[];
@@ -1320,11 +1135,7 @@ function collectMessageEntryIds(
 				` — best-effort mapping returned; boundary trim may not match exactly`,
 		);
 		if (strict) return undefined;
-		// Defensively fall back: if we have FEWER ids than expected, pad
-		// with undefined at the front (covers historical compaction-summary
-		// cases where Pi prepended a synthetic message we missed). If we
-		// have MORE ids than expected, slice from the END (post-compaction
-		// matters most for boundary lookup).
+		// `collectMessageEntryIds` retains the most recent IDs for boundary lookup when `ids` exceeds `expectedLength`.
 		const _unused = sm2; // satisfy lint about unused alias above
 		void _unused;
 		if (ids.length < expectedLength) {
@@ -1335,8 +1146,6 @@ function collectMessageEntryIds(
 			padded.push(...ids);
 			return padded;
 		}
-		// ids.length > expectedLength — slice from the end (the most
-		// recent entries are the ones we need for boundary lookup).
 		return ids.slice(ids.length - expectedLength);
 	}
 
@@ -1360,16 +1169,13 @@ export function collectMessageEntryIdsStrict(
 }
 
 /**
- * Resolve each context message to a real SessionEntry id without assuming the
- * context and branch arrays have identical positions. Pi clones context messages
- * before extension handlers run, so production alignment uses stable content
- * fingerprints cached with the session's branch projection. Reference matching
- * remains as a compatibility path for test doubles and older runtimes.
+ * The handler uses content fingerprints because context and branch arrays need not share positions.
+ * Pi clones context messages before extension handlers run, so production alignment uses content fingerprints.
+ * Reference matching supports test doubles and Pi runtimes that do not clone context messages.
  *
- * Ambiguous fingerprints intentionally remain unresolved rather than risking a
- * wrong durable boundary. Custom and branch-summary wrappers also remain
- * unresolved because Pi synthesizes them for each context event and historian
- * boundaries only target ordinary message entries.
+ * Ambiguous fingerprints remain unresolved to avoid selecting the wrong durable boundary.
+ * Custom and branch-summary wrappers remain unresolved because Pi synthesizes them for each context event.
+ * Historian boundaries target only ordinary message entries.
  */
 export function collectMessageEntryIdsByRef(
 	ctx: ExtensionContext,
@@ -1401,9 +1207,6 @@ export function collectMessageEntryIdsByRef(
 		}
 	}
 
-	// SessionManager clones context messages before this handler runs, so the
-	// fingerprint index is the production alignment path. The reference index is
-	// retained for test doubles and older Pi runtimes that do not clone.
 	const { entryIdByMessageRef, entryIdsByFingerprint } =
 		getPiBranchEntryLookup(entries);
 
@@ -1427,10 +1230,8 @@ export function collectMessageEntryIdsByRef(
 		const fingerprintBucket = fingerprint
 			? entryIdsByFingerprint.get(fingerprint)
 			: undefined;
-		// A fingerprint is only a safe fallback when it uniquely identifies a
-		// branch entry. Repeated/cloned messages can share timestamp/role/text;
-		// consuming the "next" bucket item would silently anchor to the wrong
-		// SessionEntry after one clone is dropped or reordered.
+		// Repeated or cloned messages can share timestamps, roles, and text.
+		// Ambiguous fingerprint buckets remain unresolved to avoid anchoring clones to the wrong SessionEntry.
 		const fingerprintId =
 			fingerprintBucket?.length === 1 &&
 			!consumedFingerprintIds.has(fingerprintBucket[0] as string)
@@ -1446,11 +1247,6 @@ export function collectMessageEntryIdsByRef(
 		}
 	}
 
-	// One-shot diagnostic: log a coverage summary so we can see how often
-	// the new resolver finds real ids vs. falls back. This replaces the
-	// "length mismatch" log line that `collectMessageEntryIds` used to
-	// emit — that log was misleading because the position-based walk
-	// reported divergence even when the underlying refs were fine.
 	if (resolved < messages.length) {
 		log(
 			`[magic-context][pi]${sessionId ? `[${sessionId}]` : ""} ` +
@@ -1539,9 +1335,8 @@ function buildPiAlignedEntryIds(
 }
 
 // The first two prepended Pi messages already contain the compartment summaries.
-// Calling appendCompaction makes Pi add the same summary during the next projection,
-// changing bytes sent to the provider one pass after cache invalidation. Remove it
-// only when the branch entry proves this plugin created the matching compaction.
+// `appendCompaction` duplicates the summary on the next projection.
+// The code removes `appendCompaction` only when the branch entry proves this plugin created the matching compaction.
 function stripMcOwnedPiCompactionSummary(
 	messages: PiAgentMessage[],
 	entryIds: (string | undefined)[],
@@ -1600,16 +1395,10 @@ function getPiBranchEntryLookup(
 }
 
 /**
- * Build a `Map<AgentMessage-ref, SessionEntry.id>` from branch entries.
  *
- * Same source-of-truth as `collectMessageEntryIdsByRef` (the message-typed
- * branch entries), but keyed by object identity instead of collapsed to a
- * positional array. This is the splice-safe map threaded to post-mutation
- * consumers (sticky reminders, note nudges, auto-search) so they resolve the
- * CURRENT message's entry id by reference rather than by a stale index. Only the
- * lossless reference path is included — the fingerprint fallback in
- * `collectMessageEntryIdsByRef` is position/consumption-ordered and not safe to
- * reuse out of order, so unmapped messages simply fall through (anchor defers).
+ * Post-mutation consumers resolve each current message's entry ID by reference, avoiding stale positional indexes after splices.
+ * `collectMessageEntryIdsByRef` must process `messages` in input order because fingerprint matching consumes bucket entries.
+ * Unmapped messages defer anchor resolution.
  */
 function buildEntryIdByRefMap(
 	branchEntries: readonly unknown[] | null,
@@ -1796,13 +1585,8 @@ function firstPiTextContent(content: unknown): string | null {
 }
 
 /**
- * Build a `messageId → fingerprint` map from the RAW pre-transform messages,
- * keyed by the stable id each message resolves to this pass. Captured before
- * `runPipeline` mutates text (temporal markers, §N§ prefix, caveman) so the
- * fingerprint is byte-stable across the fallback-pass (in-flight) and the
- * real-id-pass (settled) — the invariant tag adoption depends on. The
- * fingerprint is persisted on the tag row at creation; only message-typed
- * entries get one (tool tags are out of scope).
+ * Tag adoption requires the fingerprint to remain byte-stable across fallback and real-ID passes.
+ * Only message entries receive persisted fingerprints; tool tags are out of scope.
  */
 function buildEntryFingerprintMap(
 	messages: readonly PiAgentMessage[],
@@ -1895,12 +1679,7 @@ function hasAdoptablePiFallbackMessageTags(
 }
 
 /**
- * Pi fallback-tag adoption pre-pass. Runs BEFORE tagging. Message text tags are
- * matched by raw-message fingerprint; tool tags are owner-driven from stored
- * `pi-msg-*` owners to the current real assistant entry id by `(timestamp,
- * callId)`. Collision folds keep the synthetic row's tag number/drop metadata,
- * merge size/token accounting by MAX, retarget pending ops, and update the
- * tagger's in-memory aliases before `tagTranscript` looks anything up.
+ * Fallback-tag adoption runs before tagging so tagging reuses adopted tags instead of allocating duplicates.
  */
 function adoptPiFallbackTags(
 	db: ContextDatabase,
@@ -1909,10 +1688,7 @@ function adoptPiFallbackTags(
 	fingerprintById: ReadonlyMap<string, string>,
 	options: AdoptPiFallbackTagsOptions = {},
 ): void {
-	// A positive preflight remains a valid fast path, but a negative preflight is
-	// only advisory: a sibling connection can commit a fallback row after the
-	// fingerprint map is built. Re-probe negatives here so the decision to skip
-	// observes commits that happened before adoption starts.
+	// The adoption pre-pass re-probes negative results so it observes commits made before adoption starts.
 	const hasFallbackMessageTags =
 		options.hasFallbackMessageTags === true ||
 		hasPiFallbackMessageTags(db, sessionId);
@@ -1927,13 +1703,11 @@ function adoptPiFallbackTags(
 	);
 	if (!shouldRunMessageMigration && !shouldRunToolOwnerMigration) return;
 
-	// db.transaction() uses a savepoint when the caller is already in a
-	// transaction, so no manual BEGIN/COMMIT bookkeeping is needed here.
+	// db.transaction() uses a savepoint inside an existing transaction.
 	db.transaction(() => {
 		if (shouldRunMessageMigration) {
 			for (const [realMessageId, fingerprint] of fingerprintById) {
-				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
-				// predecessor to migrate from.
+				// Only real IDs can be adoption targets; pi-msg-* IDs remain fallback aliases.
 				if (realMessageId.startsWith("pi-msg-")) continue;
 				const candidates = findAdoptableFallbackTags(
 					db,
@@ -1941,10 +1715,8 @@ function adoptPiFallbackTags(
 					fingerprint,
 				);
 				if (candidates.length === 0) continue;
-				// Group candidates by their fallback message base id (strip the :pN
-				// suffix). A unique base means exactly one fallback message carried this
-				// fingerprint → safe to adopt; duplicates (same fingerprint on >1
-				// fallback message) are ambiguous → skip, let tagTranscript allocate
+				// A unique fallback-message base ID proves that one fallback message supplied the fingerprint.
+				// Ambiguous fallback-message bases skip adoption so tagTranscript allocates a new tag.
 				// fresh.
 				const baseIds = new Set<string>();
 				for (const c of candidates) {
@@ -1964,8 +1736,6 @@ function adoptPiFallbackTags(
 						realContentId,
 					);
 					if (adoption.action !== "skipped") {
-						// Drop stale fallback and collision aliases, then bind the survivor
-						// under the real key so the same-pass exact lookup hits it.
 						tagger.unbindTag(sessionId, c.messageId);
 						if (adoption.action === "folded") {
 							tagger.unbindTag(sessionId, realContentId);
@@ -2019,8 +1789,6 @@ function adoptPiFallbackTags(
 						adoption.tagNumber,
 					);
 					if (accounting) {
-						// Collision folds can raise stored maxima; refresh the mirror before
-						// identity reuse uses it as the no-BPE growth baseline.
 						tagger.setToolTagAccounting(
 							sessionId,
 							adoption.tagNumber,
@@ -2034,12 +1802,7 @@ function adoptPiFallbackTags(
 }
 
 /**
- * Register the Pi `context` event handler.
  *
- * The Tagger is created once per session boot — same lifecycle as the
- * OpenCode plugin's tagger. It maintains in-memory state (the
- * monotonic counter, assignment map) across `context` events so tag
- * numbers stay stable for the duration of the Pi session.
  */
 export function registerPiContextHandler(
 	pi: ExtensionAPI,
@@ -2047,11 +1810,7 @@ export function registerPiContextHandler(
 ): void {
 	const tagger = createTagger();
 
-	// Pi can switch projects mid-process (`/cd`, multi-root). A scheduler is
-	// pure (config in, decision out — no per-session state), so it's safe to
-	// rebuild per project. We memoize one scheduler per distinct PiScheduler
-	// options instance so the hot path doesn't reparse TTL every pass; the
-	// per-cwd options are already memoized by the caller's resolveForProject.
+	// Caching avoids recreating the Scheduler on each context event.
 	const schedulerCache = new WeakMap<PiSchedulerOptions, Scheduler>();
 	const DEFAULT_SCHEDULER_CONFIG: PiSchedulerOptions = {
 		executeThresholdPercentage: 65,
@@ -2076,7 +1835,6 @@ export function registerPiContextHandler(
 			const tFindSession = performance.now();
 			const sessionId = resolveSessionId(ctx);
 			if (sessionId === undefined) {
-				// No active session — fall through with no mutation.
 				log(
 					"[magic-context][pi] context event fired with no session id (falling through unmodified)",
 				);
@@ -2086,10 +1844,6 @@ export function registerPiContextHandler(
 			const projectDirectory = ctx.cwd;
 			const fullWireMessageCount = event.messages.length;
 
-			// Resolve the effective options for THIS pass's project. On a `/cd`
-			// switch this picks up the switched-into checkout's config (caller
-			// memoizes per cwd). Falls back to baseOptions (launch cwd) when no
-			// resolver is wired (tests) or the resolver returns nothing.
 			const options =
 				baseOptions.resolveForProject?.(projectDirectory) ?? baseOptions;
 			const schedulerConfig = options.scheduler ?? DEFAULT_SCHEDULER_CONFIG;
@@ -2101,10 +1855,6 @@ export function registerPiContextHandler(
 				) ?? "";
 			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
 			if (projectIdentity) {
-				// Ongoing enforcement-artifact revalidation, mirroring the
-				// OpenCode transform: a deleted or edited artifact withdraws
-				// the ENFORCED rung instead of standing forever. Internally
-				// throttled; failures are non-fatal.
 				try {
 					revalidateEnforcementArtifacts(
 						options.db,
@@ -2147,11 +1897,8 @@ export function registerPiContextHandler(
 			);
 			rawMessageProviderUnregistersBySession.set(sessionId, unregisterRaw);
 			scheduleReconciliation(options.db, sessionId, readRawSessionMessages);
-			// Pi builds the context from this exact branch projection before cloning
-			// messages for extension handlers. A compaction-aware projection with the
-			// same length is therefore the lossless O(1) alignment lane. If another
-			// extension changed the message count, fall back to conservative fingerprint
-			// matching and leave ambiguous messages unresolved.
+			// Fingerprint matching preserves alignment when another extension changes the message count.
+			// Ambiguous fingerprints remain unresolved to avoid selecting the wrong durable boundary.
 			const branchLookup =
 				branchEntries === null ? null : getPiBranchEntryLookup(branchEntries);
 			const alignedEntryIds = branchLookup?.alignedEntryIds ?? null;
@@ -2188,9 +1935,6 @@ export function registerPiContextHandler(
 				const removed = trimPiMessagesToCachedBoundary(
 					options.db,
 					sessionId,
-					// SAFETY: Pi AgentMessage and plugin-core messages share the
-					// id and role fields trimPiMessagesToCachedBoundary reads;
-					// TypeScript cannot unify types from different packages.
 					event.messages as unknown as Parameters<
 						typeof trimPiMessagesToCachedBoundary
 					>[2],
@@ -2205,10 +1949,6 @@ export function registerPiContextHandler(
 					);
 				}
 			}
-			// Splice-safe message→entryId map keyed by reference. runPipeline
-			// mutates the message array in place (compartment trim + placeholder
-			// strip), so post-mutation consumers must resolve by identity, not by
-			// the stale positional strictEntryIds.
 			const entryIdByRef = buildEntryIdByRefMap(branchEntries);
 			const previouslyTaggedIds =
 				taggedStableMessageIdsBySession.get(sessionId);
@@ -2256,10 +1996,6 @@ export function registerPiContextHandler(
 				tMessageIndexScheduling,
 			);
 
-			// Lazy-initialize tagger state from DB. Idempotent: re-init
-			// during the same session is a no-op because the in-memory
-			// counter is already populated. Required because the tag
-			// counter persists across plugin restarts via the
 			// `session_meta.counter` column.
 			const taggerFloor = strictEntryIds
 				? deriveTagLoadFloor(options.db, sessionId, strictEntryIds)
@@ -2271,21 +2007,13 @@ export function registerPiContextHandler(
 			firstContextPassSeenBySession.add(sessionId);
 			const piUsage = ctx.getContextUsage?.();
 			const tModelDetect = performance.now();
-			// Seed the in-memory model key from the JSONL on the first pass after a
-			// (re)start. liveModelBySession is volatile, so without this a model
-			// switch that happened while the process was DOWN would go undetected
-			// (previousModelKey undefined → modelChanged false), leaking the prior
-			// model's detected-context-limit / reasoning-watermark / historian-
-			// failure state into the new model. The last model_change entry in the
-			// branch is the session's last-used model; seeding it lets the
-			// comparison below fire. No-op when the branch has no model_change
-			// (older sessions) — previousModelKey stays undefined (today's behavior).
+			// Without a seed, `previousModelKey` is undefined, so `modelChanged` is false and prior-model state leaks into the new model.
+			// Without a seed, the prior model's detected-context-limit, reasoning-watermark, and historian-failure state can leak into the new model.
 			if (
 				isFirstContextPassForSession &&
 				liveModelBySession.get(sessionId) === undefined
 			) {
-				// Reuse the branch entries already read above (readPiBranchEntries
-				// ForContext) — getBranch() must be walked only once per event.
+				// The handler reuses branchEntries because getBranch() is traversed once per event.
 				const seeded = findLastModelKeyFromBranch(branchEntries);
 				if (seeded !== undefined) {
 					liveModelBySession.set(sessionId, seeded);
@@ -2302,30 +2030,16 @@ export function registerPiContextHandler(
 				liveModelBySession.set(sessionId, currentModelKey);
 			}
 
-			// Resolve scheduler decision: execute-vs-defer based on TTL
-			// + threshold. Drives whether heuristic cleanup runs on this
-			// pass. Read live context usage from Pi (tokens/percent) and
-			// the persisted session-meta record (last_response_time,
 			// cache_ttl).
-			// Prefer the OpenCode-equivalent pressure persisted by
-			// `message_end` in `index.ts`. `session_meta.lastContextPercentage`
-			// is computed from the assistant message's `usage` with the
-			// same formula OpenCode uses (input + cacheRead + cacheWrite,
-			// divided by `effectiveContextLimit` which already factors in
-			// `detected_context_limit`). Pi's built-in `getContextUsage()`
-			// `percent` field includes output tokens, which causes a
-			// small but real drift in tests and a much larger drift after
-			// a provider overflow recovery sets a lower detected limit.
-			// Fall back to `piUsage` on the first pass before message_end
-			// has had a chance to run.
+			// `effectiveContextLimit` already incorporates `detected_context_limit`.
+			// Pi's `getContextUsage().percent` includes output tokens.
+			// `sessionMetaForUsage` falls back to `piUsage` before the first `message_end` persists usage.
 			const tMeta = performance.now();
 			const sessionMetaForUsage = getOrCreateSessionMeta(options.db, sessionId);
 			logTransformTiming(sessionId, "getOrCreateSessionMeta", tMeta);
 
-			// The Pi equivalent of OpenCode marker cleanup is durable
-			// pending_pi_compaction_marker_state plus these deferred-drain sets.
-			// Reconcile before any transform phase so an off pass cannot drain or
-			// render stale MC compaction state.
+			// `pending_pi_compaction_marker_state` and the deferred-drain sets are Pi's durable equivalent of OpenCode marker cleanup.
+			// The transform reconciles before every phase so a disabled phase cannot drain or render stale MC compaction state.
 			const compactionTransition = reconcilePiCompactionMode({
 				db: options.db,
 				sessionId,
@@ -2354,8 +2068,8 @@ export function registerPiContextHandler(
 					);
 				}
 			}
-			// Model change invalidates the safe-token baseline + alert state too
-			// (new model, new limits), so it clears all four pressure fields.
+			// A model change invalidates the safe-token baseline and alert state.
+			// A model change clears all four pressure fields because the new model has different limits.
 			const usageReset = {
 				lastContextPercentage: 0,
 				lastInputTokens: 0,
@@ -2363,13 +2077,8 @@ export function registerPiContextHandler(
 				cacheAlertSent: false,
 			};
 			if (modelChanged) {
-				// Model change: clear UNCONDITIONALLY (not gated on stale usage).
-				// The reasoning watermark, historian failure/recovery state, and
-				// detected context limit were specific to the previous model and
-				// must be discarded so the new model gets a clean slate — even when
-				// the prior usage counters happen to read zero (e.g. a switch right
-				// after a reset). Mirrors OpenCode transform.ts model-change reset,
-				// which runs with no usage>0 guard.
+				// A model change clears model-specific state unconditionally, even when usage is zero.
+				// A model change discards the prior model's reasoning watermark, historian state, and detected context limit.
 				sessionLog(
 					sessionId,
 					`transform: model switch ${previousModelKey} -> ${currentModelKey} reset — percentage=${sessionMetaForUsage.lastContextPercentage.toFixed(1)}% tokens=${sessionMetaForUsage.lastInputTokens} — clearing stale model-specific state`,
@@ -2382,9 +2091,6 @@ export function registerPiContextHandler(
 				clearPersistedReasoningWatermark(options.db, sessionId);
 				clearDetectedContextLimit(options.db, sessionId);
 				clearEmergencyRecovery(options.db, sessionId);
-				// The emergency idempotence latch is keyed to the prior model's
-				// ceiling; a smaller new model must re-evaluate the full tail.
-				// Mirrors OpenCode hook-handlers.ts model-change reset.
 				clearEmergencyDropSample(options.db, sessionId);
 				sessionMetaForUsage.clearedReasoningThroughTag = 0;
 				sessionMetaForUsage.lastContextPercentage = 0;
@@ -2395,16 +2101,8 @@ export function registerPiContextHandler(
 				isFirstContextPassForSession &&
 				sessionMetaForUsage.lastContextPercentage > 0
 			) {
-				// First pass after restart (same model): clear ONLY the two stale
-				// pressure fields. Gate on lastContextPercentage>0 (matches OpenCode
-				// transform.ts first-pass). historian-failure state and the
-				// reasoning watermark MUST be preserved — restart recovery uses the
-				// failure backoff, and clearing the reasoning watermark would
-				// resurface previously cleared reasoning (a cache bust + larger
-				// prompt). observedSafeInputTokens and cacheAlertSent are ALSO
-				// preserved: the model is unchanged, so the learned safe-input
-				// baseline still holds across the restart (OpenCode preserves it
-				// too — only lastContextPercentage/lastInputTokens are cleared).
+				// A same-model restart preserves historian failure state and the reasoning watermark.
+				// The unchanged model retains its learned safe-input baseline across a restart.
 				sessionLog(
 					sessionId,
 					`transform: first pass reset — percentage=${sessionMetaForUsage.lastContextPercentage.toFixed(1)}% tokens=${sessionMetaForUsage.lastInputTokens} — clearing stale usage state`,
@@ -2418,11 +2116,7 @@ export function registerPiContextHandler(
 			}
 			let usagePercentage = 0;
 			let usageInputTokens = 0;
-			// Persisted usage (from message_end via persistPiPressureFromMessageEnd)
-			// already has its percentage computed against the sane-bounded +
-			// detected-limit-corrected effective limit, so it's authoritative and
-			// must NOT be recomputed below. The fallback path (raw getContextUsage)
-			// uses Pi's own denominator and DOES need correcting.
+			// The transform uses persisted usage without recomputing its percentage; only raw getContextUsage usage needs denominator correction.
 			let usedPersistedUsage = false;
 			if (
 				sessionMetaForUsage.lastContextPercentage > 0 &&
@@ -2437,29 +2131,16 @@ export function registerPiContextHandler(
 				usageInputTokens =
 					typeof piUsage?.tokens === "number" ? piUsage.tokens : 0;
 			}
-			// Sane-bound Pi's reported window the SAME way message_end does
-			// (isSaneLimit, not `> 0`). A garbage-but-positive window (e.g. a
-			// transient 6748) must be REJECTED here, not trusted — otherwise the
-			// history budget collapses to a few hundred tokens and over-archives.
 			let usageContextLimit = isSaneLimit(piUsage?.contextWindow)
 				? piUsage.contextWindow
 				: undefined;
 			let detectedContextLimit: number | undefined;
 
-			// Overflow recovery: a previous LLM call ended with a
-			// provider context-overflow error AND the pi.on("message_end")
-			// handler persisted needs_emergency_recovery=1. On THIS pass:
 			//
-			//   1. If the error reported a real context limit, prefer
-			//      that limit over Pi's reported contextWindow (which
-			//      was clearly wrong if we just overflowed).
-			//   2. Bump effective percentage to 95% so the existing
-			//      emergency path (await historian + drop-all-tools)
-			//      fires regardless of pressure math.
+			// If a provider context-overflow error reports a valid limit, the recovery path prefers that limit.
+			// The recovery path floors usagePercentage at 95%.
 			//
-			// Mirrors OpenCode's transform.ts wiring. The recovery flag is
-			// cleared by the historian publication path on success (see
-			// signalPiHistoryRefresh), so we won't keep bumping forever.
+			// Successful historian publication clears needsEmergencyRecovery.
 			const tEmergencyRecovery = performance.now();
 			let needsEmergencyBump = false;
 			let emergencyRecoveryArmed = false;
@@ -2469,9 +2150,7 @@ export function registerPiContextHandler(
 					: getOverflowState(options.db, sessionId);
 				if (overflowState.detectedContextLimit > 0) {
 					detectedContextLimit = overflowState.detectedContextLimit;
-					// Always prefer detected limit over reported window
-					// when one exists — the reported window came from
-					// metadata that produced a wrong answer last time.
+					// The recovery path prefers the detected limit because provider metadata can report an invalid context window.
 					usageContextLimit = Math.min(
 						usageContextLimit ?? overflowState.detectedContextLimit,
 						overflowState.detectedContextLimit,
@@ -2494,14 +2173,9 @@ export function registerPiContextHandler(
 					? ctx.model.provider
 					: undefined;
 			const canUseEmptySentinels = modelAcceptsEmptyContent(providerId);
-			// Cold-start stable-limit fallback: if `getContextUsage()` hasn't
-			// reported a (sane) window yet (first pass after restart, before any
-			// response), read the model's window directly from `ctx.model`
-			// — Pi exposes it at model-select, independent of any message. This
-			// is Pi's authoritative source (replacing the old models.dev lookup);
-			// sane-bounded so a transient bad value can't shrink the budget to the
-			// 60K default and over-archive. An unknown/insane window yields
-			// undefined and we keep the live back-derivation path.
+			// The fallback uses ctx.model.contextWindow when getContextUsage() has not reported a sane window.
+			// isSaneLimit rejects bad windows so their values cannot reduce the budget below the 60K fallback.
+			// Unknown or insane modelWindow leaves usageContextLimit undefined for live back-derivation.
 			if (usageContextLimit === undefined) {
 				const modelWindow = ctx.model?.contextWindow;
 				if (isSaneLimit(modelWindow)) {
@@ -2527,12 +2201,8 @@ export function registerPiContextHandler(
 			const { forceMaterializationPercentage } = escalationBands(
 				effectiveExecuteThresholdPercentage,
 			);
-			// Fallback-path percentage correction: when we DIDN'T use persisted
-			// usage, `usagePercentage` is on Pi's raw denominator — which is wrong
-			// once we've corrected the limit (detected-overflow cap, or a sane
-			// window replacing a garbage one). Recompute against the corrected
-			// limit so the scheduler's percentage check and the 85/95% cleanup
-			// paths see the true pressure. (Persisted usage is already correct.)
+			// When persisted usage is unavailable, Pi's usagePercentage uses the raw denominator, so the transform recomputes it against the corrected limit.
+			// The recomputed percentage drives the scheduler check and the 85% and 95% cleanup paths.
 			if (
 				!usedPersistedUsage &&
 				isSaneLimit(usageContextLimit) &&
@@ -2548,8 +2218,7 @@ export function registerPiContextHandler(
 					usageContextLimit,
 				));
 			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
-			// Emergency bump LAST so it floors recovery pressure without capping
-			// a higher live forward-pressure reading.
+			// The recovery path applies the emergency bump after forward-pressure flooring so the bump cannot cap a higher reading.
 			if (needsEmergencyBump) {
 				sessionLog(
 					sessionId,
@@ -2577,20 +2246,10 @@ export function registerPiContextHandler(
 			}
 			logTransformTiming(sessionId, "schedulerAndUsage", tScheduler);
 
-			// Migrated/imported sessions: a Pi session loaded with a large
-			// existing JSONL has no usage data yet (pre-LLM-call) and no
-			// `last_response_time` baseline, so the scheduler returns
-			// "defer" on the brand-new-session branch — but the message
-			// array IS already enormous and WILL overflow the model on
-			// this turn. Force "execute" when the AgentMessage[] arriving
-			// for transform is much larger than any healthy fresh session
+			// A migrated Pi session can have existing JSONL without usage data or a last_response_time baseline.
+			// Imported sessions force execution when the scheduler defers, usage is 0, `lastResponseTime` is 0, and the session has at least 50 messages.
 			// would produce.
 			//
-			// Threshold: 50 messages. A normal first turn carries 1
-			// system message + 1 user message; even a complex multi-step
-			// first turn with tool calls would only reach ~10. 50 is
-			// firmly in "this came from migration or session import"
-			// territory and below it we keep the cache-friendly defer.
 			const piMessageCount = fullWireMessageCount;
 			const looksLikeImportedSession =
 				schedulerDecision === "defer" &&
@@ -2606,27 +2265,12 @@ export function registerPiContextHandler(
 			}
 			logTransformTiming(sessionId, "modelChangeDetection", tModelDetect);
 
-			// Pi stable-id scheme cutover (one-time, per session). When this
-			// session's persisted tags/source_contents/caveman/placeholder state
-			// were keyed under the OLD index-based pi-msg-* scheme (stored scheme <
-			// PI_STABLE_ID_SCHEME, NULL = 0 = legacy), switching to real-entry-id
-			// ids re-keys every row → the tagger re-tags and prior drops orphan.
-			// Force ONE controlled execute+materialize pass so heuristic cleanup
-			// re-drops by tag content and the prefix rebuilds in a single bust
-			// (rather than an uncontrolled defer-pass bust that could leak
-			// full-size content). Also clear stripped_placeholder_ids so the
-			// forced pass rediscovers placeholders under the new scheme. The new
-			// scheme stamp is staged until every transform phase succeeds. A failed
-			// cutover therefore retries placeholder discovery and fallback adoption on
-			// the next pass instead of hiding legacy pi-msg-* replay state.
+			// Legacy `pi-msg-*` keys orphan persisted state after switching to real entry IDs.
+			// `stableIdSchemeCutover` forces materialization so cleanup re-drops legacy content under entry IDs.
+			// A successful cutover clears `stripped_placeholder_ids` so placeholder discovery uses real entry IDs.
+			// The transform persists `PI_STABLE_ID_SCHEME` only after all transform phases succeed.
 			const storedStableIdScheme = sessionMeta.piStableIdScheme ?? 0;
-			// Only activate the cutover when REAL SessionEntry ids are available this
-			// pass. The cutover re-keys persisted state from pi-msg-* index ids to
-			// real entry ids; if branch resolution failed (strictEntryIds null →
-			// pi-msg-* fallback), forcing an execute+materialize would burn a cache
-			// bust without re-keying anything, then either false-complete (if we
-			// stamped) or churn the placeholder set under pi-msg-* ids. Defer the
-			// whole cutover to a later pass when getBranch() succeeds.
+			// The cutover retries after `getBranch()` returns real entry IDs.
 			const realEntryIdsAvailable =
 				strictEntryIds?.some((id) => typeof id === "string" && id.length > 0) ??
 				false;
@@ -2644,14 +2288,9 @@ export function registerPiContextHandler(
 			if (stableIdSchemeCutover && !options.compactionOff) {
 				schedulerDecision = "execute";
 				signalPiPendingMaterialization(sessionId);
-				// Re-keying of stripped_placeholder_ids from pi-msg-* to real ids is
-				// done by the strip's own prune this pass (forceDiscovery + carried
-				// map → finalIds = idsToStrip ∩ presentIds, and stale pi-msg-* ids
-				// aren't in the real-id presentIds, so they're dropped atomically
-				// within the strip's persist). We deliberately do NOT pre-clear the
-				// set here: an early clear before the pass succeeds would lose the
-				// placeholder set on a mid-pass failure, and forceDiscovery keeps
-				// retrying every pass until the scheme stamps anyway.
+				// `prune` removes legacy `pi-msg-*` placeholder IDs because they are absent from real-ID `presentIds`.
+				// `stripped_placeholder_ids` must remain intact until a successful pass; pre-clearing loses placeholder IDs on mid-pass failure.
+				// `forceDiscovery` retries until the stable-ID scheme is stored.
 				sessionLog(
 					sessionId,
 					`stable-id scheme cutover: stored=${storedStableIdScheme} < current=${PI_STABLE_ID_SCHEME} — forcing execute+materialize this pass`,
@@ -2691,55 +2330,33 @@ export function registerPiContextHandler(
 			}
 
 			schedulerDecision = midTurnAdjustedSchedulerDecision;
-			// NOTE: do NOT promote defer→execute when a deferred-execute flag
-			// exists. OpenCode treats the flag as drain-on-success ONLY (it never
-			// re-raises execute) — see transform-postprocess-phase.ts boundary-exec
-			// drain + boundary-execution-integration.test.ts case 4 ("boundary defer
-			// with prior flag preserves the flag"). The scheduler is idempotent:
-			// shouldExecute re-returns "execute" on the next non-mid-turn pass while
-			// pressure still holds, so the deferred execute fires naturally without a
-			// Pi-only override. Promoting here diverged from OpenCode in exactly the
-			// case where pressure dropped below threshold after the mid-turn defer:
-			// OpenCode correctly defers (byte-stable) while Pi force-executed a
-			// spurious cache-busting pass. The flag is drained on the next pass that
-			// genuinely executes (peek+clear at the end of runPipeline).
+			// The deferred-execute flag is drained only by a successful execution; it does not promote `defer` to `execute`.
+			// The scheduler re-returns `execute` on the next non-mid-turn pass while pressure holds.
+			// When pressure drops below the threshold after a mid-turn defer, promotion would force a cache-busting pass instead of deferring.
+			// `runPipeline` clears the deferred-execute flag only after it completes successfully.
 			sessionLog(
 				sessionId,
 				`[boundary-exec] base=${schedulerDecisionEarly} bypass=${bypassReason} midTurn=${midTurn} effective=${midTurnAdjustedSchedulerDecision} sideEffect=${sideEffect}`,
 			);
 
-			// At the derived force band, enable aggressive drop-all-tools mode.
-			// Mirrors OpenCode transform-postprocess-phase.ts:145-146.
+			// `forceMaterialization` enables drop-all-tools mode at the derived force band.
 			const forceMaterialization =
 				!options.compactionOff &&
 				usagePercentage >= forceMaterializationPercentage;
 
-			// 95% emergency block: usage is dangerous enough that we
-			// MUST wait for any in-flight historian to finish so its
-			// queued drops can materialize on this pass, AND we apply
-			// drop-all-tools cleanup to shrink the prompt as much as
-			// possible before the LLM call. Mirrors OpenCode's >=95%
-			// emergency path in transform.ts (~line 514+).
+			// The emergency block waits for an in-flight historian so queued drops materialize before the LLM call.
+			// The emergency block applies `dropAllTools` to reduce prompt size.
 			//
-			// Pi differences vs OpenCode:
-			//   - We can't `client.session.abort()` mid-pass (Pi
-			//     doesn't expose that surface to extensions). The next
-			//     best is to await the in-flight historian here so the
-			//     LLM call still happens, but with a freshly-shrunk
-			//     prompt. If no historian is in flight we still apply
-			//     dropAllTools via forceMaterialization so the prompt
+			// Pi extensions cannot call `client.session.abort()` mid-pass.
+			// When no historian is in flight, `forceMaterialization` still applies `dropAllTools`.
 			//     shrinks regardless.
-			//   - We cap the wait at 30s to avoid stalling the user's
-			//     turn forever if historian hangs. After 30s we fall
-			//     through to the normal pipeline (with drop-all-tools
-			//     still active via the derived force-band branch).
+			// The 30-second cap prevents a hung historian from delaying the user's LLM call.
 			const hardUsagePercentage = needsEmergencyBump
 				? Math.max(EMERGENCY_BLOCK_PERCENTAGE, usagePercentage)
 				: windowGeometry?.usableHard && usageInputTokens > 0
 					? (usageInputTokens / windowGeometry.usableHard) * 100
 					: usagePercentage;
-			// Direct/test callers without a model cannot resolve geometry. Keep the
-			// prior denominator in that compatibility lane; production always has ctx.model.
+			// Without `ctx.model`, callers use `usagePercentage` because geometry cannot be resolved.
 			const emergencyPercentage = ctx.model
 				? hardUsagePercentage
 				: usagePercentage;
@@ -2762,9 +2379,6 @@ export function registerPiContextHandler(
 					);
 				}
 
-				// Wait for in-flight historian (if any) so its drops can
-				// be applied on this pass. Bounded so a hung historian
-				// doesn't stall the user's turn.
 				const histPromise = inFlightHistorian.get(sessionId);
 				if (histPromise) {
 					try {
@@ -2773,17 +2387,12 @@ export function registerPiContextHandler(
 							sessionId,
 							"EMERGENCY: historian wait completed (or timed out)",
 						);
-					} catch {
-						// Historian already logged its own failure; just continue.
-					}
+					} catch {}
 				}
 
-				// Disarm a stuck emergency-recovery flag only after real pressure has
-				// fallen below the force-materialization threshold. The flag must survive
-				// while the session is genuinely oversized; clearing it early would expose
-				// the next send to another overflow. Once the user has freed enough context,
-				// the emergency bump is stale and can stop forcing every pass to 95%. The
-				// detected context limit is left intact as authoritative model data.
+				// Clearing `emergencyRecoveryArmed` while the session remains oversized can cause the next send to overflow.
+				// After usage falls below `forceMaterializationPercentage`, a stale emergency bump need not force every pass to 95%.
+				// Disarming recovery does not clear the detected context limit.
 				if (
 					emergencyRecoveryArmed &&
 					realUsagePercentageBeforeEmergencyBump <
@@ -2806,30 +2415,14 @@ export function registerPiContextHandler(
 				}
 			}
 
-			// `isCacheBusting` controls whether the injection cache is
-			// bypassed for the `<session-history>` block. ONLY reads
-			// `historyRefreshSessions` — the narrow injection-rebuild
-			// signal — to mirror OpenCode's transform.ts:444 exactly.
+			// `historyRefreshSessions` is the only injection-cache rebuild signal.
 			//
-			// Critical: do NOT force a cache rebuild on every execute /
-			// force / emergency pass. Those signal that THIS pass will
-			// mutate tag state (drops, caveman, reasoning clearing), but
-			// the rendered `<session-history>` block depends only on
-			// stored compartments/facts/memories, which only change
-			// when historian publishes (which sets historyRefreshSessions
-			// via the shared compartment-runner publish path).
+			// Force and emergency passes do not rebuild the injection cache.
+			// Force and emergency passes indicate that the current pass mutates tag state.
 			//
-			// Without this separation, every execute pass rebuilds and
-			// re-renders the history block — busting Anthropic prompt
-			// cache on EVERY tool call once context crosses the execute
-			// threshold, exactly the regression Oracle flagged.
-			// PEEK-then-drain-on-success pattern (Oracle audit Round 8 #6):
-			// capture the boolean here, but DELETE only after
-			// `injectSessionHistoryIntoPi(...)` succeeds inside
-			// `runPipeline`. If injection throws, the flag survives so
-			// the next pass retries the rebuild. Defer passes within the
-			// same TTL window still hit the cached injection result
-			// because the consumer compares against the cached cutoff.
+			// Otherwise, every execute pass re-renders the history block and busts Anthropic's prompt cache after the execute threshold.
+			// `runPipeline` removes `sessionId` from `historyRefreshSessions` only after `injectSessionHistoryIntoPi(...)` succeeds.
+			// If injection throws in `runPipeline`, `runPipeline` retains `historyRefreshSessions` so the next pass rebuilds history.
 			const isCacheBusting = historyRefreshSessions.has(sessionId);
 			logTransformTiming(sessionId, "boundaryTriggerChecks", tBoundaryChecks);
 
@@ -2843,23 +2436,15 @@ export function registerPiContextHandler(
 				tEmergencyRecovery,
 			);
 
-			// Resolve SessionEntry IDs for each AgentMessage in event.messages
-			// so the boundary lookup in `<session-history>` injection uses
-			// the same id format historian persists. Reference-based
-			// matching — see collectMessageEntryIdsByRef for why this is
-			// preferred over the position-based collectMessageEntryIds.
+			// `entryIds` uses historian's persisted ID format for `<session-history>` boundary lookups.
 			const entryIds = strictEntryIds ?? undefined;
 
-			// Ceiling for the tiered emergency drop = contextLimit ×
-			// executeThreshold%. Undefined when the limit isn't resolved → the
-			// emergency drop skips that pass (95% block stays the backstop).
+			// `emergencyCeilingTokens` is undefined when the context limit is unresolved, so emergency dropping skips that pass; the 95% block remains the backstop.
 			const emergencyCeilingTokens =
 				usageContextLimit && usageContextLimit > 0
 					? Math.floor(
 							usageContextLimit *
-								// Ceiling from the SCHEDULER execute threshold (not
-								// options.historian, which falls back to 65 and ignores
-								// the user's execute_threshold_* when historian is off).
+								// `emergencyCeilingTokens` uses the scheduler execute threshold because `options.historian` defaults to 65% when historian is disabled and ignores `execute_threshold_*`.
 								(resolveExecuteThreshold(
 									schedulerConfig.executeThresholdPercentage ?? 65,
 									liveModelBySession.get(sessionId),
@@ -2892,9 +2477,6 @@ export function registerPiContextHandler(
 					? {
 							...options.injection,
 							memoryEnabled: options.injection.memoryEnabled,
-							// v2 decay rendering needs the HISTORY budget (~60K), not the
-							// memory injection budget (~4K). Compute it from live usage +
-							// historian config, mirroring OpenCode's decayPressure budget.
 							historyBudgetTokens: resolveHistoryBudgetTokensForPi({
 								historyBudgetPercentage:
 									options.historian?.historyBudgetPercentage,
@@ -2914,9 +2496,7 @@ export function registerPiContextHandler(
 				reusableMessageIds,
 				stableIdSchemeCutover,
 				schedulerDecision,
-				// 95% emergency forces drop-all-tools regardless of the
-				// derived force gate, so the LLM call sees the smallest possible
-				// prompt before we hand control back to Pi.
+				// At 95% usage, emergency recovery drops all tools.
 				forceMaterialization: forceMaterialization || isEmergency,
 				forceMaterializationPercentage,
 				contextUsage: {
@@ -2939,9 +2519,7 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
 			const postPipelineStart = performance.now();
 			const tTransformDecision = performance.now();
-			// Replace the reuse window only after a successful pass. An id absent from
-			// the current branch must take one full derivation pass if it later returns,
-			// and bounding the set to the live branch prevents session-long growth.
+			// The reuse window is replaced only after a successful pass. An ID absent from the current branch must complete one derivation pass if it returns; limiting the set to the live branch prevents session-long growth.
 			if (strictEntryIds) {
 				recordSuccessfulTaggedMessageIds(sessionId, strictEntryIds);
 			}
@@ -2975,10 +2553,7 @@ export function registerPiContextHandler(
 				tTransformDecision,
 			);
 
-			// After tagging+drops have committed, check whether historian
-			// should fire. Historian config is optional — tagging-only
-			// behavior is the Step 4b.2 contract, and historian is
-			// fire-and-forget so we never block the LLM call on it.
+			// Historian config is optional, so tagging-only runs remain supported.
 			const tHistorianScheduling = performance.now();
 			if (options.historian && !options.compactionOff) {
 				maybeFireHistorian({
@@ -2999,11 +2574,8 @@ export function registerPiContextHandler(
 				tHistorianScheduling,
 			);
 
-			// Step 4b.4: nudge + note-nudge + auto-search hint. All three
-			// run AFTER tagging/drops finish so they see the post-mutation
-			// message shape. Each is independently optional and fail-open —
-			// any thrown error is logged and the pipeline returns the
-			// already-mutated messages unchanged.
+			// Post-transform hints run after tagging and drops so they observe the post-mutation message shape.
+			// Any thrown error is logged; the pipeline returns the already-mutated messages unchanged.
 			const tPostTransform = performance.now();
 			let outputMessages = result.messages as PiAgentMessage[];
 			let assertTailHygieneLastWriter: (() => void) | undefined;
@@ -3017,14 +2589,11 @@ export function registerPiContextHandler(
 						messages: outputMessages,
 						projectIdentity,
 						entryIds: strictEntryIds,
-						// Use the map produced after commits and splices because those operations
-						// can change the final message-reference to entry-ID mapping.
+						// The pipeline uses `result.postCommitEntryIdByRef` because commits and splices can change message-reference-to-entry-ID mappings.
 						entryIdByRef: result.postCommitEntryIdByRef,
-						// Same signal OpenCode uses to gate sticky-anchor GC
-						// (isCacheBustingPass = history-refresh OR work executed).
+						// Sticky-anchor GC treats history refresh or executed work as cache-busting.
 						isCacheBusting: isCacheBusting || result.executedWorkThisPass,
-						// These leading synthetic messages have no persisted entry IDs, so
-						// exclude them from the sticky-anchor GC denominator.
+						// Sticky-anchor GC excludes leading synthetic messages from its denominator because they lack persisted entry IDs.
 						syntheticLeadingCount: result.syntheticLeadingCount,
 					});
 				}
@@ -3044,8 +2613,6 @@ export function registerPiContextHandler(
 						db: options.db,
 						messages: outputMessages,
 						entryIds: strictEntryIds,
-						// Use the map produced after commits and splices because those operations
-						// can change the final message-reference to entry-ID mapping.
 						entryIdByRef: result.postCommitEntryIdByRef,
 						ensureProjectRegistered: () =>
 							ensureProjectRegisteredFromPiDirectory(
@@ -3068,26 +2635,13 @@ export function registerPiContextHandler(
 			}
 			logTransformTiming(sessionId, "autoSearch", tAutoSearch);
 
-			// Synthetic todowrite injection — Pi parity with OpenCode's
-			// transform-postprocess-phase.ts B7. On cache-busting passes,
-			// inject a Pi-shape toolCall + toolResult pair built from the
-			// `session_meta.last_todo_state` snapshot captured by
-			// `tool_execution_start` in index.ts. On defer passes, replay
-			// the same pair from the persisted snapshot to keep wire bytes
-			// byte-identical (Anthropic prompt cache stability).
+			// Cache-busting passes inject a synthetic Pi `toolCall` and `toolResult` from `session_meta.last_todo_state`.
+			// Deferred passes replay the persisted pair so its wire bytes remain identical.
 			//
-			// Cache-busting gate parity: OpenCode uses
-			// `isCacheBustingPass = shouldApplyPendingOps || shouldRunHeuristics`
-			// (transform-postprocess-phase.ts:273). Pi's `isCacheBusting`
-			// flag from the outer handler only covers history refresh
-			// (historian publication), so we OR it with
-			// `result.executedWorkThisPass` — pending-op materialization,
-			// heuristic cleanup, or reasoning clearing — to match
-			// OpenCode's broader "execute pass that actually mutated state"
+			// The cache-busting condition includes `result.executedWorkThisPass` because `isCacheBusting` covers only history refresh.
+			// The cache-busting condition treats pending-op materialization, heuristic cleanup, and reasoning clearing as cache-busting work.
 			// semantics.
 			//
-			// Subagents skip — they don't get synthetic injection in
-			// OpenCode either (see B7 `args.fullFeatureMode` gate).
 			const tTodoCapture = performance.now();
 			try {
 				const sessionMetaForTodo = getOrCreateSessionMeta(
@@ -3101,9 +2655,7 @@ export function registerPiContextHandler(
 				) {
 					const isCacheBustingForTodo =
 						isCacheBusting || result.executedWorkThisPass;
-					// SAFETY: Pi AgentMessage and plugin-core messages share the
-					// fields injectSyntheticTodowriteForPi reads and returns;
-					// TypeScript cannot unify types from different packages.
+					// SAFETY: `PiAgentMessage` and plugin-core messages share every field that `injectSyntheticTodowriteForPi` reads and returns; TypeScript cannot unify the package types.
 					outputMessages = injectSyntheticTodowriteForPi({
 						db: options.db,
 						sessionId,
@@ -3123,9 +2675,8 @@ export function registerPiContextHandler(
 			}
 			logTransformTiming(sessionId, "todoCapture", tTodoCapture);
 
-			// Walk Pi's final rendered entry stream once to calculate both nudge-channel
-			// totals. A cache-busting pass replaces the saved baseline; a deferred pass
-			// keeps it and adds only newly appended content and protection-boundary moves.
+			// Cache-busting passes replace the saved baseline; deferred passes retain it.
+			// A deferred pass preserves the saved baseline and adds only newly appended content and protection-boundary moves.
 			const tChannelAccounting = performance.now();
 			try {
 				const sessionMetaForCh1 = getOrCreateSessionMeta(options.db, sessionId);
@@ -3209,13 +2760,7 @@ export function registerPiContextHandler(
 				tChannelAccounting,
 			);
 
-			// Work-metrics update runs on EVERY transform pass (not just
-			// execute passes). The Pi compute helper is pure-read on
-			// outputMessages; setSessionWorkMetrics is a pure write to
-			// session_meta (no tag state, no message[0] mutation, no
-			// cache-busting). Gating on executedWorkThisPass would mean
-			// sessions sitting below execute threshold never see populated
-			// values, making Pi's status surface permanently zero.
+			// Every transform pass updates work metrics so sessions below the execute threshold populate Pi's status values.
 			const tWorkMetrics = performance.now();
 			try {
 				const metrics = computePiWorkMetrics(outputMessages as unknown[]);
@@ -3235,9 +2780,7 @@ export function registerPiContextHandler(
 
 			const tStableIdSchemePersist = performance.now();
 			if (stableIdSchemeCutover && !options.compactionOff) {
-				// Scheme stamps only after the cutover pass completed. If this write
-				// fails, the outer fail-open path ships the original messages and the
-				// next pass repeats forced placeholder discovery.
+				// The cutover pass stamps the scheme only after completion; failure ships the original messages so the next pass repeats forced placeholder discovery.
 				persistStableIdSchemeForRun(options.db, sessionId, {
 					piStableIdScheme: PI_STABLE_ID_SCHEME,
 				});
@@ -3258,10 +2801,7 @@ export function registerPiContextHandler(
 
 			logTransformTiming(sessionId, "postTransformPhase", tPostTransform);
 
-			// Cast the rebuilt array back to the AgentMessage[] shape Pi's
-			// ContextEventResult expects. The nudge/note/auto-search paths
-			// preserve message identity for unchanged messages and only
-			// rebuild the mutated ones, so this cast is safe at runtime.
+			// The rebuilt array is cast to `AgentMessage[]` because unchanged nudge, note, and auto-search messages retain identity and only mutated messages are rebuilt.
 			clearLastTransformErrorIfSet(options.db, sessionId);
 			options.maybeAutoEmbedSession?.(
 				sessionId,
@@ -3290,8 +2830,7 @@ export function registerPiContextHandler(
 				messages: typeof event.messages;
 			};
 		} catch (err) {
-			// Loud fail-closed / emergency aborts must reach the user — do not
-			// swallow into native-compaction fallthrough.
+			// Fail-closed and emergency aborts must reach the user; do not fall through to native compaction.
 			if (isFailClosedBlockingError(err) && !baseOptions.compactionOff)
 				throw err;
 			const message = err instanceof Error ? err.message : String(err);
@@ -3301,16 +2840,13 @@ export function registerPiContextHandler(
 				stack,
 			);
 			if (sessionIdForError) {
-				// baseOptions.db (not the per-pass `options`, which is scoped to
-				// the try). The DB handle is shared across all projects.
 				persistLastTransformErrorIfChanged(
 					baseOptions.db,
 					sessionIdForError,
 					summarizeTransformError(err),
 				);
 			}
-			// Fall through with no mutation — Pi proceeds with original
-			// messages, equivalent to a no-op transform pass.
+			// The fallback leaves messages unmodified so Pi receives the originals.
 			return;
 		}
 	});
@@ -3320,26 +2856,14 @@ export function registerPiContextHandler(
 }
 
 /**
- * Track in-flight historian runs per session so we don't fire a second
- * pass while the first is still running. The flag also exists in
- * session_meta.compartment_in_progress (see `runPiHistorian` setting
- * it), but that DB-side flag is durable across restarts and the
- * trigger logic already inspects it; this in-memory map is a
- * fast-path so we don't hit the DB just to dedupe per turn.
+ * Per-session in-flight historian Promises prevent concurrent runs and let shutdown await them without a per-turn DB lookup.
  *
- * We store the actual Promise (not just the session id) so the
- * `session_shutdown` handler can `await` outstanding runs before Pi
- * exits — critical for `pi --print` mode where the parent process
- * exits as soon as `agent_end` fires, otherwise killing the historian
+ * `session_shutdown` awaits stored historian Promises before Pi exits; `--print` exits after `agent_end`.
  * subprocess mid-run.
  */
 const inFlightHistorian = new Map<string, Promise<unknown>>();
 
 /**
- * Wait for all in-flight historian runs to complete. Called from the
- * Pi `session_shutdown` event handler so historian can finish writing
- * compartments before the process exits. Returns immediately if no
- * runs are in-flight.
  */
 export async function awaitInFlightHistorians(): Promise<void> {
 	if (inFlightHistorian.size === 0) return;
@@ -3359,14 +2883,10 @@ export function resolvePiHistorianTriggerInputs(args: {
 	clearReasoningAge: number;
 	commitClusterTrigger: { enabled: boolean; min_clusters: number } | undefined;
 	contextLimit: number;
-	/** ceiling = contextLimit × executeThreshold% (tiered emergency drop). */
+	/* */
 	emergencyCeilingTokens: number;
 } {
-	// Pi resolves the context window from its own runtime (passed in as
-	// usageContextLimit, derived from getContextUsage()/getModel().contextWindow
-	// with the detected-overflow override already applied). models.dev is not
-	// consulted for Pi. Fall back to the conservative default only when the
-	// runtime hasn't reported a usable window yet.
+	// Pi supplies `usageContextLimit` from its runtime.
 	const contextLimit =
 		typeof args.usageContextLimit === "number" &&
 		Number.isFinite(args.usageContextLimit) &&
@@ -3404,9 +2924,7 @@ export function selectPiHistorianRunBoundarySnapshot(args: {
 	resolvedBoundarySnapshot: ProtectedTailBoundarySnapshot;
 	triggerBoundarySnapshot?: ProtectedTailBoundarySnapshot;
 }): ProtectedTailBoundarySnapshot {
-	// The trigger may re-resolve under emergency pressure; the runner must
-	// consume the exact boundary the fire decision evaluated, falling back only
-	// for recovery paths that did not go through the trigger.
+	// The runner uses `triggerBoundarySnapshot` when available to preserve the boundary evaluated by the trigger.
 	return args.triggerBoundarySnapshot ?? args.resolvedBoundarySnapshot;
 }
 
@@ -3429,14 +2947,7 @@ export function resolveHistoryBudgetTokensForPi(args: {
 		modelKey,
 	} = args;
 	if (!historyBudgetPercentage) return undefined;
-	// Prefer the model's STABLE context limit (Pi reports contextWindow; an
-	// overflow-detected limit overrides it). Only fall back to the live-usage
-	// back-derivation when no stable limit is available — and that fallback
-	// needs a positive percentage. The earlier `usagePercentage <= 0` early
-	// return was too aggressive: on the first pass after restart Pi can report
-	// percentage=0 while contextWindow is already known, which forced the
-	// budget through to the hard-coded 60K default and over-archived history
-	// (matches the OpenCode resolveHistoryBudgetTokens fix).
+	// When `usageContextLimit` is known, `usagePercentage === 0` does not disable budget resolution.
 	const derivedLimit =
 		usageContextLimit && usageContextLimit > 0
 			? usageContextLimit
@@ -3446,11 +2957,7 @@ export function resolveHistoryBudgetTokensForPi(args: {
 	if (!Number.isFinite(derivedLimit) || derivedLimit <= 0) return undefined;
 	return Math.floor(
 		derivedLimit *
-			// Pass executeThresholdTokens so token-based per-model thresholds drive
-			// the history budget identically to OpenCode (resolveHistoryBudgetTokens).
-			// Without it, a session configured with execute_threshold_tokens would
-			// get a different (percentage-only) decay budget than OpenCode → different
-			// render tiers for the same state.
+			// `executeThresholdTokens` must affect history-budget resolution.
 			(resolveExecuteThreshold(executeThresholdPercentage ?? 65, modelKey, 65, {
 				tokensConfig: executeThresholdTokens,
 				contextLimit: derivedLimit,
@@ -3474,7 +2981,7 @@ function startPiCompartmentLeaseRenewal(
 				);
 			}
 		} catch (err) {
-			// A missed renewal is safe because the compartment lease has a five-minute TTL.
+			// The compartment lease expires after five minutes if renewal is missed.
 			sessionLog(
 				sessionId,
 				`compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
@@ -3547,9 +3054,7 @@ function sendPiIgnoredNotification(
 				);
 			}
 			return;
-		} catch {
-			// Fall through to session log below.
-		}
+		} catch {}
 	}
 	sessionLog("pi", message);
 }
@@ -3591,8 +3096,7 @@ function spawnPiHistorianRun(args: {
 			return;
 		}
 		if (isWrapupInProgress(db, sessionId)) {
-			// Close the cross-process check/lease race: /ctx-wrapup may have published
-			// its marker after the first check but before this process won the lease.
+			// `/ctx-wrapup` can publish its marker between the initial check and lease acquisition; recheck after acquiring the lease.
 			sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
 			releaseCompartmentLease(db, sessionId, holderId);
 			return;
@@ -3647,23 +3151,13 @@ function spawnPiHistorianRun(args: {
 							`historian: clearEmergencyRecovery failed: ${err instanceof Error ? err.message : String(err)}`,
 						);
 					}
-					// Historian publication invalidates the injection cache AND
-					// queues drops for the messages now covered by new
-					// compartments. Mirrors OpenCode's onInjectionCacheCleared
-					// callback in transform.ts:502-505:
-					//   - signalPiHistoryRefresh: triggers ONE rebuild on the next
-					//     transform pass (drained immediately after rebuild).
-					//   - signalPiPendingMaterialization: queues the drops the
-					//     historian published; persists until the next pipeline
-					//     pass actually materializes them. Without this signal,
-					//     drops sit in pending_ops and context climbs until the
-					//     derived force-materialization threshold — exactly the
-					//     "context kept going up after historian ran" symptom
-					//     users observed at 64% → 69%+ on Pi.
+					// Historian publication invalidates the injection cache and queues drops for messages covered by new compartments.
+					// `signalPiDeferredHistoryRefresh` schedules one rebuild for the next transform pass.
+					// The next transform pass drains the refresh immediately after rebuilding.
+					// `signalPiDeferredMaterialization` queues historian-published drops until a pipeline pass materializes them.
+					// Without `signalPiDeferredMaterialization`, drops remain in `pending_ops` and context climbs to the derived force-materialization threshold.
 					//
-					// We deliberately do NOT signal systemPromptRefresh — historian
-					// doesn't change disk-backed adjuncts (docs/profile/key-files),
-					// so re-reading them would burn IO for nothing.
+					// Historian does not change disk-backed adjuncts, so do not signal `systemPromptRefresh`.
 					signalPiDeferredHistoryRefresh(sessionId);
 					signalPiDeferredMaterialization(sessionId);
 					if (sessionStillActive) {
@@ -3724,14 +3218,11 @@ function resolvePiReadBranchEntries(
 }
 
 /**
- * Trigger evaluation + fire-and-forget historian invocation. Runs
- * after the synchronous tagging pass so trigger logic sees the
+ * `maybeFireHistorian` evaluates the trigger and invokes the historian without awaiting it.
+ * `maybeFireHistorian` runs after synchronous tagging so trigger logic sees just-assigned tags.
  * just-assigned tags.
  *
- * The actual historian subagent spawn (`runPiHistorian`) is async
- * and intentionally NOT awaited — the LLM call should never wait on
- * historian. Errors are logged but never propagated; the user's
- * agent turn continues regardless of historian outcome.
+ * Errors are logged but never propagated; the user's agent turn continues regardless of historian outcome.
  */
 function maybeFireHistorian(args: {
 	pi: ExtensionAPI;
@@ -3754,9 +3245,8 @@ function maybeFireHistorian(args: {
 	}
 
 	if (isWrapupInProgress(db, sessionId)) {
-		// /ctx-wrapup owns compartment-state publication while this marker is live.
-		// The marker has a five-minute TTL renewed by wrapup, so a crashed wrapup
-		// self-expires instead of suppressing trigger-fired historian runs forever.
+		// `/ctx-wrapup` owns compartment-state publication while the wrapup marker is live.
+		// The marker has a five-minute TTL renewed by wrapup; a crashed wrapup self-expires instead of suppressing trigger-fired historian runs forever.
 		sessionLog(
 			sessionId,
 			"historian trigger eval: /ctx-wrapup active, skipping",
@@ -3764,34 +3254,26 @@ function maybeFireHistorian(args: {
 		return;
 	}
 
-	// Prefer OpenCode-equivalent pressure persisted by message_end.
-	// Pi's built-in `ctx.getContextUsage()` reports total-tokens
-	// percent (input + output + cache), but historian/trigger math
-	// expects wire-input pressure (input + cacheRead + cacheWrite).
-	// `session_meta.lastContextPercentage` carries the corrected value
-	// computed by `pi-pressure.ts` against the effective context
-	// limit (with detected_context_limit override applied).
+	// Pi's built-in `ctx.getContextUsage()` reports total-token percentage (`input + output + cache`), but historian and trigger math require wire-input pressure (`input + cacheRead + cacheWrite`).
+	// `session_meta.lastContextPercentage` is computed by `pi-pressure.ts` against the effective context limit, including any `detected_context_limit` override.
 	let usage: { percentage: number; inputTokens: number };
 	let usageContextLimit: number | undefined;
 	try {
 		const piUsage = ctx.getContextUsage?.();
 		let usageSource: "session_meta" | "piUsage fallback";
-		// Sane-bound (isSaneLimit, NOT `> 0`) so a garbage-but-positive window
-		// can't drive the trigger budget — mirrors the main pressure pass.
+		// Only `isSaneLimit(limit)` may determine the trigger budget; a positive invalid window cannot.
 		usageContextLimit = isSaneLimit(piUsage?.contextWindow)
 			? piUsage.contextWindow
 			: undefined;
 		let detectedContextLimit: number | undefined;
-		// Cold-start: fall back to the model's window when usage hasn't reported
-		// a sane one yet (first pass after restart).
+		// Cold starts use the model's window until usage is reported.
 		if (
 			usageContextLimit === undefined &&
 			isSaneLimit(ctx.model?.contextWindow)
 		) {
 			usageContextLimit = ctx.model.contextWindow;
 		}
-		// Apply the detected-overflow cap (authoritative real limit) just like the
-		// main pass — otherwise the trigger budget uses the wrong (larger) limit.
+		// The detected overflow limit caps the trigger budget.
 		try {
 			const overflowState = getOverflowState(db, sessionId);
 			if (overflowState.detectedContextLimit > 0) {
@@ -3801,9 +3283,7 @@ function maybeFireHistorian(args: {
 					overflowState.detectedContextLimit,
 				);
 			}
-		} catch {
-			// Best-effort — fall through with the uncorrected limit.
-		}
+		} catch {}
 		usageContextLimit = resolvePiUsableContextLimit({
 			rawContextWindow: usageContextLimit,
 			model: ctx.model,
@@ -3820,10 +3300,7 @@ function maybeFireHistorian(args: {
 			};
 			usageSource = "session_meta";
 		} else {
-			// Fallback to Pi-reported usage when no message_end has
-			// landed yet (first turn). This is the same fallback the
-			// original implementation used; the +output token drift
-			// of ~0.1% is acceptable on the first turn before
+			// The fallback uses Pi-reported usage only when no `message_end` run has recorded usage.
 			// message_end runs.
 			if (
 				!piUsage ||
@@ -3837,9 +3314,7 @@ function maybeFireHistorian(args: {
 				);
 				return;
 			}
-			// Recompute the fallback percentage against the corrected limit (raw
-			// piUsage.percent is on Pi's own denominator and is wrong once the
-			// limit was sane-bounded or overflow-capped).
+			// The fallback recomputes against `usageContextLimit` because `piUsage.percent` may use a different denominator.
 			const fallbackPercentage =
 				isSaneLimit(usageContextLimit) && piUsage.tokens > 0
 					? (piUsage.tokens / usageContextLimit) * 100
@@ -3868,11 +3343,8 @@ function maybeFireHistorian(args: {
 		return;
 	}
 
-	// Register the Pi RawMessageProvider for this sessionId so the
-	// shared trigger logic + historian can read Pi session messages
-	// via the standard `readRawSessionMessages` etc. helpers. The
-	// provider stays registered while the historian runs and
-	// unregisters in finally.
+	// `rawMessageProvider` remains registered for `sessionId` until the historian finishes so shared trigger logic and the historian can read Pi session messages.
+	// via `readRawSessionMessages`.
 	const provider = args.rawMessageProvider ?? {
 		readMessages: () => readPiSessionMessages(ctx),
 	};
@@ -3912,9 +3384,6 @@ function maybeFireHistorian(args: {
 			let snapshot = ensureRunnablePiBoundaryForTests(
 				resolvePiBoundarySnapshot(),
 			);
-			// Derived band, not literal 80: under a raised execute threshold the
-			// emergency-scaled retry must not relax the boundary below the force
-			// band (same escalation class as the OpenCode trigger's force gate).
 			if (
 				!hasRunnableCompartmentWindow(snapshot) &&
 				usage.percentage >= historianForceMaterializationPercentage
@@ -3977,9 +3446,7 @@ function maybeFireHistorian(args: {
 			}
 		}
 
-		// Pi's cleared thinking is safe to project for every provider: its
-		// serializers omit empty thinking blocks, unlike OpenCode's
-		// canonical-Anthropic-only empty-sentinel path.
+		// Pi serializers omit empty thinking blocks, unlike OpenCode's canonical-Anthropic-only empty-sentinel path.
 		const trigger = checkCompartmentTrigger(
 			db,
 			sessionId,
@@ -4005,23 +3472,8 @@ function maybeFireHistorian(args: {
 				sessionId,
 				`historian trigger eval: shouldFire=false (no trigger condition met)`,
 			);
-			// Disarm a STALE emergency-recovery flag here, where the AUTHORITATIVE
-			// runnable-window snapshot is in hand. The early disarm in the main
-			// pass (the `isEmergency` block) uses the loose "any raw past boundary"
-			// check, which returns true for a tiny non-runnable tail (e.g. one
-			// in-progress message after /ctx-recomp) and so never disarms — the
-			// flag then bumps every pass to 95% forever even at low real pressure.
 			//
-			// Gate on REAL pressure (usage.percentage, NOT the 95% emergency bump):
-			//   - LOW pressure + armed + no runnable window  → the flag is STALE
-			//     (overflow already resolved, e.g. by /ctx-recomp); disarm so it
-			//     stops force-bumping. This is the user-rescued case (~20%).
-			//   - HIGH pressure + armed + no runnable window  → a GENUINE overflow
-			//     whose tail is one in-progress arc; the window will become runnable
-			//     once the arc closes. Keep armed so drop-all-tools keeps shrinking
-			//     the prompt every pass until then (OpenCode keeps it armed too,
-			//     stopping only the bump via a counter escape). detectedContextLimit
-			//     is left intact (authoritative model data).
+			// High pressure with no runnable window keeps emergency recovery armed.
 			try {
 				const overflowState = getOverflowState(db, sessionId);
 				if (
@@ -4059,11 +3511,8 @@ function maybeFireHistorian(args: {
 			`historian trigger fired (reason=${trigger.reason ?? "unknown"}) usage=${usage.percentage.toFixed(1)}% — spawning subagent`,
 		);
 
-		// Fire-and-forget for the user's LLM call: the parent agent
-		// turn never awaits this. But we DO track the Promise in
-		// inFlightHistorian so `awaitInFlightHistorians()` can wait
-		// at session_shutdown — without that, `pi --print` mode would
-		// kill the historian subprocess mid-run when the parent exits.
+		// The parent LLM turn does not await `spawnPiHistorianRun`.
+		// `pi --print` would kill the historian subprocess when the parent exits without shutdown waiting.
 		spawnPiHistorianRun({
 			pi: args.pi,
 			ctx,
@@ -4098,113 +3547,85 @@ interface RunPipelineArgs {
 	projectDirectory: string;
 	sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
 	messages: Parameters<typeof createPiTranscript>[0];
-	/** Smart-drops (experimental, default off): also reclaim tool output that a
-	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
-	 *  sent to the model are byte-identical to the age-based-only behavior. */
+	/**
+	 * */
 	smartDrops?: boolean;
 	protectedTags: number;
-	/** Heuristic-cleanup config — when omitted, defaults to OpenCode parity values. */
+	/** When omitted, heuristic-cleanup config uses OpenCode parity defaults. */
 	heuristics?: {
 		caveman?: { enabled: boolean; minChars: number };
 	};
 	isSubagent?: boolean;
-	/** Additive-only transform mode: no tags, drops, history trim, markers, or nudges. */
+	/** Additive-only transform mode adds no tags, drops, history trim, markers, or nudges. */
 	compactionOff?: boolean;
-	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
+	/* */
 	emergencyCeilingTokens?: number;
-	/** Memory-injection config — when omitted, no <session-history> injection runs. */
+	/** When omitted, memory-injection config disables `<session-history>` injection. */
 	injection?: {
-		/** When false (config `memory.enabled=false`), project memories are NOT
-		 *  read or rendered into m[0]/m[1]. Docs are controlled by injectDocs. */
+		/**
+		 * */
 		memoryEnabled?: boolean;
-		/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+		/** `injectDocs` defaults to true; when false, `m[0]` omits the `<project-docs>` block and docs hash. */
 		injectDocs?: boolean;
 		injectionBudgetTokens: number;
-		/** v2 decay-render history budget (~60K), distinct from the memory
-		 *  injection budget. Drives compartment tier demotion in renderM0Pi. */
+		/**
+		 * */
 		historyBudgetTokens?: number;
 		temporalAwareness?: boolean;
-		/** mural.enabled — when enabled, generate a deterministic image of memories that did not fit the context budget whenever the system performs a full (HARD) context fold. */
+		/** `muralEnabled` generates a deterministic image of memories excluded by the context budget during a full HARD context fold. */
 		muralEnabled?: boolean;
 	};
 	/**
-	 * Optional entry-id array, indexed 1:1 with `messages`, providing
-	 * the SessionEntry id for each AgentMessage. When supplied,
-	 * `injectSessionHistoryIntoPi` uses these IDs for compartment
-	 * boundary lookup — matching what historian persists as
-	 * `start_message_id`/`end_message_id` (set up via read-session-pi.ts:
-	 * `RawMessage.id = entry.id`). Caller resolves this by walking
-	 * `ctx.sessionManager.getBranch()` and filtering to message-type
-	 * entries — same filter `buildSessionContext` applies.
+	 * Boundary lookup matches historian IDs with `RawMessage.id = entry.id`; callers must filter message entries from `ctx.sessionManager.getBranch()`, matching `buildSessionContext`.
 	 *
-	 * Without this, boundary lookup falls back to a synthesized
-	 * `pi-msg-${index}-${ts}-${role}` id, which never matches anything
-	 * historian wrote → `<session-history>` cannot trim raw history.
+	 * When `entryIds` is absent, boundary lookup uses synthesized IDs that do not match historian IDs, so `<session-history>` cannot trim raw history.
 	 */
 	entryIds?: readonly (string | undefined)[];
 	/**
-	 * Splice-safe message→entryId map keyed by AgentMessage reference. Best-effort
-	 * first try for stable-id resolution (misses messages tagging/drops cloned this
-	 * pass — positional entryIds is the mandatory fallback). Threaded so the
-	 * transcript-tag path and the reasoning/heuristic stable-id paths resolve the
-	 * SAME id for a message (the cross-path lookup invariant).
+	 * `entryIdByRef` maps each `AgentMessage` reference to its entry ID; cloned messages fall back to `entryIds`.
+	 * Transcript tagging and reasoning cleanup must resolve the same entry ID for each message.
 	 */
 	entryIdByRef?: ReadonlyMap<object, string> | null;
-	/** Real entry ids whose append-only Pi message objects were tagged previously. */
+	/* */
 	reusableMessageIds?: ReadonlySet<string>;
 	/**
-	 * True on the one-time stable-id-scheme cutover pass (Pi message identity
-	 * switched from index-based to real-entry-id). Forces placeholder rediscovery
-	 * under the new scheme. The forced execute+materialize cutover machinery
-	 * (pi_stable_id_scheme persisted version) is wired by the caller; when unset,
-	 * no cutover behavior runs (safe default).
+	 * `stableIdSchemeCutover` forces placeholder rediscovery after Pi message IDs switch from index-based IDs to entry IDs.
+	 * The caller enables the cutover only after persisting the `pi_stable_id_scheme` version.
 	 */
 	stableIdSchemeCutover?: boolean;
 	/**
-	 * Pre-resolved scheduler decision for THIS pass. When `"execute"`,
-	 * heuristic cleanup runs (cache-busting). When `"defer"`, only the
-	 * cache-stable stages run (tagging + applyFlushedStatuses + replay
-	 * cached injection). Mirrors OpenCode's `schedulerDecisionEarly`.
+	 * `schedulerDecision` determines whether heuristic cleanup runs for this pass.
+	 * `"defer"` runs tagging, `applyFlushedStatuses`, and cached-injection replay.
 	 */
 	schedulerDecision: "execute" | "defer";
 	/**
-	 * Force-materialization signal: when true, drop-all-tools mode
-	 * activates (mirrors OpenCode's derived force-band emergency cleanup). Caller
-	 * computes from current usage percentage.
+	 * `forceMaterialization` enables drop-all-tools mode.
+	 * The caller derives `forceMaterialization` from current context usage.
 	 */
 	forceMaterialization?: boolean;
-	/** Resolved escalation band for this pass (defaults to 85 for test/direct callers). */
+	/** `forceMaterializationPercentage` defaults to `85` for callers that omit it. */
 	forceMaterializationPercentage?: number;
 	contextUsage: { percentage: number; inputTokens: number };
 	/**
-	 * One-shot signal that the injection cache should be invalidated and
-	 * the prepared block rebuilt on this pass. Mirrors OpenCode's
+	 * `isCacheBusting` rebuilds the prepared injection block for this pass.
 	 * historyRefreshSessions set.
 	 */
 	isCacheBusting: boolean;
 	/**
-	 * Reasoning-clearing config. When provided, typed PiThinkingContent
-	 * blocks for messages older than `clearReasoningAge` from the newest
-	 * tag are replaced with `[cleared]` on execute passes; the watermark
-	 * is persisted to `session_meta.cleared_reasoning_through_tag` so
-	 * defer passes replay the cleared state. Mirrors OpenCode's
-	 * `clearOldReasoning` + `replayClearedReasoning` pair.
+	 * When configured, execute passes replace eligible `PiThinkingContent` blocks with `[cleared]`.
+	 * A block is eligible when its message is more than `clearReasoningAge` tags older than the newest tag.
+	 * The code persists the cleared-through watermark in `session_meta.cleared_reasoning_through_tag`.
+	 * Defer passes replay the persisted cleared-reasoning state.
 	 *
-	 * OpenCode PR #24146 (preserve empty reasoning_content for DeepSeek
-	 * V4 thinking mode) made the provider transform always emit the
-	 * interleaved field (e.g. Moonshot/Kimi `reasoning_content`) — empty
-	 * when no reasoning parts remain — so providers that previously
-	 * needed prior reasoning preserved no longer reject the request.
+	 * The provider transform always emits the interleaved `reasoning_content` field, even when no reasoning parts remain.
 	 */
 	reasoningClearing?: {
 		clearReasoningAge: number;
 	};
-	/** True only when the active provider filters empty sentinel content safely. */
+	/** `canUseEmptySentinels` is true only when the active provider filters empty sentinel content. */
 	canUseEmptySentinels: boolean;
 	/**
-	 * Whether to inject temporal `<!-- +Xm -->` markers into user
-	 * messages with large gaps. Mirrors OpenCode's
-	 * `experimental.temporal_awareness`. Idempotent across passes.
+	 * When enabled, `temporalAwareness` causes the pipeline to inject `<!-- +Xm -->` markers into user `experimental.temporal_awareness` idempotently across passes.
 	 */
 	temporalAwareness?: boolean;
 	appendCompaction?: ApplyDeferredPiCompactionMarkerDeps["appendCompaction"];
@@ -4213,20 +3634,17 @@ interface RunPipelineArgs {
 
 interface RunPipelineResult {
 	messages: unknown[];
-	/** Whether heuristic cleanup actually ran on this pass. */
+	/* */
 	heuristicsExecuted: boolean;
-	/** Whether any execute-only state mutation ran on this pass. */
+	/* */
 	executedWorkThisPass: boolean;
-	/** Whether <session-history> was written into message[0]. */
+	/** `historyInjected` is true when `<session-history>` is written into `message[0]`. */
 	historyInjected: boolean;
 	/**
-	 * Count of synthetic id-less messages injection prepended (the m[0]/m[1]
-	 * pair). Anchor-GC excludes these from its "all messages resolved"
-	 * denominator — they never resolve to a real entry id, so without this
-	 * exclusion `allResolved` is permanently false and pruning never runs.
+	 * `syntheticLeadingCount` excludes synthetic leading messages from Anchor-GC because they have no real entry ID and would otherwise keep `allResolved` false.
 	 */
 	syntheticLeadingCount: number;
-	/** Aggregate counts for log parity with OpenCode. */
+	/* */
 	heuristicsResult: PiHeuristicCleanupResult | null;
 	injectionResult: PiInjectionResult | null;
 	materialized: boolean;
@@ -4239,13 +3657,11 @@ interface RunPipelineResult {
 	reasoningWatermark: number;
 	activeTags: ReturnType<typeof getActiveTagsBySession>;
 	/**
-	 * REAL-SessionEntry-id map keyed by AgentMessage object identity, built AFTER
-	 * transcript.commit() and BEFORE injection splices. The ONLY correct map for
-	 * consumers running after runPipeline mutated the array (sticky reminder,
-	 * note nudges, auto-search): the pass-start `entryIdByRef` keys pre-commit
-	 * objects and misses every cloned (dirty) message. Contains NO pi-msg-*
-	 * fallback ids, so a branch-resolution failure leaves a message unmapped and
-	 * the consumer correctly falls to its degraded (entryIds === null) path.
+	 * `postCommitEntryIdByRef` maps post-commit `AgentMessage` objects to real `SessionEntry` IDs.
+	 * Consumers after `runPipeline` must use `postCommitEntryIdByRef`.
+	 * The pass-start `entryIdByRef` omits cloned dirty messages because it keys pre-commit objects.
+	 * `postCommitEntryIdByRef` contains no `pi-msg-*` fallback IDs; unresolved branches remain unmapped.
+	 * Consumers must use their degraded `entryIds === null` path when branch resolution leaves a message unmapped.
 	 */
 	postCommitEntryIdByRef: ReadonlyMap<object, string>;
 }
@@ -4254,24 +3670,16 @@ function pendingPiMarkerCoveredByRenderedBoundary(
 	pending: PendingPiCompactionMarker,
 	injection: PiInjectionResult | null,
 ): boolean {
-	// Contention fallbacks must never authorize a native trim: the served
-	// bytes may lag the latest compartment snapshot.
+	// Contention-exhausted injections cannot authorize native trimming because served bytes can lag the latest compartment snapshot.
 	if (!injection || injection.contentionExhausted) return false;
-	// m[0] arm: the boundary rendered into the m[0] snapshot.
+	// The m[0] arm accepts the boundary rendered into the m[0] snapshot.
 	const boundary = injection.renderedBoundary;
 	if (pending.endMessageId === boundary.endMessageId) return true;
 	if (boundary.ordinal !== null && pending.ordinal <= boundary.ordinal)
 		return true;
-	// m[1] arm (liveness fix): fresh publications render their compartment
-	// into the m[1] delta, not m[0] (which folds only on a HARD bust), so the
-	// m[0] snapshot boundary stays behind the pending marker until an
-	// unrelated HARD fold — starving the drain for hours in stable sessions.
-	// Accept coverage from a compartment actually rendered into m[1] THIS
-	// pass. The field is non-null only when m[1] was freshly recomputed this
-	// pass without a contention fallback (null on cached/sibling replay, where
-	// contentionExhausted alone would miss the sibling-fallback's stale
-	// bytes), so this restores OpenCode's consuming-pass drain parity without
-	// ever trimming getBranch() beyond content the model was shown this pass.
+	// Fresh publications render their compartment into m[1], so m[1] coverage permits pending markers to drain without a HARD bust.
+	// `m[1]` coverage requires a compartment freshly rendered during the pass.
+	// `m1RenderedCoverage` is null for cached or sibling replays.
 	const m1Coverage = injection.m1RenderedCoverage;
 	if (!m1Coverage) return false;
 	if (pending.endMessageId === m1Coverage.endMessageId) return true;
@@ -4389,12 +3797,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const deferredHistoryWasPendingAtPassStart =
 		deferredHistoryRefreshSessions.has(args.sessionId);
 
-	// 0. Inject temporal `<!-- +Xm -->` markers into user messages
-	// BEFORE tagging so the §N§ tag prefix wraps around our marker on
-	// re-tagging. Idempotent: existing markers are detected by regex
-	// and skipped. Same invariants as OpenCode's `injectTemporalMarkers`
-	// at transform.ts:648 — runs on every pass, deterministic from
-	// timestamps, retroactive when the flag flips.
 	if (args.temporalAwareness) {
 		const tTemporal = performance.now();
 		try {
@@ -4414,11 +3816,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		logTransformTiming(args.sessionId, "injectTemporalMarkers", tTemporal);
 	}
 
-	// Pass entryIds so the transcript tags each message under its real SessionEntry
-	// id (position-independent) instead of the index-based pi-msg-* id that drifts
-	// when the visible array shifts (compaction trim / custom_message inserts),
-	// orphaning tags/source_contents/caveman/drop-state. Positional entryIds is
-	// exactly aligned here: tagging runs at transcript-build time, before any splice.
 	const tTranscriptBuild = performance.now();
 	const transcript = createPiTranscript(
 		args.messages,
@@ -4426,19 +3823,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.entryIds,
 	);
 	logTransformTiming(args.sessionId, "transcriptBuild", tTranscriptBuild);
-	// Reasoning clearing/replay mutate `part.thinking` in place. They MUST target
-	// the transcript's `working` array (the channel commit() flushes), not the
-	// original `args.messages`: tagging/drops/caveman reassign working[idx] to
-	// fresh objects, so a reasoning mutation written to args.messages[idx] (a
-	// now-divergent object) would be discarded when commit() does
-	// source[idx] = working[idx], leaving the cleared-reasoning watermark ahead
-	// of the actual wire bytes → defer-pass replay divergence → cache bust.
 	const workingMessages = transcript.getWorkingMessages();
-	// Stable-id resolver for the reasoning/placeholder paths. MUST match the id the
-	// transcript assigned each message (so reasoning's messageIdToMaxTag lookup
-	// hits). Reasoning runs on `workingMessages` where tagging may have cloned
-	// working[i] → entryIdByRef misses those, so positional args.entryIds is the
-	// mandatory fallback (same precedence resolvePiStableId enforces).
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		resolvePiStableId(
 			msg,
@@ -4459,24 +3844,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const alreadyRanHeuristicsThisTurn =
 		currentTurnId !== null &&
 		lastHeuristicsTurnIdBySession.get(args.sessionId) === currentTurnId;
-	// Pi's primary process always registers ctx_reduce. Hidden/no-session child
-	// processes do not use this context handler; if a future path marks a session
-	// as subagent here, suppress visible tags and nudges so the prompt never points
-	// at a missing session-scoped tool.
 	const ctxReduceCallable = !args.sessionMeta.isSubagent;
-	// Mid-turn-aware gate for consuming DEFERRED publication signals — mirrors
-	// OpenCode's canConsumeDeferredOnThisPass. `args.schedulerDecision` is ALREADY
-	// the mid-turn-adjusted decision (applyMidTurnDeferral downgrades execute→defer
-	// mid-turn), so a deferred-publication signal that lands mid-turn is NOT
-	// consumed here — it waits for the next non-mid-turn execute/force pass. This
-	// breaks the previous inverted dependency where shouldRunHeuristics read the
-	// RAW deferredMaterializationSessions.has() (no mid-turn gate) and then
-	// canConsumeDeferredLate was derived FROM shouldRunHeuristics — so Pi ran
-	// heuristics + drained the native compaction marker mid-turn where OpenCode
-	// stays deferred (busting the Anthropic prompt cache while a multi-step turn
-	// was still accumulating tool calls). (OpenCode also consumes on
-	// justAwaitedPublication, but Pi's historian is detached and signals via the
-	// deferred sets post-publish, so there's no inline await to special-case.)
 	const canConsumeDeferredLate =
 		args.schedulerDecision === "execute" ||
 		args.forceMaterialization === true ||
@@ -4484,23 +3852,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const deferredMaterializeEligible =
 		canConsumeDeferredLate &&
 		deferredMaterializationSessions.has(args.sessionId);
-	// A HARD decision alone is not a cache bust. Execute it against a shadow
-	// message array first, then let pending drops, heuristics, and reasoning cleanup
-	// ride the bust only when m[0] actually materialized. Contention or any other
-	// suppressed attempt keeps defer replay immutable; the wire injection below
-	// still performs its own late decision for races after this preflight.
 	const piHardSignals = args.injection
 		? (() => {
-				// HARD-bust signals (parity with OpenCode). systemHash + TTL idle
-				// derive from freshly-read session_meta; modelKey from the volatile live
 				// map.
 				const hardMeta = args.sessionMeta;
 				let piTtlMs = 5 * 60 * 1000;
 				try {
 					piTtlMs = parseCacheTtl(hardMeta.cacheTtl);
-				} catch {
-					// invalid cache_ttl → 5m default (parity with execute-status)
-				}
+				} catch {}
 				return {
 					systemHash:
 						typeof hardMeta.systemPromptHash === "string"
@@ -4516,9 +3875,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				};
 			})()
 		: undefined;
-	// Build the fold state once and reuse it for both the preflight and the wire
-	// injection. Omitting a render-affecting field from only one of those calls can
-	// manufacture a HARD signal that the real injection immediately disproves.
 	const piM0State =
 		args.injection && piHardSignals
 			? {
@@ -4549,9 +3905,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
 	if (foldDueDecision.value && piM0State) {
 		try {
-			// Persist the fold before opening mutation gates. The shadow array keeps
-			// this pre-execution off the outgoing wire; the normal injection below
-			// replays the persisted pair into the real message array.
 			preFoldInjectionResult = injectM0M1PiForRun(
 				piM0State,
 				args.db,
@@ -4597,41 +3950,20 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 	const historianRunning = inFlightHistorian.has(args.sessionId);
-	// A normal execute/deferred drain waits while the historian reads its raw
-	// snapshot. Only a fold that was persisted successfully may bypass the veto;
-	// an advisory mismatch or contention fallback cannot authorize mutations.
 	const bypassHistorianGate =
 		args.forceMaterialization === true || foldExecutedThisPass;
 	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
-	// Pi sessions are primary-equivalent today. If Pi adds subagents on this
-	// transform path, subagents should bypass this once-per-turn guard like
-	// OpenCode does, because they do not share the primary agent's turn cache.
 	const shouldRunHeuristics =
 		args.heuristics !== undefined &&
 		(!historianRunning || bypassHistorianGate) &&
 		(args.forceMaterialization === true ||
 			hasPendingMaterializeSignal ||
 			deferredMaterializeEligible ||
-			// A fold persisted earlier in this pass already busted the prefix, so
-			// reductions may ride it without causing an independent bust.
 			foldExecutedThisPass ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 
-	// 1. Tagging: assigns tag numbers + injects §N§ prefixes when ctx_reduce
-	// is callable. DB-side tag IDs still get created when prefixes are skipped
-	// so queued drops and automatic cleanup continue to work.
 	//
-	// Pi-only fallback-tag adoption: the newest (in-flight) message is tagged
-	// under an unstable pi-msg-* fallback id on the pass it is newest (its real
-	// SessionEntry id isn't resolvable yet), then resolves to its real id one
-	// pass later. Build a raw-message fingerprint map (BEFORE tagging mutates
-	// text) and migrate any fallback-id tag onto the real id up front, so the
-	// message keeps its tag_number/§N§ instead of getting a fresh tag. No-op for
-	// OpenCode (this path is Pi-only) and for messages already on a real id.
 	const tFallbackIdentity = performance.now();
-	// This indexed preflight avoids rebuilding fingerprints for every old message.
-	// A negative result is rechecked by adoption after this map is complete, while
-	// tool-owner adoption performs its only existence probe at that later point.
 	const hasFallbackMessageTags = hasPiFallbackMessageTags(
 		args.db,
 		args.sessionId,
@@ -4640,8 +3972,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.messages as PiAgentMessage[],
 		stableIdResolver,
 		args.reusableMessageIds,
-		// Existing fallback rows may match any old real-id message. Once the
-		// indexed gate is empty, only the newly observed tail needs fingerprints.
 		hasFallbackMessageTags,
 	);
 	adoptPiFallbackTags(
@@ -4705,15 +4035,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
 
-	// 1b. Note-nudge `commit_detected` trigger. Mirrors OpenCode's logic
-	// in `tag-messages.ts` + `transform.ts:677-690`: only fire on the
-	// RISING edge (this pass saw a commit, previous pass did not, and a
-	// previous pass actually ran). First-pass detection silently sets
-	// the baseline so a fresh restart over an old session that already
-	// committed doesn't surface a stale trigger.
 	//
-	// Subagents never deliver note nudges (gated in postprocess), so
-	// skip accumulating orphan trigger state.
 	try {
 		if (!args.sessionMeta.isSubagent) {
 			const hasRecentCommit = detectRecentCommit(args.messages);
@@ -4725,38 +4047,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			commitSeenLastPass.set(args.sessionId, hasRecentCommit);
 		}
 	} catch (err) {
-		// commit-detect is opportunistic; failure should not break the
-		// pipeline. Log and continue.
+		// Commit detection is best-effort; failures must not interrupt the pipeline.
+		// On commit-detection failure, the pipeline logs the error and continues.
 		sessionLog(
 			args.sessionId,
 			`commit-detect failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 		);
 	}
 
-	// 2. Apply queued drops from pending_ops. Gated on scheduler decision
-	// because materialization mutates tag content, busting provider cache.
-	// Mirrors OpenCode's transform-postprocess-phase.ts:184-186 gating:
-	// run on execute, force, OR when /ctx-flush has set
-	// pendingMaterializationSessions for this session. Hash-change
-	// detection in `before_agent_start` also signals this set so a
-	// real prompt-content change forces materialization on the same
-	// turn the cache already busts.
-	// Normal drains wait while this session's historian is in flight. Force
-	// materialization and successfully executed m[0] folds may bypass that veto.
+	// Queued-drop materialization is gated because it mutates tag content and busts the provider cache.
+	// Scheduler decisions gate ordinary queued-drop materialization; explicit flushes and forced materialization can also apply pending operations.
 	//
-	// PEEK-then-drain-on-success pattern (Oracle audit Round 8 #6):
-	// the signal is only deleted AFTER applyPendingOperations succeeds.
-	// If the call throws, the flag survives so the next pass retries.
+	// `pendingMaterializationSessions` removes the session only after `applyPendingOperations` succeeds.
+	// If `applyPendingOperations` throws, `pendingMaterializationSessions` retains the session for the next pass.
 	//
-	// Drops in the protected window are deferred (re-queued) so the
-	// agent's recent working context stays intact.
+	// Protected-window drops are re-queued to preserve the agent's recent working context.
 	const deferredMaterializationWasPending = deferredMaterializationSessions.has(
 		args.sessionId,
 	);
 	const deferredHistoryRefreshWasPending = deferredHistoryWasPendingAtPassStart;
-	// Defer passes replay persisted tag statuses below; they never apply newly
-	// queued operations. Avoid reading pending_ops unless this pass can consume
-	// them, matching OpenCode's cache-stable per-pass gate.
+	// Defer passes replay persisted tag statuses without applying newly queued operations.
 	const shouldReadPendingOps =
 		!args.compactionOff &&
 		(args.schedulerDecision === "execute" ||
@@ -4777,27 +4087,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					RECENT_TOOL_SKELETON_WINDOW,
 				)
 			: [];
-	// The deferred-execute flag is drain-on-success ONLY — it must NOT appear
-	// here. OpenCode never gates work on the flag (peekDeferredExecutePending is
-	// read solely by the drain in transform-postprocess-phase.ts); the idempotent
-	// scheduler re-returns "execute" on the next non-mid-turn pass (pressure ≥
-	// threshold or TTL elapsed) and THAT drives the deferred execute. Including
-	// the flag here made Pi apply pending ops on a defer pass purely because the
-	// flag existed — a cache-busting half-execute (ops without heuristics) on a
-	// pass OpenCode keeps byte-stable. The flag is drained below on the next pass
-	// that genuinely executes.
+	// `deferredMaterialize` must not gate base pending-operation application.
+	// The scheduler drives deferred execution only on a non-mid-turn pass that returns `"execute"`.
+	// Deferred materialization is consumed only when the scheduler returns `"execute"` on a non-mid-turn pass.
 	const baseShouldApplyPendingOps =
 		args.schedulerDecision === "execute" ||
 		args.forceMaterialization ||
 		hasPendingMaterializeSignal ||
 		foldExecutedThisPass;
-	// `canConsumeDeferredLate` is computed ONCE, earlier (above shouldRunHeuristics),
-	// as a mid-turn-aware gate independent of shouldRunHeuristics — mirroring
-	// OpenCode's canConsumeDeferredOnThisPass. It must NOT be re-derived from
-	// shouldRunHeuristics here (the old inverted dependency that let deferred
-	// publication drain mid-turn). Explicit flush (hasPendingMaterializeSignal)
-	// still forces application via baseShouldApplyPendingOps, exactly as OpenCode
-	// keeps isExplicitFlush separate from the deferred-consumption gate.
+	// `canConsumeDeferredLate` must remain independent of `shouldRunHeuristics` to prevent mid-turn deferred drains.
 	const deferredMaterialize =
 		canConsumeDeferredLate && deferredMaterializationWasPending;
 	const deferredHistoryRefresh =
@@ -4846,10 +4144,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				tApplyPending,
 			);
 			executedWorkThisPass = true;
-			// materializationSatisfiedThisPass enables the deferred-HISTORY drain
-			// below. OpenCode drains deferred-history on history-consumption alone
-			// (not heuristics success), so setting this right after pending-ops
-			// success matches OpenCode for the history drain.
+			// A successful pending-operation application sets `materializationSatisfiedThisPass` so deferred history can drain without heuristic success.
 			materializationSatisfiedThisPass = true;
 			pendingOpsAppliedThisPass = true;
 			if (hasPendingMaterializeSignal) {
@@ -4857,14 +4152,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					consumePendingMaterialization(args.sessionId);
 				}
 			}
-			// NOTE: do NOT consume deferredMaterialization here. OpenCode only
-			// marks deferredMaterializedSuccessfully AFTER the heuristics phase
-			// also completes (its pending-ops + heuristics share one try block, and
-			// the success flag is set at the end). If heuristics throws, OpenCode
-			// leaves deferred-materialization UNdrained so the next pass retries the
-			// full publication-driven materialization + heuristics. Pi's heuristics
-			// run in a separate try below, so we defer this consume to after that
-			// block, gated on heuristics success (or heuristics being disabled).
+			// `deferredMaterialization` remains pending until heuristics succeeds or is disabled.
+			// `deferredMaterializedSuccessfully` is set only after heuristics succeeds or is disabled.
+			// If heuristics throws, deferred materialization remains pending for the next pass.
+			// If heuristics throws, OpenCode leaves deferred materialization undrained so the next pass retries publication-driven materialization and heuristics.
+			// `Pi` consumes deferred materialization only after its separate heuristics try succeeds or heuristics is disabled.
 		} catch (err) {
 			sessionLog(
 				args.sessionId,
@@ -4879,15 +4171,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
-	// 3. Apply persistent dropped/truncated tag statuses so cross-pass
-	// drops survive. Always runs, regardless of scheduler decision —
-	// this is the cache-stable replay of mutations persisted on prior
-	// execute passes. Mirrors OpenCode's `applyFlushedStatuses` call
+	// Status replay reapplies persisted dropped and truncated tag statuses so drops survive across passes.
+	// Status replay always runs regardless of scheduler decision so persisted drops survive across passes.
 	// at transform.ts:728.
 	//
-	// Status replay only acts on dropped targets. Filter by both status and
-	// visible tag number in SQLite so active rows are not materialized merely to
-	// be discarded by applyFlushedStatuses.
+	// Status replay filters SQLite rows by dropped status and visible tag number so active rows are not materialized.
+	// SQLite filters by status and visible tag number so status replay does not materialize active rows.
 	const targetTagNumbers = [...targets.keys()];
 	const tGetTags = performance.now();
 	const flushedDroppedTags = getDroppedTagsByNumbers(
@@ -4911,14 +4200,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	logTransformTiming(args.sessionId, "applyFlushedStatuses", tFlushed);
 	logTransformTiming(args.sessionId, "batchFinalize:flushed", tFlushed);
 
-	// 3b. Reasoning replay (cache-stable, runs on EVERY pass).
-	// Re-applies typed-reasoning [cleared] markers and inline
-	// <thinking> stripping for messages whose tag is below the
-	// persisted watermark. Pi rebuilds AgentMessage[] from the JSONL
-	// on every context event, so without replay the original
-	// thinking content would re-appear on defer passes and bust
-	// provider prompt cache. Mirrors OpenCode's
-	// `replayClearedReasoning` + `replayStrippedInlineThinking`
+	// Reasoning replay reapplies `[cleared]` markers and strips inline `<thinking>` from messages below the persisted watermark.
+	// Reasoning replay is required on every context event so original thinking content does not reappear.
+	// `Pi` replays reasoning so original thinking content does not reappear on defer passes.
 	// in transform-postprocess-phase.ts.
 	const messageIdToMaxTag = buildMessageIdToMaxTag(targets);
 	if (args.reasoningClearing) {
@@ -4963,24 +4247,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
-	// 3c. Caveman compression replay (cache-stable, runs on EVERY pass).
-	// applyPiHeuristicCleanup persists per-tag caveman_depth on execute
-	// passes, but the actual compressed text only lives in memory; on
-	// the next defer pass the AgentMessage[] is rebuilt fresh from the
-	// JSONL and arrives uncompressed. Without replay, every defer pass
-	// after a caveman pass would bust the provider cache prefix because
-	// the compressed text vanishes and reverts to the original.
+	// On execute passes, `applyPiHeuristicCleanup` persists per-tag `caveman_depth`, but compressed text exists only in memory.
+	// Caveman compression replays on every context event because compressed text exists only in memory.
+	// The next defer pass rebuilds `AgentMessage[]` from JSONL with uncompressed text.
+	// Without replay, defer passes after caveman compression bust the provider cache prefix.
+	// Without replay, the next defer pass replaces compressed text with the original JSONL text.
 	//
-	// Mirrors OpenCode's `replayCavemanCompression` call in
-	// transform.ts:793. Idempotent — `cavemanCompress(originalText, level)`
-	// is deterministic, so replay produces the exact text the original
-	// execute pass produced, regardless of how many times it runs.
 	if (args.heuristics?.caveman?.enabled && !args.isSubagent) {
 		const tCavemanReplay = performance.now();
 		try {
-			// P0 perf: caveman replay only acts on tags whose tag_number is in
-			// `targets`, so fetch just that slice instead of the whole session
-			// (~50k rows on long sessions).
 			const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
 			const replayed = replayCavemanCompression(
 				args.sessionId,
@@ -5003,30 +4278,19 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		logTransformTiming(args.sessionId, "cavemanReplay", tCavemanReplay);
 	}
 
-	// 3d. Cleanup stages NOT applicable to Pi (intentionally omitted):
 	//
-	// - stripStructuralNoise: removes OpenCode AI-SDK-specific part
-	//   types (step-start, step-finish, meta, reasoning shells). Pi's
-	//   AgentMessage shape doesn't have these — only text, toolCall,
-	//   toolResult, thinking, image — so there's nothing to strip.
+	// `stripStructuralNoise` has no Pi-specific parts to remove.
 	//
-	// - stripReasoningFromMergedAssistants: handles a quirk of the
-	//   Vercel AI SDK where two consecutive assistant messages with
-	//   reasoning parts get merged before send. Pi's send path doesn't
-	//   merge messages this way, so the workaround isn't needed.
+	// Pi does not need `stripReasoningFromMergedAssistants` because its send path does not merge consecutive assistant messages.
 	//
 
-	// 4. Heuristic cleanup — drops aged tools, dedups, strips system
-	// injections, age-tier caveman compression. Gated on scheduler
-	// decision because mutations bust provider cache; persisted to DB
-	// so subsequent defer passes replay via applyFlushedStatuses.
-	// Mirrors OpenCode's `applyHeuristicCleanup` call in
+	// Heuristic mutations bust the provider cache, so the scheduler gates cleanup.
+	// Persisted heuristic mutations let defer passes replay them.
 	// transform-postprocess-phase.ts.
 	let heuristicsExecuted = false;
 	let heuristicsResult: PiHeuristicCleanupResult | null = null;
 	const tActiveTags = performance.now();
-	// Pending ops have already materialized above; reread active tags so the
-	// emergency-drop floor excludes tags reclaimed earlier in this same pass.
+	// The active-tag reread excludes tags reclaimed in this pass from the emergency-drop floor.
 	const activeTags = getActiveTagsBySession(args.db, args.sessionId);
 	logTransformTiming(
 		args.sessionId,
@@ -5060,9 +4324,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				{
 					protectedTags: args.protectedTags,
 					staleReduceStripEnabled: args.canUseEmptySentinels,
-					// Tiered emergency drop fires only at the derived force band AND when the
-					// ceiling is known. forceMaterialization already incorporates
-					// the derived force-band / emergency condition for Pi (primary-equivalent).
 					emergency:
 						args.forceMaterialization === true &&
 						args.emergencyCeilingTokens !== undefined &&
@@ -5113,17 +4374,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
-	// Consume deferred-materialization ONLY after the full pass (pending ops +
-	// heuristics) succeeded — matching OpenCode, which sets
-	// deferredMaterializedSuccessfully after its shared pending-ops+heuristics
-	// try block completes. If heuristics was SUPPOSED to run this pass
-	// (shouldRunHeuristics) but threw (heuristicsExecuted stays false), we leave
-	// the signal armed so the next pass retries the publication-driven
-	// materialization + heuristics. When heuristics weren't scheduled this pass
-	// (!shouldRunHeuristics — e.g. heuristics disabled), pending-ops success is
-	// sufficient. Whenever deferredMaterialize is true, shouldRunHeuristics is
-	// also true (deferredMaterializeEligible feeds it), so the common path waits
-	// on heuristics exactly like OpenCode.
+	// Deferred materialization is consumed only after pending operations and heuristics succeed.
+	// A cleanup failure leaves deferred materialization armed for the next pass.
+	// `pendingOpsAppliedThisPass` satisfies deferred materialization when `args.heuristics === undefined`.
 	if (deferredMaterialize && pendingOpsAppliedThisPass) {
 		const fullPassSucceeded = shouldRunHeuristics ? heuristicsExecuted : true;
 		if (fullPassSucceeded) {
@@ -5133,23 +4386,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
-	// 4b. Reasoning clearing on EXECUTE passes only (cache-busting).
-	// Walks Pi assistant messages whose tag number is older than
-	// `clearReasoningAge` from the newest tag and replaces typed
-	// PiThinkingContent.thinking with `[cleared]`. Persists the
-	// max-tag-cleared watermark so subsequent defer passes replay
-	// the same set via the cache-stable replay above. Mirrors
-	// OpenCode's `clearOldReasoning` (strip-content.ts) gated to
-	// execute passes via the same scheduler decision used for
+	// The cleanup persists the maximum cleared tag so replay uses the same cleared range.
 	// heuristic cleanup.
-	// Gate reasoning clearing on the SAME signal as heuristic drops
-	// (shouldRunHeuristics), not the narrower execute||forceMaterialization.
-	// OpenCode runs clearOldReasoning inside its shouldRunHeuristics block, so
-	// the reasoning-watermark advance rides the exact same cache-busting passes
-	// as the tool drops. The old gate skipped reasoning on pending/deferred-
-	// materialization passes where heuristics DO run — leaving reasoning on the
-	// wire on a pass that already dropped tools (inconsistent + a missed
-	// same-pass mutation). shouldRunHeuristics is the broader, correct set.
+	// `shouldRunHeuristics` gates reasoning clearing so reasoning cleanup and tool drops share cache-busting passes.
 	if (args.reasoningClearing && shouldRunHeuristics) {
 		const rollbackReasoning = captureReasoningMutationRollback(workingMessages);
 		try {
@@ -5195,9 +4434,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				executedWorkThisPass = true;
 			}
 		} catch (err) {
-			// Never ship cleared reasoning unless replay state persisted. Restoring the
-			// pre-cleanup parts keeps this pass byte-stable and lets the next execute
-			// pass retry the watermark write.
+			// A reasoning-cleanup failure restores reasoning mutations before logging the error.
+			// The next cleanup pass retries the watermark write.
 			rollbackReasoning();
 			sessionLog(
 				args.sessionId,
@@ -5227,11 +4465,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			watermark: reclaimMeta.toolReclaimWatermark ?? 0,
 			pendingOps,
 		});
-		// Smart-drops: also reclaim older todowrite/ctx_reduce/meta outputs that
-		// a later call supersedes, and compress superseded edits to an
-		// edit_marker (keep filePath + region hint). Merged into the same
-		// already-gated drop apply as the age-based sweep above. Dedupe (a tag
-		// can qualify under more than one rule).
+		// Smart-drops run only during the age-based sweep.
+		// Multiple rules can select the same tag; deduplication prevents duplicate selection.
 		const editMarkerTagIds = new Set<number>();
 		if (args.smartDrops) {
 			const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
@@ -5254,8 +4489,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				pendingOps,
 			});
 			for (const op of editReclaim.ops) {
-				// Drop wins over compress: only compress an edit no earlier rule
-				// already selected for a full/skeleton drop.
+				// Drop wins over compression: only compress edits no earlier rule selected for a full or skeleton drop.
 				if (!selectedIds.has(op.tagId)) {
 					syntheticPendingOps.push(op);
 					selectedIds.add(op.tagId);
@@ -5282,10 +4516,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 	}
 
-	// 4c. Processed-image replay/detection. Pi carries base64 image data in
-	// user and tool-result parts. Frozen ids replay on every Anthropic pass;
-	// newly aged ids are detected only while this pass is already busting and
-	// are persisted before their bytes are replaced with empty text sentinels.
+	// Pi stores base64 image data in user and tool-result parts.
+	// Anthropic passes replay frozen IDs.
+	// `isCacheBusting`, `shouldApplyPendingOps`, or `shouldRunHeuristics` triggers newly aged-ID detection.
 	if (args.canUseEmptySentinels) {
 		const tProcessedImages = performance.now();
 		try {
@@ -5317,11 +4550,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
-	// 5. Commit tagging mutations back to Pi messages BEFORE injecting
-	// the history block. Otherwise the injection write target is the
-	// pre-tagged content. Pi's transcript adapter writes mutations
-	// back to the underlying AgentMessage[] via the part proxies, so
-	// commit() just locks the result in.
+	// History injection writes to tagged content only after `transcript.commit()`.
+	// Pi's transcript adapter propagates part-proxy mutations to the underlying AgentMessage[] objects.
 	const tTranscriptCommit = performance.now();
 	transcript.commit();
 	logTransformTiming(args.sessionId, "transcriptCommit", tTranscriptCommit);
@@ -5335,27 +4565,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
-	// Two post-commit stable-id maps, both keyed by AgentMessage object identity.
-	// Built AFTER commit() — commit reassigns args.messages[idx] = working[idx]
-	// (cloned objects for dirty messages), so a map built BEFORE the pipeline (the
-	// pass-start `entryIdByRef`) keys the PRE-commit objects and misses every
-	// cloned message. Built BEFORE injectM0M1Pi — injection splices/unshifts the
-	// array, after which positional entryIds[index] is stale; object identity
-	// survives both the clone and the splice, so a ref-keyed map resolves correctly
-	// for consumers that run AFTER the pipeline mutates the array. There is NO
-	// structural splice between pass start and here (only commit's in-place
-	// reassignment), so positional entryIds[i] is still authoritative at build time.
+	// `commit()` replaces dirty message objects with clones, so map construction follows it.
+	// `injectM0M1Pi` splices the message array after map construction.
+	// Injection splices the message array, so positional entryIds[index] becomes stale.
+	// `commit()` replaces dirty message objects with clones, so the ref-keyed map uses cloned-message identities that remain valid after injection splices the array.
 	//
-	// Two maps because the consumers have DIFFERENT identity contracts:
-	//   1. postCommitStableIdByRef (FULL fallback via resolvePiStableId, incl.
-	//      pi-msg-* index ids) — for stripPiDroppedPlaceholderMessages, which needs
-	//      a stable id for EVERY message (skip-on-miss + legacy path).
-	//   2. postCommitEntryIdByRef (REAL SessionEntry ids ONLY, no pi-msg-* fallback)
-	//      — for sticky reminder / note nudges / auto-search. These must fall to
-	//      their degraded path (entryIds === null) when branch resolution failed;
-	//      a pi-msg-* fallback id would defeat that and anchor to an unstable id.
-	// The only legitimate misses are injection's synthetic m[0]/m[1] prepends,
-	// which carry no SessionEntry id and must not be anchored.
+	// Use separate maps because placeholder stripping accepts fallback IDs, while reminders and auto-search require SessionEntry IDs.
+	// Use postCommitStableIdByRef for stripPiDroppedPlaceholderMessages because it resolves fallback pi-msg-* IDs.
+	// Use postCommitEntryIdByRef only for real SessionEntry IDs; do not fall back to pi-msg-* IDs.
+	// Sticky reminders, note nudges, and auto-search use entryIds === null when branch resolution fails.
+	// Do not use a pi-msg-* fallback ID after branch resolution fails; it would anchor these features to an unstable ID.
 	const tPostCommitStableIdMaps = performance.now();
 	const postCommitStableIdByRef = new Map<object, string>();
 	const postCommitEntryIdByRef = new Map<object, string>();
@@ -5369,8 +4588,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.entryIdByRef ?? undefined,
 		);
 		if (id) postCommitStableIdByRef.set(m as object, id);
-		// Real-only: positional entryIds[i] is a real SessionEntry id or undefined
-		// (never pi-msg-*). Authoritative here because nothing has spliced yet.
+		// Each positional `entryIds[i]` is a real `SessionEntry` ID or `undefined`.
 		const realId = args.entryIds?.[i];
 		if (typeof realId === "string" && realId.length > 0) {
 			postCommitEntryIdByRef.set(m as object, realId);
@@ -5382,38 +4600,19 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		tPostCommitStableIdMaps,
 	);
 
-	// 6. <session-history> injection — writes compartments, facts, and
-	// project memories into message[0]. This is the second-biggest
-	// reduction lever after heuristic cleanup: a session that's been
-	// summarized has its bulk history replaced by a compact compartment
-	// block. Mirrors OpenCode's prepareCompartmentInjection +
-	// renderCompartmentInjection pair (transform.ts:587-616 + ~960).
 	let injectionResult: PiInjectionResult | null = null;
 	if (args.injection) {
 		if (!piM0State)
 			throw new Error("memory injection requires hard-signal state");
 		try {
 			const tInjection = performance.now();
-			// NOTE: do NOT clear the m[0]/m[1] cache on a cache-busting pass. A new
-			// compartment is an m[1] DELTA (SOFT), not an m[0] re-materialization
-			// (HARD) — clearing forced mustMaterializePi to first_render and folded
-			// m[0] every history-refresh pass, defeating the whole m[0]/m[1] split.
-			// This matches OpenCode's rule that a new compartment sequence alone is not
-			// a HARD trigger. injectM0M1Pi now keeps cached m[0] and soft-refreshes m[1];
-			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
-			// re-materialize inside mustMaterializePi when genuinely needed.
+			// New compartments are soft m[1] deltas, so cache-busting passes retain cached m[0] unless mustMaterializePi detects a hard trigger.
 			const wireInjectionResult = injectM0M1PiForRun(
 				piM0State,
 				args.db,
 				args.messages as Parameters<typeof injectM0M1Pi>[2],
 				args.entryIds,
-				// recomputeM1ThisPass: recompute m[1] (vs byte-identical replay) on any
-				// cache-busting pass — history refresh (new compartment published),
-				// deferred history refresh, OR executed work (drops/heuristics). A
-				// history-refresh-only pass has executedWorkThisPass=false but MUST
-				// re-render m[1] so the new compartment surfaces; gating on work alone
-				// (the prior behavior, masked by the now-removed cache clear) would
-				// replay stale m[1]. Mirrors OpenCode's isCacheBustingPass gate.
+				// Recompute m[1] after cache-busting, deferred-history-refresh, or executed-work passes so newly published compartments are rendered.
 				args.isCacheBusting || deferredHistoryRefresh || executedWorkThisPass,
 			);
 			injectionResult = preFoldInjectionResult?.m0Materialized
@@ -5425,9 +4624,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					}
 				: wireInjectionResult;
 			// Temporal markers are derived before history injection trims raw messages.
-			// If that trim promotes a user message to the raw-history head, its marker
-			// was based on a predecessor that is no longer visible. Remove it now so the
-			// marker-applying pass matches the next pass, where trimming happens first.
+			// After trimming, remove a leading user's temporal marker if an omitted predecessor determined it; this matches the next pass.
 			if (
 				args.temporalAwareness &&
 				injectionResult.skippedVisibleMessages > 0
@@ -5436,13 +4633,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.messages[injectionResult.syntheticLeadingCount];
 				stripPiLeadingTemporalMarker(firstRetainedMessage);
 			}
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
-			// only drain `historyRefreshSessions` if the rebuild
-			// succeeded AND this pass was busting the cache. If
-			// injection throws, the flag survives so the next pass
-			// retries the rebuild. Deferred-history is NOT drained
-			// here; Pi-native compaction marker application happens at
-			// the end of runPipeline after materializing work succeeds.
+			// Delete `historyRefreshSessions` only after cache-busting injection succeeds.
 			if (args.isCacheBusting) {
 				historyRefreshSessions.delete(args.sessionId);
 				historyWasConsumedThisPass = true;
@@ -5469,23 +4660,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		db: args.db,
 		sessionId: args.sessionId,
 		messages: args.messages,
-		// Discovery is gated to history-refresh passes ONLY (args.isCacheBusting) —
-		// deliberately NARROWER than OpenCode's `shouldApplyPendingOps ||
-		// shouldRunHeuristics`. The two harnesses diverge in strip SEMANTICS:
-		// OpenCode NEUTRALIZES a placeholder-only message in place (replaces parts
-		// with an empty sentinel, message stays in the array), so discovering on a
-		// fresh-drop execute pass is harmless. Pi REMOVES (splices) the message.
-		// A freshly-dropped tool stub renders as `[dropped §N§]`, which
-		// isDroppedOnlyText matches — so discovering on the same execute pass that
-		// created it would splice out the just-dropped turn and collapse it. We
-		// therefore discover only at history-refresh boundaries (where the array is
-		// rebuilt anyway); a stub created on a drop-only execute pass is tiny and
-		// gets discovered on the next refresh pass. Replay still runs every pass.
+		// Pi splices the message during the fresh-drop execute pass.
 		isCacheBusting: args.isCacheBusting,
 		stableIdByRef: postCommitStableIdByRef,
-		// F4 cutover: when the stable-id scheme just changed, force rediscovery so
-		// previously-stripped placeholders get re-keyed under the new scheme this
-		// pass (discovery is otherwise gated on isCacheBusting = history-refresh).
 		forceDiscovery: args.stableIdSchemeCutover === true,
 	});
 	logTransformTiming(
@@ -5494,19 +4671,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		tDroppedPlaceholders,
 	);
 
-	// Drain predicate intentionally has two Pi-specific terms beyond OpenCode's
-	// `historyWasConsumedThisPass && deferredHistoryWasPendingAtPassStart &&
 	// !suppress`:
-	//   • `materializationSatisfiedThisPass` — Pi's m[0]/m[1] materialization is
-	//     a separate signal from history consumption; the deferred-history
-	//     one-shot must not drain until materialization actually landed this pass,
-	//     or the next pass would rebuild against a half-applied snapshot.
-	//   • `|| hasPendingMaterializeSignal` — Pi rebuilds a fresh AgentMessage[]
-	//     per `context` event (no persistent transform array), so a pending
-	//     materialize signal that arrived mid-pass is an equally valid drain
-	//     trigger as a pass-start-pending refresh.
-	// Net effect is signal-equivalent to OpenCode's model for the same
-	// scheduler/materialization input (Oracle Round 8 peek-then-drain).
 	const deferredHistoryDrainEligible =
 		historyWasConsumedThisPass &&
 		materializationSatisfiedThisPass &&
@@ -5687,35 +4852,17 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 }
 
 // ---------------------------------------------------------------------------
-// Nudge / note-nudge helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Note-nudge + Channel 1/2 helpers.
  *
- * The rolling/iteration nudge and the tool-heavy sticky reminder were removed
- * in the ctx_reduce nudge redesign — replaced by Channel 1 (in-turn tool-result
- * append via `pi.on("tool_result")`, see `ctx-reduce-nudge-pi.ts`) and Channel 2
- * (the hidden `sendMessage` ceiling). `appendReminderToUserMessageByIdPi` /
- * `appendReminderToPiUserMessage` below are retained — they back the note-nudge
- * and auto-search hint paths, which still inject into user messages.
  */
 /**
  * Apply note-nudge replay + delivery. Mirrors OpenCode's
  * `transform-postprocess-phase.ts` note-nudge pass.
  *
  * Two paths:
- *   1. Sticky replay: a previously-delivered nudge anchored to a user
- *      message id replays into that same message every pass (idempotent
- *      because `appendReminderToUserMessageById` checks for the exact
- *      reminder text before appending).
- *   2. Fresh delivery: when a note trigger has fired since the last
- *      delivery and the agent hasn't already read the note state,
- *      append a `<instruction name="deferred_notes">…` block to the
- *      latest user message and mark delivered.
  *
- * Both paths fail-open: if no eligible user message exists, the call
- * simply returns the messages unchanged.
  */
 function applyNoteNudges(args: {
 	sessionId: string;
@@ -5724,25 +4871,12 @@ function applyNoteNudges(args: {
 	projectIdentity: string;
 	entryIds: readonly (string | undefined)[] | null;
 	/**
-	 * Splice-safe message→entryId map keyed by AgentMessage reference. Resolved
-	 * against branch entries and correct even though `messages` was spliced since
-	 * `entryIds` (positional) was computed. Takes precedence over `entryIds`.
 	 */
 	entryIdByRef?: ReadonlyMap<object, string> | null;
 	/**
-	 * Whether THIS pass is cache-busting. Sticky-anchor pruning is storage-only
-	 * and must run ONLY on cache-busting passes (parity with OpenCode
-	 * transform-postprocess `args.fullFeatureMode && isCacheBustingPass`). On a
-	 * defer pass the persisted sticky state must not change, or future replay
-	 * bytes could shift and bust the prompt cache.
 	 */
 	isCacheBusting: boolean;
 	/**
-	 * Count of ALL id-less synthetic messages present in `messages` — the
-	 * m[0]/m[1] prepends plus the rolling-nudge synthetic if it fired this pass.
-	 * Excluded from the anchor-GC `allResolved` denominator (see below) since none
-	 * of them resolve to a real entry id. Position is irrelevant; only the count
-	 * matters for the denominator.
 	 */
 	syntheticLeadingCount?: number;
 }): PiAgentMessage[] {
@@ -5775,7 +4909,6 @@ function applyNoteNudges(args: {
 	}
 	for (const decision of getAutoSearchHintDecisions(db, sessionId)) {
 		if (decision.decision === "hint") {
-			// Anti-memory warnings never replay from stored hint text.
 			if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
 				continue;
 			}
@@ -5789,16 +4922,7 @@ function applyNoteNudges(args: {
 	}
 	logTransformTiming(sessionId, "stickyReplayDecisions", tStickyReplay);
 
-	// Path 2: fresh delivery. Use the latest user message id (or null if
-	// no user messages yet) as the trigger-message hint to peekNoteNudgeText.
 	//
-	// Visibility-aware suppression: peekNoteNudgeText suppresses the
-	// nudge when the agent already ran ctx_note(read) since the latest
-	// note activity AND that read is still visible in the current
-	// message context. Once the read has aged out / been dropped, we
-	// re-surface the nudge at the next work-boundary trigger so the
-	// agent regains visibility into deferred intentions. Mirrors
-	// OpenCode's transform-postprocess-phase.ts:647 wiring.
 	const latestUser = findLatestUserMessageIdPi(messages, messageIdByIndex);
 	const latestUserId = latestUser?.messageId ?? null;
 	const noteReadStillVisible = hasVisibleNoteReadCallPi(messages);
@@ -5845,23 +4969,14 @@ function applyNoteNudges(args: {
 		}
 	}
 
-	// Storage-only GC of stale sticky anchors — gated on cache-busting passes
-	// ONLY (parity with OpenCode). Pruning on a defer pass would mutate persisted
-	// sticky-injection state and could shift future replay bytes.
 	//
-	// The visible set MUST reflect the CURRENT (post-splice) messages, not the
-	// stale positional `entryIds`: pruning against pre-splice positions could
-	// drop an anchor whose message is still present (just shifted) and therefore
-	// erase a still-needed replay. We derive it from `messageIdByIndex`, which is
-	// reference-resolved against the current array. Only prune when every current
-	// message resolved to a real id (a partial map could miss a present message
-	// and wrongly prune its anchor).
+	// Derive the visible set from messageIdByIndex, which resolves references in the current messages array.
+	// Prune only when messageIdByIndex resolves every real message.
+	// A partial messageIdByIndex map can omit a present message and wrongly prune its anchor.
 	if (args.isCacheBusting) {
 		const visibleIds = new Set<string>(messageIdByIndex.values());
-		// "All REAL messages resolved" — exclude injection's synthetic id-less
-		// m[0]/m[1] prepends from the denominator (they never resolve to a real
-		// entry id). Without this, allResolved is permanently false on every
-		// injected pass and the prune never runs → unbounded anchor growth.
+		// Exclude synthetic leading messages from realMessageCount because they never resolve to entry IDs.
+		// Including synthetic messages in realMessageCount makes allResolved false on every injected pass.
 		const realMessageCount = Math.max(
 			0,
 			messages.length - (args.syntheticLeadingCount ?? 0),
@@ -5876,7 +4991,7 @@ function applyNoteNudges(args: {
 	return messages;
 }
 
-/** Returns true when the message is a user role with non-empty text content. */
+/* */
 function hasMeaningfulUserTextPi(message: PiAgentMessage): boolean {
 	if (message.role !== "user") return false;
 	const content = (message as { content: unknown }).content;
@@ -5898,25 +5013,15 @@ function hasMeaningfulUserTextPi(message: PiAgentMessage): boolean {
 type PiMessageIdByIndex = Map<number, string>;
 
 /**
- * Build an index→entryId map for the CURRENT `messages` array.
+ * Rebuild the index→entryId map after message mutations because strictEntryIds indexes the original event.messages array.
  *
- * # Why a per-call rebuild keyed by reference, not a frozen positional array
  *
- * `strictEntryIds` is a positional array resolved against the ORIGINAL
- * `event.messages` at pass start. `runPipeline` then structurally mutates the
- * array in place — compartment-boundary trim and `stripPiDroppedPlaceholderMessages`
- * both `splice()` messages out, shifting every later index. Any consumer that
- * runs AFTER those splices (sticky reminders, note nudges, auto-search hints)
- * must NOT index the stale positional `strictEntryIds[]` against the shifted
- * array — index N no longer points at the same message, so anchors would resolve
- * to the wrong SessionEntry id and replay/prune on the wrong message (the Pi
- * analogue of the #81 positional-drift class).
+ * Compartment-boundary trimming and stripPiDroppedPlaceholderMessages splice messages in place, shifting later indexes.
+ * Consumers that run after splices must not index strictEntryIds against the mutated messages array.
+ * After a splice, strictEntryIds[index] can identify a different SessionEntry than messages[index], causing replay and pruning to target the wrong message.
  *
- * Reference identity survives splices (splicing changes positions, not object
- * identity). When `entryIdByRef` is supplied, each CURRENT message is resolved
- * through it by identity, so the map is correct regardless of how many splices
- * happened. The positional `entryIds` path is kept for pre-mutation callers
- * (those that legitimately align to the original `event.messages`).
+ * Splicing preserves message object identity.
+ * The reference map remains valid after splices.
  */
 function buildPiMessageIdByIndex(
 	messages: PiAgentMessage[],
@@ -5926,8 +5031,7 @@ function buildPiMessageIdByIndex(
 ): PiMessageIdByIndex {
 	const ids = new Map<number, string>();
 	for (let index = 0; index < messages.length; index += 1) {
-		// Reference-identity resolution takes precedence: correct even after the
-		// array was spliced since strictEntryIds was computed.
+		// Prefer `entryIdByRef` after splices because `strictEntryIds` retains pass-start indices.
 		if (entryIdByRef) {
 			const msg = messages[index];
 			const byRef =
@@ -5938,17 +5042,8 @@ function buildPiMessageIdByIndex(
 				ids.set(index, byRef);
 				continue;
 			}
-			// CRITICAL: when a ref-map is supplied, a MISS must NOT fall back to
-			// positional `entryIds[index]`. The ref-map is built against the
-			// CURRENT (post-commit/post-splice) array; `entryIds` is the stale
-			// pass-start positional array, so after a splice index N no longer
-			// points at the same message and the positional id would anchor the
-			// WRONG message. The only legitimate ref-map misses are injection's
-			// synthetic m[0]/m[1] prepends and commit-cloned messages with no real
-			// SessionEntry id — both must resolve to "unmapped" so the consumer
-			// degrades safely (replay-only / no fresh anchor) rather than mis-anchor.
-			// The own-`.id` fallback below IS splice-safe (reads the current
-			// object's own id, not a positional lookup) so it stays for replay
+			// With `entryIdByRef`, do not fall back to `entryIds[index]`: splices can misalign positional IDs.
+			// `messages[index].id` is splice-safe because it belongs to the current message object.
 			// callers (includeMessageIdFallback=true).
 			if (includeMessageIdFallback) {
 				const messageId = (messages[index] as { id?: unknown } | undefined)?.id;
@@ -5958,8 +5053,7 @@ function buildPiMessageIdByIndex(
 			}
 			continue;
 		}
-		// No ref-map (pre-mutation callers that legitimately align to the original
-		// event.messages): positional entryIds is authoritative.
+		// Without `entryIdByRef`, positional `entryIds` is authoritative only while `messages` retains its original order.
 		const entryId = entryIds?.[index];
 		if (typeof entryId === "string") {
 			ids.set(index, entryId);
@@ -5971,10 +5065,7 @@ function buildPiMessageIdByIndex(
 				ids.set(index, messageId);
 			}
 		}
-		// Fresh anchors deliberately do not use AgentMessage.id: Pi's context
-		// messages may carry transient wrapper ids that are not SessionEntry ids.
-		// Existing anchors may still replay through that fallback for backward
-		// compatibility when includeMessageIdFallback=true.
+		// Fresh anchors must not use `AgentMessage.id` because it is not a `SessionEntry` ID.
 	}
 	return ids;
 }
@@ -5995,9 +5086,7 @@ function findLatestUserMessageIdPi(
 }
 
 /**
- * Append `reminder` to the user message at `messageId`. Idempotent: skips if
- * the exact reminder text is already present. Mirrors
- * `appendReminderToUserMessageById` from OpenCode's
+ * Do not append `reminder` when the user content already includes it.
  * `transform-message-helpers.ts:54`.
  */
 function appendReminderToUserMessageByIdPi(
@@ -6017,20 +5106,13 @@ function appendReminderToUserMessageByIdPi(
 }
 
 /**
- * Append text to a user message, preserving its existing content shape:
- *   - `string`: direct concat (Pi accepts string user content).
- *   - array: append to the first text block, or push a new text block
- *     when the message is image-only.
  *
- * Idempotent — skips when the reminder is already present.
+ * The function appends only when the string content or first text block does not include `reminder`.
  */
 function appendReminderToPiUserMessage(
 	message: PiAgentMessage,
 	reminder: string,
 ): void {
-	// Only `user` messages carry a string-or-array content shape we can
-	// safely append to. Other roles (toolResult, custom, bashExecution)
-	// don't get nudge text.
 	if (message.role !== "user") return;
 	const userMsg = message as { content: unknown };
 
@@ -6060,8 +5142,7 @@ function appendReminderToPiUserMessage(
 			return;
 		}
 	}
-	// Image-only or empty array — push a new text block. Trim leading
-	// `\n\n` because there's nothing to separate from.
+	// The function trims leading whitespace because no text block precedes the new block.
 	contentArr.push({ type: "text", text: reminder.trimStart() });
 }
 
@@ -6074,41 +5155,12 @@ function clearPiCompactionOffInMemoryState(sessionId: string): void {
 }
 
 /**
- * Per-session cleanup. Pi has no `session_deleted` event, but it does
- * fire `session_before_switch` when the user switches to a different
- * session within the same Pi process, and `session_shutdown` when the
- * process exits. Both are valid moments to drain caches keyed by the
- * outgoing session id so we don't leak unbounded memory across many
- * session switches in a long-lived Pi process.
  *
- * Counterpart to OpenCode `session.deleted` cleanup in
- * `event-handler.ts:262-276`. We clean every per-session map this
  * module owns:
- *   - all 3 refresh signal sets (history / pendingMaterialization /
  *     systemPromptRefresh)
- *   - first-pass tracking
- *   - emergency-notification cooldown
- *   - auto-search per-turn cache
- *   - compressor cooldown timer
- *   - stable-message token totals
  *
- * NOT cleaned (intentional):
- *   - `inFlightHistorian` / `inFlightCompressor` — these promises
- *     own their own cleanup in `.finally()` and a session switch
- *     doesn't cancel a background subagent that's already running.
- *   - `pendingNoteNudgeState` — module-private to other files; they
- *     expose their own clear helpers called from where they live.
+ * Not cleaned:
  */
-// IMPORTANT: this clears only IN-MEMORY, process-local maps — it must NOT call
-// the durable DB `clearSession(db, sessionId)`. The two callers are
-// `session_shutdown` and `session_before_switch`, NEITHER of which means the
-// session was deleted — the session still exists on disk and may be resumed.
-// Pi has no `session_deleted` event (OpenCode's event-handler is the only place
-// the durable DB clearSession fires). Calling DB clearSession here would DESTROY
-// live durable state (compartments, tags, memories) for a session the user
-// merely switched away from — a data-loss bug far worse than the bounded
-// orphan-row cost for sessions that are genuinely abandoned and never resumed.
-// Do not add DB clearSession here.
 export function clearContextHandlerSession(sessionId: string): void {
 	invalidateTrueRawTokenCache({ sessionId, reason: "pi.branch.changed" });
 	activeContextHandlerSessions.delete(sessionId);

@@ -22,12 +22,7 @@ import {
     loadHistorySnapshot,
 } from "../scripts/validate-incident-history";
 
-// Each isolated child here pays a fresh TestHarness plus `opencode serve` cold
-// start, which the surrounding e2e-host job documents as able to exceed 120s —
-// so the runner's 120s library default would classify a correct case as
-// `deadline_exceeded`. Derive the child budget from the per-test budget instead
-// of restating a number: the child's own deadline must fire first so the runner
-// still produces a classified result rather than being killed by bun:test.
+// Keep the case timeout below bun:test's timeout so the runner classifies failures before bun:test terminates the child.
 const GREEN_TEST_TIMEOUT_MS = 300_000;
 const GREEN_CASE_TIMEOUT_MS = GREEN_TEST_TIMEOUT_MS - 60_000;
 
@@ -49,12 +44,6 @@ const RUST_GREEN_VARIANT_IDS = [
 const mode = process.env.MC_E2E_MODE === "rust" ? "rust" : "ts";
 const harness: Harness = mode === "rust" ? "rust" : "opencode";
 
-// Resolve the direct-host fixture in THIS process, which still has real Cargo
-// state, and publish the path for the environment allowlist to carry into each
-// case child. A child left to `buildDirectHostFixture()` would build against the
-// empty per-case CARGO_HOME the workspace relocation creates and fail offline.
-// The incident-pool CLI does the same for its own schedule; a fixture built by an
-// earlier test phase cannot reach this separate wrapper process any other way.
 if (mode === "rust" && !process.env.MC_E2E_DIRECT_HOST_FIXTURE_BIN) {
     const prereqs = detectRustPrerequisites({ allowBuild: true });
     if (prereqs.fixtureBin) {

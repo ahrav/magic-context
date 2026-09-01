@@ -150,19 +150,14 @@ function seedCurrentDatabase(dbPath: string): void {
 }
 
 function corruptLastTagLeaf(dbPath: string): void {
-    // Damage the CELL CONTENT of one leaf page of the `tags` b-tree while leaving the page
-    // header and cell pointer array intact, so `.recover` can still walk the tree and salvage
-    // the other pages. Three things this deliberately avoids, each of which made the fixture
-    // depend on the toolchain rather than on the code under test:
-    //   - `dbstat` to find the page: a compile-time option (SQLITE_ENABLE_DBSTAT_VTAB) that
-    //     some SQLite builds omit entirely.
-    //   - scanning the file for row text: picks a different page depending on how the build
-    //     packs cells, so a different page gets destroyed on each machine.
-    //   - zeroing the whole page: destroys the header too, and whether `.recover` can still
-    //     rebuild the tree after that varies by SQLite version — locally it salvaged, on CI
-    //     it gave up and the command correctly reported the database unsalvageable.
-    // Walking the documented on-disk format keeps page SELECTION deterministic, and damaging
-    // only the cell area keeps the RESULT deterministic.
+    // The fixture corrupts one leaf-page `tags` cell while preserving its header and cell pointer array.
+    // Preserving the header and cell pointer array lets `.recover` walk the tree and salvage cells.
+    // The fixture avoids three toolchain-dependent strategies:
+    // `dbstat` requires `SQLITE_ENABLE_DBSTAT_VTAB`, which some SQLite builds omit.
+    // Scanning row text can select different pages because SQLite builds pack cells differently.
+    // Zeroing the whole page destroys its header.
+    // Walking the documented format makes page selection deterministic.
+    // Damaging only the cell area makes recovery deterministic.
     const db = new Database(dbPath, { readonly: true });
     const { page_size: pageSize } = db.prepare("PRAGMA page_size").get() as { page_size: number };
     const { rootpage } = db
@@ -188,9 +183,8 @@ function corruptLastTagLeaf(dbPath: string): void {
         const headerAt = pageno === 1 ? 100 : 0;
         readSync(fd, buffer, 0, pageSize, (pageno - 1) * pageSize);
         if (buffer[headerAt] !== 0x0d) throw new Error("no tags leaf page found");
-        // Cell content begins at the offset in header bytes 5-6; everything from there to the
-        // end of the page is row data. Overwrite it and leave the 8-byte header plus the cell
-        // pointer array alone.
+        // Header bytes 5–6 store the cell-content-area offset.
+        // The cell-content area extends from its offset to the end of the page.
         const cellContentStart = buffer.readUInt16BE(headerAt + 5) || pageSize;
         const damage = Buffer.alloc(pageSize - cellContentStart, 0xff);
         writeSync(fd, damage, 0, damage.length, (pageno - 1) * pageSize + cellContentStart);
@@ -216,13 +210,11 @@ function integrity(dbPath: string): string[] {
     }
 }
 
-// The salvage test needs exactly what `runRepairDb` uses by default: a sqlite3
-// whose `.recover` works. `.recover` reads raw pages through the sqlite_dbpage
-// virtual table, a compile-time option (SQLITE_ENABLE_DBPAGE_VTAB) that distro
-// builds may omit, so probe the executable once at load time and skip the
-// salvage test when the capability is absent. The probe returns a verdict only
-// when sqlite3 gave an unambiguous answer; anything else throws and fails this
-// file loudly — a skip must never hide a broken probe.
+// `runRepairDb` requires a sqlite3 shell whose `.recover` supports `sqlite_dbpage`.
+// `.recover` requires `SQLITE_ENABLE_DBPAGE_VTAB` to read raw pages through `sqlite_dbpage`.
+// The probe reports unavailable only when `.recover` is unavailable.
+// The probe throws unless sqlite3 gives an unambiguous answer.
+// Anything else throws; a skip must never hide a broken probe.
 function probeRecoverCapability(sqliteExecutable: string): {
     available: boolean;
     reason: string;
@@ -250,8 +242,6 @@ function probeRecoverCapability(sqliteExecutable: string): {
 
 const salvageCapability = probeRecoverCapability(defaultSqliteExecutable());
 const salvageIt = salvageCapability.available ? it : it.skip;
-// The .recover-dependent test names live in consts so their salvageIt(...)
-// registrations fit the formatter's 100-column limit.
 const salvageTestName =
     "backs up and salvages readable rows from a genuinely corrupted SQLite page";
 const unsalvageableTestName =
@@ -263,10 +253,6 @@ afterEach(() => {
 
 describe("doctor repair-db", () => {
     if (!salvageCapability.available) {
-        // The salvage test below is registered as skipped; this test states why
-        // and proves the skip came from a deliberate probe verdict rather than a
-        // probe that merely guessed — a green suite that never ran the salvage
-        // path must at least show its reason.
         it(`salvage test skipped: ${salvageCapability.reason}`, () => {
             expect(salvageCapability.reason).toMatch(/SQLITE_ENABLE_DBPAGE_VTAB|could not start/);
         });
@@ -288,10 +274,6 @@ describe("doctor repair-db", () => {
             deps: { now: () => new Date("2026-08-11T12:34:56.789Z") },
         });
 
-        // Report WHY salvage failed rather than just the exit code. The command captures its
-        // reason in prompts.messages, and without surfacing it a failure here says only
-        // "expected 0, received 2" — which cost several CI round-trips diagnosing a fixture
-        // whose behaviour differed by SQLite version.
         expect({ code, why: prompts.messages.filter((m) => m.startsWith("error:")) }).toEqual({
             code: REPAIR_DB_EXIT.salvaged,
             why: [],
@@ -351,9 +333,6 @@ describe("doctor repair-db", () => {
         expect(output).toContain("Backup:");
     });
 
-    // Like the salvage test above, this test exercises a REAL `.recover` run
-    // (here: one that must fail on the data), so it needs a capability-bearing
-    // sqlite3 and is skipped the same way when the shell lacks it.
     salvageIt(unsalvageableTestName, async () => {
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");
@@ -459,25 +438,18 @@ describe("doctor repair-db", () => {
     it("does not offer destructive reset when sqlite3 lacks the capability .recover needs", async () => {
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");
-        // A real, populated database: on a full sqlite3 build it would be
-        // salvageable, which is precisely why the command must not declare it
-        // unsalvageable just because THIS shell lacks a feature.
+        // A database that `.recover` can salvage must not be reported as unsalvageable when the shell lacks the required feature.
         seedCurrentDatabase(dbPath);
         const originalDigest = digest(dbPath);
-        // Stand-in for a sqlite3 built without SQLITE_ENABLE_DBPAGE_VTAB: the
-        // shell starts, but `.recover` dies the moment it reaches for
-        // sqlite_dbpage — the exact stderr seen on the CI runner. Injected
-        // through the same sqliteExecutable seam as the could-not-start test;
-        // no real sqlite3 is invoked.
+        // The fake shell fails when `.recover` queries `sqlite_dbpage`, simulating sqlite3 without `SQLITE_ENABLE_DBPAGE_VTAB`.
+        // The fake shell invokes no real sqlite3.
         const stubSqlite = join(storageDir, "sqlite3-without-dbpage");
         writeFileSync(
             stubSqlite,
             "#!/bin/sh\necho 'sql error: no such table: sqlite_dbpage (1)' >&2\nexit 1\n",
             { mode: 0o755 },
         );
-        // confirmations=[true]: if the command DID offer the destructive reset,
-        // the mock would accept it and wipe the database — so a green test also
-        // proves no reset was ever offered.
+        // `MockPrompts([true])` accepts a destructive-reset confirmation.
         const prompts = new MockPrompts([true]);
 
         const code = await runRepairDb({
@@ -490,8 +462,6 @@ describe("doctor repair-db", () => {
             },
         });
 
-        // Self-describing: on failure this prints the exit code alongside every
-        // error message the command produced.
         expect({ code, why: prompts.messages.filter((m) => m.startsWith("error:")) }).toEqual({
             code: REPAIR_DB_EXIT.failed,
             why: [expect.stringContaining("no such table: sqlite_dbpage")],
@@ -501,11 +471,9 @@ describe("doctor repair-db", () => {
         const output = prompts.messages.join("\n");
         expect(output).not.toContain("confirm:");
         expect(output).toContain("Reset was not offered because salvage did not run");
-        // The message names the missing capability and what to do about it.
         expect(output).toContain("SQLITE_ENABLE_DBPAGE_VTAB");
         expect(output).toContain("Database remains unchanged");
         expect(output).toContain("Backup base:");
-        // The database bytes are untouched.
         expect(digest(dbPath)).toBe(originalDigest);
     });
 

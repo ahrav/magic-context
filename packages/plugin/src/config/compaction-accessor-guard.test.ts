@@ -3,32 +3,24 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 // isCompactionEnabled (config/agent-disable.ts) is the ONLY non-schema reader
-// of the `compaction.enabled` config path. Every gate site (pi-plugin, cli,
-// plugin boot, session hooks) must IMPORT it and never re-derive the value.
-// This guard asserts no other source file reads `compaction.enabled` or
-// `compaction?.enabled` directly. Precedent: the runMigrations import guard
+// Gate sites must use `isCompactionEnabled` rather than read `compaction.enabled` directly.
+// Reject direct `compaction.enabled` and `compaction?.enabled` reads outside `ALLOWED_READERS`.
 // (packages/cli/src/lib/migration-import-guard.test.ts).
 //
-// The schema file (config/schema/magic-context.ts) is the single producer of
-// the path and is excluded; the accessor file (config/agent-disable.ts) is the
-// single consumer and is excluded. The storage helpers read a DB column
-// (compaction_mode_record), not the config path, so they are not in scope.
+// `magic-context.ts` defines `compaction.enabled` and is excluded from this check.
 
 const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
 const SOURCE_ROOTS = ["packages/cli/src", "packages/plugin/src", "packages/pi-plugin/src"];
 
 const ALLOWED_READERS = new Set<string>([
-    // The accessor itself — the one permitted non-schema reader.
+    // `agent-disable.ts` is the permitted non-schema reader.
     "packages/plugin/src/config/agent-disable.ts",
-    // The Zod schema that defines the path.
+    // `magic-context.ts` defines `compaction.enabled`.
     "packages/plugin/src/config/schema/magic-context.ts",
-    // project-security.ts references the path NAME in a warning string when it
-    // strips the project-tier field; it never reads the parsed config path.
-    // The strip operates on a raw Record<string, unknown> by key name, not on
-    // a parsed MagicContextConfig.
+    // `project-security.ts` only names `compaction.enabled` in a warning while deleting a raw project-tier key.
     "packages/plugin/src/config/project-security.ts",
     // OMP's own setting key appears only as an external CLI string literal;
-    // these files never read Magic Context's parsed compaction config.
+    // `omp-helpers.ts`, `setup-omp.ts`, and `doctor-omp.ts` never read Magic Context's parsed compaction config.
     "packages/cli/src/lib/omp-helpers.ts",
     "packages/cli/src/commands/setup-omp.ts",
     "packages/cli/src/commands/doctor-omp.ts",
@@ -47,12 +39,10 @@ function sourceFiles(directory: string): string[] {
     return result;
 }
 
-// Conservatively matches the textual token `compaction.enabled` or
-// `compaction?.enabled`, including string literals. False positives are
-// allow-listed only after confirming they do not read Magic Context's parsed
+// `COMPACTION_ENABLED_READ` matches `compaction.enabled` and `compaction?.enabled`, including string literals.
+// False positives are allow-listed only when they do not read Magic Context's parsed config path.
 // config path.
-// It does NOT match the DB column `compaction_mode_record`, the accessor name
-// `isCompactionEnabled`, or the schema's own `.object({ enabled: ... })`.
+// `COMPACTION_ENABLED_READ` excludes `compaction_mode_record`, `isCompactionEnabled`, and schema `.object({ enabled: ... })`.
 const COMPACTION_ENABLED_READ = /\bcompaction\??\s*\.\s*enabled\b(?!_)/;
 
 describe("compaction.enabled accessor exclusivity (issue #266)", () => {

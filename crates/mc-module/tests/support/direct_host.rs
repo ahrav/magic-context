@@ -171,10 +171,7 @@ impl FixtureProcess {
         self.control_raw(format!("{}\n", json!({"id": id, "command": {"name": name}})).as_bytes())
     }
 
-    /// Best-effort graceful shutdown that reports failure instead of panicking.
-    /// `control_raw` panics loudly on purpose, which is right inside a test body
-    /// and fatal in `Drop`: a panic while unwinding a failed test aborts the
-    /// runner and hides the failure that started the unwind.
+    /// `control_raw` may panic in test bodies; a panic in `Drop` during unwinding aborts the runner and hides the original failure.
     fn try_graceful_shutdown(&self) -> std::io::Result<()> {
         let request = format!(
             "{}\n",
@@ -374,9 +371,6 @@ pub async fn request_json(client: &Client, route: RouteHandle, body: Value) -> V
     serde_json::from_slice(&response.body).expect("response JSON")
 }
 
-/// Poll `status` until the module reports an open store, and return that status.
-/// Connection publication proves the transport is ready, not that the store is
-/// open, so a terminal `store_unavailable` is a retry rather than a failure.
 pub async fn wait_for_store(client: &Client, route: RouteHandle, session: &str) -> Value {
     let deadline = Instant::now() + BUDGET;
     loop {

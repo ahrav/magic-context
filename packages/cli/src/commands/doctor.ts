@@ -1,13 +1,8 @@
 /**
- * Unified `doctor` command.
  *
- * Dispatches to the per-harness doctor based on `--harness` or auto-detection.
- * Supports `--force`, `--issue`, and `--clear` flags identically across both.
+ * `runDoctor` dispatches to the per-harness doctor selected by `--harness` or auto-detection.
  *
- * `--clear` is special: it presents an interactive picker that lets the user
- * choose which caches to clear across all installed harnesses. It does NOT
- * dispatch through the per-harness flows because the goal is a single "what
- * do I want to nuke?" prompt rather than two separate flows.
+ * `--clear` presents one picker for caches across installed harnesses.
  */
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -34,15 +29,7 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     if (options.clear) return runClear();
 
     const sharedDbPath = join(getMagicContextStorageDir(), "context.db");
-    // A published marker means a reset crashed between publishing its intent and
-    // moving the family, and it promises that initialization stays blocked until
-    // the reset is completed or rolled back. Warning and continuing broke that
-    // promise: the migration sweep and the backfills below both open
-    // `context.db` read-write, and those writes can change or recreate the
-    // artifacts the marker binds, after which `verifyResetMarkerFamily` refuses
-    // the recovery the marker exists to enable. So stop before any database is
-    // opened. `doctor reset-db` is routed ahead of this function, so the
-    // recovery path itself is unaffected.
+    // A pending reset blocks doctor before the migration sweep opens `context.db` read-write.
     if (existsSync(databaseResetMarkerPath(sharedDbPath))) {
         log.error(
             `A database reset is pending for ${sharedDbPath}. Run \`${DATABASE_RESET_COMMAND}\` to complete or roll it back; doctor cannot run until then.`,
@@ -61,20 +48,14 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
         return 0;
     }
 
-    // Reconcile interrupted cross-harness session migrations. The journal lives
-    // in the SHARED cortexkit DB (harness-agnostic), so this runs exactly once
-    // per doctor invocation — dispatching per adapter would reconcile the same
-    // physical database repeatedly. The sweep is phase-based and idempotent; a
-    // missing/out-of-range database simply has nothing to reconcile.
+    // The shared migration journal is reconciled once per doctor invocation because per-adapter dispatch would repeat the same database sweep.
     const { sweepPendingMigrations, formatMigrationSweepLines } = await import("./migrate");
     const sweepDbPath = join(getMagicContextStorageDir(), "context.db");
     let sweepDb: ReturnType<typeof openExistingContextDatabaseForMutation> = null;
     try {
         sweepDb = openExistingContextDatabaseForMutation(sweepDbPath);
     } catch {
-        // Fence refusals (database newer or older than this CLI supports) and
-        // missing databases leave nothing to sweep; the per-harness doctors
-        // below report the underlying database condition.
+        // Doctor skips the sweep when opening the database fails or no database exists.
     }
     if (sweepDb !== null) {
         try {
@@ -84,8 +65,7 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
                 else log.info(line);
             }
         } catch (error) {
-            // A genuine reconciliation failure (e.g. an unreadable stage file)
-            // should be visible, but must not abort the whole doctor run.
+            // Doctor logs reconciliation failures and continues the remaining checks.
             log.warn(
                 `Session-migration recovery sweep failed: ${
                     error instanceof Error ? error.message : String(error)
@@ -128,9 +108,7 @@ async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions
 }
 
 /**
- * Interactive cache-clear flow. Presents one combined picker showing
- * cleanable caches across every installed harness with their current
- * sizes; the user selects which to clear.
+ * The picker lists cleanable caches from every installed harness.
  */
 async function runClear(): Promise<number> {
     intro("Magic Context — Clear caches");

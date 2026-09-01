@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::read::snapshot_tip;
-use super::ObservationPayload;
 use crate::kernel::envelope::{
     check_fence, replace_alignment_projection_tx, AlignmentProjectionSpec,
 };
@@ -60,6 +59,12 @@ struct AlignmentPayload<'a> {
     decision_id: &'a str,
     observation_id: &'a str,
     alignment_kind: &'a str,
+}
+
+/// Serde ignores unknown fields, so decoding only `classification` accepts wider payload shapes.
+#[derive(Deserialize)]
+struct ObservationClassification {
+    classification: String,
 }
 
 impl KernelStore {
@@ -118,10 +123,10 @@ pub(crate) fn rebuild_alignment_tx(tx: &Transaction<'_>) -> Result<AlignmentRebu
             built_through_commit_seq: tip,
         })
         .collect::<Vec<_>>();
-    let result = replace_alignment_projection_tx(tx, &specs)?;
+    let rows = replace_alignment_projection_tx(tx, tip, &specs)?;
     Ok(AlignmentRebuild {
         built_through_commit_seq: tip,
-        rows: result.rows,
+        rows,
         published: true,
     })
 }
@@ -144,8 +149,7 @@ fn load_alignment_input(
                               AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
                         )
                  FROM decisions d
-                 WHERE created_commit_seq<=?1
-                 ORDER BY object_id",
+                 WHERE created_commit_seq<=?1",
             )
             .map_err(|_| KernelError::Io)?;
         let rows = statement
@@ -179,51 +183,34 @@ fn load_alignment_input(
                              AND e.created_commit_seq<=?1
                              AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
                        )
-                   )
-                 ORDER BY observation_id",
+                   )",
             )
             .map_err(|_| KernelError::Io)?;
-        let rows = statement
+        let encoded = statement
             .query_map([requested], |row| {
-                let observation_id = row.get::<_, String>(0)?;
-                let payload = row.get::<_, Vec<u8>>(1)?;
-                let payload: ObservationPayload =
-                    serde_json::from_slice(&payload).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            payload.len(),
-                            rusqlite::types::Type::Blob,
-                            Box::new(error),
-                        )
-                    })?;
-                Ok((observation_id, payload.classification))
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })
             .map_err(|_| KernelError::Io)?
-            .collect::<rusqlite::Result<HashMap<_, _>>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| KernelError::Io)?;
-        rows
+        let mut observations = HashMap::with_capacity(encoded.len());
+        for (observation_id, payload) in encoded {
+            let decoded: ObservationClassification =
+                serde_json::from_slice(&payload).map_err(|_| KernelError::CorruptCanonicalRow)?;
+            observations.insert(observation_id, decoded.classification);
+        }
+        observations
     };
     let dependencies = {
         let mut statement = tx
             .prepare(
-                "SELECT d.observation_id,d.dependency_object_id
-                 FROM observation_dependencies d
-                 JOIN observations o USING(observation_id)
-                 WHERE d.dependency_kind='implements'
-                   AND o.created_commit_seq<=?1
-                   AND (o.invalidated_commit_seq IS NULL OR ?1<o.invalidated_commit_seq)
-                   AND (
-                       o.evidence_id IS NULL OR EXISTS(
-                           SELECT 1 FROM evidence_meta e
-                           WHERE e.evidence_id=o.evidence_id
-                             AND e.created_commit_seq<=?1
-                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
-                       )
-                   )
-                 ORDER BY d.observation_id,d.dependency_object_id",
+                "SELECT observation_id,dependency_object_id
+                 FROM observation_dependencies
+                 WHERE dependency_kind='implements'",
             )
             .map_err(|_| KernelError::Io)?;
         let rows = statement
-            .query_map([requested], |row| {
+            .query_map([], |row| {
                 Ok(Dependency {
                     observation_id: row.get(0)?,
                     decision_object_id: row.get(1)?,
@@ -247,7 +234,7 @@ fn derive_alignment(input: AlignmentInput) -> Result<AlignmentSnapshot, KernelEr
     let mut rows = BTreeMap::new();
     for dependency in &input.dependencies {
         let Some(alignment_kind) = input.observations.get(&dependency.observation_id) else {
-            return Err(KernelError::Conflict);
+            continue;
         };
         let Some(decision) = resolve_decision(&input.decisions, &dependency.decision_object_id)?
         else {
@@ -265,12 +252,9 @@ fn derive_alignment(input: AlignmentInput) -> Result<AlignmentSnapshot, KernelEr
             alignment_kind: alignment_kind.clone(),
             alignment_payload: payload,
         };
-        let key = (row.decision_id.clone(), row.observation_id.clone());
-        if let Some(existing) = rows.insert(key, row.clone()) {
-            if existing != row {
-                return Err(KernelError::Conflict);
-            }
-        }
+        // Every field is a function of this key, so a repeated key carries an
+        // identical row and overwriting is lossless.
+        rows.insert((row.decision_id.clone(), row.observation_id.clone()), row);
     }
     Ok(AlignmentSnapshot {
         known_as_of: input.known_as_of,

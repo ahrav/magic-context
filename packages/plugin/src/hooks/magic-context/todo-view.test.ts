@@ -116,7 +116,7 @@ describe("buildSyntheticTodoPart", () => {
     it("title reflects active count only", () => {
         const part = buildSyntheticTodoPart(validState);
         if (!part) throw new Error("part null");
-        // 1 active todo (in_progress); the completed one doesn't count
+        // The active-count calculation includes the in_progress item and excludes the completed item.
         expect(part.state.title).toBe("1 todos");
     });
 
@@ -158,7 +158,6 @@ describe("computeSyntheticCallId", () => {
 
     it("produces an id format that does not collide with provider formats", () => {
         const id = computeSyntheticCallId("any");
-        // Anthropic uses toolu_*, OpenAI uses call_* — synthetic must not start with either
         expect(id.startsWith("toolu_")).toBe(false);
         expect(id.startsWith("call_")).toBe(false);
     });

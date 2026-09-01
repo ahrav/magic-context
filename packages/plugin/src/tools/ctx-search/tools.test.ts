@@ -388,9 +388,6 @@ describe("createCtxSearchTools", () => {
     });
 
     it("honors the requested limit for a multi-locator query", async () => {
-        // The cap was raised to the locator count, so `limit: 1` with two valid
-        // ids returned both and a long enough list slipped past the shared
-        // hard ceiling that every other search path observes.
         const first = seedProjectMemoryClaim(db, {
             projectIdentity: "git:repo-project",
             content: "First locator claim.",
@@ -426,9 +423,9 @@ describe("createCtxSearchTools", () => {
     });
 
     it("does not resolve locators when the source restriction excludes memory", async () => {
-        // The short-circuit runs before sources reach unifiedSearch, so it has
-        // to honour the restriction itself: `[]` is documented as searching no
-        // sources, and a non-memory restriction must not return claim content.
+        // Locator resolution bypasses `unifiedSearch` and must honor `sources`.
+        // An empty `sources` array searches no sources.
+        // Locator resolution returns no claim content when `sources` excludes `memory`.
         const claim = seedProjectMemoryClaim(db, {
             projectIdentity: "git:repo-project",
             content: "Locator content behind a source restriction.",
@@ -487,8 +484,6 @@ describe("createCtxSearchTools", () => {
 
             const result = await tools.ctx_search.execute({ query: "7234" }, toolContext());
 
-            // The id short-circuit found nothing for 7234, so the call must
-            // reach the normal text lanes (which we mocked here).
             expect(result).toContain("[1] [memory]");
             expect(result).toContain("Numeric query that survived into text search.");
         } finally {
@@ -533,7 +528,7 @@ describe("createCtxSearchTools", () => {
             expect(missing).toContain("Fallback text search hit.");
             expect(calls).toBe(1);
 
-            // A row outside the project scope is as invisible as a missing one.
+            // Project-scoped locator lookup treats out-of-scope rows as missing.
             const hiddenResult = await tools.ctx_search.execute(
                 { query: hidden.publicClaimId },
                 toolContext(),
@@ -657,7 +652,6 @@ describe("executeCtxSearch", () => {
             expect(execution.text).toBe(
                 String(await tools.ctx_search.execute(args, toolContext())),
             );
-            // Both calls run through the same explicit-search options.
             expect(spy).toHaveBeenCalledTimes(2);
             for (const call of spy.mock.calls) {
                 const options = call[4] as { explicitSearch?: boolean };

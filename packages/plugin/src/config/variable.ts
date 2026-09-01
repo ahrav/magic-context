@@ -8,27 +8,23 @@ export interface SubstituteInput {
     /** Raw config text before JSONC parsing. */
     text: string;
     /**
-     * Path of the config file the text came from. Used to resolve relative
-     * `{file:...}` references and to emit useful warnings. Pass undefined for
-     * virtual/synthetic inputs (tests) — in that case `{file:}` tokens with
-     * relative paths resolve against `cwd`, which is rarely what callers want,
-     * so callers should prefer passing a real path when one exists.
+     * Resolves relative `{file:...}` references.
+     * Pass `undefined` for virtual inputs.
+     * When `configPath` is undefined, relative `{file:}` paths resolve against `cwd`.
+     * Pass `configPath` when a backing file exists.
      */
     configPath?: string;
     /**
-     * Project-level config files are untrusted repository input. Do not expand
-     * secret-bearing tokens there; leave them literal and warn instead.
+     * Project-level config files leave `{env:}` and `{file:}` tokens literal to prevent secret expansion.
      */
     isProjectConfig?: boolean;
 }
 
 export interface SubstituteResult {
-    /** Config text with all `{env:X}` and `{file:path}` tokens replaced. */
+    /* */
     text: string;
     /**
-     * Human-readable warnings for missing env vars, unreadable files, and
-     * unresolved tokens that fell back to empty string. Safe to surface to the
-     * user via logger/toast/startup notification.
+     * Warnings cover missing environment variables, unreadable files, and tokens replaced with an empty string.
      */
     warnings: string[];
 }
@@ -37,9 +33,7 @@ const ENV_PATTERN = /\{env:([^}]+)\}/g;
 const FILE_PATTERN = /\{file:([^}]+)\}/g;
 
 /**
- * Directories that almost never belong in a config file's `{file:}` inline.
- * Returns a short human label when `resolvedPath` sits inside one, else null.
- * Used to WARN (not block) on user-level config — see the call site.
+ * User-level configs warn, rather than block, when `{file:}` resolves under these directories.
  */
 function sensitiveFilePathReason(resolvedPath: string): string | null {
     const home = homedir();
@@ -58,23 +52,14 @@ function sensitiveFilePathReason(resolvedPath: string): string | null {
 }
 
 /**
- * Expand `{env:VAR}` and `{file:path}` tokens in raw config text.
  *
- * Mirrors OpenCode's `ConfigVariable.substitute` semantics so users can share
- * the same patterns across `opencode.json(c)` and `magic-context.jsonc`:
  *   - `{env:VAR}` → `process.env.VAR` (trimmed key), JSON-escaped for safe inlining, empty string when missing
  *   - `{file:~/path}` → contents of `~/path`, JSON-escaped for safe inlining
- *   - `{file:./rel}` or `{file:rel}` → resolved against the config file's dir
+ * `{file:./rel}` and `{file:rel}` resolve against `dirname(configPath)`, or `cwd` when `configPath` is undefined.
  *   - `{file:/abs}` → resolved as absolute
  *
- * Unlike OpenCode we treat missing values as warnings rather than hard errors:
- * magic-context config is less critical than the main OpenCode config, and a
- * typo in an optional embedding key should not prevent the plugin from loading
- * with other (valid) settings.
+ * Missing values produce warnings instead of errors.
  *
- * File and env value substitution is JSON-escaped (wrapped then unwrapped
- * through `JSON.stringify`) so line breaks, quotes, and backslashes survive
- * the subsequent JSONC parse.
  */
 export function substituteConfigVariables(input: SubstituteInput): SubstituteResult {
     const warnings: string[] = [];
@@ -99,9 +84,7 @@ export function substituteConfigVariables(input: SubstituteInput): SubstituteRes
         return { text, warnings };
     }
 
-    // Strip JSONC comments before substitution so tokens in comments cannot
-    // trigger env/file side effects. The shared parser helper is string-aware,
-    // so URL strings and literal comment markers inside strings are preserved.
+    // Strip JSONC comments before substitution to prevent tokens in comments from triggering environment or file reads.
     text = stripJsonComments(text);
 
     text = text.replace(ENV_PATTERN, (_, rawName: string) => {
@@ -135,8 +118,6 @@ export function substituteConfigVariables(input: SubstituteInput): SubstituteRes
         output += text.slice(cursor, index);
         cursor = index + token.length;
 
-        // Skip tokens inside line comments: agents-only feature, matches OpenCode.
-        // We run before JSONC parsing so raw comments are still in the text.
         const lineStart = text.lastIndexOf("\n", index - 1) + 1;
         const prefix = text.slice(lineStart, index).trimStart();
         if (prefix.startsWith("//")) {
@@ -151,10 +132,8 @@ export function substituteConfigVariables(input: SubstituteInput): SubstituteRes
             filePath = resolve(configDir, filePath);
         }
 
-        // Warn (don't block — this is user-level config, mirroring OpenCode's
-        // {file:} semantics) when a {file:} token resolves into a known-sensitive
-        // directory. A user pasting `{file:~/.ssh/id_rsa}` from a copied snippet
-        // would otherwise silently inline a private key into the prompt.
+        // Inlining a sensitive file exposes its contents in the substituted config.
+        // Inlining a sensitive file exposes its contents in the substituted config.
         const sensitiveReason = sensitiveFilePathReason(filePath);
         if (sensitiveReason) {
             warnings.push(
@@ -181,9 +160,8 @@ export function substituteConfigVariables(input: SubstituteInput): SubstituteRes
             continue;
         }
 
-        // JSON-escape so embedded quotes, newlines, and backslashes don't break
-        // the surrounding JSONC. Slice(1, -1) strips the outer quotes that
-        // JSON.stringify adds so the token stays inside the caller's own string.
+        // JSON-escape substitutions so quotes, backslashes, and line breaks survive JSONC parsing.
+        // `slice(1, -1)` removes `JSON.stringify`'s outer quotes so the substitution remains inside the caller's string literal.
         output += JSON.stringify(contents).slice(1, -1);
     }
 

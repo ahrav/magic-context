@@ -1,12 +1,9 @@
 import type { Database } from "../../../shared/sqlite";
 
 /**
- * Per-task dreamer scheduling state (Dreamer v2). One row per (project, task):
- * when it last ran, when it's next due, and its last outcome. Replaces the
- * project-level `dream_queue` + the single `last_dream_at:<project>` key — drains
- * run straight off this table + keyed leases (see lease.ts).
+ * Each `(project, task)` has one scheduling-state row.
  *
- * Project-scoped, NOT session-scoped → intentionally absent from clearSession().
+ * `clearSession()` must retain scheduling state because it is project-scoped.
  */
 
 export interface TaskScheduleStateRow {
@@ -16,29 +13,26 @@ export interface TaskScheduleStateRow {
     lastRunAt: number | null;
     /** Epoch ms of the next scheduled fire. null = never due (disabled / impossible cron). */
     nextDueAt: number | null;
-    /** The cron `schedule` string `next_due_at` was last computed FROM. The
-     *  scheduler reconciles this against the live config each pass: when the
-     *  config schedule differs, `next_due_at` is recomputed so config is always
-     *  authoritative (a disabled/enabled/changed task takes effect immediately,
-     *  not only after the stale slot fires once). null on legacy rows. */
+    /** `schedule` stores the value used to compute `next_due_at`.
+     * The scheduler compares `schedule` with the live config on every pass.
+     * The scheduler recomputes `next_due_at` when the live config differs from `schedule`.
+     * Schedule changes take effect immediately rather than after a stale slot fires.
+     * */
     schedule: string | null;
     lastStatus: "completed" | "failed" | "skipped" | null;
     lastError: string | null;
     retryCount: number;
-    /** LEGACY/INERT: the old verify commit watermark. Verify now gates per-memory
-     *  on each memory's own `verified_at` (map records the file→memory mapping
-     *  first), so no global commit watermark is written. Column kept (v43) to
-     *  avoid a DROP-COLUMN migration; field kept for a faithful round-trip. Do
-     *  NOT read it for new logic. */
+    /** Do not read `lastCheckedCommit` in new logic; verification uses each memory's `verified_at` value.
+     * Verify gates each memory on its own `verified_at` value after recording the file-to-memory mapping.
+     * Keep the column for faithful row round-trips.
+     * */
     lastCheckedCommit?: string | null;
-    /** Start of the currently open verify-broad cycle, or null when the cycle
-     *  is closed. This field reuses an existing database column from schema
-     *  version 43 as the cycle watermark, allowing a broad pool to drain across
-     *  scheduled runs without a migration. */
+    /** Stores the start of the open verify-broad cycle; null when no cycle is open.
+     * */
     lastBroadRunAt?: number | null;
-    /** retrospective CONTENT watermark: max message ts actually scanned. Distinct
-     *  from lastRunAt (schedule-completion time) — lastRunAt as a content cutoff
-     *  loses messages that arrive mid-run. Undefined on writes preserves the DB
+    /** Stores the maximum message timestamp actually scanned.
+     * `lastRunAt` records schedule-completion time, not a content cutoff.
+     * Omitting `retrospectiveWatermarkMs` on writes preserves the stored database value.
      *  value. */
     retrospectiveWatermarkMs?: number | null;
 }
@@ -121,12 +115,6 @@ export function getMostRecentTaskRunAt(db: Database, projectPath: string): numbe
 }
 
 /**
- * Delete task_schedule_state rows for a project whose `task` is NOT in the given
- * keep-set. Used to garbage-collect RETIRED task names (e.g. the v1
- * improve/consolidate/archive-stale rows superseded by the verify/curate split):
- * reconcile adds/updates canonical tasks but never removed obsolete rows, so they
- * lingered forever as perpetually-"due" garbage that polluted the dashboard.
- * Returns the number of rows deleted.
  */
 export function pruneNonCanonicalTaskRows(
     db: Database,
@@ -144,11 +132,10 @@ export function pruneNonCanonicalTaskRows(
 }
 
 /**
- * Delete ALL task_schedule_state rows for a project. Used to GC a fully-orphaned
- * project — a `dir:<md5>` identity whose backing directory is gone (e.g. a
- * finalized mason worktree). NEVER call this for a `git:` identity: that is
- * shared across worktrees/clones of the same repo, so a single dead worktree
- * must not delete the shared project's schedule. Returns rows deleted.
+ * Delete schedule rows only for orphaned `dir:<md5>` projects.
+ * A `dir:<md5>` identity is orphaned when its backing directory is gone.
+ * Never delete schedule rows for a `git:` identity.
+ * A `git:` identity is shared by worktrees and clones of the same repository.
  */
 export function deleteTaskScheduleRowsForProject(db: Database, projectPath: string): number {
     const result = db
@@ -158,9 +145,9 @@ export function deleteTaskScheduleRowsForProject(db: Database, projectPath: stri
 }
 
 /**
- * Idempotent first-seed: insert the row only if absent. Concurrent processes can
- * both call this safely — ON CONFLICT DO NOTHING means the first writer wins and
- * the second is a no-op (both compute the same next_due_at from the same cron).
+ * `ON CONFLICT DO NOTHING` makes concurrent first-seeds idempotent: the first writer wins.
+ * `ON CONFLICT DO NOTHING` makes concurrent first-seeds idempotent: the first writer wins.
+ * `ON CONFLICT DO NOTHING` makes concurrent first-seeds idempotent: the first writer wins.
  */
 export function seedTaskScheduleState(
     db: Database,
@@ -175,14 +162,11 @@ export function seedTaskScheduleState(
     ).run(projectPath, task, lastRunAt, nextDueAt, schedule);
 }
 
-/** Full upsert of a row's schedule fields (used on run completion / gate-skip /
- *  retry advancement / schedule reconciliation). Callers that read-then-write
- *  should wrap in BEGIN IMMEDIATE; run-completion writes are already
- *  single-writer under the domain lease.
+/**
  *
- *  Optional watermark fields preserve the existing value when omitted. Passing
- *  `lastBroadRunAt: null` explicitly closes a broad cycle; this distinction is
- *  needed because a closed cycle is durable state, not an absent patch. */
+ * Optional watermark fields preserve existing values when omitted.
+ * Passing `lastBroadRunAt: null` explicitly closes a broad cycle.
+ * A closed broad cycle is durable state, not an absent patch. */
 export function writeTaskScheduleState(db: Database, row: TaskScheduleStateRow): void {
     const broadCycleUpdate =
         row.lastBroadRunAt === undefined
@@ -218,11 +202,6 @@ export function writeTaskScheduleState(db: Database, row: TaskScheduleStateRow):
 }
 
 /**
- * Source-window idempotence for the retrospective task. A friction window
- * re-seen across the run-overlap (the ~12 user lines re-read before the
- * watermark) must not re-extract the same learning. `windowKey` is a stable hash
- * over the flagged user lines' (sessionId:ts) anchors — NOT prompt ordinals,
- * which are batch-local and unstable.
  */
 export function isRetrospectiveWindowProcessed(
     db: Database,

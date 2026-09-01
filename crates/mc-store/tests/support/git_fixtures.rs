@@ -41,12 +41,23 @@ fn signature(seconds: i64) -> gix::actor::Signature {
 
 /// Writes a full snapshot of `files` as a (possibly nested) tree.
 pub fn write_tree(repo: &gix::Repository, files: &[(&str, &str)]) -> ObjectId {
+    let with_modes: Vec<_> = files
+        .iter()
+        .map(|(path, content)| (*path, *content, gix::objs::tree::EntryKind::Blob))
+        .collect();
+    write_tree_with_modes(repo, &with_modes)
+}
+
+pub fn write_tree_with_modes(
+    repo: &gix::Repository,
+    files: &[(&str, &str, gix::objs::tree::EntryKind)],
+) -> ObjectId {
     #[derive(Default)]
     struct Node {
-        files: BTreeMap<String, ObjectId>,
+        files: BTreeMap<String, (ObjectId, gix::objs::tree::EntryKind)>,
         dirs: BTreeMap<String, Node>,
     }
-    fn insert(node: &mut Node, path: &str, blob: ObjectId) {
+    fn insert(node: &mut Node, path: &str, blob: (ObjectId, gix::objs::tree::EntryKind)) {
         match path.split_once('/') {
             Some((dir, rest)) => insert(node.dirs.entry(dir.to_string()).or_default(), rest, blob),
             None => {
@@ -63,9 +74,9 @@ pub fn write_tree(repo: &gix::Repository, files: &[(&str, &str)]) -> ObjectId {
                 oid: write_node(repo, child),
             });
         }
-        for (name, blob) in &node.files {
+        for (name, (blob, kind)) in &node.files {
             entries.push(gix::objs::tree::Entry {
-                mode: gix::objs::tree::EntryKind::Blob.into(),
+                mode: (*kind).into(),
                 filename: BString::from(name.as_str()),
                 oid: *blob,
             });
@@ -75,9 +86,9 @@ pub fn write_tree(repo: &gix::Repository, files: &[(&str, &str)]) -> ObjectId {
         repo.write_object(&tree).expect("tree writes").detach()
     }
     let mut root = Node::default();
-    for (path, content) in files {
+    for (path, content, kind) in files {
         let blob = repo.write_blob(content.as_bytes()).expect("blob writes");
-        insert(&mut root, path, blob.detach());
+        insert(&mut root, path, (blob.detach(), *kind));
     }
     write_node(repo, &root)
 }
@@ -94,6 +105,18 @@ pub fn commit_snapshot(
     seconds: i64,
 ) -> ObjectId {
     let tree = write_tree(repo, files);
+    commit_tree(repo, branch, parents, tree, message, seconds)
+}
+
+pub fn commit_snapshot_with_modes(
+    repo: &gix::Repository,
+    branch: &str,
+    parents: &[ObjectId],
+    files: &[(&str, &str, gix::objs::tree::EntryKind)],
+    message: &str,
+    seconds: i64,
+) -> ObjectId {
+    let tree = write_tree_with_modes(repo, files);
     commit_tree(repo, branch, parents, tree, message, seconds)
 }
 

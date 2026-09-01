@@ -1,13 +1,11 @@
 #!/usr/bin/env bun
 /**
- * Validate the prompt-surface checklist and its fragment composition
- * map. Applicability is calculated from the source fragment's composedIn set and
- * sharedAcrossPresets flag; it is never accepted solely because a row declares a
- * status. The same command also validates the budget fixture when requested.
+ * The script validates the prompt-surface checklist and fragment-composition map.
+ * The validator derives applicability from each source fragment's `composedIn` and `sharedAcrossPresets` values, not from row status.
+ * With `--budget`, the command also validates the budget fixture.
  *
  * Usage:
  *   bun packages/plugin/scripts/check-prompt-surface.ts
- *   bun packages/plugin/scripts/check-prompt-surface.ts --budget
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";

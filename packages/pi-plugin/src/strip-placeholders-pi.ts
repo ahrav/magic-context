@@ -1,17 +1,7 @@
 /**
- * Pi dropped-placeholder stripping — mirrors OpenCode's
- * `stripDroppedPlaceholderMessages` plus persisted
  * `session_meta.stripped_placeholder_ids` replay.
  *
- * OpenCode replaces placeholder-only messages with sentinel shells to
- * keep provider-cache array structure stable. Pi rebuilds `AgentMessage[]`
- * from JSONL on every pass, so the Pi-native operation is simpler: remove
- * messages whose only model-visible content is `[dropped §N§]` after
- * `applyFlushedStatuses` has replayed dropped tag state.
  *
- * Replay is persistent and runs on every pass from stable Pi message ids.
- * Discovery of new placeholder-only ids happens only on cache-busting
- * passes, matching OpenCode's "discover on execute, replay everywhere"
  * contract.
  */
 
@@ -41,14 +31,7 @@ function isDroppedOnlyText(text: string): boolean {
 function messageIsPlaceholderOnly(message: unknown): boolean {
 	if (!message || typeof message !== "object") return false;
 	const msg = message as { role?: unknown; content?: unknown };
-	// Only assistant messages may be neutralized/removed. User-role messages
-	// anchor turn boundaries the AI SDK relies on to avoid merging consecutive
-	// assistants — removing one can collapse a boundary. Mirrors OpenCode's
-	// strip-content.ts ("Never neutralize user-role messages — they anchor turn
-	// boundaries"). In Pi's raw array, tool results carry role "toolResult"
-	// (synthetic tool-result user folds live only in the transcript view, never
-	// written back to this array), so genuine user prompts are the only user-role
-	// entries here — never all-[dropped] — making this a safe parity guard.
+	// Do not remove user messages: the AI SDK uses them as turn boundaries, so removal can merge consecutive assistant messages.
 	if (msg.role !== "assistant") return false;
 
 	if (typeof msg.content === "string") return isDroppedOnlyText(msg.content);
@@ -78,20 +61,14 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	messages: unknown[];
 	isCacheBusting: boolean;
 	/**
-	 * Carried stable-id map keyed by message object reference, built by the caller
-	 * POST-commit / PRE-injection (see context-handler). This runs AFTER
-	 * injectM0M1Pi splices the array, so positional index→id is stale; object
-	 * identity survives the splice. Skip-on-miss: the only legitimate misses are
-	 * injection's synthetic m[0]/m[1] prepends (never placeholders).
+	 * The caller builds the map after commit and before injection.
+	 * `injectM0M1Pi` splices `messages`, so index-to-ID mappings become stale; use object references.
 	 */
 	stableIdByRef?: ReadonlyMap<object, string>;
 	/**
-	 * Force placeholder rediscovery regardless of isCacheBusting. Set on the
-	 * stable-id-scheme cutover pass so previously-stripped placeholders get
-	 * re-keyed under the new scheme (discovery is otherwise history-refresh-gated).
 	 */
 	forceDiscovery?: boolean;
-	/** Test seam for exhausting the durable CAS write. */
+	/* */
 	applyDelta?: typeof applyStrippedPlaceholderDelta;
 }): StripPiDroppedPlaceholderResult {
 	const { db, sessionId, messages, isCacheBusting, stableIdByRef } = args;
@@ -140,8 +117,8 @@ export function stripPiDroppedPlaceholderMessages(args: {
 			},
 		);
 		if (persisted) {
-			// Bytes ship only after their replay state is durable. If the CAS fails,
-			// replay the old frozen set and retry discovery on the next busting pass.
+			// Send message bytes only after their replay state is durable.
+			// On persistence failure, leave `idsToStrip` unchanged; a later cache-busting or forced-discovery pass rediscovers placeholders.
 			for (const id of discoveredIds) idsToStrip.add(id);
 			for (const id of removedIds) idsToStrip.delete(id);
 			discovered = discoveredIds.length;

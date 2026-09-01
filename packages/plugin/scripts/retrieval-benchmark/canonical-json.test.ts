@@ -28,8 +28,7 @@ describe("canonicalJson", () => {
     });
 
     it("rejects sparse-array holes instead of emitting malformed JSON", () => {
-        // [1, <hole>, 3]: Array.prototype.map skips the hole and join would
-        // serialize it as an empty slot ("[1,,3]").
+        // Array.prototype.map skips holes, and Array.prototype.join serializes them as empty slots (`[1,,3]`).
         const sparse = [1];
         sparse.length = 3;
         sparse[2] = 3;

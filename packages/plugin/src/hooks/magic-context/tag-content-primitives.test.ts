@@ -19,7 +19,7 @@ const CYRILLIC_HA = "\u04a9"; // ҩ — a stray closer a model improvised in the
 
 describe("dangling-open tag cleanup (§N + improvised closer, no closing §)", () => {
     it("strips §N$ — the agent opened the tag and closed with $ (would orphan '$')", () => {
-        // Exact production shape: §103012$ → before this, stray-§ left "103012$".
+        // The cleanup consumes `$` as the improvised closer to prevent an orphaned `$` in output.
         expect(stripPersistedAssistantText(`${SECTION}103012$ Fixed it`)).toBe("Fixed it");
     });
 

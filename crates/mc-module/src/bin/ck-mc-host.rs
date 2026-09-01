@@ -1,11 +1,10 @@
-//! `ck-mc-host`: the production lifecycle/serve executable (plan U2, KTD1).
+//! `ck-mc-host` is the lifecycle and serve executable.
 //!
-//! Leaf binary: depends on `mc-module` + `mc-host`, never the reverse.
-//! Commands: `serve` (daemon mode), `start`, `stop`, `restart`, `probe`,
-//! plus side-effect-free `--version` and `release-info`. Every lifecycle
-//! command emits exactly one `magic-context.daemon/v1` JSON object on
-//! stdout; exit 0 means `ok:true`, exit 1 an operational failure, and
-//! exit 2 a usage error with no lifecycle call.
+//! `ck-mc-host` depends on `mc-module` and `mc-host`; neither dependency depends on `ck-mc-host`.
+//! `--version` and `release-info` have no side effects.
+//! Each lifecycle command emits exactly one `magic-context.daemon/v1` JSON object on stdout.
+//! Exit 0 means `ok:true`; exit 1 indicates an operational failure.
+//! Exit 2 indicates a usage error and makes no lifecycle call.
 
 #![deny(unsafe_code)]
 
@@ -28,34 +27,27 @@ use mc_host::{
 use mc_module::release_contract;
 
 // -------------------------------------------------------------------------
-// Deadlines (plan budget table, KTD22). Every phase receives
-// min(phase hard cap, aggregate remaining); the aggregate always wins.
 // -------------------------------------------------------------------------
 
-/// Fresh Linux request-to-authenticated-transport outer aggregate (hard).
+/// The outer aggregate caps fresh Linux request-to-authenticated-transport handling at 60 seconds.
 const OUTER_AGGREGATE: Duration = Duration::from_secs(60);
-/// Spawn/publication/auth phase (hard). Before publishing, serve fully
-/// revalidates the staged generation and re-hashes every retained harness
-/// closure node (hundreds of megabytes when both harnesses are qualified),
-/// so this budget covers cold-page-cache reads of that working set, not
-/// just process spawn and socket publication.
+/// The 10-second spawn/publication/auth budget covers staged-generation revalidation and retained harness closure hashing before publication.
+/// Before publication, `serve` revalidates the staged generation and hashes every retained harness closure node.
+/// Both qualified harnesses can require hashing hundreds of megabytes of closure nodes.
+/// The budget covers cold-page-cache reads of the retained harness closure nodes.
 const SPAWN_PUBLICATION_AUTH: Duration = Duration::from_secs(10);
-/// Stop teardown: committed shutdown until publication removal plus both
-/// fences acquirable, bounded above the runtime's own shutdown deadline.
+/// The teardown budget covers committed shutdown through publication removal and acquisition of both fences.
 const STOP_TEARDOWN: Duration = Duration::from_secs(10);
-/// Bounded settle window for an observed `starting`/`stopping` transition
-/// before reporting `lifecycle_busy`.
+/// The command waits at most 5 seconds for an observed `starting` or `stopping` transition before reporting `lifecycle_busy`.
 const TRANSITION_SETTLE: Duration = Duration::from_secs(5);
 const REPROBE_INTERVAL: Duration = Duration::from_millis(100);
-/// Bound on the best-effort close that follows a proven handshake. It exists only
-/// so a stalled peer cannot hang the phase; expiring it never changes an
-/// authentication verdict the handshake already settled.
+/// The 500 ms close grace prevents a stalled peer from hanging the phase after a proven handshake.
+/// Expiry after a proven handshake does not change the authentication verdict.
+/// The handshake settles the authentication verdict before close grace begins.
 const CLOSE_GRACE: Duration = Duration::from_millis(500);
 
-/// Dev/test-only phase-cap override in milliseconds, clamped to the outer
-/// aggregate. Lengthens the spawn/publication/auth and teardown phase caps
-/// for slow debug-build CI hosts; the aggregate deadline still binds, so a
-/// poisoned value cannot create an unbounded wait.
+/// The override can lengthen only the spawn/publication/auth and teardown caps.
+/// The aggregate deadline prevents any phase-cap value from causing an unbounded wait.
 const PHASE_CAP_ENV: &str = "CK_MC_HOST_TEST_PHASE_CAP_MS";
 
 fn phase_cap(default: Duration) -> Duration {
@@ -68,7 +60,6 @@ fn phase_cap(default: Duration) -> Duration {
     }
 }
 
-/// KTD22 nesting: the lesser of the phase's hard cap and aggregate remaining.
 fn phase_deadline(outer: Instant, cap: Duration) -> Instant {
     let now = Instant::now();
     let remaining = outer.saturating_duration_since(now);
@@ -76,8 +67,7 @@ fn phase_deadline(outer: Instant, cap: Duration) -> Instant {
 }
 
 // -------------------------------------------------------------------------
-// Closed v1 result vocabulary (KTD12). Remediations mirror the embedded
-// release contract's precedence table; a unit test pins the mapping to the
+// Result reasons use the closed v1 vocabulary.
 // generated JSON.
 // -------------------------------------------------------------------------
 
@@ -131,7 +121,7 @@ struct ReadinessRecord {
 
 #[derive(serde::Serialize)]
 struct Readiness {
-    transport: ReadinessRecord,
+    shared_memory: ReadinessRecord,
 }
 
 #[derive(serde::Serialize)]
@@ -171,6 +161,7 @@ struct DaemonResult {
     remediation: Option<&'static str>,
     effects: Option<Effects>,
     readiness: Option<Readiness>,
+    shared_memory: Option<serde_json::Value>,
     checks: Vec<Check>,
     versions: Versions,
 }
@@ -186,6 +177,7 @@ impl DaemonResult {
             remediation: remediation_for(reason),
             effects: None,
             readiness: None,
+            shared_memory: None,
             checks: Vec::new(),
             versions: Versions::local(),
         }
@@ -197,9 +189,9 @@ impl DaemonResult {
     }
 
     fn finish(mut self) -> Self {
-        // Applicable-check derivation from the final verdict: the fences
-        // check reports lock coherence, the publication check reports
-        // whether a running incarnation's credential was observed. IDs stay
+        // Applicable checks derive from the final verdict.
+        // The lifecycle check reports lock coherence.
+        // The publication check reports whether a running incarnation's credential was observed.
         // lexicographically sorted.
         let fences = match self.state {
             "wedged" => ("fail", "wedged"),
@@ -231,8 +223,6 @@ impl DaemonResult {
 }
 
 // -------------------------------------------------------------------------
-// Argument parsing: strict and bounded. Anything unrecognized is a usage
-// error (exit 2) with no lifecycle call.
 // -------------------------------------------------------------------------
 
 enum Command {
@@ -303,8 +293,6 @@ fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
         "--version" => Ok(Command::Version),
         "release-info" => Ok(Command::ReleaseInfo),
         "input-lock-digest" => Ok(Command::InputLockDigest),
-        // `probe` is the historical spelling of the contract's `status`
-        // command; both resolve to the same observation.
         "status" | "probe" => Ok(Command::Status),
         "start" => Ok(Command::Start {
             payload_dir,
@@ -321,11 +309,10 @@ fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
 }
 
 // -------------------------------------------------------------------------
-// Reason mapping from mc-host error types. Native error detail is tainted
-// and never serialized; only closed static reasons leave this process.
+// The process never serializes native error detail.
+// Only closed static reasons leave this process.
 // -------------------------------------------------------------------------
 
-/// (state, reason) for a failed operation.
 fn instance_failure(error: &InstanceError) -> (&'static str, &'static str) {
     match error {
         InstanceError::NoDataDir => ("unavailable", "no_data_dir"),
@@ -350,13 +337,8 @@ fn generation_failure(error: &GenerationError) -> (&'static str, &'static str) {
     }
 }
 
-/// The lifecycle state to report for a failure that commits nothing.
 ///
-/// A pre-commit rejection touches no daemon, so the state it reports has to be
-/// the one already on disk. Hard-coding `stopped` told a lifecycle consumer the
-/// daemon was down while it was still serving — a contradiction next to
-/// `stop_committed:false`, and exactly the shape that drives an unnecessary
-/// recovery. Probe failures are classified the way every other command
+/// Pre-commit rejections report the on-disk lifecycle state.
 /// classifies them.
 fn unchanged_state() -> &'static str {
     match probe() {
@@ -375,15 +357,7 @@ fn probe_state(state: LifecycleState) -> &'static str {
     }
 }
 
-/// The one classification of a quarantined-record observation, shared by
-/// every command so they cannot drift.
 ///
-/// `probe_lifecycle` reports the quarantined record as `stopped` when both
-/// fences are free and as `wedged` when one is held, but the record is
-/// quarantined in both shapes and `InstanceGuard::acquire` refuses to start
-/// over either. Commands that checked only the `wedged` shape would spawn a
-/// child that can never publish and then report `startup_timeout`, so the
-/// reason — not the state — is what callers must key on.
 fn quarantined_observation(observed: &LifecycleProbe) -> Option<(&'static str, &'static str)> {
     if observed.reason != mc_host::UNSUPPORTED_STATE_SCHEMA_REASON {
         return None;
@@ -395,16 +369,12 @@ fn quarantined_observation(observed: &LifecycleProbe) -> Option<(&'static str, &
 }
 
 // -------------------------------------------------------------------------
-// Shared lifecycle plumbing.
 // -------------------------------------------------------------------------
 
 fn probe() -> Result<LifecycleProbe, InstanceError> {
     mc_host::probe_lifecycle(None, &ProbeFreshness::default())
 }
 
-/// Re-probes through observed `starting`/`stopping` transitions until they
-/// settle or the bounded window expires. Never waits unbounded while the
-/// caller holds the transaction lock.
 fn settle_probe(deadline: Instant) -> Result<LifecycleProbe, InstanceError> {
     loop {
         let observed = probe()?;
@@ -422,9 +392,6 @@ fn publication_path() -> Result<PathBuf, InstanceError> {
 }
 
 fn daemon_log_path() -> Result<PathBuf, InstanceError> {
-    // The coordination root is stable, owner-only, and already exists for
-    // any mutator (transaction-lock acquisition created it), which the
-    // replaceable managed `run` subtree does not guarantee at spawn time.
     Ok(mc_host::coordination_dir_path(None)?.join("daemon.log"))
 }
 
@@ -442,8 +409,6 @@ impl Runtime {
             .map_err(|_| "tokio runtime construction failed")
     }
 
-    /// One bounded authenticated connect (bearer handshake) then close.
-    /// Returns the proof-authenticated daemon version, never publication metadata.
     fn authenticate(&self, publication: &Path, deadline: Instant) -> Option<String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -451,13 +416,8 @@ impl Runtime {
         }
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
-            // Only the handshake is bounded by the phase deadline. A completed
-            // handshake *is* the authenticated-transport proof, so the close that
-            // follows is best-effort cleanup and must not be able to withdraw it:
-            // `close` carries its own longer deadline than this phase cap, so
-            // folding it into the same timeout let a healthy daemon under slow
-            // teardown report `authentication_failed`. It is still bounded, so a
-            // stalled peer cannot hang the phase.
+            // Only `Client::connect` uses `remaining`; `client.close()` uses `CLOSE_GRACE`.
+            // `client.close()` runs after `daemon_ver` is saved and cannot change the returned value.
             match tokio::time::timeout(remaining, Client::connect(&path)).await {
                 Ok(Ok(client)) => {
                     let daemon_ver = client.daemon_ver().to_owned();
@@ -469,14 +429,9 @@ impl Runtime {
         })
     }
 
-    /// Authenticated `host.shutdown`; `Ok` is the full-frame acknowledgement
-    /// commit point (KTD4).
+    /// `host.shutdown` requires authentication; `Ok` means the full acknowledgement frame was received.
     ///
-    /// `Err("shutdown_outcome_unknown")` is distinct from a definite failure:
-    /// the request reached `WRITING`/`WRITTEN` and then timed out, so the host
-    /// may already have committed and begun tearing down. Collapsing it into a
-    /// not-committed result would let a caller report a serving daemon as
-    /// untouched while it goes down.
+    /// `Err("shutdown_outcome_unknown")` reports an unknown shutdown outcome, not a definite failure.
     fn shutdown(&self, publication: &Path, deadline: Instant) -> Result<(), &'static str> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -484,12 +439,9 @@ impl Runtime {
         }
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
-            // Bounded by the caller's deadline as well as by the client's own
-            // timeouts: an unreachable or stalled peer must not let one attempt
-            // outlive the budget the caller reserved for the whole operation.
-            // A timeout here is an unknown outcome, not a proven failure — the
-            // request may already have been written — so it is reported as such
-            // and settled by observation.
+            // The caller's deadline bounds each attempt in addition to the client's timeouts.
+            // An unreachable or stalled peer cannot let an attempt exceed the caller's reserved budget.
+            // A timeout reports an unknown outcome because the request may already have been written.
             match tokio::time::timeout(remaining, async {
                 let client = Client::connect(&path)
                     .await
@@ -510,7 +462,7 @@ impl Runtime {
     }
 }
 
-/// Untrusted publication daemon version for observational output only.
+/// The publication daemon version is untrusted and supports observational output only.
 /// Authorization and compatibility never consume this value.
 fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
     observed
@@ -519,18 +471,9 @@ fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
         .map(|publication| publication.daemon_ver.clone())
 }
 
-/// Parses `mc-host/X.Y.Z` against the embedded half-open supported daemon
-/// range from the release contract.
 ///
-/// The accepted shape must stay byte-for-byte identical to
 /// `evaluateDaemonCompatibility` in
 /// `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`, whose
-/// `^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$` regex gates the same
-/// authenticated `daemon_ver` against the same contract range. The two must
-/// agree on every input or one side reports a daemon compatible while the other
-/// rejects it, so `triple` rejects anything but three components that are pure
-/// ASCII digits with no redundant leading zero — `u64::from_str` alone would
-/// accept a leading `+` and `007`, neither of which the regex does.
 fn daemon_version_compatible(daemon_ver: &str) -> bool {
     fn triple(version: &str) -> Option<[u64; 3]> {
         fn component(part: &str) -> Option<u64> {
@@ -570,17 +513,11 @@ fn daemon_version_compatible(daemon_ver: &str) -> bool {
 // probe
 // -------------------------------------------------------------------------
 
-/// Read-only, no-create observation. Mirrors the plan's `status` row
-/// semantics: a coherent `stopped` observation is `not_running` (ok:false),
+/// `cmd_probe` observes the daemon without creating an instance.
 /// `running` with a contract-conforming publication is `healthy` (ok:true).
-/// No connection is dialed: probe stays purely observational, so `proof`
-/// and readiness stay null and `versions.daemon` is publication-diagnostic.
+/// `cmd_probe` does not dial a connection, so `proof` and readiness remain null.
+/// `cmd_probe` reports `versions.daemon` only as publication diagnostics.
 ///
-/// The emitted `command` is `status`, the contracted name for these row
-/// semantics. The release contract fixes a closed command union of `start`,
-/// `stop`, `restart`, `status`, and `doctor`, so a `probe` command would be
-/// rejected by every consumer validating against the embedded contract. `probe`
-/// remains an accepted CLI spelling of the same operation.
 fn cmd_probe() -> DaemonResult {
     let command = "status";
     let observed = match probe() {
@@ -610,9 +547,6 @@ fn cmd_probe() -> DaemonResult {
 // start
 // -------------------------------------------------------------------------
 
-/// The staged start pipeline shared by `start` and `restart`'s successor
-/// phase. The caller already holds the transaction lock and supplies the
-/// aggregate deadline. Returns the terminal (ok, state, reason) triple plus
 /// authenticated-transport readiness.
 struct StartOutcome {
     ok: bool,
@@ -623,26 +557,15 @@ struct StartOutcome {
     generation_check: Option<(&'static str, &'static str)>,
 }
 
-/// Where the successor's generation comes from.
 ///
-/// The two arms are exclusive by construction: a caller that already holds a
-/// resolved generation has no use for a payload root or an expected digest, and
-/// passing all three as separate parameters left the digest silently dead
-/// whenever a preflighted generation was supplied.
 enum SuccessorGeneration<'a> {
-    /// Resolve during the start. `start` uses this: nothing was running, so there
-    /// is no stop to sequence the resolution ahead of.
     Resolve {
         payload_dir: Option<&'a Path>,
         payload_manifest_digest: Option<&'a str>,
     },
-    /// Reuse what the pre-stop preflight already resolved and validated, so
-    /// `restart` validates its successor exactly once even though it has to do so
-    /// before committing an irreversible stop.
     Preflighted(ResolvedGeneration),
 }
 
-/// Starts a successor daemon.
 fn start_phase(
     runtime: &Runtime,
     generation: SuccessorGeneration<'_>,
@@ -651,8 +574,6 @@ fn start_phase(
     launcher_envelope: serve::PreparedLauncherEnvelope,
     stop_committed: bool,
 ) -> StartOutcome {
-    // Resolution failures are the only ones that say anything about the retained
-    // artifact, so they are the only ones that may report the generation check as
     // failing.
     let unresolved = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
@@ -662,11 +583,6 @@ fn start_phase(
         daemon_ver: None,
         generation_check: Some(("fail", reason)),
     };
-    // Every failure after resolution — namespace drift, log or envelope faults,
-    // spawn faults, a spent budget — leaves a generation that was completely
-    // validated moments earlier. Reporting `artifact.current_generation` as
-    // failing there would tell a diagnostic consumer the retained artifact is
-    // corrupt on the strength of an unrelated lifecycle or spawn error.
     let resolved_but_failed = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
         start_committed: false,
@@ -676,7 +592,6 @@ fn start_phase(
         generation_check: Some(("pass", "healthy")),
     };
 
-    // Validate or stage the requested generation (KTD9).
     let ResolvedGeneration {
         digest,
         launcher: generation_launcher,
@@ -691,38 +606,26 @@ fn start_phase(
         },
     };
 
-    // Namespace identity must still hold before the spawn commit (KTD2).
     if anchor.verify().is_err() {
         return resolved_but_failed("wedged", "wedged");
     }
 
-    // Generation resolution stages and hashes every payload file synchronously
-    // and can outlast the aggregate on slow storage. With nothing committed,
-    // spawning past the budget would report `startup_timeout` to the caller while
-    // a daemon comes up behind it, so the spawn is refused instead and the caller
-    // can retry cleanly. Resolution already succeeded, so the generation check
+    // Generation resolution can outlast `outer` on slow storage.
+    // Spawning after `outer` expires would return `startup_timeout` while allowing a daemon to start later.
+    // Refusing the spawn prevents a daemon from starting after `startup_timeout` is returned.
     // passes.
     //
-    // Once a stop is committed the trade inverts: the spawn is the only path back
-    // to service, and refusing it would turn an overrun into an outage. The
-    // deadline must never be the reason a committed stop has no successor, so the
-    // aggregate is allowed to overrun rather than the daemon left down. The
-    // pre-stop reservation in `cmd_restart` is what keeps that overrun rare;
-    // post-stop staging is unbounded work that no reservation can size.
+    // After a committed stop, spawning is the only path that restores service.
+    // After a committed stop, `outer` may expire without preventing the successor spawn.
+    // After a committed stop, the aggregate may overrun `outer` to restore service.
     if !stop_committed && Instant::now() >= outer {
         return resolved_but_failed("stopped", "startup_timeout");
     }
 
-    // The library owns the managed layout; deriving the data root by
-    // walking parents off a derived path would silently break if that
-    // layout ever gained or lost a level.
     let envelope = launcher_envelope.to_startup(digest);
     let envelope_bytes = match serde_json::to_vec(&envelope) {
         Ok(bytes) => bytes,
-        // A Unix data root may hold bytes that are not valid UTF-8, which the
-        // JSON envelope cannot represent. That is an operational failure of this
-        // command, not a reason to abandon the single required result object
-        // after generation staging has already run.
+        // Unix data-root paths can contain non-UTF-8 bytes that JSON cannot represent.
         Err(_) => return resolved_but_failed("stopped", "internal_error"),
     };
     let log_path = match daemon_log_path() {
@@ -733,20 +636,16 @@ fn start_phase(
         return resolved_but_failed("stopped", "internal_error");
     }
 
-    // Bounded wait for publication evidence plus authentication — never for
-    // the child PID.
+    // The loop waits for publication and authentication evidence, not the child PID.
     let deadline = phase_deadline(outer, phase_cap(SPAWN_PUBLICATION_AUTH));
     let publication = match publication_path() {
         Ok(path) => path,
         Err(_) => return resolved_but_failed("stopped", "internal_error"),
     };
     loop {
-        // Authentication alone does not prove *this* root has a serving daemon: a
-        // still-valid publication left in the runtime directory authenticates
-        // whichever endpoint it names, which need not be the child being waited
-        // on. A coherent `Running` probe is the local evidence that a lock-held
-        // incarnation exists here, and the daemon publishes only after taking its
-        // fences, so requiring it costs nothing on the success path.
+        // `runtime.authenticate` can authenticate a stale publication for another endpoint, so authentication alone cannot identify this root's daemon.
+        // `probe()` returning `LifecycleState::Running` proves that a lock-held incarnation exists at this root.
+        // The daemon publishes only after taking its fences.
         if let Some(daemon_ver) = publication
             .exists()
             .then(|| runtime.authenticate(&publication, deadline))
@@ -796,10 +695,8 @@ fn start_phase(
             }
         }
         if Instant::now() >= deadline {
-            // A child that exited before publishing — a rejected envelope or a
-            // failed post-fork step — leaves a coherent `stopped` observation.
-            // Reporting that as `wedged` would claim fence incoherence and emit
-            // failed lifecycle checks with no daemon left to inspect.
+            // A child that exits before publishing leaves a coherent `stopped` observation.
+            // Reporting a pre-publication child exit as `wedged` would falsely claim fence incoherence.
             let state = match probe().map(|observed| observed.state) {
                 Ok(LifecycleState::Starting) => "starting",
                 Ok(LifecycleState::Stopped) => "stopped",
@@ -818,45 +715,25 @@ fn start_phase(
     }
 }
 
-/// Read-only preflight of the successor generation, run before any stop.
+/// `restart` preflights the successor generation before stopping the current daemon.
 ///
-/// `restart` commits an irreversible stop, so every successor condition that
-/// is already true on disk must be discovered first. Otherwise an absent
-/// store, an absent or quarantined profile, or a generation that fails
-/// revalidation takes the serving daemon down with `stop_committed:true`,
-/// `start_committed:false`, and no takeover — a hard outage produced by
-/// state that was observable before anything was touched.
+/// An irreversible stop requires discovering every successor condition already present on disk first.
 ///
-/// Returns the resolved generation when the caller may reuse it, so the
-/// successor start does not pay a second validation pass.
+/// The resolver returns the resolved generation to avoid revalidating before successor start.
 fn preflight_generation(
     payload_dir: Option<&Path>,
     payload_manifest_digest: Option<&str>,
 ) -> Result<Option<ResolvedGeneration>, (&'static str, &'static str)> {
-    // Platform support is pre-existing state like any other, so it is decided
-    // here rather than inside the post-stop resolution: otherwise
-    // `restart --payload-dir` on an unsupported target commits the stop and only
-    // then reports `unsupported_platform`, which is an outage produced by a
-    // condition that was knowable before anything was touched.
+    // Reject unsupported targets before stop because post-stop resolution would otherwise commit the stop before reporting `unsupported_platform`.
     if build_target().is_none() {
         return Err(("stopped", "unsupported_platform"));
     }
     match payload_dir {
-        // Dev staging prunes, stages, and promotes, so the mutation must stay
-        // after the stop. Everything read-only about it is preflighted here: the
-        // source tree, and the destination store's own state. A quarantined or
-        // insecure store fails staging just as surely as a bad source tree does,
-        // and it is observable under the lock we already hold, so discovering it
-        // after the stop would commit an outage for a condition that was knowable
+        // A quarantined or insecure store fails staging before any mutation.
         // beforehand.
         Some(dir) => {
             let payload = payload_sources(dir, payload_manifest_digest)?;
-            // Byte identity is read-only, so it is proven here rather than during
-            // the post-stop copy. Otherwise a manifest-listed launcher, model, or
-            // runtime that no longer matches what was packaged passed this
-            // preflight, `cmd_restart` committed the stop, and only
-            // `stage_and_promote` discovered the known-bad source — a hard outage
-            // for a condition that was readable before anything was touched.
+            // A source byte mismatch must fail before the irreversible stop.
             mc_host::generation::verify_sources(&payload.sources)
                 .map_err(|e| generation_failure(&e))?;
             // No-create probe: an absent store is fine, staging creates it.
@@ -873,19 +750,14 @@ fn preflight_generation(
             }
             Ok(None)
         }
-        // Production resolution is entirely read-only, so it runs in full
-        // here and its result — digest and retained launcher alike — is handed
-        // to the successor start.
+        // An unresolved production generation must not commit a stop.
         None => resolve_generation(None, payload_manifest_digest).map(Some),
     }
 }
 
-/// This build's payload target, in the release contract's platform spelling.
+/// `build_target` returns the target in the release contract's platform spelling.
 ///
-/// The contract enumerates `platforms.supported[].target`; staging commits one
-/// of those names into every manifest, and selection compares against it. A
-/// single definition keeps the value the staging path writes and the value the
-/// selection path requires from drifting apart.
+/// Staging writes and selection compares `platforms.supported[].target`; sharing this definition prevents spelling drift.
 const fn build_target() -> Option<&'static str> {
     if cfg!(all(
         target_os = "linux",
@@ -893,23 +765,14 @@ const fn build_target() -> Option<&'static str> {
         target_env = "gnu"
     )) {
         Some("linux-x64-gnu")
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Some("darwin-arm64")
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Some("darwin-x64")
     } else {
         None
     }
 }
 
-/// Confirms a validated generation was staged by this release for this target.
+/// The validation confirms that the generation was staged by this release for this target.
 ///
-/// `validate` proves a generation is internally coherent, not that it belongs
-/// to the running binary. An upgrade or a copied data directory can leave a
-/// structurally valid generation from another release or platform as the
-/// current selection; without this check the new daemon would accept and
-/// advertise that payload. Both fields are committed by the manifest, so the
-/// comparison is against content the digest already binds.
+/// `validate` does not verify that the generation matches the running binary.
 fn generation_identity_matches(
     manifest: &mc_host::generation::GenerationManifest,
     target: &str,
@@ -923,28 +786,15 @@ fn generation_identity_matches(
     Ok(())
 }
 
-/// A generation that resolved, with the launcher the successor must exec.
 ///
-/// The launcher is the payload's own `ck-mc-host`, opened through the validated
-/// generation so the descriptor names bytes the digest already covers. It is
-/// absent when the retained payload carries no launcher, in which case the
-/// successor re-execs the running image.
+/// When present, `launcher` is an open verified `ck-mc-host` descriptor bound to the generation digest.
 struct ResolvedGeneration {
     digest: String,
     launcher: Option<std::os::fd::OwnedFd>,
 }
 
-/// Opens the generation's own launcher, or reports that it has none.
 ///
-/// `.ok()` on the verification result conflated two different states: a dev
-/// fixture that legitimately ships no launcher, and a production payload whose
-/// launcher was deleted, truncated, or rewritten since staging. Both reached
-/// `spawn_detached` as `None`, which then re-execs the *running* binary — so a
-/// tampered launcher produced a successful start from bytes outside the selected
-/// generation instead of failing closed.
 ///
-/// The manifest separates the two: a launcher it names must verify, and one it
-/// does not name does not exist.
 fn generation_launcher(
     validated: &mc_host::generation::ValidatedGeneration,
 ) -> Result<Option<std::os::fd::OwnedFd>, (&'static str, &'static str)> {
@@ -970,20 +820,13 @@ fn generation_launcher(
         .map_err(|_| ("stopped", "native_payload_invalid"))
 }
 
-/// An explicit verified payload root stages a candidate. Without one, only a
-/// fully valid retained current generation may start.
 ///
-/// `payload_manifest_digest` is the digest the caller requires the resolved
-/// generation to have been staged from; a mismatch is `native_payload_invalid`.
+/// `payload_manifest_digest` requires the resolved generation to have been staged from that digest; a mismatch returns `native_payload_invalid`.
 fn resolve_generation(
     payload_dir: Option<&Path>,
     payload_manifest_digest: Option<&str>,
 ) -> Result<ResolvedGeneration, (&'static str, &'static str)> {
-    // Platform support is decided before any payload state is inspected. The
-    // contract orders `unsupported_platform` ahead of `native_payload_missing`
-    // in its failing-reason precedence, and on an unsupported target a fresh
-    // data root would otherwise report a missing payload and tell the user to
-    // install one that cannot run here.
+    // `unsupported_platform` takes precedence over `native_payload_missing`, so `build_target()` runs before payload inspection.
     let Some(target) = build_target() else {
         return Err(("stopped", "unsupported_platform"));
     };
@@ -998,16 +841,14 @@ fn resolve_generation(
             {
                 protected.insert(current);
             }
-            // Prune unreferenced complete generations and stale temps under
-            // the held transaction lock before staging.
+            // The staging transaction prunes unreferenced complete generations and stale staging directories while holding the transaction lock.
             store
                 .prune(&protected)
                 .map_err(|e| generation_failure(&e))?;
             let meta = StageMeta {
                 target: target.to_owned(),
                 release_contract_sha256: release_contract::RELEASE_CONTRACT_SHA256.to_owned(),
-                // Dev/test staging is explicitly unqualified (U9): the value
-                // is a self-describing marker, not a placeholder hash in a
+                // The `unqualified-dev-manifest` value identifies an unqualified dev/test payload; it is not a placeholder hash.
                 // production payload.
                 inputs_lock_sha256: payload.inputs_lock_sha256,
                 source_payload_manifest_sha256: payload_manifest_digest
@@ -1017,7 +858,6 @@ fn resolve_generation(
             let digest = store
                 .stage_and_promote(&payload.sources, &meta, &protected)
                 .map_err(|e| generation_failure(&e))?;
-            // Complete revalidation of the promoted generation before spawn.
             let validated = store
                 .validate(&digest)
                 .map_err(|e| generation_failure(&e))?;
@@ -1035,10 +875,7 @@ fn resolve_generation(
                         .validate(&digest)
                         .map_err(|e| generation_failure(&e))?;
                     generation_identity_matches(&validated.manifest, target)?;
-                    // A caller naming the digest it expects is asserting which payload
-                    // the successor must come from, so a generation that disagrees —
-                    // or that predates the field and cannot answer at all — is not
-                    // the one that was asked for.
+                    // When `payload_manifest_digest` is supplied, `resolve_generation` rejects a generation whose `source_payload_manifest_sha256` differs or is absent.
                     if payload_manifest_digest.is_some_and(|expected| {
                         validated.manifest.source_payload_manifest_sha256.as_deref()
                             != Some(expected)
@@ -1138,10 +975,7 @@ fn trusted_payload_sources(
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.read_to_end(&mut bytes).map_err(|_| invalid)?;
     let canonical = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    // The digest is what binds these bytes, so the encoding only has to match
-    // the producer's byte-for-byte. `scripts/build-mc-host-payload.ts` writes
-    // `canonicalJson(manifest)` — key-sorted, two-space indented, one trailing
-    // newline — and hashes exactly that, so interior newlines are expected here.
+    // The digest binds the manifest's exact bytes, so serialization must match the producer byte-for-byte.
     if format!("{:x}", sha2::Sha256::digest(canonical)) != expected_manifest_digest {
         return Err(invalid);
     }
@@ -1152,8 +986,6 @@ fn trusted_payload_sources(
     };
     let expected_package = match target {
         "linux-x64-gnu" => "@cortexkit/mc-host-linux-x64-gnu",
-        "darwin-arm64" => "@cortexkit/mc-host-darwin-arm64",
-        "darwin-x64" => "@cortexkit/mc-host-darwin-x64",
         _ => return Err(invalid),
     };
     let _ = (&manifest.platform_floor, &manifest.synapse);
@@ -1166,11 +998,7 @@ fn trusted_payload_sources(
         || manifest.package.version != release_contract::RELEASE_VERSION
         || manifest.package.target != target
         || manifest.launcher != "payload/bin/ck-mc-host"
-        // The qualified lock is compiled into this executable, so the payload has to
-        // cite that exact one. Checking only that the value was well-formed hex let a
-        // manifest label arbitrary model, ORT, or harness bytes as production while
-        // naming an unrelated lock, and the generation then persisted that unverified
-        // claim as its own provenance.
+        // `production_inputs_lock_sha256` must equal the lock compiled into the executable; hex validation alone would permit unrelated production inputs.
         || manifest.production_inputs_lock_sha256
             != mc_module::production_inputs::PRODUCTION_INPUTS_LOCK_SHA256
     {
@@ -1225,8 +1053,6 @@ fn trusted_payload_sources(
     })
 }
 
-/// Enumerates a dev payload directory into sorted staging sources. Only
-/// regular files are accepted; symlinks and special files are rejected.
 fn unqualified_payload_sources(
     dir: &Path,
 ) -> Result<Vec<SourceSpec>, (&'static str, &'static str)> {
@@ -1303,7 +1129,6 @@ fn cmd_start(
         Err(_) => return DaemonResult::new(command, false, "stopped", "internal_error"),
     };
 
-    // Serialized lifecycle transaction (KTD2); bounded acquisition.
     let _tx = match LifecycleTransactionLock::acquire_exclusive(None) {
         Ok(tx) => tx,
         Err(error) => {
@@ -1325,8 +1150,7 @@ fn cmd_start(
             return DaemonResult::new(command, false, state, reason);
         }
     };
-    // A quarantined record blocks the start in every observed state, so it is
-    // classified before the state dispatch rather than only on `wedged`.
+    // Quarantined records must block startup in every state, so classify them before dispatching on `wedged`.
     if let Some((state, reason)) = quarantined_observation(&observed) {
         return DaemonResult::new(command, false, state, reason);
     }
@@ -1374,7 +1198,7 @@ fn cmd_start(
             result.versions.daemon = Some(daemon_ver);
             result.versions.proof = Some("current");
             result.readiness = Some(Readiness {
-                transport: ReadinessRecord {
+                shared_memory: ReadinessRecord {
                     state: "ready",
                     reason: "healthy",
                 },
@@ -1430,7 +1254,7 @@ fn start_outcome_result(
     if outcome.ok {
         result.versions.proof = Some("current");
         result.readiness = Some(Readiness {
-            transport: ReadinessRecord {
+            shared_memory: ReadinessRecord {
                 state: "ready",
                 reason: "healthy",
             },
@@ -1454,16 +1278,10 @@ fn start_outcome_result(
 // stop
 // -------------------------------------------------------------------------
 
-/// Committed-stop phase shared by `stop` and `restart`. The caller holds the
-/// transaction lock and has already observed `Running`. Returns
-/// `(stop_committed, terminal)` where terminal is `Ok(())` for a completed
-/// teardown or the (state, reason) failure.
+/// `stop` and `restart` share this committed-stop phase after the caller acquires the transaction lock and observes `Running`.
+/// The function returns `(stop_committed, terminal)`, where `terminal` is `Ok(())` after teardown or a `(state, reason)` failure.
 ///
-/// An unknown shutdown outcome is resolved by observation, never assumed: the
-/// host commits at full-frame write completion, so a client-side timeout can
-/// race a commit that already happened. Reporting that as not-committed would
-/// tell a caller the daemon is untouched while it is tearing down, and would
-/// make `restart` skip its successor start.
+/// After a shutdown timeout, the function probes because the host may have committed at full-frame write completion.
 fn stop_phase(
     runtime: &Runtime,
     outer: Instant,
@@ -1476,19 +1294,18 @@ fn stop_phase(
     match runtime.shutdown(&publication, outer) {
         Ok(()) => {}
         Err("authentication_failed") => return (false, Err(("running", "authentication_failed"))),
-        // The frame was in flight when the client deadline expired: the host
-        // may already have committed. Fall through to the teardown wait and
-        // let the probe decide, rather than asserting either bit.
+        // After an in-flight frame times out, the function waits for teardown and lets the probe determine whether the host committed it.
+        // After an in-flight frame times out, the function waits for teardown and lets the probe determine whether the host committed it.
         Err("shutdown_outcome_unknown") => commit_uncertain = true,
-        // A response-in-flight attempt that did not settle: not committed.
+        // An unresolved response-in-flight attempt requires a commit probe.
         Err(_) => return (false, Err(("running", "lifecycle_busy"))),
     }
-    // Acknowledged (or in-flight and unresolved): wait for the teardown to
-    // become observable and let the probe settle the commit question.
+    // After acknowledgement or an unresolved in-flight request, the function waits for teardown and lets the probe determine whether the host committed it.
+    // After acknowledgement or an unresolved in-flight request, the function waits for teardown and lets the probe determine whether the host committed it.
     let deadline = phase_deadline(outer, phase_cap(STOP_TEARDOWN));
     loop {
         match probe() {
-            // Observed teardown proves the commit, acknowledged or not.
+            // If the request was never acknowledged, teardown observation determines whether it committed.
             Ok(observed) if observed.state == LifecycleState::Stopped => {
                 return (true, Ok(()));
             }
@@ -1497,15 +1314,12 @@ fn stop_phase(
         }
         if Instant::now() >= deadline {
             if commit_uncertain {
-                // Never acknowledged, so the commit is decided by observation
-                // rather than assumed in either direction.
+                // If the request was never acknowledged, teardown observation determines whether it committed.
+                // If the request was never acknowledged, teardown observation determines whether it committed.
                 return match probe().map(|observed| observed.state) {
-                    // Still fully running: the shutdown did not take effect,
-                    // so the daemon really is untouched.
+                    // The daemon is still running; the shutdown did not take effect.
                     Ok(LifecycleState::Running) => (false, Err(("running", "lifecycle_busy"))),
-                    // Teardown is visibly underway or no longer readable:
-                    // report a committed stop so no caller assumes the
-                    // daemon kept serving.
+                    // The function reports a committed stop so callers do not assume the daemon kept serving.
                     _ => (true, Err(("stopping", "shutdown_timeout"))),
                 };
             }
@@ -1536,22 +1350,13 @@ fn cmd_stop() -> DaemonResult {
             return DaemonResult::new(command, false, state, reason);
         }
     };
-    // Classified before the state dispatch so a quarantined record is not
-    // reported as a clean `already_stopped`: it carries an `align_versions`
-    // remediation and will block the next start.
+    // The function classifies quarantined records before state dispatch to avoid reporting `already_stopped`.
+    // Quarantined records require `align_versions` and block the next start.
     if let Some((state, reason)) = quarantined_observation(&observed) {
         return DaemonResult::new(command, false, state, reason);
     }
     match observed.state {
-        // No lock-held incarnation exists, so the state the caller asked for
-        // holds before any cleanup runs. Selector cleanup is best-effort
-        // stale-state removal under the transaction ownership boundary: a
-        // removal or fsync fault leaves behind a stale selector the next start
-        // rewrites, which cannot unmake the stopped state, so it is swallowed
-        // rather than reported as a failed `stop`. An unsupported schema is not
-        // that: the file is owned by a newer binary, is preserved as evidence
-        // for it, and blocks the next start until `align_versions`, so it stays
-        // a `wedged` failure.
+        // The transaction lock confines selector cleanup to stale-state removal.
         LifecycleState::Stopped => match serve::clear_active_selection() {
             Err("unsupported active harness selection schema") => {
                 DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
@@ -1573,13 +1378,6 @@ fn cmd_stop() -> DaemonResult {
             "lifecycle_busy",
         ),
         LifecycleState::Running => match stop_phase(&runtime, outer) {
-            // The stop transaction committed: the incarnation was signalled,
-            // acknowledged, and observed stopped. Nothing after that point can
-            // un-commit it, so a best-effort selector-cleanup fault — stale
-            // bookkeeping the next start rewrites — must not turn a stop that
-            // already happened into a failed command. An unsupported schema
-            // still fails `wedged`: that file is owned by a newer binary, is
-            // preserved as evidence for it, and blocks the next start until
             // `align_versions`.
             (_, Ok(())) => match serve::clear_active_selection() {
                 Err("unsupported active harness selection schema") => {
@@ -1614,8 +1412,7 @@ fn cmd_restart(
                 .with_effects(effects(false, false))
         }
     };
-    // ONE transaction lock held continuously across stop, teardown,
-    // promotion, and successor start (KTD24); every wait below is bounded.
+    // A single transaction lock spans stop, teardown, promotion, and successor start; every wait below is bounded.
     let _tx = match LifecycleTransactionLock::acquire_exclusive(None) {
         Ok(tx) => tx,
         Err(error) => {
@@ -1640,15 +1437,11 @@ fn cmd_restart(
                 .with_effects(effects(false, false));
         }
     };
-    // Classified before any stop: a quarantined record blocks the successor
-    // start in every observed state, so committing a stop over it would
-    // guarantee an outage with no takeover.
+    // A quarantined record prevents successor startup before any stop.
     if let Some((state, reason)) = quarantined_observation(&observed) {
         return DaemonResult::new(command, false, state, reason)
             .with_effects(effects(false, false));
     }
-    // States that cannot be restarted at all return before the successor
-    // preflight, so no validation work is done for a request that bails.
     match observed.state {
         LifecycleState::Wedged => {
             return DaemonResult::new(command, false, "wedged", "wedged")
@@ -1665,14 +1458,11 @@ fn cmd_restart(
         }
         LifecycleState::Stopped | LifecycleState::Running => {}
     }
-    // The stop below is irreversible, so the successor is proven resolvable
-    // first. Every failure here is pre-existing on-disk state and reports
-    // both effect bits false with the daemon still serving.
+    // Preflight runs before the irreversible stop so resolver failures leave the daemon serving.
     let preresolved = match preflight_generation(payload_dir, payload_manifest_digest) {
         Ok(preresolved) => preresolved,
         Err((_, reason)) => {
-            // Nothing has been touched, so the reported state is the one just
-            // observed rather than the resolver's start-from-stopped default.
+            // On preflight failure, the function reports the observed state because no state changed.
             return DaemonResult::new(command, false, probe_state(observed.state), reason)
                 .with_effects(effects(false, false));
         }
@@ -1727,20 +1517,9 @@ fn cmd_restart(
     };
     let stop_committed = match observed.state {
         LifecycleState::Running => {
-            // The stop is irreversible and the successor start needs a budget of
-            // its own, so the successor's phase is *reserved* out of the
-            // aggregate rather than merely checked once: the stop is given
-            // `outer` minus that reservation, so no amount of time spent
-            // acknowledging or observing the teardown can consume it. Checking a
-            // snapshot and then handing the stop the full aggregate would let a
-            // shutdown that acknowledges near the deadline leave the old daemon
-            // stopped with `start_phase` refusing to spawn — an outage
-            // manufactured by a deadline rather than by any on-disk state.
+            // The function reserves `start_phase` time before stopping so teardown cannot exhaust the successor-start budget.
             //
-            // When the reservation cannot be met the restart is refused with the
-            // daemon still serving and both effect bits false; retrying is the
-            // contract remediation for `lifecycle_busy`, and a refused restart is
-            // recoverable where a committed stop with no successor is not.
+            // If reservation fails, return `lifecycle_busy` without effects so callers can retry.
             let stop_deadline = match outer.checked_sub(phase_cap(SPAWN_PUBLICATION_AUTH)) {
                 Some(deadline) if deadline > Instant::now() => deadline,
                 _ => {
@@ -1750,26 +1529,22 @@ fn cmd_restart(
             };
             match stop_phase(&runtime, stop_deadline) {
                 (_, Ok(())) => true,
-                // Pre-acknowledgement failure: no start attempt, both bits false.
+                // A pre-acknowledgement failure does not attempt a start and leaves both effects false.
                 (false, Err((state, reason))) => {
                     return DaemonResult::new(command, false, state, reason)
                         .with_effects(effects(false, false));
                 }
-                // Acknowledged but teardown missed its deadline: committed stop,
-                // no start attempt.
+                // If acknowledged teardown misses its deadline, the stop remains committed and no start is attempted.
                 (true, Err((state, reason))) => {
                     return DaemonResult::new(command, false, state, reason)
                         .with_effects(effects(true, false));
                 }
             }
         }
-        // Nothing was running, so there is no stop to commit.
         _ => false,
     };
     let outcome = start_phase(
         &runtime,
-        // Dev staging mutates, so the preflight leaves it for the post-stop
-        // resolution; production resolution is read-only and already ran.
         match preresolved {
             Some(resolved) => SuccessorGeneration::Preflighted(resolved),
             None => SuccessorGeneration::Resolve {
@@ -1806,7 +1581,6 @@ fn emit(result: DaemonResult) -> i32 {
             }
         }
         Err(_) => {
-            // Bounded stderr only when the JSON object cannot be formed.
             eprintln!("ck-mc-host: result serialization failed");
             1
         }
@@ -1903,8 +1677,6 @@ mod tests {
     use super::*;
     use sha2::Digest;
 
-    /// Every reason/remediation pair this binary can emit must match the
-    /// embedded release contract's precedence table exactly.
     #[test]
     fn remediation_mapping_matches_release_contract() {
         let contract: serde_json::Value =
@@ -1914,14 +1686,10 @@ mod tests {
             .expect("failing reasons");
         for entry in failing {
             let id = entry["id"].as_str().expect("reason id");
-            // `harness_unavailable` remediation is subreason-driven and this
-            // binary never emits it as a top-level reason.
             if id == "harness_unavailable" {
                 continue;
             }
             let expected = entry["remediation"].as_str();
-            // Round-trip through a leaked static so the lookup signature
-            // stays &'static str.
             let reason: &'static str = Box::leak(id.to_owned().into_boxed_str());
             assert_eq!(
                 remediation_for(reason),
@@ -1982,7 +1750,6 @@ mod tests {
             })
         ));
         assert!(matches!(parse_args(&os(&["status"])), Ok(Command::Status)));
-        // `probe` is the accepted historical spelling of the same command.
         assert!(matches!(parse_args(&os(&["probe"])), Ok(Command::Status)));
         assert!(matches!(
             parse_args(&os(&["--version"])),
@@ -2038,16 +1805,12 @@ mod tests {
         };
         let package_name = match target {
             "linux-x64-gnu" => "@cortexkit/mc-host-linux-x64-gnu",
-            "darwin-arm64" => "@cortexkit/mc-host-darwin-arm64",
-            "darwin-x64" => "@cortexkit/mc-host-darwin-x64",
             _ => return,
         };
         let manifest = serde_json::json!({
             "schema": "magic-context.mc-host-payload-manifest/v1",
             "release": {"id": "mc-host-release", "version": release_contract::RELEASE_VERSION},
             "release_contract_sha256": release_contract::RELEASE_CONTRACT_SHA256,
-            // The payload must cite the lock compiled into this binary; any other
-            // well-formed digest is rejected.
             "production_inputs_lock_sha256":
                 mc_module::production_inputs::PRODUCTION_INPUTS_LOCK_SHA256,
             "mode": "production",
@@ -2081,9 +1844,6 @@ mod tests {
             serde_json::to_string_pretty(&manifest).expect("manifest")
         )
         .into_bytes();
-        // The producer writes the manifest indented with a trailing newline and
-        // hashes those exact bytes; a compact encoding here would let the
-        // verifier drift back to rejecting every real payload.
         let manifest_digest = hash(
             manifest_bytes
                 .strip_suffix(b"\n")
@@ -2170,14 +1930,11 @@ mod tests {
         assert!(!daemon_version_compatible("other/0.1.0"));
         assert!(!daemon_version_compatible("mc-host/1"));
     }
-    /// The accepted shape matches the plugin's canonical semver grammar.
     #[test]
     fn daemon_version_shape_matches_the_typescript_gate() {
-        // `u64::from_str` alone accepts these; the regex does not.
         assert!(!daemon_version_compatible("mc-host/+0.1.0"));
         assert!(!daemon_version_compatible("mc-host/0.+1.0"));
         assert!(!daemon_version_compatible("mc-host/0.1.+0"));
-        // Neither side accepts empty components, signs, or whitespace.
         assert!(!daemon_version_compatible("mc-host/0..0"));
         assert!(!daemon_version_compatible("mc-host/0.1."));
         assert!(!daemon_version_compatible("mc-host/-0.1.0"));
@@ -2185,14 +1942,10 @@ mod tests {
         assert!(!daemon_version_compatible("mc-host/0.1.0 "));
         assert!(!daemon_version_compatible("mc-host/0.1.0-rc1"));
         assert!(!daemon_version_compatible("mc-host/0.1.0.0"));
-        // A redundant leading zero is not the canonical spelling, and the
-        // mismatch detail both sides emit calls the grammar canonical, so
-        // neither side may accept it.
         assert!(!daemon_version_compatible("mc-host/0.01.0"));
         assert!(!daemon_version_compatible("mc-host/00.1.0"));
         assert!(!daemon_version_compatible("mc-host/0.1.00"));
         assert!(!daemon_version_compatible("mc-host/01.2.3"));
-        // A single zero component is canonical and stays accepted.
         assert!(daemon_version_compatible("mc-host/0.1.0"));
     }
 }

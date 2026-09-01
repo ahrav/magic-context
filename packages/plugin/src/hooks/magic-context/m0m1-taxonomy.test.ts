@@ -1,17 +1,13 @@
 /// <reference types="bun-types" />
 
-// Cache-stability gate for the SOFT+ / SOFT / HARD materialization taxonomy.
 //
-// This is THE regression guard for the m[0]/m[1] split. The contract:
 //   SOFT+ (defer pass, nothing new)      → m[0] AND m[1] replay BYTE-IDENTICAL.
 //   SOFT  (exec / cache-busting pass)    → m[1] re-renders, m[0] stays identical.
-//   HARD  (TTL idle / system / tools /   → m[0] re-materializes (fold m[1] in),
-//          model change, or content)        m[1] resets to placeholder.
+// A HARD pass folds m[1] into rematerialized m[0] and resets m[1] to the placeholder.
+// A HARD pass caused by TTL idle, system, tools, model change, or content resets m[1] to the placeholder.
 //
-// The bug this guards against: a routine historian publish (new compartment)
-// must NEVER mutate m[0] — folding m[0] on every publish busts the Anthropic
-// prompt-cache prefix for the whole conversation. New compartments are an m[1]
-// delta that folds into m[0] only on a HARD bust.
+// A routine historian publish must not mutate m[0].
+// `m[1]` delta folds into `m[0]` only on a HARD bust.
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -55,14 +51,13 @@ function compartment(seq: number, title: string, body: string): CompartmentInput
         endMessageId: `m${seq}`,
         title,
         content: body,
-        // p1 present → stored as v2 (legacy=0), so upgrade_state stays "ready"
-        // and does not itself trigger a HARD bust.
+        // `p1` stores the compartment as v2, so `upgrade_state` remains `"ready"`.
+        // `p1` does not trigger a HARD bust.
         p1: body,
     };
 }
 
-// The stable provider-identity baseline. Holding these constant means no HARD
-// signal fires, isolating the compartment/SOFT behavior under test.
+// The test holds `BASE_HARD` constant to prevent HARD signals and isolate compartment/SOFT behavior.
 const BASE_HARD: M0HardSignals = {
     systemHash: "sys-v1",
     modelKey: "anthropic/opus",
@@ -82,8 +77,7 @@ function pass(opts: {
     isCacheBustingPass: boolean;
     hard?: M0HardSignals;
 }): PassResult {
-    // Mirror production: read fresh session_meta each pass (the persisted m[0]/m[1]
-    // markers drive the decision), so byte-identity is proven through the DB.
+    // Each pass rereads session_meta because persisted m[0]/m[1] markers determine the decision.
     const state = getOrCreateSessionMeta(db, SESSION_ID);
     const result = injectM0M1({
         db,
@@ -114,16 +108,14 @@ describe("m[0]/m[1] materialization taxonomy", () => {
     it("SOFT+: a new compartment + defer passes replay m[0] AND m[1] byte-identical", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
-        // Baseline: compartment A folded into m[0] via first_render.
+        // The `first_render` pass folds compartment A into `m[0]`.
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         const baseline = pass({ projectDirectory, isCacheBustingPass: true });
         expect(baseline.reason).toBe("first_render");
 
-        // Publish compartment B (the routine historian publish).
         appendCompartments(db, SESSION_ID, [compartment(1, "B", "Bravo delta")]);
 
-        // Defer passes: NOTHING re-renders. m[0] and m[1] are byte-identical to
-        // the baseline — B does NOT leak in (it surfaces only on an exec pass).
+        // Compartment B appears only on an exec pass.
         const d1 = pass({ projectDirectory, isCacheBustingPass: false });
         const d2 = pass({ projectDirectory, isCacheBustingPass: false });
         expect(d1.rematerialized).toBe(false);
@@ -142,10 +134,9 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         appendCompartments(db, SESSION_ID, [compartment(1, "B", "Bravo delta")]);
 
         const soft = pass({ projectDirectory, isCacheBustingPass: true });
-        // m[0] is the frozen prefix — byte-identical. No HARD fold.
         expect(soft.rematerialized).toBe(false);
         expect(soft.m0).toBe(baseline.m0);
-        // m[1] re-rendered and now carries B as a <new-compartments> delta.
+        // `m[1]` re-renders and carries B as a `<new-compartments>` delta.
         expect(soft.m1).not.toBe(baseline.m1);
         expect(soft.m1).toContain("Bravo delta");
         expect(soft.m0).not.toContain("Bravo delta");
@@ -157,7 +148,6 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         pass({ projectDirectory, isCacheBustingPass: true });
         appendCompartments(db, SESSION_ID, [compartment(1, "B", "Bravo delta")]);
-        // Surface B in m[1] first (SOFT), then the model switches.
         pass({ projectDirectory, isCacheBustingPass: true });
 
         const hard = pass({
@@ -167,7 +157,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         });
         expect(hard.reason).toBe("model_change");
         expect(hard.rematerialized).toBe(true);
-        // B is now folded into the m[0] baseline; m[1] resets to placeholder.
+        // `m[0]` includes B; `m[1]` resets to the placeholder.
         expect(hard.m0).toContain("Bravo delta");
         expect(hard.m1).toBe(M1_PLACEHOLDER);
     });
@@ -193,8 +183,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         pass({ projectDirectory, isCacheBustingPass: true });
 
-        // Unknown signals this pass (e.g. before tool.definition fires) must NOT
-        // fold — "" means "no signal", not "changed to empty".
+        // `""` means no signal; unknown tool definitions do not trigger a HARD fold.
         const unknown = pass({
             projectDirectory,
             isCacheBustingPass: true,
@@ -214,10 +203,8 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         pass({ projectDirectory, isCacheBustingPass: true });
 
-        // Simulate "came back after idle": the m[0] baseline was materialized in
-        // the past, and a response completed AFTER that baseline (lastResponseTime
-        // > materializedAt). Both are real past timestamps so the post-fold
-        // materializedAt (= now) exceeds lastResponseTime → idempotent.
+        // `materializedAt < lastResponseTime` simulates an idle return.
+        // `materializedAt` greater than `lastResponseTime` prevents another idle fold.
         const tPast = Date.now() - 60 * 60 * 1000;
         db.prepare(
             "UPDATE session_meta SET cached_m0_materialized_at = ? WHERE session_id = ?",
@@ -232,9 +219,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         expect(fold.reason).toBe("ttl_idle");
         expect(fold.rematerialized).toBe(true);
 
-        // Same signals again within the turn: cacheExpired stays true, but the
-        // fold advanced materializedAt to now, so lastResponseTime (past) is no
-        // longer > materializedAt → no re-fold.
+        // The fold advances `materializedAt` past `lastResponseTime`, preventing another fold.
         const again = pass({ projectDirectory, isCacheBustingPass: true, hard: ttlHard });
         expect(again.rematerialized).toBe(false);
         expect(again.reason).not.toBe("ttl_idle");
@@ -246,9 +231,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         pass({ projectDirectory, isCacheBustingPass: true });
 
-        // "never" resolves to Infinity in parseCacheTtl, so hardCacheExpired is
-        // always false. Verify mustMaterialize does NOT fire ttl_idle even when
-        // lastResponseTime is ancient — the "never" lane stays warm.
+        // `cacheExpired: false` prevents a `ttl_idle` fold regardless of `lastResponseTime`.
         const tPast = Date.now() - 10 * 24 * 60 * 60 * 1000; // 10 days ago
         db.prepare(
             "UPDATE session_meta SET cached_m0_materialized_at = ? WHERE session_id = ?",
@@ -265,16 +248,14 @@ describe("m[0]/m[1] materialization taxonomy", () => {
     });
 
     it("pressure backstop: small m[0] + large m[1] folds via the absolute m[1] cap", () => {
-        // The ratio test (m1 > 15% of m0) is suppressed when m[0] is below the
-        // 2000-char floor, so without an absolute cap a tiny-m[0] session could
-        // grow m[1] unbounded after the max_compartment_seq trigger was removed.
-        // The absolute cap (m[1] > 20% of the history budget) catches this.
+        // `m[0]` below 2,000 characters disables the `m[1] > 15% of m[0]` ratio test.
+        // An absolute cap prevents unbounded `m[1]` growth when `m[0]` is below 2,000 characters.
+        // The absolute cap folds when `m[1]` exceeds 20% of the history budget.
         db = makeDb();
         const projectDirectory = makeProjectDir();
-        // Tiny baseline m[0] (well under the 2000-char ratio floor).
+        // `m[0]` starts below the 2,000-character ratio floor.
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Ax")]);
-        // Drive with a SMALL history budget so the absolute cap (20% of budget) is
-        // easily exceeded by a few new compartments rendered at full P1 in m[1].
+        // With a 60-token history budget, the absolute cap is 12 tokens.
         const smallBudget: M0HardSignals = BASE_HARD;
         const baseline = injectM0M1({
             db,
@@ -288,7 +269,6 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         });
         expect(baseline.decision.reason).toBe("first_render");
 
-        // Append several compartments → m[1] grows past 20% of the 60-token budget.
         appendCompartments(db, SESSION_ID, [
             compartment(1, "B", "Bravo delta with enough words to consume tokens"),
             compartment(2, "C", "Charlie delta with more words again to consume more tokens"),
@@ -304,7 +284,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
             isCacheBustingPass: true,
             hardSignals: smallBudget,
         });
-        // The absolute-cap backstop folded m[1] into m[0] this pass.
+        // `m[1]` exceeds the absolute cap, so this pass folds it into `m[0]`.
         expect(folded.m0RematerializedThisPass).toBe(true);
         expect(folded.m1Text).toBe(M1_PLACEHOLDER);
     });
@@ -315,8 +295,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         pass({ projectDirectory, isCacheBustingPass: true, hard: BASE_HARD });
 
-        // Fresh state read from DB (mirrors a restart): the persisted markers must
-        // match BASE_HARD so a same-identity pass does NOT spuriously fold.
+        // Persisted markers must match `BASE_HARD` so a same-identity pass does not fold after a restart.
         const restartState = getOrCreateSessionMeta(db, SESSION_ID);
         expect(restartState.cachedM0ModelKey).toBe("anthropic/opus");
         expect(restartState.cachedM0SystemHash).toBe("sys-v1");

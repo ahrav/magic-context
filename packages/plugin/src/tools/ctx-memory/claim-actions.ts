@@ -53,7 +53,7 @@ export interface CtxMemoryProducerIdentity extends ProducerIdentity {
     requestScope: string;
 }
 
-/** Tool-call identity is the durable operation key; actions add no live-row suffix. */
+/* */
 export function createCtxMemoryProducerIdentity(
     identity: CtxMemoryCallIdentity,
 ): CtxMemoryProducerIdentity {
@@ -85,8 +85,8 @@ interface WorkspaceReadScope {
     ownProjectIds: number[];
     sharedCategories: string[];
     workspaceEpoch: string;
-    /** Identities the epoch and authorization derive from, so the provider can
-     *  recompute the fingerprint at publication time. */
+    /**
+     * */
     workspaceIdentities: string[];
 }
 
@@ -177,15 +177,7 @@ function authorizeOwnClaims(
 }
 
 /**
- * Enforce the claim category taxonomy at the action boundary.
  *
- * The tool schema already types `category` as an enum, but a parse failure in
- * `createCtxMemoryTool` falls back to executing the raw argument object so that
- * provider-shaped calls keep working. The schema is `passthrough`, so unknown
- * compatibility fields never fail a parse — a failure means an ADVERTISED field
- * is malformed, and the raw value then reaches here. Storage only checks that
- * the category is non-empty, so without this an out-of-taxonomy string would be
- * recorded permanently on a revision.
  */
 function requireTaxonomyCategory(category: string | undefined): string | undefined {
     if (category === undefined || category === "") return undefined;
@@ -477,8 +469,6 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             });
             return mutationResult(action, operation);
         }
-        // assertCtxMemoryWriteShape above already rejected this arm unless it
-        // carries non-empty content and a positive taxonomy category.
         const content = (args.content as string).trim();
         const category = requireTaxonomyCategory(args.category?.trim()) as string;
         const operation = createProjectMemoryClaim(db, producer, {

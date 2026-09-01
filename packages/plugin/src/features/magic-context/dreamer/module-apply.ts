@@ -33,8 +33,8 @@ export interface DreamerModuleRoute {
     moduleCommandId: string;
 }
 
-/** Resolve ownership once for every dreamer applier. A rust transform setting alone is not
- * authority: the module's durable state is the fence that prevents TS fallback writes. */
+/**
+ * */
 export async function resolveDreamerModuleRoute(args: {
     db: Database;
     projectIdentity: string;

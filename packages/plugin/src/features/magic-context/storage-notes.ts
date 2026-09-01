@@ -23,11 +23,9 @@ export interface Note {
     lastCheckedAt: number | null;
     readyAt: number | null;
     readyReason: string | null;
-    /** Message ordinal of the live tail when the note was written, so the note
-     *  can be traced back to the conversation that produced it. The agent reads
-     *  this as the upper bound and expands `anchorOrdinal - x .. anchorOrdinal`
-     *  via ctx_expand at its own discretion. Null for notes written before this
-     *  was tracked, or when the session had no indexed messages yet. */
+    /** `anchorOrdinal` records the live-tail message ordinal when the note is written.
+     * The agent uses `anchorOrdinal` to trace the note to its source conversation.
+     * `anchorOrdinal` is null when the session has no indexed messages. */
     anchorOrdinal: number | null;
     compiledCheck: string | null;
     manifestJson: string | null;
@@ -236,9 +234,9 @@ function noteRevisionColumnsExist(db: Database): boolean {
 }
 
 /**
- * SQL fragment bumping the optimistic-concurrency revision counter, or ""
- * pre-migration. Every smart-note mutator must include it: a write path that
- * skips the bump silently defeats the claim revision fence in
+ * This SQL fragment increments the optimistic-concurrency revision counter.
+ * Every smart-note mutator must include the revision bump.
+ * Skipping the bump defeats the claim revision fence.
  * `smart-notes/storage.ts` (`claimExpectedState`).
  */
 function revisionBumpSql(db: Database): string {
@@ -312,13 +310,8 @@ export function getNotes(db: Database, options: GetNotesOptions = {}): Note[] {
 const NOTE_SEARCH_STATUSES: NoteStatus[] = ["active", "pending", "ready", "dismissed"];
 
 /**
- * Shared searchable-note eligibility predicate (status + session/smart scope).
- * Candidate selection, hydration, the recency fallback, and the corpus counts
- * all build from this one fragment so eligibility cannot drift between them —
- * a divergence would silently drop selected candidates at hydration or give
- * the FTS and fallback paths different eligible universes.
- * Bind with `searchableNoteScopeParams` immediately after any preceding
- * placeholders in the statement.
+ * Callers must bind `searchableNoteScopeParams` after all preceding statement placeholders.
+ * Callers must bind `searchableNoteScopeParams` after all preceding statement placeholders.
  */
 function searchableNoteScopeSql(prefix: string): string {
     const col = (name: string) => (prefix.length > 0 ? `${prefix}.${name}` : name);
@@ -344,8 +337,8 @@ function notesProjectionExists(db: Database): boolean {
     return row?.present === 1;
 }
 
-/** Scope and status join into the statement BEFORE the LIMIT so ineligible
- *  rows cannot crowd an eligible hit out of the capped pool. */
+/** Scope and status must precede LIMIT so ineligible rows cannot crowd eligible hits out of the capped pool.
+ * Scope and status must precede LIMIT so ineligible rows cannot crowd eligible hits out of the capped pool. */
 export function selectNoteCandidateIds(
     db: Database,
     ftsQuery: string,
@@ -376,11 +369,10 @@ export function selectNoteCandidateIds(
 }
 
 /**
- * Eligible-corpus document frequency for each FTS query, in query order, or
- * null when the projection is absent or a query is malformed so the caller
- * falls back to its pool-derived counts. Counting runs over the whole scoped
- * corpus — not the capped candidate pool — so probe-discrimination weights
- * keep a corpus-wide numerator to match their corpus-wide denominator.
+ * The query returns document frequencies in FTS-query order for the scoped searchable corpus.
+ * The query returns null when the projection is absent or an FTS query is malformed.
+ * Counts cover the whole scoped corpus, not the capped candidate pool, so probe-discrimination weights use matching corpus-wide numerators and denominators.
+ * Counts cover the whole scoped corpus, not the capped candidate pool, so probe-discrimination weights use matching corpus-wide numerators and denominators.
  */
 export function countNoteFtsMatchesBatch(
     db: Database,
@@ -421,8 +413,8 @@ export function countNoteFtsMatchesBatch(
     }
 }
 
-/** Notes in the caller's search scope restricted to `ids`, ordered as a scoped
- *  scan would return them. */
+/** The query returns only `ids` within the caller's search scope, in scoped-scan order.
+ * */
 export function getSearchableNotesByIds(
     db: Database,
     options: { ids: readonly number[]; sessionId: string; projectPath: string },
@@ -463,7 +455,7 @@ export function getRecentSearchableNotes(
         .map(toNote);
 }
 
-/** Size of the scoped searchable corpus. */
+/* */
 export function countSearchableNotes(
     db: Database,
     options: { sessionId: string; projectPath: string },
@@ -579,9 +571,9 @@ export function updateNote(
             (updates.content !== undefined && updates.content !== existing.content) ||
             (updates.projectPath !== undefined && updates.projectPath !== existing.projectPath));
 
-    // A compiler-input edit forces status='pending' below; silently overriding
-    // a contradictory explicit status would persist the wrong state, so fail
-    // loud instead. Callers change status in a separate call.
+    // The mutator rejects an explicit status when a compiler-input edit forces `status = 'pending'`; callers must update status separately.
+    // The mutator rejects an explicit status when a compiler-input edit forces `status = 'pending'`; callers must update status separately.
+    // The mutator rejects an explicit status when a compiler-input edit forces `status = 'pending'`; callers must update status separately.
     if (updates.status !== undefined && compilerInputChanged && updates.status !== "pending") {
         throw new Error(
             `updateNote: cannot combine status '${updates.status}' with a smart-note compiler-input edit (content/condition/projectPath force status='pending')`,
@@ -602,8 +594,8 @@ export function updateNote(
             params.push(updates.surfaceCondition);
         }
         if (compilerInputChanged) {
-            // A new trigger has not been evaluated yet; clear stale readiness so
-            // the note cannot keep surfacing under the previous condition.
+            // The trigger clears stale readiness until the updated condition is evaluated.
+            // A project move preserves `surfaceCondition` but invalidates the compiled artifact.
             sets.push(
                 "status = 'pending'",
                 "last_checked_at = NULL",
@@ -628,13 +620,7 @@ export function updateNote(
                 updates.projectPath !== existing.projectPath &&
                 existing.compileStatus === "compiled"
             ) {
-                // A project move keeps the condition text but invalidates a
-                // Retina compilation: local-fs compiled configs resolve
-                // relative paths and default repositories against the project
-                // root, and a preserved compile_status='compiled' keeps the
-                // note Retina-owned watching the old checkout instead of being
-                // recompiled for the new one. 'plain'/'refused' verdicts carry
-                // no project-relative artifact and stay.
+                // A project move preserves `surfaceCondition` but invalidates the compiled artifact.
                 sets.push(
                     "compiled_provider = NULL",
                     "compiled_config = NULL",

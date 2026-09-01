@@ -5,8 +5,7 @@ edition = "2021"
 publish = false
 description = "STRICT compile-closure stub. Surface = verified subc API inventory rows only. Never run."
 
-# Standalone workspace root: cargo invoked in this evidence dir must not try
-# to join the enclosing repo workspace, which does not list these stubs.
+# Cargo invoked in this evidence directory must not join the enclosing workspace because it does not list these stubs.
 [workspace]
 
 [dependencies]

@@ -1,10 +1,7 @@
 /**
- * Conflict warning for Desktop mode when magic-context is disabled.
  *
- * - When conflicts detected: reads Desktop app state → finds active session → sends ignored warning
- * - When no conflicts: cleans up any leftover warning messages from previous runs
  *
- * TUI handles this via a startup dialog — this covers Desktop only.
+ * TUI shows a startup dialog; this module handles Desktop.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -19,8 +16,6 @@ const CONFLICT_WARNING_MARKER = "⚠️ Magic Context is disabled due to conflic
 const SCHEMA_FENCE_MARKER = "⚠️ Magic Context is disabled — database is newer than this version";
 const ENABLED_MARKER = "✨ Magic Context is now enabled";
 const ANNOUNCEMENT_MARKER = "✨ Magic Context — what's new in";
-
-// --- Desktop state file resolution ---
 
 function getDesktopStatePath(): string | null {
     const os = platform();
@@ -63,7 +58,6 @@ function readDesktopState(directory: string): DesktopState {
         const raw = readFileSync(statePath, "utf-8");
         const state = JSON.parse(raw) as Record<string, unknown>;
 
-        // Extract sidecar URL from server state
         let sidecarUrl: string | null = null;
         const serverStr = state.server;
         if (typeof serverStr === "string") {
@@ -72,12 +66,9 @@ function readDesktopState(directory: string): DesktopState {
                 if (typeof serverState.currentSidecarUrl === "string") {
                     sidecarUrl = serverState.currentSidecarUrl;
                 }
-            } catch {
-                // ignore parse error
-            }
+            } catch {}
         }
 
-        // Extract last session for directory
         let sessionId: string | null = null;
         const layoutPage = state["layout.page"];
         if (typeof layoutPage === "string") {
@@ -100,7 +91,6 @@ function readDesktopState(directory: string): DesktopState {
     }
 }
 
-// Cache per directory so each project gets its own lookup
 const cachedDesktopStateByDir = new Map<string, DesktopState>();
 
 function getDesktopState(directory: string): DesktopState {
@@ -112,15 +102,12 @@ function getDesktopState(directory: string): DesktopState {
     return cached;
 }
 
-// --- SDK-based message deletion ---
-
 async function deleteMessage(
     serverUrl: string,
     sessionId: string,
     messageId: string,
 ): Promise<boolean> {
     // OpenCode's Session2 wrapper doesn't expose deleteMessage.
-    // Use raw HTTP to the actual server URL from ctx.serverUrl.
     const auth = getServerAuth();
     const url = `${serverUrl}/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`;
 
@@ -153,8 +140,6 @@ function getServerAuth(): string | undefined {
     return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
-// --- Read session messages via SDK ---
-
 type SdkMessage = {
     info?: { id?: string; role?: string; sessionID?: string };
     parts?: Array<{ type?: string; text?: string; ignored?: boolean }>;
@@ -173,8 +158,6 @@ async function getSessionMessages(client: unknown, sessionId: string): Promise<S
 
         if (typeof c.session?.messages === "function") {
             // Bounded limit prevents loading the entire session into memory.
-            // We only scan the tail for recent conflict warning user messages,
-            // which are typically the last 1-3 messages.
             const result = await c.session.messages({
                 path: { id: sessionId },
                 query: { limit: 50 },
@@ -189,10 +172,7 @@ async function getSessionMessages(client: unknown, sessionId: string): Promise<S
     return [];
 }
 
-// --- Public API ---
-
 /**
- * Send an ignored notification to the active Desktop session at plugin startup.
  */
 export async function sendConflictWarning(
     client: unknown,
@@ -221,8 +201,7 @@ export async function sendConflictWarning(
 }
 
 /**
- * Clean up leftover conflict warning messages from previous disabled runs.
- * Called at startup when no conflicts exist (plugin is enabled normally).
+ * The plugin removes leftover conflict-warning messages from disabled runs.
  */
 export async function cleanupConflictWarnings(
     client: unknown,
@@ -237,7 +216,6 @@ export async function cleanupConflictWarnings(
     const messages = await getSessionMessages(client, sessionId);
     if (messages.length === 0) return;
 
-    // Scan from the end for consecutive conflict warning messages
     const warningMessageIds: string[] = [];
     for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i];
@@ -264,7 +242,6 @@ export async function cleanupConflictWarnings(
     }
 
     if (warningMessageIds.length === 0) {
-        // Also clean up any stale "enabled" messages from previous cleanup runs
         await cleanupEnabledMessages(messages, serverUrl, sessionId);
         return;
     }
@@ -298,12 +275,11 @@ export async function cleanupConflictWarnings(
     // startup instead.
     if (disposition !== "sent") return;
 
-    // Auto-remove the "enabled" message after 1 second so it doesn't persist across restarts.
-    // We identify it by the ENABLED_MARKER + ignored flag to avoid deleting real user messages.
+    // The plugin removes the "enabled" message after 1 second so it does not persist across restarts.
+    // The plugin identifies enabled confirmations by ENABLED_MARKER and the ignored flag to avoid deleting user messages.
     setTimeout(async () => {
         try {
             const freshMessages = await getSessionMessages(client, sessionId);
-            // Scan from end for our specific enabled marker
             for (let i = freshMessages.length - 1; i >= 0; i--) {
                 const msg = freshMessages[i];
                 const msgId = msg.info?.id;
@@ -333,7 +309,7 @@ export async function cleanupConflictWarnings(
     }, 1000);
 }
 
-/** Remove any leftover "enabled" messages that survived from a previous cleanup run */
+/** The startup cleanup removes enabled messages left by an earlier run. */
 async function cleanupEnabledMessages(
     messages: SdkMessage[],
     serverUrl: string | undefined,
@@ -366,13 +342,9 @@ async function cleanupEnabledMessages(
 }
 
 /**
- * Desktop schema-fence warning. When OpenCode and Pi share context.db and one
- * harness auto-updates first, it migrates the DB to a newer schema; the lagging
- * harness then fail-closes and disables ALL of Magic Context. Previously this
- * was log-only, so the user just saw the plugin silently stop working. Surface
- * a clear ignored message telling them what happened and how to fix it. No
- * auto-remove: this is a real blocking state the user must act on (update the
- * lagging harness), unlike the transient TUI-setup notice.
+ * When OpenCode and Pi share context.db, an update by either can migrate it beyond the other's supported schema.
+ * The lagging harness fail-closes and disables Magic Context when the persisted schema exceeds its supported version.
+ * Do not auto-remove the schema fence; updating the lagging harness resolves the block.
  */
 export async function sendSchemaFenceWarning(
     client: unknown,
@@ -412,13 +384,8 @@ export async function sendSchemaFenceWarning(
 }
 
 /**
- * Desktop startup announcement: post a one-shot ignored message describing
- * what's new in this release. Mirrors the TUI's RPC-driven dialog path so both
- * surfaces deliver the same announcement once per ANNOUNCEMENT_VERSION.
+ * The plugin posts one ignored announcement per ANNOUNCEMENT_VERSION at Desktop startup.
  *
- * Persistence lives in `getMagicContextStorageDir()/last_announced_version`,
- * shared with the TUI handlers and the Pi plugin so a dismissal in any harness
- * suppresses the others for the same announcement.
  */
 export async function sendStartupAnnouncement(
     client: unknown,
@@ -432,8 +399,6 @@ export async function sendStartupAnnouncement(
 
     const { sessionId } = getDesktopState(directory);
     if (!sessionId) {
-        // No active Desktop session — TUI will pick it up next time it loads.
-        // The persistence file is the same across surfaces, so this is correct.
         return;
     }
 
@@ -445,11 +410,6 @@ export async function sendStartupAnnouncement(
     // forcePersist, which makes the helper skip its own isTuiConnected toast
     // check, so this gate is the only TUI suppression on this path.
     //
-    // Check the target session first (precise), then fall back to "any TUI
-    // connected": the announcement is a global once-per-version event with a
-    // shared dismissal stamp, so if ANY TUI is polling it will show the dialog —
-    // and the getDesktopState sessionId can differ from the TUI's polled session,
-    // which a per-session-only check would miss (the reported bug).
     const { isTuiConnected } = await import("../shared/rpc-notifications");
     if (isTuiConnected(sessionId) || isTuiConnected()) return;
 
@@ -462,8 +422,6 @@ export async function sendStartupAnnouncement(
     const bullets = features.map((line) => `  • ${line}`).join("\n");
     const sections = [`${ANNOUNCEMENT_MARKER} v${version}:`, "", bullets];
     if (footer && footer.trim().length > 0) {
-        // Blank-line separator distinguishes the persistent footer (Discord
-        // invite, etc.) from the version-specific bullets.
         sections.push("", footer);
     }
     const text = sections.join("\n");

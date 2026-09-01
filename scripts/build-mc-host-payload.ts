@@ -92,6 +92,7 @@ const PARENT_DIRS: Record<string, string> = {
 };
 
 export const LAUNCHER_PATH = "payload/bin/ck-mc-host";
+export const NATIVE_ADDON_PATH = "payload/native/mc_shm_native.node";
 
 /** Linux-only U9-gated production slots (R25). Corpus is a certification input,
  *  not a shipped file. Populated only from qualified locked bytes; never committed.
@@ -126,22 +127,6 @@ export interface PayloadTarget {
 }
 
 export const PAYLOAD_TARGETS: readonly PayloadTarget[] = [
-    {
-        package: "@cortexkit/mc-host-darwin-arm64",
-        dir: "packages/mc-host-darwin-arm64",
-        target: "darwin-arm64",
-        os: ["darwin"],
-        cpu: ["arm64"],
-        synapse: "unsupported",
-    },
-    {
-        package: "@cortexkit/mc-host-darwin-x64",
-        dir: "packages/mc-host-darwin-x64",
-        target: "darwin-x64",
-        os: ["darwin"],
-        cpu: ["x64"],
-        synapse: "unsupported",
-    },
     {
         package: "@cortexkit/mc-host-linux-x64-gnu",
         dir: "packages/mc-host-linux-x64-gnu",
@@ -547,14 +532,16 @@ export function validatePayloadManifest(
             fail(`files[${index}]: sha256 must be a real 64-hex digest`);
         }
     }
-    // Exact allowed file set per target/mode (R25, plan scenario 8): dev payloads
-    // and macOS payloads carry only the launcher; a Linux production payload
-    // carries the launcher plus exactly the U9-gated ORT/model slots.
+    // Every production payload carries the one mandatory native ring addon.
+    // Linux additionally carries the U9-gated ORT/model slots.
     const expectedPaths =
-        m.mode === "production" && target.synapse === "certified_cpu"
+        m.mode === "production"
             ? [
                   LAUNCHER_PATH,
-                  ...Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS),
+                  NATIVE_ADDON_PATH,
+                  ...(target.synapse === "certified_cpu"
+                      ? Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS)
+                      : []),
               ].sort()
             : [LAUNCHER_PATH];
     if (JSON.stringify([...seen].sort()) !== JSON.stringify(expectedPaths)) {
@@ -739,8 +726,6 @@ export function validatePayloadPackageDir(
     }
 }
 
-/** Each parent must declare all three payload packages at the exact
- *  synchronized version — no ranges, tags, or workspace specifiers (R20). */
 export function validateParentManifests(
     rootDir: string,
     contract: ReleaseContract,
@@ -781,6 +766,39 @@ export function validateParentManifests(
                 )
             ) {
                 fail(`${where}: unknown payload optional dependency ${name}`);
+            }
+        }
+        // npm continues when optionalDependencies installation fails, so an addon listed in optionalDependencies overrides its required entry.
+        for (const addon of contract.packages.addons) {
+            if (addon in optional) {
+                fail(
+                    `${where}: optionalDependencies[${addon}] makes a required ` +
+                        `addon optional; declare it only in dependencies`,
+                );
+            }
+        }
+        // Addons are non-optional, so an install fails outright when the name
+        // or version is wrong. Validating only optionalDependencies let a hard
+        // requirement sit entirely outside the contract.
+        const required = (pkg.dependencies ?? {}) as Record<string, unknown>;
+        if (typeof required !== "object" || Array.isArray(required)) {
+            fail(`${where}: dependencies must be an object`);
+        }
+        for (const addon of contract.packages.addons) {
+            const spec = required[addon];
+            if (spec !== contract.release.version) {
+                fail(
+                    `${where}: dependencies[${addon}] must be the exact ` +
+                        `version ${contract.release.version}, got ${JSON.stringify(spec)}`,
+                );
+            }
+        }
+        for (const name of Object.keys(required)) {
+            if (
+                name.startsWith("@cortexkit/mc-") &&
+                !(contract.packages.addons as readonly string[]).includes(name)
+            ) {
+                fail(`${where}: unknown @cortexkit/mc- dependency ${name}`);
             }
         }
     }
@@ -835,8 +853,14 @@ export function buildTrustArtifacts(
         const launcher = manifest.files.find(
             (entry) => entry.path === LAUNCHER_PATH,
         );
+        const nativeAddon = manifest.files.find(
+            (entry) => entry.path === NATIVE_ADDON_PATH,
+        );
         if (launcher === undefined) {
             fail(`${target.target}: production manifest has no launcher`);
+        }
+        if (nativeAddon === undefined) {
+            fail(`${target.target}: production manifest has no native addon`);
         }
         return {
             ...common,
@@ -1200,6 +1224,7 @@ export interface PackedProductionPayload {
 
 export interface ProductionPayloadSources {
     binaryPath: string;
+    nativeAddonPath: string;
     qualifiedInputs?: Partial<Record<(typeof INPUT_KEYS)[number], string>>;
     qualifiedInputExpectations?: Partial<
         Record<
@@ -1330,6 +1355,7 @@ export function assembleProductionPayload(
         { path: string; input?: (typeof INPUT_KEYS)[number] }
     >([
         [LAUNCHER_PATH, { path: options.sources.binaryPath }],
+        [NATIVE_ADDON_PATH, { path: options.sources.nativeAddonPath }],
     ]);
     if (target.synapse === "certified_cpu") {
         for (const [input, relative] of Object.entries(
@@ -1486,12 +1512,10 @@ export function verifyProductionBinaryIdentity(
     binaryPath: string,
     expectedLockSha256: string,
 ): void {
-    const executable =
-        process.platform === "linux"
-            ? "/proc/self/fd/3"
-            : process.platform === "darwin"
-              ? "/dev/fd/3"
-              : fail("production binary identity probe is unsupported");
+    if (process.platform !== "linux") {
+        fail("production binary identity probe is unsupported");
+    }
+    const executable = "/proc/self/fd/3";
     let fd: number;
     try {
         fd = openSync(
@@ -1529,6 +1553,7 @@ export function buildProductionPayload(
     options: {
         target: PayloadTarget;
         binaryPath: string;
+        nativeAddonPath?: string;
         outDir: string;
         skipRegistryGate?: boolean;
         allowExactFloorPending?: boolean;
@@ -1568,6 +1593,9 @@ export function buildProductionPayload(
         packageMetadataDir: join(rootDir, options.target.dir),
         sources: {
             binaryPath: options.binaryPath,
+            nativeAddonPath:
+                options.nativeAddonPath ??
+                join(rootDir, "target", "release", "libmc_shm_native.so"),
             ...(qualifiedInputs === undefined
                 ? {}
                 : {
@@ -1810,6 +1838,7 @@ export function buildProductionPayloads(
     const payload = buildProductionPayload(rootDir, {
         target: hostTarget(),
         binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
+        nativeAddonPath: join(rootDir, "target", "release", "libmc_shm_native.so"),
         outDir,
     });
     return packProductionPayload(payload, outDir);
@@ -1883,6 +1912,12 @@ function main(): void {
             const result = buildProductionPayload(rootDir, {
                 target,
                 binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
+                nativeAddonPath: join(
+                    rootDir,
+                    "target",
+                    "release",
+                    "libmc_shm_native.so",
+                ),
                 outDir:
                     outDir ??
                     join(rootDir, "tmp", "mc-host-local-production-payload"),

@@ -11,7 +11,6 @@ interface StoredTag extends TagEntry {
     inputTokenCount: number | null;
 }
 
-// Mock DB that simulates bun:sqlite interface
 function createMockDb(options?: { failCounterWrite?: boolean; rollbackTransactions?: boolean }) {
     const tags: StoredTag[] = [];
     const sessionMeta: Record<string, { counter: number }> = {};

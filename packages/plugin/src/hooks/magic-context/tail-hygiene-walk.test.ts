@@ -298,7 +298,7 @@ describe("tail hygiene single-walk instrument", () => {
         ];
 
         const measured = measureTailHygiene({ messages, tags, protectedTags: 0 });
-        // The neighboring tagged prose still contributes U even though both orphan rows are rejected.
+        // Neighboring tagged prose contributes U even though both orphan rows are rejected.
         expect(measured.u).toBeGreaterThan(0);
         const textOnly = measureTailHygiene({
             messages: [messages[0], messages[2]],
@@ -483,19 +483,9 @@ describe("tail hygiene baseline and defer-window deltas", () => {
 });
 
 describe("tail hygiene walk performance", () => {
-    // Guards the walk's cost against an algorithmic regression, not the
-    // runner it happens to execute on. The suite runs under
-    // `bun test --shard` with up to eight shards in parallel, so on a shared
-    // CI runner a near-max statistic tracks contention: a 25-sample p95 is
-    // the second-slowest sample, and one scheduling stall fails the gate.
-    // The median over a larger sample keeps the same budget while ignoring
-    // transient stalls — the walk is pure CPU over an in-memory tail, so a
-    // real regression moves the whole distribution, not just its tail.
     it("stays below 15ms median on a 250k-token rendered tail", () => {
         const messages = [textMessage("perf", "token ".repeat(250_000))];
         const tags = [tag(1, "perf:p0", "message")];
-        // Unmeasured warmup: the first walks pay JIT and first-touch
-        // allocation costs that no steady-state pass repeats.
         for (let warmup = 0; warmup < 5; warmup += 1) {
             measureTailHygiene({ messages, tags, protectedTags: 0 });
         }

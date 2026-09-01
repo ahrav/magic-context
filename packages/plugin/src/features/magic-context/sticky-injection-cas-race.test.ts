@@ -43,7 +43,7 @@ describe("sticky-injection CAS helpers", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
     });
@@ -62,7 +62,7 @@ describe("sticky-injection CAS helpers", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
     });
@@ -85,7 +85,7 @@ describe("sticky-injection CAS helpers", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
     });
@@ -112,7 +112,7 @@ describe("sticky-injection CAS helpers", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
     });

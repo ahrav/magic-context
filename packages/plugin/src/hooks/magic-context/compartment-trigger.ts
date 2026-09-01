@@ -49,23 +49,22 @@ export interface CompartmentTriggerResult {
     shouldFire: boolean;
     reason?: "projected_headroom" | "force_band" | "commit_clusters" | "tail_size";
     /**
-     * The protected-tail boundary snapshot the decision was computed from.
-     * Present whenever the tail inspection ran. Callers that start the
-     * historian in the SAME pass (transform path) should hand this to
-     * runCompartmentPhase so it doesn't re-resolve the boundary — one
-     * resolution per pass, and the historian sees exactly the snapshot the
+     * The trigger computes its decision from this protected-tail boundary snapshot.
+     * boundarySnapshot is present whenever tail inspection runs; transform callers that start the historian in the same pass must pass boundarySnapshot to runCompartmentPhase.
+     * Passing boundarySnapshot to runCompartmentPhase preserves one boundary resolution per pass.
+     * Passing boundarySnapshot gives the historian the snapshot used for the trigger decision.
      * decision saw.
      */
     boundarySnapshot?: ProtectedTailBoundarySnapshot;
 }
 
 /**
- * In-memory tail source for the trigger — the transform's `args.messages`
- * converted to absolute-ordinal RawMessages (via `buildInMemoryTailRawMessages`
- * with `anchorFound=true`). When supplied, the tail inspection primes the
- * raw-message cache from memory and performs ZERO opencode.db reads on the hot
- * path. Callers must only pass an ANCHORED conversion — an unanchored one has
- * assumed ordinals; leave it undefined to fall through to the DB-primed path.
+ * InMemoryTailSource contains the transform's args.messages converted to absolute-ordinal RawMessages.
+ * buildInMemoryTailRawMessages must use anchorFound=true when constructing InMemoryTailSource.
+ * When callers supply InMemoryTailSource, tail inspection primes the raw-message cache from memory.
+ * The in-memory path performs no opencode.db reads during tail inspection.
+ * Callers must pass only an anchored conversion; otherwise leave the source undefined to use the DB-primed path.
+ * Unanchored conversions have assumed ordinals; leave the source undefined to use the DB-primed path.
  */
 export interface InMemoryTailSource {
     messages: RawMessage[];
@@ -73,9 +72,9 @@ export interface InMemoryTailSource {
 }
 
 /**
- * Wire capability for projecting reclaimable reasoning bytes. OpenCode derives
- * this from the provider's empty-sentinel support; Pi overrides it because its
- * serializers safely omit cleared thinking for every provider.
+ * ReasoningProjectionCapability indicates whether a provider can clear reasoning content when projecting reclaimable bytes.
+ * OpenCode derives canClearReasoning from empty-sentinel support.
+ * Serializers omit cleared thinking for every provider.
  */
 export interface ReasoningProjectionCapability {
     providerID?: string;
@@ -83,9 +82,9 @@ export interface ReasoningProjectionCapability {
 }
 
 /**
- * Deferred tail conversion for callers that have already tagged the live wire.
- * The trigger's cheap gate can use the caller-provided tag floor without building
- * RawMessages; the factory runs only when authoritative tail inspection is needed.
+ * LazyInMemoryTailSource defers RawMessage conversion until tail inspection requires it.
+ * The trigger's cheap gate uses the caller-provided tag floor before constructing RawMessages.
+ * The factory constructs RawMessages only when authoritative tail inspection is needed.
  */
 export type LazyInMemoryTailSource = () => InMemoryTailSource | undefined;
 
@@ -103,15 +102,9 @@ function getActiveOrDroppedTagOwnerMessageIds(
     sessionId: string,
     floor = 0,
 ): Set<string> {
-    // floor > 0 (OpenCode) scopes to the live-wire range (tag_number >= floor) —
-    // the same scoping the other two cheap-gate tag scans use. This set is only
-    // consumed to mark which IN-MEMORY TAIL messages are already tag-covered (so
-    // the cheap-gate's per-message estimate charges only uncovered ones). Every
-    // in-memory tail message is at/after the floor by construction, so a tag
-    // below the floor could never cover a tail message anyway — scoping shrinks
-    // the set to the live wire with an identical loop result, while avoiding the
-    // full-session tag scan (~64-72ms on a 100k-tag session, the residual
-    // compartmentTrigger cost). floor=0 (Pi / no-floor) keeps the full scan.
+    // The returned owner IDs identify in-memory tail messages already covered by tags.
+    // The cheap-gate estimate charges only messages without a matching tag owner.
+    // Every in-memory tail message is at or after floor by construction, so tags below floor cannot cover tail messages.
     const rows = (
         floor > 0
             ? db
@@ -149,8 +142,8 @@ function estimateUntaggedInMemoryTailUpperBound(
     let total = 0;
     for (const message of inMemoryTail.messages) {
         // The anchored in-memory tail includes the last compartment boundary row
-        // itself; it is not eligible for a new compartment and the persisted bound
-        // deliberately excludes compacted tags, so do not charge it here.
+        // The boundary row is not eligible for a new compartment.
+        // The persisted bound excludes compacted tags, so the estimate must not charge the boundary row.
         if (message.ordinal <= lastCompartmentEnd) continue;
         if (coveredOwnerMessageIds.has(message.id)) continue;
         total += estimateTrueRawMessageTokens(message, {
@@ -161,25 +154,15 @@ function estimateUntaggedInMemoryTailUpperBound(
 }
 
 /**
- * Convert the transform's in-memory `args.messages` into a trigger tail source,
- * applying the anchored-only gate:
+ * Convert `args.messages` into a trigger tail source only when the compaction boundary is present.
+ * The conversion returns a tail source only when it finds the compaction boundary in args.messages.
  *
- * - Compartments exist + boundary has a message id → require the anchor to be
- *   FOUND in the array (`anchorFound`). OpenCode's `filterCompacted` stops at
- *   our compaction marker (the boundary message), so the anchor is normally the
- *   array head; when the marker drain lags, the anchor sits a few messages in
- *   and the converter drops the already-compartmentalized prefix. If it isn't
- *   present at all (deleted, or the marker advanced past it), ordinal
- *   assignment would be an unverified guess → return undefined so the caller
- *   falls through to the DB-primed read.
- * - Compartments exist but the boundary row has NO message id (legacy rows) →
- *   undefined (DB path, as before).
- * - No compartments (#132 early-session) → the whole array is the session;
- *   ordinals from 1, no anchor needed.
+ * anchorFound is true only when args.messages contains the compaction boundary.
+ * The compaction boundary is the anchor; marker-draining lag can place it after the array head.
+ * Drop the prefix because it belongs to an already compartmentalized range.
+ * An absent anchor makes ordinal assignment unverifiable.
+ * Without a boundary message ID, ordinal assignment is unverifiable.
  *
- * Live-verified byte-identical to the DB path on every boundary decision field
- * (offset, protectedTailStart, eligibleEndOrdinal, N, trueRawEligibleTokens,
- * arc fencing) across real sessions before the cutover.
  */
 export function buildTriggerInMemoryTail(
     db: Database,
@@ -225,8 +208,6 @@ function estimateProjectedPostDropPercentage(
 
     let droppableBytes = 0;
 
-    // 1. Pending user-queued drops (from ctx_reduce) — include both text and reasoning bytes
-    //    because dropping a message tag also clears its associated reasoning parts
     const pendingDrops = getPendingOps(db, sessionId).filter((op) => op.operation === "drop");
     const pendingDropTagIds = new Set(pendingDrops.map((op) => op.tagId));
     if (pendingDrops.length > 0) {
@@ -235,10 +216,6 @@ function estimateProjectedPostDropPercentage(
             .reduce((sum, tag) => sum + tag.byteSize + tag.reasoningByteSize, 0);
     }
 
-    // 2. Reasoning clearing: reasoning bytes on message tags between watermark and age cutoff.
-    //    (Phase 2 removed routine age-based tool drops — tool outputs are no longer
-    //    projected as droppable here. The tiered emergency drop fires only at the derived force band,
-    //    which is above this trigger's window, so it is intentionally not modeled.)
     const maxTag = activeTags.reduce((max, t) => Math.max(max, t.tagNumber), 0);
     if (
         canClearReasoning &&
@@ -248,9 +225,8 @@ function estimateProjectedPostDropPercentage(
         const reasoningAgeCutoff = maxTag - clearReasoningAge;
         for (const tag of activeTags) {
             if (tag.type !== "message") continue;
-            // Skip tags already fully counted in pending drops (text + reasoning)
+            // The reasoning-clear estimate excludes tags already counted in pending drops.
             if (pendingDropTagIds.has(tag.tagNumber)) continue;
-            // Only count reasoning not yet cleared (between watermark and age cutoff)
             if (tag.tagNumber <= clearedReasoningThroughTag) continue;
             if (tag.tagNumber > reasoningAgeCutoff) continue;
             if (tag.reasoningByteSize > 0) {
@@ -272,11 +248,8 @@ interface TailInfo {
     isMeaningful: boolean;
     tokenEstimate: number;
     /**
-     * True when the TC chunk scan exhausted its token budget before reaching
-     * the end of the eligible head — i.e. the chunked (U:/A:/TC:) content
-     * exceeds the scan budget. `tokenEstimate` saturates at the scan budget
-     * (the reader stops appending blocks at the cap), so THIS is the signal
-     * that the narratable content crossed the tail_size threshold.
+     * `tokenEstimate` saturates at the scan budget when content exceeds it.
+     * Budget exhaustion means narratable content exceeds the tail-size threshold.
      */
     chunkHasMore: boolean;
     trueRawEligibleTokens: number;
@@ -315,21 +288,6 @@ function getUnsummarizedTailInfo(
 ): TailInfo {
     return withRawSessionMessageCache(() => {
         try {
-            // Prime the scoped cache from MEMORY when the transform supplied its
-            // own `args.messages` tail (live-verified byte-identical to the DB
-            // read on every boundary decision field) — zero opencode.db reads.
-            // Otherwise prime with the TAIL-ONLY DB read so the boundary
-            // resolution and chunk scan below read only messages after the last
-            // compartment — never the whole session (the O(session) read that
-            // froze the JS event loop ~3s on a large session and made every
-            // parallel tool.definition hook measure multi-second durations). The
-            // boundary math is offset-forward only, so a tail slice anchored at
-            // lastCompartmentEnd+1 yields an identical trigger decision. Skipped
-            // (full read) when the protected-tail policy hasn't migrated to v3
-            // yet, because the one-time v3 seed (getLegacyProtectedTailStartOrdinal)
-            // scans ALL user-message parts; once seeded it never runs again.
-            // No-op for Pi (provider-backed) and in test/no-DB environments, and
-            // when no usable boundary anchor exists (falls through to full read).
             const memoryPrimed = inMemoryTail
                 ? primeInMemoryTailRawMessageCache({
                       sessionId,
@@ -441,8 +399,6 @@ export function checkCompartmentTrigger(
     const lazyInMemoryTail = typeof inMemoryTail === "function" ? inMemoryTail : undefined;
     let resolvedInMemoryTail = typeof inMemoryTail === "function" ? undefined : inMemoryTail;
 
-    // An in-memory tail is usable only after the one-time v3 seed, which needs
-    // the complete session. Before then, retain the provider-backed fallback.
     if (resolvedInMemoryTail) {
         try {
             const policyVersion = loadProtectedTailMeta(db, sessionId).protectedTailPolicyVersion;
@@ -452,20 +408,7 @@ export function checkCompartmentTrigger(
         }
     }
 
-    // Tag load-scoping floor (OpenCode only). Both tag scans below — the pre-gate
-    // upper-bound sum and the boundary's stored-token map — used to scan the
-    // whole session's tags (~100k rows → ~90ms combined every pass) to read data
-    // about only the live wire. Scope both reads to `tag_number >= floor`.
     //
-    // The caller (transform) passes `taggerFloorOverride` derived directly from
-    // the raw wire ids — that path is NOT gated on the compaction-marker anchor,
-    // so the floor stays live even on passes where `inMemoryTail` is undefined
-    // (post-restart / marker-drain lag, when `buildTriggerInMemoryTail` bails).
-    // Those were exactly the passes that regressed to the full ~90ms scan. Fall
-    // back to deriving from `inMemoryTail` (its leading ids) when no override is
-    // given, then to 0 (Pi / un-seeded migration path) → unchanged full scan.
-    // The floor only ever UNDER-estimates (lower = loads more), so the boundary
-    // cut stays byte-identical and the pre-gate bound stays a valid upper bound.
     const taggerFloor =
         taggerFloorOverride !== undefined && taggerFloorOverride > 0
             ? taggerFloorOverride
@@ -477,46 +420,12 @@ export function checkCompartmentTrigger(
                 )
               : 0;
 
-    // Cheap pre-gate (avoids the full raw tail inspection on every message.updated).
     //
-    // getUnsummarizedTailInfo resolves the protected-tail boundary and runs the
-    // TC chunk scan / true-raw token walk. Below the proactive floor, the ONLY
-    // triggers that can fire are the size-based ones (commit_clusters needs
-    // eligible TC-tokens ≥ triggerBudget; tail_size needs true-raw eligible ≥
-    // triggerBudget×MULT). The active+dropped tag token sum is a cheap,
-    // conservative UPPER BOUND on already-tagged eligible-tail tokens (eligible
-    // ⊆ the post-compaction live tail covered by active/dropped tags; any
-    // pre-boundary still-active tag only inflates it). When the transform passes
-    // an in-memory tail, it may include newest messages that run BEFORE tagging,
-    // so add a real per-message true-raw estimate for exactly those uncovered
-    // in-memory messages. Only trust the persisted bound when the tag store is
-    // fully backfilled (nullCount === 0); a cold/partial store undercounts and
-    // falls through to the authoritative path.
     const proactiveFloorForGate = getProactiveCompartmentTriggerPercentage(
         executeThresholdPercentage,
     );
     if (usage.percentage < proactiveFloorForGate) {
         try {
-            // Bound must include DROPPED tags: ctx_reduce/emergency drops
-            // remove tool output from the wire but the raw content still
-            // counts toward the historian's true-raw chunk size — an
-            // active-only bound undercounts after drops and suppresses real
-            // tail-size triggers. Scoped to the live-wire floor: a whole-session
-            // sum is a uselessly-loose bound AND leaves nullCount stuck at the
-            // legacy-row count forever (never backfilled), so the skip could never
-            // trigger; scoping makes it a tight valid upper bound with nullCount≈0.
-            // When there IS an in-memory tail, the scoped floor is safe: any live
-            // tag sitting below the floor has its owner message in `inMemoryTail`
-            // and is NOT in the (also-floor-scoped) covered-owner set, so
-            // estimateUntaggedInMemoryTailUpperBound charges its true-raw tokens —
-            // nothing is lost. But with NO in-memory tail (post-restart /
-            // marker-drain lag) there is no such compensation: a scoped bound would
-            // silently DROP the tokens of any live tool tag below the floor and
-            // could falsely cheap-skip a needed historian fire (context overflow).
-            // So fall back to floor 0 here — the full active+dropped sum is still a
-            // valid UPPER bound (pre-boundary tags only inflate it), just looser.
-            // A lazy source is supplied only after the caller has tagged the live
-            // wire, so its scoped persisted sum already covers the retained tail.
             const boundFloor = resolvedInMemoryTail || lazyInMemoryTail ? taggerFloor : 0;
             const { bound: persistedBound, nullCount } = getTriggerTagTokenUpperBound(
                 db,
@@ -533,9 +442,6 @@ export function checkCompartmentTrigger(
                       )
                     : 0;
                 const eligibleUpperBound = persistedBound + untaggedUpperBound;
-                // Smallest token floor any size trigger needs is triggerBudget
-                // (commit_clusters). tail_size needs even more. Equality falls
-                // through to preserve the existing conservative < semantics.
                 if (eligibleUpperBound < triggerBudget) {
                     const memorySuffix = resolvedInMemoryTail
                         ? ` (persisted=${persistedBound}, untagged-memory≤${untaggedUpperBound})`
@@ -548,8 +454,6 @@ export function checkCompartmentTrigger(
                 }
             }
         } catch (error) {
-            // Best-effort gate: any failure falls through to the authoritative
-            // (expensive) path, never changing behavior — only its cost.
             sessionLog(
                 sessionId,
                 `compartment trigger: cheap-gate skipped (falling through to full read): ${error instanceof Error ? error.message : String(error)}`,
@@ -577,13 +481,6 @@ export function checkCompartmentTrigger(
         taggerFloor,
     );
     if (!tailInfo.hasNewRawHistory) {
-        // Diagnostic data collection is best-effort. The helpers can throw if
-        // the OpenCode session DB is unavailable (e.g. in unit-test env or
-        // when the harness has not yet wired a RawMessageProvider). A throw
-        // here would propagate to the caller's try/catch and prevent
-        // downstream state updates (e.g. session-meta writes in event-handler
-        // line 542). Swallow any failure and log without the diagnostic
-        // fields so callers see no behavioral change.
         try {
             const lastCompartmentEnd = getLastCompartmentEndMessage(db, sessionId);
             sessionLog(
@@ -599,10 +496,6 @@ export function checkCompartmentTrigger(
         return { shouldFire: false };
     }
 
-    // Never project reclaimed reasoning unless this harness can actually clear
-    // it from the provider wire. The OpenCode fallback shares the sentinel
-    // predicate with the postprocess clearing path; Pi explicitly supplies its
-    // own provider-independent capability.
     const canClearReasoning =
         reasoningProjection?.canClearReasoning ??
         modelAcceptsEmptyContent(reasoningProjection?.providerID);
@@ -620,7 +513,6 @@ export function checkCompartmentTrigger(
     const forceMaterializationPercentage = escalationBands(
         executeThresholdPercentage,
     ).forceMaterializationPercentage;
-    // Force only at the threshold-derived band; below it the proactive path retains precedence.
     if (usage.percentage >= forceMaterializationPercentage) {
         if (
             projectedPostDropPercentage !== null &&
@@ -645,9 +537,6 @@ export function checkCompartmentTrigger(
             };
         }
         const scale = usage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE ? 0.25 : 0.5;
-        // Scaled re-resolution must read from the same source as the primary
-        // inspection: prime from the in-memory tail when supplied (zero DB
-        // reads), otherwise this rare force-band path does its own full read as before.
         const scaledBoundary = withRawSessionMessageCache(() => {
             if (resolvedInMemoryTail) {
                 primeInMemoryTailRawMessageCache({
@@ -677,7 +566,6 @@ export function checkCompartmentTrigger(
         return { shouldFire: false };
     }
 
-    // Commit-cluster trigger: N+ distinct work phases with commits, enough token volume
     const clusterEnabled = commitClusterTrigger?.enabled ?? true;
     const minClusters =
         commitClusterTrigger?.min_clusters ?? DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER;
@@ -697,22 +585,6 @@ export function checkCompartmentTrigger(
         };
     }
 
-    // Tail-size trigger: enough NARRATABLE material accumulated, regardless of
-    // pressure or commits. Measured on the TC-chunked estimate (U:/A:/TC:
-    // lines — what the historian actually condenses), NOT true-raw. NOTE: this
-    // is a deliberate two-axis split, do not re-unify. True-raw (tool outputs
-    // included) is the axis for the BOUNDARY and the pressure paths, because
-    // it measures wire occupancy. But firing tail_size on true-raw made
-    // tool-heavy sessions fire at 25% usage on a few file reads — each run
-    // narrating ~700 tokens of content into a confetti compartment (observed
-    // live: spans degraded 155 → 27 messages/compartment over one session).
-    // Under no pressure the agent is managing its own context (drops working);
-    // the historian shouldn't spawn until there's enough chunked data to make
-    // a properly-sized compartment. Tool-heavy-but-thin tails are covered by
-    // the pressure paths (proactive floor / force band), which fire on occupancy.
-    // The chunk scan budget IS the threshold (scanBudget = max(min-estimate,
-    // budget×multiplier)), so tokenEstimate saturates at the cap — "≥ cap OR
-    // the scan ran out of budget with more blocks remaining" is the complete
     // crossed-the-threshold signal.
     if (
         tailInfo.tokenEstimate >= triggerBudget * TAIL_SIZE_TRIGGER_MULTIPLIER ||
@@ -729,7 +601,6 @@ export function checkCompartmentTrigger(
         };
     }
 
-    // Pressure-driven trigger: context is near threshold and drops aren't enough
     const proactiveTriggerPercentage = getProactiveCompartmentTriggerPercentage(
         executeThresholdPercentage,
     );

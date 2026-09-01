@@ -1,8 +1,6 @@
 /**
- * Deterministic performance-only scale corpora: a profile fully defines an
- * ordered unlabeled document stream and its hash. Documents are yielded
- * lazily so the 1M scale never materializes, and nothing here carries or
- * accepts a relevance grade.
+ * A profile fully defines an ordered, unlabeled document stream and its hash.
+ * The generator yields documents lazily so the 1M scale never materializes and neither carries nor accepts relevance grades.
  */
 
 import { createHash } from "node:crypto";
@@ -11,9 +9,8 @@ import { type DocumentKind, SYNTHETIC_SCALES, type SyntheticProfile } from "./co
 
 export const SYNTHETIC_GENERATOR_VERSION = "synthetic-generator/v1";
 
-/** Practical per-document ceiling for the generator: schema-valid but
- *  enormous word counts would make even the first yielded document hang the
- *  consumer or exhaust memory. */
+/**
+ * */
 export const SYNTHETIC_MAX_WORDS_PER_DOCUMENT = 1_024;
 
 export interface SyntheticDocument {
@@ -23,7 +20,7 @@ export interface SyntheticDocument {
     body: string;
 }
 
-function splitmix32(seed: number): () => number {
+export function splitmix32(seed: number): () => number {
     let state = seed >>> 0;
     return () => {
         state = (state + 0x9e3779b9) >>> 0;
@@ -62,10 +59,8 @@ const WORDS = [
 
 export class SyntheticProfileError extends Error {}
 
-/** Generator invariants beyond the schema: version supported by THIS
- *  generator, non-empty source distribution, coherent text-size range.
- *  Release loading calls this so an unusable profile rejects at load time
- *  instead of failing mid-scale-run in a consumer. */
+/**
+ * */
 export function checkSyntheticProfile(profile: SyntheticProfile): void {
     if (profile.generatorVersion !== SYNTHETIC_GENERATOR_VERSION) {
         throw new SyntheticProfileError("unsupported-generator-version");
@@ -82,9 +77,8 @@ export function checkSyntheticProfile(profile: SyntheticProfile): void {
     if (Object.keys(profile.sourceDistribution).length === 0) {
         throw new SyntheticProfileError("empty-source-distribution");
     }
-    // Each weight is schema-checked positive and finite, but the SUM can
-    // still overflow to Infinity, which would silently send every draw to
-    // the last source kind instead of the approved distribution.
+    // A finite source weight sum can overflow to Infinity.
+    // An infinite total weight makes every draw select the last source kind.
     const totalWeight = Object.values(profile.sourceDistribution).reduce(
         (sum, weight) => sum + (weight ?? 0),
         0,
@@ -94,7 +88,7 @@ export function checkSyntheticProfile(profile: SyntheticProfile): void {
     }
 }
 
-/** Lazily yield the profile's ordered unlabeled document stream. */
+/* */
 export function* iterateSyntheticDocuments(
     profile: SyntheticProfile,
 ): Generator<SyntheticDocument> {
@@ -130,7 +124,7 @@ export function* iterateSyntheticDocuments(
     }
 }
 
-/** Ordered stream hash over the canonical JSON of every yielded document. */
+/** The hash covers each yielded document's canonical JSON in stream order. */
 export function syntheticStreamHash(profile: SyntheticProfile): string {
     const hash = createHash("sha256");
     for (const document of iterateSyntheticDocuments(profile)) {

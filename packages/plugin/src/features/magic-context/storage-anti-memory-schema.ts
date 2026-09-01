@@ -1,4 +1,4 @@
-/** Revision-bound payload for rejected-approach claims. */
+/* */
 
 import type { Database } from "../../shared/sqlite";
 import { ANTI_MEMORY_CATEGORY } from "./memory/constants.ts";
@@ -6,7 +6,6 @@ import { ANTI_MEMORY_CATEGORY } from "./memory/constants.ts";
 export const ANTI_MEMORY_TABLES = ["claim_anti_memory_revision_payloads"] as const;
 
 export function createAntiMemorySchema(db: Database): void {
-    // Interpolation is a compile-time constant, not caller input.
     // pi-lens-ignore: sql-injection
     db.exec(`
     CREATE TABLE claim_anti_memory_revision_payloads (

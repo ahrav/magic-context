@@ -18,14 +18,13 @@ afterEach(() => {
     try {
         rmSync(tempProjectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch {
-        /* Ignore EBUSY on Windows */
+        /* */
     }
 });
 
 describe("maybeWriteHistorianStateFile", () => {
     test("returns undefined when state is small enough to inline", () => {
-        // Below threshold means caller should inline, not offload. Avoids
-        // unnecessary FS writes for short prompts that fit comfortably in the
+        // States smaller than HISTORIAN_STATE_INLINE_THRESHOLD are inlined rather than offloaded.
         // HTTP body.
         const small = "x".repeat(HISTORIAN_STATE_INLINE_THRESHOLD - 1);
         expect(maybeWriteHistorianStateFile("ses_abc", small, tempProjectDir)).toBeUndefined();
@@ -39,9 +38,6 @@ describe("maybeWriteHistorianStateFile", () => {
     });
 
     test("writes large state to <project>/.cortexkit/magic-context/historian/", () => {
-        // The whole point of the project-local move: OpenCode's
-        // external_directory permission system trusts paths inside the project
-        // boundary. Confirm the file lands under .cortexkit/magic-context/historian/.
         const big = "y".repeat(HISTORIAN_STATE_INLINE_THRESHOLD + 1);
         const stateFile = maybeWriteHistorianStateFile("ses_abc", big, tempProjectDir);
         expect(stateFile).toBeDefined();
@@ -52,15 +48,12 @@ describe("maybeWriteHistorianStateFile", () => {
         expect(stateFile!).toMatch(/\.xml$/);
         expect(existsSync(stateFile!)).toBe(true);
         expect(readFileSync(stateFile!, "utf8")).toBe(big);
-        // The transient dump dir is git-ignored via a fenced .cortexkit/.gitignore.
         const gi = path.join(tempProjectDir, ".cortexkit", ".gitignore");
         expect(existsSync(gi)).toBe(true);
         expect(readFileSync(gi, "utf8")).toContain("magic-context/");
     });
 
     test("creates .cortexkit/magic-context/historian/ recursively on fresh project", () => {
-        // Fresh projects have no .cortexkit/ subtree at all. The helper must
-        // mkdir -p so it works without any prior setup.
         expect(existsSync(path.join(tempProjectDir, ".cortexkit"))).toBe(false);
         const big = "z".repeat(HISTORIAN_STATE_INLINE_THRESHOLD + 1);
         const stateFile = maybeWriteHistorianStateFile("ses_def", big, tempProjectDir);
@@ -71,10 +64,6 @@ describe("maybeWriteHistorianStateFile", () => {
     });
 
     test("returns undefined when directory is not writable (degrades gracefully)", () => {
-        // Caller falls back to inline when offload fails. Tests with a path
-        // that cannot be created — using a non-existent parent under a
-        // read-only ancestor would be unreliable across OSes, so we instead
-        // pass a path that fails on mkdir by using a regular file as the
         // project directory.
         const fileAsProject = path.join(tempProjectDir, "not-a-dir.txt");
         require("node:fs").writeFileSync(fileAsProject, "");
@@ -97,8 +86,7 @@ describe("cleanupHistorianStateFile", () => {
     });
 
     test("is safe to call when the file does not exist", () => {
-        // Best-effort cleanup — race between two concurrent runs or a manually
-        // deleted file must not crash the finally{} block in callers.
+        // Cleanup tolerates files deleted before cleanup.
         expect(() =>
             cleanupHistorianStateFile(path.join(tempProjectDir, "nonexistent.xml")),
         ).not.toThrow();

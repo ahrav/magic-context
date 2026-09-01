@@ -3,33 +3,28 @@
 mod lifecycle;
 mod napi_buffers;
 mod scheduling;
+mod setup;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-#[cfg(target_os = "linux")]
-use std::fs::OpenOptions;
-#[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
+use std::os::fd::BorrowedFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
 use mc_shm_transport::backend::ring::RingGrant;
-use mc_shm_transport::backend::ring::{ProducerReservation, Ring};
-#[cfg(target_os = "linux")]
-use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode};
+use mc_shm_transport::backend::ring::{ProducerError, ProducerReservation, Ring};
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
-#[cfg(target_os = "linux")]
-use mc_shm_transport::profile::ring_profile;
-use napi::bindgen_prelude::{Buffer, FnArgs, Function, Object};
-use napi::{sys, Env, Error, JsValue, Result, Status, Unknown, ValueType};
+use mc_shm_transport::profile::mc_host_ring_profile;
+use napi::bindgen_prelude::{AsyncTask, Buffer, FnArgs, Function, Object};
+use napi::{sys, Env, Error, JsValue, Result, Status, Task, Unknown, ValueType};
 use napi_derive::napi;
 
 use napi_buffers::ExternalRef;
 
-#[cfg(target_os = "linux")]
-const PROFILE: &str = "mc-host-test-ring-v1";
+const PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 
 /// The one bounded, redacted failure every malformed raw descriptor maps
 /// to. Grant bytes, pids, fds, and key names never reach error messages.
@@ -43,6 +38,15 @@ pub struct NativeTestPair {
     pub arena_bytes: u32,
 }
 
+#[napi(object)]
+pub struct NativeSetupOptions {
+    pub setup_socket: String,
+    pub key: Buffer,
+    pub daemon_id: Buffer,
+    pub daemon_ver: String,
+    pub timeout_ms: u32,
+}
+
 struct ActiveLease {
     identity: ReleaseIdentity,
     buffers: Vec<ExternalRef>,
@@ -53,7 +57,16 @@ struct ActiveProducer {
     buffers: Vec<ExternalRef>,
 }
 
+struct PendingChannel {
+    to_host: Box<Ring>,
+    from_host: Ring,
+    setup: Option<setup::PendingSetup>,
+    reservation: GrantReservation,
+}
+
 struct Channel {
+    // Field order is load-bearing: Rust drops fields in declaration order, so
+    // every reservation that borrows `to_host` is dropped before `to_host`.
     producers: HashMap<u32, ActiveProducer>,
     active: HashMap<u32, ActiveLease>,
     // Aliases whose detachment failed; retained so the channel entry (and its
@@ -64,6 +77,7 @@ struct Channel {
     next_producer: u32,
     next_lease: u32,
     closed: bool,
+    setup: Option<UnixStream>,
     // Held for its Drop: releasing the process-wide claim exactly when the
     // channel entry is removed keeps quarantined and alias-holding entries
     // reserved for as long as their mapping lives.
@@ -77,6 +91,7 @@ struct Channel {
 /// active on any thread is a concurrently duplicated descriptor on all of
 /// them.
 static ACTIVE_GRANTS: Mutex<BTreeSet<Vec<u8>>> = Mutex::new(BTreeSet::new());
+static NEXT_ENVIRONMENT: AtomicU64 = AtomicU64::new(1);
 
 struct GrantReservation {
     grants: [Vec<u8>; 2],
@@ -85,7 +100,6 @@ struct GrantReservation {
 impl GrantReservation {
     /// Atomically claims both lane grants; either grant already active
     /// anywhere in the process is a replayed or duplicated descriptor.
-    #[cfg(target_os = "linux")]
     fn claim(first: Vec<u8>, second: Vec<u8>) -> Result<Self> {
         let mut active = ACTIVE_GRANTS
             .lock()
@@ -113,10 +127,12 @@ impl Drop for GrantReservation {
 
 #[derive(Default)]
 struct Registry {
-    #[cfg(target_os = "linux")]
+    environment_generation: u64,
     next_channel: u32,
+    next_pending: u32,
     channels: HashMap<u32, Channel>,
-    #[cfg(target_os = "linux")]
+    pending: HashMap<u32, PendingChannel>,
+    reactor: Option<scheduling::Reactor>,
     cleanup_registered: bool,
 }
 
@@ -212,37 +228,45 @@ fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> R
     unsafe { value.cast::<String>() }.map_err(|_| cleared_descriptor_error(env))
 }
 
-#[cfg(target_os = "linux")]
-fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
+fn strict_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let ascii = text.as_bytes();
     if ascii.len() != N * 2 {
-        return Err(descriptor_error());
+        return None;
     }
     // Strict lowercase hexadecimal only, matching the host encoder;
     // `from_str_radix` would also admit uppercase and sign prefixes.
-    fn nibble(byte: u8) -> Result<u8> {
+    fn nibble(byte: u8) -> Option<u8> {
         match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            _ => Err(descriptor_error()),
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
         }
     }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = nibble(ascii[index * 2])? << 4 | nibble(ascii[index * 2 + 1])?;
     }
-    Ok(bytes)
+    Some(bytes)
 }
 
-#[cfg(target_os = "linux")]
-fn attach_ring(pid: u32, fd: i32, grant: RingGrant) -> Result<Ring> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("/proc/{pid}/fd/{fd}"))
-        .map_err(|_| error("shared-memory attachment failed"))?;
-    Ring::attach(OwnedFd::from(file), grant, SchedulingMode::ColdParkWake)
-        .map_err(|_| error("shared-memory attachment failed"))
+fn attach_ring(fds: [i32; 3], grant: RingGrant) -> Result<Ring> {
+    let mut descriptors = Vec::with_capacity(3);
+    for fd in fds {
+        // SAFETY: N-API caller retains each descriptor through this synchronous clone.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        descriptors.push(
+            borrowed
+                .try_clone_to_owned()
+                .map_err(|_| error("shared-memory attachment failed"))?,
+        );
+    }
+    Ring::attach(
+        descriptors
+            .try_into()
+            .map_err(|_| error("shared-memory attachment failed"))?,
+        grant,
+    )
+    .map_err(|_| error("shared-memory attachment failed"))
 }
 
 fn cleanup_created_refs(
@@ -333,6 +357,9 @@ fn detach_producer(
 
 fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
+    if let Some(mut setup) = channel.setup.take() {
+        setup::goodbye(&mut setup);
+    }
     let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();
     for token in producer_tokens {
         detach_producer(env, channel, token)?.abort();
@@ -347,6 +374,10 @@ fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
 
 fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
+    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime.
+    if let Some(mut setup) = channel.setup.take() {
+        setup::goodbye(&mut setup);
+    }
     channel.to_host.enter_quarantine();
     channel.from_host.enter_quarantine();
     let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();
@@ -361,7 +392,6 @@ fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn insert_channel(registry: &mut Registry, channel: Channel) -> Result<u32> {
     registry.next_channel = registry
         .next_channel
@@ -372,12 +402,15 @@ fn insert_channel(registry: &mut Registry, channel: Channel) -> Result<u32> {
     Ok(id)
 }
 
-#[cfg(target_os = "linux")]
 fn cleanup_env(raw_env: usize) {
     let raw_env = raw_env as napi::sys::napi_env;
     let env = Env::from_raw(raw_env);
     REGISTRY.with(|registry| {
         if let Ok(mut registry) = registry.try_borrow_mut() {
+            if let Some(mut reactor) = registry.reactor.take() {
+                reactor.shutdown();
+            }
+            registry.pending.clear();
             registry.channels.retain(|_, channel| {
                 if close_channel(&env, channel).is_err() {
                     // Env teardown offers no later retry, so a failed close
@@ -391,15 +424,19 @@ fn cleanup_env(raw_env: usize) {
                     && channel.active.is_empty()
                     && channel.stranded.is_empty())
             });
+            for (_, quarantined) in registry.channels.drain() {
+                // Process exit owns uncertain alias reclamation.
+                std::mem::forget(quarantined);
+            }
         }
     });
 }
 
-#[cfg(target_os = "linux")]
 fn ensure_cleanup(env: &Env, registry: &mut Registry) -> Result<()> {
     if registry.cleanup_registered {
         return Ok(());
     }
+    registry.environment_generation = NEXT_ENVIRONMENT.fetch_add(1, Ordering::Relaxed);
     let raw = env.raw() as usize;
     env.add_async_cleanup_hook(raw, cleanup_env)?;
     registry.cleanup_registered = true;
@@ -416,6 +453,20 @@ pub fn napi_version(env: &Env) -> Result<u32> {
     } else {
         Err(error("N-API version probe failed"))
     }
+}
+
+#[napi]
+pub fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+#[napi]
+pub fn build_target() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 #[napi]
@@ -469,19 +520,11 @@ pub fn active_channel_count() -> Result<u32> {
 
 #[napi]
 pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (env, descriptor);
-        return Err(error(
-            "shared-memory transport is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
     {
         const GRANT_HEX_LEN: usize = RingGrant::encoded_len() * 2;
         // The argument is decoded as a RAW value — before any bindgen
         // numeric narrowing or property coercion — and every check below
-        // runs before the first fd open, mapping, prefault, or registry
+        // runs before the first fd open, mapping, page touch, or registry
         // insertion, so a rejected descriptor has zero side effects.
         if descriptor.get_type().map_err(|_| descriptor_error())? != ValueType::Object {
             return Err(descriptor_error());
@@ -492,28 +535,67 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
         if profile != PROFILE {
             return Err(error("shared-memory profile is unavailable"));
         }
-        let pid = integer_field(env, &object, "pid", 1.0, f64::from(u32::MAX))? as u32;
-        let host_to_peer_fd =
-            integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32;
-        let peer_to_host_fd =
-            integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32;
-        let host_to_peer_grant = RingGrant::decode(decode_hex(&string_field(
-            env,
-            &object,
-            "hostToPeerGrant",
-            GRANT_HEX_LEN,
-        )?)?)
+        let host_to_peer_fds = [
+            integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32,
+            integer_field(
+                env,
+                &object,
+                "hostToPeerDataReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+            integer_field(
+                env,
+                &object,
+                "hostToPeerCapacityReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+        ];
+        let peer_to_host_fds = [
+            integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32,
+            integer_field(
+                env,
+                &object,
+                "peerToHostDataReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+            integer_field(
+                env,
+                &object,
+                "peerToHostCapacityReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+        ];
+        let host_to_peer_grant = RingGrant::decode(
+            strict_hex(&string_field(
+                env,
+                &object,
+                "hostToPeerGrant",
+                GRANT_HEX_LEN,
+            )?)
+            .ok_or_else(descriptor_error)?,
+        )
         .map_err(|_| descriptor_error())?;
-        let peer_to_host_grant = RingGrant::decode(decode_hex(&string_field(
-            env,
-            &object,
-            "peerToHostGrant",
-            GRANT_HEX_LEN,
-        )?)?)
+        let peer_to_host_grant = RingGrant::decode(
+            strict_hex(&string_field(
+                env,
+                &object,
+                "peerToHostGrant",
+                GRANT_HEX_LEN,
+            )?)
+            .ok_or_else(descriptor_error)?,
+        )
         .map_err(|_| descriptor_error())?;
         // Both directions form one duplex pair over two distinct backing
         // objects; an aliased fd or grant collapses them onto one ring.
-        if host_to_peer_fd == peer_to_host_fd || host_to_peer_grant == peer_to_host_grant {
+        let distinct = host_to_peer_fds
+            .into_iter()
+            .chain(peer_to_host_fds)
+            .collect::<BTreeSet<_>>();
+        if distinct.len() != 6 || host_to_peer_grant == peer_to_host_grant {
             return Err(descriptor_error());
         }
         // Exclusive active attachment: a grant already backing a live
@@ -524,8 +606,8 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             host_to_peer_grant.encode().to_vec(),
             peer_to_host_grant.encode().to_vec(),
         )?;
-        let from_host = attach_ring(pid, host_to_peer_fd, host_to_peer_grant)?;
-        let to_host = attach_ring(pid, peer_to_host_fd, peer_to_host_grant)?;
+        let from_host = attach_ring(host_to_peer_fds, host_to_peer_grant)?;
+        let to_host = attach_ring(peer_to_host_fds, peer_to_host_grant)?;
         REGISTRY.with(|registry| {
             let mut registry = registry
                 .try_borrow_mut()
@@ -542,6 +624,7 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    setup: None,
                     _reservation: Some(reservation),
                 },
             )
@@ -549,22 +632,168 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
     }
 }
 
+fn setup_error(failure: std::io::Error) -> Error {
+    if failure.kind() == std::io::ErrorKind::PermissionDenied {
+        error("shared-memory identity mismatch")
+    } else {
+        error("shared-memory setup failed")
+    }
+}
+
+pub struct BeginSetupTask {
+    setup_socket: String,
+    key: Vec<u8>,
+    daemon_id: Vec<u8>,
+    daemon_ver: String,
+    timeout: Duration,
+}
+
+impl Task for BeginSetupTask {
+    type Output = setup::PendingSetup;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        setup::begin_connect(
+            std::path::Path::new(&self.setup_socket),
+            &self.key,
+            &self.daemon_id,
+            &self.daemon_ver,
+            self.timeout,
+        )
+        .map_err(setup_error)
+    }
+
+    fn resolve(&mut self, env: Env, mut pending: Self::Output) -> Result<Self::JsValue> {
+        if pending.host_to_peer_grant == pending.peer_to_host_grant {
+            return Err(descriptor_error());
+        }
+        let reservation = GrantReservation::claim(
+            pending.host_to_peer_grant.encode().to_vec(),
+            pending.peer_to_host_grant.encode().to_vec(),
+        )?;
+        let [host_mapping, host_data, host_capacity, peer_mapping, peer_data, peer_capacity] =
+            pending.take_descriptors().map_err(setup_error)?;
+        let from_host = Ring::attach(
+            [host_mapping, host_data, host_capacity],
+            pending.host_to_peer_grant,
+        )
+        .map_err(|_| error("shared-memory attachment failed"))?;
+        let to_host = Ring::attach(
+            [peer_mapping, peer_data, peer_capacity],
+            pending.peer_to_host_grant,
+        )
+        .map_err(|_| error("shared-memory attachment failed"))?;
+        REGISTRY.with(|registry| {
+            let mut registry = registry
+                .try_borrow_mut()
+                .map_err(|_| error("native channel is busy"))?;
+            ensure_cleanup(&env, &mut registry)?;
+            registry.next_pending = registry
+                .next_pending
+                .checked_add(1)
+                .ok_or_else(|| error("native setup identity exhausted"))?;
+            let id = registry.next_pending;
+            registry.pending.insert(
+                id,
+                PendingChannel {
+                    to_host: Box::new(to_host),
+                    from_host,
+                    setup: Some(pending),
+                    reservation,
+                },
+            );
+            Ok(id)
+        })
+    }
+}
+
+pub struct FinishSetupTask {
+    pending_id: u32,
+    setup: Option<setup::PendingSetup>,
+}
+
+impl Task for FinishSetupTask {
+    type Output = UnixStream;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.setup
+            .take()
+            .ok_or_else(|| error("shared-memory setup failed"))?
+            .activate()
+            .map_err(setup_error)
+    }
+
+    fn resolve(&mut self, _env: Env, stream: Self::Output) -> Result<Self::JsValue> {
+        REGISTRY.with(|registry| {
+            let mut registry = registry
+                .try_borrow_mut()
+                .map_err(|_| error("native channel is busy"))?;
+            let pending = registry
+                .pending
+                .remove(&self.pending_id)
+                .ok_or_else(|| error("shared-memory setup was cancelled"))?;
+            insert_channel(
+                &mut registry,
+                Channel {
+                    producers: HashMap::new(),
+                    active: HashMap::new(),
+                    stranded: Vec::new(),
+                    to_host: pending.to_host,
+                    from_host: pending.from_host,
+                    next_producer: 0,
+                    next_lease: 0,
+                    closed: false,
+                    setup: Some(stream),
+                    _reservation: Some(pending.reservation),
+                },
+            )
+        })
+    }
+
+    fn reject(&mut self, _env: Env, failure: Error) -> Result<Self::JsValue> {
+        REGISTRY.with(|registry| {
+            if let Ok(mut registry) = registry.try_borrow_mut() {
+                registry.pending.remove(&self.pending_id);
+            }
+        });
+        Err(failure)
+    }
+}
+
+#[napi]
+pub fn connect_setup(options: NativeSetupOptions) -> AsyncTask<BeginSetupTask> {
+    AsyncTask::new(BeginSetupTask {
+        setup_socket: options.setup_socket,
+        key: options.key.to_vec(),
+        daemon_id: options.daemon_id.to_vec(),
+        daemon_ver: options.daemon_ver,
+        timeout: Duration::from_millis(u64::from(options.timeout_ms)),
+    })
+}
+
+#[napi]
+pub fn finish_setup(pending_id: u32) -> Result<AsyncTask<FinishSetupTask>> {
+    let setup = REGISTRY.with(|registry| {
+        let mut registry = registry
+            .try_borrow_mut()
+            .map_err(|_| error("native channel is busy"))?;
+        registry
+            .pending
+            .get_mut(&pending_id)
+            .and_then(|pending| pending.setup.take())
+            .ok_or_else(|| error("shared-memory setup was cancelled"))
+    })?;
+    Ok(AsyncTask::new(FinishSetupTask {
+        pending_id,
+        setup: Some(setup),
+    }))
+}
+
 #[napi]
 pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
-    #[cfg(not(target_os = "linux"))]
     {
-        let _ = env;
-        return Err(error(
-            "shared-memory test pair is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let profile = ring_profile(
-            HardwareProfileId::new(PROFILE).map_err(|_| error("test profile unavailable"))?,
-            SchedulingMode::ColdParkWake,
-        )
-        .map_err(|_| error("test profile unavailable"))?;
+        let profile = mc_host_ring_profile().map_err(|_| error("test profile unavailable"))?;
         let first_to_second = Ring::create(&profile, 1)
             .map_err(|_| error("shared-memory test pair creation failed"))?;
         let second_from_first = first_to_second
@@ -593,6 +822,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    setup: None,
                     // Test pairs attach freshly created local rings, never a
                     // host descriptor, so no process-wide grant is claimed.
                     _reservation: None,
@@ -609,6 +839,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    setup: None,
                     _reservation: None,
                 },
             )?;
@@ -656,7 +887,7 @@ pub fn produce(
                 header,
                 Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
             )
-            .map_err(|_| error("shared-memory reservation failed"))?;
+            .map_err(reservation_error)?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
         let built = (|| -> Result<()> {
@@ -722,7 +953,9 @@ pub fn reserve(
             return Err(error("native channel is closed"));
         }
         let ring_ptr: *const Ring = channel.to_host.as_ref();
-        // SAFETY: `to_host` remains allocated until all `producers` are dropped.
+        // SAFETY: `to_host` is boxed, so moving `Channel` does not move the
+        // ring. `producers` is declared before `to_host`, so every stored
+        // reservation drops before the ring on every Channel destruction path.
         let ring: &'static Ring = unsafe { &*ring_ptr };
         let reservation = ring
             .reserve_until(
@@ -730,7 +963,7 @@ pub fn reserve(
                 [0; WIRE_V2_HEADER_BYTES],
                 Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
             )
-            .map_err(|_| error("shared-memory reservation failed"))?;
+            .map_err(reservation_error)?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
         let built = (|| -> Result<()> {
@@ -829,6 +1062,100 @@ pub fn abort_reservation(env: &Env, channel_id: u32, token: u32) -> Result<()> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_drops_borrowing_reservations_before_the_ring() {
+        let profile = mc_host_ring_profile().expect("profile");
+        let to_host = Box::new(Ring::create(&profile, 1).expect("producer ring"));
+        let from_host = Ring::create(&profile, 2).expect("consumer ring");
+        let ring_ptr: *const Ring = to_host.as_ref();
+        // SAFETY: this mirrors `reserve`: `Channel` declares `producers` before
+        // `to_host`, so the stored reservation is destroyed first.
+        let ring: &'static Ring = unsafe { &*ring_ptr };
+        let reservation = ring
+            .reserve_until(
+                0,
+                [0; WIRE_V2_HEADER_BYTES],
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("reservation");
+        let mut producers = HashMap::new();
+        producers.insert(
+            1,
+            ActiveProducer {
+                reservation,
+                buffers: Vec::new(),
+            },
+        );
+        drop(Channel {
+            producers,
+            active: HashMap::new(),
+            stranded: Vec::new(),
+            to_host,
+            from_host,
+            next_producer: 1,
+            next_lease: 0,
+            closed: false,
+            setup: None,
+            _reservation: None,
+        });
+    }
+}
+
+#[napi]
+pub fn watch(channel_id: u32, callback: Function<(), ()>) -> Result<()> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry
+            .try_borrow_mut()
+            .map_err(|_| error("native channel is busy"))?;
+        if !registry.channels.contains_key(&channel_id) {
+            return Err(error("native channel is closed"));
+        }
+        if registry.reactor.is_none() {
+            registry.reactor = Some(scheduling::Reactor::new(callback)?);
+        }
+        let Registry {
+            channels, reactor, ..
+        } = &mut *registry;
+        let channel = channels
+            .get(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        reactor.as_mut().expect("reactor initialized").register(
+            channel_id,
+            &channel.from_host,
+            channel.setup.as_ref(),
+        )
+    })
+}
+
+#[napi]
+pub fn readiness_handled() -> bool {
+    REGISTRY.with(|registry| {
+        let Ok(registry) = registry.try_borrow() else {
+            return false;
+        };
+        let Some(reactor) = registry.reactor.as_ref() else {
+            return false;
+        };
+        let mut redispatch = false;
+        for (channel_id, channel) in &registry.channels {
+            if !reactor.is_registered(*channel_id) {
+                continue;
+            }
+            redispatch |= channel.from_host.complete_data_wait().is_err();
+            match channel.from_host.arm_data_wait() {
+                Ok(true) => {}
+                Ok(false) | Err(_) => redispatch = true,
+            }
+        }
+        reactor.handled();
+        redispatch
+    })
+}
+
 #[napi]
 pub fn poll(
     env: &Env,
@@ -839,6 +1166,9 @@ pub fn poll(
         let mut registry = registry
             .try_borrow_mut()
             .map_err(|_| error("native channel is busy"))?;
+        if let Some(reactor) = registry.reactor.as_ref() {
+            reactor.ensure_healthy()?;
+        }
         let channel = registry
             .channels
             .get_mut(&channel_id)
@@ -886,6 +1216,25 @@ pub fn poll(
         Ok(Some((token, header, views)))
     })?
     else {
+        REGISTRY.with(|registry| {
+            let registry = registry
+                .try_borrow()
+                .map_err(|_| error("native channel is busy"))?;
+            let channel = registry
+                .channels
+                .get(&channel_id)
+                .ok_or_else(|| error("native channel is closed"))?;
+            let should_block = channel
+                .from_host
+                .arm_data_wait()
+                .map_err(|_| error("shared-memory receive failed"))?;
+            if !should_block {
+                if let Some(reactor) = registry.reactor.as_ref() {
+                    reactor.kick();
+                }
+            }
+            Ok::<(), Error>(())
+        })?;
         return Ok(false);
     };
 
@@ -930,12 +1279,40 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
     })
 }
 
+/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal.
+fn reservation_error(failure: ProducerError) -> Error {
+    match failure {
+        ProducerError::Exhausted | ProducerError::Deadline => error("shared-memory ring is full"),
+        _ => error("shared-memory reservation failed"),
+    }
+}
+
+#[napi]
+pub fn peer_closed(channel_id: u32) -> Result<bool> {
+    REGISTRY.with(|registry| {
+        let registry = registry
+            .try_borrow()
+            .map_err(|_| error("native channel is busy"))?;
+        let channel = registry
+            .channels
+            .get(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        Ok(match channel.setup.as_ref() {
+            Some(stream) => setup::peer_closed(stream),
+            None => false,
+        })
+    })
+}
+
 #[napi]
 pub fn close(env: &Env, channel_id: u32) -> Result<()> {
     REGISTRY.with(|registry| {
         let mut registry = registry
             .try_borrow_mut()
             .map_err(|_| error("native channel is busy"))?;
+        if let Some(reactor) = registry.reactor.as_mut() {
+            reactor.unregister(channel_id);
+        }
         let channel = registry
             .channels
             .get_mut(&channel_id)
@@ -960,6 +1337,9 @@ pub fn force_close(env: &Env, channel_id: u32) -> Result<()> {
         let mut registry = registry
             .try_borrow_mut()
             .map_err(|_| error("native channel is busy"))?;
+        if let Some(reactor) = registry.reactor.as_mut() {
+            reactor.unregister(channel_id);
+        }
         let channel = registry
             .channels
             .get_mut(&channel_id)

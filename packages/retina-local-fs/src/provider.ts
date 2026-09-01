@@ -13,7 +13,7 @@ const execFileAsync = promisify(execFile);
 const SCALAR_VERSION = 1;
 
 interface PredicateAudit {
-    /** Authoring-time audit marker. False means the source was relative or absent at write time. */
+    /** resolved_path_exists is false when the source was relative or absent at write time. */
     resolved_path_exists?: boolean;
 }
 
@@ -405,7 +405,7 @@ export type ProviderConfigValidation =
     | { success: true; config: ProviderConfig }
     | { success: false; reason: string };
 
-/** The provider's declared config schema gate, shared with authoring clients. */
+/* */
 export function validateProviderConfig(input: unknown): ProviderConfigValidation {
     try {
         return { success: true, config: parseConfig(input) };
