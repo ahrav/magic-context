@@ -62,9 +62,10 @@ pub struct ResolutionLadder<'s> {
     graph_operations: Cell<u64>,
     /// Whether any resolution needed an object the database did not hold.
     saw_unreadable_object: Cell<bool>,
-    /// Memoized re-read of sparse and shallow state; `None` until a caller commentlint: allow(JUDGE)
-    /// that means to retain graph work asks. commentlint: allow(JUDGE)
-    repository_state_moved: Cell<Option<bool>>,
+    /// Sticky once movement is seen. Only that direction is memoized: a commentlint: allow(JUDGE)
+    /// boundary that matched before one walk says nothing about the boundary a commentlint: allow(JUDGE)
+    /// later walk ran under. commentlint: allow(JUDGE)
+    repository_state_moved: Cell<bool>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -78,7 +79,7 @@ impl<'s> ResolutionLadder<'s> {
             patch_id_cache: RefCell::new(HashMap::new()),
             graph_operations: Cell::new(0),
             saw_unreadable_object: Cell::new(false),
-            repository_state_moved: Cell::new(None),
+            repository_state_moved: Cell::new(false),
         }
     }
 
@@ -126,12 +127,23 @@ impl<'s> ResolutionLadder<'s> {
     /// therefore ask before retaining any graph-derived verdict, and the commentlint: allow(JUDGE)
     /// re-read happens once per request. commentlint: allow(JUDGE)
     pub fn repository_state_moved(&self) -> bool {
-        if let Some(moved) = self.repository_state_moved.get() {
-            return moved;
+        if self.repository_state_moved.get() {
+            return true;
         }
         let moved = !self.snapshot.repository_state_still_current(self.budget);
-        self.repository_state_moved.set(Some(moved));
+        if moved {
+            self.repository_state_moved.set(true);
+        }
         moved
+    }
+
+    /// Whether movement was already seen, without re-reading.
+    ///
+    /// A verdict that reused this request's graph work — through the anchor commentlint: allow(JUDGE)
+    /// memo or the anchor cache — inherits whatever the walk behind it ran commentlint: allow(JUDGE)
+    /// under, and performs no graph operations of its own to reveal it. commentlint: allow(JUDGE)
+    pub fn repository_state_movement_seen(&self) -> bool {
+        self.repository_state_moved.get()
     }
 
     fn count_graph_operation(&self) {

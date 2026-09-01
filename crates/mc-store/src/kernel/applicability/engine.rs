@@ -349,12 +349,30 @@ impl ApplicabilityEngine {
                 budget,
             );
             stats.graph_operations += ladder.graph_operations() - graph_ops_before;
-            // Only graph-derived verdicts depend on the sparse and shallow commentlint: allow(JUDGE)
-            // boundary, so a candidate that touched no graph stays cacheable commentlint: allow(JUDGE)
-            // and is not charged the re-read. commentlint: allow(JUDGE)
-            let cacheable = classification.cacheable
-                && !(ladder.graph_operations() > graph_ops_before
-                    && ladder.repository_state_moved());
+            // A candidate that walked the graph re-tests the boundary it ran
+            // under. One that did not can still have inherited a verdict from
+            // this request's earlier graph work, so it consults what has already
+            // been seen rather than paying another re-read.
+            let boundary_moved = if ladder.graph_operations() > graph_ops_before {
+                ladder.repository_state_moved()
+            } else {
+                ladder.repository_state_movement_seen()
+            };
+            // Re-reading that state consumes the budget, and an expired request
+            // owes `Uncertain` rather than a verdict it could auto-inject.
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted while classifying this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
+            let cacheable = classification.cacheable && !boundary_moved;
             // An uncacheable verdict has no cache entry, so its token could
             // never be confirmed; claiming a pending append would make read
             // repair re-append it on every request forever.
@@ -621,10 +639,12 @@ impl ApplicabilityEngine {
                 patch_id_algorithm: PATCH_ID_ALGORITHM,
             };
             let cached = lock(&self.anchor_cache).get(&key);
-            let outcome = match cached {
+            let (outcome, boundary_moved) = match cached {
                 Some(outcome) => {
                     stats.anchor_cache_hits += 1;
-                    outcome
+                    // A cached entry was gated at insert time, so the boundary
+                    // it was walked under is the one its key names.
+                    (outcome, false)
                 }
                 None => {
                     stats.anchor_cache_misses += 1;
@@ -638,15 +658,22 @@ impl ApplicabilityEngine {
                     // A moved boundary voids every outcome, uncertain or not: commentlint: allow(JUDGE)
                     // the reachability this walk saw is not the reachability commentlint: allow(JUDGE)
                     // the key names. commentlint: allow(JUDGE)
-                    let retain = !ladder.repository_state_moved()
+                    let boundary_moved = ladder.repository_state_moved();
+                    let retain = !boundary_moved
                         && (outcome != GitConditionOutcome::Uncertain || !transient);
                     if retain {
                         let _evicted = lock(&self.anchor_cache).insert(key, outcome);
                     }
-                    outcome
+                    (outcome, boundary_moved)
                 }
             };
-            batch_anchor_memo.insert(anchor_fingerprint, outcome);
+            // The memo carries no key, so a tainted outcome placed here would
+            // reach a later candidate that performs no graph work of its own
+            // and looks safe to cache. Such an outcome is not memoized; the
+            // next candidate walks again and re-tests the boundary it ran under.
+            if !boundary_moved {
+                batch_anchor_memo.insert(anchor_fingerprint, outcome);
+            }
             outcome
         };
         match outcome {

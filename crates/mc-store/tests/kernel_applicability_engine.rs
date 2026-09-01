@@ -2756,3 +2756,154 @@ fn a_graph_verdict_is_not_retained_when_the_shallow_boundary_moves() {
     assert_eq!(shared.stats.object_cache_hits, 0);
     assert_eq!(shared.stats.anchor_cache_hits, 1);
 }
+
+/// A boundary that matched before one walk says nothing about the boundary a
+/// later walk in the same batch ran under, so a successful validation must not
+/// be memoized. Only movement is sticky.
+#[test]
+fn a_later_walk_revalidates_the_boundary_the_earlier_one_matched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let shallow_file = fixture.repo.git_dir().join("shallow");
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let snapshot = checkout(&fixture, tip);
+
+    // First candidate walks under the boundary the key names, so it caches.
+    let engine = ApplicabilityEngine::new();
+    let first = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-first", base)),
+        ..candidate("object-first")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&first),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.anchor_cache_misses, 1);
+    assert_eq!(
+        engine
+            .evaluate_batch(
+                &snapshot,
+                &QueryContext::default(),
+                &ScopeMatchContext::new(),
+                std::slice::from_ref(&first),
+                &EvalBudget::unbounded(),
+            )
+            .stats
+            .object_cache_hits,
+        1,
+        "the first candidate's verdict was walked under the recorded boundary"
+    );
+
+    // Now deepen, as a concurrent fetch would, and walk a *different* anchor.
+    // A memoized success from the first walk would let this one be retained.
+    std::fs::remove_file(&shallow_file).unwrap();
+    let second = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-second", tip)),
+        ..candidate("object-second")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&second),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.anchor_cache_misses, 1);
+
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let again = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[second],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        again.stats.object_cache_hits, 0,
+        "a walk under a moved boundary was retained because an earlier walk had matched"
+    );
+    assert_eq!(again.stats.anchor_cache_hits, 0);
+}
+
+/// A candidate that performs no graph operations can still inherit a verdict
+/// from this request's earlier graph work through the batch anchor memo, so it
+/// cannot be treated as boundary-independent.
+#[test]
+fn a_candidate_sharing_a_tainted_anchor_verdict_is_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let shallow_file = fixture.repo.git_dir().join("shallow");
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let snapshot = checkout(&fixture, tip);
+    std::fs::remove_file(&shallow_file).unwrap();
+
+    // Two candidates share one anchor row, so the second resolves from the
+    // batch memo without touching the graph itself.
+    let engine = ApplicabilityEngine::new();
+    let batch: Vec<ApplicabilityCandidate> = (0..2)
+        .map(|index| ApplicabilityCandidate {
+            anchor: Some(reachable_anchor(&fixture, "anchor-shared", base)),
+            ..candidate(&format!("object-{index}"))
+        })
+        .collect();
+    let first = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &batch,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(first.objects.len(), 2);
+
+    // Restore the boundary the keys name. Neither candidate may be served,
+    // including the one whose verdict came from the memo.
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let again = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &batch,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        again.stats.object_cache_hits, 0,
+        "a candidate that inherited a tainted anchor verdict was retained"
+    );
+    assert_eq!(again.stats.anchor_cache_hits, 0);
+}
+
+/// Two capture representations of one commit disagree about what that commit
+/// looked like, and the fallback rungs conclude reachability from a
+/// representation matching. Keeping whichever decoded last lets the surviving
+/// one decide the verdict.
+#[test]
+fn duplicate_anchor_captures_are_uncertain_rather_than_last_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let honest = capture_anchor_representation(&fixture.repo, base, &EvalBudget::unbounded())
+        .expect("capture builds");
+    let mut conflicting = honest.clone();
+    conflicting.tree_oid = Some(tip.to_string());
+    let anchored = ApplicabilityCandidate {
+        anchor: Some(AnchorRowSpec {
+            anchor_id: "anchor-duplicate".to_string(),
+            anchor_kind: "reachable_from".to_string(),
+            reachable_from_oid: Some(base.to_string()),
+            payload: Some(encode_anchor_captures(&[honest, conflicting])),
+            ..AnchorRowSpec::default()
+        }),
+        ..candidate("object-duplicate-capture")
+    };
+    let batch = engine_batch(&snapshot, &anchored);
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::Uncertain,
+        "conflicting captures resolved instead of failing closed"
+    );
+    assert!(batch.objects[0].evidence.contains("two captures"));
+}
