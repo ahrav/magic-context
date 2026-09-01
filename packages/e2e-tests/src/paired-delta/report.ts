@@ -73,6 +73,8 @@ export interface PairedDeltaReportBody {
         healthyCoordinates: number;
         /** The dispatch's own verdict, recorded because the workflow archives this report even when the step fails. */
         evidenceComplete: boolean;
+        /** Which calibration artifact supplied the noise floors, so a reader can tell two dispatches apart. */
+        calibrationFingerprint: string | null;
     };
 }
 
@@ -301,6 +303,8 @@ export interface PairedDeltaCalibrationRecord {
     varianceEstablished: boolean;
     /** Recorded so a reader can recompute `decisions.poolSize` rather than trusting the number beside it. */
     targetMinimumDetectableDelta: number;
+    /** Analysable coordinates per scenario. Recorded because a family aggregate cannot show that every scenario in it was executed. */
+    scenarioDepth: Record<string, number>;
     measuredCostUsd: number;
     estimatedReserveUsd: number;
     /** Charges from superseded attempts of retried coordinates, which carry no cost source of their own on the surviving record. */
@@ -495,6 +499,11 @@ export function buildCalibrationRecord(input: {
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
         targetMinimumDetectableDelta: input.targetMinimumDetectableDelta,
+        scenarioDepth: Object.fromEntries(
+            [...input.scenarioFamilies.keys()]
+                .sort(compareCodeUnits)
+                .map((scenarioId) => [scenarioId, depthByScenario.get(scenarioId) ?? 0]),
+        ),
         /**
          * A series whose observations are identical does not establish zero population variance, it
          * establishes that the pilot was too small to see any. Sizing from that zero would claim the
@@ -598,7 +607,10 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
      * emits one floor per row, so the duplicate reaches `estimateFamilyDeltas` — which rejects a
      * repeated key. That rejection lands after the rollouts, leaving a paid run with no report.
      */
-    const covered = families.size > 0 && [...families].every((familyId) =>
+    const covered = families.size > 0 &&
+        /** The declared family count, so omitting a family — the noisiest one lowers the derived requirement — cannot pass by shrinking the expected set to the rows that remain. */
+        families.size === record.decisions?.familyCount &&
+        [...families].every((familyId) =>
         PRIMARY_ENDPOINTS.every((endpoint) =>
             measured.filter((noise) =>
                 noise.familyId === familyId && noise.endpoint === endpoint).length === 1));
@@ -618,8 +630,16 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     const depth = Number.isSafeInteger(record.decisions?.replicateCount)
         ? Math.max(2, record.decisions.replicateCount)
         : 2;
+    /** Per scenario, not per family: a family with two scenarios is satisfied by one of them at full depth if only the aggregate is checked. */
+    const perScenario = record.scenarioDepth as Record<string, number> | null | undefined;
+    const depthPerScenario = perScenario !== null && perScenario !== undefined &&
+        typeof perScenario === "object" &&
+        Object.keys(perScenario).length > 0 &&
+        Object.values(perScenario).every((count) =>
+            Number.isSafeInteger(count) && count >= depth);
     const consistent = record.runStatus === "completed" &&
         record.varianceEstablished === true &&
+        depthPerScenario &&
         measured.length > 0 &&
         measured.every((noise) => noise.observationCount >= depth && noise.variance > 0) &&
         covered &&

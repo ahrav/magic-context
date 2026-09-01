@@ -811,6 +811,8 @@ async function sessionUsage(
     harness: TestHarness,
     sessionId: string,
     pinned: { providerId: string; modelId: string },
+    /** Only R1 schedules a mock-served call, so the fixture route is exempt for that arm alone. */
+    mockRouteExpected: boolean,
 ): Promise<SessionUsage> {
     let usage = ZERO_USAGE;
     let offPinRoute: SessionUsage["offPinRoute"] = null;
@@ -846,8 +848,17 @@ async function sessionUsage(
                 cacheCreation: tokens.cache.write,
                 cacheRead: tokens.cache.read,
             };
-            /** The mock provider serves the R1 oracle turn by design, so it is neither billable nor an identity failure. */
-            if (route.providerId === "mock-anthropic") continue;
+            /**
+             * Only R1's scripted `ctx_search` turn is served by the fixture provider by design.
+             * A blanket exemption would let a historian or native-compaction child call that
+             * accidentally routed to the mock pass the identity gate and enter the experiment as
+             * live evidence, since the authored-response scan cannot see a child call.
+             */
+            if (route.providerId === "mock-anthropic") {
+                if (mockRouteExpected) continue;
+                if (offPinRoute === null) offPinRoute = route;
+                continue;
+            }
             if (route.providerId !== pinned.providerId || route.modelId !== pinned.modelId) {
                 if (offPinRoute === null) offPinRoute = route;
                 /**
@@ -1065,10 +1076,12 @@ export function createLiveDependencies(input: {
                     }
                     const last = responses.at(-1);
                     if (!last) throw new Error("scenario produced no live prompts");
-                    const ledger = await sessionUsage(harness, sessionId, {
-                        providerId: input.providerId,
-                        modelId: input.modelId,
-                    });
+                    const ledger = await sessionUsage(
+                        harness,
+                        sessionId,
+                        { providerId: input.providerId, modelId: input.modelId },
+                        coordinate.armId === "r1",
+                    );
                     /**
                      * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
                      * A rollout whose earlier turns were served by a fallback provider or snapshot produced its outcome, and its persisted memory, partly off the pin.
@@ -1158,10 +1171,12 @@ export function createLiveDependencies(input: {
                  * bound and the measurement is larger.
                  */
                 async usageOnFailure() {
-                    return (await sessionUsage(harness, activeSessionId ?? "", {
-                        providerId: input.providerId,
-                        modelId: input.modelId,
-                    })).usage;
+                    return (await sessionUsage(
+                        harness,
+                        activeSessionId ?? "",
+                        { providerId: input.providerId, modelId: input.modelId },
+                        coordinate.armId === "r1",
+                    )).usage;
                 },
                 async dispose() {
                     await harness.dispose();
@@ -1417,6 +1432,13 @@ async function runLive(args: CliArgs): Promise<void> {
             `${policy.costBudgetUsd[mode]}; an override may only lower it`,
         );
     }
+    /** `spawnOpencode` selects a different transform pipeline under `MC_E2E_MODE`, and neither that selection nor the Rust host is in the calibration scope, so a mode other than the default would share a binding with evidence measured against different code. */
+    const harnessMode = process.env.MC_E2E_MODE;
+    if (harnessMode !== undefined && harnessMode !== "" && harnessMode !== "ts") {
+        throw new Error(
+            `paired-delta live lane runs the OpenCode pipeline; MC_E2E_MODE is ${harnessMode}`,
+        );
+    }
     /** The provider block is keyed by the declared id but backed by the Anthropic SDK and credential, so another id would echo a provider the run never used. */
     if (model.providerId !== SUPPORTED_PROVIDER) {
         throw new Error(
@@ -1444,6 +1466,8 @@ async function runLive(args: CliArgs): Promise<void> {
             familyId: declaration.familyId,
         }));
     let noiseFloors: FamilyNoiseFloor[] = [];
+    /** Carried into the records binding and the report, so a dispatch cannot mix coordinates measured under two calibration artifacts. */
+    let calibrationFingerprint: string | null = null;
     if (mode !== "calibration") {
         if (!existsSync(args.calibrationRecordPath)) {
             throw new Error(
@@ -1505,6 +1529,22 @@ async function runLive(args: CliArgs): Promise<void> {
             );
         }
         noiseFloors = calibrationNoiseFloors(calibration);
+        calibrationFingerprint = calibration.recordFingerprint;
+        /** The record's own family set, not only its declared count: a record binding this policy could still have measured a different selection. */
+        const measuredFamilies = new Set(calibration.familyNoise.map(({ familyId }) => familyId));
+        const expected = new Set(
+            manifestFamilies
+                .filter(({ scenarioId }) => scenarioIdsForMode(manifest, "calibration").has(scenarioId))
+                .map(({ familyId }) => familyId),
+        );
+        if (
+            measuredFamilies.size !== expected.size ||
+            [...expected].some((familyId) => !measuredFamilies.has(familyId))
+        ) {
+            throw new Error(
+                "paired-delta calibration record does not cover the calibration pool's families",
+            );
+        }
     }
     const registry = buildPairedDeltaRegistry();
     /**
@@ -1548,11 +1588,11 @@ async function runLive(args: CliArgs): Promise<void> {
         {
             scenarios,
             poolManifestFingerprint: manifestFingerprint,
-            repoCommit: recordsRepoCommit([
+            repoCommit: `${recordsRepoCommit([
                 args.recordsPath,
                 args.reportPath,
                 args.calibrationRecordPath,
-            ]),
+            ])}${calibrationFingerprint === null ? "" : `-cal-${calibrationFingerprint}`}`,
             pinnedProviderId: model.providerId,
             pinnedSnapshotId: model.modelId,
             replicateCount: policy.replicateCount,
@@ -1635,6 +1675,7 @@ async function runLive(args: CliArgs): Promise<void> {
             plannedCoordinates,
             healthyCoordinates,
             evidenceComplete,
+            calibrationFingerprint,
         },
     });
     publishPairedDeltaReport(report, args.reportPath);

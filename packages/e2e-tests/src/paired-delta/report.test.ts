@@ -92,6 +92,7 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
             plannedCoordinates: 12,
             healthyCoordinates: 12,
             evidenceComplete: true,
+            calibrationFingerprint: null,
         },
         exclusions: [
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
