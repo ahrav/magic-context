@@ -1,12 +1,9 @@
 import { modelRefLookupOrder } from "./harness-provider-map";
 
-/** The built-in prompt-surface variants. */
+/* */
 export type PromptSurfacePreset = "full" | "light";
 
 /**
- * The configuration consumed by prompt-surface resolution. The schema adds
- * validation and defaults; this structural type keeps the resolver usable by
- * every host without importing a config loader.
  */
 export interface PromptSurfaceConfig {
     default?: PromptSurfacePreset;
@@ -31,7 +28,7 @@ export function promptSurfaceConfigIdentity(config: PromptSurfaceConfig | undefi
 
 export type PromptSurfaceResolutionSource = "exact" | "bare" | "wildcard" | "default";
 
-/** Validate bare model, provider/model, and provider/* routing keys. */
+/** The validator accepts bare model, provider/model, and provider/* routing keys. */
 export function isValidPromptSurfaceModelKey(key: string): boolean {
     if (key.length === 0 || key.trim() !== key) return false;
 
@@ -67,15 +64,12 @@ export interface ModelKeyCandidate {
 }
 
 /**
- * Return the same progressive model-key candidates used by cache_ttl. The
- * provider/model boundary is the first slash; the rest of the string remains
- * the model ID, including additional slashes. Candidates are case-sensitive.
+ * The lookup returns candidates from most to least specific.
+ * The model ID retains additional slashes, and candidate matching is case-sensitive.
  *
- * Known harness provider aliases are checked canonical-first at each specificity,
- * so one shared config works on every harness and canonical wins on collisions.
- * Provider wildcards are checked after progressively less-specific model keys,
- * but before the caller's default. That keeps an exact or base-model override
- * authoritative while still allowing `provider/*` to cover otherwise-unlisted
+ * The lookup checks `provider/*` after exact, base-model, and bare keys.
+ * Exact and base-model overrides take precedence over `provider/*`.
+ * A provider wildcard applies only when no exact, base-model, or bare key matches.
  * models.
  */
 export function modelKeyLookupOrder(modelKey: string | undefined): ModelKeyCandidate[] {
@@ -134,8 +128,6 @@ function resolveModelConfigValue<T>(
 }
 
 /**
- * Resolve the prompt preset for a model. Invalid or missing model keys use the
- * configured default and are reported as a default resolution rather than a
  * partial match.
  */
 export function resolvePromptSurface(
@@ -152,7 +144,7 @@ export function resolvePromptSurface(
     return { preset: fallback, source: "default" };
 }
 
-/** Resolve a cache_ttl-style value with the shared model-key walk. */
+/* */
 export function resolveModelConfigOrDefault<T>(
     values: Readonly<Record<string, T>>,
     modelKey: string | undefined,

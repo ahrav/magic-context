@@ -14,18 +14,7 @@ import {
 } from "./message-index";
 
 /**
- * Detect SQLite "database is locked" errors so the async indexer can
- * downgrade them to a one-line warning instead of a stack trace.
  *
- * Why we tolerate them: incremental indexing is best-effort. Any BUSY
- * conflict is fully recoverable by the next reconciliation pass (which
- * re-reads `last_indexed_ordinal` and indexes everything missed). A
- * single SQLITE_BUSY here just means another writer (concurrent
- * transform on a different session, dreamer task, second OpenCode
- * instance) held the WAL writer lock past our 5s `busy_timeout`.
- * Throwing turns a normal busy-window into a stack trace in user logs
- * without changing the eventual indexing outcome — reconciliation fills
- * in any missed rows automatically the next time
  * `scheduleReconciliation` runs.
  */
 function isDatabaseLockedError(error: unknown): boolean {
@@ -42,31 +31,11 @@ function isDatabaseLockedError(error: unknown): boolean {
 }
 
 /**
- * Event-driven message-history FTS indexing.
  *
- * v0.17 removes indexing from the `searchMessages()` hot path. Search now only
- * runs an FTS5 SELECT; writes happen through three asynchronous triggers:
  *
- * 1. Live incremental indexing: terminal `message.updated` events schedule a
- *    single-message read and `indexSingleMessage()` insert/replace. Events are
- *    debounced per message for 100ms and completed revisions are keyed by the
- *    source version plus normalized-content hash.
- * 2. Per-session lazy reconciliation: the first transform/hook touch schedules
- *    one catch-up pass. It reads raw messages, resumes from
- *    `message_history_index.last_indexed_ordinal`, rewinds from any recorded
- *    dirty floor left by a failed incremental write, inserts missing rows, and
- *    advances the watermark to `messages.length`.
- * 3. Revert/delete handling: `message.removed` clears all FTS rows + the
- *    watermark and then re-runs reconciliation. Searches during that rebuild
- *    window correctly see no message hits.
+ * Searches return no message hits until reconciliation completes.
  *
- * Concurrency: all writes for one session go through a module-scope async lock
- * (`sessionLocks`). Work for different sessions can run in parallel; work for
- * the same session chains behind the prior Promise, so reconciliation, live
- * inserts, and clear+rebuild cannot double-insert or race the watermark.
  *
- * Watermark semantics: `last_indexed_ordinal` means every message with ordinal
- * <= watermark has been processed (inserted when indexable, skipped otherwise).
  */
 
 const INCREMENTAL_DEBOUNCE_MS = 100;
@@ -135,7 +104,7 @@ function runWithSessionLock(
 
 function logIndexingError(sessionId: string, action: string, error: unknown): void {
     if (isDatabaseLockedError(error)) {
-        // Concise warning, no stack trace. Reconciliation catches up later.
+        // Database-lock failures leave skipped messages for later reconciliation.
         sessionLog(
             sessionId,
             `message FTS async ${action} skipped (database busy; will retry on next reconciliation)`,
@@ -182,9 +151,8 @@ async function reconcileSessionIndex(
             cursor = nextCursor;
 
             if (cursor < finalWatermark) {
-                // One bounded page is the maximum synchronous work per event-loop
-                // turn. The timer-backed await lets host I/O run before the next
-                // source read and writer transaction.
+                // Each reconciliation iteration processes at most `RECONCILIATION_BATCH_SIZE` messages before yielding.
+                // `yieldToEventLoop()` defers the next source read and writer transaction to a later event-loop turn.
                 await yieldToEventLoop();
             }
         }
@@ -283,9 +251,6 @@ export function scheduleClearAndReindex(
     scheduleAfterBootQuiet(() => {
         defer(() => {
             void runWithSessionLock(sessionId, () => {
-                // An older boot-quiet reconciliation can finish after this clear was
-                // scheduled, so invalidate process state under the same session lock
-                // that clears the durable index.
                 reconciledSessions.delete(sessionId);
                 clearCompletedIncrementalKeys(sessionId);
                 clearIndexedMessages(db, sessionId);

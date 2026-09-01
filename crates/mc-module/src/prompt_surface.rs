@@ -100,11 +100,8 @@ pub struct GuidanceAsset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSurfaceSelection {
     pub model_key: Option<String>,
-    /// Caller-computed identity of the live prompt-surface config generation.
-    /// It participates only in materialization freezing, never provider-visible epochs.
     pub config_identity: String,
     pub preset: PromptSurfacePreset,
-    /// Complete trusted user-authored primary guidance bytes, resolved by the host.
     pub guidance_override: Option<String>,
     pub tool_descriptions: BTreeMap<String, String>,
 }
@@ -192,8 +189,7 @@ pub fn module_tools(selection: &PromptSurfaceSelection) -> Vec<Tool> {
                 CTX_REDUCE_DESCRIPTION.to_string(),
             )),
             execution_mode: ExecutionMode::Pure,
-            // This exact advertised shape is the Thalamus authorization contract. Prompt-surface
-            // selection may replace only the top-level description.
+            // `PromptSurfaceSelection` may replace only top-level tool descriptions.
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -242,9 +238,6 @@ pub fn selection_freeze_identity(selection: &PromptSurfaceSelection) -> String {
         return selection.config_identity.clone();
     }
 
-    // Older callers did not send an explicit config generation. Derive a stable
-    // compatibility key from the selected bytes so live preset/override changes
-    // still reselect while unchanged requests remain frozen.
     let mut hasher = Sha256::new();
     hash_part(&mut hasher, "preset", selection.preset.as_str());
     if let Some(guidance) = &selection.guidance_override {
@@ -284,9 +277,6 @@ pub fn guidance_content_hash(text: &str, preset: PromptSurfacePreset) -> String 
     hex_digest(hasher.finalize())
 }
 
-/// Combine guidance and manifest identities before deriving the render identity. Full prompts
-/// without overrides return the empty sentinel so legacy and default sessions retain their exact
-/// pre-prompt-surface render identity.
 pub fn unified_content_epoch(
     system_prompt_hash: &str,
     selection: &PromptSurfaceSelection,

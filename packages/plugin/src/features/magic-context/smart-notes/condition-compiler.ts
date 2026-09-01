@@ -22,7 +22,7 @@ export interface ConditionPathResolution {
 }
 
 export interface ConditionCompilerOptions {
-    /** Filesystem root used to resolve relative paths and default repository predicates. */
+    /** projectPath is the filesystem root for relative paths and default repository predicates. */
     projectPath: string;
     homeDirectory?: string;
     now?: () => number;
@@ -39,8 +39,8 @@ type RawPredicate =
 const VALUE = String.raw`(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)`;
 
 /**
- * Compile only the pinned deterministic local-fs phrases. Any prose outside
- * this grammar remains plain so the existing dreamer evaluator keeps custody.
+ * compileSurfaceCondition compiles only deterministic local filesystem phrases.
+ * Prose outside the grammar returns { status: "plain" }.
  */
 export async function compileSurfaceCondition(
     surfaceCondition: string,

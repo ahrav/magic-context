@@ -21,10 +21,8 @@ export function getOpenCodeCommandInvocation(
     }
 
     const command = process.env.ComSpec?.trim() || process.env.COMSPEC?.trim() || "cmd.exe";
-    // cmd.exe needs the /c payload as one outer-quoted command string. Pass the
-    // binary through the child environment so percent signs in a valid path are
-    // not treated as another variable expansion. Current callers only supply the
-    // fixed `--version` and `models` arguments.
+    // cmd.exe requires an outer-quoted command string after /c.
+    // The child environment supplies the binary so percent signs in its path cannot trigger variable expansion.
     const commandLine = [`%${OPENCODE_BINARY_ENV}%`, ...args].map((part) => `"${part}"`).join(" ");
     return {
         command,
@@ -35,10 +33,6 @@ export function getOpenCodeCommandInvocation(
 }
 
 /**
- * Run `opencode <args>`. If a `binary` path is given (an absolute path resolved
- * for a stock `~/.opencode/bin` install or a version-manager shim that is not on
- * PATH), invoke that exact path; otherwise fall back to a bare
- * `opencode` on PATH.
  */
 function runOpenCode(args: string[], binary?: string | null, timeoutMs?: number): string | null {
     try {
@@ -62,8 +56,7 @@ function runOpenCode(args: string[], binary?: string | null, timeoutMs?: number)
 }
 
 /**
- * Version probes must be bounded because a broken shim can wait forever. The
- * doctor probes every detected install, so a per-process timeout is important.
+ * A 2,000 ms timeout prevents broken shims from blocking version probes indefinitely.
  */
 export const OPENCODE_VERSION_PROBE_TIMEOUT_MS = 2_000;
 
@@ -76,7 +69,7 @@ export interface OpenCodeInstallationReport extends OpenCodeInstallation {
     active: boolean;
 }
 
-/** Probe versions for all detected installs, retaining the detection order. */
+/** The report preserves detection order and probes only CLI installations. */
 export function describeOpenCodeInstallations(
     installations: OpenCodeInstallation[],
 ): OpenCodeInstallationReport[] {

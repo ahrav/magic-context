@@ -1,12 +1,5 @@
-// Drive the deterministic mural pipeline (resolve → gate → render) against the
-// live context.db for one or more project identities, without touching the
-// running plugin process. Writes PNGs next to this script's output dir and
-// reports dimensions, token cost, and gate decisions so renderer changes can be
-// verified on real pools before any restart picks them up organically.
 //
-// Usage: bun packages/plugin/scripts/test-mural-render.ts [projectIdentity ...]
-// With no args, tests every project that has at least one active memory cue
-// plus the projects present in mural_manifest (so gate-skips are visible too).
+// Run this script with `bun packages/plugin/scripts/test-mural-render.ts [projectIdentity ...]`.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -48,9 +41,6 @@ const identities =
           ).map((row) => row.project_path);
 
 for (const identity of identities) {
-    // Same policy gate production uses: the mural is an automatic injection
-    // channel, so even this offline render tool must not draw policy-hidden
-    // content into a PNG.
     const projectIds = resolveProjectIdsForIdentities(db, [identity]);
     const state =
         projectIds.length > 0
@@ -66,8 +56,6 @@ for (const identity of identities) {
     }
     const entries = resolveMural(db, identity, undefined, pool);
     if (entries.length === 0) {
-        // Mirrors ensureMuralRendered: every memory fits the m0 budget, so there
-        // is no overflow to visualize and production emits no mural block.
         console.log(`${header} → NO MURAL (overflow pool empty; all memories fit the m0 budget)`);
         continue;
     }

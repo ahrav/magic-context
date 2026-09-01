@@ -1,5 +1,3 @@
-/// <reference types="bun-types" />
-
 import { describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -9,14 +7,6 @@ import {
     readRawSessionTailFromDb,
 } from "./read-session-raw";
 import { buildTrueRawTokenIndex, computeRawRangeFingerprint } from "./read-session-true-raw-tokens";
-
-// Locks the O(tail) protected-tail read: reading only the messages after the
-// last compartment boundary (anchored at the marker) must produce the exact same
-// boundary inputs as reading the whole session. Two invariants:
-//   1. readRawSessionTailFromDb == the full reader's tail slice (ids, absolute
-//      ordinals, parts, version) and reports the correct absolute count.
-//   2. buildTrueRawTokenIndex over the tail slice (with absoluteMessageCount)
-//      gives byte-identical offset-forward results vs the full-array index.
 
 function makeDb(): Database {
     const db = new Database(":memory:");
@@ -86,19 +76,14 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
             const full = readRawSessionMessagesFromDb(db, SES);
             expect(full.length).toBe(40);
 
-            // Pretend the last compartment ended at ordinal 30 (anchor = the
-            // message at that ordinal).
             const base = 30;
             const anchorId = full[base - 1].id;
             const tail = readRawSessionTailFromDb(db, SES, base, anchorId);
             expect(tail).not.toBeNull();
             if (!tail) return;
 
-            // Absolute count == what the full reader produced.
             expect(tail.absoluteMessageCount).toBe(full.length);
 
-            // The tail slice == full[base-1 ..] (inclusive of the anchor),
-            // identical ids / absolute ordinals / parts / version.
             const expected = full.slice(base - 1);
             expect(tail.messages.length).toBe(expected.length);
             for (let i = 0; i < expected.length; i += 1) {
@@ -109,7 +94,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
                     JSON.stringify(expected[i].parts),
                 );
             }
-            // First tail ordinal is the anchor's absolute ordinal (== base).
             expect(tail.messages[0].ordinal).toBe(base);
         } finally {
             closeQuietly(db);
@@ -134,7 +118,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
                 absoluteMessageCount: tail.absoluteMessageCount,
             });
 
-            // Absolute count matches.
             expect(tailIdx.rawMessageCount).toBe(fullIdx.rawMessageCount);
 
             const offset = base; // offset-forward queries start at the boundary
@@ -143,13 +126,9 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
                 expect(tailIdx.messageIdAtOrdinal(o)).toBe(fullIdx.messageIdAtOrdinal(o));
                 expect(tailIdx.suffixTokensFromOrdinal(o)).toBe(fullIdx.suffixTokensFromOrdinal(o));
             }
-            // findSuffixStartForTokens can return a cut BELOW the offset when the
-            // requested token target exceeds the eligible-tail total (it would
-            // need pre-boundary messages). The boundary resolver always clamps
-            // this via `Math.max(boundary, runtimeFloor)` with runtimeFloor >=
-            // offset, so the contract that matters is "equal AFTER clamping to
-            // offset" — which holds because for any cut >= offset the full and
-            // tail prefix differences are identical (the pre-offset sum cancels).
+            // `findSuffixStartForTokens` can return a cut below `offset` when the requested target exceeds the eligible-tail token total.
+            // The boundary resolver clamps cuts with `Math.max(boundary, runtimeFloor)` because oversized targets can otherwise select pre-boundary messages.
+            // The tail and full indexes have equal prefix differences after `offset` because their shared pre-offset sum cancels.
             for (const tokens of [1, 500, 2_000, 10_000, 100_000]) {
                 expect(Math.max(offset, tailIdx.findSuffixStartForTokens(tokens))).toBe(
                     Math.max(offset, fullIdx.findSuffixStartForTokens(tokens)),
@@ -189,8 +168,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
             const dbTail = readRawSessionTailFromDb(db, SES, base, anchorId);
             if (!dbTail) throw new Error("tail null");
 
-            // Simulate the transform's args.messages: OpenCode hands the
-            // post-marker tail (anchor onward) as in-memory objects.
             const views = msgs.slice(base - 1).map((m) => ({
                 id: m.id,
                 role: m.role,
@@ -216,7 +193,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
                 expect(mem.messages[i].parts.length).toBe(dbTail.messages[i].parts.length);
             }
 
-            // Token index byte-identity over both sources.
             const opts = { providerShapeVersion: "opencode-v1" as const };
             const dbIdx = buildTrueRawTokenIndex(SES, dbTail.messages, {
                 ...opts,
@@ -233,8 +209,7 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
                 expect(memIdx.suffixTokensFromOrdinal(o)).toBe(dbIdx.suffixTokensFromOrdinal(o));
             }
 
-            // Content-stable fingerprint identity (the staleness check must not
-            // reject a memory-derived snapshot when revalidating from the DB).
+            // The fingerprint must remain content-stable so DB revalidation accepts memory-derived snapshots.
             expect(computeRawRangeFingerprint(mem.messages, base, full.length + 1)).toBe(
                 computeRawRangeFingerprint(dbTail.messages, base, full.length + 1),
             );
@@ -245,7 +220,7 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
 
     it("in-memory converter: marker lag drops the pre-anchor prefix; anchor-absent returns anchorFound=false; no-compartment starts at 1", () => {
         const msgs = buildSession(12);
-        // Marker lag: args.messages starts BEFORE the anchor (extra older rows).
+        // `args.messages` can include rows preceding the anchor.
         const anchorIdx = 4; // anchor = 5th message
         const lagged = msgs.map((m) => ({ id: m.id, role: m.role, parts: m.parts }));
         const laggedResult = buildInMemoryTailRawMessages({
@@ -261,7 +236,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
         expect(laggedResult.messages.length).toBe(msgs.length - anchorIdx);
         expect(laggedResult.absoluteMessageCount).toBe(200 + (msgs.length - anchorIdx) - 1);
 
-        // Anchor absent → anchorFound=false (caller falls back to DB path).
         const absent = buildInMemoryTailRawMessages({
             messages: lagged,
             lastCompartmentEnd: 200,
@@ -270,7 +244,7 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
         if (!absent) throw new Error("absent null");
         expect(absent.anchorFound).toBe(false);
 
-        // No-compartment session: ordinals from 1 over the whole array.
+        // For sessions without compartments, the reader assigns ordinals from 1 across the whole array.
         const fresh = buildInMemoryTailRawMessages({
             messages: lagged,
             lastCompartmentEnd: 0,
@@ -280,8 +254,8 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
         expect(fresh.messages[0].ordinal).toBe(1);
         expect(fresh.absoluteMessageCount).toBe(msgs.length);
 
-        // Summary rows are filtered BEFORE ordinal assignment; malformed rows
-        // keep their ordinal slot without an element (DB reader contract).
+        // The reader assigns ordinals before filtering summary rows.
+        // The DB reader preserves each filtered summary row's ordinal slot without returning an element.
         const withNoise = [
             { id: "n-1", role: "user", parts: [{ type: "text", text: "a" }] },
             { id: "n-sum", role: "assistant", summary: true, finish: "stop", parts: [] },
@@ -309,7 +283,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
                 { id: "m-0008", role: "assistant", parts: [{ type: "text", text: "reply" }] },
             ]);
             const full = readRawSessionMessagesFromDb(db, SES);
-            // Summary row filtered → 7 real messages, contiguous ordinals 1..7.
             expect(full.length).toBe(7);
             expect(full.some((m) => m.id === "m-sum")).toBe(false);
 
@@ -318,7 +291,6 @@ describe("tail read equivalence (O(tail) protected-tail read)", () => {
             const tail = readRawSessionTailFromDb(db, SES, base, anchorId);
             if (!tail) throw new Error("tail null");
             expect(tail.absoluteMessageCount).toBe(7);
-            // tail = ordinals 5,6,7 (anchor inclusive), summary excluded.
             expect(tail.messages.map((m) => m.ordinal)).toEqual([5, 6, 7]);
             expect(tail.messages.some((m) => m.id === "m-sum")).toBe(false);
         } finally {

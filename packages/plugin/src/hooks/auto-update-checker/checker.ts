@@ -159,16 +159,14 @@ function findPackageJsonUp(startPath: string): string | null {
                         JSON.parse(readFileSync(pkgPath, "utf-8")),
                     );
                     if (pkg.success && pkg.data.name === PACKAGE_NAME) return pkgPath;
-                } catch {
-                    // Continue walking upward.
-                }
+                } catch {}
             }
             const parent = dirname(dir);
             if (parent === dir) break;
             dir = parent;
         }
     } catch {
-        // Missing path or unreadable package metadata.
+        // statSync failures return null.
     }
     return null;
 }
@@ -380,8 +378,6 @@ export async function preparePluginUpdate(
     if (!preflight) return null;
     const spec = `${PACKAGE_NAME}@${version}`;
 
-    // Prefer OpenCode's own installer for global entries. It owns cache naming
-    // and installs both server and TUI trees before patching either config.
     const globalServerPaths = [USER_OPENCODE_CONFIG, USER_OPENCODE_CONFIG_JSONC];
     const globalTuiPaths = globalServerPaths.map((path) => join(dirname(path), "tui.json"));
     globalTuiPaths.push(...globalServerPaths.map((path) => join(dirname(path), "tui.jsonc")));
@@ -392,16 +388,9 @@ export async function preparePluginUpdate(
             return { spec, configPaths: paths };
         }
         restoreConfigs(preflight);
-        // A resolved command that failed or patched only one surface is not
-        // retried manually: both snapshots remain restored and no update-ready
-        // announcement is emitted. Manual fallback is only for ENOENT/path
-        // resolution failure, where the host installer never ran.
         if (hostResult.resolved) return null;
     }
 
-    // Manual fallback is deliberately config-only. OpenCode installs the exact
-    // spec into its own new cache directory at the next boot; this code never
-    // guesses cache names or mutates an active cache tree.
     const snapshots = preflightConfigUpdates(paths, version);
     if (!snapshots) return null;
     try {
@@ -433,9 +422,7 @@ export function getCachedVersion(_spec?: string | null): string | null {
                 if (!_spec) cachedPackageVersion = pkg.data.version;
                 return pkg.data.version;
             }
-        } catch {
-            // Try the next known OpenCode cache location.
-        }
+        } catch {}
     }
 
     return null;
@@ -449,11 +436,6 @@ export function updatePinnedVersion(
     try {
         if (!existsSync(configPath)) return false;
 
-        // Validate the version before substituting it verbatim into the user's
-        // config. newVersion comes from the npm registry envelope (Zod-parsed as
-        // a shape, but not as semver), so a malformed/crafted value must never
-        // reach the JSONC. Shared strict-semver check (same guard the auto-update
-        // prepare path uses).
         if (!isValidSemver(newVersion)) {
             warn(`[auto-update-checker] Refusing to pin invalid version "${newVersion}"`);
             return false;
@@ -472,11 +454,6 @@ export function updatePinnedVersion(
         const updatedContent = content.replace(entryRegex, `$1${newEntry}$1`);
         if (updatedContent === content) return false;
 
-        // Atomic write: stage to a temp file in the same directory then rename.
-        // A direct writeFileSync that crashes mid-write would truncate the
-        // user's OpenCode config (which holds all their plugin/model settings).
-        // rename is atomic on the same filesystem, so a crash leaves either the
-        // old or the new file intact — never a half-written one.
         const tmpPath = `${configPath}.mc-tmp-${process.pid}`;
         writeFileSync(tmpPath, updatedContent, "utf-8");
         renameSync(tmpPath, configPath);

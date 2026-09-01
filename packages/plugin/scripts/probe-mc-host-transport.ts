@@ -144,7 +144,6 @@ function codecProxy(value: unknown, samples: number): {
         try {
             JSON.parse(serialized);
         } catch {
-            // Benchmark round-trip of freshly stringified data. commentlint: allow(JUDGE)
         }
         parseSamples.push(performance.now() - startedAt);
     }
@@ -719,9 +718,7 @@ console.log(
     ),
 );
 
-// Let buffered stdout drain before terminating: process.exit() truncates a
-// large report when stdout is a pipe or file. The empty write's callback
-// fires only after everything queued before it has been flushed.
+// process.exit() can truncate piped or file output, so wait for an empty stdout write callback.
 await new Promise<void>((resolveFlush) => {
     process.stdout.write("", () => resolveFlush());
 });

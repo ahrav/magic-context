@@ -1,4 +1,3 @@
-# Shown on each interactive shell in the setup sandbox. Sourced from .bashrc.
 cat <<'BANNER'
 
   Magic Context: setup/doctor sandbox  (published @latest)

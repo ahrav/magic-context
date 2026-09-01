@@ -86,10 +86,7 @@ function attachRawPartVersion(value: unknown, timeUpdated: number | undefined): 
             enumerable: false,
             configurable: true,
         });
-    } catch {
-        // Non-extensible provider objects are rare; the recursive byte-length
-        // fingerprint still catches content changes when metadata cannot attach.
-    }
+    } catch {}
     return value;
 }
 
@@ -115,9 +112,6 @@ export function readRawSessionMessagesFromDb(db: Database, sessionId: string): R
         partsByMessageId.set(part.message_id, list);
     }
 
-    // Filter out compaction summary messages injected by magic-context.
-    // These exist only for OpenCode's filterCompacted boundary and must not
-    // be visible to historian, trigger evaluation, FTS indexing, or ctx_expand.
     const filtered = messageRows.filter(
         (row) => !isRawCompactionSummaryInfo(parseJsonRecord(row.data)),
     );
@@ -142,9 +136,7 @@ interface PagedRawMessageRow extends RawMessageRow {
 }
 
 /**
- * Read one bounded page from the canonical raw-message ordinal space. Message
- * and part JSON parsing is limited to the requested page so background FTS work
- * cannot monopolize the event loop by hydrating an entire long session.
+ * The page limit bounds JSON parsing and per-call work.
  */
 export function readRawSessionMessagePageFromDb(
     db: Database,
@@ -234,9 +226,7 @@ export function countRawSessionMessageOrdinalsFromDb(db: Database, sessionId: st
 }
 
 /**
- * Read the canonical raw-message ordinal space without loading or parsing part rows.
- * Keep the ordering, summary predicate, and malformed-message behavior identical to
- * `readRawSessionMessagesFromDb`; consumers compare these ordinals across passes.
+ * readRawSessionMessageIdOrdinalsFromDb preserves readRawSessionMessagePageFromDb's ordering, summary predicate, and malformed-message behavior.
  */
 export function readRawSessionMessageIdOrdinalsFromDb(
     db: Database,
@@ -259,7 +249,7 @@ export function readRawSessionMessageIdOrdinalsFromDb(
     return ordinalById;
 }
 
-/** Read a keyset page used to incrementally maintain shadow message ordinals. */
+/** The keyset page supports incremental maintenance of shadow message ordinals. */
 export function readRawSessionMessageOrdinalPageFromDb(
     db: Database,
     sessionId: string,
@@ -302,7 +292,7 @@ export function readRawSessionMessageOrdinalPageFromDb(
     });
 }
 
-/** Count stored rows without inspecting message JSON, allowing the session-id index to answer it. */
+/** The count includes compaction-summary rows. */
 export function countStoredRawSessionMessagesFromDb(db: Database, sessionId: string): number {
     const row = db
         .prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?")
@@ -325,27 +315,12 @@ function isAnchorRow(row: unknown): row is AnchorRow {
 }
 
 /**
- * Read ONLY the eligible tail — messages at/after the last compartment boundary
- * — assigning them their correct ABSOLUTE ordinals (continuing from
- * `baseOrdinal`), and return the absolute session message count alongside.
+ * The function includes the compartment boundary and assigns it ordinal `baseOrdinal`.
  *
- * This is the O(tail) read: it never touches the ~63k pre-boundary rows that the
- * full reader scans just to recover the tail's ordinal base — a number the
- * compaction marker already stores (`end_message` ordinal + `end_message_id`
- * anchor). On a months-long session the full read is O(session) and grows
- * unbounded; this stays flat at the tail size.
+ * The compaction marker excludes pre-boundary rows.
  *
- * Anchor semantics: reads rows with `(time_created, id) >= anchor` (INCLUSIVE of
- * the boundary message), in the same sort order as the full reader, filters
- * compaction-summary rows identically, and numbers the kept messages
- * `baseOrdinal, baseOrdinal+1, …`. Including the anchor keeps
- * `messageIdAtOrdinal(baseOrdinal)` real (the full reader has it too) so
- * boundary-edge message ids match.
+ * Including the anchor ensures `messageIdAtOrdinal(baseOrdinal)` returns the boundary message.
  *
- * Returns null when the anchor message id isn't found (deleted / legacy
- * compartment without `end_message_id`); the caller then falls back to the full
- * read. `absoluteMessageCount` = `baseOrdinal + (keptTail - 1)` = the exact
- * count the full reader would produce, so every absolute-ordinal consumer lines
  * up.
  */
 export function readRawSessionTailFromDb(
@@ -359,12 +334,7 @@ export function readRawSessionTailFromDb(
         .get(anchorMessageId, sessionId);
     if (!isAnchorRow(anchorRow)) return null;
 
-    // Defensive: if the anchor itself is a compaction-summary row, the ordinal
-    // mapping is ill-defined — summary rows are filtered out BEFORE ordinal
-    // assignment in the full numbering, so a summary anchor has no ordinal and
-    // `baseOrdinal` cannot correspond to it. Unreachable from current callers
-    // (compartment boundaries come from ordinal walks over non-summary rows),
-    // but if it ever happens, bail to the full reader rather than produce an
+    // The `messageIdAtOrdinal` mapping excludes summary anchors because the full reader filters summaries before assigning ordinals.
     // off-by-one window.
     const anchorInfo = parseJsonRecord((anchorRow as { data?: string }).data ?? "");
     if (anchorInfo?.summary === true && anchorInfo?.finish === "stop") return null;
@@ -379,7 +349,7 @@ export function readRawSessionTailFromDb(
         .all(sessionId, anchorRow.time_created, anchorRow.time_created, anchorRow.id)
         .filter(isRawMessageRow);
 
-    // Identical compaction-summary filter to the full reader, applied BEFORE
+    // Compaction-summary rows do not consume ordinal slots.
     // ordinal assignment.
     const filtered = messageRows.filter((row) => {
         const info = parseJsonRecord(row.data);
@@ -412,8 +382,7 @@ export function readRawSessionTailFromDb(
     for (const row of filtered) {
         const info = parseJsonRecord(row.data);
         if (!info) {
-            // Mirror the full reader: a malformed row keeps its ordinal slot but
-            // yields no element.
+            // A malformed row consumes an ordinal slot but produces no element.
             ord += 1;
             continue;
         }
@@ -428,21 +397,18 @@ export function readRawSessionTailFromDb(
         ord += 1;
     }
 
-    // ord now points one past the last assigned ordinal, so the absolute count is
-    // ord - 1 (== baseOrdinal + keptIncludingMalformed - 1).
+    // `ord` points one past the last assigned ordinal, so the absolute count is `ord - 1`.
     return { messages, absoluteMessageCount: Math.max(0, ord - 1) };
 }
 
 /**
- * Minimal structural view of an in-memory transform message, extracted from
- * OpenCode's `MessageLike` by the caller. Kept dependency-free so this module
- * doesn't import the transform/tagging layer.
+ * The interface avoids a transform-layer dependency.
  */
 export interface InMemoryMessageView {
     id: string;
     role: string;
     parts: unknown[];
-    /** From the message `info` if present; used to mirror the DB summary filter. */
+    /** `summary` uses message `info` when present to mirror the DB summary filter. */
     summary?: boolean;
     finish?: string;
 }
@@ -450,16 +416,12 @@ export interface InMemoryMessageView {
 export interface InMemoryTailResult {
     messages: RawMessage[];
     absoluteMessageCount: number;
-    /** True when the compaction anchor id was located within the array. */
+    /* */
     anchorFound: boolean;
 }
 
 /**
- * Extract the minimal structural view from OpenCode transform messages
- * (`args.messages`, MessageLike-shaped: `{ info, parts }`). Tolerates missing
- * fields — a message without a string id becomes an empty-id view, which
- * `buildInMemoryTailRawMessages` treats as a malformed row (ordinal slot kept,
- * no element), mirroring the DB reader.
+ * A malformed row preserves its ordinal but emits no element.
  */
 export function extractInMemoryMessageViews(
     messages: readonly { info?: unknown; parts?: unknown }[],
@@ -477,31 +439,16 @@ export function extractInMemoryMessageViews(
 }
 
 /**
- * Build an absolute-ordinal `RawMessage[]` tail from the in-memory transform
- * messages (`args.messages`), mirroring {@link readRawSessionTailFromDb} so the
- * boundary resolver produces an identical result without any opencode.db read.
+ * The function mirrors {@link readRawSessionTailFromDb} so the boundary resolver can operate without reading opencode.db.
  *
- * OpenCode hands the transform the post-compaction-marker tail, i.e. the eligible
- * window, already parsed. Ordinals are anchored at the last compartment boundary:
  *
- * - If `anchorMessageId` is found at index k, that message IS the boundary
- *   (ordinal `lastCompartmentEnd`); messages k, k+1, … get ordinals
- *   `lastCompartmentEnd, lastCompartmentEnd+1, …`. Messages before k (compaction
- *   marker lag — already compartmentalized) are dropped, matching the DB tail
- *   which starts AT the anchor.
- * - If the anchor isn't present (it was a summary row OpenCode already filtered,
- *   or marker is ahead), the array is assumed to start at `lastCompartmentEnd+1`
- *   and ordinals run `lastCompartmentEnd+1, …`. `anchorFound=false` flags this so
- *   callers can choose the DB fallback if they don't trust the assumption.
- * - No compartments yet (#132): pass `lastCompartmentEnd=0`,
- *   `anchorMessageId=null` → ordinals from 1 over the whole array.
+ * - If `anchorMessageId` is found at index k, that message is the boundary.
+ * The function assigns the found anchor ordinal `lastCompartmentEnd` and assigns subsequent messages consecutive ordinals.
+ * The function drops messages before a found anchor because the DB tail starts at the anchor.
+ * When no anchor is found, the first row receives ordinal `max(1, lastCompartmentEnd + 1)`.
+ * When no anchor is found, the function assumes the first row follows `lastCompartmentEnd`.
  *
- * Mirrors the DB reader's contracts: compaction-summary rows
- * (`summary===true && finish==='stop'`) are filtered BEFORE ordinal assignment;
- * a malformed message (no string id) keeps its ordinal slot but yields no element;
- * `absoluteMessageCount` equals what the DB reader would report for the same tail.
  *
- * Returns null when there are no usable messages.
  */
 export function buildInMemoryTailRawMessages(args: {
     messages: readonly InMemoryMessageView[];
@@ -510,9 +457,6 @@ export function buildInMemoryTailRawMessages(args: {
 }): InMemoryTailResult | null {
     const { messages, lastCompartmentEnd, anchorMessageId } = args;
 
-    // Mirror the DB reader's compaction-summary filter, applied BEFORE ordinal
-    // assignment. (These rows are normally already absent post-filterCompacted,
-    // but filtering defensively keeps ordinals aligned if one slips through.)
     const filtered = messages.filter((m) => !(m.summary === true && m.finish === "stop"));
     if (filtered.length === 0) return null;
 
@@ -526,11 +470,9 @@ export function buildInMemoryTailRawMessages(args: {
             startIndex = anchorIndex;
             baseOrdinal = lastCompartmentEnd; // the anchor row IS lastCompartmentEnd
         } else {
-            // Anchor filtered out / marker ahead: assume array starts just past it.
             baseOrdinal = Math.max(1, lastCompartmentEnd + 1);
         }
     } else {
-        // No-compartment (#132) case: whole array is eligible from ordinal 1.
         baseOrdinal = Math.max(1, lastCompartmentEnd + 1);
     }
 
@@ -539,7 +481,6 @@ export function buildInMemoryTailRawMessages(args: {
     for (let i = startIndex; i < filtered.length; i += 1) {
         const m = filtered[i];
         if (!m.id || typeof m.id !== "string") {
-            // Mirror the DB reader: malformed row keeps its ordinal slot, no element.
             ord += 1;
             continue;
         }
@@ -588,9 +529,6 @@ export function readRawSessionMessagePartsByIdFromDb(
 }
 
 /**
- * Resolve one message ID in the canonical raw-message ordinal space. Synthetic
- * compaction summaries are excluded so this count matches every module wire
- * ordinal and does not depend on the stored compartment basis.
  */
 export function readRawSessionMessageOrdinalByIdFromDb(
     db: Database,

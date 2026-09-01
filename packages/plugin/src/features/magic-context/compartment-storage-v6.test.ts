@@ -19,9 +19,7 @@ afterEach(() => {
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-        } catch {
-            // Ignore EBUSY on Windows
-        }
+        } catch {}
     }
     tempDirs.length = 0;
     process.env.XDG_DATA_HOME = undefined;
@@ -99,10 +97,6 @@ describe("getCompartmentsByEndMessageId (plan v6 §5)", () => {
     });
 
     test("returns array (length > 1) when multiple compartments share endMessageId — schema invariant violation case", () => {
-        // Schema only enforces UNIQUE(session_id, sequence), NOT (session_id, end_message_id).
-        // If a future bug ever leaves two rows sharing a boundary, the marker drain's
-        // validatePendingTarget treats length > 1 as a stale-skip. This test simulates
-        // that schema violation directly so the defensive code path stays exercised.
         useTempDataHome("getby-dup-");
         const db = openDatabase();
         appendCompartments(db, "ses-dup", [
@@ -127,7 +121,6 @@ describe("getCompartmentsByEndMessageId (plan v6 §5)", () => {
         ]);
         const results = getCompartmentsByEndMessageId(db, "ses-dup", "msg-dup");
         expect(results.length).toBe(2);
-        // ORDER BY sequence ASC — first row is sequence 0
         expect(results[0].sequence).toBe(0);
         expect(results[1].sequence).toBe(1);
     });

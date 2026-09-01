@@ -1,37 +1,29 @@
 /**
- * Test-support statement counters.
  *
- * Work claims in the search hot path ("this no longer scans every note",
- * "exactly K rich rows hydrate") must be provable without timing assertions,
- * which are flaky on shared CI. `countingDatabase` wraps a real `Database` in a
- * transparent proxy that records the SQL text, bindings, and returned row count
- * of every executed statement, so a test can assert on structural work instead
- * of elapsed milliseconds.
+ * Tests can assert structural work instead of elapsed time.
  *
- * Lives in `src/` (not a `*.test.ts` file) for the same reason as
- * `mock-database.ts`: several suites share it.
  */
 
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 
 export interface StatementExecution {
     sql: string;
-    /** `all`, `get`, or `run` — which accessor executed the statement. */
+    /* */
     method: "all" | "get" | "run";
     bindings: unknown[];
-    /** Rows handed back to the caller (0 or 1 for `get`, 0 for `run`). */
+    /* */
     rowCount: number;
 }
 
 export interface CountingDatabase {
-    /** Pass this to production code instead of the raw database. */
+    /** Callers use `db` instead of `target` to record prepared-statement executions. */
     db: Database;
     executions: StatementExecution[];
-    /** Executions whose SQL matches `pattern`. */
+    /* */
     matching(pattern: string | RegExp): StatementExecution[];
-    /** Number of executions whose SQL matches `pattern`. */
+    /* */
     count(pattern: string | RegExp): number;
-    /** Total rows returned by executions whose SQL matches `pattern`. */
+    /* */
     rows(pattern: string | RegExp): number;
     reset(): void;
 }
@@ -81,8 +73,7 @@ export function countingDatabase(target: Database): CountingDatabase {
                 return (sql: string) => wrapStatement(sql, target.prepare(sql));
             }
             const value = (target as unknown as Record<string | symbol, unknown>)[prop];
-            // Bind to the real database: SQLite adapter methods (transaction,
-            // exec, close) break when `this` is the proxy.
+            // Database methods are bound to `target` because they fail when the proxy is their `this` value.
             return typeof value === "function" ? value.bind(target) : value;
         },
     }) as Database;

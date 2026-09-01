@@ -21,18 +21,13 @@ export function getPiCommandInvocation(piPath: string, args: string[]): PiComman
         return { command: piPath, args };
     }
 
-    // Windows command shims are scripts, not native executables. Route them
-    // through ComSpec with an explicit argv so model names and paths never enter
-    // an interpolated shell command.
+    // `.cmd` and `.bat` files must run through a command interpreter.
+    // Passing separate argv entries preserves argument boundaries.
     const command = process.env.ComSpec?.trim() || process.env.COMSPEC?.trim() || "cmd.exe";
     return { command, args: ["/d", "/s", "/c", piPath, ...args] };
 }
 
 export function detectPiBinary(): PiBinaryInfo | null {
-    // Node-only PATH walker, not which/where: shelling out fails in
-    // Alpine/slim/Nix/bunx sandboxes that lack those binaries (same reason the
-    // OpenCode detector switched to findOnPath). findOnPath handles platform
-    // extensions (.cmd/.exe) and X_OK checks internally.
     const fromPath = findOnPath("pi");
     if (fromPath) return { path: fromPath, source: "path" };
 
@@ -47,10 +42,6 @@ export function detectPiBinary(): PiBinaryInfo | null {
 }
 
 export function getPiVersion(piPath: string): string | null {
-    // Pi >= 0.71.x writes `--version` output to stderr, not stdout. Use
-    // spawnSync (not execFileSync) so we get both streams back even on
-    // a clean exit. Prefer stdout when present so future Pi versions
-    // that switch back to stdout still work.
     try {
         const invocation = getPiCommandInvocation(piPath, ["--version"]);
         const result = spawnSync(invocation.command, invocation.args, {
@@ -90,19 +81,9 @@ const SIZE_TOKEN = /^(?:\d+(?:\.\d+)?[kmgt]?|-)$/i;
 const CAPABILITY_TOKEN = /^(?:yes|no|true|false|-)$/i;
 
 /**
- * Parse `pi --list-models` output into `provider/model` ids.
  *
- * Pi prints a fixed-width TABLE, not slash-joined ids:
  *
- *     provider      model                context  max-out  thinking  images
- *     anthropic     claude-fable-5       1M       128K     yes       yes
- *     openai-codex  gpt-5.4              1M       128K     yes       yes
  *
- * The first two whitespace-separated columns are `provider` and `model`; we join
- * them. (The previous parser required each token to already contain `/`, so the
- * table produced ZERO matches and setup fell back to a hardcoded model list the
- * user didn't have — issue #144.) A pre-joined `provider/model` first token is
- * still accepted for forward-compat with any future slash-formatted output.
  */
 export function parseModelListOutput(output: string): string[] {
     const models = new Set<string>();
@@ -142,8 +123,6 @@ export function parseModelListOutput(output: string): string[] {
 }
 
 export function getAvailableModels(piPath: string): string[] {
-    // `pi --list-models` is the canonical command (prints the provider/model
-    // table). Try it first, then the older `models list` subcommand for
     // forward/backward compat.
     const outputs = [
         runPiCommand(piPath, ["--list-models"]),
@@ -154,8 +133,5 @@ export function getAvailableModels(piPath: string): string[] {
         const models = parseModelListOutput(output);
         if (models.length > 0) return models;
     }
-    // Empty/failed discovery must not fall back to a static catalog — that reintroduces
-    // issue #144 (users pick models they do not have). Callers pass [] to pickModel(),
-    // which offers free-text provider/model entry instead.
     return [];
 }

@@ -15,10 +15,7 @@ export type ImitatedArgRule =
           type: "object";
           fields: Readonly<Record<string, ImitatedArgRule>>;
           /**
-           * Fields that may be absent or null. When present and non-null the
-           * value must validate against its rule. Without this, a decode schema
-           * that omits an advertised optional field rejects the whole imitated
-           * call and loses the action.
+           * Fields in `optionalFields` may be absent or null; present non-null values must validate against their rules.
            */
           optionalFields?: Readonly<Record<string, ImitatedArgRule>>;
       }
@@ -35,10 +32,8 @@ const MAX_DECODED_STRING_LENGTH = 1024 * 1024;
 const MAX_DECODED_ARRAY_ITEMS = 100;
 
 /**
- * Nested objects must carry every required field and nothing undeclared. An
- * undeclared field would reach the tool unvalidated, and a missing required
- * field would let a partial value (a mutation token short one digest) through
- * to the mutation path. Declared optional fields may be absent or null.
+ * Nested objects must contain every required field and no undeclared fields.
+ * An undeclared field would reach the tool unvalidated.
  */
 function validObjectField(
     value: unknown,
@@ -106,9 +101,8 @@ function validDecodedArgs(value: Record<string, unknown>, schema: ImitatedArgsSc
 }
 
 /**
- * Models can imitate the clamped argument shape they see in reduced tool-call
- * history. Decode that shape once at the tool boundary, then validate the decoded
- * object against the same fields and types the tool exposes before returning it.
+ * Models can imitate the clamped argument shape from reduced tool-call history.
+ * The tool boundary decodes that shape once, then validates it against the fields and types the tool exposes.
  */
 export function unwrapImitatedReducedArgs<T extends object>(
     args: T,
@@ -134,9 +128,7 @@ export function unwrapImitatedReducedArgs<T extends object>(
         ) {
             return parsed as T;
         }
-    } catch {
-        // Keep the validated outer arguments so the tool reports its ordinary field error.
-    }
+    } catch {}
 
     return args;
 }

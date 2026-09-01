@@ -1,107 +1,64 @@
-//! Validate strictly ordered stored compartment ranges and partition them for
-//! the m0/m1 rendering split.
+//! This module validates ordered stored compartment ranges and partitions them for m0/m1 rendering.
 //!
-//! Pure over a chronological compartment list (the order
-//! [`mc_store::McStore::load_compartments`] returns). Two settled, handshake-independent
-//! pieces of the slice-4d-m0 spine:
-//!  - [`resolve_coverage`] validates that stored compartment ranges are strictly
-//!    increasing and non-overlapping, then reports the coverage end (last compartment's
-//!    end_message / end_message_id) — the m0+m1 coverage anchor. Store-pure checks
-//!    cannot tell a retired ordinal from a missing live message, so sparse coordinate
+//! The functions are pure over compartments in the order McStore::load_compartments returns.
+//! resolve_coverage rejects non-increasing or overlapping stored compartment ranges.
+//! resolve_coverage returns the last compartment's end_message and end_message_id as the coverage end.
+//! resolve_coverage uses the returned coverage end as the combined m0/m1 coverage anchor.
+//! resolve_coverage permits sparse coordinate gaps because store data cannot distinguish retired ordinals from missing live messages.
 //!    gaps are allowed here and live-aware callers guard against dropping present input.
-//!  - [`partition_by_folded_seq`] splits the compartments into the set already inside m0
-//!    (`sequence <= folded_seq`) and the new ones riding m1 at P1 (`sequence > folded_seq`).
 
 use mc_store::StoredCompartment;
 
-/// Hashes for the parts of the m0 baseline whose change means the frozen m0 bytes have
-/// changed AND that have no cheaper correction, so the pass must re-render m0 (a HARD
-/// fold). Folded into the render_config string the classifier compares each pass: when
-/// any of these differ, the composed render_config differs, and the classifier's
-/// existing "render_config changed → HARD" rule fires. Kept as NAMED fields (not one
-/// combined hash) so a diff of the composed string shows WHICH part changed (useful for
-/// telemetry); equality cost is the same, since any field change still flips the string.
+/// M0ContentEpoch fields trigger a HARD fold when their changes alter frozen m0 without a cheaper correction.
+/// Changes to composition and structure fields change `render_config` and trigger a HARD fold.
+/// Named fields preserve which M0ContentEpoch component changed in render_config diffs.
 ///
-/// Only MONOLITHIC wholesale content with no cheap correction belongs here. TWO classes
-/// are deliberately EXCLUDED:
-///  - DISCRETE itemized content (id'd memories, sequenced compartments, additive profile
-///    entries) — forward-corrected on the m1 delta (a new memory appends, an in-session
-///    memory edit rides a `<memory-updates>` correction); a SOFT that leaves m0 frozen.
-///  - PROJECT-DOCS — even though docs are monolithic m0 content, a docs-only edit must
-///    NOT evict the cached prefix (it's a low-value, frequent edit). Docs fold into m0
-///    on the NEXT natural HARD (from another cause), which re-reads them from disk; the
-///    docs hash is a SNAPSHOT MARKER persisted with the rendered m0 bytes for
-///    observability, NOT a trigger. So `docs_hash` is intentionally NOT a field here.
+/// Discrete memories, sequenced compartments, and additive profile entries use m1 corrections instead of HARD folds.
+/// New memories append on m1, and in-session memory edits use <memory-updates>.
+/// A SOFT fold leaves m0 frozen while m1 carries these corrections.
+/// A docs-only edit does not evict the cached m0 prefix.
+/// Project docs fold into m0 during the next HARD fold caused by another change.
+/// docs_hash is persisted with rendered m0 bytes as a snapshot marker.
+/// docs_hash is a snapshot marker, not a HARD-fold trigger.
 ///
-/// Including any of these would force a full m0 re-render on a routine event — the exact
-/// over-bust the m1 delta path and the docs-defer-fold exist to avoid.
 ///
-/// THE RULE that decides what belongs here (so docs_hash isn't re-added "to be more
-/// correct"): content-vs-composition. A stale CONTENT block inside an unchanged m0
-/// composition is tolerable for a few passes — it folds in on the next natural HARD, no
-/// HARD-on-its-own needed (project-docs is exactly this). But a stale COMPOSITION or
-/// STRUCTURE marker means m0 is built WRONG: a stale workspace_fingerprint → m0 composed
-/// over the wrong project set; a stale upgrade_state → m0 in an incompatible format; a
-/// stale external memory epoch → m0 missing an out-of-process edit it can't see any other
-/// way. Composition/structure staleness can't be tolerated, so it HARDs. Content
-/// staleness defer-folds. Only composition/structure markers belong in this struct.
+/// Content-only staleness may defer until the next HARD fold; composition changes require a HARD.
+/// Changes to `workspace_fingerprint`, `upgrade_state`, or the external memory epoch require a HARD because they alter m0 composition or format.
+/// An external memory-epoch change requires a HARD because m0 cannot otherwise observe the out-of-process edit.
+/// Structure staleness requires a HARD fold.
+/// Only composition and structure markers belong in this struct.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct M0ContentEpoch {
-    /// The workspace membership/policy fingerprint (member identities + their epochs +
-    /// the shared-category policy): a wholesale change to which foreign memories are
+    /// `workspace_fingerprint` tracks workspace membership and shared-category policy for visible foreign memories.
     /// visible.
     pub workspace_fingerprint: String,
-    /// The session-upgrade migration state. A session upgrade re-evaluates the whole
-    /// memory pool into the current taxonomy; the resulting wholesale rewrite changes it.
+    /// A session upgrade rewrites the memory pool under the current taxonomy, changing `upgrade_state`.
     pub upgrade_state: String,
-    /// The EXTERNAL project-memory epoch — bumped ONLY by an out-of-process editor
-    /// (the dashboard) or a session-upgrade migration. An external edit is the one
-    /// memory change the module can't see as a discrete mutation-log row (the editor
-    /// didn't queue one), so it signals via this wholesale counter and forces a HARD.
-    /// In-session memory mutations do NOT touch this — they ride the m1 correction delta
-    /// (the mutation log + cursor) as a SOFT. Must NOT be derived from the mutation log,
-    /// or in-session edits would HARD and the m1 correction path would be dead.
+    /// `memory_content_epoch` changes only for out-of-process edits or session-upgrade migrations; in-session mutations use the m1 delta.
+    /// An out-of-process edit changes `memory_content_epoch` because it creates no mutation-log row.
+    /// `memory_content_epoch` changes force HARD invalidation.
+    /// `memory_content_epoch` must not derive from the mutation log; otherwise in-session edits would force HARD invalidation.
     pub memory_content_epoch: String,
-    /// The module-wide project-memory render epoch. A non-zero value coordinates one HARD
-    /// fold for every serializer profile when the shared memory block format changes.
-    /// Empty means epoch zero and is omitted from the folded identity.
+    /// `memory_render_epoch` coordinates one HARD fold across serializer profiles when the shared memory block format changes.
+    /// An empty `memory_render_epoch` denotes epoch zero and is omitted from the folded identity.
     pub memory_render_epoch: String,
-    /// The module-wide compartment render epoch. A non-zero value coordinates one
-    /// HARD fold for every serializer profile when compartment history bytes change.
-    /// Empty means epoch zero and is omitted from the folded identity.
+    /// `compartment_render_epoch` coordinates one HARD fold across serializer profiles when compartment history bytes change.
+    /// An empty `compartment_render_epoch` denotes epoch zero and is omitted from the folded identity.
     pub compartment_render_epoch: String,
-    /// The module's own rendered-prefix FORMAT epoch for this session's serializer
-    /// profile: the "m0 in an incompatible format" composition class (same reason as
-    /// `upgrade_state`). Folded module-side so a format flip self-coordinates ONE HARD
-    /// transition per session, independent of the caller's opaque render_config string.
-    /// Epoch zero is represented by the empty string and is not rendered into the folded
-    /// identity, preserving byte-identical effective render_config strings for profiles
-    /// whose serializer epoch is still zero.
+    /// `profile_render_epoch` coordinates one HARD transition per session when the serializer format changes.
+    /// `profile_render_epoch` coordinates one HARD transition per session independently of the caller's `render_config`.
+    /// An empty `profile_render_epoch` denotes epoch zero and is omitted from the folded identity.
     pub profile_render_epoch: String,
-    /// Stores guidance and tool-manifest identities in one component for the selected prompt
-    /// surface. A model-key change therefore activates both together during cache invalidation.
-    /// Empty preserves the legacy behavior for full prompts without overrides.
+    /// `prompt_surface_epoch` combines guidance and tool-manifest identities for the selected prompt.
     pub prompt_surface_epoch: String,
-    /// The visible tagger surface epoch. A non-zero value coordinates the cache-breaking
-    /// HARD fold that introduces tag bytes; empty epoch zero is omitted so the current
-    /// disabled surface leaves every existing effective render identity byte-identical.
+    /// An empty `tagger_feature_epoch` is omitted so a disabled tag surface preserves existing effective render identities.
     pub tagger_feature_epoch: String,
-    /// A session-local compatibility salt used only while adopting a byte-affecting renderer
-    /// transition. The transform removes it from the committed identity after atomically
-    /// recording consumption, so it creates exactly one HARD without changing steady identity.
     pub transition_epoch: String,
 }
 
-/// Combine the base render_config (the provider-eviction triggers: system/model/
-/// serializer) with the [`M0ContentEpoch`] fields into the effective render_config the
-/// classifier compares. Any difference in the base OR any epoch field produces a
-/// different string (→ the classifier's "render_config changed → HARD" fires). The base
-/// is kept as a prefix so provider changes still trigger. Deterministic (fixed field
-/// order); each field is length-prefixed so no value can forge a field boundary (e.g.
-/// ("a","bc") and ("ab","c") must not collapse to the same string).
+/// Any difference in `base_render_config` or an epoch field changes the returned string.
+/// The encoding length-prefixes each field so no value can forge a field boundary.
 pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -> String {
-    // length-prefix each field so no value can forge a boundary (a value containing the
-    // delimiter can't masquerade as the next field).
     fn part(label: &str, value: &str) -> String {
         format!("{label}:{}:{value}", value.len())
     }
@@ -131,30 +88,25 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
     format!("{base_render_config}|m0epoch[{}]", parts.join(";"))
 }
 
-/// The coverage summary of a strictly ordered compartment set: the latest
-/// sequence, terminal covered ordinal, and boundary message id (the cache anchor).
+/// `CompartmentCoverage` records the latest sequence, terminal covered ordinal, and cache anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompartmentCoverage {
-    /// The highest compartment `sequence` in the set.
     pub max_sequence: i64,
-    /// The first compartment's `start_message` — the LEADING edge of m0 coverage. The
-    /// caller fails loud if a live item sits below this (it would be covered by no
-    /// compartment yet trimmed as covered — a silent leading-gap drop).
+    /// `first_covered_ordinal` marks the leading edge of m0 coverage.
+    /// The caller rejects a live item below `start_message` to prevent a silent leading-gap drop.
     pub first_covered_ordinal: u64,
-    /// The last compartment's `end_message` — the m0+m1 coverage end ordinal (the
-    /// tail-trim point: items with a greater ordinal are the live tail).
+    /// `coverage_end_ordinal` marks the m0+m1 coverage end ordinal.
+    /// `coverage_end_ordinal` is the tail-trim point: items with greater ordinals form the live tail.
     pub coverage_end_ordinal: u64,
-    /// The last compartment's `end_message_id` — the cache/revert anchor.
+    /// The last compartment's `end_message_id` is the cache/revert anchor.
     pub boundary_id: String,
 }
 
-/// An overlapping or non-increasing compartment set. Sparse coordinate gaps are
-/// legal for consumer legs because retired ordinals are not present input.
+/// `CoverageGap` reports overlapping or non-increasing compartments.
+/// Overlaps are legal for consumer legs because retired ordinals are absent from the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageGap {
-    /// The earlier compartment's end ordinal.
     pub prev_end: i64,
-    /// The later compartment's start ordinal.
     pub next_start: i64,
 }
 
@@ -168,15 +120,9 @@ impl std::fmt::Display for CoverageGap {
     }
 }
 
-/// Validate the compartments are strictly increasing and report the coverage
-/// summary. None when the set is empty (nothing covered). Errors on the first
 /// overlap found.
 ///
-/// Consumer-leg ordinals are sparse-but-strictly-increasing: the Claude Code
-/// proxy may retire numbers permanently when it re-mints message identities. This
-/// store-pure check therefore rejects overlaps (`next.start <= prev.end`) but
-/// allows coordinate gaps; live-aware transform validation catches any present
-/// raw message that would otherwise be trimmed without a compartment.
+/// The store-only check rejects overlaps (`next.start_message <= prev.end_message`) but allows coordinate gaps.
 pub fn resolve_coverage(
     compartments: &[StoredCompartment],
 ) -> Result<Option<CompartmentCoverage>, CoverageGap> {
@@ -202,10 +148,6 @@ pub fn resolve_coverage(
     }))
 }
 
-/// Split the compartments into (folded-into-m0, riding-m1): `sequence <= folded_seq`
-/// are inside the frozen m0 baseline; `sequence > folded_seq` are the new compartments
-/// the m1 delta renders at P1 until the next HARD folds them. Preserves chronological
-/// order in each half.
 pub fn partition_by_folded_seq(
     compartments: &[StoredCompartment],
     folded_seq: i64,
@@ -259,9 +201,6 @@ mod tests {
 
     #[test]
     fn sparse_coordinate_gap_is_store_pure_valid() {
-        // Consumer-leg producers can retire ordinal numbers permanently; without
-        // the live array, a store-only check cannot distinguish 11-19 being
-        // absent from being uncovered present input.
         let comps = vec![comp(1, 1, 10, "m10"), comp(2, 20, 30, "m30")];
         let cov = resolve_coverage(&comps).unwrap().unwrap();
         assert_eq!(cov.coverage_end_ordinal, 30);
@@ -270,7 +209,6 @@ mod tests {
 
     #[test]
     fn an_overlap_fails_loud() {
-        // next starts at 8 but prev ended at 10 → overlap → corrupt tiling
         let comps = vec![comp(1, 1, 10, "m10"), comp(2, 8, 15, "m15")];
         assert!(resolve_coverage(&comps).is_err());
     }
@@ -290,8 +228,6 @@ mod tests {
             transition_epoch: String::new(),
         };
         let folded = fold_m0_content_epoch(base, &epoch);
-        // the base is kept as a prefix (a provider change still alters the string) and
-        // each epoch field appears by name so a diff shows the cause
         assert_eq!(
             folded, "sys0|tools0|model0|prof0|m0epoch[ws:3:wf1;upg:2:u1;mem:3:mc1]",
             "omitted epoch-zero fields must not change existing render identities"
@@ -351,13 +287,9 @@ mod tests {
         let transition_folded = fold_m0_content_epoch(base, &transition_epoch);
         assert!(transition_folded.contains("xte:22:renderer-transition-v1"));
         assert_ne!(folded, transition_folded);
-        // docs hash is deliberately excluded from the fold (a docs-only edit must not
-        // force a full m0 re-render)
         assert!(!folded.contains("docs"));
-        // deterministic: same inputs → same string
         assert_eq!(folded, fold_m0_content_epoch(base, &epoch));
 
-        // any epoch field change produces a different folded string
         let mut e2 = epoch.clone();
         e2.memory_content_epoch = "mc2".into();
         assert_ne!(folded, fold_m0_content_epoch(base, &e2));
@@ -365,8 +297,6 @@ mod tests {
         e3.upgrade_state = "u2".into();
         assert_ne!(folded, fold_m0_content_epoch(base, &e3));
 
-        // length-prefix prevents a delimiter-forging collision: ("a","bc") vs ("ab","c")
-        // for adjacent fields must NOT collapse to the same token.
         let forge_a = M0ContentEpoch {
             workspace_fingerprint: "a".into(),
             upgrade_state: "bc".into(),
@@ -400,12 +330,10 @@ mod tests {
             vec![2, 3]
         );
 
-        // folded_seq 0 (bootstrap) → everything is new (rides m1 until first fold)
         let (folded0, new0) = partition_by_folded_seq(&comps, 0);
         assert!(folded0.is_empty());
         assert_eq!(new0.len(), 3);
 
-        // folded_seq at/past the max → nothing new (all folded)
         let (folded_all, new_all) = partition_by_folded_seq(&comps, 3);
         assert_eq!(folded_all.len(), 3);
         assert!(new_all.is_empty());

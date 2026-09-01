@@ -5,14 +5,7 @@ import { deleteDreamState, getDreamState, setDreamState } from "./storage-dream-
 const LEASE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — renewed periodically during task execution
 
 /**
- * Dreamer v2 uses one lease PER CONFLICT-DOMAIN (memory:<project>,
- * key-files:<project>, user-memories, …) so disjoint-state tasks don't block
- * each other while the memory-mutating tasks still serialize. A lease is four
- * `dream_state` rows under a key namespace.
  *
- * `DREAMING_LEASE_KEY` is the legacy single-lease key. It keeps the original
- * `acquireLease(db, holderId)` signature working (the lease-key param defaults to
- * it) for the still-suite-based runner until the per-task scheduler replaces it.
  */
 export const DREAMING_LEASE_KEY = "dreaming";
 
@@ -24,8 +17,7 @@ interface LeaseRowKeys {
 }
 
 function rowKeys(leaseKey: string): LeaseRowKeys {
-    // The legacy lease retains its historical un-namespaced row keys so an
-    // in-flight pre-upgrade lease isn't orphaned across the boundary.
+    // The default lease uses un-namespaced row keys to retain existing persisted lease state.
     if (leaseKey === DREAMING_LEASE_KEY) {
         return {
             holder: "dreaming_lease_holder",
@@ -173,9 +165,6 @@ export function runLeaseGuardedWrite<T>(
     expectedGeneration?: number,
 ): T {
     return runImmediate(db, () => {
-        // The lease is checked after BEGIN IMMEDIATE has acquired SQLite's write
-        // lock. That removes the deferred-transaction gap where another process
-        // could steal the lease after a peek but before the durable mutation.
         if (
             !peekLeaseHolderAndExpiry(db, holderId, leaseKey) ||
             (expectedGeneration !== undefined &&
@@ -187,36 +176,27 @@ export function runLeaseGuardedWrite<T>(
     });
 }
 
-/** Renewal beat interval. The lease TTL is LEASE_DURATION_MS (2×), so a single
- *  missed or contended beat still leaves a full interval of runway. */
+/** The lease TTL is twice the renewal interval, so one missed or contended renewal leaves one full interval before expiry.
+ * */
 const LEASE_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 export interface LeaseHeartbeat {
-    /** Stop the heartbeat timer. Safe to call more than once. */
+    /** Stopping the heartbeat timer is idempotent. */
     stop(): void;
-    /** True once the lease was confirmed genuinely lost (and onLost was called). */
+    /* */
     readonly lost: boolean;
 }
 
 /**
- * Keep a held lease alive on a background interval, tolerating transient DB
- * contention. The brittle inline pattern this replaces aborted the whole task on
- * the FIRST renewal hiccup — including a transient SQLITE_BUSY throw under a
- * multi-instance lock storm — even though the 2-minute TTL means one missed 60s
- * beat is harmless. That killed multi-minute dreamer runs (map-memories/verify)
- * with "prompt aborted by external signal" when the lease was never actually
+ * Renewal tolerates transient database contention because one missed 60-second renewal cannot expire a 2-minute lease.
+ * A transient `SQLITE_BUSY` renewal failure does not abort the task.
  * lost.
  *
- * We declare the lease lost (and call onLost ONCE) only when:
- *   - a DIFFERENT holder actively owns it — renewLease fails and acquireLease
- *     can't reclaim it (acquireLease reclaims an expired-but-free lease, so a
- *     self-inflicted expiry from our own delayed beat recovers instead of
- *     killing the run); or
- *   - a full TTL has elapsed with no confirmed renewal (only reachable via
- *     repeated transient throws), past which exclusive ownership can't be
+ * We declare the lease lost and call `onLost` once when another holder owns the lease or no renewal is confirmed for more than `LEASE_DURATION_MS`.
+ * Another holder actively owns the lease when `renewLease` fails and `acquireLease` cannot reclaim it.
+ * A delayed heartbeat can reclaim its own expired lease.
  *     guaranteed.
- * A transient throw with a recent successful renewal is swallowed and retried on
- * the next beat.
+ * The heartbeat loop retries a transient error on the next beat while the last confirmed renewal is within `LEASE_DURATION_MS`.
  */
 export function startLeaseHeartbeat(
     db: Database,
@@ -242,8 +222,6 @@ export function startLeaseHeartbeat(
     const beat = () => {
         if (lost) return;
         try {
-            // Continuous ownership: renewLease keeps it if still ours. This is
-            // the always-safe path — we never lost the lease.
             if (
                 renewLease(
                     db,
@@ -262,21 +240,13 @@ export function startLeaseHeartbeat(
                 declareLost("lease generation changed — another holder acquired it");
                 return;
             }
-            // renewLease failed → we are no longer the recorded holder OR the
-            // lease lapsed. If the gap since our last confirmed beat exceeds a
-            // full TTL, the lease was provably claimable by another process for a
-            // meaningful window — a sibling could have acquired AND mutated in the
-            // gap (a >2min stall / machine sleep), so blindly reclaiming a now-free
-            // lease and continuing on our stale snapshot is split-brain. Declare
-            // lost instead. A SHORT delay (≤ TTL, e.g. a slightly-late 60s beat
-            // causing self-inflicted expiry) still recovers via reclaim below.
+            // If no renewal is confirmed for more than `LEASE_DURATION_MS`, another process may acquire the lease.
+            // The holder must stop after a gap longer than LEASE_DURATION_MS because another process may own the lease.
             if (Date.now() - lastConfirmedAt > LEASE_DURATION_MS) {
                 declareLost("lease lapsed past TTL — another holder may have run");
                 return;
             }
-            // reclaim an expired-but-free lease after only a short gap (our own
-            // delayed beat); returns false only when a different holder is
-            // actively in possession.
+            // After a gap no longer than `LEASE_DURATION_MS`, `acquireLeaseWithAcquisition` reclaims a free expired lease; it returns `null` only when another holder owns the lease.
             const reacquired = acquireLeaseWithAcquisition(db, holderId, leaseKey);
             if (reacquired) {
                 if (expectedGeneration !== null && reacquired.generation !== expectedGeneration) {
@@ -295,9 +265,7 @@ export function startLeaseHeartbeat(
         }
     };
 
-    // Confirm ownership before the caller can begin work. Without this first
-    // synchronous beat, a long pre-prompt stall could let the TTL expire and a
-    // same-domain runner start while this runner still waits for the 60s timer.
+    // The initial synchronous beat prevents intervalMs from delaying the first lease-renewal attempt.
     beat();
 
     const timer = lost ? undefined : setInterval(beat, intervalMs);

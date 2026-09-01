@@ -51,13 +51,13 @@ interface ReviewUserMemoriesArgs {
     parentSessionId: string | undefined;
     sessionDirectory: string | undefined;
     holderId: string;
-    /** Keyed lease this task holds (Dreamer v2: global user-memories domain).
-     *  Defaults to the legacy single lease key for back-compat. */
+    /** Keyed lease held by this task.
+     * Defaults to the single lease key when omitted. */
     leaseKey?: string;
     deadline: number;
     leaseAcquisition?: LeaseAcquisition;
     promotionThreshold: number;
-    /** Per-task model override (Dreamer v2). */
+    /** Per-task model override. */
     model?: string;
     /** Resolved dreamer fallback chain. */
     fallbackModels?: readonly string[];
@@ -71,10 +71,7 @@ export interface ReviewResult {
     dismissed: number;
     candidatesConsumed: number;
     /**
-     * Effects of the claim-native project promotions. Reducing the outcome to
-     * counts left the dream-run audit with no claim IDs at all while the log
-     * reported `project_promoted > 0`; the curate and retrospective paths feed
-     * these through `claimEffectMemoryChanges` for the same reason.
+     * Claim IDs preserve project-promotion effects for audit logging and `claimEffectMemoryChanges`.
      */
     effects: readonly ClaimOperationResultEffect[];
 }
@@ -348,16 +345,15 @@ function validateManifestReferences(args: {
     }
     for (const [index, promotion] of args.manifest.projectPromotions.entries()) {
         useCandidates(promotion.candidateIds, `promote_project[${index}]`);
-        // The threshold gates whether the review runs at all and is otherwise
-        // stated only in the prompt, so a model that returns a single candidate
-        // out of a qualifying snapshot would turn one uncorroborated observation
-        // into a durable project claim. A project promotion has to carry its own
+        // Enforce `promotionThreshold` here because the prompt cannot prevent under-corroborated project promotions.
+        // Enforce `promotionThreshold` here because the prompt cannot prevent under-corroborated project promotions.
+        // Enforce `promotionThreshold` here because the prompt cannot prevent under-corroborated project promotions.
+        // Enforce `promotionThreshold` here because the prompt cannot prevent under-corroborated project promotions.
         // corroboration.
         //
-        // Reject an unusable threshold rather than comparing against it: test
-        // files are excluded from typecheck, so a caller that omits the field
-        // would otherwise compare against `undefined` — always false — and lose
-        // this guard silently, which is the failure mode it exists to prevent.
+        // Reject non-finite `promotionThreshold` values so omitted values cannot bypass the candidate-count check.
+        // Reject non-finite `promotionThreshold` values so omitted values cannot bypass the candidate-count check.
+        // Reject non-finite `promotionThreshold` values so omitted values cannot bypass the candidate-count check.
         if (!Number.isInteger(args.promotionThreshold) || args.promotionThreshold < 1) {
             throw new Error(
                 `promote_project[${index}] cannot be validated: promotionThreshold is ${args.promotionThreshold}`,
@@ -438,7 +434,7 @@ export function applyUserMemoryReviewManifest(args: {
     identity: AutonomousManifestIdentity;
     snapshot: UserMemoryReviewSnapshot;
     manifest: UserMemoryReviewManifest;
-    /** Minimum corroborating candidates a project promotion must carry. */
+    /** Each project promotion must carry at least `promotionThreshold` corroborating candidates. */
     promotionThreshold: number;
     nowMs?: number;
 }): ReviewApplyResult {
@@ -741,7 +737,6 @@ If no promotions are warranted, return empty arrays. Consume reviewed candidates
         task: "review-user-memories",
         publicClaimIds: [`snapshot:${snapshot.digest}`],
     });
-    // SAFETY: Runtime constructor is consumed only through abort() and signal.
     const AbortControllerConstructor = (
         globalThis as unknown as {
             AbortController: new () => { abort(): void; signal: ReviewAbortSignal };

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::scope::coerce_version;
+use super::scope::{contains_redaction_placeholder, is_commit_oid, version_req_matches};
 
 /// Schema tag for capture-time anchor representations stored in the frozen
 /// `anchors.payload` BLOB. The fallback ladder matches a fresh checkout
@@ -118,7 +118,9 @@ pub enum AnchorCondition {
         revision: String,
     },
     PlatformVersion {
-        range: String,
+        /// Parsed at decode time; evaluation never re-parses the stored
+        /// range string.
+        req: semver::VersionReq,
     },
     /// Half-open `[start, end)` in UTC milliseconds.
     WallClockInterval {
@@ -151,6 +153,7 @@ pub enum GitCondition {
 pub enum AnchorDecodeError {
     UnknownKind(String),
     MissingValue(AnchorKind),
+    ConflictingColumns(AnchorKind),
     InvalidOid(AnchorKind),
     InvalidVersionRange,
     InvalidInterval,
@@ -163,6 +166,11 @@ impl std::fmt::Display for AnchorDecodeError {
             Self::MissingValue(kind) => {
                 write!(f, "anchor kind {} has no value", kind.as_str())
             }
+            Self::ConflictingColumns(kind) => write!(
+                f,
+                "anchor kind {} has values in columns it does not own",
+                kind.as_str()
+            ),
             Self::InvalidOid(kind) => {
                 write!(f, "anchor kind {} has an invalid git OID", kind.as_str())
             }
@@ -175,13 +183,6 @@ impl std::fmt::Display for AnchorDecodeError {
 }
 
 impl std::error::Error for AnchorDecodeError {}
-
-fn is_lower_hex_oid(value: &str) -> bool {
-    (value.len() == 40 || value.len() == 64)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 
 fn decode_captures(payload: Option<&[u8]>) -> BTreeMap<String, AnchorCapture> {
     // A missing or unreadable capture payload only disables the fallback
@@ -212,10 +213,43 @@ pub fn encode_anchor_captures(captures: &[AnchorCapture]) -> Vec<u8> {
     .expect("capture payload is serializable")
 }
 
+/// The `anchors` table lacks a constraint tying populated columns to
+/// `anchor_kind`. A row written by a botched migration can therefore name one
+/// kind while carrying another kind's value, and decoding it would evaluate
+/// only the named kind and ignore the rest.
+fn unowned_columns(kind: AnchorKind, row: &AnchorRowSpec) -> bool {
+    let present = [
+        row.exact_value.is_some(),
+        row.reachable_from_oid.is_some(),
+        row.reachable_between_start_oid.is_some() || row.reachable_between_end_oid.is_some(),
+        row.deployment_revision.is_some(),
+        row.config_revision.is_some(),
+        row.platform_version_range.is_some(),
+        row.wall_clock_start.is_some() || row.wall_clock_end.is_some(),
+        row.payload.is_some(),
+    ];
+    let owned = match kind {
+        AnchorKind::Exact => [true, false, false, false, false, false, false, false],
+        AnchorKind::ReachableFrom => [false, true, false, false, false, false, false, true],
+        AnchorKind::ReachableBetween => [false, false, true, false, false, false, false, true],
+        AnchorKind::DeploymentRevision => [false, false, false, true, false, false, false, false],
+        AnchorKind::ConfigRevision => [false, false, false, false, true, false, false, false],
+        AnchorKind::PlatformVersion => [false, false, false, false, false, true, false, false],
+        AnchorKind::WallClockInterval => [false, false, false, false, false, false, true, false],
+    };
+    present
+        .iter()
+        .zip(owned.iter())
+        .any(|(present, owned)| *present && !*owned)
+}
+
 impl AnchorCondition {
     pub fn decode(row: &AnchorRowSpec) -> Result<Self, AnchorDecodeError> {
         let kind = AnchorKind::from_stored(&row.anchor_kind)
             .ok_or_else(|| AnchorDecodeError::UnknownKind(row.anchor_kind.clone()))?;
+        if unowned_columns(kind, row) {
+            return Err(AnchorDecodeError::ConflictingColumns(kind));
+        }
         let require = |value: &Option<String>| -> Result<String, AnchorDecodeError> {
             value
                 .as_deref()
@@ -225,7 +259,7 @@ impl AnchorCondition {
         };
         let require_oid = |value: &Option<String>| -> Result<String, AnchorDecodeError> {
             let value = require(value)?;
-            if !is_lower_hex_oid(&value) {
+            if !is_commit_oid(&value) {
                 return Err(AnchorDecodeError::InvalidOid(kind));
             }
             Ok(value)
@@ -251,10 +285,10 @@ impl AnchorCondition {
             }),
             AnchorKind::PlatformVersion => {
                 let range = require(&row.platform_version_range)?;
-                if semver::VersionReq::parse(&range).is_err() {
+                let Ok(req) = semver::VersionReq::parse(&range) else {
                     return Err(AnchorDecodeError::InvalidVersionRange);
-                }
-                Ok(Self::PlatformVersion { range })
+                };
+                Ok(Self::PlatformVersion { req })
             }
             AnchorKind::WallClockInterval => {
                 let (Some(start_ms), Some(end_ms)) = (row.wall_clock_start, row.wall_clock_end)
@@ -303,9 +337,18 @@ pub enum AnchorEvaluation {
 /// Evaluates a non-git anchor condition against the typed context. Git
 /// conditions report [`AnchorEvaluation::NeedsGitResolution`].
 pub fn evaluate_non_git(condition: &AnchorCondition, ctx: &QueryContext) -> AnchorEvaluation {
-    let compare = |expected: &str, actual: &Option<String>| match actual.as_deref() {
-        Some(actual) => holds(actual == expected),
-        None => AnchorEvaluation::Uncertain,
+    // A redaction placeholder on either side is unresolvable: distinct
+    // secrets collapse onto one token, so equality would report two
+    // unrelated values as the same and make the anchor spuriously current.
+    let compare = |expected: &str, actual: &Option<String>| {
+        if contains_redaction_placeholder(expected) {
+            return AnchorEvaluation::Uncertain;
+        }
+        match actual.as_deref() {
+            Some(actual) if contains_redaction_placeholder(actual) => AnchorEvaluation::Uncertain,
+            Some(actual) => holds(actual == expected),
+            None => AnchorEvaluation::Uncertain,
+        }
     };
     match condition {
         AnchorCondition::Git(_) => AnchorEvaluation::NeedsGitResolution,
@@ -314,17 +357,19 @@ pub fn evaluate_non_git(condition: &AnchorCondition, ctx: &QueryContext) -> Anch
             compare(revision, &ctx.deployment_revision)
         }
         AnchorCondition::ConfigRevision { revision } => compare(revision, &ctx.config_revision),
-        AnchorCondition::PlatformVersion { range } => {
+        AnchorCondition::PlatformVersion { req } => {
             let Some(raw) = ctx.platform_version.as_deref() else {
                 return AnchorEvaluation::Uncertain;
             };
-            let Some(version) = coerce_version(raw) else {
+            // Build metadata does not affect version requirements; reject
+            // redacted values before matching.
+            if contains_redaction_placeholder(raw) {
                 return AnchorEvaluation::Uncertain;
-            };
-            let Ok(req) = semver::VersionReq::parse(range) else {
-                return AnchorEvaluation::Uncertain;
-            };
-            holds(req.matches(&version))
+            }
+            match version_req_matches(req, raw) {
+                Some(result) => holds(result),
+                None => AnchorEvaluation::Uncertain,
+            }
         }
         AnchorCondition::WallClockInterval { start_ms, end_ms } => {
             let Some(instant) = ctx.query_instant_ms else {

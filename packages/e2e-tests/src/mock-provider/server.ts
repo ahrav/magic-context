@@ -1,13 +1,14 @@
 /**
- * Minimal Anthropic-compatible mock server.
+ * The server emulates Anthropic's Messages API.
  *
- * Accepts POST to /messages (matching `${baseURL}/messages` path used by @ai-sdk/anthropic),
- * captures each request body, and returns a scripted response with full control over
- * input/output/cache_read/cache_write token counts.
+ * The server accepts POST requests at `/messages`, matching `@ai-sdk/anthropic`'s `${baseURL}/messages` path.
+ * The server captures each request body and returns scripted responses.
+ * The mock controls input, output, cache-read, and cache-write token counts.
  *
- * Supports both Anthropic Messages SSE streaming (OpenCode's default transport) and
- * single-shot JSON responses (useful for direct unit-level probing of the mock).
+ * The server supports Anthropic Messages SSE streaming and single-shot JSON responses.
  */
+
+import { fnv1a32 } from "../fnv1a";
 
 export interface MockUsage {
     input_tokens: number;
@@ -17,48 +18,44 @@ export interface MockUsage {
 }
 
 export interface MockResponse {
-    /** Simple text response. Will be converted into an Anthropic content array. */
+    /** The mock converts `text` into an Anthropic content array. */
     text?: string;
-    /** Override content block array directly (for tool calls, multi-block). */
+    /** `content` overrides `text` for tool calls or multiple content blocks. */
     content?: unknown[];
-    /** Stop reason reported to the caller. */
+    /* */
     stop_reason?: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
     /**
-     * Token usage reported to the caller — critical for threshold tests.
-     * Required unless `error` is set (errors don't report usage).
+     * Tests use these counts to exercise token thresholds.
+     * `usage` is required unless `error` is set; errors omit usage.
      */
     usage?: MockUsage;
-    /** Delay before responding (simulate slow historian). */
+    /* */
     delayMs?: number;
-    /** Optional model name echoed back in the response. Defaults to request's model. */
+    /** `model` overrides the response model; otherwise the response echoes the request model. */
     model?: string;
     /**
-     * Return an error response instead of an assistant message.
-     * Use this to simulate provider-side failures like context overflow,
-     * rate limits, and auth errors. The harness emits an Anthropic-shaped
-     * error body with the given HTTP status and error.type/message. These
-     * errors are what `parseAPICallError` in OpenCode (and the overflow
-     * detector in magic-context) match against.
+     * `error` returns an error response instead of an assistant message.
+     * `error` simulates provider failures such as context overflow, rate limits, and authentication errors.
+     * The harness emits Anthropic-shaped error bodies for rate limits and authentication errors.
+     * The harness emits an Anthropic-shaped error body with the supplied HTTP status, type, and message.
+     * `parseAPICallError` and magic-context's overflow detector match these error bodies.
      */
     error?: {
-        /** HTTP status code (e.g. 400 for overflow, 413 for payload too large). */
+        /** `status` is the HTTP status code, such as 400 for overflow or 413 for an oversized payload. */
         status: number;
-        /** Anthropic error.type value (e.g. "invalid_request_error"). */
+        /** `type` is the Anthropic `error.type` value, such as `invalid_request_error`. */
         type: string;
-        /** Human-readable error message — regex-matched for overflow detection. */
+        /** `message` is regex-matched to detect context overflow. */
         message: string;
     };
 }
 
 /**
- * One captured `/embeddings` request — provenance for incident cases that
- * must prove WHICH content the product embedded and WHEN (A32: a stale
- * persisted vector must show no re-embed request after an out-of-band edit).
  */
 export interface CapturedEmbeddingRequest {
     receivedAt: number;
     model: string;
-    /** OpenAI-compatible `input_type` (e.g. "query" / "passage") or null. */
+    /** `inputType` stores OpenAI-compatible `input_type` values such as `query` or `passage`, or null. */
     inputType: string | null;
     inputs: string[];
 }
@@ -66,9 +63,7 @@ export interface CapturedEmbeddingRequest {
 export const EMBEDDING_DIMENSIONS = 8;
 
 /**
- * Marker tokens pinned to fixed axes of the deterministic embedding space.
- * Tokens within one axis are "synonyms" (identical vectors) with ZERO lexical
- * overlap, so a scenario can build a semantic-lane-only match that FTS cannot
+ * Tokens on the same axis produce identical vectors despite zero lexical overlap, allowing semantic-only matches that FTS cannot satisfy.
  * accidentally satisfy.
  */
 export const SEMANTIC_MARKER_AXES: readonly (readonly string[])[] = [
@@ -77,9 +72,7 @@ export const SEMANTIC_MARKER_AXES: readonly (readonly string[])[] = [
 ];
 
 /**
- * Deterministic embedding: marker tokens map to fixed axes; inputs without a
- * marker fall back to a hashed bag-of-words vector. Same input, same vector —
- * across processes and runs.
+ * The embedding is deterministic across processes and runs.
  */
 export function deterministicEmbedding(text: string): number[] {
     const tokens = text
@@ -92,11 +85,7 @@ export function deterministicEmbedding(text: string): number[] {
     }
     if (vector.every((component) => component === 0)) {
         for (const token of tokens) {
-            let hash = 2166136261;
-            for (let i = 0; i < token.length; i++) {
-                hash = Math.imul(hash ^ token.charCodeAt(i), 16777619);
-            }
-            vector[(hash >>> 0) % EMBEDDING_DIMENSIONS] += 1;
+            vector[fnv1a32(token) % EMBEDDING_DIMENSIONS] += 1;
         }
     }
     const norm = Math.hypot(...vector) || 1;
@@ -124,14 +113,11 @@ export interface MockServerOptions {
 }
 
 /**
- * Route predicate — receives the captured request body and returns a MockResponse
- * to use for THIS request, or null to skip to the next matcher / default.
+ * Return `null` to skip to the next matcher or the default response.
  *
- * Matchers run in insertion order. First match wins. If all matchers return null,
- * the main queue is consulted, then defaultResponse.
+ * Matchers run in insertion order; the first match wins.
+ * If every matcher returns `null`, the provider consults the main queue, then `defaultResponse`.
  *
- * Typical use: route historian requests (by system-prompt keyword) to a slow/custom
- * response while leaving the main agent on the default fast response.
  */
 export type RequestMatcher = (
     body: Record<string, unknown>,
@@ -153,14 +139,7 @@ export class MockProvider {
         const port = options.port ?? 0; // 0 = pick any available port
         this.server = Bun.serve({
             port,
-            // Bun defaults to 0.0.0.0, which exposes the scripted provider to
-            // the whole network; every consumer dials 127.0.0.1 anyway.
-            // Known trade-off: opencode-runner/spawn.ts records that a server
-            // bound to 127.0.0.1 on GitHub-hosted runners can make Bun's
-            // `fetch()` time out even though curl succeeds (its reason for
-            // binding 0.0.0.0). If host e2e jobs start timing out dialing the
-            // mock provider, that loopback stack edge case is the first
-            // suspect; revert to the default bind to confirm.
+            // Bun defaults to `0.0.0.0`; bind `127.0.0.1` to restrict the scripted provider to the local host.
             hostname: "127.0.0.1",
             fetch: async (req) => this.handle(req),
         });
@@ -176,7 +155,7 @@ export class MockProvider {
         }
     }
 
-    /** Queue a list of responses (consumed in order per request). */
+    /* */
     script(responses: MockResponse[]): void {
         this.responses = [...responses];
     }
@@ -186,39 +165,38 @@ export class MockProvider {
         this.defaultResponse = response;
     }
 
-    /** Append a single response to the queue. */
+    /* */
     enqueue(response: MockResponse): void {
         this.responses.push(response);
     }
 
     /**
-     * Register a request matcher. Matchers run in order; first non-null return
-     * wins. If none match, the main queue and defaultResponse are consulted.
+     * Matchers run in insertion order; the first non-`null` result determines the response.
+     * If no matcher returns a response, the provider consults the main queue, then `defaultResponse`.
      */
     addMatcher(matcher: RequestMatcher): void {
         this.matchers.push(matcher);
     }
 
-    /** All captured requests, in order. */
+    /* */
     requests(): CapturedRequest[] {
         return [...this.captured];
     }
 
-    /** Most recent request, or null if none. */
+    /* */
     lastRequest(): CapturedRequest | null {
         return this.captured[this.captured.length - 1] ?? null;
     }
 
     /**
-     * All captured `/embeddings` requests, in order. Deliberately NOT cleared
-     * by `reset()` — reset() is called between scenario phases, and embedding
-     * provenance must span the whole case (seed embed vs post-edit re-embed).
+     * Embedding requests persist across reset().
+     * Provenance must cover both the seed embedding and the post-edit re-embedding.
      */
     embeddingRequests(): CapturedEmbeddingRequest[] {
         return [...this.capturedEmbeddings];
     }
 
-    /** Clear queue, captured requests, matchers, and default response. */
+    /* */
     reset(): void {
         this.responses = [];
         this.captured = [];
@@ -228,8 +206,7 @@ export class MockProvider {
     }
 
     /**
-     * How many `/messages` requests fell through matchers and the queue to the
-     * default response. Runners set a poison default and treat any hit as
+     * Counts `/messages` requests that fall through matchers and the queue to `defaultResponse`.
      * script drift.
      */
     defaultHits(): number {
@@ -254,8 +231,6 @@ export class MockProvider {
         }
         const method = req.method;
 
-        // Deterministic OpenAI-compatible embedding endpoint. The plugin's
-        // openai-compatible provider POSTs `${endpoint}/embeddings`.
         const isEmbeddings =
             url.pathname === "/embeddings" || url.pathname === "/v1/embeddings";
         if (method === "POST" && isEmbeddings) {
@@ -328,7 +303,7 @@ export class MockProvider {
             );
         }
 
-        // Accept both /messages and /v1/messages (depending on how baseURL is configured).
+        // `baseURL` may include `/v1`, so the mock accepts both paths.
         const isMessages =
             url.pathname === "/messages" || url.pathname === "/v1/messages";
 
@@ -354,8 +329,7 @@ export class MockProvider {
             };
             this.captured.push(captured);
 
-            // Matcher routing: first-match-wins. Matchers can return tailored
-            // responses based on request body (e.g. slow down historian calls).
+            // First non-null matcher result determines the response.
             let matcherResponse: MockResponse | null = null;
             for (const matcher of this.matchers) {
                 const resp = matcher(body, headers);
@@ -388,14 +362,10 @@ export class MockProvider {
             if (scripted.delayMs && scripted.delayMs > 0) {
                 await Bun.sleep(scripted.delayMs);
             }
-            // Record completion after any scripted delay. Tests can therefore
-            // prove request overlap without making wall-clock claims.
             captured.responseCompletedAt = Date.now();
 
-            // Error response: emit an Anthropic-shaped error body with the
-            // requested HTTP status. This bypasses the SSE/streaming path
-            // because Anthropic itself returns non-SSE JSON errors even when
-            // stream=true was requested.
+            // When `scripted.error` is set, emit an Anthropic-shaped JSON error body with the requested HTTP status.
+            // The error response bypasses the SSE streaming path.
             if (scripted.error) {
                 return new Response(
                     JSON.stringify({
@@ -441,11 +411,8 @@ export class MockProvider {
             const messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 
             if (wantsStream) {
-                // Emit a minimal but complete Anthropic messages SSE sequence.
-                // Events: message_start → content_block_start → content_block_delta(s) →
-                //         content_block_stop → message_delta (with final usage) → message_stop.
-                // The @ai-sdk/anthropic client consumes this standard order to reconstruct
-                // the full response including token usage counts we scripted.
+                // The stream emits `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop` in that order.
+                // The stream emits `content_block_stop`, then `message_delta` with final usage, then `message_stop`.
                 const encoder = new TextEncoder();
                 const stream = new ReadableStream({
                     start(controller) {
@@ -481,7 +448,6 @@ export class MockProvider {
                             },
                         });
 
-                        // Emit each content block from the scripted `content` array.
                         content.forEach((block: unknown, index: number) => {
                             const blk = block as {
                                 type?: string;
@@ -511,12 +477,8 @@ export class MockProvider {
                                     index,
                                 });
                             } else if (blockType === "thinking") {
-                                // Real Anthropic streams thinking as:
-                                // 1. content_block_start { content_block: { type: "thinking", thinking: "" } }
-                                // 2. content_block_delta { delta: { type: "thinking_delta", thinking: "..." } }
-                                // 3. content_block_delta { delta: { type: "signature_delta", signature: "..." } }
+                                // A thinking block emits a start event, a thinking delta, and a signature delta.
                                 // 4. content_block_stop
-                                // @ai-sdk/anthropic reconstructs the reasoning part from these deltas.
                                 send("content_block_start", {
                                     type: "content_block_start",
                                     index,
@@ -550,8 +512,7 @@ export class MockProvider {
                                     index,
                                 });
                             } else if (blockType === "redacted_thinking") {
-                                // Redacted thinking carries opaque `data` in the start event;
-                                // no deltas are emitted — the full payload arrives up front.
+                                // The redacted-thinking block emits no deltas; its start event carries opaque `data`.
                                 send("content_block_start", {
                                     type: "content_block_start",
                                     index,
@@ -596,7 +557,7 @@ export class MockProvider {
                                     index,
                                 });
                             } else {
-                                // Pass through other non-text blocks as-is (tool_use, etc.)
+                                // Non-text blocks pass through unchanged.
                                 send("content_block_start", {
                                     type: "content_block_start",
                                     index,
@@ -616,13 +577,7 @@ export class MockProvider {
                                 stop_sequence: null,
                             },
                             usage: {
-                                // Newer OpenCode/AI SDK builds read the final
-                                // cumulative usage from message_delta when
-                                // constructing message.updated events. Keep the
-                                // same values in message_start above for older
-                                // parsers, but repeat them here so threshold-
-                                // driven e2e tests continue to exercise the
-                                // plugin's scheduler instead of seeing zeros.
+                                // `message_delta.usage` repeats the cumulative usage sent in `message_start`.
                                 input_tokens: usage.input_tokens,
                                 cache_creation_input_tokens:
                                     usage.cache_creation_input_tokens ?? 0,
@@ -647,7 +602,6 @@ export class MockProvider {
                 });
             }
 
-            // Non-streaming fallback — rarely used by OpenCode but kept for direct tests.
             const responseBody = {
                 id: messageId,
                 type: "message",
@@ -671,7 +625,6 @@ export class MockProvider {
             });
         }
 
-        // Unknown path — return 404
         return new Response(
             JSON.stringify({ error: "not_found", path: url.pathname }),
             {

@@ -32,8 +32,7 @@ describe("OpenCode tag id fallback adoption", () => {
         const sessionId = "ses-fallback";
         const tagger = createTagger();
 
-        // Pass 1: OpenCode exposes the text at part index 1, so the tag is keyed
-        // as m-stable:p1. initFromDb records the pre-write data_version signature.
+        // initFromDb records the pre-write data_version signature.
         tagger.initFromDb(sessionId, db);
         const pass1 = [
             message("m-stable", [{ type: "metadata" }, { type: "text", text: "alpha" }]),
@@ -42,9 +41,7 @@ describe("OpenCode tag id fallback adoption", () => {
         expect(textAt(pass1, 0, 1)).toBe("§1§ alpha");
         expect(tagger.getTag(sessionId, "m-stable:p1", "message")).toBe(1);
 
-        // Pass 2: the same message is now exposed at part index 0. The fallback
-        // resolver migrates tag 1 from m-stable:p1 to m-stable:p0 and must drop
-        // the old in-memory alias because initFromDb now cache-hits on data_version.
+        // The resolver migrates tag 1 from `m-stable:p1` to `m-stable:p0`; `initFromDb` must remove the old in-memory alias because it cache-hits on `data_version`.
         tagger.initFromDb(sessionId, db);
         const pass2 = [message("m-stable", [{ type: "text", text: "alpha" }])];
         tagMessages(sessionId, pass2, tagger, db);
@@ -52,9 +49,7 @@ describe("OpenCode tag id fallback adoption", () => {
         expect(tagger.getTag(sessionId, "m-stable:p0", "message")).toBe(1);
         expect(tagger.getTag(sessionId, "m-stable:p1", "message")).toBeUndefined();
 
-        // Pass 3: m-stable:p1 is a real new text part. With the stale alias still
-        // present this would incorrectly reuse §1§; with unbind+data_version-only
-        // caching it allocates §2§ while preserving the migrated §1§ prefix.
+        // With the stale alias present, the fallback resolver would incorrectly reuse §1§.
         tagger.initFromDb(sessionId, db);
         const pass3 = [
             message("m-stable", [

@@ -2,36 +2,22 @@ import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
 
 /**
- * Compartment events storage (v2 / E2).
  *
- * The historian extracts discrete events (`causal_incident`,
- * `trajectory_correction`, and any future kinds) while compartmentalizing. v2.0
- * STORES these events but does NOT render them — they are a corpus for a future
- * dreamer aggregation/steering feature (cross-session pattern detection). Parsed
- * kind-agnostically (`kind` = element name, `fields` = child elements), so a new
- * event kind or field needs no schema change — `fields` round-trips as JSON.
+ * `kind` stores the element name and `fields` stores child elements as JSON; new kinds and fields require no schema change.
  *
- * Anchoring: `at_compartment="N"` is a 1-based index INTO THE CURRENT PUBLISH's
- * emitted compartment list. We resolve it to the `compartment_id` of the matching
- * persisted row at store time. When resolution fails (out-of-range index, e.g. an
- * event anchored to a discard-last compartment), `compartment_id` is NULL and we
- * keep the raw `at_compartment` for debugging.
+ * `atCompartment` is a 1-based index into the current publish's emitted compartments.
+ * `atCompartment` resolves to the durable ID of the matching emitted compartment.
+ * `compartmentId` is `null` when `atCompartment` is less than 1 or exceeds the emitted-compartment count.
+ * The row retains raw `at_compartment` when resolution fails.
  *
- * Durability caveat: `compartment_id` is a bare INTEGER (no FK). It points at the
- * compartment row that existed at store time. Full/partial recomp deletes and
- * re-inserts compartment rows, so a stored `compartment_id` can become stale
- * (dangling) after recomp. This is acceptable for v2.0 because events are
- * STORED-ONLY (not rendered or consumed yet); the future dreamer aggregation
- * feature that reads events must re-anchor or tolerate dangling ids. Do NOT rely
- * on `compartment_id` surviving recomp.
  */
 
 export interface CompartmentEventInput {
-    /** Event element name, e.g. "causal_incident" | "trajectory_correction". */
+    /** `kind` stores the event element name, such as "causal_incident" or "trajectory_correction". */
     kind: string;
-    /** 1-based index into the publish's emitted compartments; null if absent/invalid. */
+    /** `atCompartment` is a 1-based index into the publish's emitted compartments. */
     atCompartment: number | null;
-    /** Child elements verbatim (e.g. trigger, implication). */
+    /** `fields` stores child elements verbatim, such as `trigger` and `implication`. */
     fields: Record<string, string>;
 }
 
@@ -46,20 +32,17 @@ export interface ProjectCompartmentEvent extends StoredCompartmentEvent {
     compartmentStartMessage: number | null;
     compartmentEndMessage: number | null;
     /**
-     * Harness that wrote the event. Required to read anything else keyed by
-     * session id: the same session id can belong to a different project per
-     * harness, so a consumer joining on session id alone reads another
+     * The event's `harness` is required when reading rows keyed by `sessionId`.
+     * A `sessionId` can occur in different projects under different harnesses.
+     * A join on `sessionId` alone can read rows from another project.
      * project's rows.
      */
     harness: string;
 }
 
 /**
- * Persist historian-extracted events for a publish.
  *
- * @param compartmentIds durable compartment ids for the publish's emitted
- *   compartments, in emission order (index i → the (i+1)-th emitted compartment).
- *   Used to resolve `at_compartment` (1-based) to a durable `compartment_id`.
+ * `compartmentIds` contains durable IDs for the publish's emitted compartments in emission order; index `i` identifies emitted compartment `i + 1`.
  */
 export function insertCompartmentEvents(
     db: Database,
@@ -74,7 +57,6 @@ export function insertCompartmentEvents(
         "INSERT INTO compartment_events (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
     for (const ev of events) {
-        // at_compartment is 1-based into the emitted list; map to durable id.
         const idx = ev.atCompartment != null && ev.atCompartment >= 1 ? ev.atCompartment - 1 : -1;
         const compartmentId = idx >= 0 && idx < compartmentIds.length ? compartmentIds[idx] : null;
         stmt.run(
@@ -89,7 +71,7 @@ export function insertCompartmentEvents(
     }
 }
 
-/** Load all stored events for a session (newest first). For diagnostics / future dreamer aggregation. */
+/* */
 export function getCompartmentEvents(db: Database, sessionId: string): StoredCompartmentEvent[] {
     const rows = db
         .prepare(
@@ -116,21 +98,11 @@ export function getCompartmentEvents(db: Database, sessionId: string): StoredCom
 }
 
 /**
- * Read project-scoped events oldest first for idempotent background consumers.
+ * `getProjectCompartmentEvents` returns project-scoped events oldest first for idempotent background consumers.
  *
- * `pendingForProducer` excludes events the producer already receipted under the
- * `event:<id>` operation-key convention, so consumed events are never re-read
- * and per-call cost stays proportional to the unconsumed backlog rather than
- * project lifetime. `limit` bounds one call so a large backlog drains across
- * runs instead of inside one long write transaction.
+ * `pendingForProducer` excludes events with a matching `event:<id>` receipt for that producer.
  *
- * The `session_projects` join must match on harness as well as session id.
- * That table is keyed `(session_id, harness)`, so one session id can carry a
- * different project binding per harness; joining on session id alone attributes
- * an event to BOTH bindings. Since the receipt key is `event:<id>` and is not
- * project-scoped, the first project to harvest such an event writes it into its
- * own durable memory and receipts it globally, so the owning project never sees
- * it. Cross-harness leakage is a correctness bug, not a feature.
+ * `event:<id>` receipt keys do not include `projectIdentity`.
  */
 export function getProjectCompartmentEvents(
     db: Database,
@@ -207,7 +179,7 @@ function parseFields(json: string): Record<string, string> {
             return out;
         }
     } catch {
-        // corrupt row — return empty rather than throw on a read path
+        // `parseFields` returns `{}` for invalid JSON so event reads do not throw.
     }
     return {};
 }

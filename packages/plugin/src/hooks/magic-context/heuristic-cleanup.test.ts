@@ -33,8 +33,6 @@ function makeTarget(message: { parts: unknown[] }): TagTarget {
             }
             return "absent" as const;
         },
-        // Mirrors the real target: droppable iff there's a tool part present
-        // (drop() would return "removed"). The emergency planner filters on this.
         canDrop: () => message.parts.some((p: any) => p.type === "tool"),
         truncate: () => {
             const toolPart = message.parts.find((p: any) => p.type === "tool") as
@@ -111,7 +109,6 @@ describe("applyHeuristicCleanup", () => {
                     protectedTags: 0,
                 });
 
-                //#then — reasoning preserved because it has real content
                 expect(msg.parts).toHaveLength(2);
             });
         });
@@ -119,9 +116,7 @@ describe("applyHeuristicCleanup", () => {
 
     describe("#given the tiered emergency drop config (>=85% pass)", () => {
         it("#then drops oldest tool outputs down to the reclaim target, full-drop", () => {
-            //#given a tail of large tool outputs well over the ceiling. fixedFloor is
-            // derived as currentTotalInputTokens - Σ(active tag tokens), so with only
-            // tool tags here, fixedFloor≈0 and the target is 30% of the ceiling.
+            // With only tool tags, fixedFloor is 0 and the target is 30% of the ceiling.
             for (let i = 1; i <= 10; i++) {
                 insertTag(db, SESSION, `call-${i}`, "tool", 4000, i, 0, "bash");
             }
@@ -141,24 +136,22 @@ describe("applyHeuristicCleanup", () => {
                 );
             }
 
-            //#when 10 tags × 4000 bytes × 0.25 = 10000 tokens of tail; usage 10000,
-            // ceiling 6000 → target = 0 + 0.30×6000 = 1800 → reclaim ≈ 8200 tokens.
+            // Ten 4,000-byte tags contribute 10,000 tail tokens at 0.25 tokens per byte.
+            // With 10,000 tokens of usage and a 6,000-token ceiling, the target is 1,800 tokens and cleanup reclaims 8,200 tokens.
             const result = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTags: 2,
                 emergency: { currentTotalInputTokens: 10_000, ceilingTokens: 6_000 },
             });
 
-            //#then the oldest tags drop first, including the bash tool at tag 3, while the newest protected window retains its persisted skeleton.
+            // Cleanup drops the oldest tags, including the bash tool at tag 3, while the protected newest window retains its persisted skeleton.
             expect(result.droppedTools).toBeGreaterThan(0);
             const tags = getTagsBySession(db, SESSION);
             const dropped = tags
                 .filter((t) => t.status === "dropped")
                 .map((t) => t.tagNumber)
                 .sort((a, b) => a - b);
-            // protected tail (tags 9,10) never dropped.
             expect(dropped).not.toContain(9);
             expect(dropped).not.toContain(10);
-            // oldest dropped first.
             expect(dropped[0]).toBe(1);
             expect(
                 tags.filter((t) => t.status === "dropped").every((t) => t.dropMode === "truncated"),
@@ -199,8 +192,8 @@ describe("applyHeuristicCleanup", () => {
             });
             expect(latched.emergencyDroppedTools).toBe(0);
 
-            // A confirmed fail-closed abort cannot produce the fresh provider
-            // sample the latch normally waits for, so the abort path releases it.
+            // A confirmed fail-closed abort retains the latch until a fresh provider sample arrives.
+            // A confirmed fail-closed abort retains the latch until a fresh provider sample arrives.
             clearEmergencyDropSample(db, SESSION);
             const retry = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTags: 0,
@@ -220,7 +213,6 @@ describe("applyHeuristicCleanup", () => {
                     }),
                 ],
             ]);
-            // usage 1000 well under ceiling 100000 → reclaim negative → no-op.
             const result = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTags: 0,
                 emergency: { currentTotalInputTokens: 1_000, ceilingTokens: 100_000 },
@@ -242,21 +234,14 @@ describe("applyHeuristicCleanup", () => {
             const result = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTags: 0,
             });
-            // No routine tool drops anymore — only dedup/injection-strip run.
+            // Routine processing runs only deduplication and injection stripping; it does not drop tools.
             expect(result.droppedTools).toBe(0);
         });
     });
 
     /**
-     * v3.3.1 Layer C — plan §5 / Finding 1: composite-key dedup tests.
+     * Deduplication keys include ownerMsgId, preventing cross-owner calls from merging.
      *
-     * Pre-fix the dedup pass keyed both sides (tag map + fingerprint
-     * map) by bare callId and used an owner-blind fingerprint string.
-     * Two assistant turns with same `(toolName, args)` and same callId
-     * from different owners would share a fingerprint bucket and be
-     * silently merged — even though they're semantically distinct
-     * invocations. Post-fix both sides include `ownerMsgId` so cross-
-     * owner pairs produce different fingerprints and are NOT merged.
      */
     describe("#given composite-key dedup (v3.3.1 Layer C)", () => {
         function buildMessageWithId(
@@ -267,10 +252,6 @@ describe("applyHeuristicCleanup", () => {
         }
 
         it("does NOT merge cross-owner pairs with same (toolName, args, callId)", () => {
-            //#given — two assistant messages with same dedup-safe tool
-            // call (mcp_grep, same args) AND same callId, but different
-            // owners. With composite identity each turn gets its own
-            // tag (Layer A row uniqueness) and the dedup pass must NOT
             // merge them.
             insertTag(db, SESSION, "read:32", "tool", 1000, 50, 0, "mcp_grep", 0, "m-asst-1");
             insertTag(db, SESSION, "read:32", "tool", 2000, 60, 0, "mcp_grep", 0, "m-asst-2");
@@ -304,7 +285,6 @@ describe("applyHeuristicCleanup", () => {
                 protectedTags: 0,
             });
 
-            //#then — neither tag is deduplicated (cross-owner pair).
             expect(result.deduplicatedTools).toBe(0);
             const tags = getTagsBySession(db, SESSION);
             expect(tags.find((t) => t.tagNumber === 50)?.status).toBe("active");
@@ -312,11 +292,8 @@ describe("applyHeuristicCleanup", () => {
         });
 
         it("DOES merge same-owner duplicates with different callIds (Pi parallel-tool-calls shape)", () => {
-            //#given — two tool calls within the SAME assistant message
-            // (Pi parallel tool calls): same toolName, same args,
-            // different callIds. The composite keys differ (different
-            // callIds) but the fingerprint matches (same owner +
-            // toolName + args). Dedup pass must merge — older dropped,
+            // The fingerprint matches because the calls have the same owner, toolName, and args.
+            // The deduplication pass merges the calls and drops the older tag.
             // newer kept.
             insertTag(db, SESSION, "call-A", "tool", 1000, 70, 0, "mcp_grep", 0, "m-asst");
             insertTag(db, SESSION, "call-B", "tool", 2000, 80, 0, "mcp_grep", 0, "m-asst");
@@ -347,7 +324,6 @@ describe("applyHeuristicCleanup", () => {
                 protectedTags: 0,
             });
 
-            //#then — older tag dropped, newer kept.
             expect(result.deduplicatedTools).toBe(1);
             const tags = getTagsBySession(db, SESSION);
             expect(tags.find((t) => t.tagNumber === 70)?.status).toBe("dropped");

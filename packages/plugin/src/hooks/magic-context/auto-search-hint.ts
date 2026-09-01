@@ -1,26 +1,14 @@
 /**
- * Build a compact "you may recall something related" hint from unified search
- * results, ready to append to a user message.
  *
- * The hint intentionally compresses fragments so they feel like vague recall
- * rather than a drop-in answer — the goal is to nudge the agent to run
- * ctx_search for full context, not to provide the answer itself.
+ * The hint must nudge the agent to run ctx_search rather than provide an answer.
  *
- * Compression strategy per source:
- *   - memory → caveman-ultra via `cavemanCompress()` (token-dense)
- *   - git_commit → raw commit subject (already terse); prefixed with SHA + age
- *   - message → caveman-ultra, role tag
+ * The renderer uses only the subject line because commit bodies do not change the recall trigger.
  *
  * Guardrails:
- *   - Every dynamic source field is bounded to MAX_RENDER_FIELD_BYTES of
- *     valid UTF-8 BEFORE compression or tokenization, so the budget check
- *     itself never performs unbounded work
- *   - Ordinary fragments use a small character cap. Anti-memory warnings use
- *     bounded fields so their complete warning contract remains visible.
- *   - Skip fragments whose source is already present in visible session-history
- *     (caller handles) — this module only knows about search results
- *   - Total output is token-packed under MAX_AUTO_HINT_TOKENS: an over-budget
- *     fragment is omitted whole while the wrapper and footer cue stay intact
+ * The renderer bounds every dynamic source field to MAX_RENDER_FIELD_BYTES of valid UTF-8 before compression or tokenization, keeping budget checks bounded.
+ * Anti-memory warnings use bounded fields so their complete warning contract remains visible.
+ * The caller excludes sources already present in visible session history.
+ * The packer omits an over-budget fragment whole while retaining the wrapper and footer cue.
  */
 
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
@@ -40,11 +28,11 @@ const WARNING_FIELD_CHAR_CAP = 72;
 export interface AutoSearchHintOptions {
     maxFragments?: number;
     fragmentCharCap?: number;
-    /** Reference clock for age wording; injectable so a fingerprinted
-     *  benchmark scenario renders identical bytes on any day. */
+    /**
+     * The injectable reference clock makes rendering deterministic across wall-clock days. */
     nowMs?: number;
-    /** Minimum score a warning must reach to claim the reserved first slot.
-     *  Defaults to 0, which reserves the slot for any warning present. */
+    /** warningScoreThreshold sets the minimum score required to claim the reserved first slot.
+     * warningScoreThreshold defaults to 0, reserving the slot for any warning present. */
     warningScoreThreshold?: number;
 }
 
@@ -61,9 +49,8 @@ function warningField(text: string): string {
 function renderCompactAntiMemoryWarning(
     result: Extract<UnifiedSearchResult, { source: "anti_memory" }>,
 ): string {
-    // Same contract sentence as explicit search (`renderAntiMemoryWarning`),
-    // with tighter per-field caps and no locator citation: the hint budget is
-    // ~200 tokens and the agent is nudged toward ctx_search for the full record.
+    // The renderer caps each warning field at 72 characters and omits locator citations to fit the hint budget.
+    // The renderer omits locator citations to direct the agent to ctx_search for the full record.
     return renderAntiMemoryWarningLine({
         trigger: result.trigger,
         rejectedStrategy: result.rejectedStrategy,
@@ -82,9 +69,7 @@ function renderFragment(result: UnifiedSearchResult, charCap: number, nowMs: num
             return truncate(compressed, charCap);
         }
         case "git_commit": {
-            // Use only the subject line (first line) — bodies add noise without
-            // changing the recall trigger. Preserve the short SHA + relative age
-            // so the agent can decide if the age is even relevant.
+            // The renderer preserves the short SHA and relative age so the agent can decide whether the age is relevant.
             const bounded = boundDynamicField(result.content);
             const subject = bounded.split(/\r?\n/)[0] ?? bounded;
             const body = truncate(subject, Math.max(10, charCap - 20));
@@ -121,8 +106,8 @@ function assembleHint(lines: readonly string[]): string {
     return `<ctx-search-hint>\n${body}\n</ctx-search-hint>`;
 }
 
-/** `delivered` contains exactly the results whose fragments appear in
- *  `text`, in fragment order. `text` is null when nothing packs. */
+/** `delivered` contains exactly the results whose fragments appear in `text`, in fragment order.
+ * `text` is null when no fragment packs. */
 export interface PackedAutoSearchHint {
     text: string | null;
     delivered: UnifiedSearchResult[];
@@ -131,17 +116,11 @@ export interface PackedAutoSearchHint {
 }
 
 /**
- * Packs the hint under MAX_AUTO_HINT_TOKENS and reports which results
- * survived. An over-budget fragment is dropped whole from the tail; a lone
- * over-budget fragment yields a null text with an empty delivered list
- * rather than a partially emitted hint.
+ * The packer drops over-budget fragments whole from the tail.
+ * When no fragment fits the budget, return null text and an empty delivered list.
  *
- * This function does NOT enforce the caller's general score or message-length
- * gates — the transform-time auto-search wiring applies those first. The one
- * exception is `warningScoreThreshold`, because the reserved warning slot is
- * this function's own decision: it promotes a warning past the caller's
- * ranking, so the bar that warning must clear has to be enforced where the
- * promotion happens or every caller has to remember to pre-filter.
+ * Only `anti_memory` results are filtered by `warningScoreThreshold`.
+ * `packAutoSearchHint` applies `warningScoreThreshold` because it reserves the first fragment slot for an `anti_memory` result.
  */
 export function packAutoSearchHint(
     results: UnifiedSearchResult[],
@@ -152,11 +131,7 @@ export function packAutoSearchHint(
     const nowMs = options.nowMs ?? Date.now();
     const warningScoreThreshold = options.warningScoreThreshold ?? 0;
 
-    // A warning is a first-person claim about the reader's own prior decision,
-    // so a weak match is worse than no match: a warning below the bar is
-    // dropped outright rather than demoted into the tail, and the reserved slot
-    // goes to one that earned it on its own score — never to one riding another
-    // lane's strong hit past the caller's top-result gate.
+    // An eligible `anti_memory` result occupies the first fragment slot.
     const eligible = results.filter(
         (result) => result.source !== "anti_memory" || result.score >= warningScoreThreshold,
     );
@@ -175,9 +150,7 @@ export function packAutoSearchHint(
         kept.push({ result, line: `- ${fragment}` });
     }
 
-    // Token-pack whole fragments: drop from the tail until the assembled hint
-    // (wrapper and footer included) fits the budget. A lone over-budget
-    // fragment yields no hint rather than a partially emitted one.
+    // The token budget includes the assembled wrapper and footer.
     while (kept.length > 0) {
         const wrapped = assembleHint(kept.map((entry) => entry.line));
         const tokenCount = estimateTokens(wrapped);
@@ -195,8 +168,7 @@ export function packAutoSearchHint(
 }
 
 /**
- * Build the hint text. Returns null when `results` is empty, when no fragment
- * has meaningful content after compression, or when limits zero out the budget.
+ * packAutoSearchHint returns `null` when no assembled fragment set fits MAX_AUTO_HINT_TOKENS.
  */
 export function buildAutoSearchHint(
     results: UnifiedSearchResult[],
@@ -206,17 +178,15 @@ export function buildAutoSearchHint(
 }
 
 export interface AntiMemoryWarningDelivery {
-    /** Delivered warning results, in delivery order. */
+    /** `warningResults` preserves delivery order. */
     warningResults: Extract<UnifiedSearchResult, { source: "anti_memory" }>[];
-    /** Claim identity + normalized hash bindings for the persisted hint
-     *  decision. A non-empty list marks the decision non-replayable: warning
-     *  delivery always requires a fresh search rather than stored text. */
+    /**
+     * */
     memoryFragments: Array<{ id: number; hash: string }>;
 }
 
-/** One definition of "which delivered fragments are anti-memory warnings and
- * what identity binds them", shared by the OpenCode and Pi auto-search
- * runners so the deliver-or-replay contract cannot drift between harnesses. */
+/**
+ * */
 export function collectAntiMemoryWarningFragments(
     delivered: readonly UnifiedSearchResult[],
 ): AntiMemoryWarningDelivery {

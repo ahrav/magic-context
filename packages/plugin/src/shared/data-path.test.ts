@@ -30,7 +30,7 @@ describe("data-path", () => {
         process.env.XDG_DATA_HOME = undefined;
         process.env.LOCALAPPDATA = undefined;
         process.env.MAGIC_CONTEXT_LOG_PATH = undefined;
-        // Bun's env handling: explicit delete for unset
+        // Bun requires deleting an environment key to unset it.
         delete process.env.XDG_CACHE_HOME;
         delete process.env.XDG_DATA_HOME;
         delete process.env.LOCALAPPDATA;
@@ -38,10 +38,7 @@ describe("data-path", () => {
     });
 
     afterEach(() => {
-        // Restore-or-delete every var this suite touches. Several tests lift a
-        // guard (NODE_ENV, MAGIC_CONTEXT_TEST_DATA_DIR) to assert production
-        // shape, so a restore that skips the unset case would leak state into
-        // the next test and make results order-dependent.
+        // afterEach restores or deletes every environment variable this suite touches so unset NODE_ENV and MAGIC_CONTEXT_TEST_DATA_DIR cannot leak into subsequent tests.
         for (const [key, value] of Object.entries(savedEnv)) {
             if (value !== undefined) process.env[key] = value;
             else delete process.env[key];
@@ -49,9 +46,7 @@ describe("data-path", () => {
     });
 
     test("getCacheDir falls back to <homedir>/.cache when XDG_CACHE_HOME is unset (all platforms)", () => {
-        // Matches OpenCode's xdg-basedir behavior on every platform, including
-        // Windows. A previous bug mapped Windows to %LOCALAPPDATA% and caused
-        // doctor --force to target a non-existent cache directory.
+        // OpenCode's xdg-basedir uses this fallback on every platform.
         expect(getCacheDir()).toBe(path.join(os.homedir(), ".cache"));
     });
 
@@ -61,9 +56,7 @@ describe("data-path", () => {
     });
 
     test("getCacheDir ignores LOCALAPPDATA on Windows (must match OpenCode's xdg-basedir)", () => {
-        // Even with LOCALAPPDATA set, cache must go to ~/.cache to match
-        // OpenCode's own resolution. Otherwise doctor --force clears the
-        // wrong directory on Windows.
+        // OpenCode's xdg-basedir ignores LOCALAPPDATA when resolving the Windows cache directory.
         process.env.LOCALAPPDATA = "C:\\Users\\Test\\AppData\\Local";
         expect(getCacheDir()).toBe(path.join(os.homedir(), ".cache"));
     });
@@ -88,12 +81,7 @@ describe("data-path", () => {
     });
 
     test("getMagicContextStorageDir uses cortexkit/magic-context layout", () => {
-        // Cross-harness shared path: both OpenCode and Pi plugins read/write here,
-        // unlike the legacy opencode/storage/plugin/magic-context location which
-        // was OpenCode-specific. See ARCHITECTURE_DECISIONS memory for rationale.
-        // Production shape, so both test-isolation guards (the preload's data
-        // dir and the NODE_ENV backstop bun sets for every `bun test`) are
-        // lifted for the duration of this assertion.
+        // Deleting MAGIC_CONTEXT_TEST_DATA_DIR and NODE_ENV makes this assertion exercise the production path.
         const savedTestDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         const savedNodeEnv = process.env.NODE_ENV;
         delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
@@ -109,12 +97,6 @@ describe("data-path", () => {
     });
 
     test("getMagicContextStorageDir backstops to a temp dir under NODE_ENV=test with no guard set", () => {
-        // CWD-independent backstop: a `bun test` from a dir whose bunfig has no
-        // `[test] preload` runs every suite with neither guard env var set. The
-        // DB resolver used to own this branch, so direct callers of this helper
-        // (the CLI doctors' own PRAGMA integrity_check) still reached the real
-        // shared DB. Memoized, so repeated calls must agree — openDatabase()
-        // caches by path.
         const savedTestDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         process.env.NODE_ENV = "test";
@@ -129,11 +111,8 @@ describe("data-path", () => {
     });
 
     test("getMagicContextStorageDir honors MAGIC_CONTEXT_TEST_DATA_DIR when XDG_DATA_HOME is unset", () => {
-        // The hole this closes: a test that deletes XDG_DATA_HOME to exercise
-        // path fallbacks used to resolve to the user's REAL shared storage,
-        // because bun caches os.homedir() and a mutated process.env.HOME cannot
-        // move getDataDir(). Callers that build their own context.db path (the
-        // CLI doctors) then ran integrity checks against production data.
+        // When XDG_DATA_HOME is unset, test fallbacks must not resolve to shared storage.
+        // CLI doctors must not run integrity checks against production data.
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "/tmp/mc-test-isolation";
         expect(getMagicContextStorageDir()).toBe(
             path.join("/tmp/mc-test-isolation", "cortexkit", "magic-context"),
@@ -141,8 +120,7 @@ describe("data-path", () => {
     });
 
     test("getMagicContextStorageDir prefers XDG_DATA_HOME over MAGIC_CONTEXT_TEST_DATA_DIR", () => {
-        // A test managing its own per-test data home is already controlled, and
-        // several suites depend on that dir being honored.
+        // MAGIC_CONTEXT_TEST_DATA_DIR isolates the data homes required by several suites.
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "/tmp/mc-test-isolation";
         process.env.XDG_DATA_HOME = "/tmp/custom-data";
         expect(getMagicContextStorageDir()).toBe(
@@ -158,9 +136,7 @@ describe("data-path", () => {
     });
 
     test("getLegacyOpenCodeMagicContextStorageDir points at the pre-cortexkit OpenCode path", () => {
-        // Used only for one-time migration of pre-shared-storage data into the new
-        // location. Must remain stable so users with legacy installs can still
-        // have their data migrated forward across multiple plugin upgrades.
+        // The legacy data path must remain stable so upgrades can migrate pre-shared-storage data.
         expect(getLegacyOpenCodeMagicContextStorageDir()).toBe(
             path.join(
                 os.homedir(),
@@ -175,8 +151,7 @@ describe("data-path", () => {
     });
 
     test("legacy storage dir distinct from new shared dir even with same XDG override", () => {
-        // Sanity check: even when XDG_DATA_HOME points the same place, the two
-        // resolvers must return different paths so the migration copy doesn't
+        // Even when XDG_DATA_HOME points to the same location, the resolvers must return different paths to prevent migration from overwriting its source.
         // self-overwrite.
         process.env.XDG_DATA_HOME = "/tmp/test-xdg";
         const legacy = getLegacyOpenCodeMagicContextStorageDir();
@@ -187,11 +162,9 @@ describe("data-path", () => {
     });
 
     test("getProjectMagicContextDir composes <project>/.cortexkit/magic-context", () => {
-        // Project-local artifacts (historian state file, failure dumps) live
-        // inside the project so OpenCode's external_directory permission system
-        // treats them as project-internal. Without this, historian's Read tool
-        // would trigger a permission prompt on every run when artifacts lived
-        // under os.tmpdir(). Moved from .opencode/ to the shared .cortexkit/.
+        // Project-local artifacts must remain inside the project so OpenCode's external_directory permission system permits access.
+        // OpenCode treats artifacts under the project directory as project-internal, avoiding historian Read permission prompts.
+        // OpenCode prompts for historian Read access when artifacts are outside the project directory.
         expect(getProjectMagicContextDir("/Users/me/Work/proj")).toBe(
             path.join("/Users/me/Work/proj", ".cortexkit", "magic-context"),
         );
@@ -204,10 +177,10 @@ describe("data-path", () => {
     });
 
     test("getProjectMagicContextDir is unaffected by XDG_DATA_HOME", () => {
-        // Project-local paths anchor to the project directory the caller
-        // passes in, NOT to any user-config env var. Setting XDG_DATA_HOME
-        // (which changes the shared storage dir) must not change the
-        // project-local historian dir.
+        // XDG_DATA_HOME affects shared storage only; project-local artifacts remain under the supplied project directory.
+        // XDG_DATA_HOME affects shared storage only; project-local artifacts remain under the supplied project directory.
+        // XDG_DATA_HOME affects shared storage only; project-local artifacts remain under the supplied project directory.
+        // XDG_DATA_HOME affects shared storage only; project-local artifacts remain under the supplied project directory.
         process.env.XDG_DATA_HOME = "/tmp/custom-data";
         expect(getProjectMagicContextDir("/some/project")).toBe(
             path.join("/some/project", ".cortexkit", "magic-context"),
@@ -215,8 +188,6 @@ describe("data-path", () => {
     });
 
     test("getProjectMagicContextDir handles trailing slashes via path.join", () => {
-        // path.join normalizes redundant separators so callers don't need to
-        // worry about how the project directory was constructed.
         expect(getProjectMagicContextDir("/some/project/")).toBe(
             path.join("/some/project/", ".cortexkit", "magic-context"),
         );
@@ -276,7 +247,7 @@ describe("ensureCortexKitArtifactGitignore", () => {
         try {
             const ckDir = path.join(dir, ".cortexkit");
             mkdirSync(ckDir, { recursive: true });
-            // Simulate a sibling (e.g. AFT) already owning a fenced block.
+            // .gitignore must not contain another `cortexkit:magic-context` block when one already exists.
             writeFileSync(
                 path.join(ckDir, ".gitignore"),
                 "# >>> cortexkit:aft\naft/scratch/\n# <<< cortexkit:aft\n",
@@ -297,7 +268,7 @@ describe("ensureCortexKitArtifactGitignore", () => {
         try {
             ensureCortexKitArtifactGitignore(dir);
             const gi = readFileSync(path.join(dir, ".cortexkit", ".gitignore"), "utf8");
-            // The config file stays tracked: it must NOT appear as an ignore.
+            // `.cortexkit/.gitignore` remains tracked; only `magic-context/` is ignored.
             expect(gi).not.toContain("magic-context.jsonc");
             expect(gi).not.toContain("*.jsonc");
         } finally {

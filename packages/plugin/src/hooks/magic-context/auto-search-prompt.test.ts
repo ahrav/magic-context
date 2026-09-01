@@ -142,22 +142,19 @@ describe("collectStrippedPromptPrefix", () => {
     });
 
     it("handles a large run of orphan closers after nested openers without stalling", () => {
-        // n openers of one drop tag followed by n closers of another: orphan
-        // rejection must be constant-time or this input is quadratic.
+        // Mismatched closers must not rescan the opener stack.
+        // Mismatched closer handling must be constant-time; otherwise this input is quadratic.
         const n = 16_000;
         const raw = `${"<instruction>".repeat(n)}${"</system-reminder>".repeat(n)}question survives`;
         const startedAt = performance.now();
         const stripped = collectStrippedPromptPrefix(raw);
         const elapsedMs = performance.now() - startedAt;
         expect(stripped).toBe("");
-        // Linear stripping finishes in single-digit milliseconds; the removed
-        // quadratic path took ~1s. The bound is generous for slow CI hosts.
         expect(elapsedMs).toBeLessThan(500);
     });
 
     it("does not let separator whitespace between dropped blocks consume the byte budget", () => {
-        // 20k newline separators exceed MAX_QUERY_BYTES on their own; they must
-        // collapse instead of crowding out the trailing user text.
+        // 20,000 newline separators exceed MAX_QUERY_BYTES; collapse them to preserve trailing user text.
         const blocks = "<system-reminder>x</system-reminder>\n".repeat(20_000);
         const stripped = collectStrippedPromptPrefix(`${blocks}real searchable question`);
         expect(stripped).toBe("real searchable question");
@@ -189,8 +186,8 @@ describe("extractBoundedAutoSearchQuery", () => {
     });
 
     it("does not let line markers consume the byte budget or split at the cap", () => {
-        // 4000 markers exceed MAX_QUERY_BYTES on their own; they must be
-        // skipped while streaming, not left for the post-budget cleanup.
+        // 4,000 markers exceed MAX_QUERY_BYTES; skip them while streaming.
+        // The streaming pass must skip markers before applying the byte budget.
         const raw = `${"§123§".repeat(4_000)} real searchable question`;
         expect(extractBoundedAutoSearchQuery(raw)).toBe("real searchable question");
     });

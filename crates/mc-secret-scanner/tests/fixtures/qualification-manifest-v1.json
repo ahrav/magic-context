@@ -1,0 +1,31 @@
+{
+  "schema": "magic-context.secret-scanner-qualification-manifest/v1",
+  "status": "tooling_only",
+  "authority_qualified": false,
+  "mode": "legacy_comparison",
+  "fixture": "qualification-v1.jsonl",
+  "fixture_sha256": "6b7d2cfc1d74ce42b4ab152ef51a2c2656388b014292f3cda4524460c5544b4a",
+  "fixture_cases": 1,
+  "planned_scan_quota": 0,
+  "operational_review_complete": false,
+  "production_divergence_classes_reproduced": false,
+  "cells": [
+    { "cell_id": "size_0_256__density_0", "size_class": "0_256", "finding_density": "0", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_0_256__density_1_8", "size_class": "0_256", "finding_density": "1_8", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_0_256__density_9_64", "size_class": "0_256", "finding_density": "9_64", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_0_256__density_65_plus", "size_class": "0_256", "finding_density": "65_plus", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_257_4096__density_0", "size_class": "257_4096", "finding_density": "0", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_257_4096__density_1_8", "size_class": "257_4096", "finding_density": "1_8", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_257_4096__density_9_64", "size_class": "257_4096", "finding_density": "9_64", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_257_4096__density_65_plus", "size_class": "257_4096", "finding_density": "65_plus", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_4097_65536__density_0", "size_class": "4097_65536", "finding_density": "0", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_4097_65536__density_1_8", "size_class": "4097_65536", "finding_density": "1_8", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_4097_65536__density_9_64", "size_class": "4097_65536", "finding_density": "9_64", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_4097_65536__density_65_plus", "size_class": "4097_65536", "finding_density": "65_plus", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_65537_524288__density_0", "size_class": "65537_524288", "finding_density": "0", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_65537_524288__density_1_8", "size_class": "65537_524288", "finding_density": "1_8", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_65537_524288__density_9_64", "size_class": "65537_524288", "finding_density": "9_64", "feasibility": "unassessed", "quota": 0 },
+    { "cell_id": "size_65537_524288__density_65_plus", "size_class": "65537_524288", "finding_density": "65_plus", "feasibility": "unassessed", "quota": 0 }
+  ],
+  "note": "Minimal synthetic fixture only. Cell feasibility, production weights, operational qualification, and authority evidence are not established."
+}

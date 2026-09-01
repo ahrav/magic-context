@@ -20,8 +20,7 @@ describe("migrateDreamerV2ForDoctor", () => {
         const cfg: Record<string, unknown> = {
             dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } },
         };
-        // Not a no-op: it backfills verify-broad rather than leaving the user on
-        // Zod's default-on for a task they never configured.
+        // Missing `verify-broad` inherits `verify`'s enabled state.
         expect(migrateDreamerV2ForDoctor(cfg)).toBe(true);
         expect(tasksOf(cfg)["verify-broad"].schedule).toBe("0 4 * * 0");
     });
@@ -82,7 +81,6 @@ describe("migrateDreamerV2ForDoctor", () => {
         expect("pin_key_files" in d).toBe(false);
         const t = tasksOf(cfg);
         expect(t["review-user-memories"].schedule).toBe(""); // opt-out preserved
-        // key-files was removed (feature moved to AFT's dreamer) — no task emitted.
         expect("key-files" in t).toBe(false);
     });
 
@@ -90,7 +88,7 @@ describe("migrateDreamerV2ForDoctor", () => {
         const dreamer: Record<string, unknown> = { schedule: "02:00-06:00" };
         const cfg: Record<string, unknown> = { dreamer };
         migrateDreamerV2ForDoctor(cfg);
-        // Same object reference retained (comment-json comment symbols survive).
+        // Retaining the object preserves comment-json comment symbols.
         expect(cfg.dreamer).toBe(dreamer);
         expect((dreamer.tasks as Record<string, unknown>).verify).toBeDefined();
         expect((dreamer.tasks as Record<string, unknown>).curate).toBeDefined();
@@ -148,7 +146,7 @@ describe("migrateDreamerV2ForDoctor", () => {
         const t = tasksOf(cfg);
         expect(t.verify.schedule).toBe("0 5 * * *");
         expect(t.verify.model).toBe("x/y");
-        // broad_interval_days is dropped; broad is its own task now.
+        // The migration drops `broad_interval_days` because `verify-broad` is a separate task.
         expect(t.verify.broad_interval_days).toBeUndefined();
         expect(t["verify-broad"].schedule).toBe("0 4 * * 0");
         expect(t.curate.schedule).toBe("0 5 * * *");

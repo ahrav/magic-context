@@ -26,12 +26,12 @@ function wirePartKind(part: unknown, role: string): string {
         return "tool";
     }
     // OpenCode's native `tool` part carries the result on user-role messages
-    // and the call on assistant-role messages.
+    // OpenCode's native `tool` part carries the call on assistant-role messages.
     if (role === "user" && rawType === "tool") return "toolresult";
     return compactWireLabel(rawType, "unknown");
 }
 
-/** Describe the final three post-transform messages without serializing content. */
+/* */
 export function describeFinalWireTail(messages: readonly MessageLike[]): string {
     return `[${messages
         .slice(-3)
@@ -49,7 +49,7 @@ function serializedTokens(value: unknown): number {
     return serialized ? estimateTokens(serialized) : 0;
 }
 
-/** Count the token-bearing fields in the message representation sent to OpenCode. */
+/* */
 export function estimateMessageTokens(message: MessageLike): MessageTokenEstimate {
     let conversation = 0;
     let toolCall = 0;
@@ -131,10 +131,6 @@ export interface FinalWireTokenEstimate {
 }
 
 /**
- * Telemetry-only estimate of the outgoing prompt after transform mutations.
- * System and tool definitions use the sidebar's calibrated measurements, while
- * messages are re-read from the final array. This is diagnostic data, not an
- * abort gate; provider-accurate gating is deferred to module-side Rust accounting.
  */
 export function estimateFinalWireInputTokens(
     input: FinalWireTokenEstimateInput,

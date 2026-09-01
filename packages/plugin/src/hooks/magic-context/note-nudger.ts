@@ -1,13 +1,9 @@
 /**
- * Note nudge state machine.
  *
- * State: idle → (trigger fires + notes exist) → nudged → (any trigger fires again) → nudged → ...
- * Suppression: after a nudge fires, suppress until the NEXT trigger event (any of 3).
+ * A successful nudge clears the pending trigger.
+ * The system suppresses nudges after delivery until one of the three trigger events occurs.
  *
  * Triggers:
- *   1. Post-historian completion — compartments just compressed history
- *   2. Post-commit detection — agent committed work, natural boundary
- *   3. Todos complete — agent finished planned work, receptive to deferred items
  *
  * The nudge itself is a short reminder folded into the existing nudge anchor.
  * It does NOT include note content — just a count and "use ctx_note read" hint.
@@ -34,7 +30,7 @@ export type NoteNudgeTrigger = "historian_complete" | "commit_detected" | "todos
 const NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
 // In-memory delivery timestamp per session. Doesn't need to survive restart —
-// if the app restarts, cooldown resets, which is acceptable.
+// A restart resets the cooldown.
 const lastDeliveredAt = new Map<string, number>();
 
 function getPersistedNoteNudgeDeliveredAt(_db: unknown, sessionId: string): number {
@@ -54,23 +50,20 @@ export function onNoteTrigger(db: Database, sessionId: string, trigger: NoteNudg
 }
 
 /**
- * Peek at whether a note nudge should be injected during this transform pass.
- * Returns the nudge text if yes, null if no.
  * Does NOT clear triggerPending — call markNoteNudgeDelivered() after successful placement.
  *
  * @param currentUserMessageId - The latest user message ID in this transform pass.
- *   If it matches the trigger-time message, delivery is deferred to avoid busting
- *   the Anthropic prompt-cache prefix (the trigger fired during the agent's turn,
- *   so injecting into the current user message would mutate cached content).
- * @param projectIdentity - Project identity for resolving ready smart notes.
- * @param noteReadStillVisible - True if the agent currently has a non-stripped
- *   `ctx_note(action="read")` tool call in their visible message context. When
+ * Defer delivery when currentUserMessageId matches the trigger-time message ID.
+ * The trigger fires during the agent's turn, so injecting into the current user message mutates Anthropic's cached prompt prefix.
+ * Injecting into the current user message mutates Anthropic's cached prompt prefix.
+ * noteReadStillVisible is true when a non-stripped ctx_note(action="read") call remains in the visible message context.
+ * A visible non-stripped ctx_note(action="read") call keeps the latest note state in the agent's context.
  *   the agent has read the latest note state AND that read is still visible,
- *   the nudge is suppressed (no value re-surfacing what's already on screen).
- *   When the read has been dropped (compactified, ctx_reduce'd, age-cleaned),
- *   the nudge fires again at the next work boundary so the agent regains
- *   visibility into deferred intentions. Caller computes this via
- *   `hasVisibleNoteReadCall(messages)` AFTER drops are materialized.
+ * Suppress the nudge because the latest note state is already visible.
+ * When compaction, ctx_reduce, or age cleaning removes the read call from context, fire the nudge at the next work boundary.
+ * Fire the nudge at the next work boundary after the read call leaves visible context.
+ * Call hasVisibleNoteReadCall(messages) after materializing drops.
+ * Call hasVisibleNoteReadCall(messages) after materializing drops.
  */
 export function peekNoteNudgeText(
     db: Database,
@@ -83,9 +76,8 @@ export function peekNoteNudgeText(
 
     if (!state.triggerPending) return null;
 
-    // On first peek after trigger, record the current user message as the
-    // trigger-time message. This is filled here (not in onNoteTrigger) because
-    // hook callers like tool.execute.after don't have access to the message array.
+    // Hook callers lack the message array, so this function records the trigger-time message ID.
+    // peekNoteNudgeText records the trigger-time message ID because some hooks lack the message array.
     if (!state.triggerMessageId && currentUserMessageId) {
         setPersistedNoteNudgeTriggerMessageId(db, sessionId, currentUserMessageId);
         state.triggerMessageId = currentUserMessageId;
@@ -105,11 +97,7 @@ export function peekNoteNudgeText(
         return null;
     }
 
-    // Suppress if we delivered a nudge recently (within 15 minutes).
-    // Prevents the same notes from being re-surfaced on every commit/todo boundary
-    // in quick succession during active work.
-    // Check unconditionally — a new trigger clears sticky fields, so gating on
-    // stickyText presence would let triggers bypass the cooldown window.
+    // The cooldown prevents repeated nudges at commit and task-list boundaries during active work.
     const deliveredAt = getPersistedNoteNudgeDeliveredAt(db, sessionId);
     if (deliveredAt > 0 && Date.now() - deliveredAt < NOTE_NUDGE_COOLDOWN_MS) {
         sessionLog(
@@ -120,7 +108,6 @@ export function peekNoteNudgeText(
         return null;
     }
 
-    // Check if there are actually notes to remind about
     const notes = getSessionNotes(db, sessionId);
     const readySmartNotes = projectIdentity ? getReadySmartNotes(db, projectIdentity) : [];
     const totalCount = notes.length + readySmartNotes.length;
@@ -130,32 +117,19 @@ export function peekNoteNudgeText(
         return null;
     }
 
-    // Suppress only when BOTH conditions hold:
-    //   1. The agent already ran ctx_note(read) AFTER the most recent note
-    //      activity — they've seen the current note state.
-    //   2. That ctx_note(read) tool call is STILL VISIBLE in their message
-    //      context (caller passes `noteReadStillVisible` after computing it
-    //      against the post-drop messages array).
+    // Suppress only if lastReadAt is later than a positive mostRecentNoteActivity and the read remains visible.
+    // The ctx_note(read) tool call remains visible in the agent's message context.
     //
-    // Both must hold because either alone produces wrong behavior:
-    //   - Timestamp-only suppression (#1 alone) keeps suppressing forever
-    //     once the read result has been compactified, ctx_reduce'd, or
-    //     age-cleaned out of context. The agent loses visibility into
-    //     deferred intentions and we never re-surface them.
-    //   - Visibility-only suppression (#2 alone) re-nudges immediately even
-    //     when the agent just read the latest state — pestering them with
-    //     content they already see.
+    // Require both conditions because either condition alone suppresses valid nudges.
+    // - Timestamp-only suppression persists after the read result leaves context.
+    // Compaction, `ctx_reduce`, or age cleanup can remove the read result from context.
+    // The agent then cannot see deferred intentions.
+    // Visibility-only suppression re-nudges immediately after the agent reads the latest state.
     //
-    // The combined check is what your original design intended: re-surface
-    // notes at work boundaries when the prior read is no longer in front
-    // of the agent.
     const lastReadAt = getNoteLastReadAt(db, sessionId);
     if (lastReadAt > 0 && noteReadStillVisible) {
         const mostRecentNoteActivity = maxNoteActivityTime([...notes, ...readySmartNotes]);
-        // Strict > so same-millisecond races favor the newer note. If a note
-        // write and a ctx_note(read) land in the same ms, we can't tell which
-        // happened first; err on the side of surfacing the note once more
-        // rather than silently suppressing a potentially new reminder.
+        // The comparison uses `>` so same-millisecond write/read races surface the note rather than suppressing it.
         if (mostRecentNoteActivity > 0 && lastReadAt > mostRecentNoteActivity) {
             sessionLog(
                 sessionId,
@@ -184,13 +158,8 @@ export function peekNoteNudgeText(
 }
 
 /**
- * Return the latest `updated_at` or `ready_at` timestamp across a batch of
- * notes. Used to compare against the agent's last ctx_note(read) watermark
- * so we skip nudges when the current note state was already read.
  *
- * `ready_at` matters for smart notes that were pending at read time and just
- * transitioned to ready — even if their `updated_at` happens to be older, the
- * ready transition is new information the agent hasn't seen.
+ * `ready_at` detects smart notes that became ready after the read even when their `updated_at` predates it.
  */
 function maxNoteActivityTime(notes: Note[]): number {
     let max = 0;
@@ -202,8 +171,6 @@ function maxNoteActivityTime(notes: Note[]): number {
 }
 
 /**
- * Mark the note nudge as delivered after successful placement.
- * Only call after appendReminderToLatestUserMessage returns an anchor (or null if no user message exists).
  */
 export function markNoteNudgeDelivered(
     db: Database,
@@ -231,8 +198,6 @@ export function markNoteNudgeDelivered(
 }
 
 /**
- * Get sticky note nudge for replay on subsequent transform passes.
- * Returns { text, messageId } if a delivered nudge needs re-injection, null otherwise.
  */
 export function getStickyNoteNudge(
     db: Database,
@@ -244,8 +209,6 @@ export function getStickyNoteNudge(
 }
 
 /**
- * Legacy wrapper — peek + mark in one call.
- * Kept for tests; prefer peekNoteNudgeText + markNoteNudgeDelivered in production.
  */
 export function getNoteNudgeText(db: Database, sessionId: string): string | null {
     const text = peekNoteNudgeText(db, sessionId);
@@ -256,7 +219,6 @@ export function getNoteNudgeText(db: Database, sessionId: string): string | null
 }
 
 /**
- * Call when session is deleted or notes are read to clear persisted state.
  */
 export function clearNoteNudgeState(
     db: Database,

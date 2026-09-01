@@ -5,17 +5,7 @@ import { capBodyToGithubLimit, extractRecentErrors } from "./issue-body";
 import { sanitizeConfigValue, sanitizeDiagnosticText } from "./redaction";
 
 /**
- * Replace absolute home paths, usernames, and known secret-token shapes in
- * captured log lines so users can share reports publicly without leaking
- * local paths or credentials.
  *
- * Order of operations matters:
- *   1. Path/user redaction first — paths are deterministic and the
- *      easiest to match, doing them before token redaction means
- *      tokens never appear inside a path-resolved replacement.
- *   2. Secret-token redaction in `SECRET_PATTERNS` order — more
- *      specific shapes (provider-prefixed keys) before generic
- *      assignment patterns, so a known shape doesn't get caught
  *      twice.
  */
 export function sanitizeLogContent(content: string): string {
@@ -41,15 +31,6 @@ export interface BundledIssueReport {
 }
 
 /**
- * Pattern tokens recognized as historian-failure signals in raw log output.
- * These are stable log strings emitted by the runtime:
- *   - `historian failure:`            — structured failure log from runners
- *   - `historian failure recorded:`   — storage-layer log when failureCount increments
- *   - `historian prompt failed:`      — SDK call failure with describeError output
- *   - `## Historian alert`            — notification payload heading
- *   - `historian alert suppressed`    — alert suppressed due to cooldown
- *   - `EMERGENCY: aborting session`   — 95% abort path
- *   - `historian: prompt attempt N failed:` — per-retry transient errors
  */
 const HISTORIAN_LOG_PATTERNS = [
     /historian failure:/,
@@ -66,8 +47,6 @@ function isHistorianLogLine(line: string): boolean {
 }
 
 /**
- * Extract historian-failure log lines from the sanitized log content.
- * Returns the most recent occurrences (up to `limit`), newest first.
  */
 function extractHistorianFailureLines(sanitized: string, limit = 30): string[] {
     const matches: string[] = [];
@@ -81,26 +60,15 @@ function extractHistorianFailureLines(sanitized: string, limit = 30): string[] {
 }
 
 /**
- * Drop log lines that reference a `ses_*` session ID OTHER than `sessionId`.
- * Lines without any `ses_*` reference are kept (they're shared-runtime logs
- * that may or may not be relevant — we don't have enough signal to drop
- * them, and keeping them is safe).
  *
- * When `sessionId` is null, no filtering happens — the full log slice is
- * returned. This is the Q2 design: filter only when the user picked a
- * specific session in the `--issue` picker.
  */
 function filterLogLinesBySession(lines: string[], sessionId: string | null): string[] {
     if (!sessionId) return lines;
-    // Pattern matches OpenCode session IDs (`ses_*` with hex/alnum body, up to
-    // 32 chars). Anchored with a non-word boundary so we don't trip on names
-    // that happen to embed `ses_`.
+    // Word boundaries prevent matching `ses_` embedded in longer identifiers.
     const otherSessionPattern = /\bses_[A-Za-z0-9]{8,32}\b/g;
     return lines.filter((line) => {
         const matches = line.match(otherSessionPattern);
         if (!matches) return true;
-        // Keep the line only if EVERY session ID it mentions matches the chosen
-        // one. Mixed-session lines (rare but possible) get dropped to be safe.
         return matches.every((id) => id === sessionId);
     });
 }
@@ -118,20 +86,11 @@ export async function bundleIssueReport(
     const logLines = filterLogLinesBySession(allLogLines, sessionFilter);
     const recentLog = sanitizeLogContent(logLines.slice(-LOG_TAIL_LINES).join("\n")).trim();
 
-    // Also extract historian-failure lines from a wider window so issue reports
-    // still capture failure signals even when more recent noise has pushed them
-    // out of the 400-line tail. We scan the last 4000 lines for historian
-    // patterns and keep up to 30 matches.
+    // The 4,000-line window includes historian failures outside the 400-line log tail.
     const historianScanWindow = sanitizeLogContent(logLines.slice(-4000).join("\n"));
     const historianFailureLines = extractHistorianFailureLines(historianScanWindow, 30);
 
-    // Pull the most recent 20 ERROR-shaped lines into their own dedicated
-    // section. The body-size cap (`capBodyToGithubLimit`) only shrinks the
-    // main `## Log (last N lines)` block, so promoting errors here
-    // guarantees the agent / human reading the issue still sees them even
-    // when the body needs heavy truncation. We scan a wide window for the
-    // same reason as historian: a flood of debug noise after the error
-    // shouldn't push the cause out of view.
+    // The 4,000-line window includes errors outside the 400-line log tail.
     const errorScanWindow = sanitizeLogContent(logLines.slice(-4000).join("\n"));
     const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
 
@@ -180,11 +139,6 @@ export async function bundleIssueReport(
         "```",
     ].join("\n");
 
-    // Cap the body at GitHub's ~64KB issue limit. If the rendered report
-    // is already short enough this is a pass-through; otherwise the main
-    // log block gets shrunk from the top (older lines first) and a
-    // truncation marker inserted. The error and historian-failure sections
-    // above survive intact — that's the whole point of extracting them.
     const bodyMarkdown = capBodyToGithubLimit(rawBodyMarkdown);
 
     const path = join(process.cwd(), `magic-context-issue-${formatTimestamp(new Date())}.md`);

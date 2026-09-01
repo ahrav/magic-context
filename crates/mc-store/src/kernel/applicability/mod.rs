@@ -12,7 +12,8 @@ mod payloads;
 mod resolve;
 
 pub use checkout::{
-    open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, SnapshotError,
+    open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, PathEncoding,
+    SnapshotError,
 };
 pub use checks::{run_cheap_check, CheckOutcome};
 pub use engine::{
@@ -26,5 +27,5 @@ pub use payloads::{
 };
 pub use resolve::{
     capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,
-    CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
+    ResolveObstacle, CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
 };

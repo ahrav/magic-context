@@ -1,36 +1,35 @@
 /**
- * Descriptor-anchored connection-file snapshot.
+ * The reader anchors each snapshot to an open descriptor.
  *
- * Normative authority: `docs/mc-host-wire-protocol.md` Section 4. Two
- * explicit validation paths exist:
+ * Section 4 of `docs/mc-host-wire-protocol.md` defines the connection-file snapshot contract.
  *
- * - Direct regular file: pre-open `lstat`, `O_RDONLY | O_NOFOLLOW |
- *   O_NONBLOCK` open, `fstat` identity/ownership/mode checks, bounded read
- *   through the descriptor, and a post-read `lstat` that must still identify
- *   the same file. One whole-snapshot restart is permitted after an atomic
- *   replacement; a second identity mismatch fails closed.
- * - Trusted symlink (explicit opt-in): capture link identity and text, open
- *   the resolved regular target with no-follow, validate the target, then
- *   prove both link and target unchanged. Any replacement fails closed.
+ * For a direct regular file, the reader opens with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`.
+ * The reader validates descriptor identity, ownership, and mode before a bounded descriptor read.
+ * The reader requires post-read `lstat` identity to match the opened file.
+ * The reader restarts the whole snapshot once after an atomic replacement.
+ * A second identity mismatch fails closed.
+ * For an explicitly trusted symlink, the reader captures the link identity and text before opening its resolved target with no-follow.
+ * The reader validates the target and requires both link and target identities to remain unchanged.
+ * Any symlink or resolved-target replacement fails closed.
  *
- * Failures are typed and redacted: no key or daemon-ID byte ever appears in
- * an error message. Directory components of both paths are trusted:
- * `O_NOFOLLOW` guards only the final component, and Node exposes no
- * `openat2`/`RESOLVE_BENEATH` to constrain the prefix, so the runtime
- * directory must not be writable by other users. Leaf-adjacent module:
- * imports only leaf modules and the Node standard library.
+ * Errors expose typed, redacted failures and never include key or daemon-ID bytes.
+ * The runtime trusts directory components of both paths.
+ * `O_NOFOLLOW` guards only the final path component.
+ * Node exposes no `openat2` or `RESOLVE_BENEATH` API to constrain path prefixes.
+ * The runtime directory must not be writable by other users.
  */
 
 import { constants as fsConstants } from "node:fs";
 import { type FileHandle, lstat, open } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type { Deadline } from "./deadline";
 
-/** Snapshot cap from wire doc Section 4.1: 65,536 bytes. */
+/** The wire protocol caps snapshots at 65,536 bytes. */
 export const MAX_CONNECTION_FILE_LEN = 65_536;
-export const CONNECTION_FILE_SCHEMA = 1;
+export const CONNECTION_FILE_SCHEMA = 2;
 export const KEY_LEN = 32;
 export const DAEMON_ID_LEN = 16;
-/** Required in every connection file; any value other than 2 fails closed. */
+/** The reader rejects every wire-version value other than 2. */
 export const WIRE_VERSION = 2;
 
 export type ConnectionFileErrorCode =
@@ -48,13 +47,13 @@ export type ConnectionFileErrorCode =
     | "invalid_json"
     | "invalid_schema"
     | "invalid_wire_version"
-    | "invalid_endpoint"
+    | "invalid_setup_socket"
     | "invalid_key"
     | "invalid_daemon_id"
     | "invalid_pid"
     | "invalid_daemon_ver";
 
-/** Typed, redacted connection-file failure. Never carries credential bytes. */
+/** Callers must not pass credential bytes in `message` or `cause`. */
 export class ConnectionFileError extends Error {
     constructor(
         message: string,
@@ -66,34 +65,32 @@ export class ConnectionFileError extends Error {
     }
 }
 
-/** Immutable validated credential snapshot. */
+/* */
 export interface ConnectionSnapshot {
-    readonly endpoint: { readonly host: string; readonly port: number };
+    readonly setupSocket: string;
     /** Exactly 32 key bytes. Bearer capability; must never be logged. */
     readonly key: Uint8Array;
-    /** Exactly 16 daemon-identity bytes. */
+    /** The daemon ID contains exactly 16 bytes. */
     readonly daemonId: Uint8Array;
     readonly pid: number;
     readonly daemonVer: string;
 }
 
 export interface ReadConnectionFileOptions {
-    /** Bounds the whole snapshot; checked between every filesystem step. */
+    /** The reader checks the deadline between filesystem steps and bounds the entire snapshot. */
     deadline: Deadline;
-    /** Test seam for the unsupported-platform check. Defaults to the real one. */
+    /** When omitted, `platform` defaults to the real platform. */
     platform?: NodeJS.Platform;
-    /** Test seam for the owning UID. Defaults to `process.getuid()`. */
+    /** When omitted, `uid` defaults to `process.getuid()`. */
     uid?: number;
     /**
-     * Test seam invoked once per attempt after the target descriptor is
-     * open, before any read. Lets tests race replacements deterministically.
+     * The reader invokes `afterOpen` once per attempt after opening the target descriptor and before reading.
+     * `afterOpen` lets tests race replacements deterministically.
      */
     afterOpen?: () => void | Promise<void>;
 }
 
 /**
- * Exact-length JSON byte-array validation lives in the shared `bytes` leaf;
- * re-exported here for the connection-file test suite.
  */
 import { toExactByteArray } from "./bytes";
 
@@ -142,9 +139,8 @@ async function openNoFollow(filePath: string): Promise<FileHandle> {
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
     } catch (error) {
-        // Only absence (ENOENT) is retryable republication churn; EACCES,
-        // ELOOP, descriptor exhaustion, and every other open fault is
-        // permanent evidence that must stop a recovery episode.
+        // The reader retries only `ENOENT`.
+        // The reader fails closed for `EACCES`, `ELOOP`, descriptor exhaustion, and every other open fault.
         if (statErrno(error) === "ENOENT") {
             throw new ConnectionFileError(
                 `connection file ${filePath} does not exist`,
@@ -161,11 +157,10 @@ async function openNoFollow(filePath: string): Promise<FileHandle> {
 }
 
 /**
- * Read up to cap + 1 bytes through the descriptor so an oversize file is
- * detected from the bytes actually read, not from possibly-stale metadata.
- * The deadline is re-checked between reads; one in-flight `read()` cannot
- * be cancelled, so a stalled filesystem can still exceed the budget by at
- * most one syscall.
+ * The reader reads `MAX_CONNECTION_FILE_LEN + 1` bytes to detect oversize content without relying on stale metadata.
+ * The reader reads `MAX_CONNECTION_FILE_LEN + 1` bytes to detect oversize content without relying on stale metadata.
+ * The loop rechecks `deadline` between reads; an in-flight `handle.read()` cannot be cancelled and can exceed the deadline by one syscall.
+ * The loop rechecks `deadline` between reads; an in-flight `handle.read()` cannot be cancelled and can exceed the deadline by one syscall.
  */
 async function readBounded(handle: FileHandle, deadline: Deadline): Promise<Uint8Array> {
     const buffer = Buffer.alloc(MAX_CONNECTION_FILE_LEN + 1);
@@ -186,9 +181,7 @@ async function readBounded(handle: FileHandle, deadline: Deadline): Promise<Uint
 }
 
 /**
- * Validate the descriptor after open: regular file, owned by this process,
- * no group/other permission bits. Ordered so a FIFO or directory descriptor
- * is rejected before any read could block or misbehave.
+ * validateOpenStat rejects non-regular descriptors before reads because FIFO reads can block.
  */
 function validateOpenStat(
     stat: { isFile(): boolean; uid: number; mode: number },
@@ -209,7 +202,7 @@ function validateOpenStat(
     }
 }
 
-/** One direct-file snapshot attempt. Identity mismatch = `replaced_during_read`. */
+/* */
 async function snapshotDirect(
     filePath: string,
     deadline: Deadline,
@@ -217,11 +210,6 @@ async function snapshotDirect(
     afterOpen?: () => void | Promise<void>,
 ): Promise<Uint8Array> {
     checkDeadline(deadline);
-    // Stat failures split by errno: an absent path (ENOENT) during daemon
-    // republication is retryable `not_found` churn, while EACCES, ENOTDIR,
-    // ELOOP, and every other stat fault is permanent configuration
-    // evidence (`stat_failed`) that must stop a recovery episode instead
-    // of retrying to its deadline.
     const before = await lstat(filePath).catch((error: unknown) => {
         if (statErrno(error) === "ENOENT") {
             throw new ConnectionFileError(
@@ -263,9 +251,6 @@ async function snapshotDirect(
         checkDeadline(deadline);
         const bytes = await readBounded(handle, deadline);
         checkDeadline(deadline);
-        // An unlink after the read (ENOENT) is a replacement event: the
-        // one-restart rule (KTD3) and churn retry classification apply.
-        // Any other stat fault is permanent evidence, as above.
         const after = await lstat(filePath).catch((error: unknown) => {
             if (statErrno(error) === "ENOENT") {
                 throw new ConnectionFileError(
@@ -297,9 +282,9 @@ function invalid(code: ConnectionFileErrorCode, message: string): ConnectionFile
 }
 
 /**
- * Validate the decoded JSON against wire doc Section 4.1: schema 1,
- * a required wire version of exactly 2, first endpoint exactly `127.0.0.1` with a port
- * in `1..=65535`, exactly 32 key bytes, exactly 16 daemon-ID bytes, a safe
+ * Validate the decoded JSON against wire doc Section 4.1: schema 2,
+ * a required wire version of exactly 2, an absolute setup-socket path,
+ * exactly 32 key bytes, exactly 16 daemon-ID bytes, a safe
  * integer PID, and a nonempty daemon version. No coercion anywhere.
  */
 function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
@@ -316,25 +301,11 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
             `connection file wire_version must be exactly ${WIRE_VERSION}`,
         );
     }
-    const endpoints = record.endpoints;
-    if (!Array.isArray(endpoints) || endpoints.length === 0) {
-        throw invalid("invalid_endpoint", "connection file must include at least one endpoint");
-    }
-    const first: unknown = endpoints[0];
-    if (typeof first !== "object" || first === null || Array.isArray(first)) {
-        throw invalid("invalid_endpoint", "connection file endpoints[0] must be an object");
-    }
-    const { host, port } = first as Record<string, unknown>;
-    if (host !== "127.0.0.1") {
+    const setupSocket = record.setup_socket;
+    if (typeof setupSocket !== "string" || setupSocket.length === 0 || !isAbsolute(setupSocket)) {
         throw invalid(
-            "invalid_endpoint",
-            "connection file endpoint host must be exactly 127.0.0.1",
-        );
-    }
-    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65_535) {
-        throw invalid(
-            "invalid_endpoint",
-            "connection file endpoint port must be an integer in 1..=65535",
+            "invalid_setup_socket",
+            "connection file setup_socket must be an absolute path",
         );
     }
     const key = toExactByteArray(record.key, KEY_LEN);
@@ -360,7 +331,7 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
         throw invalid("invalid_daemon_ver", "connection file daemon_ver must be a nonempty string");
     }
     return Object.freeze({
-        endpoint: Object.freeze({ host: "127.0.0.1", port }),
+        setupSocket,
         key,
         daemonId,
         pid,
@@ -385,9 +356,6 @@ function decodeAndValidate(bytes: Uint8Array): ConnectionSnapshot {
 }
 
 /**
- * Take one bounded, descriptor-anchored snapshot of the connection file and
- * return the validated immutable credentials. JSON is parsed only after the
- * complete byte snapshot passed every identity check.
  */
 export async function readConnectionFile(
     filePath: string,
@@ -405,8 +373,6 @@ export async function readConnectionFile(
     try {
         bytes = await snapshotDirect(filePath, options.deadline, uid, options.afterOpen);
     } catch (error) {
-        // KTD3: one whole-snapshot restart after an atomic replacement. A
-        // second identity mismatch propagates and fails closed.
         if (!(error instanceof ConnectionFileError) || error.code !== "replaced_during_read") {
             throw error;
         }

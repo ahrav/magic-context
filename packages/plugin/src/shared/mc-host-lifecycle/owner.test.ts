@@ -3,9 +3,6 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-// The producer of every payload_manifest_digest in the parent trust index.
-// Fixture digests are computed with THIS implementation so the test fails if
-// owner.ts's verifier canonicalization ever drifts from the release build's.
 import { canonicalJson } from "../../../../../scripts/generate-mc-host-release-manifest";
 import {
     canonicalPayloadManifestJson,

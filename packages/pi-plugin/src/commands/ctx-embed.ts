@@ -39,9 +39,6 @@ export async function runEmbedDrain(
 		batchSize?: number;
 	} = {},
 ): Promise<EmbedDrainStatus> {
-	// Idempotent start: a drain already running for this session means a second
-	// start would abort it then race the just-released lease to "busy" — killing
-	// the active run for nothing. Just report it's running.
 	const activeCtrl = embedRunStateBySession.get(sessionId);
 	if (activeCtrl && !activeCtrl.signal.aborted) {
 		return {
@@ -100,7 +97,7 @@ export async function runEmbedDrain(
 			},
 		);
 	} finally {
-		// Always release the controller, even on throw, so a later start works.
+		// Delete the entry only if it still belongs to `controller`, preserving a newer drain's controller.
 		if (embedRunStateBySession.get(sessionId) === controller) {
 			embedRunStateBySession.delete(sessionId);
 		}
@@ -245,7 +242,7 @@ export function registerCtxEmbedCommand(
 	});
 }
 
-/** Fire-and-forget auto-drain for the active Pi session (once per process). */
+/* */
 export function maybeAutoEmbedPiSession(
 	deps: {
 		db: ContextDatabase;
@@ -265,9 +262,6 @@ export function maybeAutoEmbedPiSession(
 	void (async () => {
 		let completedDrainWithWork = false;
 		try {
-			// Defer off the context-handler thread before any DB/config work:
-			// ensureProjectRegisteredFromPiDirectory does its config load + stale
-			// wipe synchronously, so awaiting it first would run on the hot path.
 			await new Promise((resolve) => setTimeout(resolve, 0));
 			await ensureProjectRegisteredFromPiDirectory(projectDir, deps.db);
 			const coverage = getEmbeddingCoverageStatus(
@@ -289,7 +283,6 @@ export function maybeAutoEmbedPiSession(
 			completedDrainWithWork = level === "success";
 			notify(text.replace(/^## \/ctx-embed\n\n/, ""));
 		} catch {
-			// best-effort background drain
 		} finally {
 			if (!completedDrainWithWork)
 				autoEmbedAttemptedBySession.delete(sessionId);

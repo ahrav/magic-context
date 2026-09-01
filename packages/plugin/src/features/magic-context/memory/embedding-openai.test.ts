@@ -4,11 +4,9 @@ import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { embeddingModelsMatch, OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
 
 describe("provider modelId matches canonical identity (write/read must agree)", () => {
-    // The provider's own this.modelId is what WRITES are stored under; the
+    // The provider stores writes under `this.modelId`.
     // registry/GC/reads resolve via getEmbeddingProviderIdentity(config). Any
-    // identity-affecting field present in one but not the other splits the
-    // vector space → silent zero-results + GC of valid vectors. Lock parity
-    // across every identity-affecting field.
+    // Identity-affecting fields must be identical in `this.modelId` and `getEmbeddingProviderIdentity(config)`.
     const cases: Array<{ name: string; config: EmbeddingConfig }> = [
         {
             name: "endpoint+model only",
@@ -131,8 +129,7 @@ describe("embeddingModelsMatch token-boundary semantics", () => {
         ).toBe(false);
     });
     test("REJECTS a broad configured name contained as an interior token (corruption hole)", () => {
-        // The bug: served `…-qwen3-embedding-0.6b` contains configured `qwen3-embedding`
-        // but `0.6b` is a distinct model token, not a version suffix.
+        // `0.6b` is a distinct model token, not a version suffix.
         expect(embeddingModelsMatch("text-embedding-qwen3-embedding-0.6b", "qwen3-embedding")).toBe(
             false,
         );
@@ -341,7 +338,6 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
     });
 
     test("aborts fetch when it exceeds timeout (AbortError path records failure)", async () => {
-        // Simulate a fetch that throws AbortError (our AbortController fired).
         fetchSpy.mockImplementation(async () => {
             const err = new Error("The operation was aborted");
             err.name = "AbortError";
@@ -359,8 +355,6 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
 
         const provider = makeProvider();
 
-        // Trigger a failure, then age the internal failureTimes out of window
-        // by resetting the circuit (which also clears the window).
         await provider.embed("one");
         expect(provider._getFailureCount()).toBe(1);
         provider._resetCircuit();
@@ -375,21 +369,18 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
         fetchSpy.mockImplementation((async () => errorResponse()) as FetchLike);
 
         const provider = makeProvider();
-        // Drive to OPEN.
         await provider.embed("a");
         await provider.embed("b");
         await provider.embed("c");
         expect(provider._getCircuitState()).toBe("open");
 
-        // Simulate open-timer elapsed by mutating circuit state directly
-        // via the test hook. We don't want to wait 5 minutes in a test.
+        // The test hook bypasses the 5-minute open interval.
         provider._resetCircuit();
-        // Manually drive state to "open timer elapsed, next call is a probe"
-        // — simplest path: force OPEN with a past timestamp.
+        // A past OPEN timestamp makes the next call a half-open probe.
         (provider as unknown as { circuitOpenUntil: number }).circuitOpenUntil = Date.now() - 10;
 
-        // First call after timer elapse = half-open probe. Still failing →
-        // SINGLE failure re-opens. Not 3 like CLOSED state.
+        // After the open interval elapses, the next call is a half-open probe.
+        // One failed half-open probe reopens the circuit; CLOSED requires three failures.
         const beforeProbeFailureCount = provider._getFailureCount();
         await provider.embed("probe");
         expect(provider._getFailureCount()).toBe(beforeProbeFailureCount); // window cleared on re-open
@@ -397,7 +388,7 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
     });
 
     test("half-open probe in flight: concurrent callers short-circuit (no stampede)", async () => {
-        // Hang forever to keep the probe in flight.
+        // The mock fetch remains pending so the probe stays in flight.
         let hangResolver: ((r: Response) => void) | undefined;
         fetchSpy.mockImplementation(
             (async () =>
@@ -407,31 +398,28 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
         );
 
         const provider = makeProvider();
-        // Force OPEN with elapsed timer.
         (provider as unknown as { circuitOpenUntil: number }).circuitOpenUntil = Date.now() - 10;
 
-        // Caller 1 claims the probe slot. Doesn't await yet.
+        // Caller 1 claims the probe slot without awaiting it.
         const probePromise = provider.embed("probe-caller");
 
-        // Give the promise a microtask tick to claim the probe slot.
+        // A microtask lets caller 1 claim the probe slot before caller 2 starts.
         await Promise.resolve();
 
-        // Now caller 2 should short-circuit — probe is in flight, only
-        // one caller at a time during half-open.
+        // Caller 2 short-circuits while the half-open probe is in flight.
+        // Half-open permits one caller while a probe is in flight.
         const beforeConcurrentFetches = fetchSpy.mock.calls.length;
         const concurrentResult = await provider.embed("concurrent-caller");
         expect(concurrentResult).toBeNull();
-        // No new fetch was issued by caller 2.
         expect(fetchSpy.mock.calls.length).toBe(beforeConcurrentFetches);
 
-        // Let the probe finish (success → circuit closes).
+        // A successful half-open probe closes the circuit.
         hangResolver?.(successResponse());
         await probePromise;
         expect(provider._getCircuitState()).toBe("closed");
     });
 
     test("outer caller abort doesn't count against the circuit", async () => {
-        // Fetch that respects the incoming signal and throws AbortError on abort.
         fetchSpy.mockImplementation((async (_url, init) => {
             const signal = (init as RequestInit | undefined)?.signal;
             if (signal) {
@@ -450,20 +438,16 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
         const outerController = new AbortController();
         const outerSignal = outerController.signal;
 
-        // Schedule an outer abort — caller gave up.
         setTimeout(() => outerController.abort(), 30);
 
         const result = await provider.embed("hang but outer aborts", outerSignal);
         expect(result).toBeNull();
-        // The caller's abort must NOT count as an endpoint failure. Endpoint
-        // might be perfectly healthy — caller just gave up.
+        // A caller abort does not count as an endpoint failure.
+        // A caller abort does not indicate endpoint health.
         expect(provider._getFailureCount()).toBe(0);
     });
 
     test("treats 200 with empty body as a typed failure (no SyntaxError leak)", async () => {
-        // Real-world LMStudio / Cerebras / Fireworks behavior under load: a
-        // 200 OK with an empty body. Pre-fix, this surfaced as a confusing
-        // `Unexpected end of JSON input` SyntaxError from response.json().
         fetchSpy.mockImplementation(
             (async () =>
                 new Response("", {
@@ -475,14 +459,13 @@ describe("OpenAICompatibleEmbeddingProvider circuit breaker", () => {
         const provider = makeProvider();
         const result = await provider.embed("text");
         expect(result).toBeNull();
-        // It still counts as a failure for circuit purposes — endpoint is up
-        // but not actually embedding, which is the same operational signal.
+        // A 200 response with an empty body counts as a failure for circuit-breaker purposes.
+        // A 200 response with an empty body counts as a failure because it provides no embedding.
         expect(provider._getFailureCount()).toBe(1);
     });
 
     test("treats 200 with non-JSON body as a typed failure (no SyntaxError leak)", async () => {
-        // Some upstream proxies can return an HTML error page with a 200
-        // status. Don't let JSON.parse errors poison the log.
+        // A 200 response with an HTML body must produce a typed failure rather than leak a JSON parse error.
         fetchSpy.mockImplementation(
             (async () =>
                 new Response("<html>upstream error</html>", {
@@ -516,7 +499,6 @@ describe("OpenAICompatibleEmbeddingProvider model-substitution guard", () => {
 
     test("rejects vectors when the endpoint serves a DIFFERENT model (LMStudio substitution)", async () => {
         fetchSpy.mockImplementation((async () =>
-            // requested qwen3-embedding-4b-dwq but LMStudio serves the loaded 0.6b
             modelResponse("text-embedding-qwen3-embedding-0.6b")) as FetchLike);
         const provider = new OpenAICompatibleEmbeddingProvider({
             endpoint: "http://127.0.0.1:65535",
@@ -524,7 +506,7 @@ describe("OpenAICompatibleEmbeddingProvider model-substitution guard", () => {
         });
         const result = await provider.embed("text");
         expect(result).toBeNull();
-        // Treated as a failure so the circuit breaker backs off the misrouting endpoint.
+        // A model mismatch counts as a failure so the circuit breaker backs off the misrouting endpoint.
         expect(provider._getFailureCount()).toBe(1);
     });
 

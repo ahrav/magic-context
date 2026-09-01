@@ -156,8 +156,6 @@ describe("pi subagent behavior", () => {
         }
         expect(spawnImpl).toHaveBeenCalledTimes(1);
         const [, args] = capturedSpawnCall(spawnImpl, 0);
-        // --no-session is the runner-level invariant that prevents any child
-        // session rows from being persisted by Pi's SessionManager.
         expect(args).toContain("--no-session");
     });
 });

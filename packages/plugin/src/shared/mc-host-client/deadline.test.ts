@@ -66,8 +66,7 @@ describe("Deadline", () => {
 
     test("a stage deadline cannot pass the operation end when the clock advances between samples", () => {
         let now = 0;
-        // Every read advances the clock, as a real clock does between the
-        // budget sample and the end-computation sample inside stage().
+        // Each clock read advances 50 ms to simulate elapsed time between stage() samples.
         const clock: MonotonicClock = () => (now += 50);
         const operation = Deadline.start(1_000, clock);
         const stage = operation.stage(30_000);
@@ -124,7 +123,7 @@ describe("Deadline", () => {
     });
 });
 
-/** Manually-driven scheduler: the test decides exactly when a timer fires. */
+/* */
 function fakeScheduler(): {
     scheduler: ExpiryTimerScheduler;
     fireNext: () => void;
@@ -166,15 +165,14 @@ describe("armExpiryTimer", () => {
         let expired = 0;
         armExpiryTimer(deadline, () => (expired += 1), scheduler);
 
-        // The timer fires while the deadline's clock still reads unexpired —
-        // the truncated-setTimeout race. The callback must not run.
+        // setTimeout can fire before endMs when its delay is truncated.
+        // The expiry callback must not run before isExpired() returns true.
         advance(29);
         fireNext();
         expect(expired).toBe(0);
         expect(scheduledCount()).toBe(2);
 
-        // Once the clock passes the end, the re-armed timer reports expiry,
-        // so the callback always implies isExpired().
+        // After re-arming the expiry timer, the expiry callback runs only after isExpired() returns true.
         advance(1);
         expect(deadline.isExpired()).toBe(true);
         fireNext();

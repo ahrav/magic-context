@@ -122,8 +122,8 @@ describe("parseRetrospectiveLearnings", () => {
     });
 
     test("tolerates attributes and stray whitespace on anti-memory child tags", () => {
-        // A required field that fails to extract discards the whole learning, so
-        // ordinary model formatting variance must not cost a memory.
+        // The parser discards an anti-memory learning when any required field fails to extract.
+        // Whitespace and attributes on anti-memory child tags must not invalidate a complete learning.
         const learnings = parseRetrospectiveLearnings(`<learnings>
             <learning route="anti_memory">
                 <trigger >Choosing a session cache backend</trigger>
@@ -202,10 +202,7 @@ describe("applyRetrospectiveLearnings", () => {
         ).id;
         const anti = readAntiMemory(db, publicClaimId);
         expect(anti?.payload.saferAlternative).toBe("Use the existing SQLite store");
-        // A dreamer-written anti-memory carries the inference taint, and it is
-        // reachable only through explicit search: a maintenance lane that could
-        // see it could re-create its content under a positive category and
-        // launder a rejected approach back into auto-injected memory.
+        // Anti-memories are available only through explicit search.
         expect(searchableClaims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
         expect(claims(db)).toHaveLength(0);
 
@@ -225,8 +222,6 @@ describe("applyRetrospectiveLearnings", () => {
             },
             identity("retro-run-2", "window-2"),
         );
-        // The repeated pair dedups onto the existing claim rather than adding a
-        // second one, and keeps the reason from the first observation.
         expect(searchableClaims(db)).toHaveLength(1);
         expect(readAntiMemory(db, publicClaimId)?.payload.rejectionReason).toBe(
             "The deployment must remain single-process and offline-capable",
@@ -258,9 +253,6 @@ describe("applyRetrospectiveLearnings", () => {
     });
 
     test("returns the claim effects a run needs for its memory-change telemetry", () => {
-        // Route-`memory` learnings are claim-native, so a caller diffing the
-        // legacy `memories` table sees nothing and records NULL changes for a
-        // run that did create claims. The effects have to come back here.
         db = createClaimReaderTestDatabase();
         const learnings = parseRetrospectiveLearnings(`<learnings>
             <learning route="memory" category="CONSTRAINTS">Bulk provider calls are rate limited.</learning>

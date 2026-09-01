@@ -1,16 +1,17 @@
-use std::fs::{self, File};
-
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rustix::fs::{self as rfs, AtFlags};
 use serde::Serialize;
 
+use super::MAX_TEXT_FIELD_BYTES;
 use super::{is_artifact_digest, ArtifactError, ArtifactErrorKind};
 use crate::kernel::durable_fs::{
-    append_and_sync, classify_io, durable_unlink, open_secure_directory, StorageError,
+    append_and_sync, classify_errno, classify_io, durable_unlink, open_secure_directory,
+    StorageError,
 };
 use crate::kernel::envelope::{
     check_fence, commit_with_writer, CommitIntent, ObjectRow, PendingChange, Sensitivity,
 };
-use crate::kernel::redaction::{redact, RedactedField};
+use crate::kernel::redaction::{identity, redact, RedactedField};
 use crate::kernel::{KernelError, KernelStore};
 
 const PROPAGATION_TARGETS: [&str; 4] = [
@@ -21,7 +22,7 @@ const PROPAGATION_TARGETS: [&str; 4] = [
 ];
 const MAX_AUDIT_FIELD_BYTES: usize = 1_024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactDeletionKind {
     Delete,
@@ -112,6 +113,7 @@ struct PurgeIntentLine<'a> {
 #[derive(Serialize, serde::Deserialize)]
 struct DeletionReceiptPayload {
     barrier_id: String,
+    kind: ArtifactDeletionKind,
     affected_object_ids: Vec<String>,
 }
 
@@ -141,6 +143,7 @@ struct ArtifactState {
     all_object_ids: Vec<String>,
     prior_commit_seq: Option<i64>,
     barrier_id: String,
+    prior_barrier_id: Option<String>,
     tombstoned: bool,
     pending_unlink: bool,
 }
@@ -154,6 +157,7 @@ struct Propagation<'a> {
     operator_id: &'a str,
     target_locator: &'a str,
     deleted_at: i64,
+    redactions: &'a [(String, RedactedField)],
 }
 
 impl KernelStore {
@@ -194,11 +198,18 @@ impl KernelStore {
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         let state = load_artifact_state(&writer, &request.identity)?;
+        // Idempotent replays bypass `commit_with_writer`, so check receipt conflicts here.
+        receipt_digest_conflict_free(&writer, &request.intent)?;
 
         if request.kind == ArtifactDeletionKind::Purge && state.tombstoned {
-            crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-                .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+            let repair = crate::kernel::slice::rebuild_alignment_with_writer(
+                &mut writer,
+                self.lease_epoch(),
+            );
             if state.pending_unlink {
+                // A pending unlink leaves the purge incomplete, so a repair failure is
+                // reportable here.
+                repair.map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
                 self.complete_pending_purge_locked(&mut writer, &state.digest)?;
             }
             return Ok(result_from_state(&state, request.kind, true));
@@ -210,8 +221,11 @@ impl KernelStore {
                     &state.digest,
                 ));
             }
-            crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-                .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+            // Do not report a durable deletion as failed when alignment rebuild fails.
+            let _ = crate::kernel::slice::rebuild_alignment_with_writer(
+                &mut writer,
+                self.lease_epoch(),
+            );
             return Ok(result_from_state(&state, request.kind, true));
         }
 
@@ -238,7 +252,7 @@ impl KernelStore {
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
             line.push(b'\n');
-            receipt_conflict_free(&writer, &request.intent)?;
+            receipt_describes_deletion(&writer, &request.intent, &state.barrier_id, request.kind)?;
             let mut log = self
                 .purge_intent_log
                 .lock()
@@ -259,6 +273,19 @@ impl KernelStore {
         let operator_id = redacted.operator_id.text.clone();
         let reason = redacted.reason.text.clone();
         let target_locator = redacted.target_locator.text.clone();
+        let propagation_redactions = if kind == ArtifactDeletionKind::Purge {
+            [
+                ("operator_id", &redacted.operator_id),
+                ("target_locator", &redacted.target_locator),
+                ("reason", &redacted.reason),
+            ]
+            .into_iter()
+            .filter(|(_, field)| !field.detections.is_empty())
+            .map(|(name, field)| (name.to_string(), field.clone()))
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let receipt = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
@@ -290,6 +317,17 @@ impl KernelStore {
                     deleted_at,
                 )?;
                 if kind == ArtifactDeletionKind::Purge {
+                    // A reservation whose lease has expired can outlive the ingest that
+                    // created it, and an unexpired one still blocks the tombstone.
+                    envelope
+                        .tx
+                        .execute(
+                            "DELETE FROM artifact_ingestion_reservations
+                             WHERE state='Live' AND lease_expires_at<=?1
+                               AND (artifact_digest=?2 OR artifact_reference=?3)",
+                            params![deleted_at, digest, artifact_reference],
+                        )
+                        .map_err(|_| KernelError::Io)?;
                     envelope
                         .tx
                         .execute(
@@ -338,22 +376,28 @@ impl KernelStore {
                     operator_id: &operator_id,
                     target_locator: &target_locator,
                     deleted_at,
+                    redactions: &propagation_redactions,
                 });
                 serde_json::to_string(&DeletionReceiptPayload {
                     barrier_id: barrier_id.clone(),
+                    kind,
                     affected_object_ids: event_object_ids.clone(),
                 })
                 .map_err(|_| KernelError::Io)
             },
-            fault == Some(ArtifactDeletionFault::BeforeCommit),
+            || {
+                if fault == Some(ArtifactDeletionFault::BeforeCommit) {
+                    return Err(KernelError::Fault);
+                }
+                Ok(())
+            },
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
         let committed = serde_json::from_str::<DeletionReceiptPayload>(&receipt.result)
-            .unwrap_or_else(|_| DeletionReceiptPayload {
-                barrier_id: state.barrier_id.clone(),
-                affected_object_ids: state.all_object_ids.clone(),
-            });
+            .ok()
+            .filter(|payload| payload.barrier_id == state.barrier_id && payload.kind == kind)
+            .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         let result = ArtifactDeletionResult {
             kind,
             digest: state.digest.clone(),
@@ -421,8 +465,8 @@ impl KernelStore {
     }
 
     fn unlink_purged_artifact(&self, digest: &str) -> Result<(), ArtifactError> {
-        let objects = File::open(self.artifacts_path.join("objects")).map_err(|error| {
-            self.map_cas_storage_error(classify_io(error), ArtifactErrorKind::PurgeUnlinkPending)
+        let objects = self.open_objects_directory().map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::PurgeUnlinkPending)
         })?;
         let shard = match open_secure_directory(&objects, &digest[..2]) {
             Ok(shard) => shard,
@@ -445,23 +489,23 @@ impl KernelStore {
     }
 
     pub(super) fn sweep_digest_temps(&self, digest: &str) -> Result<(), StorageError> {
-        let tmp_path = self.artifacts_path.join("tmp");
-        let tmp = File::open(&tmp_path).map_err(classify_io)?;
+        let tmp = self.open_artifacts_subdirectory("tmp")?;
         let prefix = format!(".artifact-{digest}-");
-        for entry in fs::read_dir(&tmp_path).map_err(classify_io)? {
-            let entry = entry.map_err(classify_io)?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        for entry in rfs::Dir::read_from(&tmp).map_err(classify_errno)? {
+            let entry = entry.map_err(classify_errno)?;
+            let Some(name) = entry.file_name().to_str().ok().map(str::to_owned) else {
                 continue;
             };
             if !name.starts_with(&prefix) {
                 continue;
             }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(classify_io(error)),
+            let stat = match rfs::statat(&tmp, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(error) => return Err(classify_errno(error)),
             };
-            if file_type.is_file() || file_type.is_symlink() {
+            let kind = rfs::FileType::from_raw_mode(stat.st_mode);
+            if kind.is_file() || kind.is_symlink() {
                 durable_unlink(&tmp, &name)?;
             }
         }
@@ -495,9 +539,11 @@ impl KernelStore {
         let mut statement = tx
             .prepare(
                 "SELECT bc.consumer_id,bc.required_checkpoint_commit_seq,
-                        COALESCE(c.checkpoint_commit_seq,
-                                 CASE WHEN bc.acknowledged_at IS NOT NULL
-                                      THEN bc.required_checkpoint_commit_seq END),
+                        CASE WHEN bc.acknowledged_at IS NOT NULL
+                             THEN MAX(bc.required_checkpoint_commit_seq,
+                                      COALESCE(c.checkpoint_commit_seq,
+                                               bc.required_checkpoint_commit_seq))
+                             ELSE c.checkpoint_commit_seq END,
                         (SELECT a.operator_id FROM consumer_abandonments a
                           WHERE a.consumer_id=bc.consumer_id AND a.barrier_id=bc.barrier_id
                             AND a.commit_seq>=bc.required_checkpoint_commit_seq
@@ -546,9 +592,14 @@ fn validate_request(request: &ArtifactDeletionRequest) -> Result<(), ArtifactErr
     if request.deleted_at < 0 {
         return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
     }
-    // The commit rejects a malformed request digest, which would otherwise happen
-    // after the purge intent is already durable.
     if !is_artifact_digest(&request.intent.request_digest) {
+        return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+    }
+    if request.intent.producer.trim().is_empty()
+        || request.intent.operation_key.trim().is_empty()
+        || identity(&request.intent.producer).is_err()
+        || identity(&request.intent.operation_key).is_err()
+    {
         return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
     }
     if request.kind == ArtifactDeletionKind::Purge {
@@ -583,6 +634,9 @@ fn load_artifact_state(
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         ArtifactDeletionIdentity::EvidenceId(evidence_id) if !evidence_id.trim().is_empty() => {
+            if evidence_id.len() > MAX_TEXT_FIELD_BYTES {
+                return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+            }
             let evidence_id = redact(evidence_id).text;
             let stored: String = connection
                 .query_row(
@@ -634,16 +688,39 @@ fn load_artifact_state(
         .iter()
         .filter(|row| row.3.is_none())
         .map(|row| row.0.clone())
-        .collect();
-    let barrier_id = format!("artifact-deletion-{digest}");
-    let prior_commit_seq = connection
+        .collect::<Vec<String>>();
+    let open_barrier = connection
         .query_row(
-            "SELECT delete_commit_seq FROM deletion_backfill_barriers WHERE artifact_digest=?1",
+            "SELECT barrier_id FROM deletion_backfill_barriers
+             WHERE artifact_digest=?1 AND completed_at IS NULL",
             [&digest],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    let prior_barrier = connection
+        .query_row(
+            "SELECT barrier_id,delete_commit_seq FROM deletion_backfill_barriers
+             WHERE artifact_digest=?1
+             ORDER BY delete_commit_seq DESC,barrier_id DESC LIMIT 1",
+            [&digest],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    let prior_commit_seq = prior_barrier.as_ref().map(|(_, commit_seq)| *commit_seq);
+    let prior_barrier_id = prior_barrier
+        .as_ref()
+        .map(|(barrier_id, _)| barrier_id.clone());
+    // `idx_deletion_barriers_open` admits one incomplete barrier per digest, and a
+    // completed barrier stays as an audit record holding its primary key.
+    let barrier_id = match open_barrier {
+        Some(barrier_id) => barrier_id,
+        None => format!(
+            "artifact-deletion-{digest}-{}",
+            crate::kernel::durable_fs::next_unique_id()
+        ),
+    };
     let (tombstoned, pending_unlink) = connection
         .query_row(
             "SELECT
@@ -661,14 +738,14 @@ fn load_artifact_state(
         all_object_ids,
         prior_commit_seq,
         barrier_id,
+        prior_barrier_id,
         tombstoned,
         pending_unlink,
     })
 }
 
-/// Rejects a reused operation key that carries a different request digest, which
-/// the commit refuses after the purge intent would already be durable.
-fn receipt_conflict_free(
+/// Rejects a reused operation key that carries a different request digest.
+fn receipt_digest_conflict_free(
     connection: &rusqlite::Connection,
     intent: &CommitIntent,
 ) -> Result<(), ArtifactError> {
@@ -690,6 +767,39 @@ fn receipt_conflict_free(
     Ok(())
 }
 
+fn receipt_describes_deletion(
+    connection: &rusqlite::Connection,
+    intent: &CommitIntent,
+    barrier_id: &str,
+    kind: ArtifactDeletionKind,
+) -> Result<(), ArtifactError> {
+    // `result_payload` is a BLOB column, so it cannot be read as a `String`.
+    let recorded: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT request_digest,result_payload FROM operation_receipts
+             WHERE producer=?1 AND operation_key=?2",
+            params![
+                redact(&intent.producer).text,
+                redact(&intent.operation_key).text
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    let Some((digest, payload)) = recorded else {
+        return Ok(());
+    };
+    if digest != intent.request_digest {
+        return Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit));
+    }
+    // This receipt will be replayed, so it has to describe this deletion.
+    serde_json::from_slice::<DeletionReceiptPayload>(&payload)
+        .ok()
+        .filter(|stored| stored.barrier_id == barrier_id && stored.kind == kind)
+        .map(|_| ())
+        .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
+}
+
 fn injected_storage_error(errno: rustix::io::Errno) -> StorageError {
     classify_io(std::io::Error::from_raw_os_error(errno.raw_os_error()))
 }
@@ -704,7 +814,10 @@ fn result_from_state(
         digest: state.digest.clone(),
         affected_object_ids: state.all_object_ids.clone(),
         commit_seq: state.prior_commit_seq.unwrap_or(0),
-        barrier_id: state.barrier_id.clone(),
+        barrier_id: state
+            .prior_barrier_id
+            .clone()
+            .unwrap_or_else(|| state.barrier_id.clone()),
         already_applied,
     }
 }
@@ -722,11 +835,10 @@ fn upsert_barrier(
             "INSERT INTO deletion_backfill_barriers(
                  barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
              ) VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(artifact_digest) DO UPDATE SET
+             ON CONFLICT(artifact_digest) WHERE completed_at IS NULL DO UPDATE SET
                  delete_commit_seq=excluded.delete_commit_seq,
                  artifact_reference=excluded.artifact_reference,
-                 created_at=excluded.created_at,
-                 completed_at=NULL",
+                 created_at=excluded.created_at",
             params![
                 barrier_id,
                 digest,
@@ -772,7 +884,7 @@ fn push_propagation_events(envelope: &mut crate::kernel::Envelope<'_>, work: &Pr
             },
             kind: "artifact_deletion",
             replaced_object_id: None,
-            redactions: Vec::new(),
+            redactions: work.redactions.to_vec(),
             audit: Some(serde_json::json!({
                 "target_class": target_class,
                 "deletion_kind": work.kind.as_str(),

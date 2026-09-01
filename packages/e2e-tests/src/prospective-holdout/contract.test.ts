@@ -4,11 +4,9 @@ import { parseCloseManifest, parseFreezeManifest, parsePolicyOwnerDocument, type
 import { closeManifest, freezeManifest } from "./test-fixtures";
 
 /**
- * Restates the freeze around one intake window. Approvals carry the body's fingerprint, so
- * they are re-derived: a manifest reaching the instant check has to be otherwise acceptable,
- * or a stale subject would decide the outcome instead. Both ends are supplied because a
- * normalised instant can land on either side of the window-order rule, and that rule would
- * otherwise answer for a calendar date the round-trip is what refuses.
+ * The helper recomputes approval.subjectFingerprint values so stale-subject validation cannot mask instant validation.
+ * Callers must set closesAt after normalized opensAt so window-order validation cannot mask instant validation.
+ * An invalid instant can normalize across the intakeWindow ordering boundary.
  */
 function freezeWithWindow(window: { opensAt: string; closesAt: string }): ReleaseFreezeManifest {
     const manifest = freezeManifest();
@@ -39,28 +37,24 @@ describe("prospective holdout contracts", () => {
     });
 
     it("rejects an instant the parser normalises into a different calendar date", () => {
-        // A day past the end of February. The parser answers with a finite instant by carrying
-        // the surplus days into March, so the shape passes the pattern and, without the
-        // round-trip, an impossible date is signed into the approval subject and every ordering
-        // comparison downstream reads March instead of what the artifact states. The window is
-        // stated around it so the carried instant still opens before the cutoff: the
-        // window-order rule would otherwise answer first and hide the calendar defect.
+        // The parser normalizes an invalid February day into March while matching the timestamp pattern.
+        // Round-trip validation rejects invalid calendar spellings.
+        // Downstream ordering compares the normalized instant, not the input spelling.
+        // closesAt must follow normalized opensAt so window-order validation cannot mask instant-invalid.
         expect(() => parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-02-31T00:00:00Z",
             closesAt: "2026-09-08T00:00:00Z",
         }))).toThrow(/freeze\.body\.intakeWindow\.opensAt: instant-invalid/);
-        // A February 29 in a year that has no February 29.
         expect(() => parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-09-01T00:00:00Z",
             closesAt: "2027-02-29T00:00:00Z",
         }))).toThrow(/freeze\.body\.intakeWindow\.closesAt: instant-invalid/);
-        // A day past the end of a thirty-day month.
         expect(() => parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-09-01T00:00:00Z",
             closesAt: "2026-09-31T00:00:00Z",
         }))).toThrow(/freeze\.body\.intakeWindow\.closesAt: instant-invalid/);
-        // Hour 24 names the same instant as the next day's midnight, so it too reaches the
-        // ordering checks as an instant the artifact does not spell.
+        // Hour 24 normalizes to the next day's midnight.
+        // Round-trip validation rejects input spellings that normalize before ordering checks.
         expect(() => parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-09-01T00:00:00Z",
             closesAt: "2026-09-30T24:00:00Z",
@@ -68,14 +62,12 @@ describe("prospective holdout contracts", () => {
     });
 
     it("accepts every instant spelling the pattern admits and a real leap day", () => {
-        // Seconds precision is the spelling the artifacts in this tree use, and the renderer
-        // always writes milliseconds, so comparing its output against the input verbatim
-        // would reject this.
+        // Artifacts use second precision, but the renderer emits milliseconds.
         expect(parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-09-01T00:00:00Z",
             closesAt: "2026-09-08T00:00:00Z",
         })).body.intakeWindow.closesAt).toBe("2026-09-08T00:00:00Z");
-        // The pattern also admits exactly three fractional digits, on either end, and both
+        // The pattern accepts exactly three fractional digits in opensAt and closesAt.
         // survive unchanged.
         expect(parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-09-01T00:00:00.125Z",
@@ -84,8 +76,7 @@ describe("prospective holdout contracts", () => {
             opensAt: "2026-09-01T00:00:00.125Z",
             closesAt: "2026-09-08T00:00:00.500Z",
         });
-        // A February 29 in a year that has one: the boundary the rejected spelling above sits
-        // one year away from.
+        // A leap-day date is valid; a non-leap-year February 29 is not.
         expect(parseFreezeManifest(freezeWithWindow({
             opensAt: "2026-09-01T00:00:00Z",
             closesAt: "2028-02-29T00:00:00Z",

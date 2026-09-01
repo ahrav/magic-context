@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gix::ObjectId;
 use sha2::{Digest, Sha256};
@@ -12,19 +13,14 @@ use super::super::anchor::{AnchorCapture, GitCondition};
 use super::super::scope::GraphOracle;
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 
-/// Version tag for this crate's patch identity. Values are internal
-/// fallback keys: whitespace-stripped per-file content hashes combined
-/// order-independently, never interchangeable with `git patch-id` output.
-pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v1";
+/// Identities are internal fallback keys, not `git patch-id` output.
+pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v4";
 
-/// Fallback candidates come from the first-parent walk from HEAD, capped, so
-/// resolution cost stays bounded on deep histories. A true match outside the
-/// window is unresolved at that rung.
+/// `CANDIDATE_WINDOW` bounds fallback resolution cost on deep histories.
+/// A true match outside the window is unresolved at that rung.
 pub const CANDIDATE_WINDOW: usize = 512;
 
-/// Ancestry walks stop after this many commits even under a generous
-/// deadline, keeping a single test bounded on pathological histories.
-const ANCESTRY_WALK_CAP: usize = 1 << 20;
+const MAX_PATCH_BLOB_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Verdict for one git anchor condition against one checkout snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +52,13 @@ enum CommitResolution {
 pub struct ResolutionLadder<'s> {
     snapshot: &'s CheckoutSnapshot,
     budget: &'s EvalBudget,
+    /// A shallow boundary truncates every graph walk, so a negative ancestry commentlint: allow(JUDGE)
+    /// result cannot be trusted. Read once per request. commentlint: allow(JUDGE)
+    shallow: bool,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
-    window: RefCell<Option<Vec<ObjectId>>>,
+    window: RefCell<Option<CandidateWindow>>,
+    /// A candidate's patch identity depends only on its commit.
+    patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
     graph_operations: Cell<u64>,
 }
 
@@ -66,8 +67,10 @@ impl<'s> ResolutionLadder<'s> {
         Self {
             snapshot,
             budget,
+            shallow: snapshot.repo().is_shallow(),
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
+            patch_id_cache: RefCell::new(HashMap::new()),
             graph_operations: Cell::new(0),
         }
     }
@@ -108,17 +111,24 @@ impl<'s> ResolutionLadder<'s> {
                 let start = self.resolve_commit(start_oid, captures.get(start_oid));
                 let end = self.resolve_commit(end_oid, captures.get(end_oid));
                 match (start, end) {
-                    (CommitResolution::Uncertain, _) | (_, CommitResolution::Uncertain) => {
-                        GitConditionOutcome::Uncertain
+                    // Reaching the end exits the validity window, which is commentlint: allow(JUDGE)
+                    // exactly what `historical` records, so this side is commentlint: allow(JUDGE)
+                    // tested first: a start the ladder could not place must commentlint: allow(JUDGE)
+                    // not downgrade an end that is demonstrably reached. commentlint: allow(JUDGE)
+                    // `WallClockInterval` orders its bounds the same way. commentlint: allow(JUDGE)
+                    (_, CommitResolution::Reachable) => {
+                        GitConditionOutcome::DoesNotHold { historical: true }
                     }
+                    // An unreachable start falsifies the half-open window
+                    // whatever the end resolves to: false dominates unknown.
                     (CommitResolution::NotReachable, _) => {
                         GitConditionOutcome::DoesNotHold { historical: false }
                     }
+                    (CommitResolution::Uncertain, _) | (_, CommitResolution::Uncertain) => {
+                        GitConditionOutcome::Uncertain
+                    }
                     (CommitResolution::Reachable, CommitResolution::NotReachable) => {
                         GitConditionOutcome::Holds
-                    }
-                    (CommitResolution::Reachable, CommitResolution::Reachable) => {
-                        GitConditionOutcome::DoesNotHold { historical: true }
                     }
                 }
             }
@@ -137,20 +147,42 @@ impl<'s> ResolutionLadder<'s> {
         };
         let anchor = ObjectId::from_hex(oid_hex.as_bytes()).ok();
         let anchor_present = anchor.is_some_and(|oid| repo.find_commit(oid).is_ok());
+        // An undecided ancestry test still permits a positive fallback match. commentlint: allow(JUDGE)
+        // Every window candidate is reachable from HEAD, so a match proves commentlint: allow(JUDGE)
+        // reachability; it only bars the negative conclusion below. commentlint: allow(JUDGE)
+        let mut ancestry_undecided = false;
         if anchor_present {
             match self.is_ancestor_or_equal_oid(anchor.expect("present implies parsed"), head) {
                 Some(true) => return CommitResolution::Reachable,
                 Some(false) => {}
-                None => return CommitResolution::Uncertain,
+                None => ancestry_undecided = true,
             }
         }
         match self.match_in_window(capture) {
             WindowMatch::Exactly => CommitResolution::Reachable,
             WindowMatch::Ambiguous => CommitResolution::Uncertain,
             WindowMatch::Budget => CommitResolution::Uncertain,
-            WindowMatch::None if anchor_present => CommitResolution::NotReachable,
+            WindowMatch::Unreadable => CommitResolution::Uncertain,
+            WindowMatch::None
+                if anchor_present && !ancestry_undecided && self.window_scan_complete(capture) =>
+            {
+                CommitResolution::NotReachable
+            }
             WindowMatch::None => CommitResolution::Uncertain,
         }
+    }
+
+    /// A fallback miss is only conclusive when every reachable commit was
+    /// scanned; a window truncated at [`CANDIDATE_WINDOW`] can hide the
+    /// rewrite a capture would have matched.
+    fn window_scan_complete(&self, capture: Option<&AnchorCapture>) -> bool {
+        let has_fallback_data =
+            capture.is_some_and(|capture| capture.patch_id.is_some() || capture.tree_oid.is_some());
+        if !has_fallback_data {
+            return true;
+        }
+        self.candidate_window()
+            .is_some_and(|window| !window.truncated)
     }
 
     /// Patch-ID rung, then tree-hash rung, over the bounded candidate
@@ -160,49 +192,85 @@ impl<'s> ResolutionLadder<'s> {
         let Some(capture) = capture else {
             return WindowMatch::None;
         };
+        // A patch ID using a different algorithm cannot establish anchor movement.
+        // The algorithm-independent tree rung can still establish anchor movement.
+        let mut patch_unreadable = capture
+            .patch_id
+            .as_ref()
+            .is_some_and(|patch| patch.algorithm != PATCH_ID_ALGORITHM);
         let stored_patch_id = capture
             .patch_id
             .as_ref()
-            .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM);
+            .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM)
+            // A current-tag value this build cannot have produced is commentlint: allow(JUDGE)
+            // uninterpretable fallback data, exactly like a malformed commentlint: allow(JUDGE)
+            // `tree_oid`: no candidate can ever equal it, so treating it as commentlint: allow(JUDGE)
+            // readable would turn a corrupt capture into an ordinary miss commentlint: allow(JUDGE)
+            // and let the scan conclude `NotReachable`. commentlint: allow(JUDGE)
+            .filter(|patch| {
+                let well_formed = is_sha256_hex(&patch.value);
+                patch_unreadable |= !well_formed;
+                well_formed
+            });
         if let Some(stored) = stored_patch_id {
             match self.match_candidates(|candidate| {
-                if !self.commit_touches_paths(candidate, &capture.changed_paths) {
+                if !self.commit_touches_paths(candidate, &capture.changed_paths)? {
                     return Ok(false);
                 }
-                Ok(
-                    compute_patch_id(self.snapshot.repo(), candidate, self.budget)?
-                        .is_some_and(|patch_id| patch_id == stored.value),
-                )
+                Ok(self
+                    .cached_patch_id(candidate)?
+                    .is_some_and(|patch_id| patch_id == stored.value))
             }) {
                 WindowMatch::None => {}
+                // The tree rung needs only a commit and its root tree, so an commentlint: allow(JUDGE)
+                // unreadable blob here does not bar an independent match commentlint: allow(JUDGE)
+                // there; it only rules out concluding a miss. commentlint: allow(JUDGE)
+                WindowMatch::Unreadable => patch_unreadable = true,
                 decided => return decided,
             }
         }
+        // With an unreadable patch ID, a tree miss cannot rule out a
+        // patch-rung match.
+        let unmatched = if patch_unreadable {
+            WindowMatch::Unreadable
+        } else {
+            WindowMatch::None
+        };
         let Some(tree_oid) = capture.tree_oid.as_deref() else {
-            return WindowMatch::None;
+            return unmatched;
         };
+        // A stored tree id this build cannot parse is uninterpretable fallback commentlint: allow(JUDGE)
+        // data, exactly like an unsupported patch algorithm, and commentlint: allow(JUDGE)
+        // `window_scan_complete` counts the field as present either way. commentlint: allow(JUDGE)
         let Ok(tree) = ObjectId::from_hex(tree_oid.as_bytes()) else {
-            return WindowMatch::None;
+            return WindowMatch::Unreadable;
         };
-        self.match_candidates(|candidate| {
+        match self.match_candidates(|candidate| {
             let commit = self
                 .snapshot
                 .repo()
                 .find_commit(candidate)
-                .map_err(|_| Budget)?;
-            Ok(commit.tree_id().map_err(|_| Budget)?.detach() == tree)
-        })
+                .map_err(|_| ResolveObstacle::UnreadableObject)?;
+            Ok(commit
+                .tree_id()
+                .map_err(|_| ResolveObstacle::UnreadableObject)?
+                .detach()
+                == tree)
+        }) {
+            WindowMatch::None => unmatched,
+            decided => decided,
+        }
     }
 
     fn match_candidates(
         &self,
-        mut matches: impl FnMut(ObjectId) -> Result<bool, Budget>,
+        mut matches: impl FnMut(ObjectId) -> Result<bool, ResolveObstacle>,
     ) -> WindowMatch {
         let Some(window) = self.candidate_window() else {
             return WindowMatch::Budget;
         };
         let mut found = None;
-        for candidate in window {
+        for candidate in window.commits.iter().copied() {
             if self.budget.is_exhausted() {
                 return WindowMatch::Budget;
             }
@@ -213,106 +281,166 @@ impl<'s> ResolutionLadder<'s> {
                     }
                 }
                 Ok(false) => {}
-                Err(Budget) => return WindowMatch::Budget,
+                Err(ResolveObstacle::BudgetExhausted) => return WindowMatch::Budget,
+                Err(ResolveObstacle::UnreadableObject) => return WindowMatch::Unreadable,
             }
         }
         match found {
+            _ if self.budget.is_exhausted() => WindowMatch::Budget,
             Some(_) => WindowMatch::Exactly,
             None => WindowMatch::None,
         }
     }
 
-    /// First-parent commits from HEAD, capped at [`CANDIDATE_WINDOW`],
-    /// computed once per request.
-    fn candidate_window(&self) -> Option<Vec<ObjectId>> {
+    /// Returns up to [`CANDIDATE_WINDOW`] commits cached in `self.window`.
+    fn candidate_window(&self) -> Option<CandidateWindow> {
         if let Some(window) = self.window.borrow().as_ref() {
             return Some(window.clone());
         }
         self.count_graph_operation();
         let repo = self.snapshot.repo();
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
-        let walk = repo.rev_walk([head]).first_parent_only().all().ok()?;
-        let mut window = Vec::new();
-        for info in walk.take(CANDIDATE_WINDOW) {
+        // The walk follows all parents: a rewrite reachable only through a
+        // merge's non-first parent is still a fallback candidate.
+        let walk = repo.rev_walk([head]).all().ok()?;
+        let mut commits = Vec::new();
+        let mut walk = walk.into_iter();
+        for info in walk.by_ref().take(CANDIDATE_WINDOW) {
             if self.budget.is_exhausted() {
                 return None;
             }
-            window.push(info.ok()?.id);
+            commits.push(info.ok()?.id);
         }
+        let window = CandidateWindow {
+            truncated: commits.len() == CANDIDATE_WINDOW && walk.next().is_some(),
+            commits: commits.into(),
+        };
         *self.window.borrow_mut() = Some(window.clone());
         Some(window)
     }
 
+    fn cached_patch_id(&self, candidate: ObjectId) -> Result<Option<String>, ResolveObstacle> {
+        if let Some(cached) = self.patch_id_cache.borrow().get(&candidate) {
+            return Ok(cached.clone());
+        }
+        self.count_graph_operation();
+        let patch_id = compute_patch_id(self.snapshot.repo(), candidate, self.budget)?;
+        self.patch_id_cache
+            .borrow_mut()
+            .insert(candidate, patch_id.clone());
+        Ok(patch_id)
+    }
+
     /// Whether `commit` changes any of `paths` relative to its first
     /// parent, by comparing tree entries at those paths — no content diff.
-    fn commit_touches_paths(&self, commit: ObjectId, paths: &[String]) -> bool {
+    fn commit_touches_paths(
+        &self,
+        commit: ObjectId,
+        paths: &[String],
+    ) -> Result<bool, ResolveObstacle> {
         if paths.is_empty() {
-            return true;
+            return Ok(true);
         }
         let repo = self.snapshot.repo();
         let Ok(commit) = repo.find_commit(commit) else {
-            return false;
+            return Err(ResolveObstacle::UnreadableObject);
         };
         let Ok(tree) = commit.tree() else {
-            return false;
+            return Err(ResolveObstacle::UnreadableObject);
         };
-        let parent_tree = commit
-            .parent_ids()
-            .next()
-            .and_then(|parent| repo.find_commit(parent.detach()).ok())
-            .and_then(|parent| parent.tree().ok());
-        paths.iter().any(|path| {
-            let new_entry = tree
-                .lookup_entry_by_path(path.as_str())
-                .ok()
-                .flatten()
-                .map(|entry| entry.object_id());
-            let old_entry = parent_tree.as_ref().and_then(|tree| {
-                tree.lookup_entry_by_path(path.as_str())
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent) => {
+                let Some(tree) = repo
+                    .find_commit(parent.detach())
                     .ok()
-                    .flatten()
-                    .map(|entry| entry.object_id())
-            });
-            new_entry != old_entry
-        })
+                    .and_then(|parent| parent.tree().ok())
+                else {
+                    return Err(ResolveObstacle::UnreadableObject);
+                };
+                Some(tree)
+            }
+            None => None,
+        };
+        // Mode is part of the comparison, since a diff reports a mode-only
+        // change while the entry ids stay equal.
+        //
+        // A lookup that fails is not an absent entry: in a partial clone the commentlint: allow(JUDGE)
+        // subtree holding `path` can be missing, and reading both sides as commentlint: allow(JUDGE)
+        // absent would call the candidate untouched and drop it from the commentlint: allow(JUDGE)
+        // rung, turning a present-but-unreachable anchor into a verdict. commentlint: allow(JUDGE)
+        let entry_at = |tree: &gix::Tree<'_>, path: &str| {
+            tree.lookup_entry_by_path(path)
+                .map(|entry| entry.map(|entry| (entry.object_id(), entry.mode().kind())))
+                .map_err(|_| ResolveObstacle::UnreadableObject)
+        };
+        for path in paths {
+            // The loop checks the budget for each path so a large path
+            // list can return `BudgetExhausted`.
+            if self.budget.is_exhausted() {
+                return Err(ResolveObstacle::BudgetExhausted);
+            }
+            let new_entry = entry_at(&tree, path.as_str())?;
+            let old_entry = match parent_tree.as_ref() {
+                Some(tree) => entry_at(tree, path.as_str())?,
+                None => None,
+            };
+            if new_entry != old_entry {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn is_ancestor_or_equal_oid(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+        // Cancellation makes even equal OIDs uncertain.
+        if self.budget.is_exhausted() {
+            return None;
+        }
         if ancestor == descendant {
             return Some(true);
         }
         if let Some(answer) = self.ancestry_cache.borrow().get(&(ancestor, descendant)) {
             return *answer;
         }
-        let answer = self.walk_ancestry(ancestor, descendant);
+        let answer = self.test_ancestry(ancestor, descendant);
         self.ancestry_cache
             .borrow_mut()
             .insert((ancestor, descendant), answer);
         answer
     }
 
-    /// Ancestor walk from `descendant` looking for `ancestor`. gix uses the
-    /// commit-graph file when present and falls back to the object store
-    /// per commit, so a stale graph never renders a reachable commit
-    /// unreachable. Budget exhaustion or missing objects answer unknown.
-    fn walk_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+    /// `ancestor` is an ancestor of `descendant` exactly when it appears among
+    /// their merge bases. Disjoint histories yield no base; lookup failures
+    /// return `None`.
+    ///
+    /// A shallow clone also yields no base once the walk reaches a grafted commentlint: allow(JUDGE)
+    /// boundary, which is indistinguishable from disjoint history, so a commentlint: allow(JUDGE)
+    /// negative result there stays unknown. commentlint: allow(JUDGE)
+    fn test_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
         self.count_graph_operation();
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
             return None;
         }
-        let walk = repo.rev_walk([descendant]).all().ok()?;
-        for (steps, info) in walk.enumerate() {
-            if steps >= ANCESTRY_WALK_CAP || self.budget.is_exhausted() {
-                return None;
-            }
-            let info = info.ok()?;
-            if info.id == ancestor {
-                return Some(true);
-            }
+        let bases = repo.merge_bases_many(ancestor, &[descendant]).ok()?;
+        // Do not return a graph result after the budget expires.
+        if self.budget.is_exhausted() {
+            return None;
         }
-        Some(false)
+        let reachable = bases.iter().any(|base| base.detach() == ancestor);
+        if !reachable && self.shallow {
+            return None;
+        }
+        Some(reachable)
     }
+}
+
+/// Reachable commits scanned by the fallback rungs. `truncated` records
+/// that more history existed beyond [`CANDIDATE_WINDOW`].
+#[derive(Clone)]
+struct CandidateWindow {
+    commits: Rc<[ObjectId]>,
+    truncated: bool,
 }
 
 /// Candidates that decide a fallback rung: exactly one match resolves,
@@ -322,9 +450,9 @@ enum WindowMatch {
     Ambiguous,
     None,
     Budget,
+    /// Stored fallback data this build cannot interpret.
+    Unreadable,
 }
-
-struct Budget;
 
 impl GraphOracle for ResolutionLadder<'_> {
     fn is_ancestor_or_equal(&self, ancestor: &str, descendant: &str) -> Option<bool> {
@@ -334,127 +462,263 @@ impl GraphOracle for ResolutionLadder<'_> {
     }
 }
 
-/// Computes this crate's version-tagged patch identity for `commit`:
-/// per-file hashes over (change kind, paths, whitespace-stripped content),
-/// XOR-combined so file order cannot perturb the identity. Merge commits
-/// have no patch identity, mirroring `git patch-id` semantics.
+/// File order does not affect the identity; merge commits have no patch
+/// identity.
 pub fn compute_patch_id(
     repo: &gix::Repository,
     commit: ObjectId,
     budget: &EvalBudget,
-) -> Result<Option<String>, BudgetExhaustedInResolve> {
-    let commit = match repo.find_commit(commit) {
-        Ok(commit) => commit,
-        Err(_) => return Ok(None),
+) -> Result<Option<String>, ResolveObstacle> {
+    budget_gate(budget)?;
+    let changes = match first_parent_blob_changes(repo, commit, budget)? {
+        Some(changes) if !changes.is_empty() => changes,
+        // A merge returns before the diff callback and an empty diff invokes commentlint: allow(JUDGE)
+        // none, so neither path has polled since the gate above. commentlint: allow(JUDGE)
+        _ => {
+            budget_gate(budget)?;
+            return Ok(None);
+        }
+    };
+    let mut file_hashes = Vec::with_capacity(changes.len());
+    for change in &changes {
+        budget_gate(budget)?;
+        let Some(file_hash) = file_change_hash(repo, change, budget)? else {
+            return Ok(None);
+        };
+        file_hashes.push(file_hash);
+    }
+    // Hashing all file hashes together prevents linear cancellation.
+    file_hashes.sort_unstable();
+    let mut combined = Sha256::new();
+    combined.update(PATCH_ID_ALGORITHM.as_bytes());
+    combined.update(b"\0");
+    combined.update((file_hashes.len() as u64).to_le_bytes());
+    for file_hash in &file_hashes {
+        combined.update(file_hash);
+    }
+    // The last blob's load and hash, the sort, and this fold all run after the commentlint: allow(JUDGE)
+    // final per-change poll, and callers persist or cache what comes back, so commentlint: allow(JUDGE)
+    // the gate sits at the exit rather than ahead of the aggregation. commentlint: allow(JUDGE)
+    budget_gate(budget)?;
+    Ok(Some(format!("{:x}", combined.finalize())))
+}
+
+/// The exact rendering [`compute_patch_id`] emits: 64 lowercase hex digits.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Tree changes do not identify blobs; excluding them prevents blob lookup
+/// failures.
+///
+/// Default diff options prevent repository `diff.renames` from changing the identity.
+fn first_parent_blob_changes(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    budget: &EvalBudget,
+) -> Result<Option<Vec<gix::object::tree::diff::ChangeDetached>>, ResolveObstacle> {
+    let Ok(commit) = repo.find_commit(commit) else {
+        return Err(ResolveObstacle::UnreadableObject);
     };
     let parents: Vec<_> = commit.parent_ids().collect();
     if parents.len() > 1 {
         return Ok(None);
     }
-    let new_tree = match commit.tree() {
-        Ok(tree) => tree,
-        Err(_) => return Ok(None),
+    let Ok(new_tree) = commit.tree() else {
+        return Err(ResolveObstacle::UnreadableObject);
     };
     let old_tree = match parents.first() {
-        Some(parent) => match repo
-            .find_commit(parent.detach())
-            .ok()
-            .and_then(|parent| parent.tree().ok())
-        {
-            Some(tree) => Some(tree),
-            None => return Ok(None),
-        },
-        None => None,
+        Some(parent) => {
+            let Some(tree) = repo
+                .find_commit(parent.detach())
+                .ok()
+                .and_then(|parent| parent.tree().ok())
+            else {
+                return Err(ResolveObstacle::UnreadableObject);
+            };
+            tree
+        }
+        None => repo.empty_tree(),
     };
-    let changes = match repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None) {
-        Ok(changes) => changes,
-        Err(_) => return Ok(None),
+    let Ok(mut platform) = old_tree.changes() else {
+        return Err(ResolveObstacle::UnreadableObject);
     };
-    if changes.is_empty() {
-        return Ok(None);
-    }
-    let mut combined = [0u8; 32];
-    for change in &changes {
+    platform.options(|options| *options = gix::diff::Options::default());
+    let mut changes = Vec::new();
+    let outcome = platform.for_each_to_obtain_tree(&new_tree, |change| {
         if budget.is_exhausted() {
-            return Err(BudgetExhaustedInResolve);
+            return Err(ResolveObstacle::BudgetExhausted);
         }
-        let Some(file_hash) = file_change_hash(repo, change) else {
-            return Ok(None);
-        };
-        for (byte, file_byte) in combined.iter_mut().zip(file_hash.iter()) {
-            *byte ^= file_byte;
+        if !change.entry_mode().is_tree() {
+            changes.push(change.detach());
         }
+        Ok(gix::object::tree::diff::Action::Continue(()))
+    });
+    match outcome {
+        Ok(_) => Ok(Some(changes)),
+        // The callback's budget signal surfaces wrapped in either layer.
+        Err(gix::object::tree::diff::for_each::Error::ForEach(_))
+        | Err(gix::object::tree::diff::for_each::Error::Diff(
+            gix::diff::tree_with_rewrites::Error::ForEach(_),
+        )) => Err(ResolveObstacle::BudgetExhausted),
+        Err(_) => Err(ResolveObstacle::UnreadableObject),
     }
-    Ok(Some(hex(&combined)))
 }
 
-/// Typed budget signal raised from inside patch-ID computation.
+/// Typed non-answers raised from inside patch-ID computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BudgetExhaustedInResolve;
+pub enum ResolveObstacle {
+    /// Deadline exceeded or interrupt raised.
+    BudgetExhausted,
+    /// A required object could not be read from the object database.
+    UnreadableObject,
+}
 
-impl From<BudgetExhaustedInResolve> for Budget {
-    fn from(_: BudgetExhaustedInResolve) -> Self {
-        Budget
+impl std::fmt::Display for ResolveObstacle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BudgetExhausted => {
+                f.write_str("evaluation budget exhausted during anchor resolution")
+            }
+            Self::UnreadableObject => {
+                f.write_str("required object unreadable during anchor resolution")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveObstacle {}
+
+fn budget_gate(budget: &EvalBudget) -> Result<(), ResolveObstacle> {
+    if budget.is_exhausted() {
+        Err(ResolveObstacle::BudgetExhausted)
+    } else {
+        Ok(())
     }
 }
 
 fn file_change_hash(
     repo: &gix::Repository,
     change: &gix::object::tree::diff::ChangeDetached,
-) -> Option<[u8; 32]> {
+    budget: &EvalBudget,
+) -> Result<Option<[u8; 32]>, ResolveObstacle> {
     use gix::object::tree::diff::ChangeDetached as Change;
-    let (kind, location, old_id, new_id): (&str, _, Option<ObjectId>, Option<ObjectId>) =
-        match change {
-            Change::Addition { location, id, .. } => ("add", location, None, Some(*id)),
-            Change::Deletion { location, id, .. } => ("delete", location, Some(*id), None),
-            Change::Modification {
-                location,
-                previous_id,
-                id,
-                ..
-            } => ("modify", location, Some(*previous_id), Some(*id)),
-            Change::Rewrite {
-                location,
-                source_id,
-                id,
-                ..
-            } => ("rewrite", location, Some(*source_id), Some(*id)),
-        };
+    use gix::objs::tree::{EntryKind, EntryMode};
+    type Side = Option<(ObjectId, EntryMode)>;
+    let (kind, location, old, new): (&str, _, Side, Side) = match change {
+        Change::Addition {
+            location,
+            entry_mode,
+            id,
+            ..
+        } => ("add", location, None, Some((*id, *entry_mode))),
+        Change::Deletion {
+            location,
+            entry_mode,
+            id,
+            ..
+        } => ("delete", location, Some((*id, *entry_mode)), None),
+        Change::Modification {
+            location,
+            previous_entry_mode,
+            previous_id,
+            entry_mode,
+            id,
+        } => (
+            "modify",
+            location,
+            Some((*previous_id, *previous_entry_mode)),
+            Some((*id, *entry_mode)),
+        ),
+        Change::Rewrite {
+            location,
+            source_entry_mode,
+            source_id,
+            entry_mode,
+            id,
+            ..
+        } => (
+            "rewrite",
+            location,
+            Some((*source_id, *source_entry_mode)),
+            Some((*id, *entry_mode)),
+        ),
+    };
     let mut hash = Sha256::new();
-    hash.update(b"mc-patch-id-v1-file\0");
+    // Derived from the version tag, so a hash change forces a tag change.
+    hash.update(PATCH_ID_ALGORITHM.as_bytes());
+    hash.update(b"-file\0");
     hash.update(kind.as_bytes());
     hash.update(b"\0");
     hash.update(location.as_slice());
     hash.update(b"\0");
-    for id in [old_id, new_id] {
-        match id {
-            Some(id) if !id.is_null() => {
-                let blob = repo.find_blob(id).ok()?;
-                hash.update(normalized_content(&blob.data));
+    for side in [old, new] {
+        match side {
+            Some((id, mode)) if !id.is_null() => {
+                // Entry kind makes opposite mode-only transitions hash
+                // differently.
+                hash.update((mode.kind() as u16).to_le_bytes());
+                if mode.is_commit() {
+                    hash.update(b"gitlink\0");
+                    hash.update(id.as_slice());
+                } else {
+                    if budget.is_exhausted() {
+                        return Err(ResolveObstacle::BudgetExhausted);
+                    }
+                    let Ok(header) = repo.find_header(id) else {
+                        return Err(ResolveObstacle::UnreadableObject);
+                    };
+                    if header.size() > MAX_PATCH_BLOB_BYTES {
+                        return Ok(None);
+                    }
+                    let Ok(blob) = repo.find_blob(id) else {
+                        return Err(ResolveObstacle::UnreadableObject);
+                    };
+                    // Fixed-width inner digests keep content boundaries
+                    // unambiguous.
+                    let mut content = Sha256::new();
+                    if mode.kind() == EntryKind::Link {
+                        // A symlink blob holds a target path, where a space commentlint: allow(JUDGE)
+                        // is part of the name and no NUL marks it binary, so commentlint: allow(JUDGE)
+                        // normalization would fold `a b` into `ab`. commentlint: allow(JUDGE)
+                        content.update(b"symlink\0");
+                        content.update(&blob.data);
+                    } else if is_binary(&blob.data) {
+                        content.update(b"binary\0");
+                        content.update(&blob.data);
+                    } else {
+                        hash_normalized_content(&mut content, &blob.data);
+                    }
+                    hash.update(b"blob\0");
+                    hash.update(content.finalize());
+                }
             }
-            _ => hash.update(b"<absent>"),
+            _ => hash.update(b"absent\0"),
         }
         hash.update(b"\0");
     }
-    Some(hash.finalize().into())
+    Ok(Some(hash.finalize().into()))
 }
 
-/// Strips all ASCII whitespace so formatting-only variants of the same
-/// change share a patch identity.
-fn normalized_content(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect()
+/// Git's binary heuristic: a NUL byte within the leading window. Binary
+/// bytes are all data, so whitespace normalization only applies to text.
+fn is_binary(bytes: &[u8]) -> bool {
+    const BINARY_SNIFF_BYTES: usize = 8000;
+    bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+/// Feeds `bytes` to `hash` without ASCII whitespace, so formatting-only
+/// variants of the same change share a patch identity. Runs go straight to the
+/// hasher instead of building a stripped copy.
+fn hash_normalized_content(hash: &mut Sha256, bytes: &[u8]) {
+    for run in bytes.split(|byte| byte.is_ascii_whitespace()) {
+        if !run.is_empty() {
+            hash.update(run);
+        }
+    }
 }
 
 /// Builds the capture-time representation of `commit` that anchor authoring
@@ -468,21 +732,15 @@ pub fn capture_anchor_representation(
 ) -> Option<AnchorCapture> {
     let commit = repo.find_commit(commit_oid).ok()?;
     let tree_oid = commit.tree_id().ok()?.detach();
-    let parents: Vec<_> = commit.parent_ids().collect();
-    let changed_paths = if parents.len() > 1 {
-        Vec::new()
-    } else {
-        let new_tree = commit.tree().ok()?;
-        let old_tree = match parents.first() {
-            Some(parent) => Some(repo.find_commit(parent.detach()).ok()?.tree().ok()?),
-            None => None,
-        };
-        repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
-            .ok()?
-            .iter()
-            .map(|change| change.location().to_string())
-            .collect()
-    };
+    // A lossily converted path would miss real tree entries in
+    // `commit_touches_paths`, so non-UTF-8 locations are dropped.
+    let changed_paths = first_parent_blob_changes(repo, commit_oid, budget)
+        .ok()?
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|change| std::str::from_utf8(change.location()).ok())
+        .map(str::to_owned)
+        .collect();
     let patch_id = compute_patch_id(repo, commit_oid, budget)
         .ok()?
         .map(|value| super::super::anchor::PatchIdCapture {

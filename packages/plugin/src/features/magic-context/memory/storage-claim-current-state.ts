@@ -1,17 +1,6 @@
 /**
- * Batched project-memory current-state provider (KTD6; R9-R12).
  *
- * One provider owns all project-memory reads: claims resolve by public
- * locator or authorized project set; revision attributes, evidence
- * summaries, applicability heads, lifecycle, policy, and telemetry hydrate
- * under one snapshot; policy visibility applies before any candidate limit;
- * the hydration snapshot closes; and the SnapshotVector is revalidated from
- * a fresh snapshot before the result may be published.
  *
- * Fail-closed contract: a null current-revision pointer, missing attributes
- * row, missing evidence, stale current pointer, malformed stored public ID,
- * or broken lifecycle head throws ClaimGraphCorruptionError instead of
- * serving unauditable claims.
  */
 
 import type { Database } from "../../../shared/sqlite";
@@ -53,38 +42,18 @@ export type ProjectMemorySurface =
     | "maintenance_verification";
 
 /**
- * The only surfaces a rejected approach may reach.
+ * Rejected approaches may reach only these surfaces.
  *
- * Anti-memory rows are stored warnings: approaches the user rejected. Two
- * invariants keep a warning from being laundered back into positive guidance,
- * and this set is the whole of the first one.
+ * Anti-memory rows store approaches the user rejected.
  *
- * VISIBILITY — this set is the sole authority for which surfaces may see an
- * anti-memory row, enforced twice below: once in the candidate query so hot
- * surfaces do not hydrate rows they cannot use, and once in `surfaceDecision`,
- * which is authoritative. A reader must not source anti-memory rows for a
- * surface absent from this set by going around the provider.
- *   - `explicit_search`: the user asked for warnings; showing them is the point.
- *   - `maintenance_verification`: re-judges a row IN PLACE — renews its TTL,
- *     demotes it to stale, or revises its content under the SAME category
- *     through the typed writer, which never passes a category. It cannot mint a
- *     positive-category copy, so it cannot launder. It is already the one lane
- *     trusted to see `stale` and `disputed` rows below, for the same reason.
- *     Denying it would leave a warning un-re-judged until its TTL lapsed, which
- *     is worse: a user-corroborated warning reaches VERIFIED maturity from its
- *     evidence alone (`automaticMaturityTarget`), so it would keep auto-injecting
- *     long after the rejection stopped being true.
- *   - `auto_inject` and `maintenance_hygiene` are denied. Curate and hygiene
- *     passes re-create content into NEW rows, and a rewrite can drop the
- *     negation and resurrect the rejected approach under a positive category.
+ * `explicit_search` shows warnings the user requested.
+ * `auto_inject` and `maintenance_hygiene` cannot read anti-memory rows because rewriting can drop the negation and create positive guidance.
  *
- * MUTATION — the second invariant, enforced elsewhere: every write to an
- * anti-memory row goes through the typed API in `storage-anti-memory.ts`, which
- * preserves the category and the TTL and outcome vocabulary. Generic revision
- * paths refuse the category (`refuseGenericAntiMemoryRevisionAccess`).
+ * Every anti-memory write uses the typed API in `storage-anti-memory.ts`.
+ * The typed API preserves anti-memory category, TTL, and outcome vocabulary.
+ * Generic revision-access paths refuse `ANTI_MEMORY_CATEGORY` through `refuseGenericAntiMemoryRevisionAccess`.
  *
- * Adding a surface here grants it sight of rejected approaches. Never add one
- * whose lane can re-create content under a different category.
+ * No lane may expose anti-memory if it can recreate content under another category.
  */
 const ANTI_MEMORY_VISIBLE_SURFACES: ReadonlySet<ProjectMemorySurface> = new Set([
     "explicit_search",
@@ -92,36 +61,35 @@ const ANTI_MEMORY_VISIBLE_SURFACES: ReadonlySet<ProjectMemorySurface> = new Set(
 ]);
 
 export interface ProjectMemoryWorkspaceAuthorization {
-    /** Projects owned by the active workspace member. */
+    /* */
     ownProjectIds: readonly number[];
-    /** Foreign workspace categories explicitly shared with this member. */
+    /** Members may access only explicitly shared foreign workspace categories. */
     sharedCategories: readonly string[];
 }
 
 export interface ProjectMemoryCurrentStateRequest {
-    /** Exact public locator lookup; combined with projectIds when both set. */
+    /** The provider treats each publicClaimId as an exact public locator and combines it with projectIds when both are set. */
     publicClaimIds?: readonly string[];
-    /** Authorized project set: only claims in these projects hydrate. */
+    /** The provider hydrates claims only from authorized projectIds. */
     projectIds?: readonly number[];
-    /** Optional workspace sharing filter, applied before the candidate limit. */
+    /** The provider applies workspaceAuthorization before the candidate limit. */
     workspaceAuthorization?: ProjectMemoryWorkspaceAuthorization;
-    /** Policy surface applied before any candidate limit. */
+    /** The provider applies surface before the candidate limit. */
     surface?: ProjectMemorySurface;
-    /** Lifecycle states to include; defaults to live claims only. */
+    /** The provider defaults lifecycleStates to live claims only. */
     lifecycleStates?: readonly ClaimMemoryLifecycleState[];
-    /** Candidate cap applied after visibility filtering. */
+    /** The provider applies limit after visibility filtering. */
     limit?: number;
-    /** Opaque workspace-epoch signature bound into the SnapshotVector. */
+    /** The provider binds workspaceEpoch into the SnapshotVector. */
     workspaceEpoch?: string;
     /**
-     * Workspace identities the caller derived `workspaceEpoch` and
-     * `workspaceAuthorization` from. Supplying them lets the provider recompute
-     * the fingerprint from current state at publication time instead of echoing
-     * the caller's value, which is the only way a membership or shared-category
-     * revocation landing mid-read can be detected.
+     * `workspaceIdentities` identifies the workspaces used to derive `workspaceEpoch` and `workspaceAuthorization`.
+     * Supplying `workspaceIdentities` lets the provider recompute the fingerprint at publication time.
+     * The provider recomputes the fingerprint from current state instead of echoing the caller's value.
+     * Recomputing from current state is required to detect membership or shared-category revocation during a read.
      */
     workspaceIdentities?: readonly string[];
-    /** Expiry evaluation instant; defaults to Date.now(). */
+    /** The provider defaults nowMs to Date.now(). */
     nowMs?: number;
 }
 
@@ -151,12 +119,12 @@ export interface ProjectMemoryClaimSnapshot {
     evidence: { observationCount: number; independenceKeys: string[] };
     applicability: ApplicabilityAssertionRecord[];
     policy: ProjectMemoryPolicyView;
-    /** Authoritative disposition facts read from conflict/disposition/
-     * verification rows, not the projection, so uniform absence holds even
-     * when the projection lags a policy-unaware writer. */
+    /** The provider reads authoritative disposition facts from conflict/disposition/verification rows rather than the projection.
+     * Reading conflict/disposition/verification rows preserves uniform absence when projections lag policy-unaware writers.
+     * */
     dispositions: ActiveDispositions;
-    /** Sanitized evidence label for labeled explicit-search rendering; null
-     * for clean rows. Never set on the auto_inject surface. */
+    /** The provider sets the sanitized evidence label only for labeled explicit-search rows; clean rows use `null`, and `auto_inject` never sets it.
+     * */
     explicitLabel: string | null;
     telemetry: { seenCount: number; retrievalCount: number };
     verification: {
@@ -206,10 +174,8 @@ function resolveCandidates(
             "current-state reads require public locators or an authorized project set",
         );
     }
-    // Anti-memory is reachable through explicit search and the verification
-    // lane only; filtering it in the candidate query keeps the hot automatic
-    // surfaces from paying full hydration for rows `surfaceDecision` (the
-    // authoritative check, kept as defence in depth) would discard anyway.
+    // Candidate-query filtering prevents automatic surfaces from hydrating anti-memory rows that `surfaceDecision` would later reject.
+    // The provider retains `surfaceDecision` as an authoritative defense-in-depth check after candidate filtering.
     if (!ANTI_MEMORY_VISIBLE_SURFACES.has(request.surface ?? "explicit_search")) {
         clauses.push(`NOT ${antiMemoryClaimSql("claims.current_revision_id")}`);
     }
@@ -363,8 +329,8 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
         },
         applicability: readCurrentApplicabilityAssertions(db, candidate.currentRevisionId),
         policy: {
-            // An absent projection reads as fail-closed defaults: hidden
-            // from both surfaces at CANDIDATE.
+            // An absent projection is hidden by default.
+            // An absent projection hides the claim from both surfaces at CANDIDATE.
             effectiveMaturity: policy?.effectiveMaturity ?? "CANDIDATE",
             originTaint: policy?.originTaint ?? "ASSISTANT_INFERENCE",
             autoEligible: policy?.autoEligible === 1,
@@ -386,11 +352,9 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
 }
 
 /**
- * The shared surface matrix (R10; U3 scenario 4). Expired claims and the
- * uniform-absence class (hard-hidden / contradicted / quarantined /
- * rejected) are ineligible everywhere. Authoritative soft-hide facts
- * (stale / disputed / superseded) outrank projected eligibility on the
- * automatic surface; explicit search keeps them as labeled rows.
+ * Expired claims and hard-hidden, contradicted, quarantined, or rejected claims are ineligible on every surface.
+ * Stale, disputed, and superseded facts outrank projected eligibility on the automatic surface.
+ * Explicit search returns stale, disputed, and superseded claims as labeled rows.
  */
 function workspaceAuthorized(
     item: ProjectMemoryClaimSnapshot,
@@ -413,10 +377,7 @@ function surfaceDecision(
     if (item.expiresAt !== null && item.expiresAt <= nowMs) {
         return { eligible: false, label: null };
     }
-    // Rejected approaches reach only the surfaces in
-    // ANTI_MEMORY_VISIBLE_SURFACES; that set carries the reasoning. This is the
-    // authoritative check, and the candidate query filters the same set early so
-    // hot surfaces do not pay hydration for rows discarded here.
+    // Rejected approaches are visible only on surfaces in `ANTI_MEMORY_VISIBLE_SURFACES`.
     if (item.category === ANTI_MEMORY_CATEGORY && !ANTI_MEMORY_VISIBLE_SURFACES.has(surface)) {
         return { eligible: false, label: null };
     }
@@ -432,12 +393,8 @@ function surfaceDecision(
             label: null,
         };
     }
-    // A projection written by a newer writer records decisions under policy
-    // semantics this binary cannot interpret, so its stored bits are not a
-    // trustworthy answer. Both the shared evaluator (`policy_version_unsupported`)
-    // and the legacy adapter (`unprojected`) already fail closed here; the direct
-    // provider has to agree, or an older process still attached to the database
-    // keeps auto-injecting content it cannot reason about.
+    // The evaluator must not use `autoEligible` or `explicitEligible` when `policyVersion` exceeds `CLAIM_POLICY_VERSION`.
+    // Claims evaluated under unsupported policy semantics must not be auto-injected.
     const versionUnsupported = item.policy.policyVersion > CLAIM_POLICY_VERSION;
     if (surface === "auto_inject") {
         return {
@@ -455,10 +412,7 @@ function surfaceDecision(
     return {
         eligible: true,
         label: explicitSearchLabelFromFields({
-            // An unsupported revision's stored maturity and taint were written
-            // under a scheme this build does not understand, so the label keeps
-            // the sanitized `policy:unknown` shape rather than echoing raw
-            // future-version strings to the agent.
+            // Unsupported revisions use `policy:unknown` instead of raw future-version maturity and taint values.
             effectiveMaturity: versionUnsupported ? "CANDIDATE" : item.policy.effectiveMaturity,
             originTaint: versionUnsupported ? "unknown" : item.policy.originTaint,
             dispositions,
@@ -492,9 +446,7 @@ function readSnapshotVector(
             marker.status === "present" ? marker.marker.databaseIncarnationId : "",
         workspaceEpoch,
         projectGenerations: generations,
-        // The current model allocates one generation stream per project for
-        // claims AND policy; the vector keeps the two fields separate so
-        // they may diverge without a contract change.
+        // The fields remain separate because their generations may diverge.
         policyGenerations: { ...generations },
     };
 }
@@ -549,9 +501,8 @@ export function snapshotVectorChanges(before: SnapshotVector, after: SnapshotVec
 }
 
 /**
- * Hydrate the requested current claim set under one snapshot, close it, then
- * revalidate the SnapshotVector from a fresh snapshot. Returns `stale`
- * instead of publishing when the vector moved between the two.
+ * The operation hydrates under one snapshot, then revalidates `SnapshotVector` from a fresh snapshot before publishing.
+ * The reader returns `stale` when `SnapshotVector` changes before publication.
  */
 export function readProjectMemoryCurrentState(
     db: Database,
@@ -560,19 +511,13 @@ export function readProjectMemoryCurrentState(
     const surface = request.surface ?? "explicit_search";
     const lifecycleStates = request.lifecycleStates ?? DEFAULT_LIFECYCLE_STATES;
     const suppliedWorkspaceEpoch = request.workspaceEpoch ?? "";
-    // Echoing the caller's epoch into both the hydration vector and the "fresh"
-    // re-read made the staleness comparison compare a value to itself, so it
-    // could never fire: a workspace revocation in flight was undetectable and a
-    // claim from a since-removed project could still be published. Recompute
-    // from current state at each read when the caller names its identities.
+    // Each read recomputes caller-supplied identity epochs from current state.
     const readWorkspaceEpoch = (): string =>
         request.workspaceIdentities === undefined
             ? suppliedWorkspaceEpoch
             : computeWorkspaceEpochFingerprint(db, request.workspaceIdentities);
     const workspaceEpoch = readWorkspaceEpoch();
-    // The caller authorized against a snapshot taken before this read. If the
-    // workspace has already moved, its `workspaceAuthorization` set is stale
-    // too, and only the caller can rebuild it.
+    // If the workspace moved after authorization, `workspaceAuthorization` is stale; only the caller can rebuild it.
     if (
         request.workspaceIdentities !== undefined &&
         suppliedWorkspaceEpoch !== "" &&
@@ -583,12 +528,11 @@ export function readProjectMemoryCurrentState(
     const nowMs = request.nowMs ?? Date.now();
     let items: ProjectMemoryClaimSnapshot[] = [];
     let vector: SnapshotVector | undefined;
-    // One deferred transaction = one hydration snapshot.
+    // Each deferred transaction uses one hydration snapshot.
     db.transaction(() => {
         const candidates = resolveCandidates(db, request);
         const hydrated = candidates.map((candidate) => hydrateClaim(db, candidate));
-        // Visibility before limits: lifecycle and policy filters run over
-        // the full candidate set so a hidden claim cannot consume a slot.
+        // The query applies lifecycle and policy filters before limits so hidden claims cannot consume slots.
         const visible: ProjectMemoryClaimSnapshot[] = [];
         for (const item of hydrated) {
             if (!lifecycleStates.includes(item.lifecycleState)) continue;
@@ -617,9 +561,7 @@ export function readProjectMemoryCurrentState(
 }
 
 /**
- * Resolve canonical project identities to numeric project IDs, skipping
- * identities with no registered project. Readers hold identity strings; the
- * provider keys on numeric project IDs.
+ * The reader ignores identities without registered projects because it uses identity strings while the provider keys projects by numeric ID.
  */
 export function resolveProjectIdsForIdentities(
     db: Database,
@@ -687,10 +629,8 @@ export function censusProjectMemoryClaims(
 }
 
 /**
- * Cheap lifecycle-state count of project-memory claims for status and gate
- * surfaces. Counts the claim set the provider would hydrate (public-ID rows
- * with a matching lifecycle head), without hydration or policy filtering —
- * counts gate scheduling and status displays, not content publication.
+ * The count includes public-ID rows with a matching lifecycle head and excludes hydration and policy filtering.
+ * The count supports gate scheduling and status displays, not content publication.
  */
 export function countProjectMemoryClaims(
     db: Database,

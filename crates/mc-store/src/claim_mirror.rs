@@ -1,9 +1,8 @@
-//! Rebuildable committed-claim mirror.
+//! This module stores a rebuildable committed-claim mirror.
 //!
-//! This projection is deliberately separate from the staged claim-intent ledger. It
-//! stores only public claim identities and committed snapshots. Full reseeds require
-//! the intent ledger to be drained; receipt groups advance project checkpoints only
-//! after every effect in the receipt has applied.
+//! This projection is separate from the staged claim-intent ledger.
+//! The projection stores only public claim identities and committed snapshots.
+//! Full reseeds require a drained intent ledger; receipt groups advance project checkpoints only after every receipt effect applies.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,17 +16,15 @@ use serde_json::Value;
 
 use crate::McStore;
 
-/// Version of full-snapshot and receipt-group inputs accepted by this mirror.
+/// `CLAIM_MIRROR_VERSION` identifies the full-snapshot and receipt-group input version accepted by this mirror.
 pub const CLAIM_MIRROR_VERSION: u32 = 1;
-/// Version of generation vectors accepted by this mirror.
+/// `CLAIM_MIRROR_VECTOR_VERSION` identifies the generation-vector version accepted by this mirror.
 pub const CLAIM_MIRROR_VECTOR_VERSION: u32 = 1;
-/// Version of the `claim.mirror.*` facade transport. Independent from
-/// `CLAIM_MIRROR_VERSION` so transport evolution cannot silently reinterpret
-/// snapshot or receipt payloads. Mirrors `CLAIM_MIRROR_PROTOCOL_VERSION` on the
-/// host wire; the host decoder compares it for exact equality.
+/// `CLAIM_MIRROR_PROTOCOL_VERSION` is independent of `CLAIM_MIRROR_VERSION`.
+/// The independent transport version prevents transport evolution from silently reinterpreting snapshot or receipt payloads.
 pub const CLAIM_MIRROR_PROTOCOL_VERSION: u32 = 1;
 
-/// Authoritative lifecycle stored with a committed claim revision.
+/// A committed claim revision stores an authoritative lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimMirrorLifecycle {
@@ -55,7 +52,7 @@ impl ClaimMirrorLifecycle {
     }
 }
 
-/// Source outbox change that caused a committed mirror refresh.
+/// `ClaimMirrorChangeKind` identifies the source outbox change that caused a committed mirror refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimMirrorChangeKind {
@@ -67,8 +64,8 @@ pub enum ClaimMirrorChangeKind {
     Derivation,
 }
 
-/// Complete committed state for one public claim. JSON fields preserve the
-/// authoritative claim vocabulary without introducing legacy memory defaults.
+/// `CommittedClaimMirrorRow` stores the complete committed state for one public claim.
+/// `attributes`, `applicability`, and `policy` preserve the authoritative claim vocabulary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommittedClaimMirrorRow {
@@ -86,8 +83,7 @@ pub struct CommittedClaimMirrorRow {
     pub policy_generation: i64,
 }
 
-/// Atomic full snapshot. Project checkpoints identify the last source effect
-/// included by the snapshot for each project.
+/// Project checkpoints identify the last source effect included by the snapshot for each project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMirrorSnapshot {
@@ -97,9 +93,8 @@ pub struct ClaimMirrorSnapshot {
     pub claims: Vec<CommittedClaimMirrorRow>,
 }
 
-/// One source effect in a complete receipt. `previous_project_effect_id` is the
-/// source outbox predecessor for this project, making omissions detectable even
-/// when unrelated projects occupy intervening global effect IDs.
+/// `previous_project_effect_id` identifies the preceding source outbox effect for the same project.
+/// The predecessor makes per-project omissions detectable despite intervening effects from unrelated projects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMirrorEffect {
@@ -111,12 +106,11 @@ pub struct ClaimMirrorEffect {
     pub change_kind: ClaimMirrorChangeKind,
     pub public_claim_id: String,
     pub revision_locator: String,
-    /// `None` means the claim is absent from the committed mirror view. This is
-    /// how policy-only revocation removes an otherwise unchanged revision.
+    /// `None` means the claim is absent from the committed mirror view; policy-only revocation removes an otherwise unchanged revision.
     pub claim: Option<CommittedClaimMirrorRow>,
 }
 
-/// Every effect from one lifetime source receipt, in source effect-ID order.
+/// A receipt group contains every effect from one lifetime source receipt in source effect-ID order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMirrorReceiptGroup {
@@ -127,7 +121,6 @@ pub struct ClaimMirrorReceiptGroup {
     pub effects: Vec<ClaimMirrorEffect>,
 }
 
-/// Committed generation and source-outbox checkpoint for one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimMirrorProjectState {
     pub project_generation: i64,
@@ -135,7 +128,6 @@ pub struct ClaimMirrorProjectState {
     pub acked_effect_id: i64,
 }
 
-/// Current mirror incarnation, workspace epoch, and per-project progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimMirrorState {
     pub mirror_version: u32,
@@ -145,14 +137,12 @@ pub struct ClaimMirrorState {
     pub projects: BTreeMap<i64, ClaimMirrorProjectState>,
 }
 
-/// Result of applying or replaying one complete receipt group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimMirrorApplyResult {
     pub replayed: bool,
     pub applied_effect_count: usize,
 }
 
-/// Validation, fencing, or storage failure from committed-mirror operations.
 #[derive(Debug)]
 pub enum ClaimMirrorError {
     Store(cortexkit_store::StoreError),
@@ -708,7 +698,6 @@ fn clear_claim_mirror(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
 }
 
 impl McStore {
-    /// Read the committed mirror vector and every per-project checkpoint.
     pub fn claim_mirror_state(&self) -> Result<Option<ClaimMirrorState>, ClaimMirrorError> {
         self.inner
             .with_conn(|conn| {
@@ -738,7 +727,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// List committed claims bound to one database incarnation, optionally by project.
     pub fn list_claim_mirror(
         &self,
         database_incarnation_id: &str,
@@ -749,10 +737,9 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Atomically replace the full rebuildable mirror from a validated snapshot.
+    /// The operation atomically replaces the full rebuildable mirror from a validated snapshot.
     ///
-    /// Replacing existing state requires `begin_claim_store_rebuild`; every staged
-    /// U5 intent must be terminal before this method can delete prior mirror rows.
+    /// Replacing existing state requires `begin_claim_store_rebuild`; the method may delete prior mirror rows only after every staged U5 intent is terminal.
     pub fn replace_claim_mirror_snapshot(
         &self,
         snapshot: &ClaimMirrorSnapshot,
@@ -859,7 +846,7 @@ impl McStore {
         outcome
     }
 
-    /// Atomically apply every hydrated effect from one complete source receipt.
+    /// apply_claim_mirror_receipt atomically applies every hydrated effect from one complete source receipt.
     pub fn apply_claim_mirror_receipt(
         &self,
         group: &ClaimMirrorReceiptGroup,
@@ -1031,10 +1018,9 @@ impl McStore {
                             effect.public_claim_id
                         ))));
                     }
-                    // A revision locator embeds the content digest, so the same
-                    // revision arriving with a different locator means the same
-                    // revision carries different content. Without this the upsert
-                    // below would silently replace the stored content.
+                    // A revision locator embeds the content digest.
+                    // A different locator for the same revision means different content.
+                    // Without the locator check, the upsert silently replaces stored content.
                     if incoming_revision == *revision && locator != &effect.revision_locator {
                         return Ok(Err(ClaimMirrorError::Invalid(format!(
                             "public claim {} revision {} does not match the stored locator",
@@ -1063,11 +1049,8 @@ impl McStore {
 
             for project_id in &touched {
                 let key = project_id.to_string();
-                // Every retained row in a touched project takes the receipt's
-                // generations, not just the rows an effect names. The host stamps
-                // its full snapshot from the current vector, and row equality
-                // includes these fields, so leaving untouched rows on the previous
-                // generation makes the next full replacement compare unequal and
+                // The receipt's generations apply to every retained row, not only rows named by an effect.
+                // Leaving untouched rows at the previous generation makes a full replacement compare unequal.
                 // return `ResetRequired`.
                 tx.execute(
                     "UPDATE mc_claim_mirror_claims
@@ -1123,8 +1106,6 @@ impl McStore {
         outcome
     }
 
-    /// Delete only rebuildable mirror state. The staged-intent ledger remains
-    /// untouched and must already be frozen in `resetting` with no unresolved row.
     pub fn delete_claim_mirror(&self) -> Result<(), ClaimMirrorError> {
         self.inner.with_conn_fenced(|tx| {
             let unresolved = unresolved_claim_intents(tx)?;

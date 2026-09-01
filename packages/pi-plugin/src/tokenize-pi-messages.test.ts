@@ -2,22 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { tokenizePiMessages } from "./tokenize-pi-messages";
 
 /**
- * Regression coverage for the Pi `/ctx-status` Tool Calls bug.
  *
- * Symptom: dialog showed `Tool Calls: 1.1M (650.6%)` on a 162K-token
- * context — mathematically impossible. Root cause: the dialog walked
- * `ctx.sessionManager.getBranch()`, which returns the FULL leaf-to-root
- * path including pre-compaction-marker entries. Those pre-compaction
- * tool calls/results were never tagged (predate the marker), so they
- * couldn't be filtered out of the count.
  *
- * Fix: the pipeline now persists token totals from the post-compaction
- * `event.messages` view (the same one tagger sees), and the dialog
- * reads the persisted value instead of re-walking `getBranch()`.
  *
- * These tests pin the `tokenizePiMessages()` function — the source of
- * truth for what gets persisted. Each test asserts the tool-call vs
- * conversation partitioning matches OpenCode's per-part categorization
  * in `transform.ts:1028-1119`.
  */
 
@@ -78,11 +65,7 @@ describe("tokenizePiMessages", () => {
 	});
 
 	test("toolResult role → toolCall bucket (the bulky result body)", () => {
-		// The result body dominates the bucket. Real `read` results are
-		// often kilobytes. Confirm a reasonable text result lands in
-		// toolCall, not conversation. Use varied content because
-		// repeated single chars compress unrealistically well under a
-		// real BPE tokenizer.
+		// Use varied content because BPE tokenizers compress repeated characters efficiently.
 		const bigResult = Array.from(
 			{ length: 200 },
 			(_, i) => `line ${i}: data ${i * 7}`,
@@ -111,9 +94,7 @@ describe("tokenizePiMessages", () => {
 	});
 
 	test("dropped sentinels tokenize to ~few tokens (NOT the original bulk)", () => {
-		// After the pipeline drops a tool tag, the toolResult content is
-		// replaced with `[dropped §N§]`. Confirm this tokenizes small —
-		// proves the post-strip walk reflects what the LLM actually sees.
+		// The pipeline replaces dropped `toolResult` content with `[dropped §N§]`.
 		const counts = tokenizePiMessages([
 			{
 				role: "toolResult",
@@ -172,8 +153,7 @@ describe("tokenizePiMessages", () => {
 	});
 
 	test("image content → conversation bucket (visual fallback)", () => {
-		// Pi image content is base64 without dimensions at this layer;
-		// use OpenCode's fallback constant of 1200 tokens per image.
+		// Pi image content has no dimensions at this layer, so use OpenCode's 1,200-token fallback.
 		const counts = tokenizePiMessages([
 			{
 				role: "user",
@@ -185,8 +165,7 @@ describe("tokenizePiMessages", () => {
 	});
 
 	test("image inside toolResult → toolCall bucket", () => {
-		// Tool that returns an image (e.g. screenshot) — the visual
-		// tokens should land in the tool bucket, not conversation.
+		// Image-returning tools count visual tokens in `toolCall`, not `conversation`.
 		const counts = tokenizePiMessages([
 			{
 				role: "toolResult",
@@ -342,7 +321,7 @@ describe("tokenizePiMessages", () => {
 	});
 
 	test("toolCall args as pre-stringified JSON → toolCall bucket", () => {
-		// Some Pi providers may stringify arguments before storing.
+		// Pi providers store some tool-call arguments as JSON strings.
 		const counts = tokenizePiMessages([
 			{
 				role: "assistant",

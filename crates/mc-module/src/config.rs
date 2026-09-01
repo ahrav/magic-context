@@ -1,12 +1,11 @@
-//! Thin mc-module JSONC config reader for autonomous historian firing.
+//! This module reads JSONC config for autonomous historian firing.
 //!
-//! This intentionally reads user and project tiers directly instead of depending on a
-//! daemon config plane. Per-leaf trust policy is enforced during the read: model choice
-//! is user-tier only because it affects spend; project config may only raise the execute
-//! threshold (fire less often), and may override trusted memory, auto-search, caveman, promotion,
-//! and privacy settings. User-profile and historian budgets remain user-tier only. The Rust module
-//! intentionally keeps stricter model-selection policy than the current TypeScript implementation
-//! until both implementations are deliberately aligned.
+//! The reader loads user and project tiers directly without a daemon config plane.
+//! The reader enforces per-leaf trust policy during reads.
+//! Project config may only raise the execute threshold, causing historian firing less often.
+//! Project config may override trusted memory, auto-search, caveman, promotion, and privacy settings.
+//! User-profile and historian budgets remain user-tier only.
+//! The Rust module uses stricter model-selection policy than the TypeScript implementation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,34 +13,26 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-/// Default execute threshold percentage (65.0). The Rust module reads config without the
-/// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
+/// `DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE` must equal the default in `packages/plugin/src/config/schema/magic-context.ts` because Rust reads config without the plugin.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
-/// Default token budget for project-memory injection. This is the twin of
-/// `packages/plugin/src/config/schema/magic-context.ts` and must stay at 4,000 tokens.
+/// `DEFAULT_MEMORY_BUDGET_TOKENS` must equal the TypeScript schema default of 4,000 tokens.
 pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 4_000.0;
-/// Default token budget for user-profile injection. It must remain 4,000 tokens so the Rust
-/// module and the TypeScript renderer use the same default.
+/// `DEFAULT_USER_PROFILE_BUDGET_TOKENS` must remain 4,000 tokens so Rust and the TypeScript renderer use the same default.
 pub const DEFAULT_USER_PROFILE_BUDGET_TOKENS: f64 = 4_000.0;
-/// Maximum execute threshold percentage (90.0). Output capacity is already reserved
-/// from the usable window, leaving the final 10% for mid-turn input growth.
+/// The 90% cap reserves the final 10% of the usable window for mid-turn input growth because output capacity is already reserved.
 const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 90.0;
-/// Minimum historian producer chunk size. The derived budget is one quarter of the model
-/// context limit, but it is never allowed to fall below 8,000 tokens.
 pub const MIN_HISTORIAN_CHUNK_TOKENS: usize = 8_000;
-/// Maximum historian producer chunk size. The derived budget is one quarter of the model
-/// context limit, but it is never allowed to exceed 50,000 tokens.
 pub const MAX_HISTORIAN_CHUNK_TOKENS: usize = 50_000;
-/// Matches the TypeScript historian fallback when no model catalog value is available.
+/// `DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS` matches the TypeScript historian fallback when no model catalog value is available.
 /// The explicit config override still wins when a binding supplies one.
 pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 128_000;
-/// Defaults shared with the TypeScript `memory.auto_search` schema.
+/// The auto-search defaults match the TypeScript `memory.auto_search` schema.
 pub const DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD: f64 = 0.6;
 pub const DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS: usize = 20;
-/// Defaults shared with the TypeScript `caveman_text_compression` schema.
+/// The caveman defaults match the TypeScript `caveman_text_compression` schema.
 pub const DEFAULT_CAVEMAN_MIN_SIZE: usize = 500;
 
-/// Derive the historian producer budget from its own context window, as the TS runner does.
+/// `derive_historian_chunk_tokens` matches the TS runner's context-window-based historian producer-budget derivation.
 pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
     (((context_limit_tokens as f64) * 0.25).round() as usize)
         .clamp(MIN_HISTORIAN_CHUNK_TOKENS, MAX_HISTORIAN_CHUNK_TOKENS)
@@ -83,35 +74,30 @@ impl Default for CavemanConfig {
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
-    /// Whether compaction is enabled, as resolved during host startup. This determines which
-    /// component controls context-window compaction for the request.
+    /// Compaction resolution determines the component that controls request context-window compaction.
     pub compaction_enabled: bool,
     pub memory_enabled: bool,
-    /// Independent transform-time hint controls from `memory.auto_search`.
+    /// Auto-search hint controls operate independently at transform time.
     pub auto_search: AutoSearchConfig,
-    /// Deterministic age-tier compression controls from `caveman_text_compression`.
+    /// Caveman compression uses deterministic age-tier controls.
     pub caveman: CavemanConfig,
-    /// Mirrors the TS auto-promote switch. Facts are dropped when this is false.
+    /// `auto_promote` mirrors the TS auto-promote switch; false drops facts.
     pub auto_promote: bool,
-    /// Privacy gate controlling whether historian user observations may be collected for later
-    /// review and promotion.
+    /// The privacy gate controls whether historian user observations may be collected for later review and promotion.
     pub user_memory_collection_enabled: bool,
-    /// Historian model context limit; configurable until the module has a model catalog.
     pub historian_context_limit_tokens: usize,
     pub memory_budget_tokens: f64,
     pub user_profile_budget_tokens: f64,
-    /// Controls whether the frozen m0 baseline includes the canonical project-docs block.
+    /// The m0 baseline option controls whether the frozen m0 baseline includes the canonical project-docs block.
     pub inject_docs: bool,
-    /// Controls temporal gap overlays when the active wire surface supports overlays.
+    /// The overlay option controls temporal gap overlays when the active wire surface supports overlays.
     pub temporal_awareness: bool,
-    /// Trusted USER-tier guidance bytes resolved from the user config directory at route bind.
-    /// Only the immutable contents are retained; transform and guidance requests never carry a
+    /// Route binding resolves trusted USER-tier guidance bytes from the user config directory.
     /// filesystem path.
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
-    /// Per-model TTL overrides from the object config shape. Resolution uses the
-    /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
+    /// Per-model TTL overrides use exact, bare, dash-stripped, provider-wildcard, then default matching.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
 }
 
@@ -152,10 +138,9 @@ pub struct ResolvedCacheTtl {
 }
 
 impl McModuleConfig {
-    /// Resolve the effective cache TTL while preserving whether the model walk matched an entry.
+    /// The resolver preserves whether the model walk matched an entry while resolving the effective cache TTL.
     ///
-    /// The configured default remains the effective value for host-side scheduling, but it is not
-    /// an instruction to place that value on a provider cache marker.
+    /// The default TTL schedules host-side expiry but does not set provider cache markers.
     pub fn resolve_cache_ttl_with_provenance(&self, model_key: Option<&str>) -> ResolvedCacheTtl {
         let explicit = |value: &String| ResolvedCacheTtl {
             value: value.clone(),
@@ -166,8 +151,7 @@ impl McModuleConfig {
             provenance: CacheTtlProvenance::Default,
         };
 
-        // Check an exact key before splitting into provider and model parts, so a bare key cannot
-        // silently fall back to the default TTL.
+        // The matcher checks the exact key before splitting so a configured bare key matches before fallback to the default TTL.
         if let Some(ttl) = model_key.and_then(|key| self.cache_ttl_by_model.get(key)) {
             return explicit(ttl);
         }
@@ -199,7 +183,6 @@ impl McModuleConfig {
         default()
     }
 
-    /// Resolve only the effective value for existing host-side callers.
     pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
         self.resolve_cache_ttl_with_provenance(model_key).value
     }
@@ -294,8 +277,6 @@ fn resolve_user_guidance_override(
         return;
     }
 
-    // When a guidance override path is configured, use it as the only override source. An
-    // invalid path clears any pre-resolved text and falls back to built-in guidance.
     cfg.prompt_surface_guidance_override = None;
     let configured_path = Path::new(configured_path);
     let path = if configured_path.is_absolute() {
@@ -378,15 +359,6 @@ fn merge_tiers_with_warnings(
     let mut warnings = Vec::new();
 
     if let Some(user) = user {
-        // Module-leg model override. The shared config file serves two consumers whose
-        // model namespaces differ: the TS plugin resolves harness-namespace ids (e.g.
-        // OpenCode's auth plugins register "google/antigravity-gemini-3.5-flash"),
-        // while this module drives llm-runner, whose catalog uses canonical ids
-        // ("google/gemini-3.5-flash" + a vault auth method). When module_model is
-        // present it REPLACES the plugin-namespace chain entirely (no mixing — a
-        // half-translated chain would burn permanent-classified advances every fire);
-        // when absent, fall back to the plugin keys so single-namespace setups keep
-        // working with one set of keys.
         let module_model = user
             .pointer("/historian/module_model")
             .and_then(Value::as_str)
@@ -489,10 +461,6 @@ fn merge_tiers_with_warnings(
                     cfg.cache_ttl = cache_ttl.trim().to_string();
                 }
             }
-            // Per-model map: { "default": "5m", "anthropic/claude-opus-4-8": "300m", ... }.
-            // Silently ignoring this shape left the module on the 5m default while the
-            // user had configured 300m for Anthropic models (a spurious idle-TTL HARD on
-            // a still-warm provider cache).
             Some(Value::Object(map)) => {
                 for (key, value) in map {
                     let Some(ttl) = value.as_str() else { continue };
@@ -635,8 +603,6 @@ fn number_at(value: &Value, pointer: &str) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
-/// Strip JSONC line/block comments and trailing commas while respecting string literals.
-/// The module only consumes its own config convention; this is not a general JSONC parser.
 pub fn strip_jsonc(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -736,8 +702,7 @@ mod cache_ttl_tests {
         assert_eq!(cfg.resolve_cache_ttl(Some("openai/gpt-5.6-sol")), "30m");
         assert_eq!(cfg.resolve_cache_ttl(Some("unknown/model")), "10m");
         assert_eq!(cfg.resolve_cache_ttl(None), "10m");
-        // A bare unprefixed key with an exact config entry must not downgrade
-        // to the default (pre-parity behavior preserved).
+        // A bare key with an exact config entry must not fall back to the default TTL.
         assert_eq!(cfg.resolve_cache_ttl(Some("gpt-5.6-sol")), "30m");
     }
 
@@ -841,8 +806,6 @@ mod tests {
 
     #[test]
     fn default_memory_budget_matches_typescript_schema() {
-        // Twin: packages/plugin/src/config/schema/magic-context.ts defaults
-        // memory.injection_budget_tokens to 4,000.
         assert_eq!(DEFAULT_MEMORY_BUDGET_TOKENS, 4_000.0);
         assert_eq!(merge_tiers(None, None).memory_budget_tokens, 4_000.0);
     }
@@ -1126,8 +1089,6 @@ mod tests {
             }
         });
         let cfg = merge_tiers(Some(&user), None);
-        // No plugin-namespace ids may leak into the module chain — a mixed chain
-        // burns a permanent-classified advance on every historian fire.
         assert_eq!(
             cfg.model_chain,
             vec!["google/gemini-3.5-flash", "ollama-cloud/kimi-k2.7-code"]
@@ -1205,7 +1166,7 @@ mod tests {
         let first = cache.effective_for_paths(&user, &project);
         assert_eq!(first.model_chain, vec!["model-a"]);
 
-        // Without an mtime change, a different file body is intentionally ignored.
+        // Without an mtime change, the cache ignores a different file body.
         let original_mtime = std::fs::metadata(&user).unwrap().modified().unwrap();
         std::fs::write(&user, r#"{ "historian": { "model": "model-b" } }"#).unwrap();
         filetime::set_file_mtime(&user, filetime::FileTime::from_system_time(original_mtime))
@@ -1213,7 +1174,7 @@ mod tests {
         let unchanged = cache.effective_for_paths(&user, &project);
         assert_eq!(unchanged.model_chain, vec!["model-a"]);
 
-        // Once mtime changes, the cache reloads and picks up the new user-tier model.
+        // An mtime change reloads the cached file.
         let newer = filetime::FileTime::from_unix_time(
             original_mtime
                 .duration_since(std::time::UNIX_EPOCH)

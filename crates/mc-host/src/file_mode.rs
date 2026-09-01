@@ -1,18 +1,14 @@
-//! Platform-width file mode conversion shared by the closure and generation
+//! Both closure and generation stagers use this platform-width mode conversion.
 //! stagers.
 //!
-//! Both stagers read a `mode` committed as `u32` by a manifest and hand it to
-//! rustix, so the conversion belongs to neither of them alone.
+//! Both stagers pass manifest-committed `u32` `mode` values to rustix.
 
-/// Permission bits as rustix's platform-width `RawMode`.
 ///
-/// `RawMode` is `u32` on Linux and `u16` on the Darwin targets, while the
-/// manifest commits `mode` as `u32`, so the two cannot meet without an explicit
-/// conversion — leaving it implicit compiles on Linux and fails on Darwin. Only
-/// the permission and set-id bits are meaningful to any caller here, and every
-/// value passed is already within them (0o600 or 0o700 for staged output, and a
-/// manifest mode that validation requires to equal `mode & 0o777`), so the mask
-/// documents that range rather than narrowing a value that could exceed it.
+/// `RawMode` is `u32` on Linux and `u16` on Darwin, whereas manifest `mode` is `u32`.
+/// Without the cast, the function compiles on Linux and fails on Darwin.
+/// Callers use only permission and set-ID bits.
+/// Staged output uses `0o600` or `0o700`; manifest validation requires `mode == mode & 0o777`.
+/// All callers constrain `mode` to `0o7777`, so the mask preserves every caller value.
 #[allow(clippy::unnecessary_cast)]
 pub(crate) fn raw_mode(mode: u32) -> rustix::fs::RawMode {
     (mode & 0o7777) as rustix::fs::RawMode

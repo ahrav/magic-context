@@ -1,17 +1,13 @@
 /**
- * Executable-case registry and snapshot fingerprints (U2, KTD9, R5-R6).
  *
- * A registered case binds one executable semantic revision to a driver,
- * normalizer, pure verifier, explicit root-confined implementation file
- * list, and fixture bundle. Correspondence with the catalog is strictly 1:1.
+ * Each registered case corresponds to exactly one catalog variant.
  *
  * Fingerprints:
- *  - semanticFingerprint: canonical JSON over structured contract meaning
- *    (lane, applicability, normative checks, prerequisites, fixture meaning)
- *    — formatting- and key-order-insensitive.
- *  - implementationBundleDigest: byte-hash over the explicit file list —
- *    any source-byte change alters it.
- *  - ledgerFingerprint: hash over the full adjudication ledger lines.
+ * semanticFingerprint canonicalizes contract meaning as JSON.
+ * semanticFingerprint ignores JSON formatting and key order.
+ * implementationBundleDigest hashes the explicit implementation file list.
+ * implementationBundleDigest hashes the bytes of each listed source file.
+ * ledgerFingerprint hashes the full adjudication ledger lines.
  */
 
 import { createHash } from "node:crypto";
@@ -45,8 +41,8 @@ export interface CaseDriverContext {
     storeNamespace: string;
 }
 
-/** Serializable observation data — the only shape a driver may return and
- *  the only shape a normalizer/verifier may consume. */
+/**
+ * */
 export type JsonValue =
     | string
     | number
@@ -57,7 +53,7 @@ export type JsonValue =
 export type NormalizedObservation = JsonValue;
 
 export interface VerifierCheck {
-    /** Static check id declared in the variant's normative_checks. */
+    /** id identifies a check declared in the variant's normative_checks. */
     id: string;
     passed: boolean;
 }
@@ -67,7 +63,7 @@ export type PreconditionOutcome =
     | {
           satisfied: false;
           reason: "blocked_by_dependency" | "precondition_unmet";
-          /** Reviewed catalog dependencies when reason is blocked_by_dependency. */
+          /** blockedBy lists the catalog dependencies reviewed for blocked_by_dependency. */
           blockedBy: string[];
       };
 
@@ -76,29 +72,28 @@ export type PrerequisiteOutcome = { ok: true } | { ok: false; reason: string };
 export interface RegisteredIncidentCase {
     variantId: string;
     /** Repo-root-relative driver/verifier/normalizer/fixture/dependency
-     *  files byte-hashed into the implementation-bundle digest. */
+     * implementationFiles lists repo-root-relative driver, verifier, normalizer, fixture, and dependency files hashed into implementationBundleDigest. */
     implementationFiles: string[];
-    /** Structured fixture MEANING (not raw bytes) folded into the semantic
+    /** fixtures contribute structured meaning, rather than raw bytes, to semanticFingerprint.
      *  fingerprint. */
     fixtures: Record<string, unknown>;
-    /** Returns serializable observations or throws an infrastructure error. */
+    /** driver throws infrastructure errors; otherwise, driver returns serializable observations. */
     driver(context: CaseDriverContext): Promise<JsonValue>;
     normalizer(raw: JsonValue): NormalizedObservation;
-    /** Reproduction preconditions, validated BEFORE the behavioral verifier. */
+    /** precondition runs before verifier. */
     precondition(observation: NormalizedObservation): PreconditionOutcome;
-    /** Pure verifier over the normalized observation. */
+    /* */
     verifier(observation: NormalizedObservation): VerifierCheck[];
-    /** The exact module functions this case executes, carried as references
-     *  so validation can bind them to the catalog's `file#symbol`
-     *  verifier_binding names instead of trusting registration placement. */
+    /** binding stores the exact driver and verifier functions executed by the case so validation can match catalog file#symbol bindings.
+     * */
     binding: { driver: unknown; verifier: unknown };
-    /** Parent-side availability probe; a miss reports `unavailable`. */
+    /** prerequisite reports `unavailable` when the parent-side availability probe misses. */
     prerequisite?(): PrerequisiteOutcome;
 }
 
 export type IncidentCaseRegistry = Map<string, RegisteredIncidentCase>;
 
-/** Reject absolute paths, parent escapes, and duplicates up front. */
+/* */
 function validateImplementationFiles(files: string[], variantId: string): void {
     if (files.length === 0) {
         throw new Error(
@@ -170,16 +165,14 @@ export function builtinIncidentCaseRegistry(): IncidentCaseRegistry {
     return registry;
 }
 
-/** The structured contract inputs that define one semantic revision. */
+/* */
 export type SemanticContractInput = Pick<
     IncidentVariant,
     "lane" | "applicability" | "normative_checks" | "blocked_by"
 >;
 
 /**
- * Canonical semantic fingerprint (KTD9): normative checks, applicability,
- * lane, prerequisites, and fixture meaning through canonical JSON, so
- * equivalent formatting or key order cannot change it.
+ * semanticFingerprint canonicalizes normative checks, applicability, lane, prerequisites, and fixture meaning as JSON.
  */
 export function semanticFingerprint(
     variant: SemanticContractInput,
@@ -195,8 +188,8 @@ export function semanticFingerprint(
     });
 }
 
-/** Byte-hash of the explicit root-confined implementation file list. The
- *  listed order is irrelevant (paths are sorted); the bytes are not. */
+/** implementationBundleDigest hashes the bytes of the explicit root-confined implementation file list after sorting paths.
+ * implementationBundleDigest ignores implementationFiles order but hashes exact file bytes. */
 export function implementationBundleDigest(
     rootDir: string,
     files: string[],
@@ -222,7 +215,7 @@ export function implementationBundleDigest(
     return hash.digest("hex");
 }
 
-/** Fingerprint of the full adjudication ledger (line-exact). */
+/** ledgerFingerprint hashes the full adjudication ledger line-exactly. */
 export function ledgerFingerprint(
     adjudicationLines: readonly string[],
 ): string {
@@ -230,10 +223,7 @@ export function ledgerFingerprint(
 }
 
 /**
- * Each registered case must name an executable catalog variant with a live
- * verifier binding, and its catalog semantic fingerprint must equal the
- * fingerprint recomputed from its fixtures. Unregistered executable
- * variants do not fail this validation.
+ * Unregistered executable variants fail this validation.
  */
 export function validateRegistryCatalogCorrespondence(
     registry: IncidentCaseRegistry,
@@ -265,12 +255,6 @@ export function validateRegistryCatalogCorrespondence(
                 `registered case ${variantId} has no executable catalog variant`,
             );
         }
-        // Bind the registered functions to the catalog's named symbols: a
-        // registration that wraps or swaps in another exported function from
-        // the same module must fail here, not silently execute the wrong
-        // oracle. Function identity is compared by the runtime `name` of the
-        // carried reference, which matches the catalog symbol exactly for the
-        // module-level declarations these bindings name.
         const binding = variant.verifier_binding;
         if (!binding) {
             throw new Error(
@@ -286,15 +270,8 @@ export function validateRegistryCatalogCorrespondence(
                 `registered case ${variantId} binds ${catalogDriver}/${catalogVerifier} but carries ${boundDriver || "<anonymous>"}/${boundVerifier || "<anonymous>"}`,
             );
         }
-        // The checks above validate `binding`, but `run-incident-case.ts`
-        // executes `driver`/`verifier`. Nothing coupled the two, so a
-        // registration could keep correct binding metadata while executing a
-        // different oracle. The coupling is proved structurally: the executed
-        // callback either IS the bound reference, or it was built by
-        // `adaptBoundSymbol`, which records the function object it adapted.
-        // Scanning the executed callback's source text cannot prove it, because
-        // a wrapper that merely mentions the expected name in a comment, a dead
-        // expression, or an unrelated identifier reads as bound while calling
+        // Validation requires `binding` to reference the `driver` and `verifier` that `run-incident-case.ts` executes.
+        // Source-text scans cannot prove that a callback invokes its bound function.
         // something else.
         if (
             !executesBoundSymbol(registered.driver, registered.binding.driver) ||
@@ -316,32 +293,21 @@ export function validateRegistryCatalogCorrespondence(
     }
 }
 
-/** Runtime name of a carried binding reference, for catalog comparison. */
+/* */
 function bindingName(reference: unknown): string {
     if (typeof reference !== "function") return "";
     return reference.name;
 }
 
 /**
- * The function object an adapted callback was built from, when it carries one.
  */
 const ADAPTED_FROM = Symbol.for("mc.incident-pool.adaptedFrom");
 
 /**
- * Build the callback the pool executes from the symbol the catalog binds.
  *
- * Some cases cannot register the bound symbol directly: the drivers take a
- * prepared harness rather than a `CaseDriverContext`, and the verifiers take a
- * normalized observation and return a richer record than `VerifierCheck[]`. The
- * adaptation is passed the bound reference and nothing else, so the callback it
- * returns is written against that function, and the reference is recorded on the
- * result for validation.
  *
- * This proves which function the registration is built from, not that the body
- * calls it — a `build` that ignores its argument and calls an imported impostor
- * still type-checks. That residual gap is visible at the registration site,
- * where the impostor has to be named; a source-text scan closed nothing at all,
- * because any mention of the expected identifier satisfied it.
+ * The marker records the function passed to `adaptBoundSymbol`; it does not prove that the callback calls that function.
+ * `build` can ignore `inner` and call an imported function while preserving its type.
  */
 export function adaptBoundSymbol<I, F extends (...args: never[]) => unknown>(
     inner: I,
@@ -355,18 +321,17 @@ export function adaptBoundSymbol<I, F extends (...args: never[]) => unknown>(
     return adapted;
 }
 
-/** Is `executed` the bound reference, or an adapter built from it? */
+/* */
 function executesBoundSymbol(executed: unknown, bound: unknown): boolean {
     if (typeof executed !== "function" || typeof bound !== "function")
         return false;
     if (executed === bound) return true;
-    // SAFETY: function objects support symbol-keyed properties set by adaptBoundSymbol. commentlint: allow(JUDGE)
+    // SAFETY: `executed` is a function before the symbol-keyed property read.
     return (executed as unknown as Record<symbol, unknown>)[ADAPTED_FROM] ===
         bound;
 }
 
 /**
- * The exported-symbol half of a catalog `path#symbol` binding string.
  */
 function bindingSymbol(binding: string): string {
     const symbol = binding.split("#")[1] ?? "";
