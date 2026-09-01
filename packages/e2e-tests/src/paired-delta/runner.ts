@@ -237,19 +237,19 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
             typeof record.scenarioId !== "string" ||
             typeof record.armId !== "string" ||
             !ARM_ID_SET.has(record.armId) ||
-            !Number.isSafeInteger(record.replicateIndex) ||
+            !isNonNegativeCount(record.replicateIndex) ||
             (record.replicateIndex as number) < 0
         ) {
             fail("coordinate-invalid");
         }
-        if (!Number.isFinite(record.costUsd) || (record.costUsd as number) < 0) {
+        if (!isNonNegativeAmount(record.costUsd)) {
             fail("cost-invalid");
         }
         for (const [label, value] of [
             ["prior-attempts-cost", record.priorAttemptsCostUsd],
             ["max-attempt-cost", record.maxAttemptCostUsd],
         ] as const) {
-            if (!Number.isFinite(value) || (value as number) < 0) fail(`${label}-invalid`);
+            if (!isNonNegativeAmount(value)) fail(`${label}-invalid`);
         }
         /** Each figure can be finite while their sum is not, and that sum is what the pre-scan adds to `spentUsd`: one `Infinity` there makes every later cap comparison false and serializes as `null`. commentlint: allow(JUDGE) */
         if (!Number.isFinite((record.priorAttemptsCostUsd as number) + (record.costUsd as number))) {
@@ -707,7 +707,7 @@ export async function runPairedDelta(
             ["max-attempt-cost", record.maxAttemptCostUsd],
             ["wall-clock-ms", record.wallClockMs],
         ] as const) {
-            if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+            if (!isNonNegativeAmount(value)) {
                 releaseBeforeThrowing(options.store);
                 throw new Error(
                     `records file ${label} is not a non-negative finite number at ` +
@@ -716,7 +716,7 @@ export async function runPairedDelta(
             }
         }
         /** `coordinateKey` renders a numeric `0` and the string `"0"` identically and the matrix comparisons coerce, so a non-integer index would key and resume as a replicate it is not. commentlint: allow(JUDGE) */
-        if (!Number.isSafeInteger(record.replicateIndex) || record.replicateIndex < 0) {
+        if (!isNonNegativeCount(record.replicateIndex)) {
             releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file replicate index ${String(record.replicateIndex)} is not a ` +
@@ -1504,6 +1504,16 @@ function detachedIntervention(
 }
 
 /** The reserve is the expected price of the next single call, so it takes the dearest attempt a coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit, and not this attempt's cost alone, which a coordinate that failed expensively and then succeeded cheaply would understate. One function because the pre-scan over stored records and the post-rollout bookkeeping must agree: a change applied to one site and not the other would silently undercount the reserve at the other. commentlint: allow(JUDGE) */
+/** The scalar admissibility rules the parser and the pre-scan both apply to an untrusted record. Shared as predicates rather than as one validator because the two callers legitimately differ in what they do with a rejection — the parser reports a code against a file path, the pre-scan releases its claim and names the coordinate — while the rules themselves must not drift. commentlint: allow(JUDGE) */
+function isNonNegativeCount(value: unknown): boolean {
+    return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+/** A cost may be fractional but never negative, non-finite, or absent: a `NaN` propagates into `spentUsd` and makes every later cap comparison false. commentlint: allow(JUDGE) */
+function isNonNegativeAmount(value: unknown): boolean {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 function bumpReserve(reserveUsd: number, record: RolloutRecord): number {
     return Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
 }
