@@ -481,6 +481,22 @@ fn profile_kernel(kernel: &str) {
                 ));
             }
         }
+        "batch-cold-512" => {
+            let (_dir, fixture, base, tip) = applicability_fixture();
+            let snapshot = checkout(&fixture, tip);
+            let candidates = candidates(&fixture, base, 512, false);
+            let query = QueryContext::default();
+            let scope = ScopeMatchContext::new();
+            while Instant::now() < until {
+                black_box(ApplicabilityEngine::new().evaluate_batch(
+                    &snapshot,
+                    &query,
+                    &scope,
+                    &candidates,
+                    &EvalBudget::unbounded(),
+                ));
+            }
+        }
         other => panic!("unknown MC_SCOPE_PROFILE kernel {other}"),
     }
 }
