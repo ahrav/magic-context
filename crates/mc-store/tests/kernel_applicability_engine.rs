@@ -764,6 +764,76 @@ fn cache_hits_survive_an_unreadable_object_database() {
 }
 
 #[test]
+fn cache_key_distinguishes_relevant_inputs_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let mut object = candidate("object-key-inputs");
+    object.anchor = Some(AnchorRowSpec {
+        anchor_id: "anchor-exact".to_string(),
+        anchor_kind: "exact".to_string(),
+        exact_value: Some("expected".to_string()),
+        ..AnchorRowSpec::default()
+    });
+
+    let matching = QueryContext {
+        exact_token: Some("expected".to_string()),
+        ..QueryContext::default()
+    };
+    let first = engine.evaluate_batch(
+        &snapshot,
+        &matching,
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&object),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(first.objects[0].state, ApplicabilityState::Current);
+
+    let changed = QueryContext {
+        exact_token: Some("other".to_string()),
+        ..QueryContext::default()
+    };
+    let second = engine.evaluate_batch(
+        &snapshot,
+        &changed,
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&object),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(second.stats.object_cache_hits, 0);
+    assert_eq!(second.objects[0].state, ApplicabilityState::Historical);
+
+    let irrelevant_change = QueryContext {
+        query_instant_ms: Some(42),
+        ..changed
+    };
+    let third = engine.evaluate_batch(
+        &snapshot,
+        &irrelevant_change,
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&object),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(third.stats.object_cache_hits, 1);
+
+    object.payload = Some(b"not json".to_vec());
+    let matching_with_irrelevant_change = QueryContext {
+        query_instant_ms: Some(42),
+        ..matching
+    };
+    let fourth = engine.evaluate_batch(
+        &snapshot,
+        &matching_with_irrelevant_change,
+        &ScopeMatchContext::new(),
+        &[object],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(fourth.stats.object_cache_hits, 0);
+    assert_eq!(fourth.objects[0].state, ApplicabilityState::Uncertain);
+}
+
+#[test]
 fn shared_anchor_ids_with_different_rows_never_alias() {
     let dir = tempfile::tempdir().unwrap();
     let (fixture, base, tip) = seeded_repo(dir.path());

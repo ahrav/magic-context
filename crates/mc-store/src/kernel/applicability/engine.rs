@@ -126,7 +126,7 @@ pub struct BatchEvaluation {
 struct AnchorCacheKey {
     checkout_identity: String,
     anchor_id: String,
-    payload_digest: String,
+    payload_digest: [u8; 32],
     head: String,
 }
 
@@ -137,7 +137,7 @@ struct ObjectCacheKey {
     object_revision: i64,
     head: String,
     dirty_fingerprint: String,
-    inputs_digest: String,
+    inputs_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +184,7 @@ impl ApplicabilityEngine {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
+        let mut digest_prefixes = InputDigestPrefixes::new(query, &scope_context);
         // Distinct anchors resolve once per batch even on cache misses. The
         // memo key matches the anchor cache key, so two candidates sharing
         // an anchor id but carrying different rows can never alias.
@@ -192,9 +193,8 @@ impl ApplicabilityEngine {
         for candidate in candidates {
             let token = ClassificationToken(self.object_cache_key(
                 snapshot,
-                query,
-                &scope_context,
                 candidate,
+                digest_prefixes.for_candidate(candidate),
             ));
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
@@ -450,9 +450,8 @@ impl ApplicabilityEngine {
     fn object_cache_key(
         &self,
         snapshot: &CheckoutSnapshot,
-        query: &QueryContext,
-        scope_context: &ScopeMatchContext,
         candidate: &ApplicabilityCandidate,
+        inputs_digest: [u8; 32],
     ) -> ObjectCacheKey {
         ObjectCacheKey {
             checkout_identity: snapshot.identity().to_string(),
@@ -460,7 +459,7 @@ impl ApplicabilityEngine {
             object_revision: candidate.object_revision,
             head: snapshot.head().to_string(),
             dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
-            inputs_digest: inputs_digest(query, scope_context, candidate),
+            inputs_digest,
         }
     }
 }
@@ -485,7 +484,7 @@ impl ObjectApplicability {
                 object_revision: candidate.object_revision,
                 head: String::new(),
                 dirty_fingerprint: String::new(),
-                inputs_digest: String::new(),
+                inputs_digest: [0; 32],
             }),
         }
     }
@@ -578,42 +577,81 @@ fn paths_overlap(a: &str, b: &str) -> bool {
         || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn digest_optional(payload: Option<&[u8]>) -> String {
+fn digest_optional(payload: Option<&[u8]>) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(payload.unwrap_or_default());
-    format!("{:x}", hash.finalize())
+    hash.finalize().into()
 }
 
-/// Digest over every non-snapshot input that can change the verdict, so a
-/// cache entry can never answer for a different query context, scope
-/// context, payload, or anchor row.
-fn inputs_digest(
+#[derive(Clone, Copy)]
+enum InputPrefixKind {
+    Default = 0,
+    Exact,
+    Deployment,
+    Config,
+    Platform,
+    WallClock,
+}
+
+struct InputDigestPrefixes<'a> {
+    query: &'a QueryContext,
+    scope_context: &'a ScopeMatchContext,
+    cached: [Option<Sha256>; 6],
+}
+
+impl<'a> InputDigestPrefixes<'a> {
+    fn new(query: &'a QueryContext, scope_context: &'a ScopeMatchContext) -> Self {
+        Self {
+            query,
+            scope_context,
+            cached: std::array::from_fn(|_| None),
+        }
+    }
+
+    fn for_candidate(&mut self, candidate: &ApplicabilityCandidate) -> [u8; 32] {
+        let kind = match candidate
+            .anchor
+            .as_ref()
+            .map(|anchor| anchor.anchor_kind.as_str())
+            .unwrap_or_default()
+        {
+            "exact" => InputPrefixKind::Exact,
+            "deployment_revision" => InputPrefixKind::Deployment,
+            "config_revision" => InputPrefixKind::Config,
+            "platform_version" => InputPrefixKind::Platform,
+            "wall_clock_interval" => InputPrefixKind::WallClock,
+            _ => InputPrefixKind::Default,
+        };
+        let slot = &mut self.cached[kind as usize];
+        if slot.is_none() {
+            *slot = Some(inputs_digest_prefix(self.query, self.scope_context, kind));
+        }
+        finish_inputs_digest(slot.clone().expect("digest prefix initialized"), candidate)
+    }
+}
+
+fn inputs_digest_prefix(
     query: &QueryContext,
     scope_context: &ScopeMatchContext,
-    candidate: &ApplicabilityCandidate,
-) -> String {
+    kind: InputPrefixKind,
+) -> Sha256 {
     let mut hash = Sha256::new();
     hash.update(b"mc-applicability-inputs-v1\0");
     // Only the context fields the candidate's anchor kind reads enter the
     // digest, so an unrelated context change (a fresh query instant, say)
     // cannot evict every cached classification.
-    let anchor_kind = candidate
-        .anchor
-        .as_ref()
-        .map(|anchor| anchor.anchor_kind.as_str())
-        .unwrap_or_default();
-    let relevant: &[Option<&str>] = match anchor_kind {
-        "exact" => &[query.exact_token.as_deref()],
-        "deployment_revision" => &[query.deployment_revision.as_deref()],
-        "config_revision" => &[query.config_revision.as_deref()],
-        "platform_version" => &[query.platform_version.as_deref()],
+    let relevant: &[Option<&str>] = match kind {
+        InputPrefixKind::Exact => &[query.exact_token.as_deref()],
+        InputPrefixKind::Deployment => &[query.deployment_revision.as_deref()],
+        InputPrefixKind::Config => &[query.config_revision.as_deref()],
+        InputPrefixKind::Platform => &[query.platform_version.as_deref()],
         _ => &[],
     };
     for field in relevant {
         hash.update(field.unwrap_or("<none>").as_bytes());
         hash.update(b"\0");
     }
-    if anchor_kind == "wall_clock_interval" {
+    if matches!(kind, InputPrefixKind::WallClock) {
         hash.update(
             query
                 .query_instant_ms
@@ -632,6 +670,13 @@ fn inputs_digest(
         );
         hash.update(b"\0");
     }
+    hash
+}
+
+/// Digest over every non-snapshot input that can change the verdict, so a
+/// cache entry can never answer for a different query context, scope
+/// context, payload, or anchor row.
+fn finish_inputs_digest(mut hash: Sha256, candidate: &ApplicabilityCandidate) -> [u8; 32] {
     if let Some(terms) = &candidate.scope_terms {
         hash.update([1u8]);
         hash.update((terms.len() as u64).to_le_bytes());
@@ -685,7 +730,7 @@ fn inputs_digest(
         hash.update([0u8]);
     }
     hash.update(candidate.payload.as_deref().unwrap_or_default());
-    format!("{:x}", hash.finalize())
+    hash.finalize().into()
 }
 
 /// Presence-tagged, length-prefixed encoding distinguishes `None`,
