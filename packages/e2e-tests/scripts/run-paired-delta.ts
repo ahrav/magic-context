@@ -649,9 +649,10 @@ function ledgerEntries(payload: unknown): LedgerMessage[] {
  * Reading OpenCode's own ledger also removes any dependence on the plugin recording its own
  * accounting, which it does on a best-effort path.
  *
- * Only calls on the pinned route are billed: the R1 oracle's scripted `ctx_search` turn is
- * mock-served, and pricing it as live spend would overstate the cap. An off-pin route is reported
- * so the runner's identity comparison excludes the cell.
+ * The mock-served R1 oracle turn is not billed, because pricing it as live spend would overstate
+ * the cap. Every other call is billed whatever route served it, including a fallback to another
+ * snapshot, which is real money the cap has to see; the route is reported separately so the
+ * runner's identity comparison still excludes the cell.
  */
 async function sessionUsage(
     harness: TestHarness,
@@ -682,19 +683,24 @@ async function sessionUsage(
             ) {
                 continue;
             }
-            if (route.providerId !== pinned.providerId || route.modelId !== pinned.modelId) {
-                /** The mock provider serves the R1 oracle turn by design, so it is not an identity failure. */
-                if (route.providerId !== "mock-anthropic" && offPinRoute === null) {
-                    offPinRoute = route;
-                }
-                continue;
-            }
-            usage = addUsage(usage, {
+            const spent = {
                 input: tokens.input,
                 output: tokens.output,
                 cacheCreation: tokens.cache.write,
                 cacheRead: tokens.cache.read,
-            });
+            };
+            /** The mock provider serves the R1 oracle turn by design, so it is neither billable nor an identity failure. */
+            if (route.providerId === "mock-anthropic") continue;
+            if (route.providerId !== pinned.providerId || route.modelId !== pinned.modelId) {
+                if (offPinRoute === null) offPinRoute = route;
+                /**
+                 * The cell's evidence is rejected, but the call was billed, so it is charged: a
+                 * fallback to another snapshot is real money and the cap has to see it.
+                 */
+                usage = addUsage(usage, spent);
+                continue;
+            }
+            usage = addUsage(usage, spent);
         }
         const children = (await harness.client.session.children({ path: { id } }))
             .data;
@@ -706,6 +712,26 @@ async function sessionUsage(
         }
     }
     return { usage, offPinRoute };
+}
+
+/**
+ * A row the plugin wrote for this session, which the harness cannot have precreated.
+ *
+ * `spawnOpencode` initializes `context.db` before the server starts for every arm without native
+ * compaction, so file existence proves only that the schema was installed. `session_meta` is keyed
+ * by a session id generated at runtime and written by the tagger as the plugin processes the
+ * session, so its presence is evidence the treatment actually ran.
+ */
+function pluginProcessedSession(harness: TestHarness, sessionId: string): boolean {
+    if (!harness.hasContextDb()) return false;
+    try {
+        const row = harness.contextDb()
+            .prepare("SELECT COUNT(*) AS count FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { count: number } | null;
+        return (row?.count ?? 0) > 0;
+    } catch {
+        return false;
+    }
 }
 
 function configMatchesArm(
@@ -933,7 +959,7 @@ export function createLiveDependencies(input: {
                         ) &&
                         (
                             coordinate.armId !== "mc-on" ||
-                            harness.hasContextDb()
+                            pluginProcessedSession(harness, sessionId)
                         ) &&
                         r1Valid;
                     return {
@@ -1114,11 +1140,24 @@ function secondaryMetrics(records: readonly RolloutRecord[]) {
         ]),
     );
     return {
+        /**
+         * Denominated on completed cells only. An excluded record carries `invalidSuccess: false`
+         * because no response was assessable, so counting it diluted the rate: one false claim
+         * among ten attempts, nine of them provider-unavailable, published as 10% rather than 100%
+         * of what could be scored — and differential infrastructure failure then reads as an arm
+         * being less prone to false success claims.
+         */
         invalidSuccessRateByArm: Object.fromEntries(
-            [...byArm].map(([armId, rows]) => [
-                armId,
-                rows.filter(({ cell }) => cell.invalidSuccess).length / rows.length,
-            ]),
+            [...byArm]
+                .map(([armId, rows]) => [
+                    armId,
+                    rows.filter(({ cell }) => cell.runHealth === "completed"),
+                ] as const)
+                .filter(([, scorable]) => scorable.length > 0)
+                .map(([armId, scorable]) => [
+                    armId,
+                    scorable.filter(({ cell }) => cell.invalidSuccess).length / scorable.length,
+                ]),
         ),
         tokensByArm: metric(({ usage }) =>
             usage.input + usage.output + usage.cacheCreation + usage.cacheRead),
