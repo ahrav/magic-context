@@ -402,7 +402,24 @@ impl Dimension {
             .into_iter()
             .find(|dimension| dimension.as_str() == value)
     }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Domain => 0,
+            Self::Project => 1,
+            Self::Entity => 2,
+            Self::Branch => 3,
+            Self::Environment => 4,
+            Self::Region => 5,
+            Self::Deployment => 6,
+            Self::RequestClass => 7,
+            Self::CallerClass => 8,
+            Self::Platform => 9,
+        }
+    }
 }
+
+const DIMENSION_COUNT: usize = Dimension::ALL.len();
 
 /// One decoded scope term value. `RedactedPlaceholder` captures values the
 /// write path already replaced with a redaction token: they are unresolvable
@@ -488,9 +505,10 @@ impl std::error::Error for ScopeFormError {}
 /// is canonical by construction and predicates can require it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalScope {
-    terms: BTreeMap<Dimension, TermValue>,
-    version_requirements: BTreeMap<Dimension, semver::VersionReq>,
-    version_intervals: BTreeMap<Dimension, VersionInterval>,
+    terms: [Option<TermValue>; DIMENSION_COUNT],
+    version_requirements: [Option<semver::VersionReq>; DIMENSION_COUNT],
+    version_intervals: [Option<VersionInterval>; DIMENSION_COUNT],
+    present: u16,
 }
 
 impl CanonicalScope {
@@ -498,12 +516,14 @@ impl CanonicalScope {
     /// dimensions, unknown vocabulary, and undecodable payloads are
     /// malformed.
     pub fn from_term_specs(terms: &[ScopeTermSpec]) -> Result<Self, ScopeFormError> {
-        let mut canonical = BTreeMap::new();
-        let mut version_requirements = BTreeMap::new();
-        let mut version_intervals = BTreeMap::new();
+        let mut canonical = std::array::from_fn(|_| None);
+        let mut version_requirements = std::array::from_fn(|_| None);
+        let mut version_intervals = std::array::from_fn(|_| None);
+        let mut present = 0u16;
         for term in terms {
             let dimension = Dimension::from_stored(&term.dimension)
                 .ok_or_else(|| ScopeFormError::UnknownDimension(term.dimension.clone()))?;
+            let index = dimension.index();
             let value = decode_term_value(dimension, term)?;
             let parsed_version = match &value {
                 TermValue::VersionRange(raw) => {
@@ -514,13 +534,14 @@ impl CanonicalScope {
                 }
                 _ => None,
             };
-            if canonical.insert(dimension, value).is_some() {
+            if canonical[index].replace(value).is_some() {
                 return Err(ScopeFormError::DuplicateDimension(dimension));
             }
+            present |= 1 << index;
             if let Some((requirement, interval)) = parsed_version {
-                version_requirements.insert(dimension, requirement);
+                version_requirements[index] = Some(requirement);
                 if let Some(interval) = interval {
-                    version_intervals.insert(dimension, interval);
+                    version_intervals[index] = Some(interval);
                 }
             }
         }
@@ -528,39 +549,54 @@ impl CanonicalScope {
             terms: canonical,
             version_requirements,
             version_intervals,
+            present,
         })
     }
 
     /// The empty scope constrains nothing and matches every context.
     pub fn unconstrained() -> Self {
         Self {
-            terms: BTreeMap::new(),
-            version_requirements: BTreeMap::new(),
-            version_intervals: BTreeMap::new(),
+            terms: std::array::from_fn(|_| None),
+            version_requirements: std::array::from_fn(|_| None),
+            version_intervals: std::array::from_fn(|_| None),
+            present: 0,
         }
     }
 
     pub fn terms(&self) -> impl Iterator<Item = (Dimension, &TermValue)> {
-        self.terms
-            .iter()
-            .map(|(dimension, value)| (*dimension, value))
+        let mut present = self.present;
+        std::iter::from_fn(move || {
+            if present == 0 {
+                return None;
+            }
+            let index = present.trailing_zeros() as usize;
+            present &= present - 1;
+            let dimension = Dimension::ALL[index];
+            Some((
+                dimension,
+                self.terms[index]
+                    .as_ref()
+                    .expect("occupancy bit identifies a canonical term"),
+            ))
+        })
     }
 
     pub fn term(&self, dimension: Dimension) -> Option<&TermValue> {
-        self.terms.get(&dimension)
+        self.terms[dimension.index()].as_ref()
     }
 
     fn version_requirement(&self, dimension: Dimension) -> Option<&semver::VersionReq> {
-        self.version_requirements.get(&dimension)
+        self.version_requirements[dimension.index()].as_ref()
     }
 
     fn version_interval(&self, dimension: Dimension) -> Option<&VersionInterval> {
-        self.version_intervals.get(&dimension)
+        self.version_intervals[dimension.index()].as_ref()
     }
 
     fn has_placeholder(&self) -> bool {
         self.terms
-            .values()
+            .iter()
+            .flatten()
             .any(|value| matches!(value, TermValue::RedactedPlaceholder))
     }
 }
