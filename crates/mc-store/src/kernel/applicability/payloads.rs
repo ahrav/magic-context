@@ -100,9 +100,15 @@ impl ObjectApplicabilitySpec {
 }
 
 /// `Unrecognized` preserves `CheckSpec` deserialization when `kind` has an
-/// unknown tag.
+/// unknown tag, so one unknown check kind degrades to unsupported instead of
+/// voiding the payload.
+///
+/// `deny_unknown_fields` still applies inside a *recognized* variant: an extra commentlint: allow(JUDGE)
+/// field there is a constraint this build would silently drop, so the payload commentlint: allow(JUDGE)
+/// fails closed rather than enforcing weaker semantics than its producer commentlint: allow(JUDGE)
+/// wrote. The two compose — an unknown `kind` still reaches `Unrecognized`. commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckSpec {
     FileExists {
         path: String,

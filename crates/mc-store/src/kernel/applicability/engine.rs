@@ -274,6 +274,21 @@ impl ApplicabilityEngine {
                 scoped_dirty,
             );
             let token = ClassificationToken(Some(key.clone()));
+            // Key construction reads the checked paths, so the deadline can
+            // lapse between the check above and here. A cached verdict is
+            // still a verdict, and an expired request owes `Uncertain`.
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    token,
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted before this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
             if let Some(cached) = lock(&self.object_cache).get(&key) {
                 stats.object_cache_hits += 1;
                 objects.push(ObjectApplicability {
@@ -660,6 +675,11 @@ fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Opti
         return None;
     }
     for entry in snapshot.dirty_entries() {
+        // An index bookkeeping entry is recorded for the fingerprint's sake and
+        // is not an uncommitted edit; git reports both classes clean.
+        if !entry.is_uncommitted_change() {
+            continue;
+        }
         let dirty_path = entry.path.as_str();
         for affected in affected_paths {
             if paths_overlap(dirty_path, affected) {

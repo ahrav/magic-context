@@ -1709,3 +1709,211 @@ fn a_checked_path_that_is_a_symlink_never_reads_its_target() {
         );
     }
 }
+
+/// An extra field inside a recognized check kind is a constraint this build
+/// would silently drop, so the payload has to fail closed. An unknown *kind*
+/// must still degrade to unsupported rather than voiding the payload.
+#[test]
+fn an_unknown_field_inside_a_check_is_undecodable_but_an_unknown_kind_is_not() {
+    use mc_store::kernel::applicability::PayloadDecode;
+
+    let extra_constraint = br#"{"schema":"mc.applicability.object.v1","checks":[{"kind":"file_exists","path":"x","must_be_executable":true}]}"#;
+    assert!(matches!(
+        ObjectApplicabilitySpec::decode(Some(extra_constraint)),
+        PayloadDecode::Undecodable(_)
+    ));
+
+    let unknown_kind =
+        br#"{"schema":"mc.applicability.object.v1","checks":[{"kind":"brand_new","path":"x"}]}"#;
+    assert!(matches!(
+        ObjectApplicabilitySpec::decode(Some(unknown_kind)),
+        PayloadDecode::Present(_)
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            payload: Some(extra_constraint.to_vec()),
+            ..candidate("object-extra")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+}
+
+/// `assume_valid` and `skip_worktree` entries exist so a fingerprint covers
+/// state the status walk skips. Git reports both clean, and a sparse checkout
+/// marks every unmaterialized path `skip_worktree`, so reading them as
+/// uncommitted edits would gate such an object forever.
+#[test]
+fn index_bookkeeping_entries_do_not_trip_the_dirty_gate() {
+    use gix::index::entry::Flags;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+
+    let mut index = fixture.repo.open_index().expect("index opens");
+    let position = index
+        .entry_index_by_path("src/lib.rs".into())
+        .expect("entry exists");
+    index.entries_mut()[position].flags |= Flags::ASSUME_VALID;
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    // The entry is present for the fingerprint's sake even though nothing was
+    // edited, which is precisely what must not read as dirty.
+    assert!(snapshot
+        .dirty_entries()
+        .iter()
+        .any(|entry| entry.path == "src/lib.rs" && entry.status == "assume_valid"));
+
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(vec!["src/lib.rs".to_string()], vec![]).encode(),
+            ),
+            ..candidate("object-trusted")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+}
+
+/// A genuine uncommitted edit still gates, so excluding bookkeeping entries did
+/// not disarm the dirty gate.
+#[test]
+fn a_real_uncommitted_edit_still_trips_the_dirty_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(vec!["src/lib.rs".to_string()], vec![]).encode(),
+            ),
+            ..candidate("object-src")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+}
+
+/// An anchor whose commit is not in the object database is uncertain. A fetch
+/// that supplies it moves neither HEAD nor the shallow file, so the reference
+/// set is what expires the cached uncertainty.
+#[test]
+fn a_reference_change_expires_cached_anchor_uncertainty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let absent = ApplicabilityCandidate {
+        anchor: Some(AnchorRowSpec {
+            anchor_id: "anchor-absent".to_string(),
+            anchor_kind: "reachable_from".to_string(),
+            reachable_from_oid: Some("0".repeat(40)),
+            ..AnchorRowSpec::default()
+        }),
+        ..candidate("object-absent-anchor")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&absent),
+        &EvalBudget::unbounded(),
+    );
+    assert_ne!(batch.objects[0].state, ApplicabilityState::Current);
+
+    // A new ref stands in for the fetch that would supply the missing commit.
+    let remote_ref = fixture.repo.git_dir().join("refs/remotes/origin");
+    std::fs::create_dir_all(&remote_ref).unwrap();
+    std::fs::write(remote_ref.join("main"), format!("{tip}\n")).unwrap();
+    let fetched = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert_ne!(fetched.repository_state(), snapshot.repository_state());
+    let batch = engine.evaluate_batch(
+        &fetched,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[absent],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.stats.anchor_cache_hits, 0);
+}
+
+/// An expired request owes `Uncertain` even where a cached verdict exists, so a
+/// cache hit can never outrank the budget. The engine polls again after key
+/// construction, since reading the checked paths can outlast the deadline; that
+/// window is not deterministically reachable from a test, so this pins the
+/// observable rule rather than the second poll.
+#[test]
+fn an_expired_budget_beats_a_cached_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "config.toml".to_string(),
+                    key: "flag".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-checked")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&checked),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    // The entry is cached, so only the budget can produce uncertainty here.
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::new(
+            Some(Instant::now() - Duration::from_millis(1)),
+            Default::default(),
+        ),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(!batch.objects[0].append_pending);
+}

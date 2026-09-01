@@ -248,6 +248,20 @@ pub enum PathEncoding {
     LossyWithDigest,
 }
 
+impl DirtyEntry {
+    /// Whether this entry records an uncommitted change, as opposed to an index
+    /// bookkeeping flag the status walk does not inspect.
+    ///
+    /// `skip_worktree` and `assume_valid` entries are keyed straight from the commentlint: allow(JUDGE)
+    /// index so a fingerprint covers state the walk skips. Git reports both commentlint: allow(JUDGE)
+    /// clean, and a sparse checkout marks every unmaterialized path commentlint: allow(JUDGE)
+    /// `skip_worktree`, so treating them as dirty would gate every object commentlint: allow(JUDGE)
+    /// declaring such a path forever. commentlint: allow(JUDGE)
+    pub fn is_uncommitted_change(&self) -> bool {
+        !matches!(self.status, "skip_worktree" | "assume_valid")
+    }
+}
+
 impl PathEncoding {
     fn as_bytes(self) -> &'static [u8] {
         match self {
@@ -873,7 +887,7 @@ fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), Sn
 fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
     let config = repo.config_snapshot();
     let mut hash = Sha256::new();
-    hash.update(b"mc-repo-state-v1\0");
+    hash.update(b"mc-repo-state-v2\0");
     hash.update([
         config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
         config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
@@ -882,7 +896,51 @@ fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32
     fold_file(&mut hash, &repo.git_dir().join("info/sparse-checkout"), ctx)?;
     hash.update(b"shallow\0");
     fold_file(&mut hash, &repo.shallow_file(), ctx)?;
+    hash.update(b"refs\0");
+    fold_references(&mut hash, repo, ctx)?;
     Ok(hash.finalize().into())
+}
+
+/// Folds every reference name and target into `hash`.
+///
+/// An anchor condition can be uncertain because the commit it names is not in commentlint: allow(JUDGE)
+/// the object database. A later fetch that supplies it moves neither HEAD nor commentlint: allow(JUDGE)
+/// the shallow file, but it does move a remote-tracking ref, so the reference commentlint: allow(JUDGE)
+/// set is what lets a cached uncertainty expire. commentlint: allow(JUDGE)
+fn fold_references(
+    hash: &mut Sha256,
+    repo: &gix::Repository,
+    ctx: &ScanCtx<'_>,
+) -> Result<(), SnapshotError> {
+    let platform = repo
+        .references()
+        .map_err(|error| SnapshotError::Scan(error.to_string()))?;
+    let iter = platform
+        .all()
+        .map_err(|error| SnapshotError::Scan(error.to_string()))?;
+    // Sorted so the digest does not depend on loose-versus-packed storage.
+    let mut refs: Vec<(Vec<u8>, String)> = Vec::new();
+    for reference in iter {
+        ctx.check()?;
+        // A reference that cannot be read hides state that governs resolution.
+        let reference = reference.map_err(|error| SnapshotError::Scan(error.to_string()))?;
+        let name = reference.name().as_bstr().to_vec();
+        // A symbolic target names another reference; a peeled one names an
+        // object. Both change what resolution can reach.
+        let target = match reference.target() {
+            gix::refs::TargetRef::Object(id) => format!("object:{id}"),
+            gix::refs::TargetRef::Symbolic(name) => format!("symbolic:{}", name.as_bstr()),
+        };
+        refs.push((name, target));
+    }
+    refs.sort_unstable();
+    for (name, target) in refs {
+        for field in [name.as_slice(), target.as_bytes()] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
