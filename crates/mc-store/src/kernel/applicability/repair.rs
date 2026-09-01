@@ -362,7 +362,7 @@ pub fn commit_read_repair(
             // A replay asserts the effect already landed, which retirement or
             // correction can have undone since. Verified before the verdict is
             // reported as durable.
-            if receipt.replayed && !store.repair_record_is_live(&intent.operation_key)? {
+            if receipt.replayed && !store.repair_record_is_live(&intent.operation_key, budget)? {
                 return Ok(AppendOutcome::ReceiptWithoutRecord);
             }
             // A dropped confirmation is safe: an evicted entry misses on the
@@ -513,8 +513,15 @@ const BLOCK_SCAN_ID_CHUNK: usize = 512;
 impl KernelStore {
     /// Whether a live observation still carries `operation_key` as its repair
     /// identity, which is the `source_id` the repair wrote.
-    fn repair_record_is_live(&self, operation_key: &str) -> Result<bool, KernelError> {
-        let reader = self.lock_reader()?;
+    fn repair_record_is_live(
+        &self,
+        operation_key: &str,
+        budget: &EvalBudget,
+    ) -> Result<bool, KernelError> {
+        // Bounded like the reducer's read: this runs after the repair already
+        // waited for the writer, so it is the worst place to start an
+        // unbounded wait.
+        let reader = self.lock_reader_within(&budget.acquire_limit())?;
         reader
             .query_row(
                 "SELECT EXISTS(
@@ -649,7 +656,12 @@ fn reduce_with_reader(
 }
 
 /// Scans one chunk newest-first, stopping each object at its newest kind
-/// change. Rows decode as the scan streams them. Collecting the chunk first
+/// change.
+///
+/// Rows sharing a commit sequence order by their change-event ordinal, which is
+/// insertion order. Ordering them by identifier would let one commit that writes
+/// both a clearing and a stale observation for the same target resolve to
+/// whichever identifier sorts higher rather than to the one written last. Rows decode as the scan streams them. Collecting the chunk first
 /// would materialize every historical payload for every identifier before a
 /// single one is inspected.
 fn reduce_chunk(
@@ -678,11 +690,14 @@ fn reduce_chunk(
              FROM observation_dependencies d
              JOIN observations o ON o.observation_id = d.observation_id
              JOIN object_registry r ON r.object_id = o.object_id
+             LEFT JOIN change_event e
+                 ON e.object_id = o.object_id AND e.commit_seq = o.created_commit_seq
              WHERE d.dependency_object_id IN ({placeholders})
                AND d.dependency_kind = ?{kind}
                AND o.observation_kind LIKE 'applicability.%'
                AND o.created_commit_seq <= ?{as_of}
-             ORDER BY d.dependency_object_id, o.created_commit_seq DESC, o.observation_id DESC",
+             ORDER BY d.dependency_object_id, o.created_commit_seq DESC,
+                      COALESCE(e.ordinal, 0) DESC, o.observation_id DESC",
             kind = object_ids.len() + 1,
             as_of = object_ids.len() + 2,
         ))

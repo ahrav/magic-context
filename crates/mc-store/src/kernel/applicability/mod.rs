@@ -228,6 +228,8 @@ impl ApplicabilityEngine {
             // one. The dedup identity covers the whole snapshot, so comparing
             // it skips only a repair the record already is.
             if block.is_some_and(|block| block.repair_identity == intent.operation_key()) {
+                // The durable record is this verdict, so nothing is outstanding.
+                objects[index].append_pending = false;
                 continue;
             }
             // Nothing recorded means nothing to clear.
@@ -245,8 +247,11 @@ impl ApplicabilityEngine {
                     Some("the clearing record this repair replayed is no longer live")
                 }
             };
-            if let Some(reason) = unresolved {
-                demote_if_blocked(&mut objects[index], state.as_ref(), reason);
+            match unresolved {
+                Some(reason) => demote_if_blocked(&mut objects[index], state.as_ref(), reason),
+                // `append_pending` marks an append still owed. This one landed,
+                // so a consumer reading the report has nothing to retry.
+                None => objects[index].append_pending = false,
             }
             objects[index].append = Some(outcome);
         }

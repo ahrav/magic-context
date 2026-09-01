@@ -161,6 +161,10 @@ fn failed_check_appends_observation_event_and_job_in_one_commit() {
     assert_eq!(report.objects[0].state, ApplicabilityState::Stale);
     assert!(report.auto_injectable().next().is_none());
     let (object_id, outcome) = report.appends().next().expect("one append");
+    assert!(
+        !report.objects[0].append_pending,
+        "a landed append leaves nothing outstanding"
+    );
     assert_eq!(object_id, TARGET_OBJECT);
     let AppendOutcome::Landed {
         commit_seq,
@@ -2225,4 +2229,78 @@ fn a_repair_built_against_a_superseded_reduction_is_discarded() {
             .blocked,
         "the newer stale block survives the older clearing repair"
     );
+}
+
+/// One commit can write both a clearing and a stale applicability observation
+/// for the same target through the generic API. They share a commit sequence, so
+/// ordering by identifier would resolve to whichever sorts higher rather than to
+/// the one written last.
+#[test]
+fn same_commit_observations_reduce_in_insertion_order() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let detail = |state: &str| {
+        serde_json::to_string(&ApplicabilityObservationPayload {
+            schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
+            checkout_identity_digest: checkout_identity_digest(snapshot.identity()),
+            head: snapshot.head().to_string(),
+            dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+            patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
+            state: state.to_string(),
+            evidence: format!("{state} in one commit"),
+        })
+        .unwrap()
+    };
+    let spec = |id: &str, kind: &str, state: &str| ObservationSpec {
+        observation_id: id.to_string(),
+        object_id: format!("{id}-object"),
+        domain_id: DOMAIN.to_string(),
+        proposition_id: None,
+        scope_id: None,
+        anchor_id: None,
+        evidence_id: None,
+        observation_kind: kind.to_string(),
+        payload: ObservationPayload {
+            summary: state.to_string(),
+            classification: kind.to_string(),
+            detail: Some(detail(state)),
+        },
+        observed_at: 1,
+        dependencies: vec![ObservationDependencySpec {
+            dependency_object_id: TARGET_OBJECT.to_string(),
+            dependency_kind: DEPENDENCY_KIND_TARGET.to_string(),
+            dependency_payload: None,
+        }],
+        source_kind: "fixture".to_string(),
+        source_id: id.to_string(),
+        source_revision: 1,
+        sensitivity: Sensitivity::Normal,
+    };
+    // The clearing row's identifier sorts above the stale row's, so an
+    // identifier tie-break would pick the clear even though the stale row is
+    // written second.
+    store
+        .commit(intent("same-commit", 'd'), |envelope| {
+            envelope.insert_observation(spec("zz-clear", OBSERVATION_KIND_CURRENT, "current"))?;
+            envelope.insert_observation(spec("aa-stale", OBSERVATION_KIND_STALE, "stale"))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap()
+        .expect("the commit recorded applicability observations");
+    assert_eq!(
+        block.observation_kind, OBSERVATION_KIND_STALE,
+        "the row written last is authoritative"
+    );
+    assert!(block.blocked);
 }
