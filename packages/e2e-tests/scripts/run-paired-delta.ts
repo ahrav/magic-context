@@ -765,6 +765,10 @@ const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
 /** `scriptedCtxSearchTurn` drives one tool-use response and one follow-up, both served by the fixture provider. */
 const SCRIPTED_ORACLE_MOCK_ENTRIES = 2;
 
+/** Bounds the quiescence wait. Generous enough for a historian retry to land, short enough that a stuck session fails rather than holding the run. */
+const LEDGER_SETTLE_ATTEMPTS = 12;
+const LEDGER_SETTLE_INTERVAL_MS = 500;
+
 function addUsage(
     left: RolloutObservation["usage"],
     right: RolloutObservation["usage"],
@@ -829,6 +833,35 @@ function ledgerEntries(payload: unknown): LedgerMessage[] {
  * snapshot, which is real money the cap has to see; the route is reported separately so the
  * runner's identity comparison still excludes the cell.
  */
+/**
+ * Read the ledger until two consecutive passes agree, so a call still running is not missed.
+ *
+ * The plugin resumes the parent prompt when the historian exceeds its pressure wait, so a child call
+ * can finish or retry after the final parent response. Nothing in the schema exposes an in-flight
+ * invocation — `recordChildInvocation` writes one row with a terminal status when the call ends — so
+ * quiescence is observed rather than queried. A session that never settles throws instead of being
+ * priced from a moving ledger.
+ */
+async function settledSessionUsage(
+    harness: TestHarness,
+    sessionId: string,
+    pinned: { providerId: string; modelId: string },
+    expectedMockEntries: number,
+): Promise<SessionUsage> {
+    let previous: string | null = null;
+    for (let attempt = 0; attempt < LEDGER_SETTLE_ATTEMPTS; attempt++) {
+        const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
+        const signature = JSON.stringify(reading);
+        if (signature === previous) return reading;
+        previous = signature;
+        await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
+    }
+    throw new Error(
+        `live paired-delta session ledger did not settle within ` +
+        `${LEDGER_SETTLE_ATTEMPTS} reads; a background call may still be running`,
+    );
+}
+
 async function sessionUsage(
     harness: TestHarness,
     sessionId: string,
@@ -1107,7 +1140,7 @@ export function createLiveDependencies(input: {
                     }
                     const last = responses.at(-1);
                     if (!last) throw new Error("scenario produced no live prompts");
-                    const ledger = await sessionUsage(
+                    const ledger = await settledSessionUsage(
                         harness,
                         sessionId,
                         { providerId: input.providerId, modelId: input.modelId },
