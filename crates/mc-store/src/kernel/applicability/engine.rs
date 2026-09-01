@@ -230,7 +230,7 @@ impl Hash for SnapshotCacheValues {
 struct CachedClassification {
     state: ApplicabilityState,
     evidence: Box<str>,
-    failed_check: Option<FailedCheck>,
+    failed_check: Option<Box<FailedCheck>>,
     append_confirmed: bool,
 }
 
@@ -474,7 +474,7 @@ impl ApplicabilityEngine {
                     object_revision: candidate.object_revision,
                     state: cached.state,
                     evidence: cached.evidence.into(),
-                    failed_check: cached.failed_check,
+                    failed_check: cached.failed_check.map(|failed| *failed),
                     append_pending: cached.state.blocks_auto_injection()
                         && !cached.append_confirmed,
                     token: ClassificationToken(key),
@@ -501,7 +501,7 @@ impl ApplicabilityEngine {
                     CachedClassification {
                         state: classification.state,
                         evidence: classification.evidence.as_str().into(),
-                        failed_check: classification.failed_check.clone(),
+                        failed_check: classification.failed_check.clone().map(Box::new),
                         append_confirmed: false,
                     },
                 );
