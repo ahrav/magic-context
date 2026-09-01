@@ -315,6 +315,7 @@ pub struct CheckoutSnapshot {
     head: String,
     dirty_fingerprint: String,
     dirty_entries: Vec<DirtyEntry>,
+    shallow: bool,
 }
 
 impl CheckoutSnapshot {
@@ -328,6 +329,16 @@ impl CheckoutSnapshot {
     /// HEAD commit OID, lower hex.
     pub fn head(&self) -> &str {
         &self.head
+    }
+
+    /// Whether the repository was shallow when this snapshot was taken.
+    ///
+    /// A shallow boundary truncates every graph walk, so a negative ancestry commentlint: allow(JUDGE)
+    /// result cannot be trusted. Readers take it from here rather than from commentlint: allow(JUDGE)
+    /// the live repository, which can be deepened or re-truncated after the commentlint: allow(JUDGE)
+    /// fingerprint was fixed. commentlint: allow(JUDGE)
+    pub fn is_shallow(&self) -> bool {
+        self.shallow
     }
 
     /// Digest over the sorted set of (path, status, content hash) for
@@ -422,6 +433,10 @@ pub fn snapshot_checkout(
         ));
     }
     let repository_state = repository_state(&repo, &ctx)?;
+    // Read with the rest of the scan, because a shallow file removed after
+    // this point would let a truncated walk read as definitive under a commentlint: allow(JUDGE)
+    // fingerprint that still describes the shallow state. commentlint: allow(JUDGE)
+    let shallow = repo.is_shallow();
     let dirty_fingerprint = fingerprint_entries(&dirty_entries, &repository_state);
     // Stop the watchdog before the last check, so neither the fingerprint nor commentlint: allow(JUDGE)
     // the watchdog's own teardown can carry a cacheable snapshot past the commentlint: allow(JUDGE)
@@ -434,6 +449,7 @@ pub fn snapshot_checkout(
         head,
         dirty_fingerprint,
         dirty_entries,
+        shallow,
     })
 }
 
@@ -700,27 +716,21 @@ fn worktree_content_hash(
         if file_type.is_dir() {
             // A dirty tracked gitlink resolves to a directory; its HEAD and commentlint: allow(JUDGE)
             // its own uncommitted state are the content that moved. commentlint: allow(JUDGE)
-            let Some(path) = contained_path(workdir, &rela_path) else {
-                return Ok("out-of-worktree".to_string());
-            };
-            return submodule_hash(&path, ctx);
+            return submodule_hash_at(&dir, name.as_os_str(), ctx);
         }
         return Ok("not-a-regular-file".to_string());
     }
-    let Ok(Some(mut file)) = open_regular_no_follow_at(&dir, name.as_os_str()) else {
-        return Ok("unreadable".to_string());
+    let mut file = match open_regular_no_follow_at(&dir, name.as_os_str()) {
+        Ok(Some(file)) => file,
+        // The path changed kind under the classification above.
+        Ok(None) => return Ok("unreadable".to_string()),
+        // A failure to read hides content that still governs the checkout, so commentlint: allow(JUDGE)
+        // it must not collapse onto a fixed token that two different dirty commentlint: allow(JUDGE)
+        // states would share. commentlint: allow(JUDGE)
+        Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     let mut hash = Sha256::new();
-    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
-    loop {
-        ctx.check()?;
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => hash.update(&buffer[..read]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Ok("unreadable".to_string()),
-        }
-    }
+    fold_open_file(&mut hash, &mut file, ctx)?;
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -808,6 +818,51 @@ fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> S
 /// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
 /// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
 /// read them. commentlint: allow(JUDGE)
+/// The pinned parent descriptor prevents ancestor-path replacement from
+/// redirecting the nested scan.
+///
+/// `gix` opens a repository by path, so the pinned directory is named through
+/// `/proc/self/fd`, which resolves to the descriptor's inode however the commentlint: allow(JUDGE)
+/// original pathname is rewritten. The descriptor stays open for the whole commentlint: allow(JUDGE)
+/// nested scan, which is what keeps that name valid. commentlint: allow(JUDGE)
+#[cfg(target_os = "linux")]
+fn submodule_hash_at(
+    dir: &OwnedFd,
+    name: &OsStr,
+    ctx: &ScanCtx<'_>,
+) -> Result<String, SnapshotError> {
+    use std::os::fd::AsRawFd;
+
+    let Ok(gitlink) = rfs::openat(
+        dir,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rfs::Mode::empty(),
+    ) else {
+        return Ok("unreadable-gitlink".to_string());
+    };
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", gitlink.as_raw_fd()));
+    let hashed = submodule_hash(&pinned, ctx);
+    drop(gitlink);
+    hashed
+}
+
+/// Without `/proc`, the pinned directory cannot be named for `gix`, so the
+/// gitlink is refused rather than reached through a re-resolved pathname.
+#[cfg(not(target_os = "linux"))]
+fn submodule_hash_at(
+    dir: &OwnedFd,
+    name: &OsStr,
+    _ctx: &ScanCtx<'_>,
+) -> Result<String, SnapshotError> {
+    let _ = (dir, name);
+    Ok("unreadable-gitlink".to_string())
+}
+
+/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone commentlint: allow(JUDGE)
+/// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
+/// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
+/// read them. commentlint: allow(JUDGE)
 fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotError> {
     let Some(nested) = ctx.nested() else {
         return Err(SnapshotError::Scan(format!(
@@ -816,9 +871,12 @@ fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotErro
             path.display()
         )));
     };
-    let Ok(submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
-        return Ok("not-a-regular-file".to_string());
+    let Ok(mut submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
+        return Ok("unopenable-gitlink".to_string());
     };
+    // The nested scan walks trees exactly as the top-level one does, so it
+    // wants the same cache floor.
+    submodule.object_cache_size_if_unset(4 * 1024 * 1024);
     let head = match submodule.head_id() {
         Ok(head) => head.detach().to_string(),
         Err(_) => "unborn".to_string(),
@@ -878,18 +936,26 @@ fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), Sn
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     hash.update(b"present\0");
+    fold_open_file(hash, &mut file, ctx)
+}
+
+/// A read error propagates rather than truncating: a prefix would key as a
+/// genuinely shorter file. commentlint: allow(JUDGE)
+fn fold_open_file(
+    hash: &mut Sha256,
+    file: &mut std::fs::File,
+    ctx: &ScanCtx<'_>,
+) -> Result<(), SnapshotError> {
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
     loop {
         ctx.check()?;
         match file.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => return Ok(()),
             Ok(read) => hash.update(&buffer[..read]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // A prefix would key as a genuinely shorter file. commentlint: allow(JUDGE)
             Err(error) => return Err(SnapshotError::Scan(error.to_string())),
         }
     }
-    Ok(())
 }
 
 /// Repository state beyond HEAD and the dirty set that changes what the engine commentlint: allow(JUDGE)

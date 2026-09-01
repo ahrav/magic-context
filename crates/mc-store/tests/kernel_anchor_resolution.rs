@@ -646,6 +646,37 @@ fn unreachable_start_dominates_an_uncertain_end() {
 }
 
 #[test]
+fn an_empty_commit_does_not_resolve_from_its_parent_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    // Same tree as `base`, so it has no patch identity and its tree cannot
+    // tell it apart from its parent.
+    let empty = commit_snapshot(repo, "topic", &[base], &[("f.txt", "one\n")], "empty", 2);
+
+    let captures = captures_for(repo, &[empty]);
+    let capture = captures.get(&empty.to_string()).unwrap();
+    assert!(capture.patch_id.is_none(), "an empty diff has no patch id");
+    assert!(
+        capture.tree_oid.is_none(),
+        "a tree the parent already carries is not evidence of a replay"
+    );
+
+    // `base` stays uniquely reachable, so an unguarded tree rung would match
+    // it and call the never-applied anchor current.
+    let advanced = commit_snapshot(repo, "main", &[base], &[("g.txt", "g\n")], "advance", 3);
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, advanced);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_ne!(
+        ladder.evaluate(&reachable_from(empty, captures)),
+        GitConditionOutcome::Holds,
+        "the empty commit was never applied to this history"
+    );
+}
+
+#[test]
 fn a_reached_end_is_historical_even_when_the_start_is_unreachable() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());

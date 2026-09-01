@@ -66,7 +66,7 @@ impl<'s> ResolutionLadder<'s> {
         Self {
             snapshot,
             budget,
-            shallow: snapshot.repo().is_shallow(),
+            shallow: snapshot.is_shallow(),
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
             patch_id_cache: RefCell::new(HashMap::new()),
@@ -724,7 +724,17 @@ pub fn capture_anchor_representation(
     let commit = repo.find_commit(commit_oid).ok()?;
     let tree_oid = commit.tree_id().ok()?.detach();
     budget_gate(budget).ok()?;
-    let changes = first_parent_blob_changes(repo, commit_oid, budget).ok()?;
+    // A tree a parent already carries cannot show this commit was replayed, so
+    // the tree rung would match that parent instead. Empty commits and merges commentlint: allow(JUDGE)
+    // whose result equals a side are the cases that produce one. commentlint: allow(JUDGE)
+    let tree_distinguishes = !parent_shares_tree(repo, &commit, tree_oid);
+    // A transient obstacle costs the patch rung, not the capture: the commit
+    // and tree ids are already resolved, and the tree rung runs on those commentlint: allow(JUDGE)
+    // alone. An empty path list also disables the prefilter, which is the commentlint: allow(JUDGE)
+    // safe direction. commentlint: allow(JUDGE)
+    let changes = first_parent_blob_changes(repo, commit_oid, budget)
+        .ok()
+        .flatten();
     // A lossily converted path would miss real tree entries in
     // `commit_touches_paths`, so non-UTF-8 locations are dropped.
     let changed_paths = changes
@@ -734,15 +744,34 @@ pub fn capture_anchor_representation(
         .map(str::to_owned)
         .collect();
     let patch_id = patch_id_from_changes(repo, changes.as_deref(), budget)
-        .ok()?
+        .ok()
+        .flatten()
         .map(|value| super::super::anchor::PatchIdCapture {
             algorithm: PATCH_ID_ALGORITHM.to_string(),
             value,
         });
     Some(AnchorCapture {
         commit_oid: commit_oid.to_string(),
-        tree_oid: Some(tree_oid.to_string()),
+        tree_oid: tree_distinguishes.then(|| tree_oid.to_string()),
         patch_id,
         changed_paths,
+    })
+}
+
+/// Whether any parent of `commit` already carries `tree_oid`.
+///
+/// An unreadable parent answers `true`: withholding a fallback costs a rung, commentlint: allow(JUDGE)
+/// while offering one that cannot distinguish the commit risks calling an commentlint: allow(JUDGE)
+/// anchor current on the strength of its parent. commentlint: allow(JUDGE)
+fn parent_shares_tree(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    tree_oid: ObjectId,
+) -> bool {
+    commit.parent_ids().any(|parent| {
+        repo.find_commit(parent.detach())
+            .ok()
+            .and_then(|parent| parent.tree_id().ok())
+            .is_none_or(|parent_tree| parent_tree.detach() == tree_oid)
     })
 }
