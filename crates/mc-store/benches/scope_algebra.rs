@@ -345,6 +345,53 @@ fn snapshot_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn snapshot_matrix_fixture(modified: usize, untracked: usize) -> (tempfile::TempDir, FixtureRepo) {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let names: Vec<_> = (0..1_200)
+        .map(|i| format!("dir{}/f{i:04}.txt", i % 8))
+        .collect();
+    let contents: Vec<_> = (0..1_200).map(|i| format!("content {i}\n")).collect();
+    let files: Vec<_> = names
+        .iter()
+        .map(String::as_str)
+        .zip(contents.iter().map(String::as_str))
+        .collect();
+    let head = commit_snapshot(&fixture.repo, "main", &[], &files, "base", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+    for name in names.iter().take(modified) {
+        write_worktree_file(&fixture.repo, name, "edited\n");
+    }
+    for i in 0..untracked {
+        write_worktree_file(
+            &fixture.repo,
+            &format!("new{}/u{i:04}.txt", i % 8),
+            "untracked\n",
+        );
+    }
+    (dir, fixture)
+}
+
+fn snapshot_matrix_benches(c: &mut Criterion) {
+    let fixtures = [
+        ("clean", snapshot_matrix_fixture(0, 0)),
+        ("dirty-10", snapshot_matrix_fixture(10, 0)),
+        ("dirty-1000", snapshot_matrix_fixture(1_000, 0)),
+        ("untracked-1000", snapshot_matrix_fixture(0, 1_000)),
+    ];
+    let mut group = c.benchmark_group("snapshot_matrix");
+    group.sample_size(10);
+    for (name, (_dir, fixture)) in &fixtures {
+        group.bench_function(*name, |b| {
+            b.iter(|| {
+                snapshot_checkout(black_box(&fixture.root), &EvalBudget::unbounded()).unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
 fn payload_decode_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("payload_decode");
     for size in [0usize, 4, 16, 64] {
@@ -748,7 +795,7 @@ fn configure() -> Criterion {
 criterion_group! {
     name = benches;
     config = configure();
-    targets = algebra_benches, ancestry_benches, snapshot_benches, payload_decode_benches, cheap_check_benches, batch_benches, anchor_density_benches, payload_check_benches, staleness_benches, adversarial_benches
+    targets = algebra_benches, ancestry_benches, snapshot_benches, snapshot_matrix_benches, payload_decode_benches, cheap_check_benches, batch_benches, anchor_density_benches, payload_check_benches, staleness_benches, adversarial_benches
 }
 
 fn profile_kernel(kernel: &str) {
