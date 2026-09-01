@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Deadline } from "../../shared/mc-host-client";
-import { McHostModuleTransport, __moduleTransportTest } from "./module-transport";
 import { WaiterDetachedError } from "../../shared/mc-host-lifecycle/policy";
+import { __moduleTransportTest, McHostModuleTransport } from "./module-transport";
 
 type TransportInternals = {
     connectionPromise: Promise<unknown> | null;
@@ -55,9 +55,9 @@ describe("waiter detach is not a connection failure", () => {
     });
 
     test("an abort detach does not classify as a connection failure", () => {
-        expect(
-            __moduleTransportTest.isConnectionFailure(new WaiterDetachedError("aborted")),
-        ).toBe(false);
+        expect(__moduleTransportTest.isConnectionFailure(new WaiterDetachedError("aborted"))).toBe(
+            false,
+        );
     });
 
     // The exclusion must be the class, not the code: a genuine ETIMEDOUT still invalidates.
