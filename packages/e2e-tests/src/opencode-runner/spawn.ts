@@ -359,6 +359,16 @@ function assertConfigHasNoCredentials(
         seen.add(current);
         for (const [key, child] of Object.entries(current)) {
             const childPath = `${path}.${key}`;
+            /** The key is judged before anything about the value is considered, including the placeholder exemption below: that exemption is about what a *value* stands for and says nothing about the name it sits under, so letting it `continue` first meant a credential-bearing key was accepted whenever its value happened to be an approved placeholder — the same key with any other value being refused. The label omits the key, because the key is the credential. commentlint: allow(JUDGE) */
+            if (!Array.isArray(current)) {
+                const keyFormat = credentialValueFormat(key) ?? urlCredentialFinding(key);
+                if (keyFormat !== null) {
+                    throw new Error(
+                        `config contains a ${keyFormat} as a property name under ${path}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+            }
             /** A placeholder is not a credential: what reaches disk is the token, and the value it stands for is resolved from the environment after the file is read. Checked before the key rule so a credential-shaped name can still carry one. commentlint: allow(JUDGE) */
             const placeholder = typeof child === "string" ? ENV_PLACEHOLDER.exec(child) : null;
             if (placeholder !== null) {
@@ -377,16 +387,6 @@ function assertConfigHasNoCredentials(
                     );
                 }
                 /** No `continue`: an unrecognized name falls through to the rules below, where the credential-bearing-key rule is what refuses it. Only a name the sensitive-key rule recognizes is an approved channel. commentlint: allow(JUDGE) */
-            }
-            /** A property name can be the credential rather than describe one — `{ "sk-ant-…": true }` reaches the file through the key, where the semantic-word rule finds nothing and the value rules never look. Checked before the semantic rule because a composite key can satisfy both — `sk-ant-…-apiKey` is a credential *and* ends in a credential word — and that rule interpolates the path, which contains the key. Whichever diagnostic wins must be the one that does not name it. commentlint: allow(JUDGE) */
-            if (!Array.isArray(current)) {
-                const keyFormat = credentialValueFormat(key) ?? urlCredentialFinding(key);
-                if (keyFormat !== null) {
-                    throw new Error(
-                        `config contains a ${keyFormat} as a property name under ${path}; ` +
-                            "pass credentials through extraEnv",
-                    );
-                }
             }
             if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
                 throw new Error(

@@ -347,6 +347,23 @@ describe("opencode child lifecycle", () => {
                 }
             }).toThrow(/Anthropic-style key as a property name/);
 
+            // An approved placeholder value must not exempt a credential-bearing key.
+            expect(() => {
+                try {
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        openCodeConfigExtra: {
+                            headers: {
+                                "sk-ant-abcdefghijklmnopqrstuv": "{env:ANTHROPIC_API_KEY}",
+                            },
+                        },
+                    });
+                } catch (error) {
+                    expect(String(error)).not.toContain("sk-ant-abcdefghijklmnopqrstuv");
+                    throw error;
+                }
+            }).toThrow(/Anthropic-style key as a property name/);
+
             // A composite key satisfies both key rules; whichever wins must not name it.
             expect(() => {
                 try {

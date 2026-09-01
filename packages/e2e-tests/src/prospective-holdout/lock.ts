@@ -241,7 +241,8 @@ function releaseLock(lock: string): void {
         for (const entry of siblings) {
             if (!entry.startsWith(prefix)) continue;
             const sideline = join(parent, entry);
-            if (readLockOwner(sideline)?.nonce !== LOCK_NONCE) continue;
+            /** The propagating read, for the same reason the main lock uses it: a read failure here is not proof the sideline is someone else's, and skipping it would let release report success while this process's displaced claim is still on disk. commentlint: allow(JUDGE) */
+            if (readLockOwnerForRelease(sideline)?.nonce !== LOCK_NONCE) continue;
             rmSync(sideline, { recursive: true, force: true });
         }
     };
