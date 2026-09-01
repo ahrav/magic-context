@@ -168,6 +168,14 @@ describe("isCredentialBearingConfigKey", () => {
             "OPENAIAPIKEY",
             "ANTHROPICAPIKEY",
             "AZUREOPENAIAPIKEY",
+            // Acronym casing puts the whole compound in one segment, ahead of the qualifier.
+            "primaryAPIKey",
+            "publicAPIKey",
+            "cacheAPIKey",
+            // A connection string embeds its own credential and matches no vendor shape.
+            "connectionString",
+            "storageConnectionString",
+            "databaseUrl",
             // An enumerator can sit outside the descriptor as easily as inside it.
             "apiKeyValue2",
             "passwordValue2",

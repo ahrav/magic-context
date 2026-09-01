@@ -648,7 +648,7 @@ export async function runPairedDelta(
         /** Checked before the key is computed: `coordinateKey` dereferences the entry, so a store returning `null` would be diagnosed by a `TypeError` raised outside the release path — leaving a store whose `list()` took a claim holding it through the rejected resume. commentlint: allow(JUDGE) */
         if (record === null || typeof record !== "object" || Array.isArray(record)) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 "records file contains an entry that is not a rollout record; " +
                     "point at a fresh records path",
             );
@@ -656,7 +656,7 @@ export async function runPairedDelta(
         const key = coordinateKey(record);
         if (duplicateKeys.has(key)) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file contains duplicate rollouts for ${key}; ` +
                     "point at a fresh records path",
             );
@@ -689,7 +689,7 @@ export async function runPairedDelta(
         const conflict = stored.find(inMatrix);
         if (conflict) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file already contains rollouts for this matrix ` +
                     `(${coordinateKey(conflict)}); resume the run or point ` +
                     "at a fresh records path",
@@ -712,7 +712,7 @@ export async function runPairedDelta(
         ] as const) {
             if (!isNonNegativeAmount(value)) {
                 releaseBeforeThrowing(options.store);
-                throw new Error(
+                throw new RolloutRecordsInvalidError(
                     `records file ${label} is not a non-negative finite number at ` +
                         `${coordinateKey(record)}; point at a fresh records path`,
                 );
@@ -721,7 +721,7 @@ export async function runPairedDelta(
         /** `coordinateKey` renders a numeric `0` and the string `"0"` identically and the matrix comparisons coerce, so a non-integer index would key and resume as a replicate it is not. commentlint: allow(JUDGE) */
         if (!isNonNegativeCount(record.replicateIndex)) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file replicate index ${String(record.replicateIndex)} is not a ` +
                     `non-negative safe integer at ${coordinateKey(record)}; ` +
                     "point at a fresh records path",
@@ -730,7 +730,7 @@ export async function runPairedDelta(
         /** The envelope names the shape every later read assumes, so a record from another schema cannot stand in as completed evidence for this one. commentlint: allow(JUDGE) */
         if (record.schema !== ROLLOUT_RECORD_SCHEMA) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file schema ${String(record.schema)} is not ${ROLLOUT_RECORD_SCHEMA} at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
@@ -742,7 +742,7 @@ export async function runPairedDelta(
             } catch (error) {
                 releaseBeforeThrowing(options.store);
                 if (!(error instanceof PairedDeltaContractError)) throw error;
-                throw new Error(
+                throw new RolloutRecordsInvalidError(
                     `records file cell is invalid at ${coordinateKey(record)} ` +
                         `(${error.diagnostics.join(",")}); point at a fresh records path`,
                 );
@@ -751,7 +751,7 @@ export async function runPairedDelta(
         /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. commentlint: allow(JUDGE) */
         if (cell.armId !== record.armId) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file cell arm ${cell.armId} does not match coordinate ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
@@ -759,7 +759,7 @@ export async function runPairedDelta(
         /** A record counted as neither observed nor estimated disappears from the run's provenance totals while still suppressing its rollout. commentlint: allow(JUDGE) */
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file cost source ${String(record.costSource)} is not recognized at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
@@ -774,7 +774,7 @@ export async function runPairedDelta(
         ] as const) {
             if (!Number.isSafeInteger(value) || (value as number) < 0) {
                 releaseBeforeThrowing(options.store);
-                throw new Error(
+                throw new RolloutRecordsInvalidError(
                     `records file ${label} is not a non-negative safe integer at ` +
                         `${coordinateKey(record)}; point at a fresh records path`,
                 );
@@ -783,7 +783,7 @@ export async function runPairedDelta(
         /** A completed cell priced as an estimate is a combination the live path cannot produce: unpriceable usage is what selects `estimated`, and that same condition marks the result invalid rather than completed. Accepting it let a record suppress its rollout while restoring no spend, which is the one direction that spends money. commentlint: allow(JUDGE) */
         if (record.costSource === "estimated" && cell.runHealth === "completed") {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file prices a completed cell as an estimate at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
@@ -799,7 +799,7 @@ export async function runPairedDelta(
                 : worstCaseUsd(declared, options.pricesPerMillionTokens, record.armId);
             if (record.costUsd < bound) {
                 releaseBeforeThrowing(options.store);
-                throw new Error(
+                throw new RolloutRecordsInvalidError(
                     `records file prices an estimated failure below the arm bound at ` +
                         `${coordinateKey(record)}; point at a fresh records path`,
                 );
@@ -819,7 +819,7 @@ export async function runPairedDelta(
                 Math.abs(priced - record.costUsd) > Math.max(1e-9, Math.abs(priced) * 1e-9)
             ) {
                 releaseBeforeThrowing(options.store);
-                throw new Error(
+                throw new RolloutRecordsInvalidError(
                     `records file observed cost does not price its usage at ` +
                         `${coordinateKey(record)}; the pricing table may have changed since ` +
                         "the record was written; point at a fresh records path",
@@ -831,7 +831,7 @@ export async function runPairedDelta(
         /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. commentlint: allow(JUDGE) */
         if (!Number.isFinite(spentUsd)) {
             releaseBeforeThrowing(options.store);
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `records file spend total overflows the finite range at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
@@ -869,7 +869,7 @@ export async function runPairedDelta(
                 } catch (error) {
                     releaseBeforeThrowing(options.store);
                     if (!(error instanceof PairedDeltaContractError)) throw error;
-                    throw new Error(
+                    throw new RolloutRecordsInvalidError(
                         `records file cell is invalid at ${coordinateKey(existing)} ` +
                             `(${error.diagnostics.join(",")}); point at a fresh records path`,
                     );
@@ -974,7 +974,20 @@ export async function runPairedDelta(
                     if (runMs <= 0) throw new RolloutDeadlineError("deadline reached before run");
                     /** Preparation and the rollout are bounded as separate steps because the deadline only rejects the race, never the work: a single step whose `prepare()` overran would lose the race, then resolve and call `run()` from the losing continuation — starting a paid rollout past the deadline, on a handle `finally` has already disposed, with no record of it. Bounding them apart means an overrun leaves nothing to continue into. commentlint: allow(JUDGE) */
                     const prepare = started.prepare?.bind(started);
-                    if (prepare) await withRolloutDeadline(() => prepare(), runMs);
+                    if (prepare) {
+                        const pendingPrepare = prepare();
+                        /** The deadline rejects the race, never the work: a preparation that loses can still finish and create what it was setting up — a session, a seeded oracle resource — after `finally` has already disposed the handle. Tracking it disposes the handle again once it settles, which is the same treatment a creation that lost its race gets, and without it that resource survives the run unreported. commentlint: allow(JUDGE) */
+                        pendingPrepare.catch(() => {});
+                        try {
+                            await withRolloutDeadline(() => pendingPrepare, runMs);
+                        } catch (error) {
+                            lateDisposals.push(
+                                /** Only a preparation that *resolves* late has produced something to reclaim; one that rejects created nothing, and `disposeLateHandle` reads a rejection as already reclaimed. commentlint: allow(JUDGE) */
+                                disposeLateHandle(pendingPrepare.then(() => started)),
+                            );
+                            throw error;
+                        }
+                    }
                     /** Preparation spent from the same budget, so the rollout is bounded by what remains after it. commentlint: allow(JUDGE) */
                     const rolloutMs = options.deadlineEpochMs - dependencies.now();
                     if (rolloutMs <= 0) {
@@ -1244,9 +1257,10 @@ function completedRecord(
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
         try {
-            validateCheckVector(scenario, observation.checks);
-            /** Copied into plain objects rather than retained: validation reads the contents, which says nothing about the container being cloneable, and an adapter-owned `Proxy` fails `structuredClone` inside `put` — after the rollout is paid for and with nothing persisted. Same reason the intervention is detached. commentlint: allow(JUDGE) */
-            checks = observation.checks.map((check) => ({ ...check }));
+            /** Snapshotted before validation, not after: a spread re-reads the adapter's object, so an accessor could answer one value to `validateCheckVector` and another to the copy — recording an outcome the validator never saw — or throw on the second read and lose the paid rollout. The named fields are copied rather than spread so nothing else the adapter attached rides along into the record. commentlint: allow(JUDGE) */
+            const snapshot = observation.checks.map(({ id, passed }) => ({ id, passed }));
+            validateCheckVector(scenario, snapshot);
+            checks = snapshot;
         } catch (error) {
             if (!(error instanceof PairedDeltaContractError)) throw error;
             reasonCode = "invalid-result";

@@ -232,11 +232,16 @@ function releaseLock(lock: string): void {
     const parent = dirname(lock);
     const prefix = `${basename(lock)}.reclaimed-`;
     const sweepSidelines = (): void => {
-        let siblings: string[] = [];
+        /** An enumeration failure is not an empty directory: a parent that permits traversal by known path while denying listing would make every sweep skip this process's displaced claim, and release would then report success over a claim still on disk. `ENOENT` is the one case that genuinely means there is nothing to sweep. commentlint: allow(JUDGE) */
+        let siblings: string[];
         try {
             siblings = readdirSync(parent);
-        } catch {
-            siblings = [];
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") return;
+            throw new LockOwnerUnreadableError(
+                `lock sideline directory ${parent} could not be listed (${String(code)})`,
+            );
         }
         for (const entry of siblings) {
             if (!entry.startsWith(prefix)) continue;

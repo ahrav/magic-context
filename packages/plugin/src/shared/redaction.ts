@@ -114,6 +114,12 @@ export function isSecretKey(key: string): boolean {
  * `webhookSecret`, and the glued `APIKEY` that no case transition splits.
  */
 const CREDENTIAL_TAIL_WORDS = [
+    /** A connection string embeds its own credential — `AccountKey=…`, `password=…` — and matches no vendor value shape, so the field name is the only signal. `isSensitiveEnvKey` already classifies `CONNECTION_STRING` and the URL aliases beside it; this keeps the config-key rule consistent with the environment rule. commentlint: allow(JUDGE) */
+    "connectionstring",
+    "connectionuri",
+    "connectionurl",
+    "databaseurl",
+    "databaseuri",
     "secret",
     "password",
     "passwd",
@@ -257,6 +263,14 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         // singular entry.
         compact.endsWith(word) || compact.endsWith(`${word}s`);
     if (endsWith("key")) {
+        /** The glued credential tail is checked before the qualifier, because acronym casing puts the whole compound in one segment: `primaryAPIKey` splits as `primary`/`apikey`, so the qualifier rule would read `primary` as structural and return before the compound was ever considered. An API key is a credential whatever qualifies it. commentlint: allow(JUDGE) */
+        if (
+            CREDENTIAL_KEY_PREFIXES.some(
+                (word) => compact.endsWith(`${word}key`) || compact.endsWith(`${word}keys`),
+            )
+        ) {
+            return true;
+        }
         if (qualifier !== undefined) return !STRUCTURAL_KEY_QUALIFIERS.includes(qualifier);
         // A glued name has no segment to read, so the whole word decides. `monkey` and
         // `turkey` end in these letters without naming a key at all, so a glued credential

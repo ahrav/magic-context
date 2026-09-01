@@ -419,11 +419,14 @@ describe("paired-delta runner", () => {
             reasonCode: "deadline-exceeded",
         });
         expect(result.records[0]?.harnessDisposed).toBe(true);
-        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on"]);
+        // The losing preparation resolves after the handle was disposed, so it is disposed
+        // again once it settles: whatever it finished setting up must not survive the run.
+        expect(calls.filter((call) => call === "dispose:mc-on")).toHaveLength(2);
+        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on", "dispose:mc-on"]);
 
         // The late `prepare()` completion must not call `run()` after `dispose()`.
         await new Promise((resolve) => setTimeout(resolve, 90));
-        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on"]);
+        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on", "dispose:mc-on"]);
     });
 
     it("refuses evidence from work that blocked past the deadline", async () => {
@@ -1517,6 +1520,35 @@ describe("paired-delta runner", () => {
             /entry that is not a rollout record/,
         );
         expect(released).toBe(1);
+    });
+
+    it("records the check value the validator actually read", async () => {
+        // An accessor can answer differently on a second read, so the value that was
+        // validated must be the value that is stored.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                const checks = base.checks.map((check) => {
+                    let reads = 0;
+                    return {
+                        id: check.id,
+                        get passed(): boolean {
+                            reads += 1;
+                            return reads === 1 ? check.passed : !check.passed;
+                        },
+                    };
+                });
+                return { ...base, checks };
+            }),
+        );
+
+        const stored = result.records[0];
+        if (!stored) throw new Error("missing record");
+        expect(stored.checks.map(({ passed }) => passed)).toEqual(
+            observation("mc-on", true).checks.map(({ passed }) => passed),
+        );
     });
 
     it("stores detached checks when the adapter returns a proxied vector", async () => {

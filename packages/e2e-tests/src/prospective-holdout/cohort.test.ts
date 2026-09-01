@@ -329,6 +329,9 @@ describe("cohort store lock", () => {
     });
 
     it("removes and claims nothing when a takeover cannot rename the lock aside", () => {
+        // Mode bits do not restrain root, so the rename would succeed and the branch under
+        // test would never be reached.
+        if (process.getuid?.() === 0) return;
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
             const lock = seedLock(root, null);
