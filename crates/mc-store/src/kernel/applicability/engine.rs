@@ -356,6 +356,10 @@ impl ApplicabilityEngine {
         // Distinct anchors and repeated payloads resolve once per batch.
         let mut batch_memos = BatchMemos::default();
         let mut objects = Vec::with_capacity(candidates.len());
+        self.object_cache
+            .lock()
+            .expect("cache lock")
+            .reserve(candidates.len());
         for candidate in candidates {
             let inputs_digest = match &mut batch_input_digests {
                 Some(digests) => {

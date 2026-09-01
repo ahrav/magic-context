@@ -29,6 +29,11 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
         self.current.hasher()
     }
 
+    pub(super) fn reserve(&mut self, additional: usize) {
+        self.current
+            .reserve(additional.min(self.cap.saturating_sub(self.current.len())));
+    }
+
     pub(super) fn get(&mut self, key: &K) -> Option<V> {
         if let Some(value) = self.current.get(key) {
             return Some(value.clone());

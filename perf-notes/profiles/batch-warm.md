@@ -43,3 +43,16 @@ representation.
 
 Raw profile: `/tmp/mc-scope-perf/batch-warm-iter18-199.data`; report:
 `/tmp/mc-scope-perf/batch-warm-iter18.report`.
+
+## Cold batch after iteration 22
+
+An engine-only `batch-cold-512` profile at `fa97709eb` captured 2,001 samples at 199 Hz with zero
+loss. SipHash writes own 20.2% self cycles, allocator internals about 24%, object-key `hash_one`
+6.9%, cache-table reserve/rehash 3.3%, and cache insert 2.8%. The first attempted profile through
+Criterion was rejected because Criterion's crossbeam/rayon bootstrap analysis dominated samples.
+
+The first eligible treatment is one bounded `HashMap::reserve` before batch inserts. Key hashing
+and owned public output/token strings remain the larger representation problem.
+
+Raw profile: `/tmp/mc-scope-perf/batch-cold-kernel-iter22-199.data`; report:
+`/tmp/mc-scope-perf/batch-cold-kernel-iter22.report`.
