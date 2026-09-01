@@ -3374,12 +3374,15 @@ impl ActiveWriteTransaction<'_> {
             }
             // The detector build is recorded once per field scan, so a
             // detection row carries only what varies within one scan.
-            for (ordinal, detection) in field.redaction.detections.iter().enumerate() {
+            for (ordinal, label) in persisted_detection_labels(&field.redaction.detections)
+                .into_iter()
+                .enumerate()
+            {
                 insert_detection.execute(params![
                     scan_id,
                     i64::try_from(ordinal).unwrap_or(i64::MAX),
                     "exact",
-                    detection.secret_type,
+                    label,
                     "value",
                     field.detection_action,
                 ])?;
@@ -3410,6 +3413,24 @@ impl ActiveWriteTransaction<'_> {
         Ok(())
     }
 }
+
+/// Repeated labels carry no additional type information.
+/// The count a caller needs lives in `mc_field_scans.finding_count`.
+fn persisted_detection_labels(detections: &[Detection]) -> Vec<&str> {
+    let mut labels: Vec<&str> = Vec::new();
+    for detection in detections {
+        if labels.len() == MAX_PERSISTED_DETECTION_LABELS {
+            break;
+        }
+        let label = detection.secret_type.as_str();
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+const MAX_PERSISTED_DETECTION_LABELS: usize = 64;
 
 fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
     tx.prepare_cached("SELECT lower(hex(randomblob(16)))")?
@@ -4075,9 +4096,23 @@ fn prepare_json_content_collecting(
                 } else {
                     redact_durable_text(text)
                 };
+                let scanner_found = !redaction.detections.is_empty();
                 detections.extend(redaction.detections);
                 *text = match key.and_then(protected_json_key_label) {
-                    Some(label) if !text.is_empty() => format!("<REDACTED:{label}>"),
+                    Some(label) if !text.is_empty() => {
+                        if !scanner_found {
+                            // Protected-key redaction can change a value the value-only
+                            // scanner did not detect; record a synthetic detection so
+                            // `finding_count` reflects the change.
+                            detections.push(Detection {
+                                detector_id: DETECTOR_ID,
+                                secret_type: label.clone(),
+                                offset: 0,
+                                length: text.len(),
+                            });
+                        }
+                        format!("<REDACTED:{label}>")
+                    }
                     _ => redaction.text,
                 };
             }
@@ -17504,6 +17539,89 @@ mod tests {
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         McStore::test_descriptor(dir, "magic-context-test")
+    }
+
+    /// The value-only scanner finds nothing in `{"credential":"fixture"}`, so a receipt built
+    /// from its detections alone would report no finding for bytes the key gate replaced.
+    #[test]
+    fn a_key_directed_substitution_records_its_own_detection() {
+        let mut detections = Vec::new();
+        let prepared = prepare_json_content_collecting(
+            r#"{"credential":"fixture"}"#,
+            JsonScanPolicy::DurableRejectProtected,
+            &mut detections,
+        )
+        .unwrap();
+        assert_eq!(prepared, r#"{"credential":"<REDACTED:credential>"}"#);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].secret_type, "credential");
+        assert_eq!(detections[0].length, "fixture".len());
+
+        // A value the scanner already flagged keeps its own findings and gains no duplicate.
+        let mut scanned = Vec::new();
+        prepare_json_content_collecting(
+            r#"{"credential":"password=hunter-two"}"#,
+            JsonScanPolicy::DurableRejectProtected,
+            &mut scanned,
+        )
+        .unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].secret_type, "password");
+
+        // An unprotected name still reports only what the scanner found.
+        let mut none = Vec::new();
+        prepare_json_content_collecting(
+            r#"{"payload":"fixture"}"#,
+            JsonScanPolicy::DurableRejectProtected,
+            &mut none,
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// A detection row varies only by its label, so repeats add nothing while a near-limit
+    /// field can hold tens of thousands of them.
+    #[test]
+    fn persisted_detection_rows_collapse_repeats_and_stay_bounded() {
+        let repeated = std::iter::repeat_n(
+            Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: "password".to_string(),
+                offset: 0,
+                length: 4,
+            },
+            5_000,
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(persisted_detection_labels(&repeated), vec!["password"]);
+
+        let distinct = (0..MAX_PERSISTED_DETECTION_LABELS + 10)
+            .map(|index| Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: format!("label_{index}"),
+                offset: 0,
+                length: 4,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_detection_labels(&distinct).len(),
+            MAX_PERSISTED_DETECTION_LABELS
+        );
+
+        // First-appearance order is what a reader sees, so it must not depend on sorting.
+        let mixed = ["token", "password", "token", "api_key"]
+            .into_iter()
+            .map(|label| Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: label.to_string(),
+                offset: 0,
+                length: 4,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_detection_labels(&mixed),
+            vec!["token", "password", "api_key"]
+        );
     }
 
     /// `serde_json::Value` keeps only the last member of a repeated name, so the scan never
