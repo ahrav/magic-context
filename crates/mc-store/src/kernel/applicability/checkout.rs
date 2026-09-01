@@ -186,6 +186,12 @@ impl EvalBudget {
             Ok(())
         }
     }
+
+    /// The instant this budget expires, for callers that hand a deadline to a
+    /// blocking primitive instead of polling `is_exhausted` themselves.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
 }
 
 /// `DeadlineWatchdog` raises `budget`'s interrupt when its deadline passes, so commentlint: allow(JUDGE)

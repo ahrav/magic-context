@@ -47,8 +47,6 @@ pub struct ApplicabilityRequest<'a> {
     pub query: &'a QueryContext,
     pub scope_context: &'a ScopeMatchContext,
     pub candidates: &'a [ApplicabilityCandidate],
-    /// Domain owning the applicability observations repair appends.
-    pub domain_id: &'a str,
     /// Actor recorded on repair commits.
     pub actor: &'a str,
     /// Observation timestamp in UTC milliseconds.
@@ -96,6 +94,10 @@ impl ApplicabilityEngine {
     /// A checkout that cannot be snapshotted (unreadable, unborn HEAD,
     /// budget exhausted) classifies every candidate uncertain — that is a
     /// domain outcome, not a store failure.
+    ///
+    /// An object whose durable block this request could not clear reports commentlint: allow(JUDGE)
+    /// uncertain rather than current: the block still stands for every other commentlint: allow(JUDGE)
+    /// reader, so a current label here would auto-inject a blocked object. commentlint: allow(JUDGE)
     pub fn evaluate(
         &self,
         store: &KernelStore,
@@ -119,44 +121,74 @@ impl ApplicabilityEngine {
             request.candidates,
             budget,
         );
+        let mut objects = batch.objects;
+        let repair_indices: Vec<usize> = objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| {
+                object.append_pending || object.state == ApplicabilityState::Current
+            })
+            .map(|(index, _)| index)
+            .collect();
+        // Reducing per object took the reader lock and re-derived the committed
+        // tip once per object, and deriving that tip walks the live registry.
+        let blocks = store.applicability_block_states_at_tip(
+            &repair_indices
+                .iter()
+                .map(|index| objects[*index].object_id.as_str())
+                .collect::<Vec<_>>(),
+            snapshot.identity(),
+            budget,
+        )?;
         let mut appends = Vec::new();
-        for object in &batch.objects {
-            if !object.append_pending && object.state != ApplicabilityState::Current {
-                continue;
+        for index in repair_indices {
+            // The repair pass commits, so it polls the budget per object rather
+            // than running a whole batch past an expired deadline.
+            if budget.is_exhausted() {
+                break;
             }
-            let needs_clearing = object.state == ApplicabilityState::Current
-                && store
-                    .applicability_block_state(
-                        &object.object_id,
-                        snapshot.identity(),
-                        store_tip(store)?,
-                    )?
-                    .is_some_and(|block| block.blocked);
-            if object.state == ApplicabilityState::Current && !needs_clearing {
+            let block = blocks.get(objects[index].object_id.as_str());
+            let object = &objects[index];
+            if object.state == ApplicabilityState::Current
+                && !block.is_some_and(|block| block.blocked)
+            {
                 continue;
             }
             let Some(intent) = RepairIntent::for_classification(
                 &snapshot,
                 object,
-                request.domain_id,
+                block,
                 request.actor,
                 request.observed_at,
             ) else {
                 continue;
             };
             let outcome = commit_read_repair(store, self, &snapshot, object, &intent, budget)?;
-            appends.push((object.object_id.clone(), outcome));
+            // A durable block this request could not clear still blocks every
+            // other reader, so a `Current` label here would auto-inject an
+            // object the store considers blocked.
+            let unresolved = match outcome {
+                AppendOutcome::Landed { .. } => None,
+                AppendOutcome::Discarded => Some("checkout moved before the clearing append"),
+                AppendOutcome::DeadlineMissed => {
+                    Some("deadline expired before the clearing append")
+                }
+            };
+            if let Some(reason) = unresolved {
+                if objects[index].state == ApplicabilityState::Current {
+                    objects[index].state = ApplicabilityState::Uncertain;
+                    objects[index].evidence =
+                        format!("durable applicability block not cleared: {reason}");
+                }
+            }
+            appends.push((objects[index].object_id.clone(), outcome));
         }
         Ok(ApplicabilityReport {
-            objects: batch.objects,
+            objects,
             stats: batch.stats,
             appends,
         })
     }
-}
-
-fn store_tip(store: &KernelStore) -> Result<i64, KernelError> {
-    Ok(store.known_as_of(0)?.tip)
 }
 
 fn uncertain_batch(

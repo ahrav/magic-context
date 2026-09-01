@@ -9,11 +9,13 @@
 //! the next evaluation retry the append before the object could ever
 //! auto-inject again.
 
+use std::collections::HashMap;
+
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::super::slice::{ObservationDependencySpec, ObservationPayload, ObservationSpec};
-use super::super::{CommitIntent, KernelError, KernelStore, Sensitivity};
+use super::super::{CommitIntent, Envelope, KernelError, KernelStore, Sensitivity};
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::engine::{ApplicabilityEngine, ApplicabilityState, ObjectApplicability};
 use super::payloads::{
@@ -51,7 +53,6 @@ pub struct RepairIntent {
     operation_key: String,
     request_digest: String,
     observed_at: i64,
-    domain_id: String,
     actor: String,
     head: String,
 }
@@ -65,7 +66,7 @@ impl RepairIntent {
     pub fn for_classification(
         snapshot: &CheckoutSnapshot,
         object: &ObjectApplicability,
-        domain_id: &str,
+        block: Option<&InjectionBlock>,
         actor: &str,
         observed_at: i64,
     ) -> Option<Self> {
@@ -74,10 +75,13 @@ impl RepairIntent {
             ApplicabilityState::Current => OBSERVATION_KIND_CURRENT,
             _ => return None,
         };
+        // Canonical JSON, not `Debug`: the digest is hashed into a durably
+        // stored dedup key, and `Debug` output carries no stability guarantee
+        // across compiler releases or field renames.
         let check_digest = object
             .failed_check
             .as_ref()
-            .map(|failed| format!("{:?}", failed.check))
+            .map(|failed| serde_json::to_string(&failed.check).expect("check spec is serializable"))
             .unwrap_or_default();
         let payload = ApplicabilityObservationPayload {
             schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
@@ -90,9 +94,11 @@ impl RepairIntent {
         };
         let detail = serde_json::to_string(&payload).expect("observation payload is serializable");
         // Deep-verification dedup identity (KTD9): object revision, checkout
-        // identity, failed check, and algorithm version, plus HEAD and dirty
-        // fingerprint so a re-failure after a clearing observation appends a
-        // fresh record instead of replaying the pre-clear receipt.
+        // identity, HEAD, dirty fingerprint, failed check, and algorithm
+        // version, plus the repair generation. HEAD and the fingerprint alone
+        // repeat when a checkout returns to a state it already failed at, and
+        // the generation is what distinguishes that re-failure from the
+        // pre-clear one.
         let mut key = Sha256::new();
         key.update(b"mc-applicability-repair-v1\0");
         for part in [
@@ -104,6 +110,7 @@ impl RepairIntent {
             kind,
             &check_digest,
             PATCH_ID_ALGORITHM,
+            &generation_for(block, kind).to_string(),
         ] {
             key.update(part.as_bytes());
             key.update(b"\0");
@@ -120,17 +127,18 @@ impl RepairIntent {
             operation_key,
             request_digest: format!("{:x}", digest.finalize()),
             observed_at,
-            domain_id: domain_id.to_string(),
             actor: actor.to_string(),
             head: snapshot.head().to_string(),
         })
     }
 
-    fn observation_spec(&self, commit_marker: &str) -> ObservationSpec {
+    /// `target` carries the classified object's own domain and sensitivity,
+    /// read inside the repair transaction.
+    fn observation_spec(&self, target: &RepairTarget) -> ObservationSpec {
         ObservationSpec {
-            observation_id: format!("applicability-{}", commit_marker),
-            object_id: format!("applicability-object-{}", commit_marker),
-            domain_id: self.domain_id.clone(),
+            observation_id: format!("applicability-{}", self.operation_key),
+            object_id: format!("applicability-object-{}", self.operation_key),
+            domain_id: target.domain_id.clone(),
             proposition_id: None,
             scope_id: None,
             anchor_id: None,
@@ -150,9 +158,47 @@ impl RepairIntent {
             source_kind: REPAIR_PRODUCER.to_string(),
             source_id: self.operation_key.clone(),
             source_revision: 1,
-            sensitivity: Sensitivity::Normal,
+            sensitivity: target.sensitivity,
         }
     }
+}
+
+/// The classified object's domain and sensitivity, read from the registry
+/// inside the repair transaction.
+///
+/// A repair payload carries checkout identity, evidence, and the failed check,
+/// all derived from the target. Storing the observation as `Normal` would put
+/// that content on the normal-sensitivity lane for a target the store
+/// classifies `Sensitive` or `Secret`.
+struct RepairTarget {
+    domain_id: String,
+    sensitivity: Sensitivity,
+    source_revision: i64,
+}
+
+/// Reads the live registry row for `object_id`, taking the more restrictive of
+/// the object's own class and its owning domain's.
+fn load_repair_target(
+    tx: &rusqlite::Transaction<'_>,
+    object_id: &str,
+) -> Result<Option<RepairTarget>, KernelError> {
+    tx.query_row(
+        "SELECT r.domain_id, r.source_revision, r.sensitivity_class, d.sensitivity_class
+         FROM object_registry r
+         JOIN domains d ON d.domain_id = r.domain_id
+         WHERE r.object_id=?1 AND r.invalidated_commit_seq IS NULL",
+        [object_id],
+        |row| {
+            Ok(RepairTarget {
+                domain_id: row.get::<_, String>(0)?,
+                source_revision: row.get::<_, i64>(1)?,
+                sensitivity: Sensitivity::from_stored(&row.get::<_, String>(2)?)
+                    .restrictive(Sensitivity::from_stored(&row.get::<_, String>(3)?)),
+            })
+        },
+    )
+    .optional()
+    .map_err(|_| KernelError::Io)
 }
 
 /// Commits one repair intent through the kernel envelope: observation with
@@ -181,8 +227,7 @@ pub fn commit_read_repair(
         actor: intent.actor.clone(),
         cause: format!("applicability read repair: {}", intent.kind),
     };
-    let spec = intent.observation_spec(&intent.operation_key[..16]);
-    let result = store.commit(commit_intent, |envelope| {
+    let operation = |envelope: &mut Envelope<'_>| {
         // Revalidate after acquiring the writer: the deadline may have
         // expired while waiting, and the checkout may have moved.
         if budget.is_exhausted() {
@@ -197,21 +242,23 @@ pub fn commit_read_repair(
         if live_head != intent.head {
             return Err(KernelError::Conflict);
         }
-        let revision: Option<i64> = envelope
-            .tx
-            .query_row(
-                "SELECT source_revision FROM object_registry
-                 WHERE object_id=?1 AND invalidated_commit_seq IS NULL",
-                [intent.object_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| KernelError::Io)?;
-        if revision != Some(intent.object_revision) {
+        let Some(target) = load_repair_target(envelope.tx, &intent.object_id)? else {
+            return Err(KernelError::Conflict);
+        };
+        if target.source_revision != intent.object_revision {
             return Err(KernelError::Conflict);
         }
-        Ok(envelope.insert_observation(spec.clone())?.result_json())
-    });
+        Ok(envelope
+            .insert_observation(intent.observation_spec(&target))?
+            .result_json())
+    };
+    // `commit` blocks for the writer without a timeout, which would let a
+    // near-deadline retrieval wait out its own bound and only then report
+    // `DeadlineMissed`.
+    let result = match budget.deadline() {
+        Some(deadline) => store.commit_before(deadline, commit_intent, operation),
+        None => store.commit(commit_intent, operation),
+    };
     match result {
         Ok(receipt) => {
             // A dropped confirmation is safe: an evicted entry misses on the
@@ -236,7 +283,57 @@ pub struct InjectionBlock {
     pub commit_seq: i64,
     /// Blocked unless the latest observation records `applicability.current`.
     pub blocked: bool,
+    /// Commit sequence of the newest observation whose kind differs from
+    /// `observation_kind`, or 0 when this kind is the only one recorded.
+    pub prior_kind_commit_seq: i64,
 }
+
+impl InjectionBlock {
+    /// Repair generation for an append of `kind`: the commit sequence of the
+    /// newest recorded observation whose kind differs from `kind`.
+    ///
+    /// Repeating one repair keeps its generation, so the dedup key repeats and commentlint: allow(JUDGE)
+    /// the receipt replays. Failing again after a clearing observation crosses commentlint: allow(JUDGE)
+    /// a kind change, which advances the generation, so the dedup key differs commentlint: allow(JUDGE)
+    /// from the pre-clear repair rather than replaying it. commentlint: allow(JUDGE)
+    pub fn generation_for(&self, kind: &str) -> i64 {
+        if self.observation_kind == kind {
+            self.prior_kind_commit_seq
+        } else {
+            self.commit_seq
+        }
+    }
+}
+
+fn generation_for(block: Option<&InjectionBlock>, kind: &str) -> i64 {
+    block.map_or(0, |block| block.generation_for(kind))
+}
+
+/// One object's reduction while the DESC scan walks its rows.
+enum Reduction {
+    /// Waiting for the newest row matching this checkout.
+    Latest,
+    /// Latest found; waiting for the newest row of a differing kind.
+    PriorKind(InjectionBlock),
+    Done(InjectionBlock),
+}
+
+impl Reduction {
+    fn finish(self) -> Option<InjectionBlock> {
+        match self {
+            Self::Latest => None,
+            Self::PriorKind(block) | Self::Done(block) => Some(block),
+        }
+    }
+}
+
+/// Rows scanned between budget polls. The scan is index-driven and stops at
+/// the newest kind change, so polling every row would cost more than it saves.
+const BLOCK_SCAN_POLL_INTERVAL: usize = 64;
+
+/// Object identifiers bound per reducer query. SQLite's default parameter
+/// ceiling is 32766; this leaves headroom for the other bound values.
+const BLOCK_SCAN_ID_CHUNK: usize = 512;
 
 impl KernelStore {
     /// Derives the injection block for `object_id` at `checkout_identity`
@@ -252,6 +349,43 @@ impl KernelStore {
         if known_as_of < 0 {
             return Err(KernelError::InvalidInput);
         }
+        let mut states = self.reduce_block_states(
+            &[object_id],
+            checkout_identity,
+            Some(known_as_of),
+            &EvalBudget::unbounded(),
+        )?;
+        Ok(states.remove(object_id))
+    }
+
+    /// Batched reducer over `object_ids` at the committed tip, for the repair
+    /// pass that decides whether each classified object still carries a block.
+    /// One reader transaction serves the whole batch. A per-object call would
+    /// re-derive the tip and take the reader lock once per object.
+    ///
+    /// Absent identifiers carry no recorded block.
+    pub fn applicability_block_states_at_tip(
+        &self,
+        object_ids: &[&str],
+        checkout_identity: &str,
+        budget: &EvalBudget,
+    ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+        self.reduce_block_states(object_ids, checkout_identity, None, budget)
+    }
+
+    /// `known_as_of` of `None` reads the committed tip inside the same
+    /// transaction as the scan.
+    fn reduce_block_states(
+        &self,
+        object_ids: &[&str],
+        checkout_identity: &str,
+        known_as_of: Option<i64>,
+        budget: &EvalBudget,
+    ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+        let mut states = HashMap::new();
+        if object_ids.is_empty() {
+            return Ok(states);
+        }
         let mut reader = self.lock_reader()?;
         let tx = reader
             .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -263,59 +397,122 @@ impl KernelStore {
                 |row| row.get(0),
             )
             .map_err(|_| KernelError::Io)?;
-        if known_as_of > tip {
-            return Err(KernelError::FutureSnapshot);
+        let known_as_of = match known_as_of {
+            Some(requested) if requested > tip => return Err(KernelError::FutureSnapshot),
+            Some(requested) => requested,
+            None => tip,
+        };
+        for chunk in object_ids.chunks(BLOCK_SCAN_ID_CHUNK) {
+            reduce_chunk(
+                &tx,
+                chunk,
+                checkout_identity,
+                known_as_of,
+                budget,
+                &mut states,
+            )?;
         }
-        let mut statement = tx
-            .prepare(
-                "SELECT o.observation_kind, o.observation_payload, o.created_commit_seq
-                 FROM observation_dependencies d
-                 JOIN observations o ON o.observation_id = d.observation_id
-                 WHERE d.dependency_object_id = ?1
-                   AND d.dependency_kind = ?2
-                   AND o.observation_kind LIKE 'applicability.%'
-                   AND o.created_commit_seq <= ?3
-                   AND (o.invalidated_commit_seq IS NULL OR ?3 < o.invalidated_commit_seq)
-                 ORDER BY o.created_commit_seq DESC, o.observation_id DESC",
-            )
-            .map_err(|_| KernelError::Io)?;
-        let rows = statement
-            .query_map(
-                rusqlite::params![object_id, DEPENDENCY_KIND_TARGET, known_as_of],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .map_err(|_| KernelError::Io)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| KernelError::Io)?;
-        drop(statement);
         tx.commit().map_err(|_| KernelError::Io)?;
-        for (kind, payload, commit_seq) in rows {
-            let Ok(payload) = serde_json::from_slice::<ObservationPayload>(&payload) else {
-                continue;
-            };
-            let Some(detail) = payload.detail.as_deref() else {
-                continue;
-            };
-            let Ok(detail) = serde_json::from_str::<ApplicabilityObservationPayload>(detail) else {
-                continue;
-            };
-            if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA
-                || detail.checkout_identity != checkout_identity
-            {
-                continue;
-            }
-            return Ok(Some(InjectionBlock {
+        Ok(states)
+    }
+}
+
+/// Scans one chunk newest-first, stopping each object at its newest kind
+/// change. Rows decode as the scan streams them. Collecting the chunk first
+/// would materialize every historical payload for every identifier before a
+/// single one is inspected.
+fn reduce_chunk(
+    tx: &rusqlite::Transaction<'_>,
+    object_ids: &[&str],
+    checkout_identity: &str,
+    known_as_of: i64,
+    budget: &EvalBudget,
+    states: &mut HashMap<String, InjectionBlock>,
+) -> Result<(), KernelError> {
+    let placeholders = std::iter::repeat_n("?", object_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT d.dependency_object_id, o.observation_kind, o.observation_payload,
+                    o.created_commit_seq
+             FROM observation_dependencies d
+             JOIN observations o ON o.observation_id = d.observation_id
+             WHERE d.dependency_object_id IN ({placeholders})
+               AND d.dependency_kind = ?{kind}
+               AND o.observation_kind LIKE 'applicability.%'
+               AND o.created_commit_seq <= ?{as_of}
+               AND (o.invalidated_commit_seq IS NULL OR ?{as_of} < o.invalidated_commit_seq)
+             ORDER BY d.dependency_object_id, o.created_commit_seq DESC, o.observation_id DESC",
+            kind = object_ids.len() + 1,
+            as_of = object_ids.len() + 2,
+        ))
+        .map_err(|_| KernelError::Io)?;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(object_ids.len() + 2);
+    for object_id in object_ids {
+        bound.push(object_id);
+    }
+    bound.push(&DEPENDENCY_KIND_TARGET);
+    bound.push(&known_as_of);
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(bound))
+        .map_err(|_| KernelError::Io)?;
+    let mut pending: HashMap<String, Reduction> = HashMap::new();
+    let mut scanned = 0usize;
+    while let Some(row) = rows.next().map_err(|_| KernelError::Io)? {
+        scanned += 1;
+        if scanned.is_multiple_of(BLOCK_SCAN_POLL_INTERVAL) && budget.is_exhausted() {
+            return Err(KernelError::Deadline);
+        }
+        let object_id: String = row.get(0).map_err(|_| KernelError::Io)?;
+        if matches!(pending.get(&object_id), Some(Reduction::Done(_))) {
+            continue;
+        }
+        let kind: String = row.get(1).map_err(|_| KernelError::Io)?;
+        let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
+        let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
+        if !matches_checkout(&payload, checkout_identity)? {
+            continue;
+        }
+        let entry = pending.entry(object_id).or_insert(Reduction::Latest);
+        *entry = match std::mem::replace(entry, Reduction::Latest) {
+            Reduction::Latest => Reduction::PriorKind(InjectionBlock {
                 blocked: kind != OBSERVATION_KIND_CURRENT,
                 observation_kind: kind,
                 commit_seq,
-            }));
-        }
-        Ok(None)
+                prior_kind_commit_seq: 0,
+            }),
+            Reduction::PriorKind(block) if block.observation_kind == kind => {
+                Reduction::PriorKind(block)
+            }
+            Reduction::PriorKind(block) => Reduction::Done(InjectionBlock {
+                prior_kind_commit_seq: commit_seq,
+                ..block
+            }),
+            done @ Reduction::Done(_) => done,
+        };
     }
+    for (object_id, reduction) in pending {
+        if let Some(block) = reduction.finish() {
+            states.insert(object_id, block);
+        }
+    }
+    Ok(())
+}
+
+/// A payload that does not decode fails the read. Skipping to an older row
+/// would reduce a corrupt latest record to an older `applicability.current`,
+/// or to no block at all, and let a failing object auto-inject.
+fn matches_checkout(payload: &[u8], checkout_identity: &str) -> Result<bool, KernelError> {
+    let payload = serde_json::from_slice::<ObservationPayload>(payload)
+        .map_err(|_| KernelError::CorruptCanonicalRow)?;
+    let Some(detail) = payload.detail.as_deref() else {
+        return Err(KernelError::CorruptCanonicalRow);
+    };
+    let detail = serde_json::from_str::<ApplicabilityObservationPayload>(detail)
+        .map_err(|_| KernelError::CorruptCanonicalRow)?;
+    if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA {
+        return Err(KernelError::CorruptCanonicalRow);
+    }
+    Ok(detail.checkout_identity == checkout_identity)
 }

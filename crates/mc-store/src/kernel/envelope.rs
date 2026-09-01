@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::Instant;
 
 use super::admission::{AdmissionKey, StoredAdmission};
 use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
@@ -404,6 +405,27 @@ impl KernelStore {
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
     ) -> Result<CommitReceipt, KernelError> {
         self.commit_inner(intent, operation, || Err(KernelError::Fault))
+    }
+
+    /// `commit` takes the writer with `Mutex::lock`, which has no timeout.
+    /// `commit_before` polls for the writer until `deadline` and returns `KernelError::Deadline` if it cannot acquire it.
+    pub fn commit_before(
+        &self,
+        deadline: Instant,
+        intent: CommitIntent,
+        operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
+    ) -> Result<CommitReceipt, KernelError> {
+        let intent = RedactedIntent::new(intent)?;
+        let transaction_id = operation_identity(&intent);
+        let mut writer = self.lock_writer_before(deadline)?;
+        commit_prepared_with_writer(
+            &mut writer,
+            self.lease_epoch(),
+            intent,
+            transaction_id,
+            operation,
+            || Ok(()),
+        )
     }
 
     fn commit_inner(
