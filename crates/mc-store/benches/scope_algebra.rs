@@ -68,6 +68,10 @@ fn algebra_benches(c: &mut Criterion) {
     let first_miss = context
         .clone()
         .with_value(Dimension::Domain, "documentation");
+    let outer_version =
+        CanonicalScope::from_term_specs(&[version_range("platform", ">=1.0.0, <3.0.0")]).unwrap();
+    let inner_version =
+        CanonicalScope::from_term_specs(&[version_range("platform", ">=1.5.0, <2.0.0")]).unwrap();
 
     let mut group = c.benchmark_group("algebra");
     for (name, scope) in [("one-term", &one), ("eight-term", &eight)] {
@@ -83,6 +87,15 @@ fn algebra_benches(c: &mut Criterion) {
     }
     group.bench_function("matches/eight-term-first-miss", |b| {
         b.iter(|| scope_matches(black_box(&eight), black_box(&first_miss), &UnknownGraph));
+    });
+    group.bench_function("subsumes/version-nested", |b| {
+        b.iter(|| {
+            scope_subsumes(
+                black_box(&outer_version),
+                black_box(&inner_version),
+                &UnknownGraph,
+            )
+        });
     });
     group.finish();
 }
