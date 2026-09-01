@@ -6,6 +6,7 @@ import {
     mkdirSync,
     mkdtempSync,
     readFileSync,
+    renameSync,
     rmSync,
     symlinkSync,
     utimesSync,
@@ -413,6 +414,33 @@ describe("cohort store lock", () => {
             expect(JSON.parse(readFileSync(join(sideline, LOCK_OWNER_FILE), "utf8")))
                 .toEqual(displaced);
             expect(JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"))).toEqual(third);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not let a takeover restore a claim its owner already released", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            const lock = join(root, ".lock");
+            mkdirSync(root, { recursive: true });
+            // This process holds the lock, so `LOCK_NONCE` is the owner on disk.
+            const held = withRecoverableLock(lock, { busyCode: "cohort-store: busy" }, () => {
+                // A reclaimer sidelines the directory while the owner still holds it.
+                const sideline = lockSidelinePath(lock);
+                renameSync(lock, sideline);
+                return sideline;
+            });
+            // The release ran while the directory sat at the sideline.
+            expect(existsSync(held)).toBe(false);
+            expect(existsSync(lock)).toBe(false);
+            // A restore attempt now finds nothing to move back, so a live pid cannot pin the path.
+            expect(lockAbandoned(lock)).toBeNull();
+            let ran = false;
+            withRecoverableLock(lock, { busyCode: "cohort-store: busy" }, () => {
+                ran = true;
+            });
+            expect(ran).toBe(true);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

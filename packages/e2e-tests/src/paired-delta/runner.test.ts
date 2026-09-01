@@ -16,6 +16,7 @@ import {
     type RolloutRecord,
     type RolloutStore,
     type RunPairedDeltaOptions,
+    type TokenUsage,
     type RunnerDependencies,
 } from "./runner";
 import type { ArmId, ScenarioDeclaration } from "./contract";
@@ -1270,6 +1271,38 @@ describe("paired-delta runner", () => {
             store.release();
         } finally {
             rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses duplicate coordinates from a store that does not validate", async () => {
+        // The map keeps the last record while the pre-scan bills every copy.
+        const completed = storedRecord("mc-on");
+        const store = new MemoryStore([completed, { ...completed, costUsd: 0.5 }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /duplicate rollouts for/,
+        );
+    });
+
+    it("refuses malformed measurement fields from a store that does not validate", async () => {
+        for (
+            const mutate of [
+                (record: RolloutRecord) => ({ ...record, usage: null as unknown as TokenUsage }),
+                (record: RolloutRecord) => ({ ...record, turns: -1 }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    wallClockMs: "soon" as unknown as number,
+                }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    usage: { ...record.usage, cacheRead: Number.NaN },
+                }),
+            ]
+        ) {
+            const store = new MemoryStore([mutate(storedRecord("mc-on"))]);
+            await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+                /is not a non-negative finite number/,
+            );
         }
     });
 

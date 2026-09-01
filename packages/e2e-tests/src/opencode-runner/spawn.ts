@@ -561,7 +561,13 @@ async function spawnOpencodeWithProvision(
     let stderrBuf = "";
     try {
         /** Canonicalized once here so the database decision below and `writeConfigs` cannot read different representations of the same config. commentlint: allow(JUDGE) */
-        const canonicalOpts = canonicalizeSpawnConfigs(opts);
+        const canonicalOpts: SpawnOptions = {
+            ...canonicalizeSpawnConfigs(opts),
+            /** Snapshotted so the map checked below is the map forwarded to the child: a `toJSON()` hook shares a reference with `opts.extraEnv` and can add a sensitive name while serializing. commentlint: allow(JUDGE) */
+            extraEnv: { ...(opts.extraEnv ?? {}) },
+        };
+        /** Re-checked after the hooks ran, because the check above read the environment as passed: a hook that adds a credential during serialization would otherwise reach a child whose unauthenticated server is off loopback. commentlint: allow(JUDGE) */
+        assertSecretsBoundToLoopback(canonicalOpts, hostname);
         const resolvedOpts: SpawnOptions = resources
             ? {
                   ...canonicalOpts,

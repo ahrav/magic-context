@@ -337,6 +337,33 @@ describe("opencode child lifecycle", () => {
             expect(decidedAuto !== true).toBe(written.compaction?.auto !== true);
             expect(written.compaction?.auto).toBe(false);
 
+            // A `toJSON()` hook shares a reference with `extraEnv` and runs during
+            // canonicalization, so the loopback rule has to read the post-hook environment.
+            const smuggled: Record<string, string> = {};
+            const mutating: Record<string, unknown> = { compaction: { auto: false } };
+            Object.defineProperty(mutating, "toJSON", {
+                value: () => {
+                    smuggled.ANTHROPIC_API_KEY = "sk-ant-abcdefghijklmnopqrstuv";
+                    return { compaction: { auto: false } };
+                },
+                enumerable: false,
+            });
+            const smugglingOpts = {
+                mockProviderURL: "http://127.0.0.1:4321",
+                extraEnv: smuggled,
+                openCodeConfigExtra: mutating,
+            };
+            expect(() =>
+                __spawnOpencodeTest.assertSecretsBoundToLoopback(smugglingOpts, "0.0.0.0")
+            ).not.toThrow();
+            const postHook = {
+                ...__spawnOpencodeTest.canonicalizeSpawnConfigs(smugglingOpts),
+                extraEnv: { ...(smugglingOpts.extraEnv ?? {}) },
+            };
+            expect(() =>
+                __spawnOpencodeTest.assertSecretsBoundToLoopback(postHook, "0.0.0.0")
+            ).toThrow(/refusing to bind the unauthenticated serve API/);
+
             for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {                expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
                         mockProviderURL: "http://127.0.0.1:4321",
@@ -443,6 +470,54 @@ describe("opencode child lifecycle", () => {
         expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
         expect(exitObserved).toBe(true);
         expect(child.signalCode).toBe("SIGKILL");
+    });
+
+    it("refuses a credential a serialization hook adds after the first environment check", async () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-spawn-smuggle-"));
+        const env: IsolatedEnv = {
+            configDir: join(root, "config"),
+            dataDir: join(root, "data"),
+            cacheDir: join(root, "cache"),
+            workdir: join(root, "work"),
+        };
+        for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+        const mcHost = {
+            connectionFile: join(env.dataDir, "mc-host-connection.json"),
+            async stop(): Promise<void> {},
+        } as HermeticMcHostStack;
+        // The hook mutates the same `extraEnv` object the first check already inspected.
+        const extraEnv: Record<string, string> = {};
+        const mutating: Record<string, unknown> = { compaction: { auto: false } };
+        Object.defineProperty(mutating, "toJSON", {
+            value: () => {
+                extraEnv.ANTHROPIC_API_KEY = "sk-ant-abcdefghijklmnopqrstuv";
+                return { compaction: { auto: false } };
+            },
+            enumerable: false,
+        });
+        const previousMode = process.env.MC_E2E_MODE;
+        process.env.MC_E2E_MODE = "rust";
+
+        try {
+            const error = await __spawnOpencodeTest
+                .spawnOpencodeWithProvision(
+                    {
+                        mockProviderURL: "http://127.0.0.1:1",
+                        port: 1,
+                        extraEnv,
+                        openCodeConfigExtra: mutating,
+                    },
+                    async () => ({ env, connectionFile: mcHost.connectionFile, mcHost }),
+                )
+                .catch((failure: unknown) => failure);
+
+            expect(String(error)).toContain("refusing to bind the unauthenticated serve API");
+            expect(String(error)).toContain("ANTHROPIC_API_KEY");
+        } finally {
+            if (previousMode === undefined) delete process.env.MC_E2E_MODE;
+            else process.env.MC_E2E_MODE = previousMode;
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it("stops the Rust fixture when config serialization fails before spawn", async () => {

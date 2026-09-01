@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { HoldoutContractError } from "./contract";
 
 /**
@@ -188,6 +188,21 @@ function claimLock(lock: string): LockClaim {
 }
 
 function releaseLock(lock: string): void {
+    /** A release has to reach this process's record wherever a reclaimer has moved it: a takeover that sidelined the directory can still restore it, and a record restored after its owner released would hold the path until that owner's process exits, because `lockAbandoned` will not reclaim a live holder's pid. The reclaimer's nonce names the sideline, so the sidelines are matched by this process's own owner record rather than by path. commentlint: allow(JUDGE) */
+    const parent = dirname(lock);
+    const prefix = `${basename(lock)}.reclaimed-`;
+    let siblings: string[] = [];
+    try {
+        siblings = readdirSync(parent);
+    } catch {
+        siblings = [];
+    }
+    for (const entry of siblings) {
+        if (!entry.startsWith(prefix)) continue;
+        const sideline = join(parent, entry);
+        if (readLockOwner(sideline)?.nonce !== LOCK_NONCE) continue;
+        rmSync(sideline, { recursive: true, force: true });
+    }
     // A lock reclaimed from this process belongs to the reclaimer.
     // Deleting a reclaimed lock would let another waiter acquire a lock the reclaimer still believes it holds.
     if (readLockOwner(lock)?.nonce !== LOCK_NONCE) return;

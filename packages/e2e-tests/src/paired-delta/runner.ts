@@ -576,6 +576,19 @@ export async function runPairedDelta(
     /** Option-only validation runs before `store.list()`, which claims the records path for this process: a call rejected after that claim would leave the path owned until exit and fail the corrected retry with `RolloutStoreBusyError`. commentlint: allow(JUDGE) */
     validateRunOptions(options);
     const stored = options.store.list();
+    /** `parseRolloutRecords` rejects a duplicate coordinate, but `RolloutStore` is an interface any caller can implement and the map below keeps only the last record while the pre-scan bills every copy: a completed earlier duplicate behind a failed later one would be retried, paid for, and then refused replacement by `put`, losing the new evidence. commentlint: allow(JUDGE) */
+    const duplicateKeys = new Set<string>();
+    for (const record of stored) {
+        const key = coordinateKey(record);
+        if (duplicateKeys.has(key)) {
+            options.store.release?.();
+            throw new Error(
+                `records file contains duplicate rollouts for ${key}; ` +
+                    "point at a fresh records path",
+            );
+        }
+        duplicateKeys.add(key);
+    }
     const storedByCoordinate = new Map(
         stored.map((record) => [coordinateKey(record), record]),
     );
@@ -615,12 +628,20 @@ export async function runPairedDelta(
         /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
         if (!inMatrix(record) || !bindingMatches(record, options)) continue;
         /** `parseRolloutRecords` rejects a negative or non-finite attempt cost, but `RolloutStore` is an interface any caller can implement, so the figures reaching this loop are checked here too: a negative balance keeps `spentUsd + admissionReserveUsd` under the cap and buys arms the cap should have refused, and a negative reserve floor understates the next call. commentlint: allow(JUDGE) */
+        /** The measurement fields travel the same untrusted path as the costs and feed the run's token, turn, and latency reporting, so a resume cannot rehydrate a record whose counters are malformed: `resumableEvidence` revalidates the check vector and the declaration but reads none of these. commentlint: allow(JUDGE) */
+        const usage: Partial<TokenUsage> = record.usage ?? {};
         for (const [label, value] of [
             ["cost", record.costUsd],
             ["prior-attempts-cost", record.priorAttemptsCostUsd],
             ["max-attempt-cost", record.maxAttemptCostUsd],
+            ["wall-clock-ms", record.wallClockMs],
+            ["turns", record.turns],
+            ["usage-input", usage.input],
+            ["usage-output", usage.output],
+            ["usage-cache-creation", usage.cacheCreation],
+            ["usage-cache-read", usage.cacheRead],
         ] as const) {
-            if (!Number.isFinite(value) || value < 0) {
+            if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
                 options.store.release?.();
                 throw new Error(
                     `records file ${label} is not a non-negative finite number at ` +
