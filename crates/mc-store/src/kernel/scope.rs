@@ -340,7 +340,7 @@ fn map_write_error(error: rusqlite::Error) -> KernelError {
 // Scope algebra: closed vocabulary, canonical form, and predicates.
 // ---------------------------------------------------------------------------
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Marker fragment every redaction replacement token carries (for example
 /// `<ANTHROPIC_API_KEY_REDACTED>`). A stored scope value containing it is a
@@ -751,7 +751,7 @@ pub enum MatchOutcome {
 /// Values are resolved before predicate evaluation (never ambient state).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeMatchContext {
-    values: BTreeMap<Dimension, String>,
+    values: [Option<String>; DIMENSION_COUNT],
     head_commit: Option<String>,
 }
 
@@ -761,7 +761,7 @@ impl ScopeMatchContext {
     }
 
     pub fn with_value(mut self, dimension: Dimension, value: impl Into<String>) -> Self {
-        self.values.insert(dimension, value.into());
+        self.values[dimension.index()] = Some(value.into());
         self
     }
 
@@ -771,7 +771,7 @@ impl ScopeMatchContext {
     }
 
     pub fn value(&self, dimension: Dimension) -> Option<&str> {
-        self.values.get(&dimension).map(String::as_str)
+        self.values[dimension.index()].as_deref()
     }
 }
 
