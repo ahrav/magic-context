@@ -303,6 +303,50 @@ fn a_value_keeps_non_whitespace_characters_beyond_ascii() {
     }
 }
 
+#[test]
+fn documentation_wording_near_a_credential_does_not_excuse_it() {
+    // The safelist window spans 256 bytes, so a pattern matching only the mood of
+    // the surrounding prose clears a live credential that merely sits near it.
+    let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+    for prose in [
+        "for example: ",
+        "sample config\n",
+        "example config\n",
+        "fixtures/live.env\n",
+        "__tests__/live.env\n",
+        "mocks/live.env\n",
+    ] {
+        let input = format!("{prose}{secret}");
+        let redaction = redact_durable_text(&input);
+        assert!(
+            !redaction.text.contains(secret),
+            "{input:?} produced {:?}",
+            redaction.text
+        );
+    }
+}
+
+#[test]
+fn a_placeholder_value_stays_unredacted_next_to_its_own_label() {
+    // The value safelist, not the prose patterns above, is what keeps these quiet,
+    // so removing a prose pattern must not start redacting them.
+    for input in [
+        "AKIAIOSFODNN7EXAMPLE",
+        "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+        "password = ${DB_PASSWORD}",
+        "example_key = ${DB_PASSWORD}",
+        "api_token: changeme",
+        "sha256 = abcdef0123456789abcdef0123456789",
+    ] {
+        let redaction = redact_durable_text(input);
+        assert_eq!(
+            redaction.text, input,
+            "{input} produced {:?}",
+            redaction.text
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]

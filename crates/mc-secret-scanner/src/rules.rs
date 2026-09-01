@@ -15,6 +15,13 @@ pub const CONSERVATIVE_OVERLAY_SHA256: &str =
 const UPSTREAM_BYTES: &[u8] = include_bytes!("../default_rules.yaml");
 const OVERLAY_BYTES: &[u8] = include_bytes!("../conservative_overlay.yaml");
 
+/// Suppresses an upstream-parity candidate whose surroundings show the value is
+/// not a live credential.
+///
+/// Every pattern describes the value's own syntax or immediate delimiters. A
+/// pattern matching only the mood of the surrounding prose belongs in neither
+/// list: the window spans 256 bytes, so it would clear a genuine credential that
+/// merely sits near documentation.
 const CONTEXT_SAFELIST: &[&str] = &[
     r"(?i)\b(?:placeholder|dummy|fake|sample|example|test)[-_ ]{0,3}(?:key|token|secret|password)\b|\b(?:key|token|secret|password)[-_ ]{0,3}(?:placeholder|dummy|fake|sample|example|test)\b",
     r"\bAKIA[0-9A-Z]{9}EXAMPLE\b",
@@ -28,11 +35,9 @@ const CONTEXT_SAFELIST: &[&str] = &[
     r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{\{[A-Za-z_][A-Za-z0-9_]*\}\})",
     r#"(?i)\b(?:https?|ssh)://(?:localhost|(?:[A-Za-z0-9-]+\.)*example(?:\.[A-Za-z]{2,})?)(?::\d+)?(?:/[^\s"']*)?"#,
     r"(?i)(?:<\s*/?\s*(?:secret|token|password)\s*>|(?:secretmanager|vault)://|secret(?:manager)?[:=])",
-    r"(?i)\b(?:for example|sample config|example config)\b",
     r"(?i)\b(?:INSERT[_\s-]?YOUR|REPLACE[_\s-]?WITH)[A-Z0-9_\s-]*\b",
     r"(?:ZXhhbXBsZQ==|c2FtcGxl={0,2}|dGVzdA==)",
     r"(?m)^(?:<{7}|={7}|>{7})(?: .*)?$",
-    r"(?i)\b(?:__tests?__|fixtures?|mocks?)\b",
     r"(?i)\b(?:sha(?:1|224|256|384|512)|md5)\s*[:=]\s*[A-Fa-f0-9]{8,}\b",
 ];
 
@@ -657,6 +662,29 @@ mod tests {
             .err(),
             Some(ConstructionError::OverlayDigestMismatch)
         );
+    }
+
+    // A pattern matching only the mood of the surrounding prose clears any candidate
+    // inside a 256-byte window, including a live credential quoted beside
+    // documentation, so no context pattern may match prose alone.
+    #[test]
+    fn no_context_pattern_matches_prose_without_a_credential_shaped_neighbour() {
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+        let rules = RuleSet::from_embedded().unwrap();
+        for prose in [
+            "for example",
+            "sample config",
+            "example config",
+            "fixtures",
+            "__tests__",
+            "mocks",
+        ] {
+            let window = format!("{prose}: {secret}");
+            assert!(
+                !rules.context_is_safelisted(window.as_bytes()),
+                "{prose:?} safelists a window holding a credential"
+            );
+        }
     }
 
     #[test]

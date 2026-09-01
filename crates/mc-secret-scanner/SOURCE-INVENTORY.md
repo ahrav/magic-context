@@ -53,6 +53,14 @@ that parity are deliberate:
   redacted, so the broader shape is the conservative choice here; `upstream_parity`
   stays set so the engine safelists still run against those candidates.
 
+The context safelist that those parity candidates run against omits two upstream
+patterns, `for example|sample config|example config` and `__tests__|fixtures|mocks`.
+Both match documentation wording on its own, and the safelist is applied over a
+256-byte window, so either one suppressed a credential that merely sat near
+documentation. Every pattern that remains describes the candidate's own syntax or
+immediate delimiters, and the value safelist still suppresses placeholder values
+such as `AKIAIOSFODNN7EXAMPLE` and `${VAR}` on their own.
+
 Anchor matching is case-insensitive, and the pinned corpus already depends on
 this: `aiza`, `t3blbkfj`, and `zxlk` are the only anchors recorded for regexes
 that match `AIza`, `T3BlbkFJ`, and `ZXlK`, so `gcp-api-key`, `openai-api-key`,
