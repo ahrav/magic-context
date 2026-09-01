@@ -1273,6 +1273,19 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("refuses a negative attempt cost from a store that does not validate", async () => {
+        // A custom `RolloutStore` bypasses the file store's parser, and a negative balance
+        // keeps the cap comparison under budget.
+        for (
+            const field of ["costUsd", "priorAttemptsCostUsd", "maxAttemptCostUsd"] as const
+        ) {
+            const store = new MemoryStore([{ ...storedRecord("mc-on"), [field]: -1_000 }]);
+            await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+                /is not a non-negative finite number/,
+            );
+        }
+    });
+
     it("refuses a records file whose spend total overflows across records", async () => {
         // Each record's own attempt total is finite. The sum across records is what the
         // pre-scan accumulates.

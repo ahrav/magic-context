@@ -283,24 +283,28 @@ describe("opencode child lifecycle", () => {
                     magicContextConfig: {
                         embedding: {
                             provider: "openai-compatible",
-                            api_key: "{env:EMBEDDING_KEY}",
+                            api_key: "{env:EMBEDDING_API_KEY}",
                         },
                     },
                 })
             ).not.toThrow();
             expect(
                 readFileSync(join(env.configDir, "opencode", "magic-context.jsonc"), "utf8"),
-            ).toContain("{env:EMBEDDING_KEY}");
+            ).toContain("{env:EMBEDDING_API_KEY}");
 
             // Only a whole, named placeholder: a credential must not ride along behind one,
             // and an empty or malformed name resolves to nothing.
             for (
                 const value of [
-                    "{env:EMBEDDING_KEY} sk-ant-abcdefghijklmnopqrstuv",
+                    "{env:EMBEDDING_API_KEY} sk-ant-abcdefghijklmnopqrstuv",
                     "sk-ant-abcdefghijklmnopqrstuv",
                     "{env:}",
                     "{env:9NOPE}",
-                    "prefix{env:EMBEDDING_KEY}",
+                    "prefix{env:EMBEDDING_API_KEY}",
+                    // An innocuously named variable would resolve a real credential in a child
+                    // whose unauthenticated server can be off loopback.
+                    "{env:FOO}",
+                    "{env:EMBEDDING_KEY}",
                 ]
             ) {
                 expect(() =>

@@ -614,6 +614,20 @@ export async function runPairedDelta(
     for (const record of stored) {
         /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
         if (!inMatrix(record) || !bindingMatches(record, options)) continue;
+        /** `parseRolloutRecords` rejects a negative or non-finite attempt cost, but `RolloutStore` is an interface any caller can implement, so the figures reaching this loop are checked here too: a negative balance keeps `spentUsd + admissionReserveUsd` under the cap and buys arms the cap should have refused, and a negative reserve floor understates the next call. commentlint: allow(JUDGE) */
+        for (const [label, value] of [
+            ["cost", record.costUsd],
+            ["prior-attempts-cost", record.priorAttemptsCostUsd],
+            ["max-attempt-cost", record.maxAttemptCostUsd],
+        ] as const) {
+            if (!Number.isFinite(value) || value < 0) {
+                options.store.release?.();
+                throw new Error(
+                    `records file ${label} is not a non-negative finite number at ` +
+                        `${coordinateKey(record)}; point at a fresh records path`,
+                );
+            }
+        }
         /** The reserve is the expected price of the next single call, so it takes the dearest attempt this coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit. commentlint: allow(JUDGE) */
         reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
