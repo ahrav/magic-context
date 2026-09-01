@@ -38,3 +38,8 @@ mc-store = { path = ".", features = ["test-support"] }
 gix = { workspace = true }
 proptest = "1"
 tempfile = "3"
+criterion = "=0.8.2"
+
+[[bench]]
+name = "scope_algebra"
+harness = false
