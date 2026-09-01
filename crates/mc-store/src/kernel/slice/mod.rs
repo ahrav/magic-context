@@ -9,7 +9,9 @@ use super::Sensitivity;
 pub use alignment::{AlignmentRebuild, AlignmentRow, AlignmentSnapshot};
 pub use read::{DecisionRow, ObservationRow, SliceSnapshot};
 
-pub(crate) use alignment::{rebuild_alignment_tx, rebuild_alignment_with_writer};
+pub(crate) use alignment::{
+    rebuild_alignment_tx, rebuild_alignment_with_writer, ALIGNMENT_DEPENDENCY_KIND,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DecisionPayload {
@@ -38,6 +40,11 @@ pub struct DecisionSpec {
 pub struct ObservationPayload {
     pub summary: String,
     pub classification: String,
+    /// Optional versioned JSON detail (applicability observations carry
+    /// checkout identity, HEAD, evidence, and algorithm versions here).
+    /// Absent on rows written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

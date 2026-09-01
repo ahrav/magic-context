@@ -8,6 +8,11 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { storageSubtreePath } from "../../../plugin/src/shared/data-path";
+import {
+    credentialValueFormat,
+    isCredentialBearingConfigKey,
+    urlCredentialFinding,
+} from "../../../plugin/src/shared/redaction";
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
@@ -155,6 +160,38 @@ function writeConfigs(
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
         : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
+    /** The component scan runs first so the diagnostic names where the credential is. The value rules match a vendor prefix anywhere in the string, so on a URL they would fire on a credential the component scan can attribute to a specific query key or path segment, and report only that the whole value matched. commentlint: allow(JUDGE) */
+    const urlFinding = urlCredentialFinding(mockProviderURL);
+    if (urlFinding !== null) {
+        throw new Error(
+            `mockProviderURL carries a ${urlFinding}; pass credentials through extraEnv`,
+        );
+    }
+    /** The URL is written verbatim as the generated provider's `baseURL`, so it reaches the same file the object channels are scanned for: URI userinfo — `https://token@host` — is a credential the guard refuses anywhere else, and one the component scan does not read. Checked here rather than at the spawn path so a direct caller cannot write one either. commentlint: allow(JUDGE) */
+    const urlFormat = credentialValueFormat(mockProviderURL);
+    if (urlFormat !== null) {
+        throw new Error(
+            `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
+        );
+    }
+    /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
+    /** Snapshotted before the hooks below run, for the same reason `canonicalizeSpawnConfigs` snapshots it. commentlint: allow(JUDGE) */
+    const scannedEnv = opts.extraEnv === undefined ? undefined : { ...opts.extraEnv };
+    const extra =
+        canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra", scannedEnv) ?? {};
+    const magicContextConfig = canonicalConfig(
+        opts.magicContextConfig,
+        "magicContextConfig",
+        scannedEnv,
+    );
+    const projectMagicContextConfig = canonicalConfig(
+        opts.projectMagicContextConfig,
+        "projectMagicContextConfig",
+        scannedEnv,
+    );
+    const contributedProviders = extra.provider;
+    const extraWithoutProvider = { ...extra };
+    delete extraWithoutProvider.provider;
 
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
@@ -165,6 +202,11 @@ function writeConfigs(
         // When compaction is enabled, magic-context disables its conflict detector and the plugin does nothing.
         compaction: { auto: false, prune: false },
         provider: {
+            ...(contributedProviders &&
+                    typeof contributedProviders === "object" &&
+                    !Array.isArray(contributedProviders)
+                ? contributedProviders
+                : {}),
             "mock-anthropic": {
                 api: "@ai-sdk/anthropic",
                 name: "Mock Anthropic",
@@ -192,7 +234,7 @@ function writeConfigs(
                 },
             },
         },
-        ...(opts.openCodeConfigExtra ?? {}),
+        ...extraWithoutProvider,
     };
 
     const magicContext: Record<string, unknown> = {
@@ -202,7 +244,7 @@ function writeConfigs(
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
         sidekick: { disable: true },
-        ...(opts.magicContextConfig ?? {}),
+        ...(magicContextConfig ?? {}),
     };
     if (opts.userMcHostConnectionFile) {
         Object.assign(magicContext, {
@@ -221,7 +263,7 @@ function writeConfigs(
         JSON.stringify(magicContext, null, 2),
     );
 
-    if (opts.projectMagicContextConfig) {
+    if (projectMagicContextConfig) {
         const projectConfigDir = join(env.workdir, ".cortexkit");
         mkdirSync(projectConfigDir, { recursive: true });
         writeFileSync(
@@ -230,7 +272,7 @@ function writeConfigs(
                 {
                     $schema:
                         "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
-                    ...opts.projectMagicContextConfig,
+                    ...projectMagicContextConfig,
                 },
                 null,
                 2,
@@ -238,6 +280,141 @@ function writeConfigs(
         );
     }
 
+}
+
+/**
+ * Every decision that reads a caller-supplied config reads the same serialized value: `writeConfigs` persists it, and the provisioning path reads `compaction.auto` from it to decide whether to initialize the isolated database. Canonicalizing in only one of the two would let a `toJSON()` hook write one configuration and provision for another.
+ * commentlint: allow(JUDGE)
+ */
+function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
+    /** Copied before any `toJSON()` runs, and returned so the child is given the same map that was validated: a hook that replaces `extraEnv` rather than mutating it would otherwise have its replacement forwarded while validation read the map it displaced. commentlint: allow(JUDGE) */
+    const extraEnv = opts.extraEnv === undefined ? undefined : { ...opts.extraEnv };
+    return {
+        ...opts,
+        extraEnv,
+        openCodeConfigExtra: canonicalConfig(
+            opts.openCodeConfigExtra,
+            "openCodeConfigExtra",
+            extraEnv,
+        ),
+        magicContextConfig: canonicalConfig(
+            opts.magicContextConfig,
+            "magicContextConfig",
+            extraEnv,
+        ),
+        projectMagicContextConfig: canonicalConfig(
+            opts.projectMagicContextConfig,
+            "projectMagicContextConfig",
+            extraEnv,
+        ),
+    };
+}
+
+/**
+ * Serialize before validation so `toJSON()` transformations cannot bypass credential checks.
+ * Cyclic input causes `JSON.stringify` to throw before credential validation.
+ */
+function canonicalConfig(
+    value: Record<string, unknown> | undefined,
+    label: string,
+    extraEnv?: Record<string, string>,
+): Record<string, unknown> | undefined {
+    if (value === undefined) return undefined;
+    /** A spread copies own enumerable fields whatever `toJSON()` reported, so the scan and the write must read one representation; `writeConfigs` assembles every file from this return value. commentlint: allow(JUDGE) */
+    const serialized = JSON.parse(JSON.stringify(value)) as unknown;
+    /** A `toJSON()` returning a non-object leaves no fields to spread, and treating it as a config would write the scalar's own properties instead. commentlint: allow(JUDGE) */
+    if (serialized === null || typeof serialized !== "object" || Array.isArray(serialized)) {
+        throw new Error(`${label} must serialize to a JSON object`);
+    }
+    const canonical = serialized as Record<string, unknown>;
+    assertConfigHasNoCredentials(canonical, label, extraEnv);
+    return canonical;
+}
+
+/**
+ * The user config loader expands `{env:NAME}` before the plugin reads a value, and `embedding.api_key` is the schema's only channel for the remote embedding key, so a harness cannot deliver it through `extraEnv` alone.
+ * Anchored at both ends and restricted to an environment variable name, so a credential cannot ride along after the placeholder and an empty name is refused.
+ * The captured name is required to be sensitive by `isSensitiveEnvKey`, which keeps `extraEnv` the only channel that can deliver the resolved value and leaves `assertSecretsBoundToLoopback` covering it: `isInheritableEnvKey` drops ambient sensitive names, so an innocuously named variable would otherwise resolve a real credential inside a child whose unauthenticated server is off loopback.
+ * commentlint: allow(JUDGE)
+ */
+const ENV_PLACEHOLDER = /^\{env:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}$/;
+
+/**
+ * `assertConfigHasNoCredentials` refuses a credential-shaped key name and a value in a named
+ * credential format. Neither test reads a value into a diagnostic: a match is reported by
+ * format name, so a refusal never puts the secret in a log.
+ *
+ * A credential in no recognized format, under an innocuous name, still reaches
+ * `opencode.json` — `extraEnv` remains the only channel that is governed by shape rather
+ * than by recognition.
+ */
+function assertConfigHasNoCredentials(
+    value: unknown,
+    label: string,
+    extraEnv?: Record<string, string>,
+): void {
+    const seen = new WeakSet<object>();
+    const visit = (current: unknown, path: string): void => {
+        if (current === null || typeof current !== "object" || seen.has(current)) return;
+        seen.add(current);
+        for (const [key, child] of Object.entries(current)) {
+            const childPath = `${path}.${key}`;
+            /** The key is judged before anything about the value is considered, including the placeholder exemption below: that exemption is about what a *value* stands for and says nothing about the name it sits under, so letting it `continue` first meant a credential-bearing key was accepted whenever its value happened to be an approved placeholder — the same key with any other value being refused. The label omits the key, because the key is the credential. commentlint: allow(JUDGE) */
+            if (!Array.isArray(current)) {
+                const keyFormat = credentialValueFormat(key) ?? urlCredentialFinding(key);
+                if (keyFormat !== null) {
+                    throw new Error(
+                        `config contains a ${keyFormat} as a property name under ${path}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+            }
+            /** A placeholder is not a credential: what reaches disk is the token, and the value it stands for is resolved from the environment after the file is read. Checked before the key rule so a credential-shaped name can still carry one. commentlint: allow(JUDGE) */
+            const placeholder = typeof child === "string" ? ENV_PLACEHOLDER.exec(child) : null;
+            if (placeholder !== null) {
+                const name = placeholder[1] as string;
+                if (isSensitiveEnvKey(name)) continue;
+                /** A name the sensitive-key rule does not recognize is the case the exemption cannot cover by name alone: `substituteConfigVariables` expands every `{env:NAME}` without consulting that rule, and `isInheritableEnvKey` only strips names it recognizes, so an ambient variable holding a real token under an innocuous label would resolve into the written config. The resolved value is read here so the shape rules judge what the placeholder will become. commentlint: allow(JUDGE) */
+                /** `extraEnv` is what the child is actually given and it overrides the ambient value, so reading `process.env` alone judged a variable the child will never see. The forwarded value is consulted first for that reason. commentlint: allow(JUDGE) */
+                const resolvedFormat = credentialValueFormat(
+                    extraEnv?.[name] ?? process.env[name] ?? "",
+                );
+                if (resolvedFormat !== null) {
+                    throw new Error(
+                        `config references ${name} at ${childPath}, which holds a ` +
+                            `${resolvedFormat} value; rename it so it is recognized as ` +
+                            "sensitive, or pass it through extraEnv",
+                    );
+                }
+                /** No `continue`: an unrecognized name falls through to the rules below, where the credential-bearing-key rule is what refuses it. Only a name the sensitive-key rule recognizes is an approved channel. commentlint: allow(JUDGE) */
+            }
+            if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
+                throw new Error(
+                    `config contains credential-shaped key: ${childPath}; ` +
+                        "pass credentials through extraEnv",
+                );
+            }
+            if (typeof child === "string") {
+                /** A config value can be a URL as easily as the harness's own can, and a deep-merged live provider's `baseURL` is exactly that: a signed URL's signature is recognized by parameter name, which no value rule reads. Run first for the same reason as above — it names the component. commentlint: allow(JUDGE) */
+                const urlValueFinding = urlCredentialFinding(child);
+                if (urlValueFinding !== null) {
+                    throw new Error(
+                        `config contains a ${urlValueFinding} at ${childPath}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+                const format = credentialValueFormat(child);
+                if (format !== null) {
+                    throw new Error(
+                        `config contains a ${format} value at ${childPath}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+            }
+            visit(child, childPath);
+        }
+    };
+    visit(value, label);
 }
 
 /**
@@ -398,7 +575,7 @@ function isInheritableEnvKey(key: string): boolean {
  * Checking the assembled environment would reject every default spawn because it contains the fake `ANTHROPIC_API_KEY`.
  *
  * `assertSecretsBoundToLoopback` does not inspect credentials embedded in `openCodeConfigExtra`.
- * Matching credentials in `openCodeConfigExtra` requires a separate predicate because config keys are camelCase.
+ * `writeConfigs` applies `assertConfigHasNoCredentials` to that channel instead.
  *
  * `Pick<SpawnOptions>` permits forwarding `extraEnv` without `hostname`.
  * Omitting `hostname` uses the all-interfaces default.
@@ -429,6 +606,13 @@ async function spawnOpencodeWithProvision(
 ): Promise<SpawnedOpencode> {
     const hostname = opts.hostname ?? "0.0.0.0";
     assertSecretsBoundToLoopback(opts, hostname);
+    /** Canonicalized and scanned before provisioning, for the same reason the loopback gate runs first: a rejected spawn must not have created a hermetic Rust stack to tear down. `canonicalizeSpawnConfigs` snapshots `extraEnv` ahead of any `toJSON()` and returns that snapshot, so the map the scan read is the map the child is given — re-reading `opts.extraEnv` later would forward whatever a hook left behind, and a hook that replaces the map is never seen by the scan at all. A hook serializes config; it does not get a say in the child's environment. commentlint: allow(JUDGE) */
+    const canonicalOpts: SpawnOptions = canonicalizeSpawnConfigs(opts);
+    /** The gate reads both maps merged. A hook cannot reach the child, but adding a sensitive name is still an attempt worth refusing rather than silently dropping, and this gate is the one that reads the hostname. commentlint: allow(JUDGE) */
+    assertSecretsBoundToLoopback({
+        ...canonicalOpts,
+        extraEnv: { ...(canonicalOpts.extraEnv ?? {}), ...(opts.extraEnv ?? {}) },
+    }, hostname);
 
     // `MC_E2E_MODE` is evaluated at this shared spawn path so Rust suites share provisioning behavior.
     const rustMode = process.env.MC_E2E_MODE === "rust";
@@ -461,15 +645,15 @@ async function spawnOpencodeWithProvision(
     try {
         const resolvedOpts: SpawnOptions = resources
             ? {
-                  ...opts,
+                  ...canonicalOpts,
                   existingEnv: resources.env,
                   userMcHostConnectionFile: resources.connectionFile,
                   projectMagicContextConfig: {
-                      ...(opts.projectMagicContextConfig ?? {}),
+                      ...(canonicalOpts.projectMagicContextConfig ?? {}),
                       transform_mode: "rust",
                   },
               }
-            : opts;
+            : canonicalOpts;
 
         const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
         const port = resolvedOpts.port ?? (await pickFreePort());
@@ -559,6 +743,7 @@ export function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
 
 export const __spawnOpencodeTest = {
     assertSecretsBoundToLoopback,
+    canonicalizeSpawnConfigs,
     isInheritableEnvKey,
     initializeIsolatedContextDb,
     rejectOnSpawnError,

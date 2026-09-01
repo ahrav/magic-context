@@ -52,6 +52,12 @@
       "detections": [{ "secret_type": "slack_token", "offset": 0, "length": 15 }]
     },
     {
+      "name": "slack app-level token",
+      "input": "xapp-1-A0123456789-1234567890123-abcdef",
+      "expected_redacted": "<SLACK_TOKEN_REDACTED>",
+      "detections": [{ "secret_type": "slack_token", "offset": 0, "length": 39 }]
+    },
+    {
       "name": "google api key",
       "input": "AIzaHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH",
       "expected_redacted": "<GOOGLE_API_KEY_REDACTED>",
@@ -251,7 +257,6 @@
     "opaque high entropy value abcdefghijklmnopqrstuvwxyz012345",
     "Bearer abc123def456",
     "short provider prefix sk-short",
-    "\u212aey=abcdefghijklmnop",
-    "xapp-1-A0123456789-1234567890123-abcdef"
+    "\u212aey=abcdefghijklmnop"
   ]
 }

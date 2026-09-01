@@ -6,7 +6,7 @@ export function mcOffOptions(): TestHarnessOptions {
 }
 
 export function naiveCompactionOptions(): TestHarnessOptions {
-    return { openCodeConfigExtra: { compaction: { auto: true } } };
+    return { openCodeConfigExtra: { compaction: { auto: true, prune: false } } };
 }
 
 export interface LiveModelOptions {
@@ -15,7 +15,7 @@ export interface LiveModelOptions {
 }
 
 /**
- *
+ * `RustTestHarness.restart()` drops `openCodeConfigExtra`.
  *
  * `hostname` is `127.0.0.1` to restrict the server to loopback.
  */

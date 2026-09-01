@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::scope::{contains_redaction_placeholder, is_commit_oid, version_req_matches};
+use super::scope::{contains_redaction_placeholder, is_commit_oid, parsed_version_req_matches};
 
 /// Schema tag for capture-time anchor representations stored in the frozen
 /// `anchors.payload` BLOB. The fallback ladder matches a fresh checkout
@@ -56,6 +56,34 @@ impl AnchorKind {
     pub fn from_stored(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == value)
     }
+
+    /// Returns the `QueryContext` dependency used for cache-key derivation.
+    /// An exhaustive match keeps new context-dependent kinds in that
+    /// derivation.
+    pub fn context_dependency(self) -> ContextDependency {
+        match self {
+            Self::Exact => ContextDependency::ExactToken,
+            Self::DeploymentRevision => ContextDependency::DeploymentRevision,
+            Self::ConfigRevision => ContextDependency::ConfigRevision,
+            Self::PlatformVersion => ContextDependency::PlatformVersion,
+            Self::WallClockInterval => ContextDependency::QueryInstant,
+            // Resolved against the checkout graph, not the query context.
+            Self::ReachableFrom | Self::ReachableBetween => ContextDependency::None,
+        }
+    }
+}
+
+/// Which part of a [`QueryContext`] an anchor kind consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContextDependency {
+    None,
+    ExactToken,
+    DeploymentRevision,
+    ConfigRevision,
+    PlatformVersion,
+    QueryInstant,
+    /// Conservative cover for a kind this build cannot map.
+    All,
 }
 
 /// Raw anchor columns as stored in the frozen `anchors` table.
@@ -155,6 +183,8 @@ pub enum AnchorDecodeError {
     MissingValue(AnchorKind),
     ConflictingColumns(AnchorKind),
     InvalidOid(AnchorKind),
+    /// Two capture representations name the same commit.
+    DuplicateCapture,
     InvalidVersionRange,
     InvalidInterval,
 }
@@ -174,6 +204,9 @@ impl std::fmt::Display for AnchorDecodeError {
             Self::InvalidOid(kind) => {
                 write!(f, "anchor kind {} has an invalid git OID", kind.as_str())
             }
+            Self::DuplicateCapture => {
+                write!(f, "anchor payload holds two captures for one commit")
+            }
             Self::InvalidVersionRange => {
                 f.write_str("anchor platform version range is unparseable")
             }
@@ -184,23 +217,35 @@ impl std::fmt::Display for AnchorDecodeError {
 
 impl std::error::Error for AnchorDecodeError {}
 
-fn decode_captures(payload: Option<&[u8]>) -> BTreeMap<String, AnchorCapture> {
+fn decode_captures(
+    payload: Option<&[u8]>,
+) -> Result<BTreeMap<String, AnchorCapture>, AnchorDecodeError> {
     // A missing or unreadable capture payload only disables the fallback
     // rungs; the primary OID and ancestry rungs still decide the anchor.
     let Some(payload) = payload else {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     };
     let Ok(decoded) = serde_json::from_slice::<AnchorCapturePayload>(payload) else {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     };
     if decoded.schema != ANCHOR_CAPTURE_SCHEMA {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     }
-    decoded
-        .captures
-        .into_iter()
-        .map(|capture| (capture.commit_oid.clone(), capture))
-        .collect()
+    let mut captures = BTreeMap::new();
+    for capture in decoded.captures {
+        // Two representations of one commit disagree about what that commit
+        // looked like, and a map would silently keep whichever came last. The
+        // fallback rungs conclude reachability from a representation matching,
+        // so the surviving one decides the verdict; that is a coin toss between
+        // conflicting metadata, not an answer.
+        if captures
+            .insert(capture.commit_oid.clone(), capture)
+            .is_some()
+        {
+            return Err(AnchorDecodeError::DuplicateCapture);
+        }
+    }
+    Ok(captures)
 }
 
 /// Serializes capture representations into the anchor payload shape the
@@ -270,12 +315,12 @@ impl AnchorCondition {
             }),
             AnchorKind::ReachableFrom => Ok(Self::Git(GitCondition::ReachableFrom {
                 oid: require_oid(&row.reachable_from_oid)?,
-                captures: decode_captures(row.payload.as_deref()),
+                captures: decode_captures(row.payload.as_deref())?,
             })),
             AnchorKind::ReachableBetween => Ok(Self::Git(GitCondition::ReachableBetween {
                 start_oid: require_oid(&row.reachable_between_start_oid)?,
                 end_oid: require_oid(&row.reachable_between_end_oid)?,
-                captures: decode_captures(row.payload.as_deref()),
+                captures: decode_captures(row.payload.as_deref())?,
             })),
             AnchorKind::DeploymentRevision => Ok(Self::DeploymentRevision {
                 revision: require(&row.deployment_revision)?,
@@ -366,7 +411,7 @@ pub fn evaluate_non_git(condition: &AnchorCondition, ctx: &QueryContext) -> Anch
             if contains_redaction_placeholder(raw) {
                 return AnchorEvaluation::Uncertain;
             }
-            match version_req_matches(req, raw) {
+            match parsed_version_req_matches(req, raw) {
                 Some(result) => holds(result),
                 None => AnchorEvaluation::Uncertain,
             }
