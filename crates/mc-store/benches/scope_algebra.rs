@@ -65,6 +65,9 @@ fn algebra_benches(c: &mut Criterion) {
     ] {
         context = context.with_value(dimension, value);
     }
+    let first_miss = context
+        .clone()
+        .with_value(Dimension::Domain, "documentation");
 
     let mut group = c.benchmark_group("algebra");
     for (name, scope) in [("one-term", &one), ("eight-term", &eight)] {
@@ -78,6 +81,9 @@ fn algebra_benches(c: &mut Criterion) {
             b.iter(|| scope_overlaps(black_box(scope), black_box(scope), &UnknownGraph));
         });
     }
+    group.bench_function("matches/eight-term-first-miss", |b| {
+        b.iter(|| scope_matches(black_box(&eight), black_box(&first_miss), &UnknownGraph));
+    });
     group.finish();
 }
 
