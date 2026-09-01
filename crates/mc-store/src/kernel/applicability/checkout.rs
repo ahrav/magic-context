@@ -23,6 +23,13 @@ const HASH_CHUNK_BYTES: usize = 64 * 1024;
 /// directory's inode, so the returned parent cannot be moved out from under commentlint: allow(JUDGE)
 /// the caller. commentlint: allow(JUDGE)
 ///
+/// `PATH` descriptors allow child resolution with directory search
+/// permission. Requiring read access would refuse a tracked file under an commentlint: allow(JUDGE)
+/// execute-only directory that git reads fine, and the resulting commentlint: allow(JUDGE)
+/// `out-of-worktree` token would then stop moving when its content changed. A commentlint: allow(JUDGE)
+/// `PATH` descriptor still serves as the base for `openat`, `statat`, and commentlint: allow(JUDGE)
+/// `readlinkat`. commentlint: allow(JUDGE)
+///
 /// `workdir` is trusted; its resolved directory is the containment root.
 fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> Option<(OwnedFd, OsString)> {
     let mut names = Vec::new();
@@ -37,7 +44,7 @@ fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> Option<(OwnedFd, OsS
     let (final_name, ancestors) = names.split_last()?;
     let mut dir = rfs::open(
         workdir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         rfs::Mode::empty(),
     )
     .ok()?;
@@ -45,7 +52,7 @@ fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> Option<(OwnedFd, OsS
         dir = rfs::openat(
             &dir,
             *ancestor,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             rfs::Mode::empty(),
         )
         .ok()?;
@@ -834,27 +841,23 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return "absent";
     };
-    let Some(path) = contained_path(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
         return "absent";
     };
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let Ok(stat) = rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) else {
         return "absent";
     };
-    let file_type = metadata.file_type();
+    let file_type = rfs::FileType::from_raw_mode(stat.st_mode);
     if file_type.is_symlink() {
         return "symlink";
     }
     if file_type.is_dir() {
         return "dir";
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Git reads executability from the owner bit alone, so a file that is commentlint: allow(JUDGE)
-        // group-executable only is still mode 100644 to it. commentlint: allow(JUDGE)
-        if metadata.permissions().mode() & 0o100 != 0 {
-            return "exec";
-        }
+    // Git reads executability from the owner bit alone, so a
+    // group-executable-only file has mode 100644.
+    if stat.st_mode & 0o100 != 0 {
+        return "exec";
     }
     "file"
 }
@@ -1019,5 +1022,37 @@ mod tests {
         assert!(open_parent_beneath(&workdir, Path::new("real/inside")).is_none());
         assert!(open_parent_beneath(&workdir, Path::new("../outside/inside")).is_none());
         assert!(open_parent_beneath(&workdir, Path::new("")).is_none());
+    }
+
+    /// Resolving a known child needs search permission, not read permission,
+    /// so a traversal that demanded read access would lose track of a tracked commentlint: allow(JUDGE)
+    /// file that git still reads — and its content edits with it. commentlint: allow(JUDGE)
+    #[test]
+    fn an_execute_only_ancestor_still_resolves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+        std::fs::create_dir(workdir.join("closed")).unwrap();
+        std::fs::write(workdir.join("closed/tracked"), b"payload").unwrap();
+        // Traversable, not readable — 0o711 would still grant the owner read.
+        std::fs::set_permissions(
+            workdir.join("closed"),
+            std::fs::Permissions::from_mode(0o111),
+        )
+        .unwrap();
+
+        let resolved = open_parent_beneath(workdir, Path::new("closed/tracked"));
+        // Restore before asserting so a failure cannot leave an undeletable dir.
+        std::fs::set_permissions(
+            workdir.join("closed"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let (dir_fd, name) = resolved.expect("an execute-only ancestor is traversable");
+        assert!(open_regular_no_follow_at(&dir_fd, name.as_os_str())
+            .expect("the file is not a scan failure")
+            .is_some());
     }
 }
