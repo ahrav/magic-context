@@ -241,6 +241,9 @@ impl ApplicabilityEngine {
                 AppendOutcome::DeadlineMissed => {
                     Some("evaluation deadline expired before the clearing append")
                 }
+                AppendOutcome::ReceiptWithoutRecord => {
+                    Some("the clearing record this repair replayed is no longer live")
+                }
             };
             if let Some(reason) = unresolved {
                 demote_if_blocked(&mut objects[index], state.as_ref(), reason);

@@ -10,8 +10,6 @@
 //! auto-inject again.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -64,6 +62,10 @@ pub enum AppendOutcome {
     Discarded,
     /// The evaluation deadline expired before the writer could commit.
     DeadlineMissed,
+    /// The receipt for this repair replayed, but no live record carries its
+    /// identity. Receipts are immutable while observations can be retired or
+    /// corrected, so a replay is not by itself proof the record exists.
+    ReceiptWithoutRecord,
 }
 
 /// Repair intent built outside any transaction from snapshot evidence.
@@ -302,14 +304,18 @@ pub fn commit_read_repair(
             .result_json())
     };
     // `commit` blocks for the writer without a timeout, which would let a
-    // near-deadline retrieval wait out its own bound and only then report
-    // `DeadlineMissed`.
-    let result = match budget.deadline() {
-        Some(deadline) => store.commit_before(deadline, commit_intent, operation),
-        None => store.commit(commit_intent, operation),
-    };
+    // bounded retrieval wait out its own bound and only then report
+    // `DeadlineMissed`. An interrupt-only budget needs the same treatment: its
+    // flag is the whole cancellation mechanism.
+    let result = store.commit_within(&budget.acquire_limit(), commit_intent, operation);
     match result {
         Ok(receipt) => {
+            // A replay asserts the effect already landed, which retirement or
+            // correction can have undone since. Verified before the verdict is
+            // reported as durable.
+            if receipt.replayed && !store.repair_record_is_live(&intent.operation_key)? {
+                return Ok(AppendOutcome::ReceiptWithoutRecord);
+            }
             // A dropped confirmation is safe: an evicted entry misses on the
             // next evaluation, which re-derives the verdict and re-appends.
             let _ = engine.confirm_durable_append(&object.token);
@@ -335,6 +341,14 @@ pub struct InjectionBlock {
     /// Commit sequence of the newest observation whose kind differs from
     /// `observation_kind`, or 0 when this kind is the only one recorded.
     pub prior_kind_commit_seq: i64,
+    /// Newest commit sequence at which an applicability observation for this
+    /// (object, checkout) was invalidated, or 0 when none was.
+    ///
+    /// Retiring or correcting a record removes it from the reduction while its
+    /// commit receipt stays, so without this a replacement repair would derive
+    /// the retired record's identity and replay that receipt instead of
+    /// inserting anything.
+    pub invalidated_commit_seq: i64,
     /// Dedup identity of the repair that wrote the latest observation, which is
     /// its `source_id`. A repair whose identity equals this one is already
     /// recorded; one that differs describes a checkout state this record does
@@ -350,12 +364,26 @@ impl InjectionBlock {
     /// the receipt replays. Failing again after a clearing observation crosses commentlint: allow(JUDGE)
     /// a kind change, which advances the generation, so the dedup key differs commentlint: allow(JUDGE)
     /// from the pre-clear repair rather than replaying it. commentlint: allow(JUDGE)
+    /// A reduction whose records were all invalidated: nothing blocks, but the
+    /// generation has moved past the identity those records carried.
+    fn invalidated(invalidated_commit_seq: i64) -> Self {
+        Self {
+            observation_kind: String::new(),
+            commit_seq: 0,
+            blocked: false,
+            prior_kind_commit_seq: 0,
+            invalidated_commit_seq,
+            repair_identity: String::new(),
+        }
+    }
+
     pub fn generation_for(&self, kind: &str) -> i64 {
-        if self.observation_kind == kind {
+        let transition = if self.observation_kind == kind {
             self.prior_kind_commit_seq
         } else {
             self.commit_seq
-        }
+        };
+        transition.max(self.invalidated_commit_seq)
     }
 }
 
@@ -434,6 +462,23 @@ fn scan_error(error: rusqlite::Error) -> KernelError {
 const BLOCK_SCAN_ID_CHUNK: usize = 512;
 
 impl KernelStore {
+    /// Whether a live observation still carries `operation_key` as its repair
+    /// identity, which is the `source_id` the repair wrote.
+    fn repair_record_is_live(&self, operation_key: &str) -> Result<bool, KernelError> {
+        let reader = self.lock_reader()?;
+        reader
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM object_registry
+                     WHERE source_kind=?1 AND source_id=?2
+                       AND invalidated_commit_seq IS NULL
+                 )",
+                rusqlite::params![REPAIR_PRODUCER, operation_key],
+                |row| row.get(0),
+            )
+            .map_err(|_| KernelError::Io)
+    }
+
     /// Derives the injection block for `object_id` at `checkout_identity`
     /// from durable observations: latest applicability observation wins;
     /// no observation means no recorded block. `known_as_of` beyond the
@@ -490,31 +535,21 @@ impl KernelStore {
             return Ok(HashMap::new());
         }
         // `lock_reader` blocks on `Mutex::lock`, which would let a concurrent
-        // reader hold this evaluation past its deadline before the scan reaches
-        // its first poll.
-        let mut reader = match budget.deadline() {
-            Some(deadline) => self.lock_reader_before(deadline)?,
-            None => self.lock_reader()?,
-        };
-        let deadline = budget.deadline();
-        if deadline.is_some() || budget.is_exhausted() {
-            let interrupt = budget.interrupt_flag();
-            reader
-                .progress_handler(
-                    BLOCK_SCAN_PROGRESS_STEPS,
-                    Some(move || {
-                        if interrupt.load(Ordering::Relaxed) {
-                            return true;
-                        }
-                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                            interrupt.store(true, Ordering::Relaxed);
-                            return true;
-                        }
-                        false
-                    }),
-                )
-                .map_err(|_| KernelError::Io)?;
-        }
+        // reader hold this evaluation past its own bound before the scan reaches
+        // its first poll. A budget with no deadline still cancels through its
+        // interrupt, so both travel in the limit.
+        let limit = budget.acquire_limit();
+        let mut reader = self.lock_reader_within(&limit)?;
+        // Installed for every budget, not only for a deadline: an interrupt
+        // raised after the scan starts has to stop it too, and the sort runs
+        // before the first row reaches the row-loop poll.
+        let scan_limit = limit.clone();
+        reader
+            .progress_handler(
+                BLOCK_SCAN_PROGRESS_STEPS,
+                Some(move || scan_limit.should_stop()),
+            )
+            .map_err(|_| KernelError::Io)?;
         let scanned = reduce_with_reader(
             &mut reader,
             object_ids,
@@ -576,13 +611,21 @@ fn reduce_chunk(
     budget: &EvalBudget,
     states: &mut HashMap<String, BlockState>,
 ) -> Result<(), KernelError> {
-    let placeholders = std::iter::repeat_n("?", object_ids.len())
+    // Numbered, not bare `?`: SQLite assigns a bare placeholder one more than
+    // the largest index seen so far, so an explicitly numbered parameter earlier
+    // in the statement would renumber this list.
+    let placeholders = (1..=object_ids.len())
+        .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(",");
     let mut statement = tx
         .prepare(&format!(
             "SELECT d.dependency_object_id, o.observation_kind, o.observation_payload,
-                    o.created_commit_seq, r.source_id
+                    o.created_commit_seq, r.source_id,
+                    CASE
+                        WHEN o.invalidated_commit_seq <= ?{as_of}
+                        THEN o.invalidated_commit_seq
+                    END
              FROM observation_dependencies d
              JOIN observations o ON o.observation_id = d.observation_id
              JOIN object_registry r ON r.object_id = o.object_id
@@ -590,7 +633,6 @@ fn reduce_chunk(
                AND d.dependency_kind = ?{kind}
                AND o.observation_kind LIKE 'applicability.%'
                AND o.created_commit_seq <= ?{as_of}
-               AND (o.invalidated_commit_seq IS NULL OR ?{as_of} < o.invalidated_commit_seq)
              ORDER BY d.dependency_object_id, o.created_commit_seq DESC, o.observation_id DESC",
             kind = object_ids.len() + 1,
             as_of = object_ids.len() + 2,
@@ -606,6 +648,7 @@ fn reduce_chunk(
         .query(rusqlite::params_from_iter(bound))
         .map_err(scan_error)?;
     let mut pending: HashMap<String, Reduction> = HashMap::new();
+    let mut invalidations: HashMap<String, i64> = HashMap::new();
     let mut scanned = 0usize;
     while let Some(row) = rows.next().map_err(scan_error)? {
         scanned += 1;
@@ -623,6 +666,7 @@ fn reduce_chunk(
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
         let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
+        let invalidated: Option<i64> = row.get(5).map_err(|_| KernelError::Io)?;
         match classify_row(&payload, &kind, checkout_digest) {
             RowMatch::Matches => {}
             RowMatch::OtherCheckout => continue,
@@ -631,6 +675,15 @@ fn reduce_chunk(
                 continue;
             }
         }
+        // An invalidated row is out of the reduction but still moves the
+        // generation, so a replacement repair cannot reuse its identity.
+        if let Some(invalidated) = invalidated {
+            invalidations
+                .entry(object_id.clone())
+                .and_modify(|newest| *newest = (*newest).max(invalidated))
+                .or_insert(invalidated);
+            continue;
+        }
         let entry = pending.entry(object_id).or_insert(Reduction::Latest);
         *entry = match std::mem::replace(entry, Reduction::Latest) {
             Reduction::Latest => Reduction::PriorKind(InjectionBlock {
@@ -638,6 +691,7 @@ fn reduce_chunk(
                 observation_kind: kind,
                 commit_seq,
                 prior_kind_commit_seq: 0,
+                invalidated_commit_seq: 0,
                 repair_identity,
             }),
             Reduction::PriorKind(block) if block.observation_kind == kind => {
@@ -651,9 +705,21 @@ fn reduce_chunk(
         };
     }
     for (object_id, reduction) in pending {
-        if let Some(block) = reduction.finish() {
-            states.insert(object_id, block);
+        let Some(mut state) = reduction.finish() else {
+            continue;
+        };
+        if let BlockState::Recorded(block) = &mut state {
+            block.invalidated_commit_seq =
+                invalidations.get(&object_id).copied().unwrap_or_default();
         }
+        states.insert(object_id, state);
+    }
+    // An object whose only records were invalidated still carries a generation,
+    // so a replacement repair does not reuse a retired identity.
+    for (object_id, invalidated) in invalidations {
+        states
+            .entry(object_id)
+            .or_insert_with(|| BlockState::Recorded(InjectionBlock::invalidated(invalidated)));
     }
     Ok(())
 }

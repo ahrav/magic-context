@@ -192,6 +192,13 @@ impl EvalBudget {
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
+
+    /// Both cancellation mechanisms as one value, for the store primitives that
+    /// wait on a connection. A budget with no deadline still cancels through its
+    /// interrupt, so the interrupt travels with the deadline.
+    pub(crate) fn acquire_limit(&self) -> crate::kernel::open::AcquireLimit {
+        crate::kernel::open::AcquireLimit::new(self.deadline, Some(Arc::clone(&self.interrupt)))
+    }
 }
 
 /// `DeadlineWatchdog` raises `budget`'s interrupt when its deadline passes, so commentlint: allow(JUDGE)

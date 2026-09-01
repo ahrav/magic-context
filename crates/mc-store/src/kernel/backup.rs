@@ -133,7 +133,8 @@ impl KernelStore {
         if Instant::now() >= request.deadline {
             return Err(KernelError::Deadline);
         }
-        let mut writer = self.lock_writer_before(request.deadline)?;
+        let mut writer =
+            self.lock_writer_within(&super::open::AcquireLimit::until(request.deadline))?;
         let capture = capture_state(
             &mut writer,
             self.lease_epoch(),

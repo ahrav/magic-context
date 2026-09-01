@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::admission::{AdmissionKey, StoredAdmission};
+use super::open::AcquireLimit;
 use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
@@ -415,21 +416,32 @@ impl KernelStore {
         intent: CommitIntent,
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
     ) -> Result<CommitReceipt, KernelError> {
-        self.commit_inner(intent, operation, || Ok(()), Some(deadline))
+        self.commit_within(&AcquireLimit::until(deadline), intent, operation)
     }
 
-    /// `deadline` of `None` waits for the writer without a bound.
+    /// `commit_before` for a caller carrying a cooperative interrupt as well as,
+    /// or instead of, a deadline.
+    pub(crate) fn commit_within(
+        &self,
+        limit: &AcquireLimit,
+        intent: CommitIntent,
+        operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
+    ) -> Result<CommitReceipt, KernelError> {
+        self.commit_inner(intent, operation, || Ok(()), Some(limit.clone()))
+    }
+
+    /// `limit` of `None` waits for the writer without a bound.
     fn commit_inner(
         &self,
         intent: CommitIntent,
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
         after_events: impl FnOnce() -> Result<(), KernelError>,
-        deadline: Option<Instant>,
+        limit: Option<AcquireLimit>,
     ) -> Result<CommitReceipt, KernelError> {
         let intent = RedactedIntent::new(intent)?;
         let transaction_id = operation_identity(&intent);
-        let mut writer = match deadline {
-            Some(deadline) => self.lock_writer_before(deadline)?,
+        let mut writer = match &limit {
+            Some(limit) => self.lock_writer_within(limit)?,
             None => self.lock_writer()?,
         };
         commit_prepared_with_writer(

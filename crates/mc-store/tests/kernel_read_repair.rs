@@ -1872,3 +1872,188 @@ fn an_unreadable_row_degrades_only_its_own_object() {
         .iter()
         .all(|object| object.state.blocks_auto_injection()));
 }
+
+/// A budget can carry a shared interrupt with no deadline, and that flag is then
+/// the whole cancellation mechanism. Acquiring a connection must observe it.
+#[test]
+fn an_interrupt_only_budget_stops_a_blocked_reader_acquisition() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+
+    let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let budget = EvalBudget::new(None, std::sync::Arc::clone(&interrupt));
+    let started = Instant::now();
+    let (error, elapsed) = std::thread::scope(|threads| {
+        threads.spawn(|| store.hold_readers_for_test(Duration::from_millis(1_500)));
+        std::thread::sleep(Duration::from_millis(50));
+        // Cancellation is raised while every reader is occupied.
+        let raiser = threads.spawn({
+            let interrupt = std::sync::Arc::clone(&interrupt);
+            move || {
+                std::thread::sleep(Duration::from_millis(150));
+                interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let error = store
+            .applicability_block_states_at_tip(&[TARGET_OBJECT], snapshot.identity(), &budget)
+            .unwrap_err();
+        raiser.join().unwrap();
+        (error, started.elapsed())
+    });
+    assert_eq!(error, KernelError::Deadline);
+    assert!(
+        elapsed < Duration::from_millis(1_400),
+        "acquisition stopped on the interrupt rather than on the holder, took {elapsed:?}"
+    );
+}
+
+/// Same contract on the writer side: an interrupt-only budget must not wait out
+/// a slow commit before noticing cancellation.
+#[test]
+fn an_interrupt_only_budget_stops_a_blocked_writer_acquisition() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    let intent_record =
+        RepairIntent::for_classification(&snapshot, &batch.objects[0], None, "test", 42).unwrap();
+
+    let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let budget = EvalBudget::new(None, std::sync::Arc::clone(&interrupt));
+    let held = std::sync::Barrier::new(2);
+    let started = Instant::now();
+    let (outcome, elapsed) = std::thread::scope(|threads| {
+        hold_writer(
+            threads,
+            &store,
+            &held,
+            "interrupt-domain",
+            Duration::from_millis(1_500),
+        );
+        threads.spawn({
+            let interrupt = std::sync::Arc::clone(&interrupt);
+            move || {
+                std::thread::sleep(Duration::from_millis(150));
+                interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let outcome = commit_read_repair(
+            &store,
+            &engine,
+            &snapshot,
+            &batch.objects[0],
+            &intent_record,
+            &budget,
+        )
+        .unwrap();
+        (outcome, started.elapsed())
+    });
+    assert_eq!(outcome, AppendOutcome::DeadlineMissed);
+    assert!(
+        elapsed < Duration::from_millis(1_400),
+        "the commit stopped on the interrupt rather than on the holder, took {elapsed:?}"
+    );
+}
+
+/// Commit receipts are immutable while observations can be retired, so a replay
+/// is not proof the record still exists. The generation moves past a retired
+/// record so the replacement lands, and a replay with no live record does not
+/// report as durable.
+#[test]
+fn retiring_a_clearing_record_lets_the_next_clear_land() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+    let evaluate = || {
+        ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &EvalBudget::unbounded(),
+            )
+            .unwrap()
+    };
+
+    evaluate();
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    let cleared = evaluate();
+    assert_eq!(cleared.objects[0].state, ApplicabilityState::Current);
+    let clearing_object = text(
+        store_dir.path(),
+        &format!(
+            "SELECT object_id FROM observations
+             WHERE observation_kind='{OBSERVATION_KIND_CURRENT}'"
+        ),
+    );
+
+    // An operator retires the clearing record; its receipt stays.
+    store
+        .commit(intent("retire-clear", 'c'), |envelope| {
+            envelope.retire_observation(&clearing_object)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert!(
+        store
+            .applicability_block_state(
+                TARGET_OBJECT,
+                snapshot.identity(),
+                store.known_as_of(0).unwrap().tip
+            )
+            .unwrap()
+            .expect("the stale record is exposed again")
+            .blocked,
+        "retiring the clear restores the older block"
+    );
+
+    // Re-evaluating the same passing checkout has to land a replacement rather
+    // than replay the retired receipt.
+    let report = evaluate();
+    assert!(
+        matches!(
+            report.appends().next(),
+            Some((
+                _,
+                AppendOutcome::Landed {
+                    replayed: false,
+                    ..
+                }
+            ))
+        ),
+        "a replacement clear lands, got {:?}",
+        report.appends().collect::<Vec<_>>()
+    );
+    assert_eq!(report.objects[0].state, ApplicabilityState::Current);
+    assert!(
+        !store
+            .applicability_block_state(
+                TARGET_OBJECT,
+                snapshot.identity(),
+                store.known_as_of(0).unwrap().tip
+            )
+            .unwrap()
+            .expect("the replacement is visible")
+            .blocked,
+        "the block is genuinely cleared, not just reported clear"
+    );
+}

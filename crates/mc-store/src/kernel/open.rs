@@ -261,37 +261,37 @@ impl KernelStore {
         Ok(writer)
     }
 
-    /// `Mutex::lock` has no timeout, so a deadline-bounded caller polls instead of
+    /// `Mutex::lock` has no timeout, so a bounded caller polls instead of
     /// blocking behind an operation that may outlive its own budget.
-    pub(super) fn lock_writer_before(
+    pub(crate) fn lock_writer_within(
         &self,
-        deadline: Instant,
+        limit: &AcquireLimit,
     ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
-        self.acquire_before(std::slice::from_ref(&self.writer), 0, deadline)
+        self.acquire_within(std::slice::from_ref(&self.writer), 0, limit)
     }
 
     pub(super) fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
     }
 
-    /// Reader counterpart of [`Self::lock_writer_before`], over the whole pool:
+    /// Reader counterpart of [`Self::lock_writer_within`], over the whole pool:
     /// one long-running reader does not decide the outcome.
-    pub(super) fn lock_reader_before(
+    pub(crate) fn lock_reader_within(
         &self,
-        deadline: Instant,
+        limit: &AcquireLimit,
     ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
         let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
-        self.acquire_before(&self.readers, start, deadline)
+        self.acquire_within(&self.readers, start, limit)
     }
 
-    /// Polls `candidates` from `start` until one is free or `deadline` passes,
-    /// so every deadline-bounded acquisition shares one poison-check order and
-    /// one backoff.
-    fn acquire_before<'pool>(
+    /// Polls `candidates` from `start` until one is free or `limit` says stop,
+    /// so every bounded acquisition shares one poison-check order and one
+    /// backoff.
+    fn acquire_within<'pool>(
         &self,
         candidates: &'pool [Mutex<Connection>],
         start: usize,
-        deadline: Instant,
+        limit: &AcquireLimit,
     ) -> Result<std::sync::MutexGuard<'pool, Connection>, KernelError> {
         loop {
             if self.poisoned.load(Ordering::Acquire) {
@@ -308,7 +308,7 @@ impl KernelStore {
                 }
                 return Ok(guard);
             }
-            if Instant::now() >= deadline {
+            if limit.should_stop() {
                 return Err(KernelError::Deadline);
             }
             std::thread::sleep(WRITER_ACQUIRE_POLL);
@@ -1099,5 +1099,55 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+}
+
+/// When a bounded caller stops waiting for a connection.
+///
+/// A deadline and a cooperative interrupt are separate mechanisms: a caller can
+/// arm either, both, or only the interrupt, and an interrupt-only caller still
+/// has to be able to stop. This carries them as plain values so the store's
+/// acquisition path does not depend on the applicability engine's budget type.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AcquireLimit {
+    deadline: Option<Instant>,
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl AcquireLimit {
+    pub(crate) fn new(
+        deadline: Option<Instant>,
+        interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        Self {
+            deadline,
+            interrupt,
+        }
+    }
+
+    pub(crate) fn until(deadline: Instant) -> Self {
+        Self::new(Some(deadline), None)
+    }
+
+    /// Raises the interrupt when the deadline passes, so one crossing stops
+    /// every waiter sharing the flag rather than only the one that noticed.
+    pub(crate) fn should_stop(&self) -> bool {
+        if self
+            .interrupt
+            .as_ref()
+            .is_some_and(|interrupt| interrupt.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            if let Some(interrupt) = &self.interrupt {
+                interrupt.store(true, Ordering::Relaxed);
+            }
+            return true;
+        }
+        false
     }
 }
