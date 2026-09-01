@@ -361,6 +361,36 @@ fn batch_benches(c: &mut Criterion) {
             });
         }
     }
+
+    for index in 0..1_000 {
+        write_worktree_file(&fixture.repo, &format!("dirty/{index}.txt"), "uncommitted");
+    }
+    let dirty_snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    for (name, affected_path) in [("dirty-disjoint", "docs"), ("dirty-overlap", "dirty")] {
+        let candidates: Vec<_> = (0..512)
+            .map(|index| ApplicabilityCandidate {
+                payload: Some(
+                    ObjectApplicabilitySpec::new(vec![affected_path.to_string()], vec![]).encode(),
+                ),
+                ..candidate(&format!("dirty-object-{index}"))
+            })
+            .collect();
+        group.bench_function(BenchmarkId::new(name, 512), |b| {
+            b.iter_batched(
+                ApplicabilityEngine::new,
+                |engine| {
+                    engine.evaluate_batch(
+                        black_box(&dirty_snapshot),
+                        black_box(&query),
+                        black_box(&scope),
+                        black_box(&candidates),
+                        &EvalBudget::unbounded(),
+                    )
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
     group.finish();
 }
 
