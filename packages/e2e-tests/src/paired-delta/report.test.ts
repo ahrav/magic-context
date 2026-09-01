@@ -778,4 +778,77 @@ describe("paired-delta calibration reader: series integrity", () => {
         expect(() => readCalibrationRecord(rewrite({ familyNoise: belowFloor })))
             .toThrow(/validity-inconsistent/);
     });
+
+    it("rejects a two-point spread whose variance only a one-point spread can reach", () => {
+        // Spread 2 requires both -1 and 1, making 1 the minimum variance for three observations.
+        const forged = build3().familyNoise.map((noise) => ({
+            ...noise,
+            spread: 2,
+            variance: 1 / 3,
+        }));
+
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: forged })))
+            .toThrow(/validity-inconsistent/);
+    });
+
+    it("accepts a two-point spread at its own floor", () => {
+        // Deltas of +1, -1, and 0 span 2 with variance exactly 1.
+        const spread2 = buildCalibrationRecord({
+            records: [
+                ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: false }),
+                ...coordinate("var-a", 1, { "mc-on": false, "mc-off": true, compaction: true }),
+                ...coordinate("var-a", 2, { "mc-on": true, "mc-off": true, compaction: true }),
+            ],
+            scenarioFamilies: new Map([["var-a", "fam-one"]]),
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            policyFingerprint: H2,
+            implementationDigest: "abc123",
+            targetMinimumDetectableDelta: 0.15,
+            decisions: { familyCount: 1, replicateCount: 3, cadence: "weekly-and-release" },
+        });
+        expect(spread2.familyNoise.map(({ spread, variance }) => [spread, variance]))
+            .toEqual([[2, 1], [2, 1]]);
+
+        const path = join(root, `record-${Math.random().toString(16).slice(2)}.json`);
+        require("node:fs").writeFileSync(path, JSON.stringify(spread2));
+        expect(readCalibrationRecord(path).validForPoolSizing).toBe(true);
+    });
+
+    it("accepts the writer's rounded variance at the spread-1 floor", () => {
+        // Eleven observations with one differing land one ulp below 1/11 after rounding the mean.
+        const eleven = buildCalibrationRecord({
+            records: Array.from({ length: 11 }, (_, index) =>
+                coordinate("var-a", index, {
+                    "mc-on": true,
+                    "mc-off": index === 0,
+                    compaction: index === 0,
+                })).flat(),
+            scenarioFamilies: new Map([["var-a", "fam-one"]]),
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            policyFingerprint: H2,
+            implementationDigest: "abc123",
+            targetMinimumDetectableDelta: 0.15,
+            decisions: { familyCount: 1, replicateCount: 11, cadence: "weekly-and-release" },
+        });
+        expect(eleven.validForPoolSizing).toBe(true);
+        expect(eleven.familyNoise[0]?.variance).toBeLessThan(1 / 11);
+
+        const path = join(root, `record-${Math.random().toString(16).slice(2)}.json`);
+        require("node:fs").writeFileSync(path, JSON.stringify(eleven));
+        expect(readCalibrationRecord(path).validForPoolSizing).toBe(true);
+    });
+
+    it("rejects a scenario depth above the declared replicate count", () => {
+        // Inflating depth and series counts together clears the family-sum cross-check.
+        const inflated = build3();
+
+        expect(() => readCalibrationRecord(rewrite({
+            scenarioDepth: { "var-a": 4 },
+            familyNoise: inflated.familyNoise.map((noise) => ({ ...noise, observationCount: 4 })),
+        }))).toThrow(/validity-inconsistent/);
+    });
 });

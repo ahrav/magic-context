@@ -248,19 +248,47 @@ function scopeDigest(): string {
             parts.push(Buffer.from("<unreadable>", "utf8"));
         }
     }
-    parts.push(...loadedBundleParts(root));
-    parts.push(...resolvedRuntimeParts());
-    parts.push(...installedDependencyParts());
+    parts.push(...executingSystemParts(root));
     return Bun.hash(Buffer.concat(parts)).toString(16);
+}
+
+/**
+ * The non-git inputs that execute rollouts or read the ledger, shared by both bindings.
+ *
+ * Excluding a system input lets the records binding combine coordinates from different session or ledger implementations.
+ */
+function executingSystemParts(root: string): Uint8Array[] {
+    return [
+        ...loadedBundleParts(root),
+        ...resolvedRuntimeParts(),
+        ...installedDependencyParts(),
+        ...hostRuntimeParts(),
+    ];
+}
+
+/**
+ * Bun version, revision, and executable bytes bind runs to the same host runtime.
+ *
+ * A direct calibration runs on the host's Bun, which loads this module and its SQLite driver.
+ */
+function hostRuntimeParts(): Uint8Array[] {
+    const parts = [
+        Buffer.from(`${process.execPath}\0`, "utf8"),
+        Buffer.from(`${Bun.version}\0${Bun.revision}\0`, "utf8"),
+    ];
+    try {
+        parts.push(readFileSync(process.execPath));
+    } catch {
+        parts.push(Buffer.from("<unreadable>", "utf8"));
+    }
+    return parts;
 }
 
 /**
  * The bytes of the plugin bundle the harness will load.
  *
  * `pluginEntryPath` prefers an existing `dist` build, which is ignored, so no git-based digest can
- * see it — `--exclude-standard` skips ignored paths by design. Both bindings need it: the
- * implementation digest so calibration cannot be reused across a rebuild, and the records binding
- * so a resume cannot mix coordinates measured against two bundles.
+ * see it — `--exclude-standard` skips ignored paths by design.
  */
 /**
  * The OpenCode executable the harness will launch.
@@ -377,7 +405,7 @@ function recordsRepoCommit(ownedPaths: readonly string[]): string {
         "--",
         ...scope,
     ]).trim();
-    const bundle = [...loadedBundleParts(root), ...resolvedRuntimeParts()];
+    const bundle = executingSystemParts(root);
     /** A clean tree still has to account for the ignored bundle, so the digest is unconditional. */
     if (status === "") {
         return `${commit}-runtime-${Bun.hash(Buffer.concat(bundle)).toString(16)}`;
@@ -914,8 +942,10 @@ function historianAbandoned(logPath: string, sessionId: string): boolean {
  * The plugin resumes the parent prompt when the historian exceeds its pressure wait, so a child call
  * can finish or retry after the final parent response. Nothing in the schema exposes an in-flight
  * invocation — `recordChildInvocation` writes one row with a terminal status when the call ends — so
- * quiescence is observed rather than queried. A session that never settles throws instead of being
- * priced from a moving ledger.
+ * quiescence is observed rather than queried.
+ *
+ * Scored rollouts reject an incomplete ledger because in-flight calls can change billed usage.
+ * Failed rollouts charge it: each row is a call the provider already billed, the runner takes the larger of this and its worst-case bound, and rejecting would fall back to a bound the historian's retry tree exceeds. commentlint: allow(JUDGE)
  */
 async function settledSessionUsage(
     harness: TestHarness,
@@ -923,13 +953,17 @@ async function settledSessionUsage(
     pinned: { providerId: string; modelId: string },
     expectedMockEntries: number,
     logPath: string,
-    /** Smaller on the failure path, which runs inside `LATE_DISPOSAL_GRACE_MS`; a settle that outlasts the grace is cut off every time and measures nothing. */
-    attempts: number = LEDGER_SETTLE_ATTEMPTS,
+    settle: {
+        /** Smaller on the failure path, which runs inside `LATE_DISPOSAL_GRACE_MS`; a settle that outlasts the grace is cut off every time and measures nothing. */
+        attempts: number;
+        incomplete: "reject" | "charge";
+    } = { attempts: LEDGER_SETTLE_ATTEMPTS, incomplete: "reject" },
 ): Promise<SessionUsage> {
     let previous: string | null = null;
-    for (let attempt = 0; attempt < attempts; attempt++) {
+    let last: SessionUsage | null = null;
+    for (let attempt = 0; attempt < settle.attempts; attempt++) {
         /** Checked every pass, not once: the plugin buffers its log for 500 ms, so the marker can appear after the first read. */
-        if (historianAbandoned(logPath, sessionId)) {
+        if (settle.incomplete === "reject" && historianAbandoned(logPath, sessionId)) {
             throw new Error(
                 "live paired-delta cannot price this rollout: the plugin resumed the parent with " +
                 "a historian still running, so the ledger is incomplete by construction",
@@ -939,11 +973,13 @@ async function settledSessionUsage(
         const signature = JSON.stringify(reading);
         if (signature === previous) return reading;
         previous = signature;
+        last = reading;
         await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
     }
+    if (settle.incomplete === "charge" && last !== null) return last;
     throw new Error(
         `live paired-delta session ledger did not settle within ` +
-        `${attempts} reads; a background call may still be running`,
+        `${settle.attempts} reads; a background call may still be running`,
     );
 }
 
@@ -1047,31 +1083,36 @@ async function sessionUsage(
  * Whether the plugin ran for this session, and — when the arm's intervention is memory — delivered it.
  *
  * A `session_meta` row proves the plugin saw the session, not that anything reached the prompt.
- * `inject-compartments` records `memory_block_count` when it materializes memory blocks, so for an
- * arm whose intervention *is* the seeded gold, that count is the identity evidence: without it an R2
- * rollout where preparation was disabled or failed mid-transform enters both the formation and
- * representation deltas as though the intervention ran, and the delta absorbs the failure as an
- * effect of Magic Context.
+ * `memory_block_ids` can include project memory from earlier turns; required seeded locators prove delivery.
  */
 function pluginProcessedSession(
     harness: TestHarness,
     sessionId: string,
-    /** Whether the arm's intervention is the seeded memory set, which must be materialized rather than merely seeded. */
-    requiresMaterializedMemory: boolean,
+    /** The seeded revision locators the arm must have rendered, or `null` when the arm's intervention is not the seeded memory set. */
+    requiredLocators: readonly string[] | null,
 ): boolean {
     if (!harness.hasContextDb()) return false;
     try {
         const row = harness.contextDb()
-            .prepare(
-                "SELECT COUNT(*) AS count, COALESCE(MAX(memory_block_count), 0) AS blocks " +
-                "FROM session_meta WHERE session_id = ?",
-            )
-            .get(sessionId) as { count: number; blocks: number } | null;
-        if ((row?.count ?? 0) === 0) return false;
-        return requiresMaterializedMemory ? (row?.blocks ?? 0) > 0 : true;
+            .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { memory_block_ids: string | null } | null;
+        if (row === null) return false;
+        if (requiredLocators === null) return true;
+        /** An empty requirement is a seeding that produced nothing, not an intervention that needs no evidence. */
+        if (requiredLocators.length === 0) return false;
+        const rendered = parseRenderedLocators(row.memory_block_ids);
+        return requiredLocators.every((locator) => rendered.has(locator));
     } catch {
         return false;
     }
+}
+
+/** Absent or non-array `memory_block_ids` yields no locators, so required locator checks fail. */
+function parseRenderedLocators(raw: string | null): Set<string> {
+    if (raw === null) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((value): value is string => typeof value === "string"));
 }
 
 function configMatchesArm(
@@ -1327,7 +1368,9 @@ export function createLiveDependencies(input: {
                             pluginProcessedSession(
                                 harness,
                                 sessionId,
-                                coordinate.armId === "r2",
+                                coordinate.armId === "r2"
+                                    ? seeded.map(({ revisionLocator }) => revisionLocator)
+                                    : null,
                             )
                         ) &&
                         r1Valid;
@@ -1356,14 +1399,14 @@ export function createLiveDependencies(input: {
                  * bound and the measurement is larger.
                  */
                 async usageOnFailure() {
-                    /** The same settle-and-marker path as a successful rollout: a single snapshot here can miss an abandoned historian and its retries, and the four-call fallback would then undercharge the cap. */
+                    /** The same settle path as a scored rollout, charging rather than rejecting an incomplete ledger: a single snapshot misses an abandoned historian's retries, and a rejection falls back to the four-call bound those retries exceed. */
                     return (await settledSessionUsage(
                         harness,
                         activeSessionId ?? "",
                         { providerId: input.providerId, modelId: input.modelId },
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                         logPath,
-                        LEDGER_SETTLE_ATTEMPTS_ON_FAILURE,
+                        { attempts: LEDGER_SETTLE_ATTEMPTS_ON_FAILURE, incomplete: "charge" },
                     )).usage;
                 },
                 async dispose() {

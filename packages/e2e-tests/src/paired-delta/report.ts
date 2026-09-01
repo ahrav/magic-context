@@ -636,12 +636,7 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     /**
  * Whether a noise row could have come from real observations.
  *
- * A primary endpoint delta is one of `{-1, 0, 1}`, so a family whose observations are not all equal
- * has a range of at least 1, and its minimum sample variance is `1/n` — reached by `n-1` equal
- * observations and one differing by 1. Without this, a self-consistently fingerprinted record can
- * pair `spread: 0` with a token `variance: 1e-12`, satisfy the `variance > 0` gate, and shrink the
- * derived pool to something the live cohort happens to clear. The relationship is checked rather
- * than the discrete observations retained, since the record is a summary by design.
+ * A primary endpoint delta is one of `{-1, 0, 1}`. Observations spanning 1 have sample variance of at least `1/n`, from `n-1` equal values and one differing by 1; observations spanning 2 contain both -1 and 1, so at least `2/(n-1)`, from the rest at 0. Accepting `1/n` for `spread: 2` lets a record claim a variance no such series produces and derive a smaller pool. Without either floor, a self-consistently fingerprinted record can pair `spread: 0` with a token `variance: 1e-12`, satisfy the `variance > 0` gate, and shrink the derived pool to something the live cohort happens to clear. The relationship is checked rather than the discrete observations retained, since the record is a summary by design. commentlint: allow(JUDGE)
  */
 function arithmeticallyReachable(noise: CalibrationFamilyNoise): boolean {
     if (noise.observationCount < 2) return false;
@@ -649,11 +644,18 @@ function arithmeticallyReachable(noise: CalibrationFamilyNoise): boolean {
         return false;
     }
     if (noise.spread === 0) return noise.variance === 0;
-    return noise.variance >= 1 / noise.observationCount;
+    const floor = noise.spread === MAX_ENDPOINT_SPREAD
+        ? 2 / (noise.observationCount - 1)
+        : 1 / noise.observationCount;
+    /** The writer sums squared deviations from a rounded mean, so at the floor its variance can land one ulp below the closed form — `n = 11` gives `0.0909090909090909` against `0.09090909090909091` — and an exact comparison rejects a series the writer produced. The next larger reachable variance is at least `1/(n(n-1))` away, so the tolerance admits no forgery. commentlint: allow(JUDGE) */
+    return noise.variance >= floor * (1 - VARIANCE_FLOOR_TOLERANCE);
 }
 
 /** `{-1, 0, 1}` deltas cannot range wider than 2. */
 const MAX_ENDPOINT_SPREAD = 2;
+
+/** Relative slack for the writer's floating-point variance, far below any gap between reachable variances. */
+const VARIANCE_FLOOR_TOLERANCE = 1e-9;
 
 /** The declared depth, not a hard-coded two: `buildCalibrationRecord` requires every scenario to reach `replicateCount`, and a reader accepting less would admit the undersampled pilot the writer refused. */
     const depth = Number.isSafeInteger(record.decisions?.replicateCount)
@@ -661,11 +663,12 @@ const MAX_ENDPOINT_SPREAD = 2;
         : 2;
     /** Per scenario, not per family: a family with two scenarios is satisfied by one of them at full depth if only the aggregate is checked. */
     const perScenario = record.scenarioDepth as Record<string, number> | null | undefined;
+    /** Exactly the declared depth, not at least it: the rollout matrix holds `replicateCount` coordinates per scenario and the store keeps one record per coordinate, so a larger depth describes observations the writer cannot have made, and inflating every depth and `observationCount` together clears the family-sum cross-check while the larger `n` admits a smaller variance. commentlint: allow(JUDGE) */
     const depthPerScenario = perScenario !== null && perScenario !== undefined &&
         typeof perScenario === "object" &&
         Object.keys(perScenario).length > 0 &&
         Object.values(perScenario).every((count) =>
-            Number.isSafeInteger(count) && count >= depth);
+            Number.isSafeInteger(count) && count === depth);
     const consistent = record.runStatus === "completed" &&
         record.varianceEstablished === true &&
         depthPerScenario &&
