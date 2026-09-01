@@ -560,14 +560,20 @@ describe("paired-delta calibration record", () => {
         expect(built.validForPoolSizing).toBe(false);
     });
 
-    it("collapses the endpoint series to one resolvable floor per family", () => {
-        // `estimateFamilyDeltas` keys one floor per family and rejects a repeated id.
+    it("derives one resolvable floor per family and endpoint", () => {
         const floors = calibrationNoiseFloors(build(split));
-        const one = floors.find(({ familyId }) => familyId === "fam-one")!;
+        const one = floors.find(({ familyId, endpoint }) =>
+            familyId === "fam-one" && endpoint === "mc-on-vs-mc-off")!;
         const noise = build(split).familyNoise
             .find((row) => row.familyId === "fam-one" && row.endpoint === "mc-on-vs-mc-off")!;
 
-        expect(floors.map(({ familyId }) => familyId)).toEqual(["fam-one", "fam-two"]);
+        /** Endpoint identity is kept, so a noisy baseline cannot withhold resolution from a stable one. */
+        expect(floors.map(({ familyId, endpoint }) => `${familyId}:${endpoint}`)).toEqual([
+            "fam-one:mc-on-vs-compaction",
+            "fam-one:mc-on-vs-mc-off",
+            "fam-two:mc-on-vs-compaction",
+            "fam-two:mc-on-vs-mc-off",
+        ]);
         /**
          * A valid-success delta is one of -1, 0, 1, so a range-based floor would be at least 1 and
          * mark every family inside it, leaving no endpoint able to resolve.

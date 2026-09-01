@@ -54,6 +54,8 @@ export interface FamilyDeltaObservation {
 }
 
 export interface FamilyNoiseFloor {
+    /** Which delta the floor was measured on. A floor from one primary baseline does not describe the other. */
+    endpoint?: PrimaryEndpoint;
     familyId: string;
     value: number;
     interval: Interval;
@@ -142,6 +144,11 @@ function bootstrapInterval(
     };
 }
 
+/** Both identifiers are free-form, so the key is JSON-encoded rather than joined. */
+function floorKey(familyId: string, endpoint: PrimaryEndpoint | undefined): string {
+    return JSON.stringify([familyId, endpoint ?? null]);
+}
+
 function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
 }
@@ -168,9 +175,9 @@ function estimateEndpoint(
      * calibration never sampled, which can both resolve noisy representation evidence and suppress a
      * stable one.
      */
-    const applicable = PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint)
-        ? noiseFloors
-        : new Map<string, FamilyNoiseFloor>();
+    const primary = PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint)
+        ? (endpoint as PrimaryEndpoint)
+        : null;
     const families = [...byFamily].sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([familyId, values]): FamilyEstimate => {
             const pointEstimate = mean(values);
@@ -179,7 +186,12 @@ function estimateEndpoint(
                 bootstrapResamples,
                 bootstrapSeed ^ fnv1a32(`${endpoint}:${familyId}`),
             );
-            const floor = applicable.get(familyId) ?? null;
+            /** An endpoint-keyed floor first, then one recorded without an endpoint, so a record from either shape resolves. */
+            const floor = primary === null
+                ? null
+                : noiseFloors.get(floorKey(familyId, primary)) ??
+                    noiseFloors.get(floorKey(familyId, undefined)) ??
+                    null;
             const label: NoiseComparison = floor === null
                 ? "no-noise-floor"
                 : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
@@ -298,7 +310,7 @@ export function estimateFamilyDeltas(input: {
         // A malformed floor must surface as a typed estimator error, not a TypeError from reading `interval`.
         const interval: Interval | null | undefined = floor.interval;
         if (
-            noiseFloors.has(floor.familyId) ||
+            noiseFloors.has(floorKey(floor.familyId, floor.endpoint)) ||
             !Number.isFinite(floor.value) ||
             floor.value < 0 ||
             interval === null ||
@@ -312,7 +324,7 @@ export function estimateFamilyDeltas(input: {
         ) {
             throw new PairedDeltaEstimatorError(`noise-floor-invalid-${floor.familyId}`);
         }
-        noiseFloors.set(floor.familyId, floor);
+        noiseFloors.set(floorKey(floor.familyId, floor.endpoint), floor);
     }
 
     const sorted = [...input.observations].sort((left, right) =>

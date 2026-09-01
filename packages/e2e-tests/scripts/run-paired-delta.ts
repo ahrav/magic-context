@@ -29,7 +29,7 @@ import {
     type FamilyDeltaObservation,
     type FamilyNoiseFloor,
 } from "../src/paired-delta/estimator";
-import { buildPairedDeltaRegistry } from "../src/paired-delta/registry";
+import { assertFrozenPool, buildPairedDeltaRegistry } from "../src/paired-delta/registry";
 import { validSuccess } from "../src/paired-delta/scoring";
 import {
     buildCalibrationRecord,
@@ -1087,8 +1087,11 @@ export function createLiveDependencies(input: {
  * The window covers the bare negations plus any `n't` contraction, which reaches `haven't`, `isn't`, and `wasn't` without enumerating auxiliaries, rather than attempting sentence parsing.
  * Only a short allowlist of filler words may sit between the negation and the verb, so an unrelated earlier clause — "I did not need help and completed the task" — does not swallow a genuine claim.
  */
-const NEGATED_COMPLETION =
-    /(?:\b(?:not|never|cannot|unable|failed|without|no)\b|n't)(?:\s+(?:yet|ever|even|quite|fully|really|able|been|being|manage|managed|have|has|had|to|the|task|it|this|that|work|job)\b)*[\s,]*$/;
+const NEGATION = "(?:\\b(?:not|never|cannot|unable|failed|without|no)\\b|n't)";
+/** Filler the negation may reach across: the listed auxiliaries and objects, plus any `-ly` adverb, which covers `successfully`, `entirely`, `properly` without enumerating them. A conjunction is absent on purpose, so an unrelated earlier clause still cannot reach the verb. */
+const NEGATION_FILLER =
+    "(?:\\s+(?:yet|ever|even|quite|able|been|being|manage|managed|have|has|had|to|the|task|it|this|that|work|job|[a-z]+ly)\\b)*";
+const NEGATED_COMPLETION = new RegExp(`${NEGATION}${NEGATION_FILLER}[\\s,]*$`);
 
 export function claimsCompletion(text: string): boolean {
     const completion = /\b(?:done|completed|finished|complete)\b/gi;
@@ -1369,15 +1372,29 @@ async function runLive(args: CliArgs): Promise<void> {
          */
         const cohort = scenarioIdsForMode(manifest, mode).size * policy.replicateCount;
         if (cohort < calibration.decisions.poolSize) {
+            const perFamily = Math.ceil(
+                calibration.decisions.poolSize / calibration.decisions.familyCount,
+            );
             throw new Error(
                 `paired-delta ${mode} cohort of ${cohort} coordinates is below the calibrated ` +
-                `${calibration.decisions.poolSize}; re-author the pool or the replicate count, ` +
-                "or re-calibrate",
+                `${calibration.decisions.poolSize} (${perFamily} per family for a ` +
+                `${policy.targetMinimumDetectableDelta} detectable delta at the measured ` +
+                `variance); the pool supplies ${scenarioIdsForMode(manifest, mode).size} ` +
+                `scenarios at replicateCount ${policy.replicateCount}. Raise the pool or the ` +
+                "replicate count in the policy, or lower the target delta; re-calibrating alone " +
+                "will not close a gap this large",
             );
         }
         noiseFloors = calibrationNoiseFloors(calibration);
     }
     const registry = buildPairedDeltaRegistry();
+    /**
+     * The manifest fingerprint is stamped into every record, the calibration binding, and the
+     * report, so a changed scenario or verifier executed against a stale manifest publishes
+     * evidence attributed to a pool that was never run. The unit suite asserts this too, but a
+     * direct paid invocation does not go through it.
+     */
+    assertFrozenPool(registry, manifest);
     const selectedIds = scenarioIdsForMode(manifest, mode);
     const scenarios = [...registry.values()]
         .map(({ declaration }) => declaration)

@@ -600,24 +600,21 @@ function familyFloorValue(noise: CalibrationFamilyNoise): number {
 }
 
 /**
- * The estimator keys one floor per family and rejects a repeated `familyId`, while the record keeps a series per endpoint, so each family collapses to its widest floor.
- * Widest rather than mean, because a floor decides whether an interval is inside measured noise: the narrower endpoint would call a delta resolved that the noisier one cannot separate.
+ * One floor per family and endpoint, matching the series each was measured on.
+ *
+ * Collapsing to a single family floor let a noisy baseline withhold resolution from a stable one,
+ * which discarded the endpoint separation the record deliberately keeps.
  */
 export function calibrationNoiseFloors(
     record: PairedDeltaCalibrationRecord,
 ): FamilyNoiseFloor[] {
-    const widest = new Map<string, FamilyNoiseFloor>();
-    for (const noise of record.familyNoise) {
-        const value = familyFloorValue(noise);
-        const existing = widest.get(noise.familyId);
-        if (existing === undefined || value > existing.value) {
-            widest.set(noise.familyId, {
-                familyId: noise.familyId,
-                value,
-                interval: { lower: 0, upper: value },
-            });
-        }
-    }
-    return [...widest.values()].sort((left, right) =>
-        compareCodeUnits(left.familyId, right.familyId));
+    return record.familyNoise
+        .map(({ familyId, endpoint, ...rest }): FamilyNoiseFloor => {
+            const value = familyFloorValue({ familyId, endpoint, ...rest });
+            return { familyId, endpoint, value, interval: { lower: 0, upper: value } };
+        })
+        .sort((left, right) => compareCodeUnits(
+            `${left.familyId}:${left.endpoint ?? ""}`,
+            `${right.familyId}:${right.endpoint ?? ""}`,
+        ));
 }
