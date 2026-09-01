@@ -450,17 +450,28 @@ pub fn compute_patch_id(
     budget: &EvalBudget,
 ) -> Result<Option<String>, ResolveObstacle> {
     budget_gate(budget)?;
-    let changes = match first_parent_blob_changes(repo, commit, budget)? {
+    let changes = first_parent_blob_changes(repo, commit, budget)?;
+    patch_id_from_changes(repo, changes.as_deref(), budget)
+}
+
+/// Computes the identity from an already-computed first-parent diff to avoid a
+/// second tree walk.
+fn patch_id_from_changes(
+    repo: &gix::Repository,
+    changes: Option<&[gix::object::tree::diff::ChangeDetached]>,
+    budget: &EvalBudget,
+) -> Result<Option<String>, ResolveObstacle> {
+    let changes = match changes {
         Some(changes) if !changes.is_empty() => changes,
         // A merge returns before the diff callback and an empty diff invokes commentlint: allow(JUDGE)
-        // none, so neither path has polled since the gate above. commentlint: allow(JUDGE)
+        // none, so neither path has polled since the caller's gate. commentlint: allow(JUDGE)
         _ => {
             budget_gate(budget)?;
             return Ok(None);
         }
     };
     let mut file_hashes = Vec::with_capacity(changes.len());
-    for change in &changes {
+    for change in changes {
         budget_gate(budget)?;
         let Some(file_hash) = file_change_hash(repo, change, budget)? else {
             return Ok(None);
@@ -712,16 +723,17 @@ pub fn capture_anchor_representation(
 ) -> Option<AnchorCapture> {
     let commit = repo.find_commit(commit_oid).ok()?;
     let tree_oid = commit.tree_id().ok()?.detach();
+    budget_gate(budget).ok()?;
+    let changes = first_parent_blob_changes(repo, commit_oid, budget).ok()?;
     // A lossily converted path would miss real tree entries in
     // `commit_touches_paths`, so non-UTF-8 locations are dropped.
-    let changed_paths = first_parent_blob_changes(repo, commit_oid, budget)
-        .ok()?
-        .unwrap_or_default()
+    let changed_paths = changes
         .iter()
+        .flatten()
         .filter_map(|change| std::str::from_utf8(change.location()).ok())
         .map(str::to_owned)
         .collect();
-    let patch_id = compute_patch_id(repo, commit_oid, budget)
+    let patch_id = patch_id_from_changes(repo, changes.as_deref(), budget)
         .ok()?
         .map(|value| super::super::anchor::PatchIdCapture {
             algorithm: PATCH_ID_ALGORITHM.to_string(),
