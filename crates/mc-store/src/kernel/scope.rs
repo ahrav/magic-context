@@ -1246,7 +1246,18 @@ pub fn scope_matches(
 pub fn scope_subsumes(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
     a.terms()
         .all(|(dimension, term_a)| match b.term(dimension) {
-            Some(term_b) => term_subsumes(term_a, term_b, oracle).unwrap_or(false),
+            Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
+                    if left == right {
+                        true
+                    } else {
+                        a.version_interval(dimension)
+                            .zip(b.version_interval(dimension))
+                            .is_some_and(|(outer, inner)| outer.contains(inner))
+                    }
+                }
+                _ => term_subsumes(term_a, term_b, oracle).unwrap_or(false),
+            },
             // `a` constrains a dimension `b` leaves open: some context outside
             // `a`'s value set matches `b`.
             None => false,
