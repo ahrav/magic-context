@@ -266,20 +266,48 @@ pub fn protected_json_key_label(key: &str) -> Option<String> {
     secret_key_label(key).filter(|_| !bare_map_key)
 }
 
+/// Returns a label only when `key` has a credential qualifier.
+///
+/// `api_key` and `private_key` carry one.
+/// `target_key` and `model_key` reduce to the bare `key` label and name structural rows.
+pub fn qualified_secret_key_label(key: &str) -> Option<String> {
+    secret_key_label(key).filter(|label| !matches!(label.as_str(), "key" | "keys"))
+}
+
 /// Whether a JSON field name has the shape the keyed scanner rules anchor on.
 ///
-/// The keyed rules match a label word anywhere inside the key (`apikey`, `authtoken`), while
-/// [`secret_key_label`] only matches a whole `_`-separated segment. A caller that refuses
-/// secret-named fields outright needs the wider test, or `{"apikey": ..}` passes the field
-/// name gate and the flattened value carries no key context for the rules to fire on.
+/// Keyed rules accept compound keys, unlike [`secret_key_label`].
+/// Matching covers segments, the separator-free key, and qualifier-prefixed compounds.
+/// Whole label words only: a substring test reads `author` as `auth`.
+/// A substring test also misses `passWord`, whose split `pass_word` holds no label word.
 ///
 /// `key` and `keys` are excluded case-insensitively, as in [`protected_json_key_label`].
 pub fn secret_shaped_json_key(key: &str) -> bool {
     if matches!(key.to_ascii_lowercase().as_str(), "key" | "keys") {
         return false;
     }
-    let lowered = separate_words(key).to_ascii_lowercase();
-    LABEL_WORDS.iter().any(|word| lowered.contains(word))
+    if key_names_a_secret(key) {
+        return true;
+    }
+    let joined = separate_words(key)
+        .to_lowercase()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    if names_a_label_word(&joined) {
+        return true;
+    }
+    LABEL_QUALIFIERS.iter().any(|qualifier| {
+        joined
+            .strip_prefix(qualifier)
+            .is_some_and(names_a_label_word)
+    })
+}
+
+/// Whether `word` is a label word, tolerating a plural suffix as the segment test does.
+fn names_a_label_word(word: &str) -> bool {
+    let stem = word.strip_suffix('s').unwrap_or(word);
+    LABEL_WORDS.contains(&stem)
 }
 
 fn key_names_a_secret(key: &str) -> bool {
@@ -405,5 +433,65 @@ mod tests {
         assert_eq!(redaction.text, "<REDACTED:secret>");
         assert_eq!(redaction.detections[0].length, input.len());
         assert!(!redaction.text.contains("sentinel"));
+    }
+
+    #[test]
+    fn secret_shaped_keys_match_whole_label_words() {
+        for key in [
+            "passWord",
+            "apikey",
+            "authtoken",
+            "api_key",
+            "client_secret",
+            "Authorization",
+            "bearerToken",
+        ] {
+            assert!(
+                secret_shaped_json_key(key),
+                "expected {key} to be protected"
+            );
+        }
+        for key in [
+            "author",
+            "authored_by",
+            "key",
+            "keys",
+            "monkey",
+            "keyboard",
+            "display_path",
+        ] {
+            assert!(
+                !secret_shaped_json_key(key),
+                "expected {key} to stay writable"
+            );
+        }
+    }
+
+    #[test]
+    fn only_qualified_key_names_mark_a_credential() {
+        for key in [
+            "api_key",
+            "private_key",
+            "access_key",
+            "apiKey",
+            "aws_secret_access_key",
+        ] {
+            assert!(
+                qualified_secret_key_label(key).is_some(),
+                "expected {key} to name a credential"
+            );
+        }
+        for key in [
+            "key",
+            "keys",
+            "last_model_key",
+            "lineage_descent_target_key",
+            "lineage_descent_source_key",
+        ] {
+            assert!(
+                qualified_secret_key_label(key).is_none(),
+                "expected {key} to name a structural row"
+            );
+        }
     }
 }

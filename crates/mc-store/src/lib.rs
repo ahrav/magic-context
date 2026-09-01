@@ -28,9 +28,10 @@ use mc_core::claim_operation::{
     CLAIM_REQUEST_ENCODING_VERSION,
 };
 use mc_core::redaction::{
-    detector_revision, detector_semantic_digest, protected_json_key_label, redact_durable_text,
-    redact_transaction_durable_text, reject_secret_text, reject_transaction_secret_text, Detection,
-    Redaction, RedactionErrorKind, DETECTOR_ID,
+    detector_revision, detector_semantic_digest, protected_json_key_label,
+    qualified_secret_key_label, redact_durable_text, redact_transaction_durable_text,
+    reject_secret_text, reject_transaction_secret_text, Detection, Redaction, RedactionErrorKind,
+    DETECTOR_ID,
 };
 use rusqlite::{
     functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension, Transaction,
@@ -2919,17 +2920,17 @@ struct PreparedWrite {
     owner_kind: &'static str,
     scans: Vec<PreparedFieldScan>,
     domain_owners: Vec<PreparedDomainOwner>,
-    existing_scan_links: Vec<PreparedExistingScanLink>,
+    existing_scan_links: BTreeSet<PreparedExistingScanLink>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PreparedDomainOwner {
     scope_kind: &'static str,
     scope_key: String,
     owner_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PreparedExistingScanLink {
     scan_id: String,
     owner: PreparedDomainOwner,
@@ -2964,7 +2965,7 @@ impl PreparedWrite {
             owner_kind: family.registration().family.owner_kind(),
             scans: Vec::new(),
             domain_owners: Vec::new(),
-            existing_scan_links: Vec::new(),
+            existing_scan_links: BTreeSet::new(),
         }
     }
 
@@ -3025,13 +3026,10 @@ impl PreparedWrite {
             self.domain_owners.push(owner.clone());
         }
         for scan_id in scan_ids {
-            let link = PreparedExistingScanLink {
+            self.existing_scan_links.insert(PreparedExistingScanLink {
                 scan_id,
                 owner: owner.clone(),
-            };
-            if !self.existing_scan_links.contains(&link) {
-                self.existing_scan_links.push(link);
-            }
+            });
         }
     }
 
@@ -3986,7 +3984,12 @@ fn prepare_json_content_collecting(
         detections: &mut Vec<Detection>,
     ) -> Result<(), McStoreError> {
         if let Some(key) = key.filter(|key| identity_json_field(key) || integrity_json_field(key)) {
-            if identity_json_field(key) && !integrity_json_field(key) && !policy.reject_protected()
+            // `api_key` passes `identity_json_field` and matches no `integrity_json_field`
+            // marker, so the length-only path would store a credential unscanned.
+            if identity_json_field(key)
+                && !integrity_json_field(key)
+                && qualified_secret_key_label(key).is_none()
+                && !policy.reject_protected()
             {
                 ensure_durable_text_bound(key)?;
                 validate_existing_value(value)?;

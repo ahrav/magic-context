@@ -242,6 +242,9 @@ impl From<crate::McStoreError> for ClaimMirrorError {
     fn from(error: crate::McStoreError) -> Self {
         match error {
             crate::McStoreError::Redaction(kind) => Self::Redaction(kind),
+            // Preserve storage failures instead of classifying them as invalid input.
+            crate::McStoreError::Store(error) => Self::Store(error),
+            crate::McStoreError::Serde(reason) => Self::Invalid(reason),
             _ => Self::Invalid("claim mirror preparation failed".to_string()),
         }
     }
@@ -266,11 +269,22 @@ fn prepare_integrity_json(
     field_id: &'static str,
     value: &Value,
 ) -> Result<(), ClaimMirrorError> {
+    /// A secret-named key only conceals a secret when text sits under it.
+    /// Rejecting `{"token_count": 3}` refuses a count that no scanner would flag.
+    fn carries_text(value: &Value) -> bool {
+        match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Array(values) => values.iter().any(carries_text),
+            Value::Object(fields) => fields.values().any(carries_text),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
     fn reject_secret_shaped_keys(value: &Value) -> Result<(), ClaimMirrorError> {
         match value {
             Value::Array(values) => values.iter().try_for_each(reject_secret_shaped_keys),
             Value::Object(fields) => fields.iter().try_for_each(|(key, value)| {
-                if secret_shaped_json_key(key) {
+                if secret_shaped_json_key(key) && carries_text(value) {
                     return Err(ClaimMirrorError::Redaction(
                         RedactionErrorKind::SecretDetected,
                     ));
@@ -286,6 +300,8 @@ fn prepare_integrity_json(
     /// No separator is safe to join on: the keyed rules skip whitespace between `=` and the
     /// value, so a field ending in `password=` swallows the next field's text and reports a
     /// secret that neither field contains.
+    ///
+    /// Object keys are stored verbatim, so scan them for credentials.
     fn scan_leaves(value: &Value, detections: &mut Vec<Detection>) -> Result<(), ClaimMirrorError> {
         match value {
             Value::String(text) => {
@@ -296,14 +312,19 @@ fn prepare_integrity_json(
             Value::Array(values) => values
                 .iter()
                 .try_for_each(|value| scan_leaves(value, detections)),
-            Value::Object(fields) => fields
-                .values()
-                .try_for_each(|value| scan_leaves(value, detections)),
+            Value::Object(fields) => fields.iter().try_for_each(|(key, value)| {
+                ensure_durable_text_bound(key)?;
+                detections.extend(redact_durable_text(key).detections);
+                scan_leaves(value, detections)
+            }),
             Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
         }
     }
 
     reject_secret_shaped_keys(value)?;
+    // Per-leaf bounds admit many small strings whose canonical encoding, which is what the
+    // mirror stores, exceeds the durable limit.
+    ensure_durable_text_bound(&validate_json_object(value, field_id)?)?;
     let mut detections = Vec::new();
     scan_leaves(value, &mut detections)?;
     if !detections.is_empty() {

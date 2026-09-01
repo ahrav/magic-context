@@ -645,3 +645,55 @@ fn integrity_json_rejects_secret_shaped_keys_without_fabricating_cross_field_mat
         )
         .expect("two individually clean fields must not combine into a detection");
 }
+
+/// A secret-shaped name guards text, not structure, and a credential can arrive as a
+/// property name rather than a value.
+#[test]
+fn integrity_json_separates_structural_names_from_credential_bearing_text() {
+    // A number under a secret-shaped name carries no text to conceal, so refusing it would
+    // make ordinary claim vocabulary unwritable.
+    for attributes in [
+        json!({"token_count": 3}),
+        json!({"key_id": 17, "auth_provider": null}),
+        json!({"stream_key": ""}),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut row = claim(CLAIM_A, 41, 3, "content", 7);
+        row.attributes = attributes.clone();
+        store
+            .replace_claim_mirror_snapshot(
+                &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+                100,
+            )
+            .unwrap_or_else(|error| panic!("{attributes} must stay writable: {error}"));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    // `secret_shaped_json_key` tests a name's spelling, so a credential used as a property
+    // name reaches the mirror unless names are scanned as content.
+    let mut row = claim(CLAIM_B, 41, 3, "content", 7);
+    // Assembled at runtime so the fixture carries no credential-shaped literal for a
+    // repository secret scanner to flag; the value the redactor sees is unchanged.
+    let credential = format!(
+        "xoxb-{}-{}-{}",
+        "123456789012", "1234567890123", "abcdefghijklmnopqrstuvwx"
+    );
+    let mut grants = serde_json::Map::new();
+    grants.insert(credential, Value::Bool(true));
+    row.attributes = json!({"grants": Value::Object(grants)});
+    let error = store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+            100,
+        )
+        .expect_err("a credential used as a property name must be refused");
+    assert!(
+        matches!(
+            error,
+            ClaimMirrorError::Redaction(RedactionErrorKind::SecretDetected)
+        ),
+        "unexpected error: {error}"
+    );
+}
