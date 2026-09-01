@@ -3108,12 +3108,18 @@ impl PreparedWrite {
         });
     }
 
-    fn reject_recorded_identities(&self, field_ids: &[&str]) -> Result<(), McStoreError> {
-        if self
-            .scans
+    /// Whether any recorded scan for `field_ids` carried a detection.
+    ///
+    /// A caller checks this before spending an existence query it would only need in order
+    /// to refuse; a clean identity, which is the ordinary case, skips the query entirely.
+    fn recorded_detections(&self, field_ids: &[&str]) -> bool {
+        self.scans
             .iter()
             .any(|scan| field_ids.contains(&scan.field_id) && !scan.redaction.detections.is_empty())
-        {
+    }
+
+    fn reject_recorded_identities(&self, field_ids: &[&str]) -> Result<(), McStoreError> {
+        if self.recorded_detections(field_ids) {
             Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected))
         } else {
             Ok(())
@@ -7745,8 +7751,32 @@ impl McStore {
     /// plain one-statement UPSERT outside the fenced cache-state transaction so the
     /// observability write never contends with or extends the pass commit.
     pub fn trace_pass_received(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
-        self.inner.with_conn(|conn| {
-            conn.prepare_cached(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A clean identity skips this query, so the ordinary pass pays one UPSERT.
+            // A detected one is only tolerable when the session is already keyed by it;
+            // a trace breadcrumb must not be what introduces a secret-bearing session.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.prepare_cached(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -7763,7 +7793,7 @@ impl McStore {
                      first_divergence = NULL",
             )?
             .execute(params![session_id, now_ms])?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
@@ -7780,8 +7810,33 @@ impl McStore {
     ) -> Result<(), McStoreError> {
         let observation_json = serialize_scheduler_observation(observation)?;
         let interesting_json: Option<String> = None;
-        self.inner.with_conn(|conn| {
-            conn.execute(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let observation_json = write.content("scheduler_history", &observation_json)?;
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A clean identity skips this query, so the ordinary pass pays one UPSERT.
+            // A detected one is only tolerable when the session is already keyed by it;
+            // a trace breadcrumb must not be what introduces a secret-bearing session.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -7835,7 +7890,7 @@ impl McStore {
                     interesting_json
                 ],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
@@ -7844,8 +7899,32 @@ impl McStore {
     /// fenced cache-state transaction so a pass completion breadcrumb cannot alter CAS
     /// semantics or hold the commit transaction open longer than the cache write itself.
     pub fn trace_pass_completed(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
-        self.inner.with_conn(|conn| {
-            conn.execute(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A clean identity skips this query, so the ordinary pass pays one UPSERT.
+            // A detected one is only tolerable when the session is already keyed by it;
+            // a trace breadcrumb must not be what introduces a secret-bearing session.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -7860,7 +7939,7 @@ impl McStore {
                      last_completed_at_ms = excluded.last_completed_at_ms",
                 params![session_id, now_ms],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
@@ -17381,6 +17460,73 @@ mod tests {
             stored, secret_session,
             "the stored identity must stay verbatim"
         );
+    }
+
+    /// A pass-trace breadcrumb runs outside the cache transaction and before it, so it must
+    /// not be the write that introduces a secret-bearing session. A session already keyed by
+    /// such an identity still gets its breadcrumb.
+    #[test]
+    fn pass_trace_refuses_a_new_secret_session_and_keeps_tracing_a_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let secret_session = "password=trace-secret";
+
+        for outcome in ["received", "completed"] {
+            let error = match outcome {
+                "received" => store.trace_pass_received(secret_session, 10),
+                _ => store.trace_pass_completed(secret_session, 10),
+            }
+            .expect_err("a trace write must not introduce a secret-bearing session");
+            assert!(
+                matches!(
+                    error,
+                    McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+                ),
+                "{outcome}: unexpected error {error:?}"
+            );
+        }
+        let traced: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_pass_trace WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(traced, 0, "a refused trace write must leave no row");
+
+        // Once the session is keyed by that identity, refusing its breadcrumb would strand
+        // the row without removing the identity from storage.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, 1, '{}', '{}', 0)",
+                    params![secret_session],
+                )
+            })
+            .unwrap();
+        store.trace_pass_received(secret_session, 20).unwrap();
+        store.trace_pass_completed(secret_session, 21).unwrap();
+        let traced: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT receive_count FROM mc_pass_trace WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(traced, 1, "a stored session must still be traced");
+
+        // A clean session is unaffected and pays no extra query.
+        store.trace_pass_received("clean-session", 30).unwrap();
+        store.trace_pass_completed("clean-session", 31).unwrap();
     }
 
     /// A "nothing happened" commit: every optional effect empty. Tests
