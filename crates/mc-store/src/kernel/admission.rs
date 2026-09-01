@@ -1101,7 +1101,7 @@ impl Envelope<'_> {
         )?;
         let mut invalidated = approval;
         invalidated.invalidated_commit_seq = Some(self.commit_seq);
-        let revocation_reason = redact(reason);
+        let revocation_reason = redact(reason)?;
         let revocation_audit = serde_json::json!({
             "approval_object_id": approval_object_id,
             "reason": revocation_reason.text,
@@ -1360,7 +1360,7 @@ impl Envelope<'_> {
             .ok_or(KernelError::AdmissionPolicy)?;
         let source_kind = identity(&prepared.facts.source_kind)?;
         let source_id = identity(&prepared.facts.source_id)?;
-        let reason = redact(&prepared.event.reason);
+        let reason = redact(&prepared.event.reason)?;
         let evidence_id = prepared
             .event
             .evidence_id

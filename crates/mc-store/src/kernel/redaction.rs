@@ -1,4 +1,4 @@
-use mc_core::redaction::{redact_secret_text, Detection};
+use mc_core::redaction::{redact_durable_text, Detection};
 use rusqlite::{params, Transaction};
 
 use super::{map_sqlite, KernelError};
@@ -9,17 +9,26 @@ pub(super) struct RedactedField {
     pub detections: Vec<Detection>,
 }
 
-pub(super) fn redact(value: &str) -> RedactedField {
-    let redaction = redact_secret_text(value);
+/// Use [`redact`] when input may exceed `MAX_REDACTABLE_BYTES`; `redact_lossy`
+/// does not preserve oversized input.
+pub(super) fn redact_lossy(value: &str) -> RedactedField {
+    let redaction = redact_durable_text(value);
     RedactedField {
         text: redaction.text,
         detections: redaction.detections,
     }
 }
 
+pub(super) fn redact(value: &str) -> Result<RedactedField, KernelError> {
+    if value.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
+        return Err(KernelError::InvalidInput);
+    }
+    Ok(redact_lossy(value))
+}
+
 /// Lookup keys, primary keys, and dedup identities must not contain detected secrets because redaction can alias distinct values.
 pub(super) fn identity(value: &str) -> Result<String, KernelError> {
-    let redaction = redact_secret_text(value);
+    let redaction = redact_durable_text(value);
     if redaction.detections.is_empty() {
         Ok(redaction.text)
     } else {

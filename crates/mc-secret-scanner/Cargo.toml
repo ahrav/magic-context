@@ -17,4 +17,11 @@ serde_norway = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+criterion = "=0.8.2"
 proptest = "1.7"
+regex-automata = "0.4"
+regex-syntax = "0.8"
+
+[[bench]]
+name = "scanner"
+harness = false

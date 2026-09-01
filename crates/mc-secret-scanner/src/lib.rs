@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod anchor_proof;
 mod api;
 mod evaluator;
+#[cfg(test)]
+mod kernels;
 mod rules;
 
 pub use api::{

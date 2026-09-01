@@ -1,0 +1,372 @@
+use std::sync::OnceLock;
+
+use mc_core::redaction::{redact_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID};
+use proptest::prelude::*;
+
+fn redactor() -> &'static Redactor {
+    static REDACTOR: OnceLock<Redactor> = OnceLock::new();
+    REDACTOR.get_or_init(|| Redactor::new().unwrap())
+}
+
+#[test]
+fn established_replacement_spelling_remains_stable() {
+    assert_eq!(
+        redact_durable_text("Authorization: Bearer abc123def456ghi789").text,
+        "Authorization: Bearer <REDACTED:bearer>"
+    );
+    for (input, expected) in [
+        (
+            "x_auth_token=hunter-two",
+            "x_auth_token=<REDACTED:x_auth_token>",
+        ),
+        (
+            "client_secret=hunter-two",
+            "client_secret=<REDACTED:client_secret>",
+        ),
+        ("aws_secret=hunter-two", "aws_secret=<REDACTED:aws_secret>"),
+    ] {
+        assert_eq!(redact_durable_text(input).text, expected, "{input}");
+    }
+}
+
+#[test]
+fn portable_scanner_is_authoritative() {
+    let input =
+        "provider AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE";
+    let redaction = redact_durable_text(input);
+    assert_eq!(redaction.text, "provider <REDACTED:secret>");
+    assert!(redaction
+        .detections
+        .iter()
+        .all(|detection| detection.detector_id == DETECTOR_ID));
+}
+
+#[test]
+fn concatenated_secret_keys_remain_redacted() {
+    for input in [
+        "apikey=hunter-two",
+        "authtoken=hunter-two",
+        r#"{"apikeys":"hunter-two"}"#,
+    ] {
+        let redaction = redact_durable_text(input);
+        assert!(!redaction.detections.is_empty(), "{input}");
+        assert!(!redaction.text.contains("hunter-two"), "{input}");
+    }
+}
+
+#[test]
+fn scalar_values_remain_visible() {
+    for input in [
+        "tokens.input=45000",
+        "hasUsageTokens=true",
+        "max_tokens=4096",
+        r#"{"max_tokens":"4096"}"#,
+    ] {
+        assert_eq!(redact_durable_text(input).text, input);
+    }
+}
+
+#[test]
+fn oversized_input_is_rejected_by_direct_scans() {
+    let input = "x".repeat(mc_secret_scanner::MAX_INPUT_BYTES + 1);
+    assert_eq!(
+        redactor().redact(&input).unwrap_err().kind(),
+        RedactionErrorKind::InputLimit
+    );
+}
+
+#[test]
+fn dense_maximum_input_succeeds() {
+    let mut input = "password=x ".repeat(mc_secret_scanner::MAX_INPUT_BYTES / 11 + 1);
+    input.truncate(mc_secret_scanner::MAX_INPUT_BYTES);
+    let redaction = redactor().redact(&input).unwrap();
+    assert!(!redaction.detections.is_empty());
+}
+
+/// An AWS access key ID with a shape the corpus rule accepts and no safelisted word.
+const AWS_KEY: &str = "AKIAQYLPMN5HGZ3ABCDE";
+const AGE_KEY: &str = "AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE";
+
+#[test]
+fn overlapping_findings_collapse_to_one_placeholder_over_their_union() {
+    // A keyed value class admits `-`, so the keyed span reaches past the provider or
+    // upstream shape nested inside it. Replacing per finding would emit a second
+    // placeholder for the trailing bytes and leave them described as their own secret.
+    for (input, expected, secret_type) in [
+        (
+            format!("token={AWS_KEY}-prod"),
+            "token=<REDACTED:token>",
+            "token",
+        ),
+        (
+            format!("password={AGE_KEY}-prod"),
+            "password=<REDACTED:password>",
+            "password",
+        ),
+    ] {
+        let redaction = redact_durable_text(&input);
+        assert_eq!(redaction.text, expected, "{input}");
+        assert_eq!(redaction.detections.len(), 1, "{input}");
+        let detection = &redaction.detections[0];
+        assert_eq!(detection.secret_type, secret_type, "{input}");
+        // The detection covers the whole redacted region, so a consumer reading it
+        // back against the pre-redaction text sees the bytes that were replaced.
+        let value_start = input.find('=').unwrap() + 1;
+        assert_eq!(detection.offset, value_start, "{input}");
+        assert_eq!(detection.length, input.len() - value_start, "{input}");
+        assert!(!redaction.text.contains("-prod"), "{input}");
+    }
+}
+
+#[test]
+fn a_key_name_supersedes_a_value_shape_on_the_same_span() {
+    // The key name states the operator's intent for the value, so it outranks a
+    // provider shape that matches the same bytes. Without a declared precedence the
+    // winner would follow incidental finding order and flip on a regex edit.
+    let redaction = redact_durable_text(&format!("token={AWS_KEY}"));
+    assert_eq!(redaction.text, "token=<REDACTED:token>");
+    assert_eq!(redaction.detections.len(), 1);
+    assert_eq!(redaction.detections[0].secret_type, "token");
+}
+
+#[test]
+fn a_value_shape_keeps_its_own_label_without_a_key_name() {
+    for (input, expected, secret_type) in [
+        (AWS_KEY, "<AWS_ACCESS_KEY_ID_REDACTED>", "aws_access_key_id"),
+        (AGE_KEY, "<REDACTED:secret>", "secret"),
+    ] {
+        let redaction = redact_durable_text(input);
+        assert_eq!(redaction.text, expected, "{input}");
+        assert_eq!(redaction.detections.len(), 1, "{input}");
+        assert_eq!(redaction.detections[0].secret_type, secret_type, "{input}");
+    }
+}
+
+#[test]
+fn only_the_value_span_is_replaced_around_an_assignment() {
+    // The engine this replaces rewrote `key <ws> = <ws> value` as `key=<REDACTED:…>`,
+    // collapsing the spacing because it replaced its whole match. Replacing only the
+    // value span leaves the surrounding bytes, which are not secret, so the redacted
+    // text is a minimal edit of the input rather than a reformatting of it. Pinned
+    // here because the spelling of redacted text is a contract for anything that
+    // parses or compares it.
+    let redaction = redact_durable_text("secret = spaced-value");
+    assert_eq!(redaction.text, "secret = <REDACTED:secret>");
+    assert_eq!(redaction.detections.len(), 1);
+    assert_eq!(redaction.detections[0].offset, 9);
+    assert_eq!(redaction.detections[0].length, "spaced-value".len());
+}
+
+#[test]
+fn a_structural_delimiter_ends_an_unquoted_value_and_quoting_covers_the_rest() {
+    // An unquoted value ends at a shell delimiter. Accepting one as content would make a
+    // trailing command or comment part of the candidate, and a suppressor word inside
+    // that trailing text discards the whole finding, leaving the credential in place.
+    // A credential holding a delimiter has to be quoted, and the quoted rules take it
+    // whole, so this is where the two shapes divide rather than a gap in coverage.
+    for delimiter in ['$', ';', '&', '|', '<', '>', '(', ')'] {
+        let bare = format!("password=alpha{delimiter}bravo");
+        let redaction = redact_durable_text(&bare);
+        assert!(!redaction.detections.is_empty(), "{bare}");
+        assert!(!redaction.text.contains("alpha"), "{bare}");
+
+        let quoted = format!("password=\"alpha{delimiter}bravo\"");
+        let redaction = redact_durable_text(&quoted);
+        assert_eq!(
+            redaction.text, "password=\"<REDACTED:password>\"",
+            "{quoted}"
+        );
+    }
+}
+
+#[test]
+fn trailing_text_cannot_suppress_a_credential() {
+    // Suppressor words mark a placeholder value. If the candidate reached past the
+    // value into a following command or comment, a suppressor word there would discard
+    // the finding and publish the credential, which is worse than the truncation that
+    // accepting the delimiter as content would have avoided.
+    for suffix in [
+        ";TODO",
+        "|example",
+        "&changeme",
+        ";# placeholder",
+        "|redacted",
+    ] {
+        let input = format!("password=alpha-bravo{suffix}");
+        let redaction = redact_durable_text(&input);
+        assert!(
+            !redaction.text.contains("alpha-bravo"),
+            "{input} published the credential as {:?}",
+            redaction.text
+        );
+    }
+
+    // A value that really is a placeholder is still suppressed.
+    for input in [
+        "password=changeme",
+        "password=${SECRET}",
+        "password=your-key-here",
+    ] {
+        assert_eq!(redact_durable_text(input).text, input, "{input}");
+    }
+}
+
+#[test]
+fn non_ascii_whitespace_around_a_separator_still_redacts() {
+    // The scanner matches bytes with Unicode mode off, so `\s` covers only ASCII. A key
+    // separated from its value by one of these would not match any rule, and an input
+    // that matches nothing is returned unchanged, so the credential would survive.
+    for separator in [
+        '\u{a0}', '\u{1680}', '\u{2000}', '\u{2005}', '\u{200a}', '\u{2028}', '\u{2029}',
+        '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
+    ] {
+        for input in [
+            format!("password{separator}={separator}production-value"),
+            format!("password{separator}=production-value"),
+            format!(r#"{{"api_key"{separator}:{separator}"production-value"}}"#),
+            format!("Authorization{separator}:{separator}Bearer{separator}abc123def456ghi789"),
+        ] {
+            let redaction = redact_durable_text(&input);
+            assert!(
+                !redaction.text.contains("production-value")
+                    && !redaction.text.contains("abc123def456ghi789"),
+                "U+{:04X} left the credential in {:?}",
+                separator as u32,
+                redaction.text
+            );
+        }
+    }
+}
+
+#[test]
+fn a_value_ends_at_the_same_whitespace_that_separates_it() {
+    // A code point treated as a separator before the value must also end the value.
+    // Accepting it as content makes the span run past the credential and replace the
+    // text that follows, which is how an ASCII space and U+00A0 came to disagree.
+    for separator in [
+        '\u{a0}', '\u{1680}', '\u{2000}', '\u{2028}', '\u{202f}', '\u{3000}',
+    ] {
+        let input = format!("password=abc{separator}next");
+        let redaction = redact_durable_text(&input);
+        assert!(
+            redaction.text.ends_with("next"),
+            "U+{:04X} consumed the text after the value: {:?}",
+            separator as u32,
+            redaction.text
+        );
+        assert!(!redaction.text.contains("abc"), "{input}");
+    }
+    assert_eq!(
+        redact_durable_text("password=abc next").text,
+        "password=<REDACTED:password> next"
+    );
+
+    // U+0085 is Unicode `White_Space` but not whitespace to JavaScript, so it is content
+    // here. Reading the Unicode set instead of the declared one would end the value at it
+    // and publish the rest of the credential.
+    assert_eq!(
+        redact_durable_text("password=alpha\u{85}bravo").text,
+        "password=<REDACTED:password>"
+    );
+}
+
+#[test]
+fn a_key_preceded_by_a_non_ascii_word_character_keeps_its_label() {
+    // The leading word boundary is ASCII-only. A Unicode boundary does not hold between
+    // a non-ASCII word character and the key name, so the key would go unrecognised and
+    // the value would fall back to whatever less specific rule also matched it.
+    for prefix in ['\u{3c0}', '\u{4e2d}', '\u{43f}', '\u{e9}'] {
+        let input = format!("{prefix}password=production-value");
+        let redaction = redact_durable_text(&input);
+        assert_eq!(
+            redaction.detections.first().map(|d| d.secret_type.as_str()),
+            Some("password"),
+            "{input} produced {:?}",
+            redaction.text
+        );
+    }
+}
+
+#[test]
+fn a_value_keeps_non_whitespace_characters_beyond_ascii() {
+    // Ending a value at every multi-byte code point would truncate any credential
+    // holding one, so only the whitespace set may end it.
+    for value in [
+        "abc\u{4e2d}\u{6587}",
+        "abc\u{e9}def",
+        "\u{5bc6}\u{7801}-1234",
+    ] {
+        let input = format!("password={value}");
+        let redaction = redact_durable_text(&input);
+        assert_eq!(redaction.text, "password=<REDACTED:password>", "{input}");
+        assert_eq!(redaction.detections[0].length, value.len(), "{input}");
+    }
+}
+
+#[test]
+fn documentation_wording_near_a_credential_does_not_excuse_it() {
+    // The safelist window spans 256 bytes, so a pattern matching only the mood of
+    // the surrounding prose clears a live credential that merely sits near it.
+    let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+    for prose in [
+        "for example: ",
+        "sample config\n",
+        "example config\n",
+        "fixtures/live.env\n",
+        "__tests__/live.env\n",
+        "mocks/live.env\n",
+    ] {
+        let input = format!("{prose}{secret}");
+        let redaction = redact_durable_text(&input);
+        assert!(
+            !redaction.text.contains(secret),
+            "{input:?} produced {:?}",
+            redaction.text
+        );
+    }
+}
+
+#[test]
+fn a_placeholder_value_stays_unredacted_next_to_its_own_label() {
+    // The value safelist, not the prose patterns above, is what keeps these quiet,
+    // so removing a prose pattern must not start redacting them.
+    for input in [
+        "AKIAIOSFODNN7EXAMPLE",
+        "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+        "password = ${DB_PASSWORD}",
+        "example_key = ${DB_PASSWORD}",
+        "api_token: changeme",
+        "sha256 = abcdef0123456789abcdef0123456789",
+    ] {
+        let redaction = redact_durable_text(input);
+        assert_eq!(
+            redaction.text, input,
+            "{input} produced {:?}",
+            redaction.text
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn arbitrary_utf8_with_real_secret_has_valid_spans(
+        prefix in ".{0,128}",
+        suffix in ".{0,128}",
+    ) {
+        let input = format!("{prefix}\npassword=property-secret\n{suffix}");
+        let redaction = redactor().redact(&input).unwrap();
+        prop_assert!(!redaction.detections.is_empty());
+        // Valid spans alone would also hold for an engine that reported the secret and
+        // then emitted it verbatim, so assert the replacement actually happened.
+        prop_assert!(redaction.text.contains("<REDACTED:password>"));
+        prop_assert!(!redaction.text.contains("password=property-secret"));
+        for detection in redaction.detections {
+            let end = detection.offset + detection.length;
+            prop_assert!(end <= input.len());
+            prop_assert!(input.is_char_boundary(detection.offset));
+            prop_assert!(input.is_char_boundary(end));
+            prop_assert!(!detection.secret_type.is_empty());
+        }
+    }
+}

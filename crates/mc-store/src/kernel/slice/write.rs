@@ -10,7 +10,7 @@ use crate::kernel::object_write::{
     insert_registry, invalidate, map_write_error, record_fields, record_registry_fields,
     set_successor,
 };
-use crate::kernel::redaction::{redact, RedactedField};
+use crate::kernel::redaction::{redact, redact_lossy, RedactedField};
 use crate::kernel::{KernelError, Sensitivity};
 
 struct RedactedDecision {
@@ -128,7 +128,7 @@ impl Envelope<'_> {
         decision_id: &str,
         spec: DecisionEventSpec,
     ) -> Result<DecisionEventOutcome, KernelError> {
-        let decision_id = redact(decision_id);
+        let decision_id = redact_lossy(decision_id);
         let spec = RedactedEvent::new(spec)?;
         require_optional_live(
             self.tx,
@@ -203,7 +203,7 @@ impl Envelope<'_> {
         replaced_object_id: &str,
         replacement: DecisionSpec,
     ) -> Result<DecisionWriteOutcome, KernelError> {
-        let replaced_object_id = redact(replaced_object_id);
+        let replaced_object_id = redact_lossy(replaced_object_id);
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "decision")?;
         let granted_before = self.subject_grants_authority(Some(&replaced_object_id.text))?;
         let replacement = RedactedDecision::new(replacement)?;
@@ -252,7 +252,7 @@ impl Envelope<'_> {
         replaced_object_id: &str,
         replacement: ObservationSpec,
     ) -> Result<ObservationWriteOutcome, KernelError> {
-        let replaced_object_id = redact(replaced_object_id);
+        let replaced_object_id = redact_lossy(replaced_object_id);
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "observation")?;
         let replacement = RedactedObservation::new(replacement)?;
         validate_successor(
@@ -306,7 +306,7 @@ impl Envelope<'_> {
         object_kind: &'static str,
         table: &'static str,
     ) -> Result<RetirementOutcome, KernelError> {
-        let object_id = redact(object_id);
+        let object_id = redact_lossy(object_id);
         let mut object = load_live_typed_object(self.tx, &object_id.text, object_kind)?;
         // Retiring an accepted decision withdraws any authority it granted, so its
         // dependents follow exactly as they do for an explicit revocation. Sampled
@@ -354,20 +354,20 @@ impl RedactedDecision {
             spec.source_revision,
         )?;
         Ok(Self {
-            decision_id: redact(&spec.decision_id),
-            object_id: redact(&spec.object_id),
-            domain_id: redact(&spec.domain_id),
-            proposition_id: spec.proposition_id.as_deref().map(redact),
-            scope_id: spec.scope_id.as_deref().map(redact),
-            anchor_id: spec.anchor_id.as_deref().map(redact),
-            evidence_id: spec.evidence_id.as_deref().map(redact),
-            decision_kind: redact(&spec.decision_kind),
+            decision_id: redact(&spec.decision_id)?,
+            object_id: redact(&spec.object_id)?,
+            domain_id: redact(&spec.domain_id)?,
+            proposition_id: spec.proposition_id.as_deref().map(redact).transpose()?,
+            scope_id: spec.scope_id.as_deref().map(redact).transpose()?,
+            anchor_id: spec.anchor_id.as_deref().map(redact).transpose()?,
+            evidence_id: spec.evidence_id.as_deref().map(redact).transpose()?,
+            decision_kind: redact(&spec.decision_kind)?,
             payload: RedactedDecisionPayload {
-                summary: redact(&spec.payload.summary),
-                rationale: redact(&spec.payload.rationale),
+                summary: redact(&spec.payload.summary)?,
+                rationale: redact(&spec.payload.rationale)?,
             },
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            source_kind: redact(&spec.source_kind)?,
+            source_id: redact(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
         })
@@ -442,22 +442,22 @@ impl RedactedObservation {
             .map(RedactedDependency::new)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            observation_id: redact(&spec.observation_id),
-            object_id: redact(&spec.object_id),
-            domain_id: redact(&spec.domain_id),
-            proposition_id: spec.proposition_id.as_deref().map(redact),
-            scope_id: spec.scope_id.as_deref().map(redact),
-            anchor_id: spec.anchor_id.as_deref().map(redact),
-            evidence_id: spec.evidence_id.as_deref().map(redact),
-            observation_kind: redact(&spec.observation_kind),
+            observation_id: redact(&spec.observation_id)?,
+            object_id: redact(&spec.object_id)?,
+            domain_id: redact(&spec.domain_id)?,
+            proposition_id: spec.proposition_id.as_deref().map(redact).transpose()?,
+            scope_id: spec.scope_id.as_deref().map(redact).transpose()?,
+            anchor_id: spec.anchor_id.as_deref().map(redact).transpose()?,
+            evidence_id: spec.evidence_id.as_deref().map(redact).transpose()?,
+            observation_kind: redact(&spec.observation_kind)?,
             payload: RedactedObservationPayload {
-                summary: redact(&spec.payload.summary),
-                classification: redact(&spec.payload.classification),
+                summary: redact(&spec.payload.summary)?,
+                classification: redact(&spec.payload.classification)?,
             },
             observed_at: spec.observed_at,
             dependencies,
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            source_kind: redact(&spec.source_kind)?,
+            source_id: redact(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
         })
@@ -534,9 +534,9 @@ impl RedactedDependency {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            object_id: redact(&spec.dependency_object_id),
-            kind: redact(&spec.dependency_kind),
-            payload: spec.dependency_payload.as_deref().map(redact),
+            object_id: redact(&spec.dependency_object_id)?,
+            kind: redact(&spec.dependency_kind)?,
+            payload: spec.dependency_payload.as_deref().map(redact).transpose()?,
         })
     }
 }
@@ -547,9 +547,9 @@ impl RedactedEvent {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            kind: redact(&spec.event_kind),
-            summary: redact(&spec.payload.summary),
-            evidence_id: spec.evidence_id.as_deref().map(redact),
+            kind: redact(&spec.event_kind)?,
+            summary: redact(&spec.payload.summary)?,
+            evidence_id: spec.evidence_id.as_deref().map(redact).transpose()?,
             recorded_at: spec.recorded_at,
         })
     }

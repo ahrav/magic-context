@@ -160,11 +160,11 @@ impl RedactedScope {
             .map(RedactedTerm::new)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            scope_id: redact(&spec.scope_id),
-            object_id: redact(&spec.object_id),
-            domain_id: redact(&spec.domain_id),
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            scope_id: redact(&spec.scope_id)?,
+            object_id: redact(&spec.object_id)?,
+            domain_id: redact(&spec.domain_id)?,
+            source_kind: redact(&spec.source_kind)?,
+            source_id: redact(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
             terms,
@@ -207,19 +207,25 @@ impl RedactedTerm {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            dimension: redact(&spec.dimension),
-            operator: redact(&spec.operator),
-            exact_value: spec.exact_value.as_deref().map(redact),
+            dimension: redact(&spec.dimension)?,
+            operator: redact(&spec.operator)?,
+            exact_value: spec.exact_value.as_deref().map(redact).transpose()?,
             set_values: spec
                 .set_values
-                .map(|values| values.iter().map(|value| redact(value)).collect()),
-            range_start: spec.range_start.as_deref().map(redact),
-            range_end: spec.range_end.as_deref().map(redact),
-            version_range: spec.version_range.as_deref().map(redact),
-            git_oid: spec.git_oid.as_deref().map(redact),
-            git_start_oid: spec.git_start_oid.as_deref().map(redact),
-            git_end_oid: spec.git_end_oid.as_deref().map(redact),
-            payload: spec.payload.as_deref().map(redact),
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| redact(value))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?,
+            range_start: spec.range_start.as_deref().map(redact).transpose()?,
+            range_end: spec.range_end.as_deref().map(redact).transpose()?,
+            version_range: spec.version_range.as_deref().map(redact).transpose()?,
+            git_oid: spec.git_oid.as_deref().map(redact).transpose()?,
+            git_start_oid: spec.git_start_oid.as_deref().map(redact).transpose()?,
+            git_end_oid: spec.git_end_oid.as_deref().map(redact).transpose()?,
+            payload: spec.payload.as_deref().map(redact).transpose()?,
         })
     }
 

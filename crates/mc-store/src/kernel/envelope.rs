@@ -293,7 +293,7 @@ impl Envelope<'_> {
         if operator_id.trim().is_empty() || remediated_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let operator_id = redact(operator_id);
+        let operator_id = redact(operator_id)?;
         match target {
             RemediationTarget::CanonicalDomainName { object_id } => {
                 let object_id = identity(&object_id)?;
@@ -840,7 +840,7 @@ fn commit_prepared_with_writer(
         return Err(error);
     }
     let rebuild_alignment = envelope.changes.iter().any(change_affects_alignment);
-    let result = redact(&result);
+    let result = redact(&result)?;
 
     let payloads = envelope
         .changes
@@ -1056,8 +1056,8 @@ impl RedactedIntent {
             producer: identity(&intent.producer)?,
             operation_key: identity(&intent.operation_key)?,
             request_digest: intent.request_digest,
-            actor: redact(&intent.actor),
-            cause: redact(&intent.cause),
+            actor: redact(&intent.actor)?,
+            cause: redact(&intent.cause)?,
         })
     }
 
@@ -1289,8 +1289,8 @@ impl RedactedCandidate {
             source_kind: identity(&spec.source_kind)?,
             source_id: identity(&spec.source_id)?,
             source_revision: spec.source_revision,
-            candidate_kind: redact(&spec.candidate_kind),
-            payload: redact(&spec.payload),
+            candidate_kind: redact(&spec.candidate_kind)?,
+            payload: redact(&spec.payload)?,
             provenance: spec
                 .provenance
                 .filter(|value| {
@@ -1416,8 +1416,8 @@ impl RedactedProjection {
         Ok(Self {
             decision_id: identity(&spec.decision_id)?,
             observation_id: identity(&spec.observation_id)?,
-            alignment_kind: redact(&spec.alignment_kind),
-            alignment_payload: spec.alignment_payload.as_deref().map(redact),
+            alignment_kind: redact(&spec.alignment_kind)?,
+            alignment_payload: spec.alignment_payload.as_deref().map(redact).transpose()?,
             built_through_commit_seq: spec.built_through_commit_seq,
         })
     }

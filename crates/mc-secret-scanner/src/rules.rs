@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,11 +10,18 @@ use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
 pub const UPSTREAM_CORPUS_SHA256: &str =
     "2f1292b50148d38afe3ebdb7c489449d103b75b7df464e06da0d5d7c89ac2820";
 pub const CONSERVATIVE_OVERLAY_SHA256: &str =
-    "c1bc93f61f86cd5cf5b838bce2c943d62070e6de1dbd9db9d146561e2fb3d642";
+    "973181a0af049fb4c0ae06160cd022b1beae3660b87ac9fa4d498864912b3487";
 
 const UPSTREAM_BYTES: &[u8] = include_bytes!("../default_rules.yaml");
 const OVERLAY_BYTES: &[u8] = include_bytes!("../conservative_overlay.yaml");
 
+/// Suppresses an upstream-parity candidate whose surroundings show the value is
+/// not a live credential.
+///
+/// Every pattern describes the value's own syntax or immediate delimiters. A
+/// pattern matching only the mood of the surrounding prose belongs in neither
+/// list: the window spans 256 bytes, so it would clear a genuine credential that
+/// merely sits near documentation.
 const CONTEXT_SAFELIST: &[&str] = &[
     r"(?i)\b(?:placeholder|dummy|fake|sample|example|test)[-_ ]{0,3}(?:key|token|secret|password)\b|\b(?:key|token|secret|password)[-_ ]{0,3}(?:placeholder|dummy|fake|sample|example|test)\b",
     r"\bAKIA[0-9A-Z]{9}EXAMPLE\b",
@@ -28,11 +35,9 @@ const CONTEXT_SAFELIST: &[&str] = &[
     r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{\{[A-Za-z_][A-Za-z0-9_]*\}\})",
     r#"(?i)\b(?:https?|ssh)://(?:localhost|(?:[A-Za-z0-9-]+\.)*example(?:\.[A-Za-z]{2,})?)(?::\d+)?(?:/[^\s"']*)?"#,
     r"(?i)(?:<\s*/?\s*(?:secret|token|password)\s*>|(?:secretmanager|vault)://|secret(?:manager)?[:=])",
-    r"(?i)\b(?:for example|sample config|example config)\b",
     r"(?i)\b(?:INSERT[_\s-]?YOUR|REPLACE[_\s-]?WITH)[A-Z0-9_\s-]*\b",
     r"(?:ZXhhbXBsZQ==|c2FtcGxl={0,2}|dGVzdA==)",
     r"(?m)^(?:<{7}|={7}|>{7})(?: .*)?$",
-    r"(?i)\b(?:__tests?__|fixtures?|mocks?)\b",
     r"(?i)\b(?:sha(?:1|224|256|384|512)|md5)\s*[:=]\s*[A-Fa-f0-9]{8,}\b",
 ];
 
@@ -92,6 +97,15 @@ pub(crate) struct RuleDeclaration {
     /// Runs the engine's context and value safelists for overlay rules that mirror corpus rules, producing one verdict when both match a credential.
     #[serde(default)]
     pub upstream_parity: bool,
+    /// Compiles this rule with Unicode mode on, so `\s` and negated classes span the
+    /// Unicode whitespace set rather than the ASCII subset the byte default matches.
+    ///
+    /// The corpus rules stay byte-oriented, which is how their upstream shapes were
+    /// adapted. A rule that separates a key from a value needs the wider set on both
+    /// sides of the separator: treating a code point as a separator while the value
+    /// class treats the same code point as content makes the value run past it.
+    #[serde(default)]
+    pub unicode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -169,8 +183,53 @@ pub(crate) struct RuleSet {
     rules: Vec<Rule>,
     anchors: AhoCorasick,
     anchor_owners: Vec<usize>,
+    overlay: RuleMask,
     context_safelist: RegexSet,
     value_safelist: RegexSet,
+}
+
+/// Inline bit set over rule indices, so preselection allocates nothing and
+/// iteration visits only the selected rules.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RuleMask {
+    words: [u64; Self::WORDS],
+}
+
+impl RuleMask {
+    const WORDS: usize = 4;
+    pub const CAPACITY: usize = Self::WORDS * 64;
+
+    fn insert(&mut self, index: usize) {
+        self.words[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        let mut words = [0u64; Self::WORDS];
+        for (slot, (left, right)) in words
+            .iter_mut()
+            .zip(self.words.into_iter().zip(other.words))
+        {
+            *slot = left & right;
+        }
+        Self { words }
+    }
+
+    /// Yields selected indices in ascending order, which is the order the
+    /// rule vector defines.
+    fn iter(self) -> impl Iterator<Item = usize> {
+        self.words
+            .into_iter()
+            .enumerate()
+            .flat_map(|(offset, mut word)| {
+                std::iter::from_fn(move || {
+                    (word != 0).then(|| {
+                        let bit = word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        offset * 64 + bit
+                    })
+                })
+            })
+    }
 }
 
 impl RuleSet {
@@ -212,13 +271,23 @@ impl RuleSet {
             (left.source, left.declaration.name.as_str())
                 .cmp(&(right.source, right.declaration.name.as_str()))
         });
+        if rules.len() > RuleMask::CAPACITY {
+            return Err(ConstructionError::InvalidRulePolicy);
+        }
         let (anchors, anchor_owners) = build_anchor_index(&rules)?;
+        let mut overlay = RuleMask::default();
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.source == RuleSource::ConservativeOverlay {
+                overlay.insert(index);
+            }
+        }
         let context_safelist = build_regex_set(CONTEXT_SAFELIST)?;
         let value_safelist = build_regex_set(VALUE_SAFELIST)?;
         Ok(Self {
             rules,
             anchors,
             anchor_owners,
+            overlay,
             context_safelist,
             value_safelist,
         })
@@ -233,24 +302,20 @@ impl RuleSet {
     /// Returns the active rules whose declared anchors occur in `bytes`.
     ///
     /// A rule runs only after at least one declared anchor matches, compared
-    /// ASCII-case-insensitively. Anchors may overlap.
-    pub fn preselect(&self, profile: ScanProfile, bytes: &[u8]) -> Vec<&Rule> {
-        let mut anchored = vec![false; self.rules.len()];
+    /// ASCII-case-insensitively. Anchors may overlap. `anchor_proof` checks
+    /// that skipping a rule cannot drop one of its findings.
+    pub fn preselect(&self, profile: ScanProfile, bytes: &[u8]) -> impl Iterator<Item = &Rule> {
+        let mut anchored = RuleMask::default();
         for hit in self.anchors.find_overlapping_iter(bytes) {
             if let Some(owner) = self.anchor_owners.get(hit.pattern().as_usize()) {
-                anchored[*owner] = true;
+                anchored.insert(*owner);
             }
         }
-        self.rules
-            .iter()
-            .enumerate()
-            .filter(|(index, rule)| {
-                anchored[*index]
-                    && (profile == ScanProfile::Comprehensive
-                        || rule.source == RuleSource::ConservativeOverlay)
-            })
-            .map(|(_, rule)| rule)
-            .collect()
+        let selected = match profile {
+            ScanProfile::Comprehensive => anchored,
+            ScanProfile::Conservative => anchored.intersect(self.overlay),
+        };
+        selected.iter().map(|index| &self.rules[index])
     }
 
     pub fn context_is_safelisted(&self, bytes: &[u8]) -> bool {
@@ -326,6 +391,9 @@ fn build_anchor_index(rules: &[Rule]) -> Result<(AhoCorasick, Vec<usize>), Const
     let automaton = AhoCorasickBuilder::new()
         .match_kind(MatchKind::Standard)
         .ascii_case_insensitive(true)
+        // Overlapping search cannot use a prefilter, so the automaton walks
+        // every input byte; a DFA resolves each byte with one table lookup.
+        .kind(Some(AhoCorasickKind::DFA))
         .build(&patterns)
         .map_err(|_| ConstructionError::InvalidRulePolicy)?;
     Ok((automaton, owners))
@@ -359,7 +427,9 @@ fn compile_rule(
 ) -> Result<Rule, ConstructionError> {
     validate_policy(&declaration)?;
     let mut builder = RegexBuilder::new(&declaration.regex);
-    builder.unicode(false).size_limit(128 * 1024 * 1024);
+    builder
+        .unicode(declaration.unicode)
+        .size_limit(128 * 1024 * 1024);
     let regex = builder
         .build()
         .map_err(|_| ConstructionError::InvalidRulePattern)?;
@@ -528,7 +598,6 @@ mod tests {
                 let bytes = input.as_bytes();
                 let selected: BTreeSet<&str> = rules
                     .preselect(profile, bytes)
-                    .iter()
                     .map(|rule| rule.declaration.name.as_str())
                     .collect();
                 for rule in rules.active(profile) {
@@ -593,6 +662,29 @@ mod tests {
             .err(),
             Some(ConstructionError::OverlayDigestMismatch)
         );
+    }
+
+    // A pattern matching only the mood of the surrounding prose clears any candidate
+    // inside a 256-byte window, including a live credential quoted beside
+    // documentation, so no context pattern may match prose alone.
+    #[test]
+    fn no_context_pattern_matches_prose_without_a_credential_shaped_neighbour() {
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+        let rules = RuleSet::from_embedded().unwrap();
+        for prose in [
+            "for example",
+            "sample config",
+            "example config",
+            "fixtures",
+            "__tests__",
+            "mocks",
+        ] {
+            let window = format!("{prose}: {secret}");
+            assert!(
+                !rules.context_is_safelisted(window.as_bytes()),
+                "{prose:?} safelists a window holding a credential"
+            );
+        }
     }
 
     #[test]

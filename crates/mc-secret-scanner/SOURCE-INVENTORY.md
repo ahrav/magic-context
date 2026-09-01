@@ -30,12 +30,12 @@ The drift check verifies digests and provenance; it does not verify adaptation.
 
 Local overlay: `crates/mc-secret-scanner/conservative_overlay.yaml`.
 
-Overlay SHA-256: `c1bc93f61f86cd5cf5b838bce2c943d62070e6de1dbd9db9d146561e2fb3d642`
+Overlay SHA-256: `973181a0af049fb4c0ae06160cd022b1beae3660b87ac9fa4d498864912b3487`
 
 The overlay is original Magic Context compatibility policy and is not copied from
 Gossip-rs. Its vendor rules reuse the lengths, alphabets, entropy floors, and
 offline validators of the corpus rule for the same credential, so a credential
-matched by both rule sets resolves to one verdict. Two bounded departures from
+matched by both rule sets resolves to one verdict. Three bounded departures from
 that parity are deliberate:
 
 - Where a corpus rule terminates on an explicit delimiter class, the overlay
@@ -44,6 +44,22 @@ that parity are deliberate:
 - The format and keyed-value rules (`magic-jwt`, `magic-bearer-token`,
   `magic-keyed-*`) are local policy for text the corpus does not cover, so they
   are broader by construction and carry their own `value_suppressors_any`.
+- `magic-anthropic-api-key` keeps the shape the previous Magic Context redaction
+  engine matched, `sk-ant-` with an optional `api03-` or `admin01-` label and a
+  32-character-or-longer body, rather than the fixed 93-character body and `AA`
+  suffix that `anthropic-api-key` and `anthropic-admin-api-key` require. The
+  overlay therefore reports `sk-ant-` candidates the corpus rejects. Narrowing it
+  to the corpus shape would stop redacting credentials the engine it replaces
+  redacted, so the broader shape is the conservative choice here; `upstream_parity`
+  stays set so the engine safelists still run against those candidates.
+
+The context safelist that those parity candidates run against omits two upstream
+patterns, `for example|sample config|example config` and `__tests__|fixtures|mocks`.
+Both match documentation wording on its own, and the safelist is applied over a
+256-byte window, so either one suppressed a credential that merely sat near
+documentation. Every pattern that remains describes the candidate's own syntax or
+immediate delimiters, and the value safelist still suppresses placeholder values
+such as `AKIAIOSFODNN7EXAMPLE` and `${VAR}` on their own.
 
 Anchor matching is case-insensitive, and the pinned corpus already depends on
 this: `aiza`, `t3blbkfj`, and `zxlk` are the only anchors recorded for regexes

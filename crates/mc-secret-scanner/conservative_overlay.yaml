@@ -1,6 +1,9 @@
 rules:
+# The body admits `-`, so this rule carries no trailing word boundary: one would reject
+# a body ending in `-`, because neither it nor end-of-input is a word position, and the
+# length floor leaves no shorter body to fall back to.
 - name: magic-anthropic-api-key
-  regex: '\bsk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{93}AA\b'
+  regex: '\bsk-ant-(?:api03-|admin01-)?[A-Za-z0-9_-]{32,}'
   anchors: [sk-ant-]
   radius: 256
   entropy:
@@ -89,9 +92,10 @@ rules:
 # `upstream_parity` above puts the vendor rules inside the engine's safelists.
 # The rules below declare their own value_suppressors_any instead.
 - name: magic-bearer-token
-  regex: '(?i)\bAuthorization\s*:\s*Bearer\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})'
+  regex: '(?i)\bAuthorization[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*Bearer[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+(?P<value>[A-Za-z0-9._~+/=-]{8,})'
   anchors: [authorization]
   radius: 256
+  unicode: true
   value_group: value
   value_suppressors_any: &overlay_value_suppressors ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE',
     'changeme', 'CHANGEME', 'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX',
@@ -104,59 +108,80 @@ rules:
 # A non-delimiting quote is content, and a backslash-escaped delimiter is content;
 # a value class that stopped at either would report a truncated secret span.
 - name: magic-keyed-double-quoted
-  regex: '(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
+  regex: '(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*"(?P<value>(?:[^"\\]|\\.)*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-single-quoted
-  regex: '(?i)''(?P<key>(?:[^''\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^''\\]|\\.)*)''\s*:\s*''(?P<value>(?:[^''\\]|\\.)*)'''
+  regex: '(?i)''(?P<key>(?:[^''\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^''\\]|\\.)*)''[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*''(?P<value>(?:[^''\\]|\\.)*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-double-single
-  regex: '(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"\s*:\s*''(?P<value>(?:[^''\\]|\\.)*)'''
+  regex: '(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*''(?P<value>(?:[^''\\]|\\.)*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-single-double
-  regex: '(?i)''(?P<key>(?:[^''\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^''\\]|\\.)*)''\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
+  regex: '(?i)''(?P<key>(?:[^''\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^''\\]|\\.)*)''[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*"(?P<value>(?:[^"\\]|\\.)*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
+# An unquoted value ends at a structural delimiter. Accepting one as content makes a
+# trailing command or comment part of the candidate, where a suppressor word in it
+# discards the whole finding and leaves the credential in place. A value that contains
+# one has to be quoted, which the quoted rules below match in full.
+# These rules declare `unicode: true` so a class may name a code point above ASCII, and
+# spell the separator set out rather than using `\s`. The set is the one JavaScript
+# treats as whitespace, which the engine on the other side of the shared fixture also
+# uses: it adds U+FEFF, which is not `White_Space`, and omits U+0085, which is. Unicode
+# `\s` would end an unquoted value at U+0085 and publish the rest of the credential.
+# The separator and the value boundary read the same set, because a code point treated
+# as a separator before the value has to end the value as well.
+# The leading `\b` stays ASCII-only. A Unicode boundary does not hold between a
+# non-ASCII word character and a key name, so a key preceded by one would not be
+# recognised as keyed and would lose the label its key states.
 # Rust regex has no backreference, so one rule cannot pair its own quotes; a shared
 # optional quote instead truncates a quoted value at its first space.
 - name: magic-keyed-assignment
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>(?:[^\s''"`;&|<>()$\\]|\\.)+)'
+  regex: '(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*=[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*(?P<value>(?:[^\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}''"`;&|<>()$\\]|\\.)+)'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-assignment-double-quoted
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*"(?P<value>(?:[^"\\]|\\.)*)"'
+  regex: '(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*=[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*"(?P<value>(?:[^"\\]|\\.)*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-assignment-single-quoted
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*''(?P<value>(?:[^''\\]|\\.)*)'''
+  regex: '(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*=[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*''(?P<value>(?:[^''\\]|\\.)*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
+  unicode: true
   key_group: key
   value_group: value
   reject_scalars: true

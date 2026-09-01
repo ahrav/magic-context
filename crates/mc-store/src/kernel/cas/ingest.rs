@@ -20,7 +20,7 @@ use crate::kernel::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::kernel::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::kernel::redaction::{identity, record, redact, RedactedField};
+use crate::kernel::redaction::{identity, record, redact_lossy, RedactedField};
 use crate::kernel::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -120,18 +120,35 @@ impl PreparedArtifact {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
 
+        // Redaction fails closed by replacing text it cannot inspect, so the payload
+        // has to be measured before that happens. Measuring the redacted bytes instead
+        // sees the placeholder's length, which passes any cap and stores the
+        // placeholder in place of the artifact.
+        if request.payload.len() > MAX_PAYLOAD_BYTES
+            || request.payload.len() > mc_core::redaction::MAX_REDACTABLE_BYTES
+        {
+            return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
+        }
+
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact(text);
+                let redaction = redact_lossy(text);
                 let bytes = redaction.text.as_bytes().to_vec();
                 (redaction, bytes, true)
             }
             Err(_) => {
-                if !redact(&String::from_utf8_lossy(&request.payload))
-                    .detections
-                    .is_empty()
                 {
-                    return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                    // Each invalid byte widens to a three-byte replacement character, so a
+                    // payload inside the raw limit can still convert to a scan input outside
+                    // it. Measuring the converted text keeps redaction's fail-closed
+                    // placeholder from being read back as proof of a secret.
+                    let inspected_text = String::from_utf8_lossy(&request.payload);
+                    if inspected_text.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
+                        return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
+                    }
+                    if !redact_lossy(&inspected_text).detections.is_empty() {
+                        return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                    }
                 }
                 (
                     RedactedField {
@@ -157,7 +174,7 @@ impl PreparedArtifact {
         // with a leaking media type stays remotely eligible.
         let metadata_detected = [&request.media_type, &request.retention_class]
             .into_iter()
-            .any(|field| !redact(field).detections.is_empty());
+            .any(|field| !redact_lossy(field).detections.is_empty());
         let sensitivity = if !payload_redaction.detections.is_empty() || metadata_detected {
             Sensitivity::Secret
         } else if !inspected {
@@ -489,7 +506,7 @@ impl KernelStore {
             }
             Ok(_) => Ok(ArtifactHandle {
                 digest: prepared.digest,
-                evidence_id: redact(&prepared.request.evidence_id).text,
+                evidence_id: redact_lossy(&prepared.request.evidence_id).text,
             }),
             Err(error) => {
                 self.cleanup_failed_reference(
@@ -664,8 +681,8 @@ fn insert_reference(
     let domain_id = identity(&prepared.request.domain_id)?;
     let source_kind = identity(&prepared.request.source_kind)?;
     let source_id = identity(&prepared.request.source_id)?;
-    let media_type = redact(&prepared.request.media_type);
-    let retention_class = redact(&prepared.request.retention_class);
+    let media_type = redact_lossy(&prepared.request.media_type);
+    let retention_class = redact_lossy(&prepared.request.retention_class);
     envelope
         .tx
         .execute(
