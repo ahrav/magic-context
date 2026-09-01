@@ -1,4 +1,7 @@
 rules:
+# The body admits `-`, so this rule carries no trailing word boundary: one would reject
+# a body ending in `-`, because neither it nor end-of-input is a word position, and the
+# length floor leaves no shorter body to fall back to.
 - name: magic-anthropic-api-key
   regex: '\bsk-ant-(?:api03-|admin01-)?[A-Za-z0-9_-]{32,}'
   anchors: [sk-ant-]
@@ -144,8 +147,6 @@ rules:
 # trailing command or comment part of the candidate, where a suppressor word in it
 # discards the whole finding and leaves the credential in place. A value that contains
 # one has to be quoted, which the quoted rules below match in full.
-# `-` ends no body above: a trailing word boundary would reject a body the declared
-# alphabet admits, and the length floor leaves no shorter body to fall back to.
 # These rules declare `unicode: true`, so `\s` and the negated value classes span the
 # Unicode whitespace set instead of the ASCII subset byte mode matches. A key separated
 # from its value by U+00A0 would otherwise match no rule and leave the credential in
@@ -154,10 +155,6 @@ rules:
 # White_Space, and JavaScript's separator set includes it.
 # Rust regex has no backreference, so one rule cannot pair its own quotes; a shared
 # optional quote instead truncates a quoted value at its first space.
-# The unquoted value class stops only at whitespace and quotes. Excluding shell
-# metacharacters such as `$`, `;`, and `|` would end the span inside a credential
-# that contains one, and the reported span is what gets replaced, so the remainder
-# would stay in the redacted text.
 - name: magic-keyed-assignment
   regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)(?:\s|\x{feff})*=(?:\s|\x{feff})*(?P<value>(?:[^\s\x{feff}''"`;&|<>()$\\]|\\.)+)'
   anchors: [key, token, secret, password, auth, bearer, credential]
