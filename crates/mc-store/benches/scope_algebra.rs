@@ -39,6 +39,42 @@ fn version_range(dimension: &str, value: &str) -> ScopeTermSpec {
     }
 }
 
+fn set_term(dimension: &str, values: &[&str]) -> ScopeTermSpec {
+    ScopeTermSpec {
+        dimension: dimension.to_string(),
+        operator: "set".to_string(),
+        set_values: Some(values.iter().map(|value| (*value).to_string()).collect()),
+        ..ScopeTermSpec::default()
+    }
+}
+
+fn range_term(dimension: &str, start: &str, end: &str) -> ScopeTermSpec {
+    ScopeTermSpec {
+        dimension: dimension.to_string(),
+        operator: "range".to_string(),
+        range_start: Some(start.to_string()),
+        range_end: Some(end.to_string()),
+        ..ScopeTermSpec::default()
+    }
+}
+
+fn git_reachable(dimension: &str, oid: &str) -> ScopeTermSpec {
+    ScopeTermSpec {
+        dimension: dimension.to_string(),
+        operator: "git_reachable".to_string(),
+        git_oid: Some(oid.to_string()),
+        ..ScopeTermSpec::default()
+    }
+}
+
+struct CompleteOracle;
+
+impl GraphOracle for CompleteOracle {
+    fn is_ancestor_or_equal(&self, ancestor: &str, descendant: &str) -> Option<bool> {
+        Some(ancestor <= descendant)
+    }
+}
+
 fn eight_term_specs() -> [ScopeTermSpec; 8] {
     [
         exact("domain", "code"),
@@ -77,6 +113,17 @@ fn algebra_benches(c: &mut Criterion) {
     let inner_version =
         CanonicalScope::from_term_specs(&[version_range("platform", ">=1.5.0, <2.0.0")]).unwrap();
     let exact_version = CanonicalScope::from_term_specs(&[exact("platform", "1.5.0")]).unwrap();
+    let set_range = CanonicalScope::from_term_specs(&[
+        set_term("branch", &["main", "release"]),
+        set_term("environment", &["test", "prod"]),
+        range_term("region", "a", "z"),
+        range_term("project", "a", "z"),
+    ])
+    .unwrap();
+    let ancestor = "11".repeat(20);
+    let descendant = "22".repeat(20);
+    let git = CanonicalScope::from_term_specs(&[git_reachable("branch", &ancestor)]).unwrap();
+    let git_context = context.clone().with_head_commit(descendant);
 
     let mut group = c.benchmark_group("algebra");
     for (name, scope) in [("one-term", &one), ("eight-term", &eight)] {
@@ -119,6 +166,24 @@ fn algebra_benches(c: &mut Criterion) {
                 &UnknownGraph,
             )
         });
+    });
+    group.bench_function("matches/set-range", |b| {
+        b.iter(|| scope_matches(black_box(&set_range), black_box(&context), &UnknownGraph));
+    });
+    group.bench_function("subsumes/set-range", |b| {
+        b.iter(|| scope_subsumes(black_box(&set_range), black_box(&set_range), &UnknownGraph));
+    });
+    group.bench_function("overlaps/set-range", |b| {
+        b.iter(|| scope_overlaps(black_box(&set_range), black_box(&set_range), &UnknownGraph));
+    });
+    group.bench_function("matches/git", |b| {
+        b.iter(|| scope_matches(black_box(&git), black_box(&git_context), &CompleteOracle));
+    });
+    group.bench_function("subsumes/git", |b| {
+        b.iter(|| scope_subsumes(black_box(&git), black_box(&git), &CompleteOracle));
+    });
+    group.bench_function("overlaps/git", |b| {
+        b.iter(|| scope_overlaps(black_box(&git), black_box(&git), &CompleteOracle));
     });
     group.bench_function("decode/eight-term", |b| {
         b.iter(|| CanonicalScope::from_term_specs(black_box(&eight_specs)).unwrap());
