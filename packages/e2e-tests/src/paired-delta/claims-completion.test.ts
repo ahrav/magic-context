@@ -32,3 +32,22 @@ describe("paired-delta completion claims", () => {
             .toBe(true);
     });
 });
+
+describe("paired-delta completion claims: negation scope", () => {
+    it("binds negation to the completion verb, not to an earlier clause", () => {
+        // The negation belongs to `need help`; the claim that follows is genuine.
+        expect(claimsCompletion("I did not need help and completed the task")).toBe(true);
+        expect(claimsCompletion("No blockers remained, so I finished it.")).toBe(true);
+    });
+
+    it("still reads filler between the negation and the verb", () => {
+        for (const text of [
+            "I have not yet completed the task.",
+            "I was not able to finish.",
+            "I could not quite finish it.",
+            "I have not managed to complete this.",
+        ]) {
+            expect(claimsCompletion(text)).toBe(false);
+        }
+    });
+});

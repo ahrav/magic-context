@@ -584,6 +584,44 @@ function armOptions(
     return mergeHarnessOptions(live, arm, scenario.modelContextLimit);
 }
 
+/**
+ * Compaction runs the historian in a child session, whose `session.prompt` calls never appear among the parent's responses.
+ * Leaving them out understated `usage`, `costUsd`, and the admission check that the cost cap runs before the next arm, so a dispatch could exceed its declared budget while the report claimed otherwise.
+ */
+function childSessionUsage(
+    harness: TestHarness,
+    sessionId: string,
+): RolloutObservation["usage"] {
+    const zero = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
+    if (!harness.hasContextDb()) return zero;
+    let row: {
+        input: number;
+        output: number;
+        cacheCreation: number;
+        cacheRead: number;
+    } | null;
+    try {
+        row = harness.contextDb().prepare(
+            `SELECT COALESCE(SUM(input_tokens), 0) AS input,
+                    COALESCE(SUM(output_tokens), 0) AS output,
+                    COALESCE(SUM(cache_write_tokens), 0) AS cacheCreation,
+                    COALESCE(SUM(cache_read_tokens), 0) AS cacheRead
+             FROM subagent_invocations WHERE session_id = ?`,
+        ).get(sessionId) as typeof row;
+    } catch (error) {
+        /** Silently treating this as zero is the defect being closed, so an unreadable ledger fails the rollout instead. */
+        throw new Error(
+            `live paired-delta cannot read child-session usage: ${(error as Error).message}`,
+        );
+    }
+    return {
+        input: row?.input ?? 0,
+        output: row?.output ?? 0,
+        cacheCreation: row?.cacheCreation ?? 0,
+        cacheRead: row?.cacheRead ?? 0,
+    };
+}
+
 function configMatchesArm(
     harness: TestHarness,
     armId: ArmId,
@@ -637,6 +675,8 @@ export function createLiveDependencies(input: {
             let harness = await TestHarness.create(harnessOptions);
             let seeded: ReturnType<typeof seedGoldMemories> = [];
             let scriptedTurnText: string | undefined;
+            /** The declaration names the point the evidence must already be buried by, so the ballast is keyed to it rather than to a literal turn id. */
+            const burialTurnId = scenario.interventions.r1.insertAfterTurnId;
             /** R2 supplies the gold as memory and R3 supplies the same content in the prompt, so the seeded row carries the declared claim alone; a second labelled copy of the evidence would make `R3 - R2` measure duplicated content as well as representation. */
             const seedOracleMemories = async (): Promise<typeof seeded> => {
                 /** `seedGoldMemories` requires `context.db` to exist; the plugin creates it after the server reports ready. */
@@ -690,7 +730,7 @@ export function createLiveDependencies(input: {
                             throw new Error("live paired-delta supports authored user turns only");
                         }
                         let content = turn.content;
-                        if (turn.id === "turn-burial") {
+                        if (turn.id === burialTurnId) {
                             /** The authored floor is bytes and the window is tokens, so the burial turn carries whichever demand is larger once converted. */
                             ballastTokens = Math.max(
                                 Math.ceil(
@@ -759,7 +799,7 @@ export function createLiveDependencies(input: {
                         ({ id }) => id === scenario.absencePrecondition.evidenceTurnId,
                     );
                     const burialIndex = scenario.turnScript.findIndex(
-                        ({ id }) => id === "turn-burial",
+                        ({ id }) => id === burialTurnId,
                     );
                     const structuralAbsence =
                         evidenceIndex >= 0 &&
@@ -820,7 +860,7 @@ export function createLiveDependencies(input: {
                                     sum.cacheCreation + response.usage.cacheCreation,
                                 cacheRead: sum.cacheRead + response.usage.cacheRead,
                             }),
-                            { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+                            childSessionUsage(harness, sessionId),
                         ),
                         turns: scenario.turnScript.length +
                             (scriptedTurnText === undefined ? 0 : 1),
@@ -839,12 +879,16 @@ export function createLiveDependencies(input: {
 /**
  * A completion word is only a claim when it is not negated: `invalidSuccess` counts an arm asserting success it did not achieve, so a refusal that says "not done" is the opposite of the thing being measured.
  * The window covers the bare negations plus any `n't` contraction, which reaches `haven't`, `isn't`, and `wasn't` without enumerating auxiliaries, rather than attempting sentence parsing.
+ * Only a short allowlist of filler words may sit between the negation and the verb, so an unrelated earlier clause — "I did not need help and completed the task" — does not swallow a genuine claim.
  */
+const NEGATED_COMPLETION =
+    /(?:\b(?:not|never|cannot|unable|failed|without|no)\b|n't)(?:\s+(?:yet|ever|even|quite|fully|really|able|been|being|manage|managed|have|has|had|to|the|task|it|this|that|work|job)\b)*[\s,]*$/;
+
 export function claimsCompletion(text: string): boolean {
     const completion = /\b(?:done|completed|finished|complete)\b/gi;
     for (const match of text.matchAll(completion)) {
         const before = text.slice(Math.max(0, match.index - 40), match.index).toLowerCase();
-        if (/(?:\b(?:not|never|cannot|unable|failed|without|no)\b|n't)[\s\w,'-]*$/.test(before)) {
+        if (NEGATED_COMPLETION.test(before)) {
             continue;
         }
         return true;

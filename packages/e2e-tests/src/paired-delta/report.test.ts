@@ -534,12 +534,25 @@ describe("paired-delta calibration record", () => {
         expect(built.validForPoolSizing).toBe(false);
     });
 
-    it("collapses the endpoint series to one widest floor per family", () => {
+    it("collapses the endpoint series to one resolvable floor per family", () => {
         // `estimateFamilyDeltas` keys one floor per family and rejects a repeated id.
         const floors = calibrationNoiseFloors(build(split));
+        const one = floors.find(({ familyId }) => familyId === "fam-one")!;
+        const noise = build(split).familyNoise
+            .find((row) => row.familyId === "fam-one" && row.endpoint === "mc-on-vs-mc-off")!;
 
         expect(floors.map(({ familyId }) => familyId)).toEqual(["fam-one", "fam-two"]);
-        expect(floors.find(({ familyId }) => familyId === "fam-one")?.value).toBe(1);
+        /**
+         * A valid-success delta is one of -1, 0, 1, so a range-based floor would be at least 1 and
+         * mark every family inside it, leaving no endpoint able to resolve.
+         */
+        expect(noise.spread).toBe(1);
+        expect(one.value).toBeLessThan(1);
+        expect(one.value).toBeCloseTo(
+            1.959964 * Math.sqrt(noise.variance / noise.observationCount),
+            12,
+        );
+        expect(one.interval).toEqual({ lower: 0, upper: one.value });
         expect(() => estimateFamilyDeltas({
             observations: [
                 {

@@ -559,17 +559,36 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
 }
 
 /**
- * The estimator keys one floor per family and rejects a repeated `familyId`, while the record keeps a series per endpoint, so each family collapses to its widest observed floor.
+ * The floor is the uncertainty of the family mean, not the observed range.
+ *
+ * A valid-success delta is one of -1, 0, or 1, so any varying series spans at least 1 while every
+ * family point estimate lies within [-1, 1]. A range-based floor would therefore mark every family
+ * inside its floor and no endpoint could ever resolve. The half-width of a 95% normal interval on
+ * the mean scales with the evidence instead: it shrinks as replicates accumulate, which is the
+ * quantity a resolution claim has to clear.
+ */
+function familyFloorValue(noise: CalibrationFamilyNoise): number {
+    if (noise.observationCount < 2 || !(noise.variance > 0)) return 0;
+    return 1.959964 * Math.sqrt(noise.variance / noise.observationCount);
+}
+
+/**
+ * The estimator keys one floor per family and rejects a repeated `familyId`, while the record keeps a series per endpoint, so each family collapses to its widest floor.
  * Widest rather than mean, because a floor decides whether an interval is inside measured noise: the narrower endpoint would call a delta resolved that the noisier one cannot separate.
  */
 export function calibrationNoiseFloors(
     record: PairedDeltaCalibrationRecord,
 ): FamilyNoiseFloor[] {
     const widest = new Map<string, FamilyNoiseFloor>();
-    for (const { familyId, spread, interval } of record.familyNoise) {
-        const existing = widest.get(familyId);
-        if (existing === undefined || spread > existing.value) {
-            widest.set(familyId, { familyId, value: spread, interval });
+    for (const noise of record.familyNoise) {
+        const value = familyFloorValue(noise);
+        const existing = widest.get(noise.familyId);
+        if (existing === undefined || value > existing.value) {
+            widest.set(noise.familyId, {
+                familyId: noise.familyId,
+                value,
+                interval: { lower: 0, upper: value },
+            });
         }
     }
     return [...widest.values()].sort((left, right) =>
