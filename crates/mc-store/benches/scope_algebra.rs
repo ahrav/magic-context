@@ -575,6 +575,19 @@ fn profile_kernel(kernel: &str) {
                 black_box(run_cheap_check(&snapshot, &check, &budget));
             }
         }
+        "payload-64" => {
+            let affected = (0..64).map(|i| format!("src/mod{i}/file.rs")).collect();
+            let checks = (0..64)
+                .map(|i| CheckSpec::ConfigKey {
+                    path: format!("configs/app{i}.toml"),
+                    key: format!("key_{i}"),
+                })
+                .collect();
+            let payload = ObjectApplicabilitySpec::new(affected, checks).encode();
+            while Instant::now() < until {
+                black_box(ObjectApplicabilitySpec::decode(Some(&payload)).expect("payload"));
+            }
+        }
         other => panic!("unknown MC_SCOPE_PROFILE kernel {other}"),
     }
 }
