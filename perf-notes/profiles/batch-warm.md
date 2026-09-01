@@ -44,6 +44,14 @@ representation.
 Raw profile: `/tmp/mc-scope-perf/batch-warm-iter18-199.data`; report:
 `/tmp/mc-scope-perf/batch-warm-iter18.report`.
 
+At the iteration-40 checkpoint, a fresh 199 Hz warm profile captured 1,996 samples with zero loss.
+`SnapshotCacheKey` exact equality owns 4.1% through repeated string comparisons; `CandidateInputs`
+equality owns 2.5%. Iteration 41 canonicalizes the stored shared snapshot `Arc` on the first hit,
+then uses pointer equality for the rest of that batch while retaining exact fallback comparison.
+
+Raw profile: `/tmp/mc-scope-perf/batch-warm-iter40-199.data`; report:
+`/tmp/mc-scope-perf/batch-warm-iter40.report`.
+
 ## Cold batch after iteration 22
 
 An engine-only `batch-cold-512` profile at `fa97709eb` captured 2,001 samples at 199 Hz with zero

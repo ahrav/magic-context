@@ -164,6 +164,11 @@ impl SnapshotCacheKey {
 
 impl PartialEq for SnapshotCacheKey {
     fn eq(&self, other: &Self) -> bool {
+        if let (Self::Shared(left), Self::Shared(right)) = (self, other) {
+            if Arc::ptr_eq(left, right) {
+                return true;
+            }
+        }
         self.values() == other.values()
     }
 }
@@ -350,7 +355,7 @@ impl ApplicabilityEngine {
             snapshot.head(),
             snapshot.dirty_fingerprint(),
         ));
-        let cache_context = (candidates.len() > 1).then(|| {
+        let mut cache_context = (candidates.len() > 1).then(|| {
             Arc::new(SnapshotCacheValues {
                 hash: snapshot_hash,
                 checkout_identity: snapshot.identity().to_string(),
@@ -424,6 +429,14 @@ impl ApplicabilityEngine {
                 .get_key_value(&key)
             {
                 stats.object_cache_hits += 1;
+                if let SnapshotCacheKey::Shared(context) = &key.snapshot {
+                    if cache_context
+                        .as_ref()
+                        .is_none_or(|current| !Arc::ptr_eq(current, context))
+                    {
+                        cache_context = Some(Arc::clone(context));
+                    }
+                }
                 objects.push(ObjectApplicability {
                     object_id: candidate.object_id.clone(),
                     object_revision: candidate.object_revision,
