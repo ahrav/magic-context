@@ -835,7 +835,17 @@ export async function runPairedDelta(
                 mcOn?.cell.runHealth === "completed" &&
                 mcOn.cell.criticalPassed < mcOn.cell.criticalTotal
             ) {
+                /** The trigger is what makes the ladder scheduled, so its rungs are preflighted here rather than beside the primary arms: checking them before the trigger fired would refuse coordinates whose ladder never runs, and checking them one at a time lets an earlier rung pay for evidence a later stale rung invalidates. commentlint: allow(JUDGE) */
                 for (const armId of REGRET_ARM_IDS.slice(1)) {
+                    const blocked = blockingStoredArm(armId);
+                    if (blocked) {
+                        invalidStoredCoordinates.push(blocked);
+                        coordinateBlocked = true;
+                        coordinateResult.incomplete = true;
+                        break;
+                    }
+                }
+                for (const armId of coordinateBlocked ? [] : REGRET_ARM_IDS.slice(1)) {
                     const rung = await runArm(armId);
                     if (coordinateBlocked) {
                         coordinateResult.incomplete = true;
@@ -1273,10 +1283,17 @@ async function withRolloutDeadline<T>(
         };
         arm();
     });
+    const startedAt = Date.now();
     /** `work()` runs inside the guard because a `run()` or `prepare()` that throws synchronously — a valid implementation, since the contract only promises a returned promise — would otherwise escape before the timer could be cleared, leaving `expiry` armed to hold the process open and then reject with no consumer. commentlint: allow(JUDGE) */
     let pending: Promise<T> | undefined;
     try {
         pending = work();
+        /** Arming the timer first bounds nothing while `work()` holds the event loop: the expiry callback is a macrotask, so a factory that blocks past its allowance and returns an already-resolved promise wins the race below on a microtask before the overdue timer can run. The elapsed check is taken here rather than after the race so async work settling near the boundary is not failed by scheduling delay. commentlint: allow(JUDGE) */
+        if (Date.now() - startedAt >= remainingMs) {
+            throw new RolloutDeadlineError(
+                `rollout still in flight after the ${remainingMs}ms deadline budget`,
+            );
+        }
         return await Promise.race([pending, expiry]);
     } finally {
         clearTimeout(timer);

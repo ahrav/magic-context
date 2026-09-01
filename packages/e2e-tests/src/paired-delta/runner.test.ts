@@ -414,6 +414,33 @@ describe("paired-delta runner", () => {
         expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on"]);
     });
 
+    it("refuses evidence from work that blocked past the deadline", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 20 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run(): Promise<RolloutObservation> {
+                            // Blocking holds the event loop, so the expiry macrotask cannot run
+                            // and the returned promise is already fulfilled.
+                            const until = Date.now() + 60;
+                            while (Date.now() < until) { /* spin */ }
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
     it("bounds rollout creation with the run deadline and disposes a late handle", async () => {        const disposedArms: string[] = [];
         const lateHandle = (disposeFails: boolean) =>
             async (armId: string): Promise<RolloutHandle> => {
@@ -1662,6 +1689,34 @@ describe("paired-delta runner", () => {
             formation: 0,
             representation: 0,
         });
+    });
+
+    it("blocks the triggered ladder before r1 pays when a later rung is stale", async () => {
+        // A full run whose `mc-on` fails a critical check, so the ladder is triggered.
+        const first = await runPairedDelta(
+            options(),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+        const staleR2 = structuredClone(first.records.find(({ armId }) => armId === "r2")!);
+        staleR2.echoedModelId = "different-snapshot";
+        // `r1` is absent, so without a ladder preflight it runs and pays first.
+        const store = new MemoryStore([staleR2]);
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on"), events),
+        );
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.invalidStoredCoordinates).toContainEqual({
+            poolManifestFingerprint: "a".repeat(64),
+            scenarioId: scenario.scenarioId,
+            armId: "r2",
+            replicateIndex: 0,
+        });
+        expect(events).not.toContain("create:r1");
+        expect(events).not.toContain("create:r3");
     });
 
     it("schedules no oracle rollout for passing or incomplete MC-on", async () => {
