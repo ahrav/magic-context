@@ -5,6 +5,7 @@
 //! the intent ledger to be drained; receipt groups advance project checkpoints only
 //! after every effect in the receipt has applied.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use mc_core::claim_operation::{
@@ -1061,8 +1062,14 @@ impl McStore {
             .last()
             .ok_or_else(|| ClaimMirrorError::Invalid("receipt has no effects".to_string()))?
             .effect_id;
+        // A per-effect rejection must roll the transaction back, because the loop below
+        // interleaves validation with mutation: an earlier effect can already be applied
+        // when a later one is refused. Returning a disposition would commit that partial
+        // group, so the typed rejection is stashed here and the closure fails instead.
+        let rejected: RefCell<Option<ClaimMirrorError>> = RefCell::new(None);
         let outcome = write.execute(&self.inner, |coordinated| {
             let tx = coordinated.tx();
+            rejected.borrow_mut().take();
             let existing_ids = existing_claim_ids_tx(tx, incarnation)?;
             for effect in &group.effects {
                 let prepared = &mut coordinated.prepared.borrow_mut();
@@ -1211,20 +1218,26 @@ impl McStore {
                             .optional()?;
                         if let Some((project_id, locator, revision)) = existing.as_ref() {
                             if *project_id != effect.project_id {
-                                return Ok(Err(ClaimMirrorError::Invalid(format!(
-                                    "public claim {} changed projects",
-                                    effect.public_claim_id
-                                ))));
+                                {
+                                    *rejected.borrow_mut() = Some(ClaimMirrorError::Invalid(format!(
+                                        "public claim {} changed projects",
+                                        effect.public_claim_id
+                                    )));
+                                    return Err(rusqlite::Error::InvalidQuery);
+                                }
                             }
                             let incoming_revision =
                                 parse_revision_locator(&effect.revision_locator)
                                     .ok_or(rusqlite::Error::InvalidQuery)?
                                     .revision;
                             if incoming_revision < *revision {
-                                return Ok(Err(ClaimMirrorError::Invalid(format!(
-                                    "public claim {} revision regressed",
-                                    effect.public_claim_id
-                                ))));
+                                {
+                                    *rejected.borrow_mut() = Some(ClaimMirrorError::Invalid(format!(
+                                        "public claim {} revision regressed",
+                                        effect.public_claim_id
+                                    )));
+                                    return Err(rusqlite::Error::InvalidQuery);
+                                }
                             }
                             // A revision locator embeds the content digest, so the same
                             // revision arriving with a different locator means the same
@@ -1232,16 +1245,22 @@ impl McStore {
                             // below would silently replace the stored content.
                             if incoming_revision == *revision && locator != &effect.revision_locator
                             {
-                                return Ok(Err(ClaimMirrorError::Invalid(format!(
-                                    "public claim {} revision {} does not match the stored locator",
-                                    effect.public_claim_id, incoming_revision
-                                ))));
+                                {
+                                    *rejected.borrow_mut() = Some(ClaimMirrorError::Invalid(format!(
+                                        "public claim {} revision {} does not match the stored locator",
+                                        effect.public_claim_id, incoming_revision
+                                    )));
+                                    return Err(rusqlite::Error::InvalidQuery);
+                                }
                             }
                             if effect.claim.is_none() && locator != &effect.revision_locator {
-                                return Ok(Err(ClaimMirrorError::Invalid(format!(
-                                    "revocation for {} does not match current revision",
-                                    effect.public_claim_id
-                                ))));
+                                {
+                                    *rejected.borrow_mut() = Some(ClaimMirrorError::Invalid(format!(
+                                        "revocation for {} does not match current revision",
+                                        effect.public_claim_id
+                                    )));
+                                    return Err(rusqlite::Error::InvalidQuery);
+                                }
                             }
                         }
                         if let Some(claim) = &effect.claim {
@@ -1324,8 +1343,16 @@ impl McStore {
                 Ok(result) if !result.replayed => WriteDisposition::Applied(outcome),
                 _ => WriteDisposition::Replay(outcome),
             })
-        })?;
-        outcome
+        });
+        match outcome {
+            Ok(outcome) => outcome,
+            // A stashed rejection means the closure failed on purpose so the fence would
+            // roll back; report the reason it refused, not the rollback itself.
+            Err(error) => match rejected.borrow_mut().take() {
+                Some(rejection) => Err(rejection),
+                None => Err(ClaimMirrorError::from(error)),
+            },
+        }
     }
 
     /// Delete only rebuildable mirror state. The staged-intent ledger remains

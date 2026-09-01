@@ -697,3 +697,65 @@ fn integrity_json_separates_structural_names_from_credential_bearing_text() {
         "unexpected error: {error}"
     );
 }
+
+/// A receipt group applies its effects one at a time, so a rejection raised after an
+/// earlier effect has already been written must roll the whole group back. Committing the
+/// prefix would leave the mirror holding claims from a group the caller was told failed.
+#[test]
+fn receipt_rejected_on_a_later_effect_leaves_no_earlier_effect_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+    // CLAIM_A is stored at revision 2; CLAIM_B does not exist yet.
+    let stored = claim(CLAIM_A, 41, 2, "Stored content.", 1);
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![stored.clone()]),
+            1,
+        )
+        .unwrap();
+
+    // Effect 1 inserts CLAIM_B and is valid on its own. Effect 2 regresses CLAIM_A's
+    // revision and is refused, and it is only reached after effect 1 has been inserted.
+    let fresh = claim(CLAIM_B, 41, 3, "New claim.", 2);
+    let regressed = claim(CLAIM_A, 41, 1, "Older revision.", 2);
+    let receipt = group(
+        9,
+        &[(41, 2)],
+        vec![
+            effect(
+                1,
+                0,
+                41,
+                2,
+                ClaimMirrorChangeKind::Upsert,
+                Some(fresh.clone()),
+                &fresh,
+            ),
+            effect(
+                2,
+                1,
+                41,
+                2,
+                ClaimMirrorChangeKind::Upsert,
+                Some(regressed.clone()),
+                &regressed,
+            ),
+        ],
+    );
+
+    assert!(
+        matches!(
+            store.apply_claim_mirror_receipt(&receipt, 2),
+            Err(ClaimMirrorError::Invalid(_))
+        ),
+        "a regressed revision must be refused"
+    );
+
+    // The refusal must be total: effect 1's row must not survive it.
+    assert_eq!(
+        store.list_claim_mirror(INCARNATION, Some(41)).unwrap(),
+        vec![stored],
+        "a rejected group must leave only the pre-existing claim"
+    );
+}
