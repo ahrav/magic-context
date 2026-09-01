@@ -214,7 +214,7 @@ const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
  * non-finite or negative cost would disable the cost cap: adding NaN to the
  * spent total makes every later cap comparison false.
  */
-/** Raised when a records file cannot be parsed. A distinct type because the exit code a caller keys off has to separate "this file needs inspection" from "the run stopped on budget"; matching diagnostic prose would couple the CLI to wording that is free to change. commentlint: allow(JUDGE) */
+/** Raised when a records file cannot be parsed. A distinct type because the exit code a caller keys off has to separate "this file needs inspection" from "the run stopped on budget"; matching diagnostic prose would couple the CLI to wording that is free to change. Every rejection `parseRolloutRecords` raises uses it — syntax, per-record shape, duplicate coordinates, and the file-wide spend total all mean the same thing to a caller, so a rule that threw a plain `Error` would silently downgrade to the resumable code. commentlint: allow(JUDGE) */
 export class RolloutRecordsInvalidError extends Error {}
 
 function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
@@ -302,7 +302,7 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
     (raw as RolloutRecord[]).forEach((record, index) => {
         const key = coordinateKey(record);
         if (seen.has(key)) {
-            throw new Error(
+            throw new RolloutRecordsInvalidError(
                 `rollout store ${path} record ${index}: duplicate-coordinate ${key}`,
             );
         }
@@ -314,7 +314,7 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         0,
     );
     if (!Number.isFinite(total)) {
-        throw new Error(`rollout store ${path}: spend-total-invalid`);
+        throw new RolloutRecordsInvalidError(`rollout store ${path}: spend-total-invalid`);
     }
     return raw as RolloutRecord[];
 }

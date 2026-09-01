@@ -1893,6 +1893,30 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("types every parse rejection as an unusable records file", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-parse-types-"));
+        try {
+            // Each of these means the same thing to a caller: inspect this path.
+            const cases: Array<[string, unknown]> = [
+                ["duplicate coordinate", [storedRecord("mc-on"), storedRecord("mc-on")]],
+                ["not an array", { schema: "paired-delta-rollout/v1" }],
+                ["spend total", [
+                    { ...storedRecord("mc-on"), costUsd: Number.MAX_VALUE },
+                    { ...storedRecord("mc-off"), costUsd: Number.MAX_VALUE },
+                ]],
+            ];
+            for (const [label, contents] of cases) {
+                const path = join(root, `${label.replace(/\s+/g, "-")}.json`);
+                writeFileSync(path, JSON.stringify(contents));
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(
+                    RolloutRecordsInvalidError,
+                );
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("re-reads the file on every list when the store is read-only", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-readonly-stale-"));
         try {
