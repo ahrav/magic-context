@@ -474,3 +474,337 @@ fn scope_context_dimension_values_gate_matching() {
     );
     assert_eq!(batch.objects[0].state, ApplicabilityState::OutOfScope);
 }
+
+#[test]
+fn distinct_anchor_rows_never_share_a_cached_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+
+    // Rows that differ only in `exact_value` must not share a cache entry.
+    let first = ApplicabilityCandidate {
+        anchor: Some(AnchorRowSpec {
+            anchor_id: "anchor-a".to_string(),
+            anchor_kind: "exact".to_string(),
+            exact_value: Some("ab".to_string()),
+            ..AnchorRowSpec::default()
+        }),
+        ..candidate("object-x")
+    };
+    let second = ApplicabilityCandidate {
+        anchor: Some(AnchorRowSpec {
+            anchor_id: "anchor-a".to_string(),
+            anchor_kind: "exact".to_string(),
+            exact_value: Some("a".to_string()),
+            ..AnchorRowSpec::default()
+        }),
+        ..candidate("object-x")
+    };
+    let with_payload = ApplicabilityCandidate {
+        anchor: Some(AnchorRowSpec {
+            anchor_id: "anchor-a".to_string(),
+            anchor_kind: "exact".to_string(),
+            exact_value: Some("ab".to_string()),
+            payload: Some(Vec::new()),
+            ..AnchorRowSpec::default()
+        }),
+        ..candidate("object-x")
+    };
+
+    let query = QueryContext {
+        exact_token: Some("ab".to_string()),
+        ..QueryContext::default()
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &ScopeMatchContext::new(),
+        &[first, second, with_payload],
+        &EvalBudget::unbounded(),
+    );
+    let tokens: Vec<_> = batch.objects.iter().map(|object| &object.token).collect();
+    assert_ne!(tokens[0], tokens[1]);
+    assert_ne!(tokens[0], tokens[2]);
+    assert_ne!(tokens[1], tokens[2]);
+    // Same object, three distinct anchor rows: each classifies on its own
+    // inputs rather than answering from another row's cache entry.
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.stats.object_cache_misses, 3);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Historical);
+}
+
+#[test]
+fn rows_sharing_an_anchor_id_decode_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+
+    // Same anchor_id, one decodable row and one undecodable row, in both
+    // orders: the batch decode memo must never let one row answer for the
+    // other.
+    let valid_row = reachable_anchor(&fixture, "anchor-dup", base);
+    let broken_row = AnchorRowSpec {
+        anchor_id: "anchor-dup".to_string(),
+        anchor_kind: "reachable_from".to_string(),
+        reachable_from_oid: Some("not-an-oid".to_string()),
+        ..AnchorRowSpec::default()
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[
+            ApplicabilityCandidate {
+                anchor: Some(valid_row.clone()),
+                ..candidate("object-valid-first")
+            },
+            ApplicabilityCandidate {
+                anchor: Some(broken_row.clone()),
+                ..candidate("object-broken-second")
+            },
+            ApplicabilityCandidate {
+                anchor: Some(broken_row),
+                ..candidate("object-broken-third")
+            },
+            ApplicabilityCandidate {
+                anchor: Some(valid_row),
+                ..candidate("object-valid-fourth")
+            },
+        ],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Uncertain);
+    assert!(batch.objects[1].evidence.contains("undecodable anchor"));
+    assert_eq!(batch.objects[2].state, ApplicabilityState::Uncertain);
+    assert_eq!(batch.objects[3].state, ApplicabilityState::Current);
+}
+
+#[test]
+fn unreadable_payloads_are_uncertain_rather_than_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+
+    // A payload the build cannot read leaves the object's declared paths and
+    // checks unknown, so it must not reach the auto-injectable state.
+    let corrupt = ApplicabilityCandidate {
+        payload: Some(b"{not json".to_vec()),
+        ..candidate("object-corrupt")
+    };
+    let future_schema = ApplicabilityCandidate {
+        payload: Some(
+            br#"{"schema":"mc.applicability.object.v2","affected_paths":["src/lib.rs"]}"#.to_vec(),
+        ),
+        ..candidate("object-future-schema")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[corrupt, future_schema],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(batch.objects[0].evidence.contains("did not parse"));
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Uncertain);
+    assert!(batch.objects[1].evidence.contains("schema"));
+    assert!(batch
+        .objects
+        .iter()
+        .all(|object| object.state.blocks_auto_injection()));
+}
+
+#[test]
+fn check_paths_outside_the_checkout_are_uncertain() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+
+    let spec = |path: &str| ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: path.to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-escape")
+    };
+    // `/etc/hostname` exists on the host, and `Path::join` would let the
+    // absolute path replace the workdir; a traversal likewise leaves it.
+    let absolute = spec("/etc/hostname");
+    let traversal = spec("../../../../etc/passwd");
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[absolute, traversal],
+        &EvalBudget::unbounded(),
+    );
+    for object in &batch.objects {
+        assert_eq!(object.state, ApplicabilityState::Uncertain);
+        assert!(object.evidence.contains("not a plain relative path"));
+        // Never a definite verdict: the check was refused, not evaluated.
+        assert!(object.failed_check.is_none());
+    }
+}
+
+#[test]
+fn unknown_check_kinds_degrade_without_voiding_the_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let engine = ApplicabilityEngine::new();
+
+    // The unknown check kind must not discard `affected_paths`: the dirty gate
+    // runs before checks, so a DirtyTreeUncertain verdict proves the rest of
+    // the payload still decoded.
+    let with_paths = ApplicabilityCandidate {
+        payload: Some(
+            br#"{"schema":"mc.applicability.object.v1","affected_paths":["src/lib.rs"],
+                 "checks":[{"kind":"future_kind","path":"x"}]}"#
+                .to_vec(),
+        ),
+        ..candidate("object-unknown-check-with-paths")
+    };
+    let only_check = ApplicabilityCandidate {
+        payload: Some(
+            br#"{"schema":"mc.applicability.object.v1","affected_paths":[],
+                 "checks":[{"kind":"future_kind","path":"x"}]}"#
+                .to_vec(),
+        ),
+        ..candidate("object-unknown-check")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[with_paths, only_check],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Uncertain);
+    assert!(batch.objects[1].evidence.contains("not recognized"));
+}
+
+#[test]
+fn only_cached_classifications_claim_a_pending_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+
+    let stale = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "src/deleted.rs".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-stale")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&stale),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+    assert!(batch.objects[0].append_pending);
+    // The token names a live cache entry, so the confirmation lands and the
+    // next hit stops asking for the append.
+    assert!(engine.confirm_durable_append(&batch.objects[0].token));
+    let repeat = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[stale],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(repeat.stats.object_cache_hits, 1);
+    assert!(!repeat.objects[0].append_pending);
+
+    // A budget-exhausted verdict is never cached, so it must not advertise an
+    // append that could never be confirmed.
+    let expired = EvalBudget::new(
+        Some(Instant::now() - Duration::from_millis(1)),
+        Default::default(),
+    );
+    let transient = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[candidate("object-transient")],
+        &expired,
+    );
+    assert_eq!(transient.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(!transient.objects[0].append_pending);
+    assert!(!engine.confirm_durable_append(&transient.objects[0].token));
+}
+
+#[test]
+fn unconstrained_objects_do_not_claim_an_anchor_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[
+            candidate("object-bare"),
+            ApplicabilityCandidate {
+                anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+                ..candidate("object-anchored")
+            },
+        ],
+        &EvalBudget::unbounded(),
+    );
+    // Both are current, but the evidence is the durable record, so it must not
+    // claim an anchor resolved for an object that has none.
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert!(!batch.objects[0].evidence.contains("anchor holds"));
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Current);
+    assert!(batch.objects[1].evidence.contains("anchor holds"));
+}
+
+#[test]
+fn every_state_maps_to_a_distinct_observation_kind() {
+    let states = [
+        ApplicabilityState::Current,
+        ApplicabilityState::Historical,
+        ApplicabilityState::OutOfScope,
+        ApplicabilityState::Uncertain,
+        ApplicabilityState::DirtyTreeUncertain,
+        ApplicabilityState::Stale,
+        ApplicabilityState::LifecycleInvalidated,
+    ];
+    let mut kinds: Vec<&str> = states
+        .iter()
+        .map(|state| state.observation_kind())
+        .collect();
+    kinds.sort_unstable();
+    let total = kinds.len();
+    kinds.dedup();
+    assert_eq!(kinds.len(), total, "observation kinds collide");
+    assert!(kinds.iter().all(|kind| kind.starts_with("applicability.")));
+}

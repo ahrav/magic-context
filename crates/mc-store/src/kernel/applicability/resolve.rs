@@ -274,6 +274,8 @@ impl<'s> ResolutionLadder<'s> {
             if self.budget.is_exhausted() {
                 return WindowMatch::Budget;
             }
+            // `matches` performs graph operations not counted internally.
+            self.count_graph_operation();
             match matches(candidate) {
                 Ok(true) => {
                     if found.replace(candidate).is_some() {

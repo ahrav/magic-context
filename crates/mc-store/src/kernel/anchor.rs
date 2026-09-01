@@ -56,6 +56,34 @@ impl AnchorKind {
     pub fn from_stored(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == value)
     }
+
+    /// Returns the `QueryContext` dependency used for cache-key derivation.
+    /// An exhaustive match keeps new context-dependent kinds in that
+    /// derivation.
+    pub fn context_dependency(self) -> ContextDependency {
+        match self {
+            Self::Exact => ContextDependency::ExactToken,
+            Self::DeploymentRevision => ContextDependency::DeploymentRevision,
+            Self::ConfigRevision => ContextDependency::ConfigRevision,
+            Self::PlatformVersion => ContextDependency::PlatformVersion,
+            Self::WallClockInterval => ContextDependency::QueryInstant,
+            // Resolved against the checkout graph, not the query context.
+            Self::ReachableFrom | Self::ReachableBetween => ContextDependency::None,
+        }
+    }
+}
+
+/// Which part of a [`QueryContext`] an anchor kind consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContextDependency {
+    None,
+    ExactToken,
+    DeploymentRevision,
+    ConfigRevision,
+    PlatformVersion,
+    QueryInstant,
+    /// Conservative cover for a kind this build cannot map.
+    All,
 }
 
 /// Raw anchor columns as stored in the frozen `anchors` table.

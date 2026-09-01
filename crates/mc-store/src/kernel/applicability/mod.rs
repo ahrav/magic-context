@@ -15,15 +15,17 @@ pub use checkout::{
     open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, PathEncoding,
     SnapshotError,
 };
-pub use checks::{run_cheap_check, CheckOutcome};
+pub use checks::{run_cheap_check, CheckCache, CheckOutcome, MAX_CONFIG_BYTES};
 pub use engine::{
     ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityState, BatchEvaluation,
     ClassificationToken, EvaluationStats, FailedCheck, ObjectApplicability,
 };
 pub use payloads::{
-    ApplicabilityObservationPayload, CheckSpec, ObjectApplicabilitySpec, DEPENDENCY_KIND_TARGET,
-    OBJECT_APPLICABILITY_SCHEMA, OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT,
-    OBSERVATION_KIND_HISTORICAL, OBSERVATION_KIND_STALE, OBSERVATION_KIND_UNCERTAIN,
+    ApplicabilityObservationPayload, CheckSpec, ObjectApplicabilitySpec, PayloadDecode,
+    DEPENDENCY_KIND_TARGET, OBJECT_APPLICABILITY_SCHEMA, OBSERVATION_APPLICABILITY_SCHEMA,
+    OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_DIRTY_TREE_UNCERTAIN, OBSERVATION_KIND_HISTORICAL,
+    OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
+    OBSERVATION_KIND_UNCERTAIN,
 };
 pub use resolve::{
     capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,

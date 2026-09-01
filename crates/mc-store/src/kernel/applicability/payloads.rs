@@ -20,14 +20,16 @@ pub const OBSERVATION_KIND_CURRENT: &str = "applicability.current";
 pub const OBSERVATION_KIND_HISTORICAL: &str = "applicability.historical";
 pub const OBSERVATION_KIND_UNCERTAIN: &str = "applicability.uncertain";
 pub const OBSERVATION_KIND_STALE: &str = "applicability.stale";
+pub const OBSERVATION_KIND_OUT_OF_SCOPE: &str = "applicability.out_of_scope";
+pub const OBSERVATION_KIND_DIRTY_TREE_UNCERTAIN: &str = "applicability.dirty_tree_uncertain";
+pub const OBSERVATION_KIND_LIFECYCLE_INVALIDATED: &str = "applicability.lifecycle_invalidated";
 
 /// Dependency kind linking an applicability observation to the object it
 /// classifies; the injection-block reducer reverse-looks-up through it.
 pub const DEPENDENCY_KIND_TARGET: &str = "applicability_target";
 
 /// Object-side applicability inputs, decoded from the owning row's frozen
-/// `payload` BLOB. Absent or undecodable payloads mean the object declares
-/// no affected paths and no cheap checks.
+/// `payload` BLOB.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectApplicabilitySpec {
     pub schema: String,
@@ -35,6 +37,16 @@ pub struct ObjectApplicabilitySpec {
     pub affected_paths: Vec<String>,
     #[serde(default)]
     pub checks: Vec<CheckSpec>,
+}
+
+/// `Absent` and `Undecodable` license different verdicts: an absent payload
+/// declares nothing, while an unreadable payload leaves staleness unknown.
+/// `Undecodable` carries the JSON or schema error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadDecode {
+    Absent,
+    Present(ObjectApplicabilitySpec),
+    Undecodable(String),
 }
 
 impl ObjectApplicabilitySpec {
@@ -50,24 +62,46 @@ impl ObjectApplicabilitySpec {
         serde_json::to_vec(self).expect("object applicability payload is serializable")
     }
 
-    /// Fail-closed decode: `None` when the payload is missing, unreadable,
-    /// or carries an unknown schema. Callers treat `None` as "no declared
-    /// inputs".
-    pub fn decode(payload: Option<&[u8]>) -> Option<Self> {
-        let decoded = serde_json::from_slice::<Self>(payload?).ok()?;
-        (decoded.schema == OBJECT_APPLICABILITY_SCHEMA).then_some(decoded)
+    pub fn decode(payload: Option<&[u8]>) -> PayloadDecode {
+        let Some(payload) = payload else {
+            return PayloadDecode::Absent;
+        };
+        let decoded = match serde_json::from_slice::<Self>(payload) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return PayloadDecode::Undecodable(format!(
+                    "object applicability payload did not parse: {error}"
+                ));
+            }
+        };
+        if decoded.schema != OBJECT_APPLICABILITY_SCHEMA {
+            return PayloadDecode::Undecodable(format!(
+                "object applicability payload schema {:?} is not {OBJECT_APPLICABILITY_SCHEMA}",
+                decoded.schema
+            ));
+        }
+        PayloadDecode::Present(decoded)
     }
 }
 
-/// One bounded cheap check. `Symbol` ships as vocabulary only: it decodes,
-/// evaluates as unsupported, and renders the object uncertain until a real
-/// resolver introduces the trait seam.
+/// `Unrecognized` preserves `CheckSpec` deserialization when `kind` has an
+/// unknown tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckSpec {
-    FileExists { path: String },
-    ConfigKey { path: String, key: String },
-    Symbol { path: String, symbol: String },
+    FileExists {
+        path: String,
+    },
+    ConfigKey {
+        path: String,
+        key: String,
+    },
+    Symbol {
+        path: String,
+        symbol: String,
+    },
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// Durable payload of one applicability observation: enough to identify the

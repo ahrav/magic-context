@@ -24,8 +24,8 @@ pub use admission::{
 };
 pub use anchor::{
     encode_anchor_captures, evaluate_non_git, AnchorCapture, AnchorCondition, AnchorDecodeError,
-    AnchorEvaluation, AnchorKind, AnchorRowSpec, GitCondition, PatchIdCapture, QueryContext,
-    ANCHOR_CAPTURE_SCHEMA,
+    AnchorEvaluation, AnchorKind, AnchorRowSpec, ContextDependency, GitCondition, PatchIdCapture,
+    QueryContext, ANCHOR_CAPTURE_SCHEMA,
 };
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub use backup::filesystem_is_unsafe_for_test;

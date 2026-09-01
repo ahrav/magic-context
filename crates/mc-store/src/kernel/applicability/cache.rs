@@ -29,11 +29,14 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
         if let Some(value) = self.current.get(key) {
             return Some(value.clone());
         }
-        if let Some(value) = self.previous.remove(key) {
-            self.insert(key.clone(), value.clone());
-            return Some(value);
+        let value = self.previous.remove(key)?;
+        // Promotion bypasses `insert` so a read never rotates.
+        if self.current.len() < self.cap {
+            self.current.insert(key.clone(), value.clone());
+        } else {
+            self.previous.insert(key.clone(), value.clone());
         }
-        None
+        Some(value)
     }
 
     pub(super) fn insert(&mut self, key: K, value: V) {
@@ -43,12 +46,71 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
         self.current.insert(key, value);
     }
 
-    /// Mutates a cached value in place wherever it currently lives.
-    pub(super) fn update(&mut self, key: &K, apply: impl FnOnce(&mut V)) {
+    /// Returns whether the key was present, so a caller cannot mistake a
+    /// dropped entry for an applied mutation.
+    pub(super) fn update(&mut self, key: &K, apply: impl FnOnce(&mut V)) -> bool {
         if let Some(value) = self.current.get_mut(key) {
             apply(value);
+            true
         } else if let Some(value) = self.previous.get_mut(key) {
             apply(value);
+            true
+        } else {
+            false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promoting_from_the_previous_generation_keeps_the_rest_of_it() {
+        let mut cache: TwoGenerationCache<u32, u32> = TwoGenerationCache::new(4);
+        // Fill one generation, then rotate it into `previous`.
+        for key in 0..4 {
+            cache.insert(key, key);
+        }
+        cache.insert(100, 100);
+        assert_eq!(cache.previous.len(), 4);
+        // Refill `current` so a promotion would meet the rotation condition.
+        for key in 101..104 {
+            cache.insert(key, key);
+        }
+        assert_eq!(cache.current.len(), 4);
+
+        // Reading one previous-generation entry must not evict its siblings.
+        assert_eq!(cache.get(&0), Some(0));
+        for key in 1..4 {
+            assert_eq!(
+                cache.get(&key),
+                Some(key),
+                "entry {key} was evicted by a read"
+            );
+        }
+    }
+
+    #[test]
+    fn residency_stays_within_two_generations_under_promotion() {
+        let mut cache: TwoGenerationCache<u32, u32> = TwoGenerationCache::new(4);
+        for key in 0..100 {
+            cache.insert(key, key);
+            // Re-reading recent keys drives promotion alongside inserts.
+            let _ = cache.get(&key.saturating_sub(3));
+        }
+        assert!(
+            cache.current.len() + cache.previous.len() <= 2 * cache.cap,
+            "residency grew past two generations"
+        );
+    }
+
+    #[test]
+    fn update_reports_whether_the_key_was_present() {
+        let mut cache: TwoGenerationCache<u32, u32> = TwoGenerationCache::new(4);
+        cache.insert(1, 1);
+        assert!(cache.update(&1, |value| *value = 2));
+        assert_eq!(cache.get(&1), Some(2));
+        assert!(!cache.update(&9, |value| *value = 3));
     }
 }
