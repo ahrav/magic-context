@@ -87,6 +87,7 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
             spentUsd: 12.5,
             observedCostRollouts: 6,
             estimatedCostRollouts: 1,
+            refusedRegretLadders: { "intervention-mismatch": 2 },
         },
         exclusions: [
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },

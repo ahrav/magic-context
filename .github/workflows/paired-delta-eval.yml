@@ -51,11 +51,15 @@ jobs:
           esac
           echo "PAIRED_DELTA_MODE=$MODE" >> "$GITHUB_ENV"
 
+      # The smoke lane drives the same orchestration the live modes use — provider resolution, the
+      # regret ladder, exclusion classification — against mocks, so a regression in it fails here
+      # rather than after a scheduled dispatch has spent live budget.
       - name: Gate deterministic lane without credentials
         run: |
           bun run --cwd packages/e2e-tests typecheck
           bun run --cwd packages/e2e-tests test:paired-delta-unit
           bun run --cwd packages/e2e-tests validate-mode-manifest
+          bun packages/e2e-tests/scripts/run-paired-delta.ts --smoke
 
       # A later step in this job injects a live provider credential, so the
       # binary is pinned to a release and verified against a pinned digest
@@ -119,12 +123,13 @@ jobs:
           key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Weekly and release dispatches now fail closed on an invalid record, so caching one would block every later run.
+      # The attempt is in the key for the same immutability reason as the rollout checkpoint: without it a rerun's corrected record would no-op against attempt 1's entry, and the stale one would keep being restored.
       - name: Save calibration evidence
         if: success() && env.PAIRED_DELTA_MODE == 'calibration' && hashFiles('packages/e2e-tests/artifacts/paired-delta-calibration.json') != ''
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.sha }}-${{ github.run_id }}
+          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # `upload-artifact@v4` artifacts are immutable, so the attempt is part of the name: a rerun uploading under the prior attempt's name conflicts instead of replacing it.
       - name: Archive reports and rollout records

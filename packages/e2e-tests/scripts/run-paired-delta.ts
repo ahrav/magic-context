@@ -997,9 +997,11 @@ function buildAnalysis(
     poolManifestFingerprint: string,
     pinnedSnapshotId: string,
     noiseFloors: readonly FamilyNoiseFloor[],
-): FamilyDeltaAnalysis {
+): { analysis: FamilyDeltaAnalysis; refusedRegretLadders: Record<string, number> } {
     const byId = new Map(scenarios.map((scenario) => [scenario.scenarioId, scenario]));
     const observations: FamilyDeltaObservation[] = [];
+    /** A refused ladder leaves the cell `completed`, so it carries no `reasonCode` and would otherwise be indistinguishable from a run that scheduled no regret arms. */
+    const refusedRegretLadders: Record<string, number> = {};
     for (const coordinate of result.coordinates) {
         const scenario = byId.get(coordinate.scenarioId);
         if (!scenario) continue;
@@ -1022,6 +1024,10 @@ function buildAnalysis(
             }
         }
         const regret = coordinate.regret;
+        if (regret?.refusedReason) {
+            refusedRegretLadders[regret.refusedReason] =
+                (refusedRegretLadders[regret.refusedReason] ?? 0) + 1;
+        }
         if (regret && !regret.refusedReason) {
             for (const endpoint of ["retrieval", "formation", "representation"] as const) {
                 const delta = regret[endpoint];
@@ -1048,6 +1054,8 @@ function buildAnalysis(
     };
     if (observations.length === 0) {
         return {
+            refusedRegretLadders,
+            analysis: {
             ...lane,
             bootstrapSeed: BOOTSTRAP_SEED,
             bootstrapResamples: policy.bootstrapResamples,
@@ -1058,16 +1066,20 @@ function buildAnalysis(
             liveRegret: [],
             providerMixedRegret: [],
             rawRegretRecords: [],
+            },
         };
     }
-    return estimateFamilyDeltas({
+    return {
+        refusedRegretLadders,
+        analysis: estimateFamilyDeltas({
         observations,
         minimumAnalyzableFamilyCount: policy.minimumAnalyzableFamilyCount,
         bootstrapSeed: BOOTSTRAP_SEED,
         bootstrapResamples: policy.bootstrapResamples,
         lane,
         noiseFloors,
-    });
+        }),
+    };
 }
 
 const BOOTSTRAP_SEED = 20260831;
@@ -1296,7 +1308,7 @@ async function runLive(args: CliArgs): Promise<void> {
     const plannedCoordinates = scenarios.length * policy.replicateCount;
     const healthyCoordinates = result.coordinates.filter(({ cells }) =>
         PRIMARY_ARM_IDS.every((armId) => cells[armId]?.cell.runHealth === "completed")).length;
-    const analysis = buildAnalysis(
+    const { analysis, refusedRegretLadders } = buildAnalysis(
         result,
         scenarios,
         policy,
@@ -1319,6 +1331,7 @@ async function runLive(args: CliArgs): Promise<void> {
             spentUsd: result.spentUsd,
             observedCostRollouts: result.observedCostRollouts,
             estimatedCostRollouts: result.estimatedCostRollouts,
+            refusedRegretLadders,
         },
     });
     publishPairedDeltaReport(report, args.reportPath);
@@ -1333,6 +1346,7 @@ async function runLive(args: CliArgs): Promise<void> {
         evidenceSufficient: analysis.evidenceSufficient,
         plannedCoordinates,
         healthyCoordinates,
+        refusedRegretLadders,
         validForPoolSizing: mode === "calibration" ? calibrationValidForSizing : null,
     }, null, 2));
     /** A non-completed status outranks the calibration verdict, because the caller keyed on `harness-unreclaimed` must not lose it. */

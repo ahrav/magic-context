@@ -63,6 +63,8 @@ export interface PairedDeltaReportBody {
         spentUsd: number;
         observedCostRollouts: number;
         estimatedCostRollouts: number;
+        /** A refused ladder leaves its cell `completed`, so it reaches no exclusion count; without this a systemic refusal reads as an unscheduled regret arm. */
+        refusedRegretLadders: Record<string, number>;
     };
 }
 
@@ -209,7 +211,9 @@ export function buildPairedDeltaReport(input: {
         !Number.isSafeInteger(input.runSummary.observedCostRollouts) ||
         input.runSummary.observedCostRollouts < 0 ||
         !Number.isSafeInteger(input.runSummary.estimatedCostRollouts) ||
-        input.runSummary.estimatedCostRollouts < 0
+        input.runSummary.estimatedCostRollouts < 0 ||
+        Object.values(input.runSummary.refusedRegretLadders).some((count) =>
+            !Number.isSafeInteger(count) || count < 1)
     ) {
         throw new Error("paired-delta-report: run-summary-invalid");
     }
