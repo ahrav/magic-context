@@ -762,6 +762,9 @@ interface SessionUsage {
 
 const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
 
+/** `scriptedCtxSearchTurn` drives one tool-use response and one follow-up, both served by the fixture provider. */
+const SCRIPTED_ORACLE_MOCK_ENTRIES = 2;
+
 function addUsage(
     left: RolloutObservation["usage"],
     right: RolloutObservation["usage"],
@@ -784,9 +787,18 @@ interface LedgerMessage {
     };
 }
 
+/**
+ * Rows of a session's message ledger.
+ *
+ * A missing or non-array `data` is treated as a failure rather than an empty ledger: read as zero it
+ * would publish a completed cell with no spend and hide an off-pin historian or compaction call, so
+ * the rollout would look cheap and clean precisely when the ledger could not be read.
+ */
 function ledgerEntries(payload: unknown): LedgerMessage[] {
     const rows = (payload as { data?: unknown } | null)?.data;
-    if (!Array.isArray(rows)) return [];
+    if (!Array.isArray(rows)) {
+        throw new Error("live paired-delta received no session ledger to price the rollout from");
+    }
     return rows
         .map((row) => (row as { info?: LedgerMessage } | null)?.info)
         .filter((info): info is LedgerMessage =>
@@ -811,11 +823,12 @@ async function sessionUsage(
     harness: TestHarness,
     sessionId: string,
     pinned: { providerId: string; modelId: string },
-    /** Only R1 schedules a mock-served call, so the fixture route is exempt for that arm alone. */
-    mockRouteExpected: boolean,
+    /** How many fixture-served entries the arm scheduled. R1's scripted `ctx_search` turn makes exactly two: the tool-use response and its follow-up. */
+    expectedMockEntries: number,
 ): Promise<SessionUsage> {
     let usage = ZERO_USAGE;
     let offPinRoute: SessionUsage["offPinRoute"] = null;
+    let mockEntries = 0;
     let frontier = [sessionId];
     const seen = new Set<string>();
     while (frontier.length > 0) {
@@ -834,13 +847,17 @@ async function sessionUsage(
                 modelId: typeof info.modelID === "string" ? info.modelID : "",
             };
             const tokens = info.tokens;
+            /** An assistant entry names a route, so absent counters are an incomplete ledger rather than a message with nothing to price. */
             if (
                 typeof tokens?.input !== "number" ||
                 typeof tokens.output !== "number" ||
                 typeof tokens.cache?.write !== "number" ||
                 typeof tokens.cache.read !== "number"
             ) {
-                continue;
+                throw new Error(
+                    `live paired-delta session ledger entry from ${route.providerId} carries no ` +
+                    "token counters",
+                );
             }
             const spent = {
                 input: tokens.input,
@@ -855,8 +872,11 @@ async function sessionUsage(
              * live evidence, since the authored-response scan cannot see a child call.
              */
             if (route.providerId === "mock-anthropic") {
-                if (mockRouteExpected) continue;
-                if (offPinRoute === null) offPinRoute = route;
+                mockEntries += 1;
+                /** Counted rather than allowed by arm: an extra fixture-served entry — a historian or compaction call that routed to the mock — is an identity failure even on R1. */
+                if (mockEntries > expectedMockEntries && offPinRoute === null) {
+                    offPinRoute = route;
+                }
                 continue;
             }
             if (route.providerId !== pinned.providerId || route.modelId !== pinned.modelId) {
@@ -871,11 +891,12 @@ async function sessionUsage(
             usage = addUsage(usage, spent);
         }
         const rows = (children as { data?: unknown }).data;
-        if (Array.isArray(rows)) {
-            for (const child of rows) {
-                const childId = (child as { id?: unknown } | null)?.id;
-                if (typeof childId === "string") frontier.push(childId);
-            }
+        if (!Array.isArray(rows)) {
+            throw new Error("live paired-delta could not enumerate the session's children");
+        }
+        for (const child of rows) {
+            const childId = (child as { id?: unknown } | null)?.id;
+            if (typeof childId === "string") frontier.push(childId);
         }
         }
     }
@@ -1080,7 +1101,7 @@ export function createLiveDependencies(input: {
                         harness,
                         sessionId,
                         { providerId: input.providerId, modelId: input.modelId },
-                        coordinate.armId === "r1",
+                        scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                     );
                     /**
                      * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
@@ -1175,7 +1196,7 @@ export function createLiveDependencies(input: {
                         harness,
                         activeSessionId ?? "",
                         { providerId: input.providerId, modelId: input.modelId },
-                        coordinate.armId === "r1",
+                        scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                     )).usage;
                 },
                 async dispose() {
@@ -1530,6 +1551,27 @@ async function runLive(args: CliArgs): Promise<void> {
         }
         noiseFloors = calibrationNoiseFloors(calibration);
         calibrationFingerprint = calibration.recordFingerprint;
+        /** The policy fingerprint proves the record names this policy, not that it honoured its depth or target: the reader recomputes the pool size against the record's own copies of both. */
+        if (
+            calibration.decisions.replicateCount !== policy.replicateCount ||
+            calibration.targetMinimumDetectableDelta !== policy.targetMinimumDetectableDelta
+        ) {
+            throw new Error(
+                "paired-delta calibration record declares a different replicate depth or target " +
+                "delta than the policy",
+            );
+        }
+        /** Depth is validated for the keys present, so the key set itself has to be the calibration pool's. */
+        const calibrationScenarios = scenarioIdsForMode(manifest, "calibration");
+        const measuredScenarios = new Set(Object.keys(calibration.scenarioDepth));
+        if (
+            measuredScenarios.size !== calibrationScenarios.size ||
+            [...calibrationScenarios].some((scenarioId) => !measuredScenarios.has(scenarioId))
+        ) {
+            throw new Error(
+                "paired-delta calibration record does not cover the calibration pool's scenarios",
+            );
+        }
         /** The record's own family set, not only its declared count: a record binding this policy could still have measured a different selection. */
         const measuredFamilies = new Set(calibration.familyNoise.map(({ familyId }) => familyId));
         const expected = new Set(
@@ -1628,7 +1670,8 @@ async function runLive(args: CliArgs): Promise<void> {
             implementationDigest,
             targetMinimumDetectableDelta: policy.targetMinimumDetectableDelta,
             decisions: {
-                familyCount: policy.minimumAnalyzableFamilyCount,
+                /** The families this run measured, not the policy's floor: the reader requires the recorded count to equal the measured set, so a pool wider than the floor would make its own artifact unreadable. */
+                familyCount: new Set(scenarios.map(({ familyId }) => familyId)).size,
                 replicateCount: policy.replicateCount,
                 cadence: "weekly-and-release",
             },
