@@ -277,21 +277,22 @@ const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }
         label: "HTTP authorization scheme",
         pattern: /^(?:bearer|basic|digest|token)\s+[A-Za-z0-9+/_=.~-]{16,}$/i,
     },
-    { label: "JWT", pattern: /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./ },
+    /** Matched at a token boundary anywhere in the value rather than only at its start. A vendor prefix is distinctive enough that finding one mid-string identifies a credential, and requiring position zero meant any leading text — a comment, a resolved placeholder, a label — defeated every rule at once. The lookbehind keeps a prefix from matching inside a longer opaque run, where it would be a coincidence rather than a token. commentlint: allow(JUDGE) */
+    { label: "JWT", pattern: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./ },
     // Ordered before the general `sk-` shape, which would otherwise claim it.
-    { label: "Anthropic-style key", pattern: /^sk-ant-[A-Za-z0-9_-]{16,}/ },
-    { label: "OpenAI-style key", pattern: /^sk-[A-Za-z0-9_-]{16,}/ },
+    { label: "Anthropic-style key", pattern: /(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{16,}/ },
+    { label: "OpenAI-style key", pattern: /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}/ },
     /** Ordered before the `gh*_` shape, whose character class cannot reach the `i` in `github_pat_`. commentlint: allow(JUDGE) */
-    { label: "GitHub fine-grained token", pattern: /^github_pat_[A-Za-z0-9_]{20,}/ },
-    { label: "GitHub token", pattern: /^gh[pousr]_[A-Za-z0-9]{20,}/ },
-    { label: "AWS access key id", pattern: /^(?:AKIA|ASIA)[0-9A-Z]{12,}/ },
-    { label: "Google API key", pattern: /^AIza[0-9A-Za-z_-]{30,}/ },
-    { label: "Hugging Face token", pattern: /^hf_[A-Za-z0-9]{30,}/ },
+    { label: "GitHub fine-grained token", pattern: /(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}/ },
+    { label: "GitHub token", pattern: /(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9]{20,}/ },
+    { label: "AWS access key id", pattern: /(?<![A-Za-z0-9_-])(?:AKIA|ASIA)[0-9A-Z]{12,}/ },
+    { label: "Google API key", pattern: /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,}/ },
+    { label: "Hugging Face token", pattern: /(?<![A-Za-z0-9_-])hf_[A-Za-z0-9]{30,}/ },
     /** The same prefix set `SECRET_TEXT_PATTERNS` redacts: `xoxu`, `xoxv`, and `xoxc` are user, bot-refresh, and browser-session tokens, and `xapp-` is the app-level token, none of them less usable than the `xoxb` shape. commentlint: allow(JUDGE) */
-    { label: "Slack token", pattern: /^(?:xox[abprsuvc]|xapp)-[0-9A-Za-z-]{10,}/ },
+    { label: "Slack token", pattern: /(?<![A-Za-z0-9_-])(?:xox[abprsuvc]|xapp)-[0-9A-Za-z-]{10,}/ },
     { label: "PEM private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
     /** Any userinfo at all: the password may be empty (`redis://:secret@host`) or absent (`https://ghp_token@host`), and a bare token in the username position is the shape a personal access token takes. commentlint: allow(JUDGE) */
-    { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i },
+    { label: "credential-bearing URI", pattern: /(?<![A-Za-z0-9_-])[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i },
 ];
 
 /** Returns the format a value announces itself as, or null. The label never contains the value. */

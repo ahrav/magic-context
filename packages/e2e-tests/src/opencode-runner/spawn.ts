@@ -160,18 +160,18 @@ function writeConfigs(
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
         : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
-    /** The URL is written verbatim as the generated provider's `baseURL`, so it reaches the same file the object channels are scanned for: URI userinfo — `https://token@host` — is a credential the guard refuses anywhere else. Checked here rather than at the spawn path so a direct caller cannot write one either. commentlint: allow(JUDGE) */
-    const urlFormat = credentialValueFormat(mockProviderURL);
-    if (urlFormat !== null) {
-        throw new Error(
-            `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
-        );
-    }
-    /** The component scan lives beside the other credential predicates so every channel gets it, not only this one: it is the same judgment applied to a URL's own namespaces. commentlint: allow(JUDGE) */
+    /** The component scan runs first so the diagnostic names where the credential is. The value rules match a vendor prefix anywhere in the string, so on a URL they would fire on a credential the component scan can attribute to a specific query key or path segment, and report only that the whole value matched. commentlint: allow(JUDGE) */
     const urlFinding = urlCredentialFinding(mockProviderURL);
     if (urlFinding !== null) {
         throw new Error(
             `mockProviderURL carries a ${urlFinding}; pass credentials through extraEnv`,
+        );
+    }
+    /** The URL is written verbatim as the generated provider's `baseURL`, so it reaches the same file the object channels are scanned for: URI userinfo — `https://token@host` — is a credential the guard refuses anywhere else, and one the component scan does not read. Checked here rather than at the spawn path so a direct caller cannot write one either. commentlint: allow(JUDGE) */
+    const urlFormat = credentialValueFormat(mockProviderURL);
+    if (urlFormat !== null) {
+        throw new Error(
+            `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
         );
     }
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
@@ -385,18 +385,18 @@ function assertConfigHasNoCredentials(
                 );
             }
             if (typeof child === "string") {
-                const format = credentialValueFormat(child);
-                if (format !== null) {
-                    throw new Error(
-                        `config contains a ${format} value at ${childPath}; ` +
-                            "pass credentials through extraEnv",
-                    );
-                }
-                /** A config value can be a URL as easily as the harness's own can, and a deep-merged live provider's `baseURL` is exactly that: a signed URL whose signature is its credential passed every whole-value rule, because those anchor at the start. commentlint: allow(JUDGE) */
+                /** A config value can be a URL as easily as the harness's own can, and a deep-merged live provider's `baseURL` is exactly that: a signed URL's signature is recognized by parameter name, which no value rule reads. Run first for the same reason as above — it names the component. commentlint: allow(JUDGE) */
                 const urlValueFinding = urlCredentialFinding(child);
                 if (urlValueFinding !== null) {
                     throw new Error(
                         `config contains a ${urlValueFinding} at ${childPath}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+                const format = credentialValueFormat(child);
+                if (format !== null) {
+                    throw new Error(
+                        `config contains a ${format} value at ${childPath}; ` +
                             "pass credentials through extraEnv",
                     );
                 }

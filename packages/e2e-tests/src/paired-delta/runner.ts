@@ -475,10 +475,19 @@ export class FileRolloutStore implements RolloutStore {
         if (this.records && !this.readOnly) return this.records;
         let records: RolloutRecord[] = [];
         try {
-            records = parseRolloutRecords(
-                JSON.parse(readFileSync(this.path, "utf8")) as unknown,
-                this.path,
-            );
+            const text = readFileSync(this.path, "utf8");
+            /** Parsed separately so a truncated file is reported as an unusable records file rather than a bare `SyntaxError`: both mean the same thing to a caller — inspect this path — and only the typed error reaches the exit code that says so. commentlint: allow(JUDGE) */
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(text) as unknown;
+            } catch (error) {
+                throw new RolloutRecordsInvalidError(
+                    `rollout store ${this.path} is not valid JSON: ${
+                        error instanceof Error ? error.message : String(error)
+                    }`,
+                );
+            }
+            records = parseRolloutRecords(parsed, this.path);
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
@@ -628,6 +637,14 @@ export async function runPairedDelta(
     /** `parseRolloutRecords` rejects a duplicate coordinate, but `RolloutStore` is an interface any caller can implement and the map below keeps only the last record while the pre-scan bills every copy: a completed earlier duplicate behind a failed later one would be retried, paid for, and then refused replacement by `put`, losing the new evidence. commentlint: allow(JUDGE) */
     const duplicateKeys = new Set<string>();
     for (const record of stored) {
+        /** Checked before the key is computed: `coordinateKey` dereferences the entry, so a store returning `null` would be diagnosed by a `TypeError` raised outside the release path — leaving a store whose `list()` took a claim holding it through the rejected resume. commentlint: allow(JUDGE) */
+        if (record === null || typeof record !== "object" || Array.isArray(record)) {
+            releaseBeforeThrowing(options.store);
+            throw new Error(
+                "records file contains an entry that is not a rollout record; " +
+                    "point at a fresh records path",
+            );
+        }
         const key = coordinateKey(record);
         if (duplicateKeys.has(key)) {
             releaseBeforeThrowing(options.store);
@@ -1211,7 +1228,8 @@ function completedRecord(
     if (runHealth === "completed") {
         try {
             validateCheckVector(scenario, observation.checks);
-            checks = observation.checks;
+            /** Copied into plain objects rather than retained: validation reads the contents, which says nothing about the container being cloneable, and an adapter-owned `Proxy` fails `structuredClone` inside `put` — after the rollout is paid for and with nothing persisted. Same reason the intervention is detached. commentlint: allow(JUDGE) */
+            checks = observation.checks.map((check) => ({ ...check }));
         } catch (error) {
             if (!(error instanceof PairedDeltaContractError)) throw error;
             reasonCode = "invalid-result";

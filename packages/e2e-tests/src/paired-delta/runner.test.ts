@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     FileRolloutStore,
+    RolloutRecordsInvalidError,
     RolloutStoreBusyError,
     ProviderUnavailableError,
     baseScriptFingerprint,
@@ -1479,6 +1480,39 @@ describe("paired-delta runner", () => {
         expect(unavailable.maxAttemptCostUsd).toBe(unavailable.costUsd);
     });
 
+    it("refuses a non-object entry without losing the claim", async () => {
+        // `coordinateKey` dereferences the entry, so this used to raise a TypeError outside
+        // the release path.
+        let released = 0;
+        const store: RolloutStore = {
+            list: () => [null as unknown as RolloutRecord],
+            put: () => {},
+            release: () => {
+                released += 1;
+            },
+        };
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /entry that is not a rollout record/,
+        );
+        expect(released).toBe(1);
+    });
+
+    it("stores detached checks when the adapter returns a proxied vector", async () => {
+        // `validateCheckVector` reads the contents; `structuredClone` rejects the container.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                return { ...base, checks: new Proxy(base.checks, {}) };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        expect(() => structuredClone(result.records[0]?.checks)).not.toThrow();
+    });
+
     it("refuses a record whose cell is absent without losing the claim", async () => {
         // The dereference used to raise a TypeError outside the release path.
         const store = new MemoryStore([
@@ -1838,6 +1872,22 @@ describe("paired-delta runner", () => {
             (listed[0] as { costUsd: number }).costUsd = 0;
             expect(store.list()[0]?.costUsd).toBe(storedRecord("mc-on").costUsd);
             store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reports truncated JSON as an unusable records file", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-truncated-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, '[{"schema":"paired-delta-rollout/v1"');
+
+            // A bare SyntaxError cannot be told from any other failure by a caller keyed
+            // on the exit code, and it means the same thing: inspect this path.
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(
+                RolloutRecordsInvalidError,
+            );
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

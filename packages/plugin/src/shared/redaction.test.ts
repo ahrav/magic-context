@@ -229,6 +229,23 @@ describe("credentialValueFormat", () => {
         );
         expect(credentialValueFormat("-----BEGIN RSA PRIVATE KEY-----")).toBe("PEM private key");
 
+        // Leading text used to defeat every rule at once, because all of them were
+        // anchored at position zero.
+        expect(credentialValueFormat("note: sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key",
+        );
+        expect(credentialValueFormat("{env:HOME} sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key",
+        );
+        expect(credentialValueFormat("see postgres://user:pw@host/db for details")).toBe(
+            "credential-bearing URI",
+        );
+        expect(credentialValueFormat("token=ghp_abcdefghijklmnopqrstuvwxyz012345")).toBe(
+            "GitHub token",
+        );
+        // A prefix inside a longer opaque run is a coincidence, not a token boundary.
+        expect(credentialValueFormat("Zm9vYmFyhf_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(null);
+
         // `SECRET_TEXT_PATTERNS` redacts these formats, so config validation must reject
         // them under innocuous keys.
         expect(credentialValueFormat("github_pat_abcdefghijklmnopqrstuv0123456789")).toBe(
