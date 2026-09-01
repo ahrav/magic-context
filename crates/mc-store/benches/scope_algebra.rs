@@ -497,6 +497,14 @@ fn profile_kernel(kernel: &str) {
                 ));
             }
         }
+        "snapshot-untracked-1000" => {
+            let (_dir, fixture) = snapshot_fixture(1_000);
+            while Instant::now() < until {
+                black_box(
+                    snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).expect("snapshot"),
+                );
+            }
+        }
         other => panic!("unknown MC_SCOPE_PROFILE kernel {other}"),
     }
 }
