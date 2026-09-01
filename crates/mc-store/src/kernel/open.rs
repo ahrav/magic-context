@@ -307,6 +307,51 @@ impl KernelStore {
         Ok(reader)
     }
 
+    /// Reader counterpart of [`Self::lock_writer_before`], for the same reason:
+    /// a bounded evaluation cannot block on `Mutex::lock` past its own deadline.
+    /// Every connection in the pool is tried per round, so one long reader does
+    /// not decide the outcome.
+    pub(super) fn lock_reader_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        loop {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
+            for offset in 0..self.readers.len() {
+                let index = (start + offset) % self.readers.len();
+                let guard = match self.readers[index].try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => continue,
+                };
+                if self.poisoned.load(Ordering::Acquire) {
+                    return Err(KernelError::InvalidRestore);
+                }
+                return Ok(guard);
+            }
+            if Instant::now() >= deadline {
+                return Err(KernelError::Deadline);
+            }
+            std::thread::sleep(WRITER_ACQUIRE_POLL);
+        }
+    }
+
+    /// Holds every reader connection for `duration`, so a deadline-bounded read
+    /// path can be observed returning at its own bound.
+    #[cfg(feature = "test-support")]
+    pub fn hold_readers_for_test(&self, duration: std::time::Duration) {
+        let guards = self
+            .readers
+            .iter()
+            .map(|reader| reader.lock().unwrap_or_else(PoisonError::into_inner))
+            .collect::<Vec<_>>();
+        std::thread::sleep(duration);
+        drop(guards);
+    }
+
     #[cfg(feature = "test-support")]
     pub fn invalidate_writer_fence_for_test(&self) -> Result<(), KernelError> {
         let writer = self.lock_writer()?;

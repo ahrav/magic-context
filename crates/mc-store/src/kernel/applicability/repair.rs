@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
+use super::super::redaction::redact_lossy;
 use super::super::slice::{ObservationDependencySpec, ObservationPayload, ObservationSpec};
 use super::super::{CommitIntent, Envelope, KernelError, KernelStore, Sensitivity};
 use super::checkout::{CheckoutSnapshot, EvalBudget};
@@ -26,6 +27,27 @@ use super::resolve::PATCH_ID_ALGORITHM;
 
 /// Producer recorded on applicability repair commits.
 const REPAIR_PRODUCER: &str = "applicability-engine";
+
+/// Evidence bytes carried inside an observation payload. Bounding the document
+/// keeps it far below the secret scanner's work and candidate limits, whose
+/// exhaustion replaces a whole field with a redaction token.
+const MAX_PAYLOAD_EVIDENCE_BYTES: usize = 2048;
+
+/// Redacts and bounds evidence before it becomes part of the payload document.
+///
+/// A truncation lands on a character boundary, and the marker keeps a truncated
+/// value distinguishable from one that happened to end there.
+fn evidence_for_payload(evidence: &str) -> String {
+    let redacted = redact_lossy(evidence).text;
+    if redacted.len() <= MAX_PAYLOAD_EVIDENCE_BYTES {
+        return redacted;
+    }
+    let mut end = MAX_PAYLOAD_EVIDENCE_BYTES;
+    while end > 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &redacted[..end])
+}
 
 /// How one durable append attempt ended. `Discarded` and `DeadlineMissed`
 /// leave the in-request veto in force; the append-confirmed flag stays
@@ -83,6 +105,12 @@ impl RepairIntent {
             .as_ref()
             .map(|failed| serde_json::to_string(&failed.check).expect("check spec is serializable"))
             .unwrap_or_default();
+        // `detail` is serialized before the slice redacts it as one text field,
+        // so a detection inside the free-form evidence would rewrite bytes of
+        // the JSON document itself. The reducer decodes that document and now
+        // fails closed on a document it cannot read, so the evidence is
+        // redacted and bounded first and the envelope is built around the
+        // result.
         let payload = ApplicabilityObservationPayload {
             schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
             checkout_identity: snapshot.identity().to_string(),
@@ -90,7 +118,7 @@ impl RepairIntent {
             dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
             patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
             state: object.state.label().to_string(),
-            evidence: object.evidence.clone(),
+            evidence: evidence_for_payload(&object.evidence),
         };
         let detail = serde_json::to_string(&payload).expect("observation payload is serializable");
         // Deep-verification dedup identity (KTD9): object revision, checkout
@@ -134,6 +162,12 @@ impl RepairIntent {
 
     /// `target` carries the classified object's own domain and sensitivity,
     /// read inside the repair transaction.
+    /// The observation kind this repair would append, for reconciling against
+    /// the durable record before committing.
+    pub fn observation_kind(&self) -> &'static str {
+        self.kind
+    }
+
     fn observation_spec(&self, target: &RepairTarget) -> ObservationSpec {
         ObservationSpec {
             observation_id: format!("applicability-{}", self.operation_key),
@@ -386,7 +420,13 @@ impl KernelStore {
         if object_ids.is_empty() {
             return Ok(states);
         }
-        let mut reader = self.lock_reader()?;
+        // `lock_reader` blocks on `Mutex::lock`, which would let a concurrent
+        // reader hold this evaluation past its deadline before the scan reaches
+        // its first poll.
+        let mut reader = match budget.deadline() {
+            Some(deadline) => self.lock_reader_before(deadline)?,
+            None => self.lock_reader()?,
+        };
         let tx = reader
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|_| KernelError::Io)?;
@@ -515,4 +555,61 @@ fn matches_checkout(payload: &[u8], checkout_identity: &str) -> Result<bool, Ker
         return Err(KernelError::CorruptCanonicalRow);
     }
     Ok(detail.checkout_identity == checkout_identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The slice redacts the serialized payload as one text field, and the
+    /// reducer decodes that field. Pre-redacting evidence keeps a detected
+    /// secret out of the document, so the pass over the document has nothing
+    /// left to rewrite and the JSON stays parseable.
+    #[test]
+    fn a_detected_secret_never_reaches_the_payload_document() {
+        let payload = ApplicabilityObservationPayload {
+            schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
+            checkout_identity: "checkout".to_string(),
+            head: "head".to_string(),
+            dirty_fingerprint: "fingerprint".to_string(),
+            patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
+            state: "stale".to_string(),
+            evidence: evidence_for_payload("cheap check failed: password=hunter-two"),
+        };
+        let detail = serde_json::to_string(&payload).expect("payload is serializable");
+        assert!(
+            !detail.contains("hunter-two"),
+            "the secret is gone before serialization"
+        );
+
+        let stored = redact_lossy(&detail).text;
+        let decoded = serde_json::from_str::<ApplicabilityObservationPayload>(&stored)
+            .expect("the stored document still decodes");
+        assert_eq!(decoded.checkout_identity, "checkout");
+        assert_eq!(decoded.schema, OBSERVATION_APPLICABILITY_SCHEMA);
+    }
+
+    /// The scanner replaces a whole field when its candidate or work limit is
+    /// exhausted, which a bounded field cannot reach.
+    #[test]
+    fn evidence_is_bounded_on_a_character_boundary() {
+        let dense = "π password=hunter-two ".repeat(4096);
+        let bounded = evidence_for_payload(&dense);
+        assert!(bounded.len() <= MAX_PAYLOAD_EVIDENCE_BYTES + "…[truncated]".len());
+        assert!(bounded.ends_with("…[truncated]"));
+        assert!(!bounded.contains("hunter-two"));
+        // A serialized document built from it round-trips through redaction.
+        let detail = serde_json::to_string(&ApplicabilityObservationPayload {
+            schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
+            checkout_identity: "checkout".to_string(),
+            head: "head".to_string(),
+            dirty_fingerprint: "fingerprint".to_string(),
+            patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
+            state: "stale".to_string(),
+            evidence: bounded,
+        })
+        .expect("payload is serializable");
+        serde_json::from_str::<ApplicabilityObservationPayload>(&redact_lossy(&detail).text)
+            .expect("the stored document still decodes");
+    }
 }

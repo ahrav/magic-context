@@ -861,7 +861,6 @@ fn commit_prepared_with_writer(
     if let Some(error) = envelope.poisoned {
         return Err(error);
     }
-    let rebuild_alignment = envelope.changes.iter().any(change_affects_alignment);
     let result = redact(&result)?;
 
     let payloads = envelope
@@ -963,7 +962,7 @@ fn commit_prepared_with_writer(
         &result,
         Some(commit_seq),
     )?;
-    if rebuild_alignment {
+    if commit_affects_alignment(&tx, commit_seq)? {
         super::slice::rebuild_alignment_tx(&tx)?;
     }
     tx.commit().map_err(map_sqlite)?;
@@ -978,7 +977,6 @@ fn commit_prepared_with_writer(
 /// here cannot reach only one of them.
 const ALIGNMENT_CHANGE_KINDS: &[&str] = &[
     "decision_insert",
-    "observation_insert",
     "decision_correct",
     "observation_correct",
     "decision_retire",
@@ -986,19 +984,45 @@ const ALIGNMENT_CHANGE_KINDS: &[&str] = &[
     "artifact_deletion",
 ];
 
-fn change_affects_alignment(change: &PendingChange) -> bool {
-    ALIGNMENT_CHANGE_KINDS.contains(&change.kind)
-}
+/// `derive_alignment` reads exactly one dependency kind, so an observation
+/// insert carrying none of them adds no row the projection could contain.
+/// Rebuilding for one anyway loads and decodes every decision and observation
+/// in the store while the writer is held, which retrieval-time appends such as
+/// applicability read repair would pay on every commit.
+///
+/// Corrections and retirements stay unconditional: the superseded observation
+/// may have carried an `implements` dependency that the projection still holds.
+const OBSERVATION_INSERT_KIND: &str = "observation_insert";
+const ALIGNMENT_DEPENDENCY_KIND: &str = "implements";
 
+/// Derived from committed rows rather than from the pending changes, so the
+/// live path and the replay path in `commit_prepared_with_writer` reach the
+/// same answer for one commit sequence.
 fn commit_affects_alignment(tx: &Transaction<'_>, commit_seq: i64) -> Result<bool, KernelError> {
     let kinds = serde_json::to_string(ALIGNMENT_CHANGE_KINDS).map_err(|_| KernelError::Io)?;
     tx.query_row(
         "SELECT EXISTS(
-             SELECT 1 FROM change_event
-             WHERE commit_seq=?1
-               AND change_kind IN (SELECT value FROM json_each(?2))
+             SELECT 1 FROM change_event e
+             WHERE e.commit_seq=?1
+               AND (
+                 e.change_kind IN (SELECT value FROM json_each(?2))
+                 OR (
+                   e.change_kind=?3
+                   AND EXISTS(
+                     SELECT 1 FROM observation_dependencies d
+                     JOIN observations o ON o.observation_id = d.observation_id
+                     WHERE o.object_id = e.object_id
+                       AND d.dependency_kind=?4
+                   )
+                 )
+               )
          )",
-        params![commit_seq, kinds],
+        params![
+            commit_seq,
+            kinds,
+            OBSERVATION_INSERT_KIND,
+            ALIGNMENT_DEPENDENCY_KIND
+        ],
         |row| row.get(0),
     )
     .map_err(|_| KernelError::Io)

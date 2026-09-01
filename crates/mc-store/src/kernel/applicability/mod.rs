@@ -122,38 +122,75 @@ impl ApplicabilityEngine {
             budget,
         );
         let mut objects = batch.objects;
+        // Every stale or current classification is reconciled against the
+        // durable record, not against the engine's append-confirmed flag. That
+        // flag records only that some earlier append landed; a clearing
+        // observation since then makes the confirmation stale, and a cached
+        // stale verdict would otherwise skip repair and leave the block lifted.
         let repair_indices: Vec<usize> = objects
             .iter()
             .enumerate()
             .filter(|(_, object)| {
-                object.append_pending || object.state == ApplicabilityState::Current
+                matches!(
+                    object.state,
+                    ApplicabilityState::Stale | ApplicabilityState::Current
+                )
             })
             .map(|(index, _)| index)
             .collect();
         // Reducing per object took the reader lock and re-derived the committed
         // tip once per object, and deriving that tip walks the live registry.
-        let blocks = store.applicability_block_states_at_tip(
+        let blocks = match store.applicability_block_states_at_tip(
             &repair_indices
                 .iter()
                 .map(|index| objects[*index].object_id.as_str())
                 .collect::<Vec<_>>(),
             snapshot.identity(),
             budget,
-        )?;
+        ) {
+            Ok(blocks) => blocks,
+            // A deadline is a domain outcome, not a store failure. Without the
+            // durable record no current verdict can be shown unblocked, so
+            // every one of them reports uncertain.
+            Err(KernelError::Deadline) => {
+                for index in &repair_indices {
+                    if objects[*index].state == ApplicabilityState::Current {
+                        objects[*index].state = ApplicabilityState::Uncertain;
+                        objects[*index].evidence =
+                            "durable applicability block unread: evaluation deadline expired"
+                                .to_string();
+                    }
+                }
+                return Ok(ApplicabilityReport {
+                    objects,
+                    stats: batch.stats,
+                    appends: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let mut appends = Vec::new();
-        for index in repair_indices {
+        let mut remaining = repair_indices.as_slice();
+        while let Some((index, rest)) = remaining.split_first() {
+            let index = *index;
             // The repair pass commits, so it polls the budget per object rather
-            // than running a whole batch past an expired deadline.
+            // than running a whole batch past an expired deadline. Objects it
+            // never reaches still need their labels reconciled: one whose block
+            // stands cannot stay current just because the pass stopped early.
             if budget.is_exhausted() {
+                for index in remaining {
+                    let block = blocks.get(objects[*index].object_id.as_str()).cloned();
+                    demote_if_blocked(
+                        &mut objects[*index],
+                        block.as_ref(),
+                        "evaluation deadline expired before the clearing append",
+                    );
+                }
                 break;
             }
+            remaining = rest;
             let block = blocks.get(objects[index].object_id.as_str());
             let object = &objects[index];
-            if object.state == ApplicabilityState::Current
-                && !block.is_some_and(|block| block.blocked)
-            {
-                continue;
-            }
             let Some(intent) = RepairIntent::for_classification(
                 &snapshot,
                 object,
@@ -163,23 +200,26 @@ impl ApplicabilityEngine {
             ) else {
                 continue;
             };
+            // The durable record already states this verdict for this checkout,
+            // so appending again would only duplicate it.
+            if block.is_some_and(|block| block.observation_kind == intent.observation_kind()) {
+                continue;
+            }
+            // Nothing recorded means nothing to clear.
+            if object.state == ApplicabilityState::Current && block.is_none() {
+                continue;
+            }
             let outcome = commit_read_repair(store, self, &snapshot, object, &intent, budget)?;
-            // A durable block this request could not clear still blocks every
-            // other reader, so a `Current` label here would auto-inject an
-            // object the store considers blocked.
             let unresolved = match outcome {
                 AppendOutcome::Landed { .. } => None,
                 AppendOutcome::Discarded => Some("checkout moved before the clearing append"),
                 AppendOutcome::DeadlineMissed => {
-                    Some("deadline expired before the clearing append")
+                    Some("evaluation deadline expired before the clearing append")
                 }
             };
             if let Some(reason) = unresolved {
-                if objects[index].state == ApplicabilityState::Current {
-                    objects[index].state = ApplicabilityState::Uncertain;
-                    objects[index].evidence =
-                        format!("durable applicability block not cleared: {reason}");
-                }
+                let block = block.cloned();
+                demote_if_blocked(&mut objects[index], block.as_ref(), reason);
             }
             appends.push((objects[index].object_id.clone(), outcome));
         }
@@ -189,6 +229,20 @@ impl ApplicabilityEngine {
             appends,
         })
     }
+}
+
+/// A current classification whose durable block still stands cannot be
+/// auto-injected: the block applies to every reader, not just this request.
+fn demote_if_blocked(
+    object: &mut ObjectApplicability,
+    block: Option<&InjectionBlock>,
+    reason: &str,
+) {
+    if object.state != ApplicabilityState::Current || !block.is_some_and(|block| block.blocked) {
+        return;
+    }
+    object.state = ApplicabilityState::Uncertain;
+    object.evidence = format!("durable applicability block not cleared: {reason}");
 }
 
 fn uncertain_batch(

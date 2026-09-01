@@ -265,46 +265,62 @@ fn partial_commit_rolls_back_completely_under_fault_injection() {
     }
 }
 
+/// Two repairs racing on the same failure both reach the commit, because
+/// neither can see the other's record yet. The receipt is what keeps that from
+/// duplicating the observation and its deep-verification job (KTD9).
 #[test]
 fn duplicate_repair_replays_the_receipt_without_new_rows() {
     let store_dir = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let store = seed_store(store_dir.path());
     let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
     let query = QueryContext::default();
     let scope = ScopeMatchContext::new();
     let candidates = [failing_candidate()];
 
-    let first_engine = ApplicabilityEngine::new();
-    let first = first_engine
-        .evaluate(
-            &store,
-            &request(repo_dir.path(), &query, &scope, &candidates),
-            &EvalBudget::unbounded(),
-        )
-        .unwrap();
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+    // Both attempts carry the intent built against an empty durable history,
+    // which is what two racing repairs each hold.
+    let intent_record =
+        RepairIntent::for_classification(&snapshot, &batch.objects[0], None, "test", 42).unwrap();
+    let first = commit_read_repair(
+        &store,
+        &engine,
+        &snapshot,
+        &batch.objects[0],
+        &intent_record,
+        &EvalBudget::unbounded(),
+    )
+    .unwrap();
     assert!(matches!(
-        first.appends[0].1,
+        first,
         AppendOutcome::Landed {
             replayed: false,
             ..
         }
     ));
-
-    // A second engine (fresh caches — a different process) evaluates the
-    // same failure: the same dedup identity replays the receipt.
-    let second_engine = ApplicabilityEngine::new();
-    let second = second_engine
-        .evaluate(
-            &store,
-            &request(repo_dir.path(), &query, &scope, &candidates),
-            &EvalBudget::unbounded(),
-        )
-        .unwrap();
-    assert!(matches!(
-        second.appends[0].1,
-        AppendOutcome::Landed { replayed: true, .. }
-    ));
+    let second = commit_read_repair(
+        &store,
+        &engine,
+        &snapshot,
+        &batch.objects[0],
+        &intent_record,
+        &EvalBudget::unbounded(),
+    )
+    .unwrap();
+    assert!(
+        matches!(second, AppendOutcome::Landed { replayed: true, .. }),
+        "the second attempt replays the receipt, got {second:?}"
+    );
     assert_eq!(
         count(
             store_dir.path(),
@@ -321,6 +337,64 @@ fn duplicate_repair_replays_the_receipt_without_new_rows() {
         ),
         1,
         "exactly one outbox job for the repair"
+    );
+}
+
+/// A verdict the durable record already states needs no append, so the repair
+/// pass does not take the writer at all. The engine's append-confirmed flag is
+/// per process; this reconciliation is what a second process relies on.
+#[test]
+fn an_already_recorded_verdict_skips_the_commit() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+
+    let first = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert!(matches!(
+        first.appends[0].1,
+        AppendOutcome::Landed {
+            replayed: false,
+            ..
+        }
+    ));
+    let tip_after_first = store.known_as_of(0).unwrap().tip;
+
+    // A second engine — a different process, empty caches — reaches the same
+    // stale verdict the record already holds.
+    let second = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert_eq!(second.objects[0].state, ApplicabilityState::Stale);
+    assert!(
+        second.appends.is_empty(),
+        "no append is attempted, got {:?}",
+        second.appends
+    );
+    assert_eq!(
+        store.known_as_of(0).unwrap().tip,
+        tip_after_first,
+        "no commit means no new commit sequence"
+    );
+    assert_eq!(
+        count(
+            store_dir.path(),
+            "SELECT COUNT(*) FROM observations WHERE observation_kind LIKE 'applicability.%'"
+        ),
+        1
     );
 }
 
@@ -1002,4 +1076,337 @@ fn a_worktree_edit_after_the_snapshot_is_superseded_by_the_next_evaluation() {
             .expect("the superseding record is visible at the tip")
             .blocked
     );
+}
+
+/// One engine, one cache. A confirmed stale append, a clear, then a return to
+/// the failing state hits the cached stale entry whose append is already marked
+/// confirmed — so the flag cannot be what decides whether repair runs, or the
+/// durable block would stay lifted while the object reads stale in-request.
+#[test]
+fn a_confirmed_cache_entry_still_repairs_after_a_clear() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    // One engine for every step, so the cache carries across them.
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+    let evaluate = || {
+        engine
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &EvalBudget::unbounded(),
+            )
+            .unwrap()
+    };
+
+    let blocked = evaluate();
+    assert_eq!(blocked.objects[0].state, ApplicabilityState::Stale);
+    assert!(matches!(
+        blocked.appends[0].1,
+        AppendOutcome::Landed {
+            replayed: false,
+            ..
+        }
+    ));
+
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    let cleared = evaluate();
+    assert_eq!(cleared.objects[0].state, ApplicabilityState::Current);
+    assert!(matches!(cleared.appends[0].1, AppendOutcome::Landed { .. }));
+
+    // Back to the failing state: identical HEAD, dirty fingerprint, revision
+    // and check, so this is a hit on the entry from the first evaluation.
+    std::fs::remove_file(repo_dir.path().join("src/feature.rs")).unwrap();
+    let refailed = evaluate();
+    assert_eq!(refailed.objects[0].state, ApplicabilityState::Stale);
+    assert!(
+        refailed.stats.object_cache_hits >= 1,
+        "the third evaluation reuses the cached stale verdict"
+    );
+    assert!(
+        matches!(
+            refailed.appends.first(),
+            Some((_, AppendOutcome::Landed { .. }))
+        ),
+        "the cached verdict still repairs, got {:?}",
+        refailed.appends
+    );
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert!(
+        store
+            .applicability_block_state(
+                TARGET_OBJECT,
+                snapshot.identity(),
+                store.known_as_of(0).unwrap().tip
+            )
+            .unwrap()
+            .expect("the block is recorded again")
+            .blocked,
+        "the durable block returns with the failure"
+    );
+}
+
+/// The deadline can expire before the pass reaches every object. An object it
+/// never reached must not keep a current label while its block stands.
+#[test]
+fn objects_the_repair_pass_never_reached_do_not_stay_current() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    store
+        .commit(intent("blocked-second", '6'), |envelope| {
+            envelope.insert_decision(DecisionSpec {
+                decision_id: "decision-4".to_string(),
+                object_id: "second-blocked".to_string(),
+                domain_id: DOMAIN.to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                decision_kind: "adr".to_string(),
+                payload: DecisionPayload {
+                    summary: "second".to_string(),
+                    rationale: "fixture".to_string(),
+                },
+                source_kind: "fixture".to_string(),
+                source_id: "decision-4".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [
+        feature_candidate(TARGET_OBJECT),
+        feature_candidate("second-blocked"),
+    ];
+    // Record a durable block for both objects while the file is absent.
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    // Both now classify current, so both need their blocks cleared.
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+
+    let held = std::sync::Barrier::new(2);
+    let report = std::thread::scope(|threads| {
+        hold_writer(
+            threads,
+            &store,
+            &held,
+            "unreached-domain",
+            Duration::from_millis(1_500),
+        );
+        let budget = EvalBudget::new(
+            Some(Instant::now() + Duration::from_millis(200)),
+            Default::default(),
+        );
+        ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &budget,
+            )
+            .unwrap()
+    });
+    assert_eq!(
+        report.appends.len(),
+        1,
+        "the first append consumed the deadline"
+    );
+    for object in &report.objects {
+        assert_eq!(
+            object.state,
+            ApplicabilityState::Uncertain,
+            "{} kept a current label with its block standing",
+            object.object_id
+        );
+    }
+    assert!(report.auto_injectable().next().is_none());
+}
+
+/// End to end over the committed row: a check path carrying secret-shaped and
+/// JSON-punctuation bytes still produces a payload the reducer decodes. The
+/// pre-redaction and bound that keep it that way are proven in the unit tests
+/// beside `evidence_for_payload`.
+#[test]
+fn a_secret_shaped_check_path_leaves_the_stored_payload_decodable() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    // The checked path reaches the evidence string verbatim.
+    let candidates = [ApplicabilityCandidate {
+        object_id: TARGET_OBJECT.to_string(),
+        object_revision: 1,
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "src/AKIAIOSFODNN7EXAMPLE/\"quoted\"/{brace}.rs".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..ApplicabilityCandidate::default()
+    }];
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert!(matches!(report.appends[0].1, AppendOutcome::Landed { .. }));
+
+    // The reducer decodes the committed document rather than failing closed on
+    // a payload redaction rewrote.
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap()
+        .expect("the stored payload still decodes");
+    assert!(block.blocked);
+}
+
+/// The reducer takes a reader connection, and `Mutex::lock` has no timeout, so
+/// a held pool could carry a bounded evaluation past its deadline before the
+/// scan reached its first poll.
+#[test]
+fn a_held_reader_pool_does_not_outlast_the_evaluation_deadline() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+
+    let started = Instant::now();
+    let (report, elapsed) = std::thread::scope(|threads| {
+        threads.spawn(|| store.hold_readers_for_test(Duration::from_millis(1_500)));
+        // Give the holder the whole pool before the bounded evaluation starts.
+        std::thread::sleep(Duration::from_millis(50));
+        let budget = EvalBudget::new(
+            Some(Instant::now() + Duration::from_millis(200)),
+            Default::default(),
+        );
+        let report = ApplicabilityEngine::new()
+            .evaluate(
+                &store,
+                &request(repo_dir.path(), &query, &scope, &candidates),
+                &budget,
+            )
+            .unwrap();
+        (report, started.elapsed())
+    });
+    assert!(
+        elapsed < Duration::from_millis(1_400),
+        "the evaluation returned at its own deadline rather than at the holder's, took {elapsed:?}"
+    );
+    // A deadline is a domain outcome: the batch still carries labels.
+    assert_eq!(report.objects.len(), 1);
+    assert!(report.appends.is_empty());
+}
+
+/// Alignment is derived from `implements` dependencies alone, and an
+/// applicability observation carries only `applicability_target`. Rebuilding for
+/// one loads and decodes every decision and observation in the store while the
+/// writer is held, which every retrieval-time repair would otherwise pay.
+#[test]
+fn a_repair_commit_does_not_rebuild_the_alignment_projection() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+
+    let generation = "SELECT COALESCE((SELECT built_through_commit_seq
+                       FROM alignment_projection_state WHERE singleton=1),0)";
+    let before = count(store_dir.path(), generation);
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let AppendOutcome::Landed { commit_seq, .. } = report.appends[0].1 else {
+        panic!("expected a landed append, got {:?}", report.appends[0].1);
+    };
+    assert_eq!(
+        count(store_dir.path(), generation),
+        before,
+        "the repair commit left the projection generation where it was"
+    );
+    assert!(
+        commit_seq > before,
+        "the repair did commit, at {commit_seq}, past generation {before}"
+    );
+}
+
+/// The narrowing is specific to dependencies alignment does not read: an
+/// observation carrying `implements` still rebuilds.
+#[test]
+fn an_implements_observation_still_rebuilds_the_alignment_projection() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let generation = "SELECT COALESCE((SELECT built_through_commit_seq
+                       FROM alignment_projection_state WHERE singleton=1),0)";
+    let before = count(store_dir.path(), generation);
+    let receipt = store
+        .commit(intent("implements-observation", '8'), |envelope| {
+            envelope.insert_observation(ObservationSpec {
+                observation_id: "obs-implements".to_string(),
+                object_id: "obs-implements-object".to_string(),
+                domain_id: DOMAIN.to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                observation_kind: "state".to_string(),
+                payload: ObservationPayload {
+                    summary: "implements the target".to_string(),
+                    classification: "implemented".to_string(),
+                    detail: None,
+                },
+                observed_at: 1,
+                dependencies: vec![ObservationDependencySpec {
+                    dependency_object_id: TARGET_OBJECT.to_string(),
+                    dependency_kind: "implements".to_string(),
+                    dependency_payload: None,
+                }],
+                source_kind: "fixture".to_string(),
+                source_id: "obs-implements".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        count(store_dir.path(), generation),
+        receipt.commit_seq,
+        "an alignment-bearing insert advances the projection generation"
+    );
+    assert!(receipt.commit_seq > before);
 }
