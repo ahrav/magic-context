@@ -170,6 +170,15 @@ const CREDENTIAL_KEY_PREFIXES: readonly string[] = [
     "api",
     "access",
     "admin",
+    "bearer",
+    "cert",
+    "db",
+    "jwt",
+    "oauth",
+    "signature",
+    "sql",
+    "ssl",
+    "tls",
     "auth",
     "client",
     "consumer",
@@ -188,6 +197,10 @@ const CREDENTIAL_KEY_PREFIXES: readonly string[] = [
 ];
 
 const STRUCTURAL_KEY_QUALIFIERS = [
+    /** A public key is published by definition, and a caller cannot route one through `extraEnv` because it is not a secret; refusing the write blocked a legitimate field. `private` stays absent, so `privateKey` is still read as a credential. commentlint: allow(JUDGE) */
+    "public",
+    "fingerprint",
+    "thumbprint",
     "foreign",
     "primary",
     "composite",
@@ -228,6 +241,8 @@ export function isCredentialBearingConfigKey(key: string): boolean {
     }
     // The qualifier is read from the adjacent segment, not from any prefix of the compacted
     // key: `identityTokens` and `idleTokens` both begin with `id`.
+    /** A trailing enumerator distinguishes a rotated pair, it does not change what the field holds: `apiKey2` is the second API key. Stripped after the descriptors so `apiKey2Value` reduces the same way. commentlint: allow(JUDGE) */
+    compact = compact.replace(/[0-9]+$/, "");
     const qualifier = segments.length > 1 ? segments.at(-2) : undefined;
     const endsWith = (word: string): boolean =>
         // Plurals are derived rather than listed, so `dbPasswords` cannot slip past a
@@ -245,7 +260,10 @@ export function isCredentialBearingConfigKey(key: string): boolean {
     }
     if (CREDENTIAL_TAIL_WORDS.some(endsWith)) return true;
     if (!endsWith("token")) return false;
-    return qualifier === undefined || !TOKEN_COUNTING_QUALIFIERS.includes(qualifier);
+    if (qualifier === undefined) return true;
+    /** A counting qualifier excuses a count, and a count is plural: `cachedTokens` reports usage while `cacheToken` names one bearer token. Reading the qualifier without the number let a singular credential inherit the exemption. commentlint: allow(JUDGE) */
+    if (!compact.endsWith("tokens")) return true;
+    return !TOKEN_COUNTING_QUALIFIERS.includes(qualifier);
 }
 
 /**
@@ -280,6 +298,75 @@ const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }
 export function credentialValueFormat(value: string): string | null {
     const trimmed = value.trim();
     return CREDENTIAL_VALUE_FORMATS.find(({ pattern }) => pattern.test(trimmed))?.label ?? null;
+}
+
+/** Parameter names by which the major signed-URL schemes carry their bearer signature: Azure SAS `sig`, SigV4 `x-amz-signature`, Google `signature`. A signed URL's signature *is* the credential — it is bearer authority for the request — and it announces itself by parameter name rather than by value shape, because a base64 signature matches no vendor prefix. Recognized only inside a URL, not by `isCredentialBearingConfigKey`, because `signature` names a legitimate config field elsewhere while in a query it grants access. commentlint: allow(JUDGE) */
+const SIGNED_URL_CREDENTIAL_PARAMS: ReadonlySet<string> = new Set([
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-goog-signature",
+    "x-sap-signature",
+]);
+
+/** A segment that is not valid percent-encoding is judged as written rather than refused: `decodeURIComponent` throws on a stray `%`, and a malformed escape is not itself a credential. commentlint: allow(JUDGE) */
+function decodeUrlPart(part: string): string {
+    try {
+        return decodeURIComponent(part);
+    } catch {
+        return part;
+    }
+}
+
+/**
+ * Names a credential carried by a URL's own structure, or null when it carries none.
+ *
+ * `credentialValueFormat` anchors its rules at the start of the whole value, so a credential
+ * parked in a hostname label, a path segment, a query parameter, or a fragment matches
+ * neither a vendor prefix nor the userinfo rule. Each of those is its own namespace and is
+ * judged here with the same value rules the config channels use: labels and segments carry no
+ * key, so they are offered whole under an empty key; a fragment that is key-value shaped is
+ * parsed as pairs, and one that is not is offered whole. Values that do not parse as a URL
+ * carry no such namespace and are left to the whole-value rules.
+ * commentlint: allow(JUDGE)
+ */
+export function urlCredentialFinding(value: string): string | null {
+    let url: URL;
+    try {
+        url = new URL(value.trim());
+    } catch {
+        return null;
+    }
+    const pairs: Array<[string, string]> = [
+        ...url.hostname.split("."),
+        ...url.pathname.split("/"),
+    ]
+        .filter((part) => part.length > 0)
+        .map((part) => ["", decodeUrlPart(part)] as [string, string]);
+    pairs.push(...url.searchParams.entries());
+    const fragment = url.hash.replace(/^#/, "");
+    if (fragment.length > 0) {
+        if (/[=&]/.test(fragment)) {
+            pairs.push(...new URLSearchParams(fragment).entries());
+        } else {
+            pairs.push(["", decodeUrlPart(fragment)]);
+        }
+    }
+    for (const [key, part] of pairs) {
+        if (SIGNED_URL_CREDENTIAL_PARAMS.has(key.toLowerCase())) {
+            return `signed-URL credential parameter ${key}`;
+        }
+        if (key.length > 0 && isCredentialBearingConfigKey(key)) {
+            return `credential-shaped query key ${key}`;
+        }
+        const format = credentialValueFormat(part);
+        if (format !== null) {
+            return key.length > 0
+                ? `${format} value in query key ${key}`
+                : `${format} value in a URL component`;
+        }
+    }
+    return null;
 }
 
 /** `sanitizePathStringPortable` rewrites generic home-directory patterns without reading the host's home directory or username.

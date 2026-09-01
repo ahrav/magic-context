@@ -11,6 +11,7 @@ import { storageSubtreePath } from "../../../plugin/src/shared/data-path";
 import {
     credentialValueFormat,
     isCredentialBearingConfigKey,
+    urlCredentialFinding,
 } from "../../../plugin/src/shared/redaction";
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "../initialize-context-db";
@@ -166,28 +167,12 @@ function writeConfigs(
             `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
         );
     }
-    /** `credentialValueFormat` anchors its rules at the start of the whole value, so a credential parked in the query or fragment matches neither the userinfo rule nor a vendor prefix. Both are key-value namespaces of their own and are scanned with the same key and value rules the config channels use. commentlint: allow(JUDGE) */
-    for (const [key, value] of parsedUrlPairs(mockProviderURL)) {
-        /** A signed URL's signature is the credential: it is bearer authority for the request, and it announces itself by parameter name rather than by value shape — a base64 signature matches no vendor prefix. Recognized here rather than in `isCredentialBearingConfigKey`, because `signature` names a legitimate config field elsewhere while in a URL query it grants access. commentlint: allow(JUDGE) */
-        if (SIGNED_URL_CREDENTIAL_PARAMS.has(key.toLowerCase())) {
-            throw new Error(
-                `mockProviderURL carries a signed-URL credential parameter ${key}; ` +
-                    "pass credentials through extraEnv",
-            );
-        }
-        if (key.length > 0 && isCredentialBearingConfigKey(key)) {
-            throw new Error(
-                `mockProviderURL carries a credential-shaped query key ${key}; ` +
-                    "pass credentials through extraEnv",
-            );
-        }
-        const queryFormat = credentialValueFormat(value);
-        if (queryFormat !== null) {
-            throw new Error(
-                `mockProviderURL carries a ${queryFormat} value in query key ${key}; ` +
-                    "pass credentials through extraEnv",
-            );
-        }
+    /** The component scan lives beside the other credential predicates so every channel gets it, not only this one: it is the same judgment applied to a URL's own namespaces. commentlint: allow(JUDGE) */
+    const urlFinding = urlCredentialFinding(mockProviderURL);
+    if (urlFinding !== null) {
+        throw new Error(
+            `mockProviderURL carries a ${urlFinding}; pass credentials through extraEnv`,
+        );
     }
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
     /** Snapshotted before the hooks below run, for the same reason `canonicalizeSpawnConfigs` snapshots it. commentlint: allow(JUDGE) */
@@ -325,50 +310,6 @@ function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
     };
 }
 
-/** A segment that is not valid percent-encoding is judged as written rather than refused: `decodeURIComponent` throws on a stray `%`, and a malformed escape is not itself a credential. commentlint: allow(JUDGE) */
-function decodeSegment(segment: string): string {
-    try {
-        return decodeURIComponent(segment);
-    } catch {
-        return segment;
-    }
-}
-
-/** Parameter names by which the major signed-URL schemes carry their bearer signature: Azure SAS `sig`, SigV4 `x-amz-signature`, Google `signature`, and the `token`-style forms `isCredentialBearingConfigKey` already rejects are omitted because it covers them. commentlint: allow(JUDGE) */
-const SIGNED_URL_CREDENTIAL_PARAMS: ReadonlySet<string> = new Set([
-    "sig",
-    "signature",
-    "x-amz-signature",
-    "x-goog-signature",
-    "x-sap-signature",
-]);
-
-/** A value that does not parse as a URL carries no key namespace to scan, and the userinfo rule above has already read the whole string. The fragment is included because `searchParams` excludes it while an OAuth implicit-flow redirect puts its access token there, so `#access_token=…` would otherwise reach the file unread. A fragment that is not key-value shaped is offered whole under an empty key, which the value rules still judge. commentlint: allow(JUDGE) */
-function parsedUrlPairs(value: string): Array<[string, string]> {
-    let url: URL;
-    try {
-        url = new URL(value);
-    } catch {
-        return [];
-    }
-    /** A hostname label and a path segment both carry no key to judge, and the value rules anchor at the start of the whole URL, so a credential parked in either is read by neither. Each is offered whole under an empty key, decoded first so a percent-encoded credential is judged as itself. A capability-style endpoint that puts its token in the leftmost label is the hostname case. commentlint: allow(JUDGE) */
-    const pairs: Array<[string, string]> = [
-        ...url.hostname.split("."),
-        ...url.pathname.split("/"),
-    ]
-        .filter((part) => part.length > 0)
-        .map((part) => ["", decodeSegment(part)]);
-    pairs.push(...url.searchParams.entries());
-    const fragment = url.hash.replace(/^#/, "");
-    if (fragment.length === 0) return pairs;
-    if (/[=&]/.test(fragment)) {
-        pairs.push(...new URLSearchParams(fragment).entries());
-    } else {
-        pairs.push(["", decodeSegment(fragment)]);
-    }
-    return pairs;
-}
-
 /**
  * Serialize before validation so `toJSON()` transformations cannot bypass credential checks.
  * Cyclic input causes `JSON.stringify` to throw before credential validation.
@@ -448,6 +389,14 @@ function assertConfigHasNoCredentials(
                 if (format !== null) {
                     throw new Error(
                         `config contains a ${format} value at ${childPath}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
+                /** A config value can be a URL as easily as the harness's own can, and a deep-merged live provider's `baseURL` is exactly that: a signed URL whose signature is its credential passed every whole-value rule, because those anchor at the start. commentlint: allow(JUDGE) */
+                const urlValueFinding = urlCredentialFinding(child);
+                if (urlValueFinding !== null) {
+                    throw new Error(
+                        `config contains a ${urlValueFinding} at ${childPath}; ` +
                             "pass credentials through extraEnv",
                     );
                 }

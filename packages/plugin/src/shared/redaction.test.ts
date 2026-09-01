@@ -151,6 +151,18 @@ describe("isCredentialBearingConfigKey", () => {
             "MASTERKEYID",
             "APIKEYHEADER",
             "ACCESSTOKENVALUE",
+            // A trailing enumerator distinguishes a rotated pair; it does not change what
+            // the field holds.
+            "apiKey2",
+            "apiKey2Value",
+            "APIKEY2",
+            // A counting qualifier excuses a plural count, not one singular bearer token.
+            "cacheToken",
+            "cachedToken",
+            // The same logical field must not depend on the caller's casing.
+            "dbkey",
+            "oauthkey",
+            "jwtkey",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
@@ -186,6 +198,13 @@ describe("isCredentialBearingConfigKey", () => {
             "monkeys",
             "MONKEY",
             "donkeyCount",
+            // Published by definition, and not routable through extraEnv.
+            "publicKey",
+            "PUBLICKEY",
+            "publicKeyId",
+            // Plural counts keep their exemption.
+            "cachedTokens",
+            "cacheTokens",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }

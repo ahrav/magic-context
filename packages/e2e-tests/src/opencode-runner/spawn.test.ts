@@ -331,6 +331,24 @@ describe("opencode child lifecycle", () => {
                 delete process.env.PAIRED_DELTA_BUILD_ID;
             }
 
+            // A deep-merged live provider's baseURL is a config value like any other, and a
+            // signed URL's signature passes every whole-value rule.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    openCodeConfigExtra: {
+                        provider: {
+                            azureBlob: {
+                                options: {
+                                    baseURL:
+                                        "https://acct.blob.core.windows.net/c/f?sv=2021-08-06&sig=Zm9vYmFyYmF6cXV4",
+                                },
+                            },
+                        },
+                    },
+                })
+            ).toThrow(/signed-URL credential parameter sig/);
+
             // `extraEnv` overrides the ambient value, so it is what the child resolves.
             expect(() =>
                 __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
@@ -437,7 +455,7 @@ describe("opencode child lifecycle", () => {
                     ],
                     [
                         "https://host.internal/v1#sk-ant-abcdefghijklmnopqrstuv",
-                        /Anthropic-style key value in query key/,
+                        /Anthropic-style key value in a URL component/,
                     ],
                     // A signed URL announces its credential by parameter name; the signature
                     // itself matches no vendor prefix.
@@ -449,16 +467,16 @@ describe("opencode child lifecycle", () => {
                     // the whole URL.
                     [
                         "https://host.internal/v1/sk-ant-abcdefghijklmnopqrstuv",
-                        /Anthropic-style key value in query key/,
+                        /Anthropic-style key value in a URL component/,
                     ],
                     // A capability-style endpoint can carry its token in the leftmost label.
                     [
                         "https://sk-ant-abcdefghijklmnopqrstuv.gateway.internal/v1",
-                        /Anthropic-style key value in query key/,
+                        /Anthropic-style key value in a URL component/,
                     ],
                     [
                         "https://host.internal/v1/sk-ant-abcdefghijklmnopqrstuv/chat",
-                        /Anthropic-style key value in query key/,
+                        /Anthropic-style key value in a URL component/,
                     ],
                     [
                         "https://host.internal/v1?X-Amz-Signature=deadbeefcafe",

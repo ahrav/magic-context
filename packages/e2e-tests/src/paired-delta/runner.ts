@@ -997,7 +997,8 @@ export async function runPairedDelta(
                 records.push(record);
                 coordinateResult.cells[armId] = record;
                 spentUsd += record.costUsd;
-                reserveUsd = Math.max(reserveUsd, record.costUsd);
+                /** The dearest attempt this coordinate has seen, not just this one's cost: a coordinate that failed expensively and then succeeded cheaply carries the earlier figure in `maxAttemptCostUsd`, and folding only the cheap success would size the reserve below the price of a retry. Same expression the pre-scan uses over stored records. commentlint: allow(JUDGE) */
+        reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
                 if (disposalFailed) status = "harness-unreclaimed";
                 else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
