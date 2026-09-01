@@ -363,6 +363,21 @@ fn generation_for(block: Option<&InjectionBlock>, kind: &str) -> i64 {
     block.map_or(0, |block| block.generation_for(kind))
 }
 
+/// What the reducer could establish for one object at one checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockState {
+    /// Latest applicability observation for this (object, checkout).
+    Recorded(InjectionBlock),
+    /// A row this build cannot read: an undecodable payload, an absent detail,
+    /// an unexpected schema tag, or a payload state disagreeing with its kind.
+    ///
+    /// An unreadable row cannot be attributed to a checkout, so it may be this
+    /// object's newest record and skipping it would lift a block. The object
+    /// therefore fails closed on its own, rather than the read failing for
+    /// every object sharing the batch.
+    Unreadable,
+}
+
 /// One object's reduction while the DESC scan walks its rows.
 enum Reduction {
     /// Waiting for the newest row matching this checkout.
@@ -370,15 +385,24 @@ enum Reduction {
     /// Latest found; waiting for the newest row of a differing kind.
     PriorKind(InjectionBlock),
     Done(InjectionBlock),
+    Unreadable,
 }
 
 impl Reduction {
-    fn finish(self) -> Option<InjectionBlock> {
+    fn finish(self) -> Option<BlockState> {
         match self {
             Self::Latest => None,
-            Self::PriorKind(block) | Self::Done(block) => Some(block),
+            Self::PriorKind(block) | Self::Done(block) => Some(BlockState::Recorded(block)),
+            Self::Unreadable => Some(BlockState::Unreadable),
         }
     }
+}
+
+/// Whether one scanned row describes the checkout under reduction.
+enum RowMatch {
+    Matches,
+    OtherCheckout,
+    Unreadable,
 }
 
 /// Rows scanned between budget polls. The scan is index-driven and stops at
@@ -429,7 +453,13 @@ impl KernelStore {
             Some(known_as_of),
             &EvalBudget::unbounded(),
         )?;
-        Ok(states.remove(object_id))
+        match states.remove(object_id) {
+            Some(BlockState::Recorded(block)) => Ok(Some(block)),
+            // One object is the whole scope here, so an unreadable row is this
+            // caller's failure to report.
+            Some(BlockState::Unreadable) => Err(KernelError::CorruptCanonicalRow),
+            None => Ok(None),
+        }
     }
 
     /// Batched reducer over `object_ids` at the committed tip, for the repair
@@ -443,7 +473,7 @@ impl KernelStore {
         object_ids: &[&str],
         checkout_identity: &str,
         budget: &EvalBudget,
-    ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+    ) -> Result<HashMap<String, BlockState>, KernelError> {
         self.reduce_block_states(object_ids, checkout_identity, None, budget)
     }
 
@@ -455,7 +485,7 @@ impl KernelStore {
         checkout_identity: &str,
         known_as_of: Option<i64>,
         budget: &EvalBudget,
-    ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+    ) -> Result<HashMap<String, BlockState>, KernelError> {
         if object_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -507,7 +537,7 @@ fn reduce_with_reader(
     checkout_identity: &str,
     known_as_of: Option<i64>,
     budget: &EvalBudget,
-) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+) -> Result<HashMap<String, BlockState>, KernelError> {
     let mut states = HashMap::new();
     let tx = reader
         .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -544,7 +574,7 @@ fn reduce_chunk(
     checkout_digest: &str,
     known_as_of: i64,
     budget: &EvalBudget,
-    states: &mut HashMap<String, InjectionBlock>,
+    states: &mut HashMap<String, BlockState>,
 ) -> Result<(), KernelError> {
     let placeholders = std::iter::repeat_n("?", object_ids.len())
         .collect::<Vec<_>>()
@@ -583,15 +613,23 @@ fn reduce_chunk(
             return Err(KernelError::Deadline);
         }
         let object_id: String = row.get(0).map_err(scan_error)?;
-        if matches!(pending.get(&object_id), Some(Reduction::Done(_))) {
+        if matches!(
+            pending.get(&object_id),
+            Some(Reduction::Done(_) | Reduction::Unreadable)
+        ) {
             continue;
         }
         let kind: String = row.get(1).map_err(|_| KernelError::Io)?;
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
         let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
-        if !matches_checkout(&payload, &kind, checkout_digest)? {
-            continue;
+        match classify_row(&payload, &kind, checkout_digest) {
+            RowMatch::Matches => {}
+            RowMatch::OtherCheckout => continue,
+            RowMatch::Unreadable => {
+                pending.insert(object_id, Reduction::Unreadable);
+                continue;
+            }
         }
         let entry = pending.entry(object_id).or_insert(Reduction::Latest);
         *entry = match std::mem::replace(entry, Reduction::Latest) {
@@ -609,7 +647,7 @@ fn reduce_chunk(
                 prior_kind_commit_seq: commit_seq,
                 ..block
             }),
-            done @ Reduction::Done(_) => done,
+            settled @ (Reduction::Done(_) | Reduction::Unreadable) => settled,
         };
     }
     for (object_id, reduction) in pending {
@@ -620,32 +658,38 @@ fn reduce_chunk(
     Ok(())
 }
 
-/// A payload that does not decode fails the read. Skipping to an older row
-/// would reduce a corrupt latest record to an older `applicability.current`,
-/// or to no block at all, and let a failing object auto-inject.
+/// An unreadable row is not skipped to an older one: doing so would reduce a
+/// corrupt latest record to an older `applicability.current`, or to no block at
+/// all, and let a failing object auto-inject.
 ///
 /// `blocked` comes from the outer observation kind, so a row whose payload
-/// records a different state than that kind is rejected rather than trusted.
-/// The generic `insert_observation` API accepts any kind with any payload, and
-/// such a row would otherwise clear a real block.
-fn matches_checkout(
+/// records a different state than that kind counts as unreadable rather than
+/// trusted. The generic `insert_observation` API accepts any kind with any
+/// payload, and such a row would otherwise clear a real block.
+fn classify_row(
     payload: &[u8],
     observation_kind: &str,
     checkout_identity_digest: &str,
-) -> Result<bool, KernelError> {
-    let payload = serde_json::from_slice::<ObservationPayload>(payload)
-        .map_err(|_| KernelError::CorruptCanonicalRow)?;
-    let Some(detail) = payload.detail.as_deref() else {
-        return Err(KernelError::CorruptCanonicalRow);
+) -> RowMatch {
+    let Ok(payload) = serde_json::from_slice::<ObservationPayload>(payload) else {
+        return RowMatch::Unreadable;
     };
-    let detail = serde_json::from_str::<ApplicabilityObservationPayload>(detail)
-        .map_err(|_| KernelError::CorruptCanonicalRow)?;
+    let Some(detail) = payload.detail.as_deref() else {
+        return RowMatch::Unreadable;
+    };
+    let Ok(detail) = serde_json::from_str::<ApplicabilityObservationPayload>(detail) else {
+        return RowMatch::Unreadable;
+    };
     if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA
         || observation_kind != observation_kind_for_state(&detail.state)
     {
-        return Err(KernelError::CorruptCanonicalRow);
+        return RowMatch::Unreadable;
     }
-    Ok(detail.checkout_identity_digest == checkout_identity_digest)
+    if detail.checkout_identity_digest == checkout_identity_digest {
+        RowMatch::Matches
+    } else {
+        RowMatch::OtherCheckout
+    }
 }
 
 /// The observation kind that carries `state`, which is the vocabulary

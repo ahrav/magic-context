@@ -1,5 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// The one dependency kind the alignment projection reads.
+///
+/// `commit_affects_alignment` and `insert_observation` both gate on this kind,
+/// so a second alignment-relevant kind added to the query below has to change
+/// this constant with it.
+pub(crate) const ALIGNMENT_DEPENDENCY_KIND: &str = "implements";
+
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -206,11 +213,11 @@ fn load_alignment_input(
             .prepare(
                 "SELECT observation_id,dependency_object_id
                  FROM observation_dependencies
-                 WHERE dependency_kind='implements'",
+                 WHERE dependency_kind=?1",
             )
             .map_err(|_| KernelError::Io)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([ALIGNMENT_DEPENDENCY_KIND], |row| {
                 Ok(Dependency {
                     observation_id: row.get(0)?,
                     decision_object_id: row.get(1)?,

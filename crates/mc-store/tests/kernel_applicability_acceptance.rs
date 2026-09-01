@@ -484,5 +484,8 @@ fn acceptance_failed_check_blocks_before_deep_verification() {
     // scheduled, not consumed).
     assert_eq!(report.objects[0].state, ApplicabilityState::Stale);
     assert!(report.auto_injectable().next().is_none());
-    assert!(matches!(report.appends[0].1, AppendOutcome::Landed { .. }));
+    assert!(matches!(
+        *report.appends().next().expect("an append").1,
+        AppendOutcome::Landed { .. }
+    ));
 }

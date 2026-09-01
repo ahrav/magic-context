@@ -9,7 +9,9 @@ use super::Sensitivity;
 pub use alignment::{AlignmentRebuild, AlignmentRow, AlignmentSnapshot};
 pub use read::{DecisionRow, ObservationRow, SliceSnapshot};
 
-pub(crate) use alignment::{rebuild_alignment_tx, rebuild_alignment_with_writer};
+pub(crate) use alignment::{
+    rebuild_alignment_tx, rebuild_alignment_with_writer, ALIGNMENT_DEPENDENCY_KIND,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DecisionPayload {

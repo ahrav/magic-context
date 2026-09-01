@@ -29,6 +29,7 @@ use super::payloads::{
     OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
     OBSERVATION_KIND_UNCERTAIN,
 };
+use super::repair::AppendOutcome;
 use super::resolve::{GitConditionOutcome, ResolutionLadder, PATCH_ID_ALGORITHM};
 
 /// Applicability state of one object at one checkout. Everything except
@@ -127,6 +128,10 @@ pub struct ObjectApplicability {
     pub failed_check: Option<FailedCheck>,
     pub append_pending: bool,
     pub token: ClassificationToken,
+    /// Outcome of the durable append this request attempted, or `None` when
+    /// repair did not touch the object. Carried here rather than in a parallel
+    /// collection keyed by object id, which callers had to re-correlate.
+    pub append: Option<AppendOutcome>,
 }
 
 /// Cache and repo-access counters for one batch; the zero-IO-on-hit
@@ -329,6 +334,7 @@ impl ApplicabilityEngine {
                         && !cached.query_local
                         && !cached.append_confirmed,
                     token,
+                    append: None,
                 });
                 continue;
             }
@@ -733,6 +739,7 @@ impl ObjectApplicability {
             failed_check: None,
             append_pending: false,
             token: ClassificationToken(None),
+            append: None,
         }
     }
 }
@@ -816,6 +823,7 @@ fn finished(
         failed_check: classification.failed_check,
         append_pending: append_pending && classification.state.blocks_auto_injection(),
         token,
+        append: None,
     }
 }
 

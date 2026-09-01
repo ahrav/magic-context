@@ -634,7 +634,7 @@ fn insert_observation(
         spec.evidence_id.as_ref(),
     )?;
     for dependency in &spec.dependencies {
-        if dependency.kind.text == "implements" {
+        if dependency.kind.text == super::ALIGNMENT_DEPENDENCY_KIND {
             require_live_decision_object(tx, &dependency.object_id.text)?;
         } else {
             require_live(

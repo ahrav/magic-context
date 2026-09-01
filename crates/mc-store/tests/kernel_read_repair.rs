@@ -13,9 +13,10 @@ use git_fixtures::{commit_snapshot, init_repo, materialize, set_head_detached, F
 use mc_store::kernel::applicability::{
     checkout_identity_digest, commit_read_repair, snapshot_checkout, AppendOutcome,
     ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityObservationPayload,
-    ApplicabilityRequest, ApplicabilityState, CheckSpec, EvalBudget, ObjectApplicabilitySpec,
-    RepairIntent, DEPENDENCY_KIND_TARGET, OBSERVATION_APPLICABILITY_SCHEMA,
-    OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE, PATCH_ID_ALGORITHM,
+    ApplicabilityRequest, ApplicabilityState, BlockState, CheckSpec, EvalBudget,
+    ObjectApplicabilitySpec, RepairIntent, DEPENDENCY_KIND_TARGET,
+    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
+    PATCH_ID_ALGORITHM,
 };
 use mc_store::kernel::{
     CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelError, KernelStore,
@@ -159,7 +160,7 @@ fn failed_check_appends_observation_event_and_job_in_one_commit() {
     // AE5: the object is vetoed in this request, independent of the append.
     assert_eq!(report.objects[0].state, ApplicabilityState::Stale);
     assert!(report.auto_injectable().next().is_none());
-    let (object_id, outcome) = &report.appends[0];
+    let (object_id, outcome) = report.appends().next().expect("one append");
     assert_eq!(object_id, TARGET_OBJECT);
     let AppendOutcome::Landed {
         commit_seq,
@@ -363,7 +364,7 @@ fn an_already_recorded_verdict_skips_the_commit() {
         )
         .unwrap();
     assert!(matches!(
-        first.appends[0].1,
+        *first.appends().next().expect("an append").1,
         AppendOutcome::Landed {
             replayed: false,
             ..
@@ -382,9 +383,9 @@ fn an_already_recorded_verdict_skips_the_commit() {
         .unwrap();
     assert_eq!(second.objects[0].state, ApplicabilityState::Stale);
     assert!(
-        second.appends.is_empty(),
+        second.appends().next().is_none(),
         "no append is attempted, got {:?}",
-        second.appends
+        second.appends().collect::<Vec<_>>()
     );
     assert_eq!(
         store.known_as_of(0).unwrap().tip,
@@ -458,7 +459,7 @@ fn deadline_missed_append_retries_on_the_next_evaluation() {
         .unwrap();
     assert!(report.stats.object_cache_hits >= 1);
     assert!(matches!(
-        report.appends[0].1,
+        *report.appends().next().expect("an append").1,
         AppendOutcome::Landed {
             replayed: false,
             ..
@@ -565,7 +566,7 @@ fn passing_reevaluation_clears_the_block_bitemporally() {
         .unwrap();
     assert_eq!(report.objects[0].state, ApplicabilityState::Current);
     assert!(matches!(
-        report.appends.first(),
+        report.appends().collect::<Vec<_>>().first(),
         Some((_, AppendOutcome::Landed { .. }))
     ));
     let cleared_as_of = store.known_as_of(0).unwrap().tip;
@@ -647,7 +648,7 @@ fn refailure_after_a_clear_appends_instead_of_replaying_the_pre_clear_receipt() 
         )
         .unwrap();
     assert!(matches!(
-        first.appends[0].1,
+        *first.appends().next().expect("an append").1,
         AppendOutcome::Landed {
             replayed: false,
             ..
@@ -689,14 +690,14 @@ fn refailure_after_a_clear_appends_instead_of_replaying_the_pre_clear_receipt() 
     assert_eq!(refailed.objects[0].state, ApplicabilityState::Stale);
     assert!(
         matches!(
-            refailed.appends[0].1,
+            *refailed.appends().next().expect("an append").1,
             AppendOutcome::Landed {
                 replayed: false,
                 ..
             }
         ),
         "the re-failure appends a fresh record, got {:?}",
-        refailed.appends[0].1
+        *refailed.appends().next().expect("an append").1
     );
     let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
     let block = store
@@ -772,7 +773,10 @@ fn repair_inherits_the_target_domain_and_sensitivity() {
             &EvalBudget::unbounded(),
         )
         .unwrap();
-    assert!(matches!(report.appends[0].1, AppendOutcome::Landed { .. }));
+    assert!(matches!(
+        *report.appends().next().expect("an append").1,
+        AppendOutcome::Landed { .. }
+    ));
 
     let observation = "SELECT observation_id FROM observations
                        WHERE observation_kind LIKE 'applicability.%'";
@@ -924,7 +928,10 @@ fn a_clearing_append_that_cannot_commit_leaves_the_object_uncertain() {
         (report, started.elapsed())
     });
     let (report, elapsed) = report;
-    assert_eq!(report.appends[0].1, AppendOutcome::DeadlineMissed);
+    assert_eq!(
+        *report.appends().next().expect("an append").1,
+        AppendOutcome::DeadlineMissed
+    );
     assert_eq!(report.objects[0].state, ApplicabilityState::Uncertain);
     assert!(
         report.auto_injectable().next().is_none(),
@@ -1001,11 +1008,14 @@ fn the_repair_pass_stops_when_the_deadline_expires_mid_batch() {
         "every candidate still gets a label"
     );
     assert_eq!(
-        report.appends.len(),
+        report.appends().count(),
         1,
         "the first append consumed the deadline, so the second is not attempted"
     );
-    assert_eq!(report.appends[0].1, AppendOutcome::DeadlineMissed);
+    assert_eq!(
+        *report.appends().next().expect("an append").1,
+        AppendOutcome::DeadlineMissed
+    );
 }
 
 /// A worktree edit between the snapshot and the commit leaves the recorded
@@ -1108,7 +1118,7 @@ fn a_confirmed_cache_entry_still_repairs_after_a_clear() {
     let blocked = evaluate();
     assert_eq!(blocked.objects[0].state, ApplicabilityState::Stale);
     assert!(matches!(
-        blocked.appends[0].1,
+        *blocked.appends().next().expect("an append").1,
         AppendOutcome::Landed {
             replayed: false,
             ..
@@ -1118,7 +1128,10 @@ fn a_confirmed_cache_entry_still_repairs_after_a_clear() {
     git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
     let cleared = evaluate();
     assert_eq!(cleared.objects[0].state, ApplicabilityState::Current);
-    assert!(matches!(cleared.appends[0].1, AppendOutcome::Landed { .. }));
+    assert!(matches!(
+        *cleared.appends().next().expect("an append").1,
+        AppendOutcome::Landed { .. }
+    ));
 
     // Back to the failing state: identical HEAD, dirty fingerprint, revision
     // and check, so this is a hit on the entry from the first evaluation.
@@ -1131,11 +1144,11 @@ fn a_confirmed_cache_entry_still_repairs_after_a_clear() {
     );
     assert!(
         matches!(
-            refailed.appends.first(),
+            refailed.appends().collect::<Vec<_>>().first(),
             Some((_, AppendOutcome::Landed { .. }))
         ),
         "the cached verdict still repairs, got {:?}",
-        refailed.appends
+        refailed.appends().collect::<Vec<_>>()
     );
     let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
     assert!(
@@ -1223,7 +1236,7 @@ fn objects_the_repair_pass_never_reached_do_not_stay_current() {
             .unwrap()
     });
     assert_eq!(
-        report.appends.len(),
+        report.appends().count(),
         1,
         "the first append consumed the deadline"
     );
@@ -1272,7 +1285,10 @@ fn a_secret_shaped_check_path_leaves_the_stored_payload_decodable() {
             &EvalBudget::unbounded(),
         )
         .unwrap();
-    assert!(matches!(report.appends[0].1, AppendOutcome::Landed { .. }));
+    assert!(matches!(
+        *report.appends().next().expect("an append").1,
+        AppendOutcome::Landed { .. }
+    ));
 
     // The reducer decodes the committed document rather than failing closed on
     // a payload redaction rewrote.
@@ -1325,7 +1341,7 @@ fn a_held_reader_pool_does_not_outlast_the_evaluation_deadline() {
     );
     // A deadline is a domain outcome: the batch still carries labels.
     assert_eq!(report.objects.len(), 1);
-    assert!(report.appends.is_empty());
+    assert!(report.appends().next().is_none());
 }
 
 /// Alignment is derived from `implements` dependencies alone, and an
@@ -1352,8 +1368,12 @@ fn a_repair_commit_does_not_rebuild_the_alignment_projection() {
             &EvalBudget::unbounded(),
         )
         .unwrap();
-    let AppendOutcome::Landed { commit_seq, .. } = report.appends[0].1 else {
-        panic!("expected a landed append, got {:?}", report.appends[0].1);
+    let AppendOutcome::Landed { commit_seq, .. } = *report.appends().next().expect("an append").1
+    else {
+        panic!(
+            "expected a landed append, got {:?}",
+            *report.appends().next().expect("an append").1
+        );
     };
     assert_eq!(
         count(store_dir.path(), generation),
@@ -1438,7 +1458,10 @@ fn a_secret_shaped_checkout_path_still_matches_its_own_block() {
             &EvalBudget::unbounded(),
         )
         .unwrap();
-    assert!(matches!(report.appends[0].1, AppendOutcome::Landed { .. }));
+    assert!(matches!(
+        *report.appends().next().expect("an append").1,
+        AppendOutcome::Landed { .. }
+    ));
 
     let snapshot = snapshot_checkout(&repo_dir, &EvalBudget::unbounded()).unwrap();
     assert!(
@@ -1481,7 +1504,7 @@ fn a_moved_head_with_the_same_failure_still_appends() {
 
     let first = evaluate();
     assert!(matches!(
-        first.appends[0].1,
+        *first.appends().next().expect("an append").1,
         AppendOutcome::Landed {
             replayed: false,
             ..
@@ -1508,7 +1531,7 @@ fn a_moved_head_with_the_same_failure_still_appends() {
     assert_eq!(second.objects[0].state, ApplicabilityState::Stale);
     assert!(
         matches!(
-            second.appends.first(),
+            second.appends().collect::<Vec<_>>().first(),
             Some((
                 _,
                 AppendOutcome::Landed {
@@ -1518,7 +1541,7 @@ fn a_moved_head_with_the_same_failure_still_appends() {
             ))
         ),
         "the moved checkout appends its own evidence, got {:?}",
-        second.appends
+        second.appends().collect::<Vec<_>>()
     );
     assert_eq!(
         count(
@@ -1755,4 +1778,97 @@ fn an_interrupted_budget_stops_the_reducer_inside_sqlite() {
         .unwrap()
         .expect("the block is still readable");
     assert!(block.blocked);
+}
+
+/// One unreadable row degrades its own object rather than failing the read for
+/// every object sharing the batch.
+#[test]
+fn an_unreadable_row_degrades_only_its_own_object() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    store
+        .commit(intent("neighbour", 'b'), |envelope| {
+            envelope.insert_decision(DecisionSpec {
+                decision_id: "decision-5".to_string(),
+                object_id: "neighbour-object".to_string(),
+                domain_id: DOMAIN.to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                decision_kind: "adr".to_string(),
+                payload: DecisionPayload {
+                    summary: "neighbour".to_string(),
+                    rationale: "fixture".to_string(),
+                },
+                source_kind: "fixture".to_string(),
+                source_id: "decision-5".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [
+        failing_candidate(),
+        ApplicabilityCandidate {
+            object_id: "neighbour-object".to_string(),
+            ..failing_candidate()
+        },
+    ];
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+
+    // Corrupt only the first object's record.
+    let connection = Connection::open(store_dir.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id IN (
+                 SELECT observation_id FROM observation_dependencies
+                 WHERE dependency_object_id=?1 AND dependency_kind=?2
+             )",
+            (TARGET_OBJECT, DEPENDENCY_KIND_TARGET),
+        )
+        .unwrap();
+    drop(connection);
+
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let states = store
+        .applicability_block_states_at_tip(
+            &[TARGET_OBJECT, "neighbour-object"],
+            snapshot.identity(),
+            &EvalBudget::unbounded(),
+        )
+        .expect("the batch still reads");
+    assert_eq!(states.get(TARGET_OBJECT), Some(&BlockState::Unreadable));
+    let neighbour = states
+        .get("neighbour-object")
+        .expect("the untouched object still reduces");
+    assert!(
+        matches!(neighbour, BlockState::Recorded(block) if block.blocked),
+        "got {neighbour:?}"
+    );
+
+    // A current verdict over an unreadable record cannot auto-inject.
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert!(report
+        .objects
+        .iter()
+        .all(|object| object.state.blocks_auto_injection()));
 }

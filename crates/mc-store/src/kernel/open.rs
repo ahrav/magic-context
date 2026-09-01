@@ -267,62 +267,38 @@ impl KernelStore {
         &self,
         deadline: Instant,
     ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
-        loop {
-            if self.poisoned.load(Ordering::Acquire) {
-                return Err(KernelError::InvalidRestore);
-            }
-            let guard = match self.writer.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
-                        return Err(KernelError::Deadline);
-                    }
-                    std::thread::sleep(WRITER_ACQUIRE_POLL);
-                    continue;
-                }
-            };
-            if self.poisoned.load(Ordering::Acquire) {
-                return Err(KernelError::InvalidRestore);
-            }
-            return Ok(guard);
-        }
+        self.acquire_before(std::slice::from_ref(&self.writer), 0, deadline)
     }
 
     pub(super) fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
     }
 
-    pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(KernelError::InvalidRestore);
-        }
-        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let reader = self.readers[index]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(KernelError::InvalidRestore);
-        }
-        Ok(reader)
-    }
-
-    /// Reader counterpart of [`Self::lock_writer_before`], for the same reason:
-    /// a bounded evaluation cannot block on `Mutex::lock` past its own deadline.
-    /// Every connection in the pool is tried per round, so one long reader does
-    /// not decide the outcome.
+    /// Reader counterpart of [`Self::lock_writer_before`], over the whole pool:
+    /// one long-running reader does not decide the outcome.
     pub(super) fn lock_reader_before(
         &self,
         deadline: Instant,
     ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        self.acquire_before(&self.readers, start, deadline)
+    }
+
+    /// Polls `candidates` from `start` until one is free or `deadline` passes,
+    /// so every deadline-bounded acquisition shares one poison-check order and
+    /// one backoff.
+    fn acquire_before<'pool>(
+        &self,
+        candidates: &'pool [Mutex<Connection>],
+        start: usize,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'pool, Connection>, KernelError> {
         loop {
             if self.poisoned.load(Ordering::Acquire) {
                 return Err(KernelError::InvalidRestore);
             }
-            let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
-            for offset in 0..self.readers.len() {
-                let index = (start + offset) % self.readers.len();
-                let guard = match self.readers[index].try_lock() {
+            for offset in 0..candidates.len() {
+                let guard = match candidates[(start + offset) % candidates.len()].try_lock() {
                     Ok(guard) => guard,
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(TryLockError::WouldBlock) => continue,
@@ -337,6 +313,20 @@ impl KernelStore {
             }
             std::thread::sleep(WRITER_ACQUIRE_POLL);
         }
+    }
+
+    pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let reader = self.readers[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        Ok(reader)
     }
 
     /// Holds every reader connection for `duration`, so a deadline-bounded read

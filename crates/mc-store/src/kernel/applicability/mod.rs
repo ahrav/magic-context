@@ -35,7 +35,7 @@ pub use payloads::{
     OBSERVATION_KIND_LIFECYCLE_INVALIDATED, OBSERVATION_KIND_OUT_OF_SCOPE, OBSERVATION_KIND_STALE,
     OBSERVATION_KIND_UNCERTAIN,
 };
-pub use repair::{commit_read_repair, AppendOutcome, InjectionBlock, RepairIntent};
+pub use repair::{commit_read_repair, AppendOutcome, BlockState, InjectionBlock, RepairIntent};
 pub use resolve::{
     capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,
     ResolveObstacle, CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
@@ -61,9 +61,18 @@ pub struct ApplicabilityRequest<'a> {
 pub struct ApplicabilityReport {
     pub objects: Vec<ObjectApplicability>,
     pub stats: EvaluationStats,
-    /// Durable append outcomes for the objects repair touched this request,
-    /// in `objects` order (objects without appends are absent).
-    pub appends: Vec<(String, AppendOutcome)>,
+}
+
+impl ApplicabilityReport {
+    /// The objects repair appended for this request, with their outcomes.
+    pub fn appends(&self) -> impl Iterator<Item = (&str, &AppendOutcome)> {
+        self.objects.iter().filter_map(|object| {
+            object
+                .append
+                .as_ref()
+                .map(|append| (object.object_id.as_str(), append))
+        })
+    }
 }
 
 impl ApplicabilityReport {
@@ -111,7 +120,6 @@ impl ApplicabilityEngine {
                 return Ok(ApplicabilityReport {
                     objects: uncertain_batch(request.candidates, &error),
                     stats: EvaluationStats::default(),
-                    appends: Vec::new(),
                 });
             }
         };
@@ -165,12 +173,10 @@ impl ApplicabilityEngine {
                 return Ok(ApplicabilityReport {
                     objects,
                     stats: batch.stats,
-                    appends: Vec::new(),
                 });
             }
             Err(error) => return Err(error),
         };
-        let mut appends = Vec::new();
         let mut remaining = repair_indices.as_slice();
         while let Some((index, rest)) = remaining.split_first() {
             let index = *index;
@@ -180,17 +186,32 @@ impl ApplicabilityEngine {
             // stands cannot stay current just because the pass stopped early.
             if budget.is_exhausted() {
                 for index in remaining {
-                    let block = blocks.get(objects[*index].object_id.as_str()).cloned();
+                    let state = blocks.get(objects[*index].object_id.as_str()).cloned();
                     demote_if_blocked(
                         &mut objects[*index],
-                        block.as_ref(),
+                        state.as_ref(),
                         "evaluation deadline expired before the clearing append",
                     );
                 }
                 break;
             }
             remaining = rest;
-            let block = blocks.get(objects[index].object_id.as_str());
+            let state = blocks.get(objects[index].object_id.as_str()).cloned();
+            // An unreadable record leaves freshness unprovable, and its
+            // generation unknowable, so the object degrades on its own instead
+            // of a repair being built from a record nothing could read.
+            if matches!(state, Some(BlockState::Unreadable)) {
+                demote_if_blocked(
+                    &mut objects[index],
+                    state.as_ref(),
+                    "durable applicability record is unreadable",
+                );
+                continue;
+            }
+            let block = match &state {
+                Some(BlockState::Recorded(block)) => Some(block),
+                _ => None,
+            };
             let object = &objects[index];
             let Some(intent) = RepairIntent::for_classification(
                 &snapshot,
@@ -222,27 +243,27 @@ impl ApplicabilityEngine {
                 }
             };
             if let Some(reason) = unresolved {
-                let block = block.cloned();
-                demote_if_blocked(&mut objects[index], block.as_ref(), reason);
+                demote_if_blocked(&mut objects[index], state.as_ref(), reason);
             }
-            appends.push((objects[index].object_id.clone(), outcome));
+            objects[index].append = Some(outcome);
         }
         Ok(ApplicabilityReport {
             objects,
             stats: batch.stats,
-            appends,
         })
     }
 }
 
 /// A current classification whose durable block still stands cannot be
 /// auto-injected: the block applies to every reader, not just this request.
-fn demote_if_blocked(
-    object: &mut ObjectApplicability,
-    block: Option<&InjectionBlock>,
-    reason: &str,
-) {
-    if object.state != ApplicabilityState::Current || !block.is_some_and(|block| block.blocked) {
+fn demote_if_blocked(object: &mut ObjectApplicability, state: Option<&BlockState>, reason: &str) {
+    let blocked = match state {
+        Some(BlockState::Recorded(block)) => block.blocked,
+        // Freshness that cannot be read cannot be shown clear.
+        Some(BlockState::Unreadable) => true,
+        None => false,
+    };
+    if object.state != ApplicabilityState::Current || !blocked {
         return;
     }
     object.state = ApplicabilityState::Uncertain;
