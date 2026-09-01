@@ -2,12 +2,11 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::checkout::{open_regular_no_follow, CheckoutSnapshot, EvalBudget};
+use super::checkout::{CheckoutSnapshot, EvalBudget, WorktreeEntry};
 use super::payloads::CheckSpec;
 
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -23,13 +22,12 @@ pub enum CheckOutcome {
     BudgetExhausted,
 }
 
-/// A file that is definitely not there is a definite check failure. Anything
-/// else — a permission error, a transient I/O error, a non-regular file, or a
-/// file past the size cap — leaves the key unevaluated.
+/// Absence is settled by the shape probe before a read is attempted, so a read
+/// either yields content or leaves the key unevaluated: a permission error, a
+/// transient I/O error, a vanished path, or a file past the size cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfigRead {
     Content(Arc<str>),
-    Missing,
     Unevaluated(String),
 }
 
@@ -43,29 +41,27 @@ impl ConfigRead {
                 hash.update(content.as_bytes());
                 format!("content:{:x}", hash.finalize())
             }
-            Self::Missing => "missing".to_string(),
             Self::Unevaluated(reason) => format!("unevaluated:{reason}"),
         }
     }
 }
 
-/// Whether a declared path resolves, and to what: the shape a `FileExists`
-/// check reads, separate from any content a `ConfigKey` check reads.
+/// Whether a declared path is a file a check can read, and if not, why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Resolved {
-    /// Present and a regular file, established without following a link.
-    RegularFile(PathBuf),
-    /// Resolved inside the worktree and definitely not there.
+    /// Present and a regular file, established without following a symlink.
+    RegularFile,
+    /// Resolved beneath the worktree and definitely not there.
     Absent,
-    /// The declared spelling never resolved, or resolved to something no check
-    /// can read. Nothing was read.
+    /// Nothing was read: the spelling leaves the worktree, or what is there is
+    /// a shape no check consumes.
     Unresolvable(String),
 }
 
 impl Resolved {
     fn observation(&self) -> &str {
         match self {
-            Self::RegularFile(_) => "regular-file",
+            Self::RegularFile => "regular-file",
             Self::Absent => "absent",
             Self::Unresolvable(reason) => reason,
         }
@@ -82,7 +78,7 @@ impl Resolved {
 #[derive(Debug, Default)]
 pub struct CheckCache {
     resolved: HashMap<String, Resolved>,
-    contents: HashMap<PathBuf, ConfigRead>,
+    contents: HashMap<String, ConfigRead>,
 }
 
 impl CheckCache {
@@ -94,18 +90,32 @@ impl CheckCache {
         if let Some(cached) = self.resolved.get(path) {
             return cached.clone();
         }
-        let resolved = resolve_uncached(snapshot, path);
+        let resolved = match snapshot.worktree_entry(path) {
+            WorktreeEntry::RegularFile => Resolved::RegularFile,
+            WorktreeEntry::Absent => Resolved::Absent,
+            // A terminal symlink is where the target could sit outside the
+            // checkout, so no check follows one to a verdict.
+            WorktreeEntry::Symlink => Resolved::Unresolvable(format!(
+                "check path {path} is a symlink, whose target this check will not follow"
+            )),
+            WorktreeEntry::Directory => Resolved::Unresolvable(format!(
+                "check path {path} is a directory, not a file a check can read"
+            )),
+            WorktreeEntry::Other => {
+                Resolved::Unresolvable(format!("check path {path} is not a regular file"))
+            }
+            WorktreeEntry::Unresolvable(reason) => Resolved::Unresolvable(reason),
+        };
         self.resolved.insert(path.to_string(), resolved.clone());
         resolved
     }
 
-    fn read(&mut self, absolute: &Path) -> ConfigRead {
-        if let Some(cached) = self.contents.get(absolute) {
+    fn read(&mut self, snapshot: &CheckoutSnapshot, path: &str) -> ConfigRead {
+        if let Some(cached) = self.contents.get(path) {
             return cached.clone();
         }
-        let outcome = read_bounded(absolute);
-        self.contents
-            .insert(absolute.to_path_buf(), outcome.clone());
+        let outcome = read_bounded(snapshot, path);
+        self.contents.insert(path.to_string(), outcome.clone());
         outcome
     }
 }
@@ -127,8 +137,8 @@ pub fn check_observation(
             // Only a regular file is read, so only then is there content to
             // name; the shape alone settles the other cases.
             match resolved {
-                Resolved::RegularFile(absolute) => {
-                    let content = cache.read(&absolute).observation();
+                Resolved::RegularFile => {
+                    let content = cache.read(snapshot, path).observation();
                     Some(format!("{shape}\u{1f}{content}"))
                 }
                 Resolved::Absent | Resolved::Unresolvable(_) => Some(shape),
@@ -139,14 +149,16 @@ pub fn check_observation(
     }
 }
 
-/// Reads through a no-follow descriptor and sizes the file by that descriptor,
-/// so a path swapped for a symlink between resolution and this read cannot
-/// redirect the read outside the checkout.
+/// Reads through a descriptor walk that follows no symlink at any level, and
+/// sizes the file by that descriptor.
 ///
+/// A pathname re-resolved after a containment check can escape: a concurrent commentlint: allow(JUDGE)
+/// checkout that replaces an ancestor directory with a symlink redirects every commentlint: allow(JUDGE)
+/// later pathname operation, and `NOFOLLOW` guards only the final component. commentlint: allow(JUDGE)
 /// FIFOs can block reads and character devices such as `/dev/zero` produce commentlint: allow(JUDGE)
-/// valid UTF-8 indefinitely, both of which `open_regular_no_follow` rejects. commentlint: allow(JUDGE)
-fn read_bounded(absolute: &Path) -> ConfigRead {
-    let file = match open_regular_no_follow(absolute) {
+/// valid UTF-8 indefinitely, both of which the open refuses. commentlint: allow(JUDGE)
+fn read_bounded(snapshot: &CheckoutSnapshot, path: &str) -> ConfigRead {
+    let file = match snapshot.open_worktree_regular(path) {
         Ok(Some(file)) => file,
         // Resolution already saw a regular file here, so the path moved.
         Ok(None) => {
@@ -165,45 +177,6 @@ fn read_bounded(absolute: &Path) -> ConfigRead {
     match file.take(MAX_CONFIG_BYTES).read_to_string(&mut content) {
         Ok(_) => ConfigRead::Content(Arc::from(content)),
         Err(error) => ConfigRead::Unevaluated(error.to_string()),
-    }
-}
-
-/// `Path::join` lets an absolute path replace the workdir and never resolves
-/// `..`.
-///
-/// The two unresolvable reasons stay distinct: read repair and debugging commentlint: allow(JUDGE)
-/// otherwise cannot tell a malformed declared path from a checkout with no commentlint: allow(JUDGE)
-/// worktree to resolve it against. commentlint: allow(JUDGE)
-fn resolve_uncached(snapshot: &CheckoutSnapshot, path: &str) -> Resolved {
-    if !Path::new(path)
-        .components()
-        .all(|component| matches!(component, Component::Normal(_)))
-    {
-        return Resolved::Unresolvable(format!(
-            "check path {path} is not a plain relative path inside the checkout"
-        ));
-    }
-    let Some(absolute) = snapshot.worktree_path(path) else {
-        return Resolved::Unresolvable(format!(
-            "check path {path} does not resolve inside this checkout's worktree"
-        ));
-    };
-    // `worktree_path` clears the path's ancestors but leaves the final
-    // component unresolved, so this is where a terminal link is caught.
-    // `symlink_metadata` reports the link itself rather than its target.
-    match std::fs::symlink_metadata(&absolute) {
-        Ok(metadata) if metadata.is_file() => Resolved::RegularFile(absolute),
-        Ok(metadata) if metadata.is_symlink() => Resolved::Unresolvable(format!(
-            "check path {path} is a symlink, whose target this check will not follow"
-        )),
-        Ok(metadata) if metadata.is_dir() => Resolved::Unresolvable(format!(
-            "check path {path} is a directory, not a file a check can read"
-        )),
-        Ok(_) => Resolved::Unresolvable(format!("check path {path} is not a regular file")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Resolved::Absent,
-        Err(error) => {
-            Resolved::Unresolvable(format!("check path {path} could not be inspected: {error}"))
-        }
     }
 }
 
@@ -227,7 +200,7 @@ pub fn run_cheap_check(
     }
     match check {
         CheckSpec::FileExists { path } => match cache.resolve(snapshot, path) {
-            Resolved::RegularFile(_) => CheckOutcome::Passed,
+            Resolved::RegularFile => CheckOutcome::Passed,
             Resolved::Absent => CheckOutcome::Failed {
                 evidence: format!("file {path} does not exist in the checkout"),
             },
@@ -235,22 +208,17 @@ pub fn run_cheap_check(
             Resolved::Unresolvable(reason) => unevaluated(reason),
         },
         CheckSpec::ConfigKey { path, key } => {
-            let absolute = match cache.resolve(snapshot, path) {
-                Resolved::RegularFile(absolute) => absolute,
+            match cache.resolve(snapshot, path) {
+                Resolved::RegularFile => {}
                 Resolved::Absent => {
                     return CheckOutcome::Failed {
                         evidence: format!("config file {path} does not exist in the checkout"),
                     };
                 }
                 Resolved::Unresolvable(reason) => return unevaluated(reason),
-            };
-            let content = match cache.read(&absolute) {
+            }
+            let content = match cache.read(snapshot, path) {
                 ConfigRead::Content(content) => content,
-                ConfigRead::Missing => {
-                    return CheckOutcome::Failed {
-                        evidence: format!("config file {path} does not exist in the checkout"),
-                    };
-                }
                 // The key may well be defined; the read never got to look.
                 ConfigRead::Unevaluated(reason) => {
                     return unevaluated(format!("config file {path} could not be read: {reason}"));

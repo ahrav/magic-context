@@ -1943,3 +1943,119 @@ fn an_expired_budget_beats_a_cached_verdict() {
     assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
     assert!(!batch.objects[0].append_pending);
 }
+
+/// A scope exclusion depends on the query context, but the observation payload
+/// records checkout identity and state with no scope or query context. A durable
+/// append would therefore read as an object-wide exclusion and keep blocking a
+/// later query the object does apply to.
+#[test]
+fn a_query_local_exclusion_claims_no_durable_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+
+    let scoped = ApplicabilityCandidate {
+        scope_terms: Some(vec![ScopeTermSpec {
+            dimension: Dimension::Project.as_str().to_string(),
+            operator: "exact".to_string(),
+            exact_value: Some("other-project".to_string()),
+            ..ScopeTermSpec::default()
+        }]),
+        ..candidate("object-scoped")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new().with_value(Dimension::Project, "this-project"),
+        &[scoped],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::OutOfScope);
+    assert!(
+        !batch.objects[0].append_pending,
+        "a per-query exclusion asked read repair to record an object-wide one"
+    );
+
+    // A checkout-derived block still records: the dirty tree is the same for
+    // every query against this checkout.
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let dirty = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &dirty,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+            payload: Some(
+                ObjectApplicabilitySpec::new(vec!["src/lib.rs".to_string()], vec![]).encode(),
+            ),
+            ..candidate("object-dirty")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+    assert!(batch.objects[0].append_pending);
+}
+
+/// An ancestor directory swapped for a symlink after containment validation
+/// redirects every later pathname operation, and no-follow on the final
+/// component does not help. Resolution walks each ancestor with a pinned
+/// descriptor instead.
+#[cfg(unix)]
+#[test]
+fn a_checked_path_under_a_symlinked_ancestor_is_never_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("app.conf"), "flag = true\n").unwrap();
+
+    let fixture = init_repo(&dir.path().join("wt"));
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    // `conf` is an ancestor of the declared path and is itself a link out.
+    std::os::unix::fs::symlink(&outside, fixture.root.join("conf")).unwrap();
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    for (index, check) in [
+        CheckSpec::ConfigKey {
+            path: "conf/app.conf".to_string(),
+            key: "flag".to_string(),
+        },
+        CheckSpec::FileExists {
+            path: "conf/app.conf".to_string(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            &[ApplicabilityCandidate {
+                payload: Some(ObjectApplicabilitySpec::new(vec![], vec![check.clone()]).encode()),
+                ..candidate(&format!("object-{index}"))
+            }],
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(
+            batch.objects[0].state,
+            ApplicabilityState::Uncertain,
+            "{check:?} read through a symlinked ancestor"
+        );
+        assert!(batch.objects[0].failed_check.is_none());
+    }
+}

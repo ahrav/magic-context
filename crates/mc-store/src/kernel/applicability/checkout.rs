@@ -100,18 +100,6 @@ fn open_regular_no_follow_at<Fd: std::os::fd::AsFd>(
     Ok(Some(file))
 }
 
-/// Opens `path` the way [`fold_file`] does, for a caller that holds a full path
-/// rather than a directory descriptor.
-///
-/// The cheap checks resolve a declared path through `worktree_path`, which commentlint: allow(JUDGE)
-/// clears the ancestors but leaves the final component unresolved, so the read commentlint: allow(JUDGE)
-/// still has to refuse a terminal symlink at open time. commentlint: allow(JUDGE)
-pub(super) fn open_regular_no_follow(
-    path: &Path,
-) -> Result<Option<std::fs::File>, rustix::io::Errno> {
-    open_regular_no_follow_at(rfs::CWD, path.as_os_str())
-}
-
 /// Worker-thread ceiling for the status scan. Spawn and coordination cost commentlint: allow(JUDGE)
 /// grows with core count while the stat-bound scan does not, so an uncapped commentlint: allow(JUDGE)
 /// scan on a many-core host spends more on threads than on the walk. gix commentlint: allow(JUDGE)
@@ -417,6 +405,86 @@ impl CheckoutSnapshot {
     /// re-check it, or use no-follow access such as `symlink_metadata`. commentlint: allow(JUDGE)
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
         contained_path(self.repo.workdir()?, Path::new(rela_path))
+    }
+}
+
+/// Shape of one worktree entry, established without following a symlink at any
+/// level — ancestor or final.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WorktreeEntry {
+    RegularFile,
+    Absent,
+    Symlink,
+    Directory,
+    /// Present as something no reader can consume: FIFO, socket, device.
+    Other,
+    /// The declared spelling leaves the worktree, or its ancestors could not be
+    /// walked beneath it.
+    Unresolvable(String),
+}
+
+impl CheckoutSnapshot {
+    /// Inspects `rela_path` beneath the worktree without traversing a symlink.
+    ///
+    /// `worktree_path` validates containment against a pathname, which a commentlint: allow(JUDGE)
+    /// concurrent checkout can invalidate by replacing an ancestor directory commentlint: allow(JUDGE)
+    /// with a symlink before the caller looks. Resolving through commentlint: allow(JUDGE)
+    /// `open_parent_beneath` pins every ancestor's inode instead, so no rung of commentlint: allow(JUDGE)
+    /// the path can be swapped out from under this stat. commentlint: allow(JUDGE)
+    pub(super) fn worktree_entry(&self, rela_path: &str) -> WorktreeEntry {
+        let Some(workdir) = self.repo.workdir() else {
+            return WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} has no worktree to resolve against"
+            ));
+        };
+        // A malformed spelling and an ancestor that cannot be walked both stop
+        // `open_parent_beneath`, and read repair needs them distinguished.
+        if !Path::new(rela_path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} is not a plain relative path inside the checkout"
+            ));
+        }
+        let Some((dir, name)) = open_parent_beneath(workdir, Path::new(rela_path)) else {
+            return WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} does not resolve beneath this checkout's worktree"
+            ));
+        };
+        match rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                let kind = rfs::FileType::from_raw_mode(stat.st_mode);
+                if kind.is_file() {
+                    WorktreeEntry::RegularFile
+                } else if kind.is_symlink() {
+                    WorktreeEntry::Symlink
+                } else if kind.is_dir() {
+                    WorktreeEntry::Directory
+                } else {
+                    WorktreeEntry::Other
+                }
+            }
+            Err(rustix::io::Errno::NOENT) => WorktreeEntry::Absent,
+            Err(error) => WorktreeEntry::Unresolvable(format!(
+                "path {rela_path} could not be inspected: {error}"
+            )),
+        }
+    }
+
+    /// Opens `rela_path` beneath the worktree as a regular file, following no
+    /// symlink at any level. `Ok(None)` means no regular file is there.
+    pub(super) fn open_worktree_regular(
+        &self,
+        rela_path: &str,
+    ) -> Result<Option<std::fs::File>, rustix::io::Errno> {
+        let Some(workdir) = self.repo.workdir() else {
+            return Ok(None);
+        };
+        let Some((dir, name)) = open_parent_beneath(workdir, Path::new(rela_path)) else {
+            return Ok(None);
+        };
+        open_regular_no_follow_at(&dir, name.as_os_str())
     }
 }
 

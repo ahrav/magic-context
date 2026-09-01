@@ -6,6 +6,7 @@
 //! distinct anchors resolve once per batch, never once per candidate.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -213,8 +214,16 @@ impl ApplicabilityEngine {
     ) -> BatchEvaluation {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
-        let scope_context = scope_context.clone().with_head_commit(snapshot.head());
-        let batch_prefix = batch_digest_prefix(&scope_context);
+        // Cloning the context and compressing its dimensions is work
+        // proportional to caller-supplied context size, and no candidate that
+        // exits on lifecycle invalidation or an expired budget needs either. A
+        // fully expired batch therefore pays for neither.
+        let batch_context = OnceCell::new();
+        let prepare = || {
+            let scope_context = scope_context.clone().with_head_commit(snapshot.head());
+            let prefix = batch_digest_prefix(&scope_context);
+            (scope_context, prefix)
+        };
         // Distinct anchor rows resolve once per batch even on cache misses.
         // Rows sharing an `anchor_id` can carry different conditions, so the
         // row fingerprint keys the memo rather than the id.
@@ -262,12 +271,13 @@ impl ApplicabilityEngine {
                     }
                 }
             });
+            let (scope_context, batch_prefix) = batch_context.get_or_init(prepare);
             let payload_decode = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
             let scoped_dirty =
                 scoped_dirty_fingerprint(snapshot, &payload_decode, &mut check_cache);
             let key = self.object_cache_key(
                 snapshot,
-                &batch_prefix,
+                batch_prefix,
                 query,
                 candidate,
                 anchor_fingerprint.as_ref(),
@@ -308,7 +318,7 @@ impl ApplicabilityEngine {
             let classification = self.classify(
                 snapshot,
                 query,
-                &scope_context,
+                scope_context,
                 &ladder,
                 &mut batch_anchor_memo,
                 &mut batch_decode_memo,
@@ -323,7 +333,7 @@ impl ApplicabilityEngine {
             // An uncacheable verdict has no cache entry, so its token could
             // never be confirmed; claiming a pending append would make read
             // repair re-append it on every request forever.
-            let mut append_pending = classification.cacheable;
+            let mut append_pending = classification.cacheable && !classification.query_local;
             if classification.cacheable {
                 let mut cache = lock(&self.object_cache);
                 // A concurrent request that missed this same key can have
@@ -332,7 +342,7 @@ impl ApplicabilityEngine {
                 let append_confirmed = cache
                     .peek(&key)
                     .is_some_and(|cached| cached.append_confirmed);
-                append_pending = !append_confirmed;
+                append_pending = append_pending && !append_confirmed;
                 // Binding the evicted generation frees its entries after the
                 // lock guard drops, keeping the critical section bounded.
                 let _evicted = cache.insert(
@@ -407,15 +417,32 @@ impl ApplicabilityEngine {
                     return Classification::terminal(
                         ApplicabilityState::OutOfScope,
                         "scope does not match the query context",
-                    );
+                    )
+                    .query_local();
                 }
                 MatchOutcome::Uncertain => {
-                    return uncertain("scope match is unresolvable in this context".to_string());
+                    return uncertain("scope match is unresolvable in this context".to_string())
+                        .query_local();
                 }
             }
         }
         // Anchor gate.
         if let Some(anchor) = &candidate.anchor {
+            // A git anchor resolves against the checkout graph; every other kind
+            // reads the query context, and a kind this build cannot map is
+            // covered conservatively.
+            let anchor_reads_context = !matches!(
+                AnchorKind::from_stored(anchor.anchor_kind.as_str())
+                    .map(AnchorKind::context_dependency),
+                Some(ContextDependency::None)
+            );
+            let localize = |classification: Classification| {
+                if anchor_reads_context {
+                    classification.query_local()
+                } else {
+                    classification
+                }
+            };
             let fingerprint = anchor_fingerprint
                 .copied()
                 .unwrap_or_else(|| anchor_row_fingerprint(anchor));
@@ -431,9 +458,12 @@ impl ApplicabilityEngine {
             ) {
                 AnchorVerdict::Holds => {}
                 AnchorVerdict::Historical(evidence) => {
-                    return Classification::terminal(ApplicabilityState::Historical, evidence);
+                    return localize(Classification::terminal(
+                        ApplicabilityState::Historical,
+                        evidence,
+                    ));
                 }
-                AnchorVerdict::Uncertain(evidence) => return uncertain(evidence),
+                AnchorVerdict::Uncertain(evidence) => return localize(uncertain(evidence)),
             }
         }
         // Dirty-tree gate and cheap checks read the object payload.
@@ -467,6 +497,8 @@ impl ApplicabilityEngine {
                             }),
                             evidence,
                             cacheable: true,
+                            // A cheap check reads the worktree, not the query.
+                            query_local: false,
                         };
                     }
                     CheckOutcome::Unsupported { evidence } => {
@@ -634,6 +666,16 @@ struct Classification {
     evidence: String,
     failed_check: Option<FailedCheck>,
     cacheable: bool,
+    /// Whether this verdict read the query or scope context rather than the
+    /// checkout alone.
+    ///
+    /// `ApplicabilityObservationPayload` records checkout identity and state commentlint: allow(JUDGE)
+    /// with no scope or query context, so a durable observation cannot say commentlint: allow(JUDGE)
+    /// "excluded for this project" — only "excluded at this checkout". commentlint: allow(JUDGE)
+    /// Appending a query-local exclusion would read as an object-wide one and commentlint: allow(JUDGE)
+    /// keep blocking a later query the object does apply to. Such a verdict is commentlint: allow(JUDGE)
+    /// recomputed per query anyway, so it is not appended at all. commentlint: allow(JUDGE)
+    query_local: bool,
 }
 
 impl Classification {
@@ -643,6 +685,7 @@ impl Classification {
             evidence: evidence.into(),
             failed_check: None,
             cacheable: true,
+            query_local: false,
         }
     }
 
@@ -652,7 +695,13 @@ impl Classification {
             evidence: evidence.into(),
             failed_check: None,
             cacheable: false,
+            query_local: false,
         }
+    }
+
+    fn query_local(mut self) -> Self {
+        self.query_local = true;
+        self
     }
 }
 
