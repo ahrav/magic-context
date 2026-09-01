@@ -268,12 +268,55 @@ type DecodedPayload = Result<Option<ObjectApplicabilitySpec>, PayloadDecodeError
 type ScopeVerdict = Result<MatchOutcome, ScopeFormError>;
 
 #[derive(Default)]
-struct BatchMemos {
+struct PayloadMemo<'c> {
+    last: Option<(&'c [u8], DecodedPayload)>,
+    general: Option<HashMap<&'c [u8], DecodedPayload>>,
+}
+
+impl<'c> PayloadMemo<'c> {
+    fn get_or_insert_with(
+        &mut self,
+        key: &'c [u8],
+        create: impl FnOnce() -> DecodedPayload,
+    ) -> &DecodedPayload {
+        if self.general.is_none() {
+            if self
+                .last
+                .as_ref()
+                .is_some_and(|(last_key, _)| *last_key == key)
+            {
+                return &self.last.as_ref().expect("payload memo initialized").1;
+            }
+            if let Some((last_key, last_value)) = self.last.take() {
+                self.general = Some(HashMap::from([(last_key, last_value), (key, create())]));
+                return self
+                    .general
+                    .as_ref()
+                    .expect("general payload memo initialized")
+                    .get(key)
+                    .expect("new payload inserted");
+            }
+            self.last = Some((key, create()));
+            return &self.last.as_ref().expect("payload memo initialized").1;
+        }
+        let Some(general) = self.general.as_mut() else {
+            unreachable!("general payload memo checked present");
+        };
+        general.entry(key).or_insert_with(create)
+    }
+}
+
+/// Per-batch memo state. Payload decode is pure. Repeated cheap checks reuse
+/// the first live-worktree observation in the batch; budget exhaustion is
+/// tested before lookup and is never memoized.
+#[derive(Default)]
+struct BatchMemos<'c> {
     key: [u8; 32],
     anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
     anchor_verdict: LastMemo<AnchorVerdict>,
+    checks: HashMap<CheckSpec, CheckOutcome>,
     dirty_path: LastMemo<Option<String>>,
-    payload: LastMemo<DecodedPayload>,
+    payload: PayloadMemo<'c>,
     scope: LastMemo<ScopeVerdict>,
 }
 
@@ -556,14 +599,14 @@ impl ApplicabilityEngine {
             .update(token.0.as_ref(), |cached| cached.append_confirmed = true);
     }
 
-    fn classify(
+    fn classify<'c>(
         &self,
         query: &QueryContext,
         scope_context: &ScopeMatchContext,
         ladder: &ResolutionLadder<'_>,
-        memos: &mut BatchMemos,
+        memos: &mut BatchMemos<'c>,
         stats: &mut EvaluationStats,
-        candidate: &ApplicabilityCandidate,
+        candidate: &'c ApplicabilityCandidate,
     ) -> Classification {
         let snapshot = ladder.snapshot();
         let budget = ladder.budget();
@@ -629,16 +672,20 @@ impl ApplicabilityEngine {
         // present-but-undecodable payload fails closed: the declared paths
         // and checks are unknowable, so the object is uncertain, never
         // silently current.
-        let spec = match memos.payload.get_or_insert_with(memos.key, || {
-            ObjectApplicabilitySpec::decode(candidate.payload.as_deref())
-        }) {
-            Ok(spec) => spec.as_ref(),
-            Err(_) => {
-                return Classification::terminal(
-                    ApplicabilityState::Uncertain,
-                    "object applicability payload is undecodable",
-                );
-            }
+        let spec = match candidate.payload.as_deref() {
+            None => None,
+            Some(payload) => match memos
+                .payload
+                .get_or_insert_with(payload, || ObjectApplicabilitySpec::decode(Some(payload)))
+            {
+                Ok(spec) => spec.as_ref(),
+                Err(_) => {
+                    return Classification::terminal(
+                        ApplicabilityState::Uncertain,
+                        "object applicability payload is undecodable",
+                    );
+                }
+            },
         };
         if let Some(spec) = spec {
             let path = memos
@@ -651,7 +698,16 @@ impl ApplicabilityEngine {
                 );
             }
             for check in &spec.checks {
-                match run_cheap_check(snapshot, check, budget) {
+                let outcome = if budget.is_exhausted() {
+                    CheckOutcome::BudgetExhausted
+                } else {
+                    memos
+                        .checks
+                        .entry(check.clone())
+                        .or_insert_with(|| run_cheap_check(snapshot, check, budget))
+                        .clone()
+                };
+                match outcome {
                     CheckOutcome::Passed => {}
                     CheckOutcome::Failed { evidence } => {
                         return Classification {

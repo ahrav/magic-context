@@ -760,11 +760,28 @@ fn adversarial_benches(c: &mut Criterion) {
             ..candidate(&format!("malformed-{index}"))
         })
         .collect();
+    let payload_a =
+        ObjectApplicabilitySpec::new((0..64).map(|i| format!("alpha/{i}")).collect(), vec![])
+            .encode();
+    let payload_b =
+        ObjectApplicabilitySpec::new((0..64).map(|i| format!("beta/{i}")).collect(), vec![])
+            .encode();
+    let alternating_payloads: Vec<_> = (0..512)
+        .map(|index| ApplicabilityCandidate {
+            payload: Some(if index % 2 == 0 {
+                payload_a.clone()
+            } else {
+                payload_b.clone()
+            }),
+            ..candidate(&format!("payload-{index}"))
+        })
+        .collect();
     let mut group = c.benchmark_group("adversarial");
     for (name, candidates) in [
         ("distinct-anchors", &distinct_anchors),
         ("affected-paths-64", &huge_paths),
         ("malformed-version", &malformed_versions),
+        ("nonadjacent-payloads-64", &alternating_payloads),
     ] {
         group.bench_function(name, |b| {
             b.iter_batched(

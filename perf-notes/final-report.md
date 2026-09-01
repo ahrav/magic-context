@@ -1,5 +1,8 @@
 # Scope Algebra Performance Campaign: Final Report
 
+> This report records the original 76-cell campaign. The PR 152 composition
+> added the 77th non-adjacent-payload cell and the two memo treatments below.
+
 ## Outcome
 
 - Worktree: `/local/home/ahrav/scratch/magic-context-scope-perf-autoresearch`
@@ -9,10 +12,22 @@
 - Expanded-composition calibration: `1.716120`; the final best is 4.4% above that calibration.
 - The earlier 52-cell peak (`2.278665`) is not comparable to the 76-cell composition.
 - No code changed after the confirmed-best run; iterations 54-59 are log-only discard commits.
-- Nothing was pushed and no PR was opened.
+- At campaign close, nothing had been pushed and no PR had been opened.
 
 The historical log calls the expanded suite "75-cell". The completion audit counted 76 Criterion
 cells. `perf-notes/measurement-contract.md` now records the authoritative composition.
+
+## PR 152 Composition Follow-up
+
+- Batch-wide cheap-check memoization improved the original 76-cell geomean by 7.0%, including
+  9.44x and 15.84x wins for repeated 4-check and 16-check batches.
+- Adaptive non-adjacent payload memoization retains the one-entry adjacent fast path, promotes to a
+  general map only after a second distinct payload, and improved the added stress cell by 3.00x.
+- The expanded 77-cell composition estimates an 8.45% combined improvement over the campaign
+  winner. The full combined-all attempt was invalidated by host-load drift; the component runs and
+  focused confirmations own this estimate.
+- Repeated cheap checks deliberately reuse the first live-worktree observation in a batch. Budget
+  exhaustion is checked before the memo and is not cached.
 
 ## Stakeholder Numbers
 
@@ -163,9 +178,7 @@ are in `perf-notes/profiles/allocations.md`.
    overflow, restart, untracked-file, and concurrent-mutation proofs.
 3. Borrowed/shared public batch results. Ceiling: about 3.014 warm allocations and 312 requested
    bytes per candidate. Requires a public API/lifetime change.
-4. Payload/stat memos across non-adjacent candidates. Requires an explicit stats and budget charge
-   model before implementation.
-5. Cache-policy replacement. Requires retained hit-rate, reuse-distance, scan, and one-hit-wonder
+4. Cache-policy replacement. Requires retained hit-rate, reuse-distance, scan, and one-hit-wonder
    traces before S3-FIFO or another policy is decision-grade.
-6. Custom serde replacement. Reconsider only if payload decode becomes dominant after a wire-format
+5. Custom serde replacement. Reconsider only if payload decode becomes dominant after a wire-format
    or workload change.

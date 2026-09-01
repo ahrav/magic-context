@@ -83,7 +83,7 @@ impl std::error::Error for PayloadDecodeError {}
 /// One bounded cheap check. `Symbol` ships as vocabulary only: it decodes,
 /// evaluates as unsupported, and renders the object uncertain until a real
 /// resolver introduces the trait seam.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckSpec {
     FileExists { path: String },

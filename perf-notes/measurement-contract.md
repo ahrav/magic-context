@@ -1,7 +1,7 @@
 # Scope Algebra Measurement Contract
 
 - Outcome: Criterion mean operation time for each named benchmark cell.
-- Metric: unweighted geometric mean of `baseline_time / candidate_time` across all 76 cells.
+- Metric: unweighted geometric mean of `baseline_time / candidate_time` across all 77 cells.
 - Population: this checkout, rustc 1.98.0, Linux x86-64, Intel Xeon Platinum 8488C host.
 - Timing boundary: benchmark operation only; deterministic repository construction is outside it.
 - Warm state: Criterion warmup plus one explicit prewarm for snapshot fixtures. "Cold batch" means
@@ -20,10 +20,12 @@ The governor was unavailable through the cpufreq sysfs path. The identical-artif
 reported a 0.992000 geometric mean; individual unchanged cells moved in both directions by roughly
 5%, with one noisy warm-batch cell reaching about 7%.
 
-The suite grew from 37 to 52 and finally 76 cells. Historical entries call the final composition
-"75-cell"; a completion audit counted 76 `main/estimates.json` files and 76 benchmark results:
+The suite grew from 37 to 52, then 76 cells, and the PR 152 comparison added a 77th
+non-adjacent-payload stress cell. Historical entries call the prior composition "75-cell"; a
+completion audit counted 76 `main/estimates.json` files and 76 benchmark results:
 17 algebra, 13 ancestry, 3 snapshot, 4 tracked snapshot-matrix, 4 payload-decode, 3 cheap-check,
-19 batch, 6 anchor-density, 3 payload-check, 1 staleness, and 3 adversarial cells.
+19 batch, 6 anchor-density, 3 payload-check, 1 staleness, and 3 adversarial cells. The current
+composition has 4 adversarial cells.
 
 The final ancestry audit pins both artifacts to CPU 190. Unpinned historical ancestry comparisons
 remain useful as campaign evidence, but do not override the pinned direct comparisons when host
