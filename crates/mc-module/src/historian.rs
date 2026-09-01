@@ -1765,7 +1765,7 @@ mod tests {
             .commit(
                 "ses",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &test_meta_with_historian(awaiting),
             )
             .unwrap();
@@ -2931,7 +2931,7 @@ mod tests {
                 .commit(
                     lineage,
                     None,
-                    &CoreState::default(),
+                    &CoreState::empty(),
                     &test_meta_with_historian(awaiting),
                 )
                 .unwrap();
@@ -3067,7 +3067,7 @@ mod tests {
             .commit(
                 "ses",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &test_meta_with_historian(awaiting),
             )
             .unwrap();
@@ -4091,7 +4091,7 @@ mod tests {
         let store = store(dir.path());
         let meta = test_meta_with_historian(publishing_state());
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         let loaded = store.load("ses").unwrap();
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
@@ -4181,7 +4181,7 @@ mod tests {
             ..test_meta_with_historian(publishing_state())
         };
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         let loaded = store.load("ses").unwrap();
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
@@ -4230,7 +4230,7 @@ mod tests {
             .commit(
                 "ses",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &test_meta_with_historian(publishing_state()),
             )
             .unwrap();
@@ -4334,7 +4334,7 @@ mod tests {
             .commit(
                 "ses",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &ModuleMeta {
                     revert_epoch: 8,
                     ..test_meta_with_historian(awaiting)
@@ -4391,7 +4391,7 @@ mod tests {
         .unwrap();
         let meta = test_meta_with_historian(awaiting);
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
 
         let action = handle_restart_load(&store, "ses", 500).unwrap();
@@ -4418,7 +4418,7 @@ mod tests {
         let store = store(dir.path());
         let meta = test_meta_with_historian(publishing_state());
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         let loaded = store.load("ses").unwrap();
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();

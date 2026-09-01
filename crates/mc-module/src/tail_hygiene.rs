@@ -817,7 +817,7 @@ mod tests {
         let measure = || {
             measure_tail_hygiene(
                 &projection,
-                &CoreState::default(),
+                &CoreState::empty(),
                 None,
                 &tags,
                 0,
@@ -845,7 +845,7 @@ mod tests {
         let projection = project_messages(&base).unwrap();
         let measured = measure_tail_hygiene(
             &projection,
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             2,
@@ -860,7 +860,7 @@ mod tests {
         let projection = project_messages(&appended).unwrap();
         let measured = measure_tail_hygiene(
             &projection,
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             2,
@@ -884,7 +884,7 @@ mod tests {
         let baseline = refresh_tail_hygiene_baseline(
             measure_tail_hygiene(
                 &projection,
-                &CoreState::default(),
+                &CoreState::empty(),
                 None,
                 &tags,
                 0,
@@ -898,7 +898,7 @@ mod tests {
         let invalid = refresh_tail_hygiene_baseline(
             measure_tail_hygiene(
                 &projection,
-                &CoreState::default(),
+                &CoreState::empty(),
                 None,
                 &tags,
                 0,
@@ -1116,7 +1116,7 @@ mod tests {
             let projection = project_messages(&messages).expect("project parity fixture");
             let measured = measure_tail_hygiene(
                 &projection,
-                &CoreState::default(),
+                &CoreState::empty(),
                 None,
                 &tags,
                 case.protected_tags,
@@ -1196,7 +1196,7 @@ mod tests {
         ];
         let measured = measure_tail_hygiene(
             &project_messages(&base).unwrap(),
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             0,
@@ -1209,7 +1209,7 @@ mod tests {
         };
         let reasoning_measured = measure_tail_hygiene(
             &project_messages(&reasoning_mutant).unwrap(),
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             0,
@@ -1223,7 +1223,7 @@ mod tests {
         let text_mutant = vec![text("visible", 1, "kept text plus loud mutation")];
         let text_measured = measure_tail_hygiene(
             &project_messages(&text_mutant).unwrap(),
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             0,
@@ -1264,7 +1264,7 @@ mod tests {
         let tags = vec![tag(1, "result#0")];
         let measured = measure_tail_hygiene(
             &projection,
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             0,
@@ -1332,7 +1332,7 @@ mod tests {
         let tags = vec![tag(1, "before#0"), tag(2, "repeat"), tag(3, "after#0")];
         let measured = measure_tail_hygiene(
             &projection,
-            &CoreState::default(),
+            &CoreState::empty(),
             None,
             &tags,
             0,

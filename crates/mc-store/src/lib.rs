@@ -5167,7 +5167,7 @@ impl McStore {
         })
     }
 
-    /// The loader returns uninitialized defaults when no session row exists; the classifier then bootstraps.
+    /// The loader returns an empty core and default metadata when no session row exists; the classifier then bootstraps.
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
         let row = self.inner.with_conn(|conn| {
             Ok(conn
@@ -5184,7 +5184,7 @@ impl McStore {
 
         match row {
             None => Ok(LoadedState {
-                core: CoreState::default(),
+                core: CoreState::empty(),
                 meta: ModuleMeta::default(),
                 row_version: None,
             }),
@@ -5243,7 +5243,7 @@ impl McStore {
                     row_version: Some(row_version),
                 },
                 None => LoadedState {
-                    core: CoreState::default(),
+                    core: CoreState::empty(),
                     meta: ModuleMeta::default(),
                     row_version: None,
                 },
@@ -5370,7 +5370,7 @@ impl McStore {
                     row_version: Some(row_version),
                 },
                 None => LoadedState {
-                    core: CoreState::default(),
+                    core: CoreState::empty(),
                     meta: ModuleMeta::default(),
                     row_version: None,
                 },
@@ -7253,7 +7253,7 @@ impl McStore {
         &self,
         request: ModuleStateSyncRequest<'_>,
     ) -> Result<ModuleStateSyncResult, ModuleStateSyncError> {
-        let default_core_json = serde_json::to_string(&CoreState::default())
+        let default_core_json = serde_json::to_string(&CoreState::empty())
             .map_err(|e| ModuleStateSyncError::Serde(e.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
@@ -7781,7 +7781,7 @@ impl McStore {
                     };
                     (core, meta)
                 }
-                None => (CoreState::default(), ModuleMeta::default()),
+                None => (CoreState::empty(), ModuleMeta::default()),
             };
 
             if !target_meta.lineage_descent_disposition.is_empty()
@@ -8365,8 +8365,7 @@ impl McStore {
         Ok(())
     }
 
-    ///
-    /// The reset writes default `CoreState` and `ModuleMeta` values with a bumped revert epoch.
+    /// The reset writes an empty `CoreState` and default `ModuleMeta` with a bumped revert epoch.
     pub fn reset_session_for_recomp(
         &self,
         session_id: &str,
@@ -8400,7 +8399,7 @@ impl McStore {
                 )),
                 ..ModuleMeta::default()
             };
-            let core_json = match serde_json::to_string(&CoreState::default()) {
+            let core_json = match serde_json::to_string(&CoreState::empty()) {
                 Ok(json) => json,
                 Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
             };
@@ -13361,7 +13360,7 @@ mod tests {
             applied_supersession_count,
             applied_reduction_count,
         ) = interest;
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let meta = ModuleMeta::default();
         store
             .commit_transform(
@@ -13419,20 +13418,47 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_load_returns_uninitialized_defaults() {
+    fn bootstrap_load_returns_empty_state() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let loaded = store.load("ses_a").unwrap();
         assert!(!loaded.meta.initialized);
         assert_eq!(loaded.row_version, None);
-        assert_eq!(loaded.core, CoreState::default());
+        assert_eq!(loaded.core, CoreState::empty());
+    }
+
+    #[test]
+    fn load_accepts_minimal_schema_v3_core_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let meta = serde_json::to_string(&ModuleMeta::default()).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        "schema-v3",
+                        1_i64,
+                        r#"{"version":0,"boundary_id":"","frozen_units":[]}"#,
+                        meta
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let loaded = store.load("schema-v3").unwrap();
+        assert_eq!(loaded.row_version, Some(1));
+        assert_eq!(loaded.core, CoreState::empty());
     }
 
     #[test]
     fn delete_session_clears_owned_rows_without_touching_another_session() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let meta = ModuleMeta::default();
         store.commit("ses_delete", None, &core, &meta).unwrap();
         store.commit("ses_keep", None, &core, &meta).unwrap();
@@ -13516,7 +13542,7 @@ mod tests {
 
         let core = CoreState {
             boundary_id: "b1".into(),
-            ..Default::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta {
             initialized: true,
@@ -13546,7 +13572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let session = "counter-cas";
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let initial_meta = ModuleMeta {
             boundary_divergence_pending_count: 0,
             ..Default::default()
@@ -13717,7 +13743,7 @@ mod tests {
             .commit(
                 "legacy-row",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &ModuleMeta::default(),
             )
             .unwrap();
@@ -13769,7 +13795,7 @@ mod tests {
     fn stale_cas_expectation_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let meta = ModuleMeta::default();
 
         store.commit("ses_a", None, &core, &meta).unwrap(); // row_version now 1
@@ -13983,7 +14009,7 @@ mod tests {
         let queued = store.load_pending_agent_drops("ses").unwrap();
         assert_eq!(queued.len(), 1);
 
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let meta = ModuleMeta::default();
         let conflict =
             store.commit_with_consumed_drops("ses", Some(99), &core, &meta, &[queued[0].id]);
@@ -14099,7 +14125,7 @@ mod tests {
             .commit_with_consumed_drops(
                 "ses",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &ModuleMeta::default(),
                 &[pending[0].id],
             )
@@ -14144,7 +14170,7 @@ mod tests {
             .commit_with_consumed_drops(
                 "ses",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &ModuleMeta::default(),
                 &[pending[0].id],
             )
@@ -15231,7 +15257,7 @@ mod tests {
     fn scheduler_interest_includes_reductions_and_output_divergence_on_defer() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let meta = ModuleMeta::default();
         let observation = PassSchedulerObservation {
             timestamp_ms: 500,
@@ -15503,7 +15529,7 @@ mod tests {
         assert_eq!(store.load_compartments("fresh").unwrap(), compartments);
 
         store
-            .commit("used", None, &CoreState::default(), &ModuleMeta::default())
+            .commit("used", None, &CoreState::empty(), &ModuleMeta::default())
             .unwrap();
         assert!(matches!(
             store.commit_state_import("used", "bundle-c", &compartments, 999),
@@ -15893,7 +15919,7 @@ mod tests {
         let predicate = publish_predicate();
         let mut meta = publishing_meta();
         store
-            .commit("publish-health", None, &CoreState::default(), &meta)
+            .commit("publish-health", None, &CoreState::empty(), &meta)
             .unwrap();
 
         for expected_failures in 1..=3 {
@@ -15959,7 +15985,7 @@ mod tests {
         };
         let store = McStore::open(&descriptor).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .commit("ses", None, &CoreState::empty(), &publishing_meta())
             .unwrap();
 
         let hook_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -16055,7 +16081,7 @@ mod tests {
             count: 1,
         };
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         let expected = store.load("ses").unwrap().row_version;
         let predicate = HistorianPublishPredicate {
@@ -16096,7 +16122,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let store = McStore::open(&descriptor(dir.path())).unwrap();
             store
-                .commit("ses", None, &CoreState::default(), &publishing_meta())
+                .commit("ses", None, &CoreState::empty(), &publishing_meta())
                 .unwrap();
             store.fail_next_historian_side_channel_for_test(failed_kind);
             let event = HistorianEventCandidate {
@@ -16194,7 +16220,7 @@ mod tests {
         let descriptor = descriptor(dir.path());
         let store = McStore::open(&descriptor).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .commit("ses", None, &CoreState::empty(), &publishing_meta())
             .unwrap();
         store.fail_next_historian_side_channel_for_test("event");
         let event = HistorianEventCandidate {
@@ -16250,7 +16276,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .commit("ses", None, &CoreState::empty(), &publishing_meta())
             .unwrap();
         let expected = store.load("ses").unwrap().row_version;
         store
@@ -16283,7 +16309,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .commit("ses", None, &CoreState::empty(), &publishing_meta())
             .unwrap();
         let event = HistorianEventCandidate {
             kind: "orphan".into(),
@@ -16327,7 +16353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .commit("ses", None, &CoreState::empty(), &publishing_meta())
             .unwrap();
         let transcript = (0..50_000)
             .map(|i| format!("{:x}", md5::compute(i.to_string())))
@@ -16363,7 +16389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .commit("ses", None, &CoreState::empty(), &publishing_meta())
             .unwrap();
         let compartments = (0..8)
             .map(|index| StoredCompartment {
@@ -17596,7 +17622,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
-            .commit("ses", None, &CoreState::default(), &ModuleMeta::default())
+            .commit("ses", None, &CoreState::empty(), &ModuleMeta::default())
             .unwrap();
         let expected = store.load("ses").unwrap().row_version;
 
@@ -17647,7 +17673,7 @@ mod tests {
             ..Default::default()
         };
         let rv = store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         store
             .replace_compartments(
@@ -17694,7 +17720,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         store
             .replace_compartments("ses", &[recut_comp(1, 1, 1, "a#0")])
@@ -17713,7 +17739,7 @@ mod tests {
         let mut meta = publishing_meta();
         meta.revert_epoch = 1;
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         let expected = store.load("ses").unwrap().row_version;
 
@@ -19343,7 +19369,7 @@ mod lineage_descent_tests {
     fn seed_lineage(store: &McStore, key: &str, newest_live_ordinal: u64) {
         let core = CoreState {
             boundary_id: "m6#0".to_string(),
-            ..CoreState::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta {
             initialized: true,
@@ -19653,7 +19679,7 @@ mod lineage_descent_tests {
             newest_live_ordinal: 20,
             ..ModuleMeta::default()
         };
-        let mut unmarked_core = CoreState::default();
+        let mut unmarked_core = CoreState::empty();
         unmarked_core.boundary_id.clear();
         store
             .commit("D", None, &unmarked_core, &unmarked_meta)
@@ -19736,7 +19762,7 @@ mod lineage_descent_tests {
             .commit(
                 "legacy-source",
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &ModuleMeta::default(),
             )
             .unwrap();
@@ -19814,7 +19840,7 @@ mod lineage_descent_tests {
 
         let boot_core = CoreState {
             boundary_id: "own#0".to_string(),
-            ..CoreState::default()
+            ..CoreState::empty()
         };
         store
             .commit("boot", None, &boot_core, &ModuleMeta::default())
@@ -19878,7 +19904,7 @@ mod lineage_descent_tests {
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
         store
-            .commit("B", None, &CoreState::default(), &ModuleMeta::default())
+            .commit("B", None, &CoreState::empty(), &ModuleMeta::default())
             .unwrap();
         let target_before = store.load("B").unwrap();
         let prior_before = store.load("A").unwrap();

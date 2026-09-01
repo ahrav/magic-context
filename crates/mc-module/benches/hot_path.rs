@@ -84,7 +84,7 @@ fn bench_tail_hygiene(c: &mut Criterion) {
     warm_tokenizer();
     let mut group = c.benchmark_group("tail_hygiene/measure");
     group.sample_size(20);
-    let core = CoreState::default();
+    let core = CoreState::empty();
     let protected: HashSet<String> = HashSet::new();
     for &count in MESSAGE_COUNTS {
         let messages = corpus::messages(ContentClass::Mixed, count, 2_048, CORPUS_SEED);

@@ -14,7 +14,7 @@ async fn competing_pass_counter_survives_direct_primary_lifecycle_and_reopen() {
     let descriptor = storage_descriptor(root.path());
     let store = McStore::open(&descriptor).expect("seed store opens");
     let session = "module-counter";
-    let core = CoreState::default();
+    let core = CoreState::empty();
     let initial = ModuleMeta {
         boundary_divergence_pending_count: 0,
         ..Default::default()
