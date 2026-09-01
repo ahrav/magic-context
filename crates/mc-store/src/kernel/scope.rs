@@ -505,16 +505,21 @@ impl CanonicalScope {
             let dimension = Dimension::from_stored(&term.dimension)
                 .ok_or_else(|| ScopeFormError::UnknownDimension(term.dimension.clone()))?;
             let value = decode_term_value(dimension, term)?;
+            let parsed_version = match &value {
+                TermValue::VersionRange(raw) => {
+                    let requirement = semver::VersionReq::parse(raw)
+                        .map_err(|_| ScopeFormError::InvalidVersionRange(dimension))?;
+                    let interval = parsed_version_req_interval(&requirement);
+                    Some((requirement, interval))
+                }
+                _ => None,
+            };
             if canonical.insert(dimension, value).is_some() {
                 return Err(ScopeFormError::DuplicateDimension(dimension));
             }
-            if let Some(TermValue::VersionRange(raw)) = canonical.get(&dimension) {
-                version_requirements.insert(
-                    dimension,
-                    semver::VersionReq::parse(raw)
-                        .expect("canonical version ranges were validated while decoding"),
-                );
-                if let Some(interval) = version_req_interval(raw) {
+            if let Some((requirement, interval)) = parsed_version {
+                version_requirements.insert(dimension, requirement);
+                if let Some(interval) = interval {
                     version_intervals.insert(dimension, interval);
                 }
             }
@@ -652,9 +657,6 @@ fn decode_term_value(
                 .as_deref()
                 .filter(|value| !value.is_empty())
                 .ok_or(ScopeFormError::MissingValue(dimension))?;
-            if semver::VersionReq::parse(raw).is_err() {
-                return Err(ScopeFormError::InvalidVersionRange(dimension));
-            }
             Ok(TermValue::VersionRange(raw.to_string()))
         }
         "git_reachable" => {
@@ -997,6 +999,10 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
 /// unknown operators).
 fn version_req_interval(raw: &str) -> Option<VersionInterval> {
     let req = semver::VersionReq::parse(raw).ok()?;
+    parsed_version_req_interval(&req)
+}
+
+fn parsed_version_req_interval(req: &semver::VersionReq) -> Option<VersionInterval> {
     let mut interval = VersionInterval::full();
     for comparator in &req.comparators {
         interval = interval.intersect(comparator_interval(comparator)?);
