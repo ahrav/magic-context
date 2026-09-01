@@ -258,6 +258,7 @@ impl ApplicabilityEngine {
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
         let mut digest_prefixes = InputDigestPrefixes::new(query, &scope_context);
         let mut batch_input_digests = (candidates.len() > 1).then(HashMap::new);
+        let mut last_input_digest = None;
         // Distinct anchors resolve once per batch even on cache misses. The
         // memo key matches the anchor cache key, so two candidates sharing
         // an anchor id but carrying different rows can never alias.
@@ -267,11 +268,19 @@ impl ApplicabilityEngine {
             let inputs_digest = match &mut batch_input_digests {
                 Some(digests) => {
                     let candidate_inputs = CandidateInputs::new(candidate);
-                    digests.get(&candidate_inputs).copied().unwrap_or_else(|| {
-                        let digest = digest_prefixes.for_candidate(candidate);
-                        digests.insert(candidate_inputs, digest);
+                    if let Some((_, digest)) =
+                        last_input_digest.filter(|(last, _)| *last == candidate_inputs)
+                    {
                         digest
-                    })
+                    } else {
+                        let digest = digests.get(&candidate_inputs).copied().unwrap_or_else(|| {
+                            let digest = digest_prefixes.for_candidate(candidate);
+                            digests.insert(candidate_inputs, digest);
+                            digest
+                        });
+                        last_input_digest = Some((candidate_inputs, digest));
+                        digest
+                    }
                 }
                 None => digest_prefixes.for_candidate(candidate),
             };
