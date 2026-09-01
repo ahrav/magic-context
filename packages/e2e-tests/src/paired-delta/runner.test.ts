@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1274,6 +1274,40 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("does not cache evidence a failed publication never wrote", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-publish-fail-"));
+        const dir = join(root, "nested");
+        try {
+            const path = join(dir, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+            expect(store.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+
+            // The file stays readable so `reload()` succeeds; only the write fails.
+            chmodSync(dir, 0o500);
+            let blocked = false;
+            try {
+                writeFileSync(join(dir, ".probe"), "");
+                rmSync(join(dir, ".probe"), { force: true });
+            } catch {
+                blocked = true;
+            }
+            // A privileged runner ignores the mode, which leaves nothing to assert.
+            if (!blocked) return;
+
+            expect(() => store.put(storedRecord("mc-off"))).toThrow();
+            chmodSync(dir, 0o700);
+            // The cache must not report a record the file does not hold.
+            expect(store.list().map(({ armId }) => armId)).toEqual(["mc-on"]);
+            store.release();
+        } finally {
+            try {
+                chmodSync(dir, 0o700);
+            } catch { /* the directory may not exist */ }
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("refuses duplicate coordinates from a store that does not validate", async () => {
         // The map keeps the last record while the pre-scan bills every copy.
         const completed = storedRecord("mc-on");
@@ -1301,7 +1335,29 @@ describe("paired-delta runner", () => {
         ) {
             const store = new MemoryStore([mutate(storedRecord("mc-on"))]);
             await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
-                /is not a non-negative finite number/,
+                /is not a non-negative (finite number|safe integer)/,
+            );
+        }
+    });
+
+    it("refuses fractional or unsafe persisted counters", async () => {
+        // `finiteUsage` admits a live observation only at non-negative safe integers.
+        for (
+            const mutate of [
+                (record: RolloutRecord) => ({ ...record, turns: 0.5 }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    usage: { ...record.usage, input: 0.5 },
+                }),
+                (record: RolloutRecord) => ({
+                    ...record,
+                    usage: { ...record.usage, input: Number.MAX_VALUE },
+                }),
+            ]
+        ) {
+            const store = new MemoryStore([mutate(storedRecord("mc-on"))]);
+            await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+                /is not a non-negative safe integer/,
             );
         }
     });

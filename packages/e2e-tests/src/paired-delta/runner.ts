@@ -393,21 +393,22 @@ export class FileRolloutStore implements RolloutStore {
             );
         }
         /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so no interleaving of lock takeover and publication can erase a coordinate this process never knew about. The cached snapshot is replaced by the merged state, which also means a stale cache cannot survive a lost lock. commentlint: allow(JUDGE) */
-        const records = this.reload();
+        const merged = [...this.reload()];
         const key = coordinateKey(record);
         const index = this.indexByCoordinate.get(key);
-        if (index !== undefined && records[index]?.cell.runHealth === "completed") {
+        if (index !== undefined && merged[index]?.cell.runHealth === "completed") {
             throw new Error(`refusing to replace completed rollout ${key}`);
         }
-        if (index !== undefined) {
-            records[index] = record;
-        } else {
-            this.indexByCoordinate.set(key, records.length);
-            records.push(record);
-        }
+        if (index !== undefined) merged[index] = record;
+        else merged.push(record);
         // The records file feeds spend and resume decisions for later runs, so
         // it stays owner-only even though report artifacts are world-readable.
-        publishJsonAtomically(records, this.path, { mode: 0o600 });
+        /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. commentlint: allow(JUDGE) */
+        publishJsonAtomically(merged, this.path, { mode: 0o600 });
+        this.records = merged;
+        this.indexByCoordinate = new Map(
+            merged.map((stored, position) => [coordinateKey(stored), position]),
+        );
     }
 
     private invalidate(): void {
@@ -635,16 +636,27 @@ export async function runPairedDelta(
             ["prior-attempts-cost", record.priorAttemptsCostUsd],
             ["max-attempt-cost", record.maxAttemptCostUsd],
             ["wall-clock-ms", record.wallClockMs],
+        ] as const) {
+            if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+                options.store.release?.();
+                throw new Error(
+                    `records file ${label} is not a non-negative finite number at ` +
+                        `${coordinateKey(record)}; point at a fresh records path`,
+                );
+            }
+        }
+        /** `finiteUsage` admits a live observation only at non-negative safe integers, because a counter near `Number.MAX_VALUE` prices to `Infinity` and a fractional token or turn count is not a measurement any harness can produce. A persisted record has to clear the same bar or a resume reports counts the live path would have refused. commentlint: allow(JUDGE) */
+        for (const [label, value] of [
             ["turns", record.turns],
             ["usage-input", usage.input],
             ["usage-output", usage.output],
             ["usage-cache-creation", usage.cacheCreation],
             ["usage-cache-read", usage.cacheRead],
         ] as const) {
-            if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+            if (!Number.isSafeInteger(value) || (value as number) < 0) {
                 options.store.release?.();
                 throw new Error(
-                    `records file ${label} is not a non-negative finite number at ` +
+                    `records file ${label} is not a non-negative safe integer at ` +
                         `${coordinateKey(record)}; point at a fresh records path`,
                 );
             }
