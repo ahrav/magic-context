@@ -3,6 +3,8 @@
 mod api;
 #[cfg(test)]
 mod anchor_proof;
+#[cfg(test)]
+mod kernels;
 mod evaluator;
 mod rules;
 

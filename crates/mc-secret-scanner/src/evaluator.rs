@@ -535,7 +535,7 @@ fn qualifier_reach(token: &[u8], reverse: bool) -> Vec<bool> {
     reach
 }
 
-fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
     key.split(|byte| !byte.is_ascii_alphanumeric())
         .flat_map(|part| CamelTokens { remaining: part })
         .filter(|part| !part.is_empty())
@@ -573,7 +573,7 @@ static DEFAULT_CHAR_CLASS: crate::rules::CharClassSpec = crate::rules::CharClass
     min_window_len: 32,
 };
 
-fn lowercase_percent(bytes: &[u8]) -> usize {
+pub(crate) fn lowercase_percent(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
@@ -806,7 +806,7 @@ fn local_context_allows(
     Ok(true)
 }
 
-fn is_uuid(value: &[u8]) -> bool {
+pub(crate) fn is_uuid(value: &[u8]) -> bool {
     value.len() == 36
         && value.iter().enumerate().all(|(index, byte)| {
             matches!(index, 8 | 13 | 18 | 23) && *byte == b'-'
@@ -900,7 +900,7 @@ fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-fn base62_u32(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn base62_u32(bytes: &[u8]) -> Option<u32> {
     let mut value = 0u64;
     for byte in bytes {
         let digit = match byte {
@@ -914,7 +914,7 @@ fn base62_u32(bytes: &[u8]) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for byte in bytes {
         crc ^= u32::from(*byte);
@@ -925,7 +925,7 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
     if bytes.len() != 8 {
         return None;
     }
@@ -1047,7 +1047,7 @@ fn base64url_prefix(input: &[u8], prefix: &[u8]) -> bool {
     decode_prefix(input, prefix, true)
 }
 
-fn decode_prefix(input: &[u8], prefix: &[u8], url: bool) -> bool {
+pub(crate) fn decode_prefix(input: &[u8], prefix: &[u8], url: bool) -> bool {
     let mut bits = 0u32;
     let mut bit_count = 0u8;
     let mut output = 0usize;
