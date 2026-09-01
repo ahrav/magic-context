@@ -142,6 +142,21 @@ fn a_value_shape_keeps_its_own_label_without_a_key_name() {
     }
 }
 
+#[test]
+fn only_the_value_span_is_replaced_around_an_assignment() {
+    // The engine this replaces rewrote `key <ws> = <ws> value` as `key=<REDACTED:…>`,
+    // collapsing the spacing because it replaced its whole match. Replacing only the
+    // value span leaves the surrounding bytes, which are not secret, so the redacted
+    // text is a minimal edit of the input rather than a reformatting of it. Pinned
+    // here because the spelling of redacted text is a contract for anything that
+    // parses or compares it.
+    let redaction = redact_durable_text("secret = spaced-value");
+    assert_eq!(redaction.text, "secret = <REDACTED:secret>");
+    assert_eq!(redaction.detections.len(), 1);
+    assert_eq!(redaction.detections[0].offset, 9);
+    assert_eq!(redaction.detections[0].length, "spaced-value".len());
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
