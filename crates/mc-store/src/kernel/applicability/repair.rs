@@ -21,7 +21,7 @@ use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::engine::{ApplicabilityEngine, ApplicabilityState, ObjectApplicability};
 use super::payloads::{
     checkout_identity_digest, ApplicabilityObservationPayload, DEPENDENCY_KIND_TARGET,
-    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
+    OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT,
 };
 use super::resolve::PATCH_ID_ALGORITHM;
 
@@ -81,6 +81,11 @@ pub struct RepairIntent {
     observed_at: i64,
     actor: String,
     head: String,
+    checkout_digest: String,
+    /// Repair generation the identity was derived from. Revalidated inside the
+    /// commit, so a repair built against an older reduction cannot overwrite a
+    /// newer one that landed while this one waited for the writer.
+    generation: i64,
 }
 
 impl RepairIntent {
@@ -96,9 +101,13 @@ impl RepairIntent {
         actor: &str,
         observed_at: i64,
     ) -> Option<Self> {
+        // Which states append is a policy decision; what kind each one carries
+        // is not. A state added later defaults to not appending, which is the
+        // safe side, and its kind still comes from the one mapping.
         let kind = match object.state {
-            ApplicabilityState::Stale => OBSERVATION_KIND_STALE,
-            ApplicabilityState::Current => OBSERVATION_KIND_CURRENT,
+            ApplicabilityState::Stale | ApplicabilityState::Current => {
+                object.state.observation_kind()
+            }
             _ => return None,
         };
         // Canonical JSON, not `Debug`: the digest is hashed into a durably
@@ -131,9 +140,11 @@ impl RepairIntent {
         // repeat when a checkout returns to a state it already failed at, and
         // the generation is what distinguishes that re-failure from the
         // pre-clear one.
+        let generation = generation_for(block, kind);
         let mut key = Sha256::new();
         key.update(b"mc-applicability-repair-v1\0");
         for part in [
+            &generation.to_string(),
             object.object_id.as_str(),
             &object.object_revision.to_string(),
             snapshot.identity(),
@@ -142,7 +153,6 @@ impl RepairIntent {
             kind,
             &check_digest,
             PATCH_ID_ALGORITHM,
-            &generation_for(block, kind).to_string(),
         ] {
             key.update(part.as_bytes());
             key.update(b"\0");
@@ -164,6 +174,8 @@ impl RepairIntent {
             observed_at,
             actor: actor.to_string(),
             head: snapshot.head().to_string(),
+            checkout_digest: payload.checkout_identity_digest.clone(),
+            generation,
         })
     }
 
@@ -207,6 +219,37 @@ impl RepairIntent {
             sensitivity: target.sensitivity,
         }
     }
+}
+
+/// Re-derives the repair generation from inside the commit transaction, so it
+/// reflects every observation committed since the intent was built.
+fn reduced_generation(
+    tx: &rusqlite::Transaction<'_>,
+    intent: &RepairIntent,
+) -> Result<i64, KernelError> {
+    let tip: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| KernelError::Io)?;
+    let mut states = HashMap::new();
+    reduce_chunk(
+        tx,
+        &[intent.object_id.as_str()],
+        &intent.checkout_digest,
+        tip,
+        &EvalBudget::unbounded(),
+        &mut states,
+    )?;
+    Ok(match states.get(&intent.object_id) {
+        Some(BlockState::Recorded(block)) => block.generation_for(intent.kind),
+        // An unreadable record leaves the generation underivable, which cannot
+        // match the one this repair was built from.
+        Some(BlockState::Unreadable) => -1,
+        None => 0,
+    })
 }
 
 /// The classified object's domain and sensitivity, read from the registry
@@ -297,6 +340,12 @@ pub fn commit_read_repair(
             return Err(KernelError::Conflict);
         };
         if target.source_revision != intent.object_revision {
+            return Err(KernelError::Conflict);
+        }
+        // A concurrent repair for a newer snapshot can land while this one waits
+        // for the writer. Inserting anyway would make the older evidence the
+        // latest record and lift the newer block.
+        if reduced_generation(envelope.tx, intent)? != intent.generation {
             return Err(KernelError::Conflict);
         }
         Ok(envelope
@@ -671,7 +720,22 @@ fn reduce_chunk(
             RowMatch::Matches => {}
             RowMatch::OtherCheckout => continue,
             RowMatch::Unreadable => {
-                pending.insert(object_id, Reduction::Unreadable);
+                // Newest-first: once a matching row is found, an older
+                // unreadable one cannot be this checkout's latest record, so the
+                // verdict stands. Its kind is unknown, so it ends the search for
+                // the transition and bounds the generation from above — the
+                // identity a later repair derives cannot collide with one from
+                // before this row.
+                let settled = match pending.remove(&object_id) {
+                    Some(Reduction::PriorKind(block)) => Reduction::Done(InjectionBlock {
+                        prior_kind_commit_seq: commit_seq,
+                        ..block
+                    }),
+                    Some(settled @ (Reduction::Done(_) | Reduction::Unreadable)) => settled,
+                    // No matching row yet, so this may be the latest one.
+                    Some(Reduction::Latest) | None => Reduction::Unreadable,
+                };
+                pending.insert(object_id, settled);
                 continue;
             }
         }
@@ -746,8 +810,11 @@ fn classify_row(
     let Ok(detail) = serde_json::from_str::<ApplicabilityObservationPayload>(detail) else {
         return RowMatch::Unreadable;
     };
+    let Some(state) = ApplicabilityState::from_label(&detail.state) else {
+        return RowMatch::Unreadable;
+    };
     if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA
-        || observation_kind != observation_kind_for_state(&detail.state)
+        || observation_kind != state.observation_kind()
     {
         return RowMatch::Unreadable;
     }
@@ -756,12 +823,6 @@ fn classify_row(
     } else {
         RowMatch::OtherCheckout
     }
-}
-
-/// The observation kind that carries `state`, which is the vocabulary
-/// `payloads.rs` defines: one kind per state label.
-fn observation_kind_for_state(state: &str) -> String {
-    format!("applicability.{state}")
 }
 
 #[cfg(test)]

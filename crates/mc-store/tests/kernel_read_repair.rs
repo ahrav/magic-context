@@ -2057,3 +2057,172 @@ fn retiring_a_clearing_record_lets_the_next_clear_land() {
         "the block is genuinely cleared, not just reported clear"
     );
 }
+
+/// Newest-first scanning means a matched latest record is already authoritative.
+/// An older row this build cannot read — a v1 payload after the schema moved to
+/// v2, for instance — must not discard it and strand the object uncertain.
+#[test]
+fn an_older_unreadable_row_does_not_discard_a_newer_verdict() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+
+    // A stale record, then a clearing one, so the older row is not the latest.
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let stale_object = text(
+        store_dir.path(),
+        &format!(
+            "SELECT object_id FROM observations
+             WHERE observation_kind='{OBSERVATION_KIND_STALE}'"
+        ),
+    );
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+
+    // Only the older record becomes unreadable.
+    let connection = Connection::open(store_dir.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00' WHERE object_id=?1",
+            [stale_object.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap()
+        .expect("the newer clearing record still reduces");
+    assert!(
+        !block.blocked,
+        "the valid latest record stands over an unreadable older one"
+    );
+    assert_eq!(block.observation_kind, OBSERVATION_KIND_CURRENT);
+
+    let report = ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert_eq!(report.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(report.auto_injectable().count(), 1);
+}
+
+/// Two evaluations can share a HEAD and disagree about the worktree. The one
+/// that reaches the writer second must not make its older evidence the latest
+/// record and lift the newer block.
+#[test]
+fn a_repair_built_against_a_superseded_reduction_is_discarded() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [feature_candidate(TARGET_OBJECT)];
+
+    // A block is recorded while the checked file is absent.
+    engine
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+
+    // One evaluation sees the file appear and builds a clearing repair, holding
+    // it while another evaluation records a newer stale block at the same HEAD.
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap();
+    let stale_intent =
+        RepairIntent::for_classification(&snapshot, &batch.objects[0], block.as_ref(), "test", 42)
+            .unwrap();
+
+    // The newer evidence lands first: the file disappears again, and an
+    // unrelated edit makes this a worktree state no record describes yet, so the
+    // second evaluation appends rather than recognising its own record.
+    std::fs::remove_file(repo_dir.path().join("src/feature.rs")).unwrap();
+    git_fixtures::write_worktree_file(&fixture.repo, "src/unrelated.rs", "pub fn u() {}\n");
+    let before_newer = store.known_as_of(0).unwrap().tip;
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let newer_tip = store.known_as_of(0).unwrap().tip;
+    assert!(
+        newer_tip > before_newer,
+        "the second evaluation recorded newer evidence"
+    );
+
+    // Now the held clearing repair reaches the writer.
+    let outcome = commit_read_repair(
+        &store,
+        &engine,
+        &snapshot,
+        &batch.objects[0],
+        &stale_intent,
+        &EvalBudget::unbounded(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        AppendOutcome::Discarded,
+        "the superseded clearing repair is discarded"
+    );
+    assert_eq!(
+        store.known_as_of(0).unwrap().tip,
+        newer_tip,
+        "nothing was committed"
+    );
+    let current = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert!(
+        store
+            .applicability_block_state(TARGET_OBJECT, current.identity(), newer_tip)
+            .unwrap()
+            .expect("the newer block stands")
+            .blocked,
+        "the newer stale block survives the older clearing repair"
+    );
+}

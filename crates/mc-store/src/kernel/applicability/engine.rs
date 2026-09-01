@@ -72,6 +72,21 @@ impl ApplicabilityState {
     }
 
     /// The durable applicability append stores this observation kind.
+    /// Inverse of [`Self::label`], so a stored label and its observation kind
+    /// are checked against one mapping rather than a naming convention.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "current" => Some(Self::Current),
+            "historical" => Some(Self::Historical),
+            "out_of_scope" => Some(Self::OutOfScope),
+            "uncertain" => Some(Self::Uncertain),
+            "dirty_tree_uncertain" => Some(Self::DirtyTreeUncertain),
+            "stale" => Some(Self::Stale),
+            "lifecycle_invalidated" => Some(Self::LifecycleInvalidated),
+            _ => None,
+        }
+    }
+
     pub fn observation_kind(self) -> &'static str {
         match self {
             Self::Current => OBSERVATION_KIND_CURRENT,
