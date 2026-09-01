@@ -228,11 +228,18 @@ impl Hash for SnapshotCacheValues {
 
 #[derive(Debug, Clone)]
 struct CachedClassification {
+    details: Option<Box<CachedClassificationDetails>>,
+    append_confirmed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedClassificationDetails {
     state: ApplicabilityState,
     evidence: Box<str>,
     failed_check: Option<Box<FailedCheck>>,
-    append_confirmed: bool,
 }
+
+const CURRENT_EVIDENCE: &str = "anchor holds at HEAD and all checks pass";
 
 struct LastMemo<T> {
     last: Option<([u8; 32], T)>,
@@ -480,14 +487,25 @@ impl ApplicabilityEngine {
                         cache_context = Some(Arc::clone(context));
                     }
                 }
+                let (state, evidence, failed_check) = match cached.details {
+                    Some(details) => (
+                        details.state,
+                        details.evidence.into(),
+                        details.failed_check.map(|failed| *failed),
+                    ),
+                    None => (
+                        ApplicabilityState::Current,
+                        CURRENT_EVIDENCE.to_string(),
+                        None,
+                    ),
+                };
                 objects.push(ObjectApplicability {
                     object_id: candidate.object_id.clone(),
                     object_revision: candidate.object_revision,
-                    state: cached.state,
-                    evidence: cached.evidence.into(),
-                    failed_check: cached.failed_check.map(|failed| *failed),
-                    append_pending: cached.state.blocks_auto_injection()
-                        && !cached.append_confirmed,
+                    state,
+                    evidence,
+                    failed_check,
+                    append_pending: state.blocks_auto_injection() && !cached.append_confirmed,
                     token: ClassificationToken(key),
                 });
                 continue;
@@ -510,9 +528,13 @@ impl ApplicabilityEngine {
                 self.object_cache.lock().expect("cache lock").insert(
                     key,
                     CachedClassification {
-                        state: classification.state,
-                        evidence: classification.evidence.as_str().into(),
-                        failed_check: classification.failed_check.clone().map(Box::new),
+                        details: (classification.state != ApplicabilityState::Current).then(|| {
+                            Box::new(CachedClassificationDetails {
+                                state: classification.state,
+                                evidence: classification.evidence.as_str().into(),
+                                failed_check: classification.failed_check.clone().map(Box::new),
+                            })
+                        }),
                         append_confirmed: false,
                     },
                 );
@@ -654,10 +676,7 @@ impl ApplicabilityEngine {
                 }
             }
         }
-        Classification::terminal(
-            ApplicabilityState::Current,
-            "anchor holds at HEAD and all checks pass",
-        )
+        Classification::terminal(ApplicabilityState::Current, CURRENT_EVIDENCE)
     }
 
     fn evaluate_anchor(
