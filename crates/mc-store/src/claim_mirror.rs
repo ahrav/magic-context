@@ -904,9 +904,8 @@ impl McStore {
                 } else {
                     prepared.identity("public_claim_id", &claim.public_claim_id)
                 };
-                recorded.map_err(|error| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                })?;
+                recorded
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             }
             let unresolved = unresolved_claim_intents(tx)?;
             if unresolved > 0 {
@@ -1072,9 +1071,8 @@ impl McStore {
                 } else {
                     prepared.identity("public_claim_id", &effect.public_claim_id)
                 };
-                recorded.map_err(|error| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                })?;
+                recorded
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             }
             let outcome =
                 (|| -> rusqlite::Result<Result<ClaimMirrorApplyResult, ClaimMirrorError>> {

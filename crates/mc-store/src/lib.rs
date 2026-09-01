@@ -3517,13 +3517,7 @@ fn retire_active_scan_domain_owner(
     owner_kind: &str,
     owner_key: &str,
 ) -> rusqlite::Result<()> {
-    retire_active_scan_domain_owners(
-        tx,
-        scope_kind,
-        scope_key,
-        Some(owner_kind),
-        Some(owner_key),
-    )
+    retire_active_scan_domain_owners(tx, scope_kind, scope_key, Some(owner_kind), Some(owner_key))
 }
 
 fn retire_active_scan_owner_kind(

@@ -5,11 +5,11 @@ use mc_core::claim_operation::{
     canonical_json_encode, sha256_hex_utf8, ClaimCommandIdentity, ClaimIntentAckKind,
     ClaimIntentBinding, SnapshotVector,
 };
+use mc_core::redaction::RedactionErrorKind;
 use mc_store::claim_mirror::{
     ClaimMirrorChangeKind, ClaimMirrorEffect, ClaimMirrorError, ClaimMirrorLifecycle,
     ClaimMirrorReceiptGroup, ClaimMirrorSnapshot, CommittedClaimMirrorRow, CLAIM_MIRROR_VERSION,
 };
-use mc_core::redaction::RedactionErrorKind;
 use mc_store::McStore;
 use serde_json::{json, Value};
 

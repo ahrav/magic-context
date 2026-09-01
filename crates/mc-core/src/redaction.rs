@@ -212,9 +212,7 @@ pub fn detector_revision() -> String {
             let revision = redactor.scanner.revision();
             format!(
                 "{}:{}:{}",
-                revision.crate_version,
-                revision.semantic_digest_version,
-                revision.upstream_commit
+                revision.crate_version, revision.semantic_digest_version, revision.upstream_commit
             )
         },
     )

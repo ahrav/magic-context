@@ -13,8 +13,7 @@ fn redactor() -> &'static Redactor {
 #[test]
 fn established_replacement_spelling_remains_stable() {
     assert_eq!(
-        redact_durable_text("Authorization: Bearer abc123def456ghi789")
-            .text,
+        redact_durable_text("Authorization: Bearer abc123def456ghi789").text,
         "Authorization: Bearer <REDACTED:bearer>"
     );
     for (input, expected) in [
@@ -28,11 +27,7 @@ fn established_replacement_spelling_remains_stable() {
         ),
         ("aws_secret=hunter-two", "aws_secret=<REDACTED:aws_secret>"),
     ] {
-        assert_eq!(
-            redact_durable_text(input).text,
-            expected,
-            "{input}"
-        );
+        assert_eq!(redact_durable_text(input).text, expected, "{input}");
     }
 }
 
