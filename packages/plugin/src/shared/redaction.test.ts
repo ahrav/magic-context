@@ -215,6 +215,10 @@ describe("isCredentialBearingConfigKey", () => {
             "public_key_value_2",
             "primary_key_id_2",
             "cached_tokens_value_2",
+            // A camelCase split leaves the digit attached to the descriptor.
+            "publicKeyValue2",
+            "primaryKeyId2",
+            "cachedTokensValue2",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }

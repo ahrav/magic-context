@@ -227,8 +227,11 @@ export function isCredentialBearingConfigKey(key: string): boolean {
     /** A trailing descriptor names the field, not the thing: `dbPasswordValue` and `masterKeyId` are the credential their descriptor points at, and `primaryKeyId` is the structural key its descriptor points at. `isSecretKey` reads them the same way. commentlint: allow(JUDGE) */
     const segments = [...allSegments];
     /** Enumerator segments are dropped alongside descriptors so the qualifier is read from the same peeled form the terminal word is: `public_key_value_2` leaves `value` as the adjacent segment otherwise, and a qualifier the structural list does not know is treated as a credential — refusing a legitimate field. commentlint: allow(JUDGE) */
-    const peelable = (segment: string): boolean =>
-        TRAILING_DESCRIPTORS.has(segment) || /^[0-9]+$/.test(segment);
+    /** A camel-case split does not separate a digit from the word it is attached to, so `publicKeyValue2` arrives as `[public, key, value2]`: the enumerator is stripped from the segment before it is matched against the descriptors, or the descriptor would stay and `key` would be read as the qualifier. commentlint: allow(JUDGE) */
+    const peelable = (segment: string): boolean => {
+        const withoutEnumerator = segment.replace(/[0-9]+$/, "");
+        return withoutEnumerator.length === 0 || TRAILING_DESCRIPTORS.has(withoutEnumerator);
+    };
     while (segments.length > 1 && peelable(segments.at(-1) as string)) {
         segments.pop();
     }
