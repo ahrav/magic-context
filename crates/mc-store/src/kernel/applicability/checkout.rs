@@ -569,14 +569,27 @@ fn index_worktree_entry(
                     status: "removed",
                     content_hash: "absent".to_string(),
                 }),
+                // The mode tag joins the content hash for the same reason it
+                // does on assume-valid and skip-worktree entries: a chmod commentlint: allow(JUDGE)
+                // moves git's worktree mode between 100644 and 100755 while commentlint: allow(JUDGE)
+                // the bytes stay equal, and a file that is already dirty by commentlint: allow(JUDGE)
+                // content would otherwise absorb that move unrecorded. commentlint: allow(JUDGE)
                 EntryStatus::Change(_) => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    content_hash: format!(
+                        "{}:{}",
+                        worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                        worktree_mode_tag(repo, rela_path.as_ref())
+                    ),
                     path,
                     path_encoding,
                     status: "modified",
                 }),
                 EntryStatus::IntentToAdd => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    content_hash: format!(
+                        "{}:{}",
+                        worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                        worktree_mode_tag(repo, rela_path.as_ref())
+                    ),
                     path,
                     path_encoding,
                     status: "intent_to_add",
@@ -793,7 +806,7 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
 
 fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v5\0");
+    hash.update(b"mc-dirty-fingerprint-v6\0");
     hash.update(repository_state);
     for entry in entries {
         // Length prefixes make adjacent fields unambiguous.

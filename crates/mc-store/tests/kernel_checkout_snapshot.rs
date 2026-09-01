@@ -117,6 +117,35 @@ fn interrupt_and_deadline_yield_typed_cancellation() {
 }
 
 #[test]
+fn a_mode_change_on_an_already_dirty_file_moves_the_fingerprint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    // Dirty by content first, so the mode change lands on an entry that is
+    // already reported as modified.
+    write_worktree_file(&fixture.repo, "a.txt", "edited\n");
+    let budget = EvalBudget::unbounded();
+    let dirty = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    let path = dir.path().join("a.txt");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o100)).unwrap();
+    let dirty_and_exec = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    assert_ne!(
+        dirty.dirty_fingerprint(),
+        dirty_and_exec.dirty_fingerprint(),
+        "git's worktree mode moved between 100644 and 100755, so these are \
+         different dirty states"
+    );
+}
+
+#[test]
 fn untracked_directory_contents_change_the_fingerprint() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());
