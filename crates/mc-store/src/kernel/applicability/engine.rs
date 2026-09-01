@@ -723,8 +723,8 @@ fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Opti
     if affected_paths.is_empty() {
         return None;
     }
-    let dirty = snapshot.dirty_paths();
-    for dirty_path in dirty {
+    for entry in snapshot.dirty_entries() {
+        let dirty_path = entry.path.as_str();
         for affected in affected_paths {
             if paths_overlap(dirty_path, affected) {
                 return Some(dirty_path.to_string());
