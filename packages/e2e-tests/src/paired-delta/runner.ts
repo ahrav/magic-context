@@ -1013,11 +1013,18 @@ export async function runPairedDelta(
                      */
                     const billed = handle?.usageOnFailure?.bind(handle);
                     if (billed) {
-                        const remaining = options.deadlineEpochMs - dependencies.now();
+                        /**
+                         * Its own grace, not what remains of the rollout deadline. On the path this
+                         * matters most — a rollout that ran out of time after billing several calls —
+                         * the remainder is already negative, and clamping to it left one millisecond
+                         * for several read-only requests, so the measurement it exists to take was
+                         * never available. Bounded like a late disposal, which is the same trade:
+                         * a little wall clock after the deadline to avoid losing accounting.
+                         */
                         try {
                             billedOnFailure = await withRolloutDeadline(
                                 billed,
-                                Math.max(1, Math.min(remaining, LATE_DISPOSAL_GRACE_MS)),
+                                LATE_DISPOSAL_GRACE_MS,
                             );
                         } catch {
                             billedOnFailure = null;

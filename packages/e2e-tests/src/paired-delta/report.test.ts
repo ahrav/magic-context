@@ -667,6 +667,18 @@ describe("paired-delta calibration record reader", () => {
         expect(readCalibrationRecord(write(written({}))).validForPoolSizing).toBe(true);
     });
 
+    it("rejects a validity claim the recorded evidence does not support", () => {
+        const record = written({});
+        // One series instead of both endpoints for the family.
+        expect(() => readCalibrationRecord(write(written({
+            familyNoise: (record.familyNoise as unknown[]).slice(0, 1),
+        })))).toThrow(/validity-inconsistent/);
+        // A pool size that is not what the recorded variance and target delta imply.
+        expect(() => readCalibrationRecord(write(written({
+            decisions: { ...(record.decisions as object), poolSize: 1 },
+        })))).toThrow(/validity-inconsistent/);
+    });
+
     it("rejects sizing decisions the cohort gates would silently pass", () => {
         // `cohort < undefined` is false, so an absent poolSize disables the gate rather than failing.
         // `undefined` is not representable in JSON, so an absent object arrives as a fingerprint mismatch.
@@ -689,7 +701,10 @@ describe("paired-delta calibration record reader", () => {
                 ? { ...(noise as object), endpoint: "latency" }
                 : noise));
 
-        expect(() => readCalibrationRecord(write(written({ familyNoise }))))
-            .toThrow(/record-invalid/);
+        /** `validForPoolSizing: false` so the endpoint check is what rejects, not the validity recompute. */
+        expect(() => readCalibrationRecord(write(written({
+            familyNoise,
+            validForPoolSizing: false,
+        })))).toThrow(/record-invalid/);
     });
 });

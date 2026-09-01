@@ -299,6 +299,8 @@ export interface PairedDeltaCalibrationRecord {
     validForPoolSizing: boolean;
     /** Whether any measured series established variance. A constant pilot cannot, and its zero variance would otherwise size the pool at its floor. */
     varianceEstablished: boolean;
+    /** Recorded so a reader can recompute `decisions.poolSize` rather than trusting the number beside it. */
+    targetMinimumDetectableDelta: number;
     measuredCostUsd: number;
     estimatedReserveUsd: number;
     /** Charges from superseded attempts of retried coordinates, which carry no cost source of their own on the surviving record. */
@@ -492,6 +494,7 @@ export function buildCalibrationRecord(input: {
         implementationDigest: input.implementationDigest,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
+        targetMinimumDetectableDelta: input.targetMinimumDetectableDelta,
         /**
          * A series whose observations are identical does not establish zero population variance, it
          * establishes that the pilot was too small to see any. Sizing from that zero would claim the
@@ -587,10 +590,31 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
      * no established variance, or no measured series at all.
      */
     const measured = Array.isArray(record.familyNoise) ? record.familyNoise : [];
+    const families = new Set(measured.map(({ familyId }) => familyId));
+    /** Every family carries a series for both primary endpoints, so a partial record cannot claim a floor for a comparison it never measured. */
+    const covered = families.size > 0 && [...families].every((familyId) =>
+        PRIMARY_ENDPOINTS.every((endpoint) =>
+            measured.some((noise) =>
+                noise.familyId === familyId && noise.endpoint === endpoint)));
+    /** Recomputed from the recorded variance and target delta, so the published decision cannot disagree with the evidence beside it. */
+    const derived = typeof record.targetMinimumDetectableDelta === "number" &&
+            Number.isFinite(record.targetMinimumDetectableDelta) &&
+            record.targetMinimumDetectableDelta > 0 &&
+            Number.isSafeInteger(record.decisions?.familyCount) &&
+            (record.decisions?.familyCount ?? 0) >= 1
+        ? derivePoolSize(
+            measured,
+            record.targetMinimumDetectableDelta,
+            record.decisions.familyCount,
+        )
+        : null;
     const consistent = record.runStatus === "completed" &&
         record.varianceEstablished === true &&
         measured.length > 0 &&
-        measured.every((noise) => noise.observationCount >= 2 && noise.variance > 0);
+        measured.every((noise) => noise.observationCount >= 2 && noise.variance > 0) &&
+        covered &&
+        derived !== null &&
+        record.decisions?.poolSize === derived;
     if (record.validForPoolSizing === true && !consistent) {
         throw new Error("paired-delta-calibration: validity-inconsistent");
     }
