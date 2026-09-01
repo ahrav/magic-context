@@ -514,6 +514,11 @@ fn scan_dirty_entries(
         .map_err(|error| SnapshotError::Scan(error.to_string()))?;
     for entry in index.entries() {
         use gix::index::entry::Flags;
+        // `ctx.check()` precedes classification so every entry observes
+        // cancellation during large scans. Ordinary entries reach `continue` commentlint: allow(JUDGE)
+        // without per-entry work, so polling only on the rare classes would commentlint: allow(JUDGE)
+        // walk a whole index past an armed deadline. commentlint: allow(JUDGE)
+        ctx.check()?;
         let status = if entry.flags.contains(Flags::SKIP_WORKTREE) {
             "skip_worktree"
         } else if entry.flags.contains(Flags::ASSUME_VALID) {
@@ -521,7 +526,6 @@ fn scan_dirty_entries(
         } else {
             continue;
         };
-        ctx.check()?;
         let rela_path = entry.path(&index);
         let (path, path_encoding) = encode_path(rela_path);
         // A chmod moves the git entry mode while the bytes stay equal, so
