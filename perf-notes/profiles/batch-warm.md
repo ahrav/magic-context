@@ -52,6 +52,16 @@ then uses pointer equality for the rest of that batch while retaining exact fall
 Raw profile: `/tmp/mc-scope-perf/batch-warm-iter40-199.data`; report:
 `/tmp/mc-scope-perf/batch-warm-iter40.report`.
 
+After iteration 41, a fresh warm profile showed SipHash writes at 10.9% despite each exact object
+key already carrying a `RandomState` prehash. Iteration 43 gives only that object table an identity
+build hasher. A post-change cold profile captured 1,991 samples with zero loss and linked
+`TwoGenerationCache<..., PrehashedState>` for lookup/insert; table-level object-key SipHash and
+`hash_one` symbols disappeared. The remaining 5.0% SipHash is the required randomized full-key
+prehash. Anchor keys retain ordinary `RandomState`.
+
+Raw proof: `/tmp/mc-scope-perf/batch-cold-iter43-199.data`; report:
+`/tmp/mc-scope-perf/batch-cold-iter43.report`.
+
 ## Cold batch after iteration 22
 
 An engine-only `batch-cold-512` profile at `fa97709eb` captured 2,001 samples at 199 Hz with zero

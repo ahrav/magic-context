@@ -5,29 +5,31 @@
 
 use std::borrow::Borrow;
 use std::collections::{hash_map::RandomState, HashMap};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
 /// Per-generation entry cap. Two full generations bound total residency;
 /// anchor resolutions and object classifications are small values.
 pub(super) const GENERATION_CAP: usize = 16_384;
 
-pub(super) struct TwoGenerationCache<K, V> {
-    current: HashMap<K, V>,
-    previous: HashMap<K, V>,
+pub(super) struct TwoGenerationCache<K, V, S = RandomState> {
+    current: HashMap<K, V, S>,
+    previous: HashMap<K, V, S>,
     cap: usize,
 }
 
-impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
+impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V, RandomState> {
     pub(super) fn new(cap: usize) -> Self {
+        Self::with_hasher(cap, RandomState::new())
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Clone, S: BuildHasher + Clone> TwoGenerationCache<K, V, S> {
+    pub(super) fn with_hasher(cap: usize, hasher: S) -> Self {
         Self {
-            current: HashMap::new(),
-            previous: HashMap::new(),
+            current: HashMap::with_hasher(hasher.clone()),
+            previous: HashMap::with_hasher(hasher),
             cap,
         }
-    }
-
-    pub(super) fn hasher(&self) -> &RandomState {
-        self.current.hasher()
     }
 
     pub(super) fn reserve(&mut self, additional: usize) {
@@ -60,7 +62,8 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
 
     pub(super) fn insert(&mut self, key: K, value: V) {
         if self.current.len() >= self.cap && !self.current.contains_key(&key) {
-            self.previous = std::mem::take(&mut self.current);
+            let current = HashMap::with_hasher(self.current.hasher().clone());
+            self.previous = std::mem::replace(&mut self.current, current);
         }
         self.current.insert(key, value);
     }

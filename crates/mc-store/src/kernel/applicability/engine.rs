@@ -147,6 +147,37 @@ impl Hash for ObjectCacheKey {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct PrehashedState;
+
+impl BuildHasher for PrehashedState {
+    type Hasher = PrehashedHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PrehashedHasher::default()
+    }
+}
+
+#[derive(Default)]
+struct PrehashedHasher(u64);
+
+impl Hasher for PrehashedHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
 #[derive(Debug, Clone)]
 enum SnapshotCacheKey {
     Owned(SnapshotCacheValues),
@@ -315,7 +346,8 @@ impl Hash for CandidateInputs<'_> {
 /// checkout snapshot.
 pub struct ApplicabilityEngine {
     anchor_cache: Mutex<TwoGenerationCache<AnchorCacheKey, GitConditionOutcome>>,
-    object_cache: Mutex<TwoGenerationCache<Arc<ObjectCacheKey>, CachedClassification>>,
+    object_cache:
+        Mutex<TwoGenerationCache<Arc<ObjectCacheKey>, CachedClassification, PrehashedState>>,
     cache_hasher: RandomState,
 }
 
@@ -327,8 +359,8 @@ impl Default for ApplicabilityEngine {
 
 impl ApplicabilityEngine {
     pub fn new() -> Self {
-        let object_cache = TwoGenerationCache::new(GENERATION_CAP);
-        let cache_hasher = object_cache.hasher().clone();
+        let cache_hasher = RandomState::new();
+        let object_cache = TwoGenerationCache::with_hasher(GENERATION_CAP, PrehashedState);
         Self {
             anchor_cache: Mutex::new(TwoGenerationCache::new(GENERATION_CAP)),
             object_cache: Mutex::new(object_cache),
