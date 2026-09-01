@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import {
@@ -123,7 +123,13 @@ function smokeRepoCommit(recordsPath: string): string {
     for (const path of untracked) {
         parts.push(Buffer.from(`${path}\n`, "utf8"));
         try {
-            parts.push(readFileSync(resolve(root, path)));
+            const absolute = resolve(root, path);
+            /** A symlink's worktree identity is the text it points at, not the bytes it resolves to: following it left the digest unchanged when the same path was retargeted at another module with identical contents, so a resume could reuse records produced against different working code. `lstat` because `readFileSync` and `statSync` both dereference. commentlint: allow(JUDGE) */
+            if (lstatSync(absolute).isSymbolicLink()) {
+                parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
+            } else {
+                parts.push(readFileSync(absolute));
+            }
         } catch {
             /** An unreadable path still changes the digest through its own name. commentlint: allow(JUDGE) */
             parts.push(Buffer.from("<unreadable>", "utf8"));

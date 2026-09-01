@@ -1479,6 +1479,29 @@ describe("paired-delta runner", () => {
         expect(unavailable.maxAttemptCostUsd).toBe(unavailable.costUsd);
     });
 
+    it("stores a validated intervention when the adapter's toJSON throws", async () => {
+        // `JSON.stringify` calls `toJSON`; the canonicalizer reads enumerable fields and
+        // never sees it, so validation passes and the detach throws after the paid rollout.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const base = observation(armId, true);
+                const hostile = { ...base.intervention };
+                Object.defineProperty(hostile, "toJSON", {
+                    value: () => {
+                        throw new Error("hostile toJSON");
+                    },
+                    enumerable: false,
+                });
+                return { ...base, intervention: hostile };
+            }),
+        );
+
+        expect(result.records.length).toBeGreaterThan(0);
+        expect(() => structuredClone(result.records[0]?.intervention)).not.toThrow();
+    });
+
     it("stores a detached intervention when the adapter returns a proxy", async () => {
         // `canonicalFingerprint` accepts a proxy; `structuredClone` inside `put` does not.
         const store = new MemoryStore();
@@ -1677,6 +1700,31 @@ describe("paired-delta runner", () => {
                 proto.reload = original;
             }
             store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps the path reserved while an invalidated store still holds its handle", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-reservation-"));
+        try {
+            const path = join(root, "records.json");
+            const owner = join(`${path}.lock`, "owner.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            // A reclaimer displaces the record, which invalidates the store while it keeps
+            // its handle. Every handle in this process shares one lock nonce, so a second
+            // store acquiring here would have its lock deleted by this store's release.
+            writeFileSync(
+                owner,
+                JSON.stringify({ pid: process.pid, nonce: "d".repeat(32), acquiredAt: Date.now() }),
+            );
+            expect(() => store.put(storedRecord("mc-off"))).toThrow(RolloutStoreBusyError);
+
+            expect(() => new FileRolloutStore(path).put(storedRecord("compaction"))).toThrow(
+                /already owned in this process/,
+            );
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

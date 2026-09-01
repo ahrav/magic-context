@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { buildCohortClose, ProspectiveIntakeStore } from "./cohort";
 import { HoldoutContractError } from "./contract";
 import { reviewSanitizedIntake, staticPrivacyRejection } from "./intake";
-import { LOCK_OWNER_FILE, lockAbandoned, lockSidelinePath, restoreOrRemoveSideline, takeOverLock, withRecoverableLock } from "./lock";
+import { LOCK_OWNER_FILE, lockAbandoned, lockSidelinePath, lockSidelinePrefix, restoreOrRemoveSideline, takeOverLock, withRecoverableLock } from "./lock";
 import { deadPid, H1, H2, H3, sanitizedIntakeFixture, frozenEventFixture } from "./test-fixtures";
 
 const key = new TextEncoder().encode("c".repeat(32));
@@ -328,37 +328,29 @@ describe("cohort store lock", () => {
         }
     });
 
-    it("removes and claims nothing when the takeover of an abandoned lock loses its rename", () => {
+    it("reclaims an abandoned lock even when a stale sideline is left behind", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
-            // An abandoned lock with no owner record reaches the reclaim path without requiring a pid that the test can prove dead.
-            // The no-owner-record case does not require a pid that the test can prove dead.
             const lock = seedLock(root, null);
             const orphaned = new Date(Date.now() - 600_000);
             utimesSync(lock, orphaned, orphaned);
-            // A non-empty sideline makes this process's rename fail.
-            // A reclaimer that renames first leaves the sideline occupied for every other reclaimer of the same lock.
-            // The sideline must be non-empty because renaming onto an empty directory replaces it and succeeds.
-            // Renaming onto an empty directory succeeds by replacing it, so an empty occupant cannot model a lost takeover.
-            // asserted here.
-            const sideline = lockSidelinePath(lock);
-            mkdirSync(sideline, { recursive: true });
-            writeFileSync(join(sideline, "occupied"), "");
+            // `restoreOrRemoveSideline` deliberately leaves the displaced directory behind
+            // when a third claimant occupies `lock`, so a sideline can outlive its takeover.
+            // A takeover that reused that path renamed into an occupied directory and failed,
+            // and acquisition spends its reclaim budget before the rename, so it did not
+            // retry and reported an abandoned lock busy.
+            const stale = lockSidelinePrefix(lock);
+            mkdirSync(stale, { recursive: true });
+            writeFileSync(join(stale, "occupied"), "");
             let ran = false;
-            const started = Date.now();
-            expect(() => withRecoverableLock(lock, { busyCode: "cohort-store: busy" }, () => {
+
+            withRecoverableLock(lock, { busyCode: "cohort-store: busy" }, () => {
                 ran = true;
-            })).toThrow(/cohort-store: busy/);
-            // A lost takeover deletes nothing and claims nothing; the lock remains, the sideline retains its contents, and the guarded operation does not run.
-            // After a lost takeover, the sideline retains its contents and the guarded operation does not run.
-            // A lost takeover must not remove `lock`; removing it would allow two reclaimers to enter the guarded operation.
-            // Two reclaimers must not both enter the guarded operation.
-            expect(ran).toBe(false);
-            expect(existsSync(lock)).toBe(true);
-            expect(existsSync(join(sideline, "occupied"))).toBe(true);
-            // After the reclaim budget is spent, acquisition waits until its deadline.
-            // The elapsed time distinguishes waiting until the deadline from giving up without retrying.
-            expect(Date.now() - started).toBeGreaterThanOrEqual(1_000);
+            });
+
+            expect(ran).toBe(true);
+            // The foreign record left at the stale sideline is never destroyed.
+            expect(existsSync(join(stale, "occupied"))).toBe(true);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

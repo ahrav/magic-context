@@ -95,10 +95,23 @@ function sameLockOwner(left: LockOwner | null, right: LockOwner | null): boolean
 
 /**
  * The sideline must be a sibling of `lock` because `renameSync` cannot cross filesystems.
- * `LOCK_NONCE` distinguishes reclaimers' sideline paths.
+ * `LOCK_NONCE` distinguishes reclaimers' sideline paths, and the counter distinguishes
+ * successive takeovers by one reclaimer: a restoration that cannot land leaves the
+ * directory in place by design, and reusing that path would make the next takeover's
+ * rename fail into an occupied directory. Acquisition sets its reclaimed flag before
+ * attempting the rename, so it does not retry, and an abandoned lock would be reported
+ * busy. The `.reclaimed-` prefix is retained because release sweeps by prefix and owner.
  */
-export function lockSidelinePath(lock: string): string {
+let sidelineSequence = 0;
+
+/** The stable part of this process's sideline paths: what release sweeps by, and what a takeover extends with a per-takeover suffix. commentlint: allow(JUDGE) */
+export function lockSidelinePrefix(lock: string): string {
     return `${lock}.reclaimed-${LOCK_NONCE}`;
+}
+
+export function lockSidelinePath(lock: string): string {
+    sidelineSequence += 1;
+    return `${lockSidelinePrefix(lock)}-${sidelineSequence}`;
 }
 
 /**

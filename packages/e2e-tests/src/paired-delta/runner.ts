@@ -453,11 +453,10 @@ export class FileRolloutStore implements RolloutStore {
         }
     }
 
-    /** The handle is deliberately kept. A reclaimer that sidelined this lock can still restore the owner record, and a restored record names this live process, which `lockAbandoned` will never reclaim — so discarding the handle here left the path blocked until the process exited. Retaining it is safe because `releaseLock` re-reads before deleting anything and removes only a record carrying this process's nonce, sweeping sidelines otherwise. commentlint: allow(JUDGE) */
+    /** The handle is deliberately kept. A reclaimer that sidelined this lock can still restore the owner record, and a restored record names this live process, which `lockAbandoned` will never reclaim — so discarding the handle here left the path blocked until the process exited. Retaining it is safe because `releaseLock` re-reads before deleting anything and removes only a record carrying this process's nonce, sweeping sidelines otherwise. The in-process reservation is kept for the same span: every handle in this process shares one lock nonce, so a second store acquiring this path would have its lock deleted by this store's later release, which reads that shared nonce as its own. Only cleanup releases either. commentlint: allow(JUDGE) */
     private invalidate(): void {
         this.records = null;
         this.indexByCoordinate = new Map();
-        ownedRecordPaths.delete(this.claim);
     }
 
     private reload(): RolloutRecord[] {
@@ -1213,9 +1212,7 @@ function completedRecord(
             ? observation.baseScriptFingerprint
             : expectedFingerprint,
         /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. Detached through JSON rather than retained, because fingerprinting proves the shape is serializable and not that the object itself is cloneable — an adapter-owned `Proxy` passes the canonicalizer and then fails `structuredClone` inside `put`, after the rollout is paid for and with nothing persisted. commentlint: allow(JUDGE) */
-        intervention: observedInterventionFingerprint === null
-            ? expectedIntervention
-            : (JSON.parse(JSON.stringify(observation.intervention)) as InterventionDescriptor),
+        intervention: detachedIntervention(observation.intervention, expectedIntervention),
         cell: {
             armId: coordinate.armId,
             checksPassed,
@@ -1403,6 +1400,20 @@ function releaseBeforeThrowing(store: RolloutStore): void {
 
 /** Bounded so a records path under continuous rewriting reports contention instead of retrying forever. commentlint: allow(JUDGE) */
 const PUBLISH_FENCE_ATTEMPTS = 3;
+
+/** The record has to be writable or the paid coordinate is lost, and every route to a detached copy runs adapter-controlled code: `JSON.stringify` calls a `toJSON` hook the canonicalizer never sees, because that reads enumerable fields only. A descriptor that will not detach falls back to the declaration's own, which is already validated — the observed value is evidence worth keeping when it survives, not worth losing a rollout over. commentlint: allow(JUDGE) */
+function detachedIntervention(
+    observed: unknown,
+    expected: InterventionDescriptor,
+): InterventionDescriptor {
+    try {
+        const detached = JSON.parse(JSON.stringify(observed)) as unknown;
+        if (interventionFingerprint(detached as InterventionDescriptor) === null) return expected;
+        return detached as InterventionDescriptor;
+    } catch {
+        return expected;
+    }
+}
 
 function coordinateKey(coordinate: RolloutCoordinate): string {
     return [
