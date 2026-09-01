@@ -41,7 +41,7 @@ fn version_range(dimension: &str, value: &str) -> ScopeTermSpec {
 
 fn algebra_benches(c: &mut Criterion) {
     let one = CanonicalScope::from_term_specs(&[exact("branch", "main")]).unwrap();
-    let eight = CanonicalScope::from_term_specs(&[
+    let eight_specs = [
         exact("domain", "code"),
         exact("project", "magic-context"),
         exact("entity", "store"),
@@ -50,8 +50,8 @@ fn algebra_benches(c: &mut Criterion) {
         exact("region", "local"),
         version_range("deployment", ">=1.0.0, <3.0.0"),
         version_range("platform", ">=1.70.0, <2.0.0"),
-    ])
-    .unwrap();
+    ];
+    let eight = CanonicalScope::from_term_specs(&eight_specs).unwrap();
     let mut context = ScopeMatchContext::new();
     for (dimension, value) in [
         (Dimension::Domain, "code"),
@@ -115,6 +115,9 @@ fn algebra_benches(c: &mut Criterion) {
                 &UnknownGraph,
             )
         });
+    });
+    group.bench_function("decode/eight-term", |b| {
+        b.iter(|| CanonicalScope::from_term_specs(black_box(&eight_specs)).unwrap());
     });
     group.finish();
 }
