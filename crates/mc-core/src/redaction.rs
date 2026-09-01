@@ -58,6 +58,29 @@ const LABEL_QUALIFIERS: &[&str] = &[
     "huggingface",
     "aws",
     "azure",
+    // The scanner's KEY_QUALIFIERS carries these and its contract test requires names like
+    // `dbapikey`, so a qualifier it recognises and this gate does not is a bypass. Only the
+    // credential prefixes are mirrored: the scanner also lists payload and encoding words
+    // (`hash`, `value`, `id`, `path`, `data`, `file`, `env`) for matching *after* a secret
+    // word, and treating those as credential qualifiers would make `file_key` and `data_key`
+    // credentials, which is the false positive the bare-`key` carve-out exists to avoid.
+    "db",
+    "database",
+    "admin",
+    "root",
+    "app",
+    "application",
+    "consumer",
+    "oauth",
+    "jwt",
+    "shared",
+    "user",
+    "vault",
+    "gcp",
+    "gitlab",
+    "slack",
+    "stripe",
+    "twilio",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -621,6 +644,42 @@ mod qualifier_chain_tests {
     fn chained_qualifiers_still_reach_the_label_word() {
         for key in ["awssecretaccesskey", "awsaccesskey", "clientsecretkey"] {
             assert!(secret_shaped_json_key(key), "{key} must be scanned");
+        }
+    }
+
+    /// This gate keeps its own qualifier vocabulary, so it can silently fall behind the
+    /// scanner's. These names are the ones `mc-secret-scanner`'s own contract test requires
+    /// the scanner to flag; a name the scanner treats as a credential must not be structural
+    /// here, because structural means the value skips content scanning entirely.
+    #[test]
+    fn the_key_gate_agrees_with_the_scanner_contract_vocabulary() {
+        for key in [
+            "dbapikey",
+            "databasepassword",
+            "adminpassword",
+            "rootpassword",
+            "oauthtoken",
+            "jwtsecret",
+            "sharedsecret",
+            "usertoken",
+            "mastertoken",
+            "servicekey",
+            "vaultsecret",
+            "slacktoken",
+        ] {
+            assert!(
+                secret_shaped_json_key(key),
+                "the scanner flags {key}; this gate must not treat it as structural"
+            );
+        }
+
+        // The scanner also lists payload and encoding words for matching after a secret
+        // word. Mirroring those would make ordinary structural names credentials.
+        for key in ["file_key", "data_key", "env_key", "path_key", "value_key"] {
+            assert!(
+                !secret_shaped_json_key(key),
+                "{key} carries no credential qualifier and must stay writable"
+            );
         }
     }
 }
