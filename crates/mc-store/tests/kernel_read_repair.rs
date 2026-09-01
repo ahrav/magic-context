@@ -1738,12 +1738,17 @@ fn a_retired_domain_discards_the_repair_instead_of_failing_the_evaluation() {
     );
 }
 
+/// A raised interrupt stops the reducer before it reads.
+///
 /// The reducer's `ORDER BY` spans two tables, so SQLite sorts each target's rows
-/// into a temporary B-tree before yielding the first one, and the row-loop poll
-/// cannot run during that sort. A progress handler tied to the budget is what
-/// stops the statement itself.
+/// before yielding the first one and the row-loop poll cannot run during that
+/// sort. A progress handler tied to the budget stops the statement itself, but it
+/// fires on a virtual-machine step boundary that a small scan can finish without
+/// reaching — so cancellation already raised is checked before the scan starts.
+/// This asserts that check; the handler covers cancellation raised mid-sort,
+/// which needs a history too large to build here.
 #[test]
-fn an_interrupted_budget_stops_the_reducer_inside_sqlite() {
+fn an_interrupted_budget_stops_the_reducer_before_it_reads() {
     let store_dir = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let store = seed_store(store_dir.path());
@@ -2514,4 +2519,137 @@ fn a_retired_unreadable_row_is_not_authoritative() {
         }
         other => panic!("expected a recorded reduction, got {other:?}"),
     }
+}
+
+/// The fence around "nothing to clear" keys on the sequence the reduction read
+/// at: an unchanged tip proves no commit landed since, and a moved tip forces a
+/// re-reduction. This asserts that pair of primitives reports movement.
+///
+/// The interleaving itself — a block landing between the reduction and the
+/// return — has no deterministic trigger from outside the engine, so the fence's
+/// demotion path is argued from these primitives rather than from a timing test.
+#[test]
+fn the_reduction_reports_the_sequence_it_read_at() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+
+    let (as_of, _) = store
+        .applicability_block_states_as_of_tip(
+            &[TARGET_OBJECT],
+            snapshot.identity(),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.applicability_tip().unwrap(),
+        as_of,
+        "an unchanged tip proves the reduction is still current"
+    );
+
+    // Any commit moves the tip past the sequence the reduction read at.
+    store
+        .commit(intent("moves-the-tip", '9'), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "tip-domain".to_string(),
+                object_id: "tip-domain-object".to_string(),
+                name: "tip".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "tip-domain".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert!(
+        store.applicability_tip().unwrap() > as_of,
+        "a commit makes the reduction stale, which is what the fence detects"
+    );
+}
+
+/// A `source_id` equal to a repair's operation key does not make a row the
+/// engine's repair. Only the engine's own `source_kind` does.
+#[test]
+fn a_foreign_source_id_is_not_a_repair_identity() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+
+    // Derive the operation key the engine would use, then let a foreign
+    // producer claim it as its own `source_id`.
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    let intent_record =
+        RepairIntent::for_classification(&snapshot, &batch.objects[0], None, "test", 42).unwrap();
+    let operation_key = intent_record.operation_key().to_string();
+    let detail = serde_json::to_string(&ApplicabilityObservationPayload {
+        schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
+        checkout_identity_digest: checkout_identity_digest(snapshot.identity()),
+        head: snapshot.head().to_string(),
+        dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+        patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
+        state: "stale".to_string(),
+        evidence: "foreign producer".to_string(),
+    })
+    .unwrap();
+    store
+        .commit(intent("foreign-identity", '8'), |envelope| {
+            envelope.insert_observation(ObservationSpec {
+                observation_id: "foreign".to_string(),
+                object_id: "foreign-object".to_string(),
+                domain_id: DOMAIN.to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                observation_kind: OBSERVATION_KIND_STALE.to_string(),
+                payload: ObservationPayload {
+                    summary: "foreign producer".to_string(),
+                    classification: OBSERVATION_KIND_STALE.to_string(),
+                    detail: Some(detail),
+                },
+                observed_at: 2,
+                dependencies: vec![ObservationDependencySpec {
+                    dependency_object_id: TARGET_OBJECT.to_string(),
+                    dependency_kind: DEPENDENCY_KIND_TARGET.to_string(),
+                    dependency_payload: None,
+                }],
+                // Not the engine, but claiming the engine's operation key.
+                source_kind: "some-other-producer".to_string(),
+                source_id: operation_key.clone(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap()
+        .expect("the foreign row still reduces");
+    assert!(
+        block.repair_identity.is_empty(),
+        "a foreign producer's source_id is not a repair identity, got {:?}",
+        block.repair_identity
+    );
+    assert_ne!(block.repair_identity, operation_key);
 }

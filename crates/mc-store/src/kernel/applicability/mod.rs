@@ -95,6 +95,14 @@ impl ApplicabilityReport {
     }
 }
 
+/// Re-reductions attempted when the tip moves under an auto-injectable verdict.
+///
+/// Each pass narrows the window to the commits that landed during it. Sustained
+/// concurrent writes stop the retries rather than the report: a block recorded
+/// after the last read is caught by the next evaluation, which is the same
+/// guarantee a single read gives once the object is reported.
+const BLOCK_FENCE_ATTEMPTS: usize = 2;
+
 impl ApplicabilityEngine {
     /// The one entry point retrieval consumers use: snapshot the checkout
     /// once, classify the batch, and perform read repair for stale and
@@ -149,7 +157,7 @@ impl ApplicabilityEngine {
             .collect();
         // Reducing per object took the reader lock and re-derived the committed
         // tip once per object, and deriving that tip walks the live registry.
-        let blocks = match store.applicability_block_states_at_tip(
+        let reduced = match store.applicability_block_states_as_of_tip(
             &repair_indices
                 .iter()
                 .map(|index| objects[*index].object_id.as_str())
@@ -157,7 +165,7 @@ impl ApplicabilityEngine {
             snapshot.identity(),
             budget,
         ) {
-            Ok(blocks) => blocks,
+            Ok(reduced) => reduced,
             // A deadline is a domain outcome, not a store failure. Without the
             // durable record no current verdict can be shown unblocked, so
             // every one of them reports uncertain.
@@ -177,6 +185,7 @@ impl ApplicabilityEngine {
             }
             Err(error) => return Err(error),
         };
+        let (mut reduced_as_of, blocks) = reduced;
         let mut remaining = repair_indices.as_slice();
         while let Some((index, rest)) = remaining.split_first() {
             let index = *index;
@@ -259,6 +268,41 @@ impl ApplicabilityEngine {
                 None => objects[index].append_pending = false,
             }
             objects[index].append = Some(outcome);
+        }
+        // Deciding not to clear a block is a read-then-act with no transaction
+        // around it, so a concurrent evaluation can record one in between. An
+        // unchanged tip proves no commit landed since the reduction; a moved tip
+        // is re-reduced, and an object blocked by what landed is demoted.
+        for _ in 0..BLOCK_FENCE_ATTEMPTS {
+            if store.applicability_tip()? == reduced_as_of || budget.is_exhausted() {
+                break;
+            }
+            let injectable: Vec<usize> = objects
+                .iter()
+                .enumerate()
+                .filter(|(_, object)| !object.state.blocks_auto_injection())
+                .map(|(index, _)| index)
+                .collect();
+            if injectable.is_empty() {
+                break;
+            }
+            let (as_of, refreshed) = store.applicability_block_states_as_of_tip(
+                &injectable
+                    .iter()
+                    .map(|index| objects[*index].object_id.as_str())
+                    .collect::<Vec<_>>(),
+                snapshot.identity(),
+                budget,
+            )?;
+            for index in injectable {
+                let state = refreshed.get(objects[index].object_id.as_str()).cloned();
+                demote_if_blocked(
+                    &mut objects[index],
+                    state.as_ref(),
+                    "a durable block was recorded during this evaluation",
+                );
+            }
+            reduced_as_of = as_of;
         }
         Ok(ApplicabilityReport {
             objects,

@@ -558,7 +558,7 @@ impl KernelStore {
         if known_as_of < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let mut states = self.reduce_block_states(
+        let (_, mut states) = self.reduce_block_states(
             &[object_id],
             checkout_identity,
             Some(known_as_of),
@@ -585,7 +585,35 @@ impl KernelStore {
         checkout_identity: &str,
         budget: &EvalBudget,
     ) -> Result<HashMap<String, BlockState>, KernelError> {
+        Ok(self
+            .applicability_block_states_as_of_tip(object_ids, checkout_identity, budget)?
+            .1)
+    }
+
+    /// The reduction plus the commit sequence it read at.
+    ///
+    /// A caller that decides something from the reduction and then acts without
+    /// a transaction can compare that sequence against the tip: an unchanged tip
+    /// proves no commit landed in between, so the reduction is still current.
+    pub fn applicability_block_states_as_of_tip(
+        &self,
+        object_ids: &[&str],
+        checkout_identity: &str,
+        budget: &EvalBudget,
+    ) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
         self.reduce_block_states(object_ids, checkout_identity, None, budget)
+    }
+
+    /// The committed tip, for fencing a decision taken from a reduction.
+    pub fn applicability_tip(&self) -> Result<i64, KernelError> {
+        let reader = self.lock_reader()?;
+        reader
+            .query_row(
+                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| KernelError::Io)
     }
 
     /// `known_as_of` of `None` reads the committed tip inside the same
@@ -596,7 +624,7 @@ impl KernelStore {
         checkout_identity: &str,
         known_as_of: Option<i64>,
         budget: &EvalBudget,
-    ) -> Result<HashMap<String, BlockState>, KernelError> {
+    ) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
         // Hashed once for the whole scan: the payload stores the digest, not the
         // identity, so the redactor cannot rewrite one side of the comparison.
         self.reduce_digest_states(
@@ -614,9 +642,15 @@ impl KernelStore {
         checkout_digest: &str,
         known_as_of: Option<i64>,
         budget: &EvalBudget,
-    ) -> Result<HashMap<String, BlockState>, KernelError> {
+    ) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
         if object_ids.is_empty() {
-            return Ok(HashMap::new());
+            return Ok((0, HashMap::new()));
+        }
+        // Cancellation already raised: the progress handler below fires on a
+        // virtual-machine step boundary, which a small scan can finish without
+        // reaching, so work the budget has cancelled does not start.
+        if budget.is_exhausted() {
+            return Err(KernelError::Deadline);
         }
         // `lock_reader` blocks on `Mutex::lock`, which would let a concurrent
         // reader hold this evaluation past its own bound before the scan reaches
@@ -656,7 +690,7 @@ fn reduce_with_reader(
     checkout_digest: &str,
     known_as_of: Option<i64>,
     budget: &EvalBudget,
-) -> Result<HashMap<String, BlockState>, KernelError> {
+) -> Result<(i64, HashMap<String, BlockState>), KernelError> {
     let mut states = HashMap::new();
     let tx = reader
         .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -684,7 +718,7 @@ fn reduce_with_reader(
         )?;
     }
     tx.commit().map_err(scan_error)?;
-    Ok(states)
+    Ok((known_as_of, states))
 }
 
 /// Scans one chunk newest-first, stopping each object at its newest kind
@@ -720,7 +754,7 @@ fn reduce_chunk(
     let mut statement = tx
         .prepare(&format!(
             "SELECT d.dependency_object_id, o.observation_kind, o.observation_payload,
-                    o.created_commit_seq, r.source_id,
+                    o.created_commit_seq, r.source_kind, r.source_id,
                     CASE
                         WHEN o.invalidated_commit_seq <= ?{as_of}
                         THEN o.invalidated_commit_seq
@@ -746,6 +780,9 @@ fn reduce_chunk(
     }
     bound.push(&DEPENDENCY_KIND_TARGET);
     bound.push(&known_as_of);
+    if budget.is_exhausted() {
+        return Err(KernelError::Deadline);
+    }
     let mut rows = statement
         .query(rusqlite::params_from_iter(bound))
         .map_err(scan_error)?;
@@ -761,8 +798,17 @@ fn reduce_chunk(
         let kind: String = row.get(1).map_err(|_| KernelError::Io)?;
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
-        let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
-        let invalidated: Option<i64> = row.get(5).map_err(|_| KernelError::Io)?;
+        // Only the engine's own repairs carry a repair identity. A row inserted
+        // through the generic API can hold any `source_id`, including one equal
+        // to a deterministic operation key, and treating that as a completed
+        // repair would skip the receipt and the deep-verification job.
+        let source_kind: String = row.get(4).map_err(|_| KernelError::Io)?;
+        let repair_identity: String = if source_kind == REPAIR_PRODUCER {
+            row.get(5).map_err(|_| KernelError::Io)?
+        } else {
+            String::new()
+        };
+        let invalidated: Option<i64> = row.get(6).map_err(|_| KernelError::Io)?;
         let matched = classify_row(&payload, &kind, checkout_digest);
         // An invalidated row is out of the reduction but still moves the
         // generation, so a replacement repair cannot reuse its identity. Folded
