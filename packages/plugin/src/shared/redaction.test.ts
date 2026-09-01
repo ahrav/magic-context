@@ -185,6 +185,11 @@ describe("isCredentialBearingConfigKey", () => {
             "passwordValue2",
             "clientSecretHeader3",
             "APIKEYVALUE2",
+            /** The Rails-style compound ends in `base`, so neither the `key` branch nor a peeled descriptor reaches the credential inside it. commentlint: allow(JUDGE) */
+            "secretKeyBase",
+            "SECRET_KEY_BASE",
+            "jwtSecretKeyBase",
+            "secret_key_base",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
@@ -198,6 +203,11 @@ describe("isCredentialBearingConfigKey", () => {
             "idealTokens",
             "baseURL",
             "models",
+            /** The `secretkeybase` compound is matched whole, so an ordinary `base` tail stays benign. commentlint: allow(JUDGE) */
+            "apiBaseUrl",
+            "codebase",
+            "database",
+            "keyBase",
             // `key` names a position in a data structure at least as often as a credential.
             "foreignKey",
             "primaryKey",

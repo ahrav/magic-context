@@ -120,6 +120,8 @@ const CREDENTIAL_TAIL_WORDS = [
     "connectionurl",
     "databaseurl",
     "databaseuri",
+    /** The Rails-style compound is listed whole because its terminal word is `base`, which no other rule reads as a credential: the `key` branch never sees `secretKeyBase`, and `base` is not a trailing descriptor that peels away to leave `secret`. Matched as the full compound rather than by a `base` tail so `baseURL`, `apiBaseUrl`, and `codebase` stay benign. commentlint: allow(JUDGE) */
+    "secretkeybase",
     "secret",
     "password",
     "passwd",

@@ -1209,15 +1209,27 @@ function completedRecord(
         priorMaxAttemptCostUsd,
         disposalFailed,
     } = inputs;
-    const identityMatches =
-        observation.echoedProviderId === options.pinnedProviderId &&
-        observation.echoedModelId === options.pinnedSnapshotId;
+    /** Read once, then used from this snapshot for both validation and classification: the observation crosses the adapter boundary, so an accessor-backed field could answer `true` to a `typeof` gate and the truthy string `"false"` to the classification that decides whether the rollout counts as evidence, or throw on its second read and lose the paid rollout before `store.put()`. Named fields are copied rather than spread so nothing else the adapter attached rides along. commentlint: allow(JUDGE) */
+    const observed = {
+        checks: observation.checks,
+        claimedDone: observation.claimedDone,
+        absencePreconditionHeld: observation.absencePreconditionHeld,
+        armIdentityMatches: observation.armIdentityMatches,
+        echoedProviderId: observation.echoedProviderId,
+        echoedModelId: observation.echoedModelId,
+        usage: observation.usage,
+        turns: observation.turns,
+        baseScriptFingerprint: observation.baseScriptFingerprint,
+        intervention: observation.intervention,
+    };
+    const identityMatches = observed.echoedProviderId === options.pinnedProviderId &&
+        observed.echoedModelId === options.pinnedSnapshotId;
     /** The intervention comes back from the rollout adapter, so it can hold a value `canonicalFingerprint` refuses; a throw here would escape `runArm` after the provider call and lose the paid coordinate instead of recording it. commentlint: allow(JUDGE) */
-    const observedInterventionFingerprint = interventionFingerprint(observation.intervention);
-    const declarationMatches = observation.baseScriptFingerprint === expectedFingerprint &&
+    const observedInterventionFingerprint = interventionFingerprint(observed.intervention);
+    const declarationMatches = observed.baseScriptFingerprint === expectedFingerprint &&
         observedInterventionFingerprint !== null &&
         observedInterventionFingerprint === interventionFingerprint(expectedIntervention);
-    const observedUsage = finiteUsage(observation.usage);
+    const observedUsage = finiteUsage(observed.usage);
     /** The counters can be individually safe and still price beyond the float range once multiplied, so the computed cost is what has to be finite. commentlint: allow(JUDGE) */
     const observedCostUsd = observedUsage === null
         ? null
@@ -1228,25 +1240,25 @@ function completedRecord(
         ? null
         : observedUsage;
     /** Every field copied onto the record crosses the adapter boundary, and one value `JSON.stringify` refuses makes the whole record unwritable — which loses the paid coordinate instead of recording it as malformed. commentlint: allow(JUDGE) */
-    const echoesAreStrings = (observation.echoedProviderId === null ||
-        typeof observation.echoedProviderId === "string") &&
-        (observation.echoedModelId === null || typeof observation.echoedModelId === "string");
+    const echoesAreStrings = (observed.echoedProviderId === null ||
+        typeof observed.echoedProviderId === "string") &&
+        (observed.echoedModelId === null || typeof observed.echoedModelId === "string");
     const shapeIsWritable = echoesAreStrings &&
-        typeof observation.baseScriptFingerprint === "string" &&
-        Number.isSafeInteger(observation.turns) &&
-        (observation.turns as number) >= 0;
+        typeof observed.baseScriptFingerprint === "string" &&
+        Number.isSafeInteger(observed.turns) &&
+        (observed.turns as number) >= 0;
     /** These gates decide whether the rollout counts as evidence, and a JSON-derived `"false"` is truthy, so a non-boolean would pass the exclusion it is supposed to trip. commentlint: allow(JUDGE) */
-    const gatesAreBoolean = typeof observation.absencePreconditionHeld === "boolean" &&
-        typeof observation.armIdentityMatches === "boolean" &&
-        typeof observation.claimedDone === "boolean";
+    const gatesAreBoolean = typeof observed.absencePreconditionHeld === "boolean" &&
+        typeof observed.armIdentityMatches === "boolean" &&
+        typeof observed.claimedDone === "boolean";
     /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
     let reasonCode: ReasonCode | null = disposalFailed
         ? "harness-failure"
         : usage === null || !gatesAreBoolean || !shapeIsWritable
             ? "invalid-result"
-            : !observation.absencePreconditionHeld
+            : !observed.absencePreconditionHeld
                 ? "absence-precondition-unmet"
-                : !observation.armIdentityMatches || !identityMatches
+                : !observed.armIdentityMatches || !identityMatches
                     ? "arm-identity-mismatch"
                     : !declarationMatches
                         ? "invalid-result"
@@ -1258,12 +1270,12 @@ function completedRecord(
     if (runHealth === "completed") {
         try {
             /** The container is established as an array before it is mapped: `null` or an object would raise a `TypeError` here, which escapes as a non-contract error and loses the paid rollout, where `validateCheckVector` turns the same input into the `invalid-result` this path is built to record. commentlint: allow(JUDGE) */
-            if (!Array.isArray(observation.checks)) {
+            if (!Array.isArray(observed.checks)) {
                 validateCheckVector(scenario, []);
                 throw new PairedDeltaContractError(["checks-not-an-array"]);
             }
             /** Snapshotted before validation, not after: a spread re-reads the adapter's object, so an accessor could answer one value to `validateCheckVector` and another to the copy — recording an outcome the validator never saw — or throw on the second read and lose the paid rollout. The named fields are copied rather than spread so nothing else the adapter attached rides along into the record. commentlint: allow(JUDGE) */
-            const snapshot = observation.checks.map(({ id, passed }) => ({ id, passed }));
+            const snapshot = observed.checks.map(({ id, passed }) => ({ id, passed }));
             validateCheckVector(scenario, snapshot);
             checks = snapshot;
         } catch (error) {
@@ -1287,13 +1299,13 @@ function completedRecord(
         repoCommit: options.repoCommit,
         pinnedProviderId: options.pinnedProviderId,
         pinnedSnapshotId: options.pinnedSnapshotId,
-        echoedProviderId: echoesAreStrings ? observation.echoedProviderId : null,
-        echoedModelId: echoesAreStrings ? observation.echoedModelId : null,
-        baseScriptFingerprint: typeof observation.baseScriptFingerprint === "string"
-            ? observation.baseScriptFingerprint
+        echoedProviderId: echoesAreStrings ? observed.echoedProviderId : null,
+        echoedModelId: echoesAreStrings ? observed.echoedModelId : null,
+        baseScriptFingerprint: typeof observed.baseScriptFingerprint === "string"
+            ? observed.baseScriptFingerprint
             : expectedFingerprint,
         /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. Detached through JSON rather than retained, because fingerprinting proves the shape is serializable and not that the object itself is cloneable — an adapter-owned `Proxy` passes the canonicalizer and then fails `structuredClone` inside `put`, after the rollout is paid for and with nothing persisted. commentlint: allow(JUDGE) */
-        intervention: detachedIntervention(observation.intervention, expectedIntervention),
+        intervention: detachedIntervention(observed.intervention, expectedIntervention),
         cell: {
             armId: coordinate.armId,
             checksPassed,
@@ -1302,7 +1314,7 @@ function completedRecord(
             criticalTotal: runHealth === "completed" ? applicableCritical.size : 0,
             invalidSuccess:
                 runHealth === "completed" &&
-                observation.claimedDone &&
+                observed.claimedDone &&
                 criticalPassed < applicableCritical.size,
             runHealth,
             reasonCode,
@@ -1315,8 +1327,8 @@ function completedRecord(
         maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, costUsd),
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
-        turns: Number.isSafeInteger(observation.turns) && observation.turns >= 0
-            ? observation.turns
+        turns: Number.isSafeInteger(observed.turns) && observed.turns >= 0
+            ? observed.turns
             : 0,
         harnessDisposed,
     };

@@ -5,6 +5,7 @@ import {
     existsSync,
     mkdirSync,
     mkdtempSync,
+    readdirSync,
     readFileSync,
     renameSync,
     rmSync,
@@ -13,7 +14,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { buildCohortClose, ProspectiveIntakeStore } from "./cohort";
 import { HoldoutContractError } from "./contract";
 import { reviewSanitizedIntake, staticPrivacyRejection } from "./intake";
@@ -21,6 +22,12 @@ import { LOCK_OWNER_FILE, lockAbandoned, lockSidelinePath, lockSidelinePrefix, r
 import { deadPid, H1, H2, H3, sanitizedIntakeFixture, frozenEventFixture } from "./test-fixtures";
 
 const key = new TextEncoder().encode("c".repeat(32));
+
+/** Found by prefix rather than by asking for a path: `lockSidelinePath` allocates a fresh suffix on each call, so calling it after a takeover names a directory the takeover never used and reports it absent whatever the takeover left behind. commentlint: allow(JUDGE) */
+function remainingSidelines(lock: string): string[] {
+    const prefix = basename(lockSidelinePrefix(lock));
+    return readdirSync(dirname(lock)).filter((entry) => entry.startsWith(prefix));
+}
 const reviewOptions = {
     commitmentKey: key,
     expectedRubricFingerprint: H3,
@@ -322,15 +329,38 @@ describe("cohort store lock", () => {
             });
             expect(ran).toBe(true);
             expect(existsSync(lock)).toBe(false);
-            expect(existsSync(lockSidelinePath(lock))).toBe(false);
+            expect(remainingSidelines(lock)).toEqual([]);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
+    it("keeps a live lock whose owner record cannot be read", () => {
+        // Root bypasses mode-bit checks, so owner-file reads succeed and cannot reach the
+        // recordless fallback.
+        if (process.getuid?.() === 0) return;
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        const lock = seedLock(root, { pid: process.pid, nonce: "live-holder", acquiredAt: Date.now() });
+        try {
+            /** The mtime is aged past the lease because a holder of this lock runs for minutes, which is what makes the recordless fallback reachable while the claim is still live. commentlint: allow(JUDGE) */
+            const orphaned = new Date(Date.now() - 600_000);
+            utimesSync(lock, orphaned, orphaned);
+            chmodSync(join(lock, LOCK_OWNER_FILE), 0o000);
+
+            expect(lockAbandoned(lock)).toBeNull();
+
+            /** Forced past the verdict, takeover still refuses: its own verification read fails the same way, so it cannot confirm the recordless claim it was handed. commentlint: allow(JUDGE) */
+            takeOverLock(lock, { owner: null });
+            expect(existsSync(lock)).toBe(true);
+            expect(remainingSidelines(lock)).toEqual([]);
+        } finally {
+            chmodSync(join(lock, LOCK_OWNER_FILE), 0o600);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("removes and claims nothing when a takeover cannot rename the lock aside", () => {
-        // Mode bits do not restrain root, so the rename would succeed and the branch under
-        // test would never be reached.
+        // Mode bits do not restrain root, so the simulated rename failure would not occur.
         if (process.getuid?.() === 0) return;
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {
@@ -405,7 +435,7 @@ describe("cohort store lock", () => {
             // The new holder keeps the lock it claimed because the takeover moves and removes nothing.
             expect(existsSync(lock)).toBe(true);
             expect(JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"))).toEqual(fresh);
-            expect(existsSync(lockSidelinePath(lock))).toBe(false);
+            expect(remainingSidelines(lock)).toEqual([]);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

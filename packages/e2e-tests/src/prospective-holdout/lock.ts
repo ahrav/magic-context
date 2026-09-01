@@ -63,28 +63,41 @@ function parseLockOwner(text: string): LockOwner | null {
     }
 }
 
-function readLockOwner(lock: string): LockOwner | null {
-    try {
-        return parseLockOwner(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"));
-    } catch {
-        return null;
-    }
-}
+/** The three answers a lock record can give, kept apart because they license different actions. `owner` is a claim that can be judged. `none` means the path carries no claim, because the record is absent — the narrow window between `mkdirSync` and the owner write — or because its bytes do not parse. `unreadable` means the record may hold a claim that could not be read. Treating `unreadable` as `none` lets an inaccessible live lock look abandoned: the verdict falls back to the directory's mtime, which a lock held across a whole multi-minute rollout leaves older than the lease, and takeover then reads its own failed read as confirmation that the path still carries the recordless claim it judged. commentlint: allow(JUDGE) */
+type LockOwnerRead =
+    | { status: "owner"; owner: LockOwner }
+    | { status: "none" }
+    | { status: "unreadable"; code: string | undefined };
 
-/** `readLockOwner` reports "no parseable claim" for both an absent record and an unreadable one, which is the right answer for judging abandonment or contention — neither can act on a record it cannot read. Release is the exception: it deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and a malformed one stay `null`; anything else raises. commentlint: allow(JUDGE) */
-function readLockOwnerForRelease(lock: string): LockOwner | null {
+function readLockOwnerRecord(lock: string): LockOwnerRead {
     let text: string;
     try {
         text = readFileSync(join(lock, LOCK_OWNER_FILE), "utf8");
     } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR") return null;
+        const code = errorCode(error);
+        if (code === "ENOENT" || code === "ENOTDIR") return { status: "none" };
+        return { status: "unreadable", code };
+    }
+    /** The checked bytes are parsed here rather than re-read: a second read can fail where the first succeeded, and a failure answered as "no claim" is exactly the conflation this type exists to prevent. commentlint: allow(JUDGE) */
+    const owner = parseLockOwner(text);
+    return owner === null ? { status: "none" } : { status: "owner", owner };
+}
+
+/** The null-collapsing view, for callers whose answer is the same either way: a read that failed and a record that is absent both mean "not confirmed to be this process's claim". commentlint: allow(JUDGE) */
+function readLockOwner(lock: string): LockOwner | null {
+    const read = readLockOwnerRecord(lock);
+    return read.status === "owner" ? read.owner : null;
+}
+
+/** Release deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and one whose bytes do not parse stay `null`; anything else raises. commentlint: allow(JUDGE) */
+function readLockOwnerForRelease(lock: string): LockOwner | null {
+    const read = readLockOwnerRecord(lock);
+    if (read.status === "unreadable") {
         throw new LockOwnerUnreadableError(
-            `lock owner record at ${lock} could not be read (${String(code)})`,
+            `lock owner record at ${lock} could not be read (${String(read.code)})`,
         );
     }
-    /** The checked bytes are parsed here rather than re-read through `readLockOwner`: a second read can fail where the first succeeded, and that helper answers `null` for a failure, which release would take as proof the claim is foreign. commentlint: allow(JUDGE) */
-    return parseLockOwner(text);
+    return read.status === "owner" ? read.owner : null;
 }
 
 /**
@@ -102,8 +115,11 @@ export interface LockAbandonment {
  * A lock is not abandoned while its lease is active or when its holder's death is unproven.
  */
 export function lockAbandoned(lock: string): LockAbandonment | null {
-    const owner = readLockOwner(lock);
-    if (owner !== null) {
+    const read = readLockOwnerRecord(lock);
+    /** A record that could not be read is not evidence of an absent claim, so the mtime fallback below is not licensed here: that path exists for the window in which a live holder has created the directory and not yet written its record, and using it for a failed read judges an inaccessible live lock abandoned. commentlint: allow(JUDGE) */
+    if (read.status === "unreadable") return null;
+    if (read.status === "owner") {
+        const { owner } = read;
         const expired = Date.now() - owner.acquiredAt > LOCK_LEASE_MS && !holderAlive(owner.pid);
         return expired ? { owner } : null;
     }
@@ -153,7 +169,12 @@ export function restoreOrRemoveSideline(
     sideline: string,
     judged: LockAbandonment,
 ): void {
-    if (sameLockOwner(readLockOwner(sideline), judged.owner)) {
+    /** The removal below destroys the sideline, so a read that merely failed must not stand in for an absent record: `sameLockOwner` matches two nulls, so a failed read against an mtime-judged verdict would delete a directory that may carry a live claim. An unreadable sideline falls through to the restoration attempts, which leave it in place when neither lands. commentlint: allow(JUDGE) */
+    const read = readLockOwnerRecord(sideline);
+    if (
+        read.status !== "unreadable" &&
+        sameLockOwner(read.status === "owner" ? read.owner : null, judged.owner)
+    ) {
         rmSync(sideline, { recursive: true, force: true });
         return;
     }
@@ -184,7 +205,10 @@ export function restoreOrRemoveSideline(
  * A hard kill between the rename and removal leaves the sideline directory in the lock's parent, where no later acquisition removes it.
  */
 export function takeOverLock(lock: string, judged: LockAbandonment): void {
-    if (!sameLockOwner(readLockOwner(lock), judged.owner)) return;
+    /** The verification read has to distinguish a failure from an absent record, because `sameLockOwner` treats two nulls as a match: a recordless lock judged by mtime, verified through a read that merely failed, confirms itself and moves whatever claim the path actually holds. commentlint: allow(JUDGE) */
+    const read = readLockOwnerRecord(lock);
+    if (read.status === "unreadable") return;
+    if (!sameLockOwner(read.status === "owner" ? read.owner : null, judged.owner)) return;
     const sideline = lockSidelinePath(lock);
     try {
         renameSync(lock, sideline);
