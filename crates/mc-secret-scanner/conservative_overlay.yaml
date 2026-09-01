@@ -1,6 +1,6 @@
 rules:
 - name: magic-anthropic-api-key
-  regex: '\bsk-ant-(?:api03-|admin01-)?[A-Za-z0-9_-]{32,}\b'
+  regex: '\bsk-ant-(?:api03-|admin01-)?[A-Za-z0-9_-]{32,}'
   anchors: [sk-ant-]
   radius: 256
   entropy:
@@ -140,6 +140,12 @@ rules:
   value_group: value
   reject_scalars: true
   value_suppressors_any: *overlay_value_suppressors
+# An unquoted value ends at a structural delimiter. Accepting one as content makes a
+# trailing command or comment part of the candidate, where a suppressor word in it
+# discards the whole finding and leaves the credential in place. A value that contains
+# one has to be quoted, which the quoted rules below match in full.
+# `-` ends no body above: a trailing word boundary would reject a body the declared
+# alphabet admits, and the length floor leaves no shorter body to fall back to.
 # These rules declare `unicode: true`, so `\s` and the negated value classes span the
 # Unicode whitespace set instead of the ASCII subset byte mode matches. A key separated
 # from its value by U+00A0 would otherwise match no rule and leave the credential in
@@ -153,7 +159,7 @@ rules:
 # that contains one, and the reported span is what gets replaced, so the remainder
 # would stay in the redacted text.
 - name: magic-keyed-assignment
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)(?:\s|\x{feff})*=(?:\s|\x{feff})*(?P<value>(?:[^\s\x{feff}''"`]|\\.)+)'
+  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)(?:\s|\x{feff})*=(?:\s|\x{feff})*(?P<value>(?:[^\s\x{feff}''"`;&|<>()$\\]|\\.)+)'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   unicode: true

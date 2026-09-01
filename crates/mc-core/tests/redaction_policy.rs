@@ -158,25 +158,57 @@ fn only_the_value_span_is_replaced_around_an_assignment() {
 }
 
 #[test]
-fn punctuation_inside_an_unquoted_value_does_not_end_the_redaction() {
-    // The replaced region is the reported value span, so a value class that stopped at
-    // shell metacharacters would leave the rest of the credential in the durable text.
-    // A backtick is excluded from the value class here and in the TypeScript engine,
-    // so it still ends the span. That gap predates the scanner and closing it on one
-    // side only would widen the divergence between the two engines.
-    for separator in ['$', ';', '&', '|', '<', '>', '(', ')'] {
-        let input = format!("password=alpha{separator}bravo");
+fn a_structural_delimiter_ends_an_unquoted_value_and_quoting_covers_the_rest() {
+    // An unquoted value ends at a shell delimiter. Accepting one as content would make a
+    // trailing command or comment part of the candidate, and a suppressor word inside
+    // that trailing text discards the whole finding, leaving the credential in place.
+    // A credential holding a delimiter has to be quoted, and the quoted rules take it
+    // whole, so this is where the two shapes divide rather than a gap in coverage.
+    for delimiter in ['$', ';', '&', '|', '<', '>', '(', ')'] {
+        let bare = format!("password=alpha{delimiter}bravo");
+        let redaction = redact_durable_text(&bare);
+        assert!(!redaction.detections.is_empty(), "{bare}");
+        assert!(!redaction.text.contains("alpha"), "{bare}");
+
+        let quoted = format!("password=\"alpha{delimiter}bravo\"");
+        let redaction = redact_durable_text(&quoted);
+        assert_eq!(
+            redaction.text, "password=\"<REDACTED:password>\"",
+            "{quoted}"
+        );
+    }
+}
+
+#[test]
+fn trailing_text_cannot_suppress_a_credential() {
+    // Suppressor words mark a placeholder value. If the candidate reached past the
+    // value into a following command or comment, a suppressor word there would discard
+    // the finding and publish the credential, which is worse than the truncation that
+    // accepting the delimiter as content would have avoided.
+    for suffix in [
+        ";TODO",
+        "|example",
+        "&changeme",
+        ";# placeholder",
+        "|redacted",
+    ] {
+        let input = format!("password=alpha-bravo{suffix}");
         let redaction = redact_durable_text(&input);
         assert!(
-            !redaction.text.contains("bravo"),
-            "{input} left credential bytes in {:?}",
+            !redaction.text.contains("alpha-bravo"),
+            "{input} published the credential as {:?}",
             redaction.text
         );
     }
-    assert_eq!(
-        redact_durable_text("password=alpha$bravo").text,
-        "password=<REDACTED:password>"
-    );
+
+    // A value that really is a placeholder is still suppressed.
+    for input in [
+        "password=changeme",
+        "password=${SECRET}",
+        "password=your-key-here",
+    ] {
+        assert_eq!(redact_durable_text(input).text, input, "{input}");
+    }
 }
 
 #[test]

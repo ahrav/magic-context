@@ -10,7 +10,7 @@ use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
 pub const UPSTREAM_CORPUS_SHA256: &str =
     "2f1292b50148d38afe3ebdb7c489449d103b75b7df464e06da0d5d7c89ac2820";
 pub const CONSERVATIVE_OVERLAY_SHA256: &str =
-    "ba1a070ee8bdcbfc1ddb4d1f85bf2e154a9e2b32eaf358f3de418c83202b1b37";
+    "efce8af13e05d6959fd493dc8378f5fa5f7e43eacc36e47dd090b7252fd87969";
 
 const UPSTREAM_BYTES: &[u8] = include_bytes!("../default_rules.yaml");
 const OVERLAY_BYTES: &[u8] = include_bytes!("../conservative_overlay.yaml");

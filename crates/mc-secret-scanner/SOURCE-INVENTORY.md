@@ -30,7 +30,7 @@ The drift check verifies digests and provenance; it does not verify adaptation.
 
 Local overlay: `crates/mc-secret-scanner/conservative_overlay.yaml`.
 
-Overlay SHA-256: `ba1a070ee8bdcbfc1ddb4d1f85bf2e154a9e2b32eaf358f3de418c83202b1b37`
+Overlay SHA-256: `efce8af13e05d6959fd493dc8378f5fa5f7e43eacc36e47dd090b7252fd87969`
 
 The overlay is original Magic Context compatibility policy and is not copied from
 Gossip-rs. Its vendor rules reuse the lengths, alphabets, entropy floors, and
