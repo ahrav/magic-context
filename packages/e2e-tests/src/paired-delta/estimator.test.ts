@@ -127,12 +127,34 @@ describe("family-clustered delta estimator", () => {
         expect(family.interval.upper).toBeGreaterThanOrEqual(family.pointEstimate);
     });
 
-    it("marks every delta unresolved below the family floor", () => {
+    it("marks every delta unresolved when the family count is short", () => {
         const result = estimate({ minimumAnalyzableFamilyCount: 6 });
         expect(result.evidenceSufficient).toBe(false);
         expect(result.endpoints.every(({ resolution }) => resolution === "unresolved")).toBe(true);
         expect(result.endpoints.every(({ families }) =>
             families.every(({ resolution }) => resolution === "unresolved"))).toBe(true);
+    });
+
+    it("marks a delta inside its family floor unresolved on its own", () => {
+        /** The family count is satisfied here, so the floor is the only thing that can withhold resolution. */
+        const result = estimate({
+            minimumAnalyzableFamilyCount: 1,
+            /** A primary observation is analyzable only when its coordinate carries both primary endpoints. */
+            observations: [
+                { coordinateId: "var-a:0", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:1", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:1", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+            ],
+        });
+        const endpoint = primaryEndpoint(result, "mc-on-vs-mc-off");
+        const family = endpoint.families[0]!;
+
+        expect(family.noise.label).toBe("inside-floor");
+        // The interval itself excludes zero, so only the floor withholds resolution.
+        expect(family.interval.lower > 0 || family.interval.upper < 0).toBe(true);
+        expect(family.resolution).toBe("unresolved");
+        expect(endpoint.resolution).toBe("unresolved");
     });
 
     it("labels estimates when no calibration noise floor exists", () => {
@@ -302,7 +324,7 @@ describe("family-clustered delta estimator", () => {
         }
     });
 
-    it("keeps retrieval provider-mixed and live regret inferentially separate", () => {
+    it("keeps every R1-dependent rung provider-mixed and live regret inferentially separate", () => {
         const result = estimate({
             observations: [
                 ...observations,
@@ -311,8 +333,10 @@ describe("family-clustered delta estimator", () => {
                 { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "representation", delta: 0.4, runHealth: "completed" },
             ],
         });
-        expect(result.providerMixedRegret.map(({ endpoint }) => endpoint)).toEqual(["retrieval"]);
-        expect(result.liveRegret.map(({ endpoint }) => endpoint)).toEqual(["formation", "representation"]);
+        // `formation` is R2 - R1, and R1's scripted search turn is mock-served.
+        expect(result.providerMixedRegret.map(({ endpoint }) => endpoint))
+            .toEqual(["formation", "retrieval"]);
+        expect(result.liveRegret.map(({ endpoint }) => endpoint)).toEqual(["representation"]);
         expect(result.rawRegretRecords.every(({ inferential }) => inferential === false)).toBe(true);
     });
 });
@@ -341,15 +365,21 @@ describe("bound prospective estimator adapter", () => {
         expect(noChange.direction).toBe("no-change");
         expect(noChange).not.toHaveProperty("noise");
 
+        /** Shifted clear of every family floor: a delta inside its floor is not separable from measured noise, so it must not project a direction. */
         const positive = adapter(estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: observations.map((row) => ({ ...row, delta: Math.abs(row.delta) + 0.7 })),
+        })).analyze(pairs, H3);
+        expect(positive.direction).toBe("improvement");
+        const insideFloor = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
             observations: observations.map((row) => ({ ...row, delta: Math.abs(row.delta) + 0.2 })),
         })).analyze(pairs, H3);
-        expect(positive.direction).toBe("improvement");
+        expect(insideFloor.direction).toBe("no-change");
 
         const negative = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
-            observations: observations.map((row) => ({ ...row, delta: -Math.abs(row.delta) - 0.2 })),
+            observations: observations.map((row) => ({ ...row, delta: -Math.abs(row.delta) - 0.7 })),
         })).analyze(pairs, H3);
         expect(negative.direction).toBe("regression");
 
@@ -358,8 +388,8 @@ describe("bound prospective estimator adapter", () => {
             observations: observations.map((row) => ({
                 ...row,
                 delta: row.endpoint === "mc-on-vs-mc-off"
-                    ? Math.abs(row.delta) + 0.2
-                    : -Math.abs(row.delta) - 0.2,
+                    ? Math.abs(row.delta) + 0.7
+                    : -Math.abs(row.delta) - 0.7,
             })),
         })).analyze(pairs, H3);
         expect(mixed.direction).toBe("no-change");

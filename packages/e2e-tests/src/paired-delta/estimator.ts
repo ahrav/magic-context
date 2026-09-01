@@ -15,9 +15,9 @@ export const MIN_BOOTSTRAP_RESAMPLES = 2000;
 // `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
 export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
-// The intervention arm behind the retrieval rung is mock-served, so its estimate is provider-mixed rather than live.
-export const PROVIDER_MIXED_REGRET_ENDPOINTS = ["retrieval"] as const;
-export const LIVE_REGRET_ENDPOINTS = ["formation", "representation"] as const;
+// Both rungs that read R1 are provider-mixed: R1's scripted `ctx_search` turn and its follow-up are mock-served, and `formation` is R2 - R1. Only `representation` compares two wholly live arms.
+export const PROVIDER_MIXED_REGRET_ENDPOINTS = ["retrieval", "formation"] as const;
+export const LIVE_REGRET_ENDPOINTS = ["representation"] as const;
 // Composing the regret set from the two partitions keeps a new rung from landing in neither aggregate bucket.
 export const REGRET_ENDPOINTS = [
     ...PROVIDER_MIXED_REGRET_ENDPOINTS,
@@ -170,20 +170,20 @@ function estimateEndpoint(
                 bootstrapSeed ^ fnv1a32(`${endpoint}:${familyId}`),
             );
             const floor = noiseFloors.get(familyId) ?? null;
+            const label: NoiseComparison = floor === null
+                ? "no-noise-floor"
+                : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
             return {
                 familyId,
                 pointEstimate,
                 interval,
                 // A nonzero singleton yields a zero-width interval without variance evidence; keep it unresolved.
-                resolution: enoughFamilies && values.length >= 2 && !includesZero(interval)
+                /** A delta no larger than its family's calibrated floor is not separable from measured noise, so the floor decides resolution rather than only annotating it. */
+                resolution: enoughFamilies && values.length >= 2 && !includesZero(interval) &&
+                    label !== "inside-floor"
                     ? "resolved"
                     : "unresolved",
-                noise: {
-                    label: floor === null
-                        ? "no-noise-floor"
-                        : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor",
-                    floor,
-                },
+                noise: { label, floor },
             };
         });
     const familyMeans = families.map(({ pointEstimate }) => pointEstimate);
@@ -192,12 +192,15 @@ function estimateEndpoint(
         bootstrapResamples,
         bootstrapSeed ^ fnv1a32(endpoint),
     );
+    /** An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor family leaves the endpoint unresolved. */
+    const insideFloor = families.some(({ noise }) => noise.label === "inside-floor");
     return {
         endpoint,
         pointEstimate: mean(familyMeans),
         interval,
         familyCount: families.length,
-        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval)
+        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval) &&
+            !insideFloor
             ? "resolved"
             : "unresolved",
         families,

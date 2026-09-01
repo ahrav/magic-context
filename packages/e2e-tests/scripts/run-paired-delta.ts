@@ -802,7 +802,7 @@ export function createLiveDependencies(input: {
                     return {
                         checks,
                         /** The probe turn is the last authored turn, and an earlier turn can acknowledge the authored rule without producing the answer. */
-                        claimedDone: /\b(?:done|completed|finished)\b/i.test(last.text),
+                        claimedDone: claimsCompletion(last.text),
                         absencePreconditionHeld,
                         armIdentityMatches,
                         echoedProviderId: offPin.providerId,
@@ -829,6 +829,22 @@ export function createLiveDependencies(input: {
             };
         },
     };
+}
+
+/**
+ * A completion word is only a claim when it is not negated: `invalidSuccess` counts an arm asserting success it did not achieve, so a refusal that says "not done" is the opposite of the thing being measured.
+ * The negation window is deliberately narrow, covering the contraction and auxiliary forms a refusal uses rather than attempting sentence parsing.
+ */
+export function claimsCompletion(text: string): boolean {
+    const completion = /\b(?:done|completed|finished|complete)\b/gi;
+    for (const match of text.matchAll(completion)) {
+        const before = text.slice(Math.max(0, match.index - 40), match.index).toLowerCase();
+        if (/\b(?:not|never|cannot|can't|couldn't|didn't|doesn't|won't|unable|failed|without)\b[\s\w,'-]*$/.test(before)) {
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -1029,6 +1045,7 @@ async function runLive(args: CliArgs): Promise<void> {
      * Calibration evidence is validated before the first provider call rather than after the experiment.
      * A weekly or release dispatch with a missing or unbound record would otherwise spend its whole budget and then discard the result.
      */
+    const implementationCommit = recordsRepoCommit(args.recordsPath);
     let noiseFloors: FamilyNoiseFloor[] = [];
     if (mode !== "calibration") {
         if (!existsSync(args.calibrationRecordPath)) {
@@ -1042,6 +1059,7 @@ async function runLive(args: CliArgs): Promise<void> {
             calibration.poolManifestFingerprint !== manifestFingerprint ||
             calibration.pinnedSnapshotId !== model.modelId ||
             calibration.policyFingerprint !== policyDocument.policyFingerprint ||
+            calibration.implementationCommit !== implementationCommit ||
             !calibration.validForPoolSizing
         ) {
             throw new Error("paired-delta calibration record does not bind this run");
@@ -1071,7 +1089,7 @@ async function runLive(args: CliArgs): Promise<void> {
         {
             scenarios,
             poolManifestFingerprint: manifestFingerprint,
-            repoCommit: recordsRepoCommit(args.recordsPath),
+            repoCommit: implementationCommit,
             pinnedProviderId: model.providerId,
             pinnedSnapshotId: model.modelId,
             replicateCount: policy.replicateCount,
@@ -1104,6 +1122,7 @@ async function runLive(args: CliArgs): Promise<void> {
             poolManifestFingerprint: manifestFingerprint,
             pinnedSnapshotId: model.modelId,
             policyFingerprint: policyDocument.policyFingerprint,
+            implementationCommit,
             targetMinimumDetectableDelta: policy.targetMinimumDetectableDelta,
             decisions: {
                 familyCount: policy.minimumAnalyzableFamilyCount,
@@ -1200,4 +1219,5 @@ async function main(): Promise<void> {
     else await runLive(args);
 }
 
-await main();
+/** Guarded so a test can import the module's helpers without launching a dispatch. */
+if (import.meta.main) await main();

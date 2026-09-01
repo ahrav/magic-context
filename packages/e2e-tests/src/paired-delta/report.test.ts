@@ -111,8 +111,10 @@ describe("paired-delta report", () => {
             { armId: "compaction", reasonCode: "deadline-exceeded", count: 1 },
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
         ]);
-        expect(built.body.regret.providerMixed.map(({ endpoint }) => endpoint)).toEqual(["retrieval"]);
-        expect(built.body.regret.live.map(({ endpoint }) => endpoint)).toEqual(["formation"]);
+        // `formation` is R2 - R1 and R1's search turn is mock-served, so both R1-dependent rungs are provider-mixed.
+        expect(built.body.regret.providerMixed.map(({ endpoint }) => endpoint))
+            .toEqual(["formation", "retrieval"]);
+        expect(built.body.regret.live.map(({ endpoint }) => endpoint)).toEqual([]);
         expect(built.body.regret.raw).toEqual([{
             coordinateId: "var-a:0",
             familyId: "fam-a",
@@ -402,6 +404,7 @@ describe("paired-delta calibration record", () => {
         poolManifestFingerprint: H1,
         pinnedSnapshotId: "claude-sonnet-4-5-20250929",
         policyFingerprint: H2,
+        implementationCommit: "abc123",
         targetMinimumDetectableDelta: overrides.targetMinimumDetectableDelta ?? 0.15,
         decisions,
     });
@@ -570,6 +573,7 @@ describe("paired-delta calibration record", () => {
             poolManifestFingerprint: H1,
             pinnedSnapshotId: "claude-sonnet-4-5-20250929",
             policyFingerprint: "not-a-digest",
+            implementationCommit: "abc123",
             targetMinimumDetectableDelta: 0.15,
             decisions,
         })).toThrow(/policy-fingerprint-invalid/);

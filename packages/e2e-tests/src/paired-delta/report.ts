@@ -265,6 +265,8 @@ export interface PairedDeltaCalibrationRecord {
     poolManifestFingerprint: string;
     /** Noise measured under one policy does not transfer to another: replicate depth and the family minimum both change what the floor means. */
     policyFingerprint: string;
+    /** The manifest digest covers the pool's own files and deliberately excludes the plugin and live runner, so the evaluated implementation is bound here instead. */
+    implementationCommit: string;
     pinnedSnapshotId: string;
     runStatus: PairedDeltaRunResult["status"];
     validForPoolSizing: boolean;
@@ -396,11 +398,15 @@ export function buildCalibrationRecord(input: {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
+    implementationCommit: string;
     targetMinimumDetectableDelta: number;
     decisions: Omit<CalibrationDecision, "poolSize">;
 }): PairedDeltaCalibrationRecord {
     requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
     requireHex64(input.policyFingerprint, "policy-fingerprint");
+    if (input.implementationCommit.trim().length === 0) {
+        throw new Error("paired-delta-calibration: implementation-commit-invalid");
+    }
     const analysable = completePrimaryCoordinates(input.records);
     const deltasByCoordinate = coordinateDeltas(input.records, analysable);
     const families = new Set(input.scenarioFamilies.values());
@@ -465,6 +471,7 @@ export function buildCalibrationRecord(input: {
         schema: PAIRED_DELTA_CALIBRATION_SCHEMA,
         poolManifestFingerprint: input.poolManifestFingerprint,
         policyFingerprint: input.policyFingerprint,
+        implementationCommit: input.implementationCommit,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
         validForPoolSizing: input.runStatus === "completed" &&
@@ -528,6 +535,8 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     if (
         typeof record.pinnedSnapshotId !== "string" ||
         typeof record.policyFingerprint !== "string" ||
+        typeof record.implementationCommit !== "string" ||
+        record.implementationCommit.trim().length === 0 ||
         typeof record.validForPoolSizing !== "boolean" ||
         !Array.isArray(record.familyNoise) ||
         record.familyNoise.some((noise) =>
