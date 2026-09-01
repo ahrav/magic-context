@@ -432,11 +432,7 @@ pub fn snapshot_checkout(
             "HEAD moved during the status scan".to_string(),
         ));
     }
-    let repository_state = repository_state(&repo, &ctx)?;
-    // Read with the rest of the scan, because a shallow file removed after
-    // this point would let a truncated walk read as definitive under a commentlint: allow(JUDGE)
-    // fingerprint that still describes the shallow state. commentlint: allow(JUDGE)
-    let shallow = repo.is_shallow();
+    let (repository_state, shallow) = repository_state(&repo, &ctx)?;
     let dirty_fingerprint = fingerprint_entries(&dirty_entries, &repository_state);
     // Stop the watchdog before the last check, so neither the fingerprint nor commentlint: allow(JUDGE)
     // the watchdog's own teardown can carry a cacheable snapshot past the commentlint: allow(JUDGE)
@@ -882,7 +878,19 @@ fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotErro
         Err(_) => "unborn".to_string(),
     };
     let entries = scan_dirty_entries(&submodule, &nested)?;
-    let state = repository_state(&submodule, &nested)?;
+    let (state, _) = repository_state(&submodule, &nested)?;
+    // The nested scan needs the same HEAD-stability check the top-level one
+    // makes: a submodule that switches commits mid-scan would otherwise pair commentlint: allow(JUDGE)
+    // an old HEAD with a new worktree and key that tuple as a clean state. commentlint: allow(JUDGE)
+    let head_after = match submodule.head_id() {
+        Ok(head) => head.detach().to_string(),
+        Err(_) => "unborn".to_string(),
+    };
+    if head_after != head {
+        return Err(SnapshotError::Scan(
+            "submodule HEAD moved during the status scan".to_string(),
+        ));
+    }
     Ok(format!(
         "gitlink:{head}:{}",
         fingerprint_entries(&entries, &state)
@@ -923,20 +931,24 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
 /// Folds `path`'s bytes into `hash` chunk by chunk, so a large file bounds commentlint: allow(JUDGE)
 /// neither the working set nor the digest. Anything other than a regular file commentlint: allow(JUDGE)
 /// counts as absent, since opening a FIFO can block indefinitely. commentlint: allow(JUDGE)
-fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), SnapshotError> {
+fn fold_file(
+    hash: &mut Sha256,
+    path: &Path,
+    ctx: &ScanCtx<'_>,
+) -> Result<Option<u64>, SnapshotError> {
     // The open is the sole authority on what is there: a stat first would commentlint: allow(JUDGE)
     // leave a window for the path to be swapped before the read. commentlint: allow(JUDGE)
     let mut file = match open_regular_no_follow_at(rfs::CWD, path.as_os_str()) {
         Ok(Some(file)) => file,
         Ok(None) => {
             hash.update(b"absent\0");
-            return Ok(());
+            return Ok(None);
         }
         // Any other failure hides content that still governs the checkout. commentlint: allow(JUDGE)
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     hash.update(b"present\0");
-    fold_open_file(hash, &mut file, ctx)
+    Ok(Some(fold_open_file(hash, &mut file, ctx)?))
 }
 
 /// A read error propagates rather than truncating: a prefix would key as a
@@ -945,13 +957,17 @@ fn fold_open_file(
     hash: &mut Sha256,
     file: &mut std::fs::File,
     ctx: &ScanCtx<'_>,
-) -> Result<(), SnapshotError> {
+) -> Result<u64, SnapshotError> {
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    let mut folded = 0u64;
     loop {
         ctx.check()?;
         match file.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(read) => hash.update(&buffer[..read]),
+            Ok(0) => return Ok(folded),
+            Ok(read) => {
+                hash.update(&buffer[..read]);
+                folded = folded.saturating_add(read as u64);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(SnapshotError::Scan(error.to_string())),
         }
@@ -971,7 +987,10 @@ fn fold_open_file(
 /// "absent" from "absent so far". A cache keyed by this generation therefore commentlint: allow(JUDGE)
 /// must not retain an outcome that an unreadable object produced; such an commentlint: allow(JUDGE)
 /// outcome is transient exactly as a budget-driven one is. commentlint: allow(JUDGE)
-fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
+fn repository_state(
+    repo: &gix::Repository,
+    ctx: &ScanCtx<'_>,
+) -> Result<([u8; 32], bool), SnapshotError> {
     let config = repo.config_snapshot();
     let mut hash = Sha256::new();
     hash.update(b"mc-repo-state-v1\0");
@@ -982,8 +1001,15 @@ fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32
     hash.update(b"sparse\0");
     fold_file(&mut hash, &repo.git_dir().join("info/sparse-checkout"), ctx)?;
     hash.update(b"shallow\0");
-    fold_file(&mut hash, &repo.shallow_file(), ctx)?;
-    Ok(hash.finalize().into())
+    // The digest and the shallow verdict come from one read, so a shallow file
+    // removed between them cannot pair a shallow fingerprint with commentlint: allow(JUDGE)
+    // `shallow == false`. A present-but-empty file is not shallow, which is commentlint: allow(JUDGE)
+    // what gix reports too. commentlint: allow(JUDGE)
+    let shallow = fold_file(&mut hash, &repo.shallow_file(), ctx)?;
+    Ok((
+        hash.finalize().into(),
+        matches!(shallow, Some(bytes) if bytes > 0),
+    ))
 }
 
 #[cfg(test)]
