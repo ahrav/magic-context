@@ -8,7 +8,9 @@ baseline)
   ;;
 compare)
   cargo bench -p mc-store --bench scope_algebra -- --baseline main
-  python3 scripts/perf-geomean.py target/criterion
+  python3 scripts/perf-geomean.py target/criterion \
+    algebra ancestry snapshot snapshot_matrix payload_decode cheap_checks \
+    batch anchor_density payload_checks staleness adversarial
   ;;
 *)
   echo "usage: $0 [baseline|compare]" >&2

@@ -155,6 +155,12 @@ impl ApplicabilityEngine {
             })
             .map(|(index, _)| index)
             .collect();
+        if repair_indices.is_empty() {
+            return Ok(ApplicabilityReport {
+                objects,
+                stats: batch.stats,
+            });
+        }
         // Reducing per object took the reader lock and re-derived the committed
         // tip once per object, and deriving that tip walks the live registry.
         let reduced = match store.applicability_block_states_as_of_tip(
