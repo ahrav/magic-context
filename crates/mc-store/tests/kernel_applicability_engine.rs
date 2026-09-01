@@ -2063,3 +2063,58 @@ fn a_checked_path_under_a_symlinked_ancestor_is_never_read() {
         assert!(batch.objects[0].failed_check.is_none());
     }
 }
+
+/// The ladder memoizes ancestry, window, and patch-ID work, so a second
+/// candidate sharing an unresolved anchor consumes the first candidate's result
+/// without re-reading the absent object. Transience is therefore a property of
+/// the request, and every candidate in the batch has to inherit it.
+#[test]
+fn every_candidate_sharing_an_absent_object_declines_to_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let anchor = AnchorRowSpec {
+        anchor_id: "anchor-absent".to_string(),
+        anchor_kind: "reachable_from".to_string(),
+        reachable_from_oid: Some("0".repeat(40)),
+        ..AnchorRowSpec::default()
+    };
+    // Two candidates, one batch, one shared anchor row: the second consumes the
+    // batch memo the first populated.
+    let batch: Vec<ApplicabilityCandidate> = (0..2)
+        .map(|index| ApplicabilityCandidate {
+            anchor: Some(anchor.clone()),
+            ..candidate(&format!("object-{index}"))
+        })
+        .collect();
+    let first = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &batch,
+        &EvalBudget::unbounded(),
+    );
+    for object in &first.objects {
+        assert_eq!(object.state, ApplicabilityState::Uncertain);
+    }
+
+    // Neither candidate's verdict may have been retained, including the one
+    // that never touched the object database itself.
+    let second = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &batch,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        second.stats.object_cache_hits, 0,
+        "a candidate served from the batch memo retained its uncertainty"
+    );
+    for object in &second.objects {
+        assert_eq!(object.state, ApplicabilityState::Uncertain);
+        assert!(!object.append_pending);
+    }
+}

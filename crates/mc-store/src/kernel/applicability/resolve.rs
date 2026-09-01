@@ -60,8 +60,8 @@ pub struct ResolutionLadder<'s> {
     /// A candidate's patch identity depends only on its commit.
     patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
     graph_operations: Cell<u64>,
-    /// Resolutions that could not read an object they needed.
-    unreadable_objects: Cell<u64>,
+    /// Whether any resolution needed an object the database did not hold.
+    saw_unreadable_object: Cell<bool>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -74,7 +74,7 @@ impl<'s> ResolutionLadder<'s> {
             window: RefCell::new(None),
             patch_id_cache: RefCell::new(HashMap::new()),
             graph_operations: Cell::new(0),
-            unreadable_objects: Cell::new(0),
+            saw_unreadable_object: Cell::new(false),
         }
     }
 
@@ -89,21 +89,27 @@ impl<'s> ResolutionLadder<'s> {
         self.budget.is_exhausted()
     }
 
-    /// Count of resolutions that needed an object the database did not hold.
+    /// Whether any resolution this request performed needed an object the
+    /// database did not hold.
     ///
     /// Object availability is deliberately outside the snapshot generation, commentlint: allow(JUDGE)
     /// because a fetch can supply a missing commit without moving HEAD, the commentlint: allow(JUDGE)
     /// worktree, sparse configuration, or the shallow file. An outcome that commentlint: allow(JUDGE)
     /// rests on an absent object is therefore transient exactly as a commentlint: allow(JUDGE)
-    /// budget-driven one is, and a caller compares this across one evaluation commentlint: allow(JUDGE)
-    /// to decide whether the outcome may be retained. commentlint: allow(JUDGE)
-    pub fn unreadable_objects(&self) -> u64 {
-        self.unreadable_objects.get()
+    /// budget-driven one is, and is not retained. commentlint: allow(JUDGE)
+    ///
+    /// This is a request-wide predicate rather than a per-evaluation delta on commentlint: allow(JUDGE)
+    /// purpose. The ancestry, window, and patch-ID memos serve later commentlint: allow(JUDGE)
+    /// candidates from the first candidate's work, so a delta would credit the commentlint: allow(JUDGE)
+    /// absent object only to whichever candidate happened to read it first and commentlint: allow(JUDGE)
+    /// let every other candidate retain the same uncertainty. An incomplete commentlint: allow(JUDGE)
+    /// object database is a property of the request, not of one lookup. commentlint: allow(JUDGE)
+    pub fn saw_unreadable_object(&self) -> bool {
+        self.saw_unreadable_object.get()
     }
 
     fn note_unreadable_object(&self) {
-        self.unreadable_objects
-            .set(self.unreadable_objects.get() + 1);
+        self.saw_unreadable_object.set(true);
     }
 
     fn count_graph_operation(&self) {
@@ -453,7 +459,15 @@ impl<'s> ResolutionLadder<'s> {
             self.note_unreadable_object();
             return None;
         }
-        let bases = repo.merge_bases_many(ancestor, &[descendant]).ok()?;
+        // Both endpoints exist, so a failure here is a missing object further
+        // in: an intermediate parent a later fetch can supply.
+        let bases = match repo.merge_bases_many(ancestor, &[descendant]) {
+            Ok(bases) => bases,
+            Err(_) => {
+                self.note_unreadable_object();
+                return None;
+            }
+        };
         // Do not return a graph result after the budget expires.
         if self.budget.is_exhausted() {
             return None;

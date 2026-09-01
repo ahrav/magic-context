@@ -339,26 +339,31 @@ impl ApplicabilityEngine {
             // repair re-append it on every request forever.
             let mut append_pending = classification.cacheable && !classification.query_local;
             if classification.cacheable {
-                let mut cache = lock(&self.object_cache);
-                // A concurrent request that missed this same key can have
-                // landed and confirmed the append already. Overwriting the
-                // entry with `false` sends repair back over confirmed work.
-                let append_confirmed = cache
-                    .peek(&key)
-                    .is_some_and(|cached| cached.append_confirmed);
-                append_pending = append_pending && !append_confirmed;
-                // Binding the evicted generation frees its entries after the
-                // lock guard drops, keeping the critical section bounded.
-                let _evicted = cache.insert(
-                    key,
-                    CachedClassification {
-                        state: classification.state,
-                        evidence: classification.evidence.clone(),
-                        failed_check: classification.failed_check.clone(),
-                        query_local: classification.query_local,
-                        append_confirmed,
-                    },
-                );
+                // The guard is scoped so it releases before `evicted` drops:
+                // locals drop in reverse declaration order, so binding the
+                // displaced generation alongside the guard would free up to a
+                // full generation of entries while still holding the lock.
+                let evicted = {
+                    let mut cache = lock(&self.object_cache);
+                    // A concurrent request that missed this same key can have
+                    // landed and confirmed the append already. Overwriting the
+                    // entry with `false` sends repair back over confirmed work.
+                    let append_confirmed = cache
+                        .peek(&key)
+                        .is_some_and(|cached| cached.append_confirmed);
+                    append_pending = append_pending && !append_confirmed;
+                    cache.insert(
+                        key,
+                        CachedClassification {
+                            state: classification.state,
+                            evidence: classification.evidence.clone(),
+                            failed_check: classification.failed_check.clone(),
+                            query_local: classification.query_local,
+                            append_confirmed,
+                        },
+                    )
+                };
+                drop(evicted);
             }
             objects.push(finished(candidate, token, classification, append_pending));
         }
@@ -396,10 +401,9 @@ impl ApplicabilityEngine {
         // needed an object the database does not hold. The cache key covers
         // neither, so retaining such a verdict pins it until eviction even
         // after a fetch or a longer budget would decide it.
-        let unreadable_before = ladder.unreadable_objects();
         let uncertain = |evidence: String| {
             let state = ApplicabilityState::Uncertain;
-            if budget.is_exhausted() || ladder.unreadable_objects() != unreadable_before {
+            if budget.is_exhausted() || ladder.saw_unreadable_object() {
                 Classification::uncacheable(state, evidence)
             } else {
                 Classification::terminal(state, evidence)
@@ -592,15 +596,13 @@ impl ApplicabilityEngine {
                 }
                 None => {
                     stats.anchor_cache_misses += 1;
-                    let unreadable_before = ladder.unreadable_objects();
                     let outcome = ladder.evaluate(git_condition);
                     // Uncertainty from an expired budget or from an object the
                     // database does not hold is transient: a fetch supplies a
                     // missing commit without moving anything this key covers,
                     // so retaining either would pin a degraded verdict to this
                     // (HEAD, anchor) until eviction.
-                    let transient = ladder.budget_was_exhausted()
-                        || ladder.unreadable_objects() != unreadable_before;
+                    let transient = ladder.budget_was_exhausted() || ladder.saw_unreadable_object();
                     if outcome != GitConditionOutcome::Uncertain || !transient {
                         let _evicted = lock(&self.anchor_cache).insert(key, outcome);
                     }
