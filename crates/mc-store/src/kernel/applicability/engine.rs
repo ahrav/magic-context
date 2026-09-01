@@ -19,7 +19,7 @@ use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::checks::{run_cheap_check, CheckOutcome};
-use super::payloads::{CheckSpec, ObjectApplicabilitySpec};
+use super::payloads::{CheckSpec, ObjectApplicabilitySpec, PayloadDecodeError};
 use super::resolve::{GitConditionOutcome, ResolutionLadder};
 
 /// Applicability state of one object at one checkout. Everything except
@@ -190,6 +190,39 @@ struct CachedClassification {
     append_confirmed: bool,
 }
 
+#[derive(Default)]
+struct PayloadMemo {
+    key: [u8; 32],
+    last: Option<([u8; 32], DecodedPayload)>,
+}
+
+type DecodedPayload = Result<Option<ObjectApplicabilitySpec>, PayloadDecodeError>;
+
+impl PayloadMemo {
+    fn decode(
+        &mut self,
+        payload: Option<&[u8]>,
+    ) -> Result<Option<&ObjectApplicabilitySpec>, PayloadDecodeError> {
+        if self
+            .last
+            .as_ref()
+            .is_none_or(|(last_key, _)| *last_key != self.key)
+        {
+            self.last = Some((self.key, ObjectApplicabilitySpec::decode(payload)));
+        }
+        match &self.last.as_ref().expect("payload memo initialized").1 {
+            Ok(spec) => Ok(spec.as_ref()),
+            Err(error) => Err(*error),
+        }
+    }
+}
+
+#[derive(Default)]
+struct BatchMemos {
+    anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
+    payload: PayloadMemo,
+}
+
 #[derive(Clone, Copy)]
 struct CandidateInputs<'a> {
     scope_terms: &'a Option<Vec<ScopeTermSpec>>,
@@ -317,10 +350,8 @@ impl ApplicabilityEngine {
         let mut digest_prefixes = InputDigestPrefixes::new(query, &scope_context);
         let mut batch_input_digests = (candidates.len() > 1).then(HashMap::new);
         let mut last_input_digest = None;
-        // Distinct anchors resolve once per batch even on cache misses. The
-        // memo key matches the anchor cache key, so two candidates sharing
-        // an anchor id but carrying different rows can never alias.
-        let mut batch_anchor_memo: HashMap<AnchorCacheKey, GitConditionOutcome> = HashMap::new();
+        // Distinct anchors and repeated payloads resolve once per batch.
+        let mut batch_memos = BatchMemos::default();
         let mut objects = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let inputs_digest = match &mut batch_input_digests {
@@ -386,11 +417,12 @@ impl ApplicabilityEngine {
                 continue;
             }
             stats.object_cache_misses += 1;
+            batch_memos.payload.key = inputs_digest;
             let classification = self.classify(
                 query,
                 &scope_context,
                 &ladder,
-                &mut batch_anchor_memo,
+                &mut batch_memos,
                 &mut stats,
                 candidate,
             );
@@ -427,7 +459,7 @@ impl ApplicabilityEngine {
         query: &QueryContext,
         scope_context: &ScopeMatchContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<AnchorCacheKey, GitConditionOutcome>,
+        memos: &mut BatchMemos,
         stats: &mut EvaluationStats,
         candidate: &ApplicabilityCandidate,
     ) -> Classification {
@@ -462,7 +494,7 @@ impl ApplicabilityEngine {
         }
         // Anchor gate.
         if let Some(anchor) = &candidate.anchor {
-            match self.evaluate_anchor(snapshot, query, ladder, batch_anchor_memo, stats, anchor) {
+            match self.evaluate_anchor(snapshot, query, ladder, &mut memos.anchors, stats, anchor) {
                 AnchorVerdict::Holds => {}
                 AnchorVerdict::Historical(evidence) => {
                     return Classification::terminal(ApplicabilityState::Historical, evidence);
@@ -481,7 +513,7 @@ impl ApplicabilityEngine {
         // present-but-undecodable payload fails closed: the declared paths
         // and checks are unknowable, so the object is uncertain, never
         // silently current.
-        let spec = match ObjectApplicabilitySpec::decode(candidate.payload.as_deref()) {
+        let spec = match memos.payload.decode(candidate.payload.as_deref()) {
             Ok(spec) => spec,
             Err(_) => {
                 return Classification::terminal(
@@ -490,7 +522,7 @@ impl ApplicabilityEngine {
                 );
             }
         };
-        if let Some(spec) = &spec {
+        if let Some(spec) = spec {
             if let Some(path) = dirty_overlap(snapshot, &spec.affected_paths) {
                 return Classification::terminal(
                     ApplicabilityState::DirtyTreeUncertain,
