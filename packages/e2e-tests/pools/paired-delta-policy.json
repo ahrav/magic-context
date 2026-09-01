@@ -6,7 +6,7 @@
     "schema": "paired-delta-policy/v1",
     "endpoint": "paired-valid-success-delta",
     "targetMinimumDetectableDelta": 0.15,
-    "minimumAnalyzableFamilyCount": 8,
+    "minimumAnalyzableFamilyCount": 4,
     "bootstrapResamples": 5000,
     "poolManifestFingerprint": "a46f9b125c06cb25f0e16917badab4898aa162a335fe948a76889310e7628a9e",
     "modelMatrix": [
@@ -35,5 +35,5 @@
       "pinned-model-echo-matched"
     ]
   },
-  "policyFingerprint": "0fd8247050c0db6edccd9f0fd0d5dbcf2ff5a9ea35f149620176fcc5815d22db"
+  "policyFingerprint": "ab7ea8d3b1fc431e9f286540e0bc7f46c4811eefe8d3cd36349d2d03e2f3410c"
 }

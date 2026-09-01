@@ -24,7 +24,9 @@ import {
     ARM_IDS,
     PRIMARY_ARM_IDS,
     parsePairedDeltaManifest,
+    parsePairedDeltaPolicy,
     type ArmId,
+    type PairedDeltaPolicy,
     type ScenarioDeclaration,
 } from "../src/paired-delta/contract";
 import {
@@ -37,23 +39,24 @@ import { buildPairedDeltaRegistry } from "../src/paired-delta/registry";
 import {
     buildCalibrationRecord,
     buildPairedDeltaReport,
+    calibrationNoiseFloors,
     publishCalibrationRecord,
     publishPairedDeltaReport,
+    readCalibrationRecord,
     type RawRegretLadder,
 } from "../src/paired-delta/report";
 import {
     FileRolloutStore,
     ProviderUnavailableError,
-    baseScriptFingerprint,
     runPairedDelta,
     verifyDualMockResolution,
-    type InterventionDescriptor,
     type PairedDeltaRunResult,
     type RolloutObservation,
     type RolloutRecord,
     type RunnerDependencies,
     type TokenPrices,
 } from "../src/paired-delta/runner";
+import { detectOverflow } from "../../plugin/src/features/magic-context/overflow-detection";
 import { canonicalFingerprint } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
 
 type LiveMode = "calibration" | "weekly" | "release";
@@ -69,26 +72,12 @@ interface CliArgs {
     deadlineMinutes: number;
 }
 
-interface LanePolicy {
-    minimumAnalyzableFamilyCount: number;
-    bootstrapResamples: number;
-    poolManifestFingerprint: string;
-    modelMatrix: Array<{
-        providerId: string;
-        modelId: string;
-        contextLimit: number;
-    }>;
-    replicateCount: number;
-    costBudgetUsd: Record<LiveMode, number>;
-    pricesPerMillionTokens: TokenPrices;
-}
-
 interface PromptResult {
     providerId: string;
     modelId: string;
     usage: RolloutObservation["usage"];
     text: string;
-    error: boolean;
+    error: unknown;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -148,12 +137,12 @@ function parseArgs(argv: string[]): CliArgs {
     };
 }
 
-function lanePolicy(): LanePolicy {
+function lanePolicy(): PairedDeltaPolicy {
     const document = parsePolicyOwnerDocument(policyJson, "magic-context-x4l.14");
     if (document.status !== "ready" || document.policy === null) {
         throw new Error("paired-delta policy is not ready");
     }
-    return document.policy as LanePolicy;
+    return parsePairedDeltaPolicy(document.policy);
 }
 
 function mergeHarnessOptions(
@@ -211,7 +200,7 @@ function parsePromptResult(raw: unknown): PromptResult {
             .filter((part) => part.type === "text" && typeof part.text === "string")
             .map((part) => part.text as string)
             .join("\n"),
-        error: info.error !== undefined,
+        error: info.error,
     };
 }
 
@@ -269,10 +258,11 @@ function configMatchesArm(
     if (!providersMatch) return false;
     if (armId === "mc-off") return Array.isArray(config.plugin) && config.plugin.length === 0;
     if (armId === "compaction") {
-        return JSON.stringify(config.compaction) === JSON.stringify({
-            auto: true,
-            prune: false,
-        });
+        // Canonical fingerprints ignore property order, and the preset
+        // supplies the expected options to avoid duplication.
+        return canonicalFingerprint(config.compaction) === canonicalFingerprint(
+            naiveCompactionOptions().openCodeConfigExtra?.compaction,
+        );
     }
     return Array.isArray(config.plugin) && config.plugin.length > 0;
 }
@@ -372,8 +362,14 @@ export function createLiveDependencies(input: {
                                 modelID: input.modelId,
                             },
                         ));
-                        if (response.error && coordinate.armId !== "mc-off") {
-                            throw new ProviderUnavailableError("live provider returned an error");
+                        if (response.error !== undefined) {
+                            const tolerated = coordinate.armId === "mc-off" &&
+                                detectOverflow(response.error).isOverflow;
+                            if (!tolerated) {
+                                throw new ProviderUnavailableError(
+                                    "live provider returned an error",
+                                );
+                            }
                         }
                         responses.push(response);
                         assistantText.push(response.text);
@@ -466,7 +462,7 @@ function score(record: RolloutRecord, checkIds: readonly string[]): number {
 function buildAnalysis(
     result: PairedDeltaRunResult,
     scenarios: readonly ScenarioDeclaration[],
-    policy: LanePolicy,
+    policy: PairedDeltaPolicy,
     noiseFloors: readonly FamilyNoiseFloor[],
 ): { analysis: FamilyDeltaAnalysis; rawRegret: RawRegretLadder[] } {
     const byId = new Map(scenarios.map((scenario) => [scenario.scenarioId, scenario]));
@@ -592,6 +588,21 @@ function repoCommit(): string {
     });
     if (result.exitCode !== 0) throw new Error("cannot resolve repository commit");
     return result.stdout.toString().trim();
+}
+
+function deskCostCeilingUsd(
+    scenarios: readonly ScenarioDeclaration[],
+    prices: TokenPrices,
+): number {
+    const perTokenUsd =
+        (prices.input + prices.output + prices.cacheCreation + prices.cacheRead) /
+        1_000_000;
+    const worstUsd = Math.max(
+        0.01,
+        ...scenarios.map(({ turnScript, modelContextLimit }) =>
+            (turnScript.length + 1) * modelContextLimit * perTokenUsd),
+    );
+    return Math.ceil(worstUsd * 2 * 100) / 100;
 }
 
 function smokeScenarios(): ScenarioDeclaration[] {
@@ -750,6 +761,16 @@ async function runLive(args: CliArgs): Promise<void> {
     const scenarios = [...registry.values()]
         .map(({ declaration }) => declaration)
         .filter(({ scenarioId }) => selectedIds.has(scenarioId));
+    // The fingerprinted policy documents the executed configuration, so the
+    // context limit it pins must match what the scenarios actually request.
+    for (const scenario of scenarios) {
+        if (scenario.modelContextLimit !== model.contextLimit) {
+            throw new Error(
+                `paired-delta policy pins contextLimit ${model.contextLimit} but ` +
+                `${scenario.scenarioId} declares ${scenario.modelContextLimit}`,
+            );
+        }
+    }
     const result = await runPairedDelta(
         {
             scenarios,
@@ -758,7 +779,10 @@ async function runLive(args: CliArgs): Promise<void> {
             pinnedProviderId: model.providerId,
             pinnedSnapshotId: model.modelId,
             replicateCount: policy.replicateCount,
-            deskCostCeilingUsd: 45,
+            deskCostCeilingUsd: deskCostCeilingUsd(
+                scenarios,
+                policy.pricesPerMillionTokens,
+            ),
             maxCostUsd: args.maxCostUsd ?? policy.costBudgetUsd[args.mode as LiveMode],
             deadlineEpochMs: Date.now() + args.deadlineMinutes * 60_000,
             pricesPerMillionTokens: policy.pricesPerMillionTokens,
@@ -790,24 +814,20 @@ async function runLive(args: CliArgs): Promise<void> {
             },
         });
         publishCalibrationRecord(calibration, args.calibrationRecordPath);
-        noiseFloors = calibration.familyNoise.map(({ familyId, spread, interval }) => ({
-            familyId,
-            value: spread,
-            interval,
-        }));
+        noiseFloors = calibrationNoiseFloors(calibration);
     } else if (existsSync(args.calibrationRecordPath)) {
-        const raw = JSON.parse(readFileSync(args.calibrationRecordPath, "utf8")) as {
-            familyNoise?: Array<{
-                familyId: string;
-                spread: number;
-                interval: { lower: number; upper: number };
-            }>;
-        };
-        noiseFloors = (raw.familyNoise ?? []).map(({ familyId, spread, interval }) => ({
-            familyId,
-            value: spread,
-            interval,
-        }));
+        const calibration = readCalibrationRecord(args.calibrationRecordPath);
+        // A record from another manifest, another model snapshot, or a
+        // partial calibration run must not lend its noise floors to this
+        // analysis.
+        if (
+            calibration.poolManifestFingerprint !== manifestFingerprint ||
+            calibration.pinnedSnapshotId !== model.modelId ||
+            !calibration.validForPoolSizing
+        ) {
+            throw new Error("paired-delta calibration record does not bind this run");
+        }
+        noiseFloors = calibrationNoiseFloors(calibration);
     }
     const { analysis, rawRegret } = buildAnalysis(result, scenarios, policy, noiseFloors);
     const report = buildPairedDeltaReport({

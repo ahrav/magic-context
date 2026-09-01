@@ -2,8 +2,11 @@ import { describe, expect, it } from "bun:test";
 import {
     PairedDeltaContractError,
     PAIRED_DELTA_MANIFEST_SCHEMA,
+    PAIRED_DELTA_POLICY_GATES,
+    PAIRED_DELTA_POLICY_SCHEMA,
     parseArmedCellResult,
     parsePairedDeltaManifest,
+    parsePairedDeltaPolicy,
     parseScenarioDeclaration,
     validateCheckVector,
     type PairedDeltaManifest,
@@ -189,5 +192,70 @@ describe("paired-delta manifest contract", () => {
                 scenarios: [{ ...entry, runModes: ["nightly"] }],
             }),
         ).toThrow(/enum-invalid/);
+    });
+});
+
+describe("paired-delta policy contract", () => {
+    const policy = () => ({
+        schema: PAIRED_DELTA_POLICY_SCHEMA as typeof PAIRED_DELTA_POLICY_SCHEMA,
+        endpoint: "paired-valid-success-delta",
+        targetMinimumDetectableDelta: 0.15,
+        minimumAnalyzableFamilyCount: 4,
+        bootstrapResamples: 5000,
+        poolManifestFingerprint: "a".repeat(64),
+        modelMatrix: [
+            {
+                providerId: "anthropic",
+                modelId: "claude-sonnet-4-5-20250929",
+                contextLimit: 8192,
+            },
+        ],
+        replicateCount: 3,
+        costBudgetUsd: { calibration: 500, weekly: 300, release: 1000 },
+        pricesPerMillionTokens: {
+            input: 3,
+            output: 15,
+            cacheCreation: 3.75,
+            cacheRead: 0.3,
+        },
+        gates: [...PAIRED_DELTA_POLICY_GATES],
+    });
+
+    it("parses a well-formed policy", () => {
+        expect(parsePairedDeltaPolicy(policy())).toEqual(policy());
+    });
+
+    it("rejects a missing budget mode", () => {
+        const raw = policy() as Record<string, unknown>;
+        raw.costBudgetUsd = { calibration: 500, weekly: 300 };
+        expect(() => parsePairedDeltaPolicy(raw)).toThrow(/costBudgetUsd/);
+    });
+
+    it("rejects a non-positive budget", () => {
+        const raw = policy();
+        raw.costBudgetUsd.weekly = 0;
+        expect(() => parsePairedDeltaPolicy(raw)).toThrow(/positive-number-required/);
+    });
+
+    it("rejects a renamed field", () => {
+        const { replicateCount, ...rest } = policy();
+        expect(() =>
+            parsePairedDeltaPolicy({ ...rest, replicates: replicateCount }),
+        ).toThrow(/fields-invalid/);
+    });
+
+    it("rejects a gate set that is not the pre-registered one", () => {
+        const raw = policy();
+        raw.gates = raw.gates.slice(1);
+        expect(() => parsePairedDeltaPolicy(raw)).toThrow(/exact-gate-set-required/);
+        expect(() =>
+            parsePairedDeltaPolicy({ ...policy(), gates: ["unknown-gate"] }),
+        ).toThrow(/enum-invalid/);
+    });
+
+    it("rejects an empty model matrix", () => {
+        expect(() =>
+            parsePairedDeltaPolicy({ ...policy(), modelMatrix: [] }),
+        ).toThrow(/modelMatrix: empty/);
     });
 });

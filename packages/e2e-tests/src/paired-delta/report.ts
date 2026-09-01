@@ -1,8 +1,9 @@
+import { readFileSync } from "node:fs";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../incident-pool/report";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import type { ArmId, ReasonCode } from "./contract";
-import type { EndpointEstimate, FamilyDeltaAnalysis } from "./estimator";
+import type { EndpointEstimate, FamilyDeltaAnalysis, FamilyNoiseFloor } from "./estimator";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
 export const PAIRED_DELTA_REPORT_SCHEMA = "paired-delta-report/v1";
@@ -209,11 +210,10 @@ export function buildCalibrationRecord(input: {
             record.cell.checksPassed / record.cell.checksTotal,
         );
     }
-    const familyNoise = [...byFamily].sort(([left], [right]) => left.localeCompare(right))
+    const familyNoise = [...byFamily]
+        .filter(([, values]) => values.length > 0)
+        .sort(([left], [right]) => left.localeCompare(right))
         .map(([familyId, values]): CalibrationFamilyNoise => {
-            if (values.length === 0) {
-                throw new Error(`paired-delta-calibration: missing-family-${familyId}`);
-            }
             const average = values.reduce((sum, value) => sum + value, 0) / values.length;
             const variance = values.length === 1
                 ? 0
@@ -233,7 +233,10 @@ export function buildCalibrationRecord(input: {
         poolManifestFingerprint: input.poolManifestFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
-        validForPoolSizing: input.runStatus === "completed",
+        // Pool sizing requires a completed run with a measurement for every
+        // family.
+        validForPoolSizing: input.runStatus === "completed" &&
+            familyNoise.length === byFamily.size,
         measuredCostUsd: input.records.reduce((sum, record) => sum + record.costUsd, 0),
         measuredWallClockMs: input.records.reduce(
             (sum, record) => sum + record.wallClockMs,
@@ -257,4 +260,44 @@ export function publishCalibrationRecord(
         throw new Error("paired-delta-calibration: fingerprint-mismatch");
     }
     publishJsonAtomically(record, path);
+}
+
+export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecord {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error("paired-delta-calibration: record-invalid");
+    }
+    const { recordFingerprint, ...body } = raw;
+    if (
+        raw.schema !== PAIRED_DELTA_CALIBRATION_SCHEMA ||
+        typeof recordFingerprint !== "string" ||
+        canonicalFingerprint(body) !== recordFingerprint
+    ) {
+        throw new Error("paired-delta-calibration: fingerprint-mismatch");
+    }
+    const record = raw as unknown as PairedDeltaCalibrationRecord;
+    requireHex64(record.poolManifestFingerprint, "pool-manifest-fingerprint");
+    if (
+        typeof record.pinnedSnapshotId !== "string" ||
+        typeof record.validForPoolSizing !== "boolean" ||
+        !Array.isArray(record.familyNoise) ||
+        record.familyNoise.some((noise) =>
+            typeof noise.familyId !== "string" ||
+            !Number.isFinite(noise.spread) ||
+            !Number.isFinite(noise.interval?.lower) ||
+            !Number.isFinite(noise.interval?.upper))
+    ) {
+        throw new Error("paired-delta-calibration: record-invalid");
+    }
+    return record;
+}
+
+export function calibrationNoiseFloors(
+    record: PairedDeltaCalibrationRecord,
+): FamilyNoiseFloor[] {
+    return record.familyNoise.map(({ familyId, spread, interval }) => ({
+        familyId,
+        value: spread,
+        interval,
+    }));
 }

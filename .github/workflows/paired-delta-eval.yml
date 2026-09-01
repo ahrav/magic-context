@@ -57,9 +57,21 @@ jobs:
           bun run --cwd packages/e2e-tests test:paired-delta-unit
           bun run --cwd packages/e2e-tests validate-mode-manifest
 
-      - name: Install OpenCode
+      # A later step in this job injects a live provider credential, so the
+      # binary is pinned to a release and verified against a pinned digest
+      # before it runs; an unpinned install script would execute whatever the
+      # install endpoint serves that day.
+      - name: Install OpenCode (pinned)
+        env:
+          OPENCODE_VERSION: "1.18.25"
+          OPENCODE_SHA256: "58a3729a6f3432dd6d2917fcc4a949788891a035818646ad480e12c947f56e78"
         run: |
-          curl -fsSL https://opencode.ai/install | bash
+          curl -fsSL -o /tmp/opencode.tar.gz \
+            "https://github.com/sst/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          echo "${OPENCODE_SHA256}  /tmp/opencode.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.opencode/bin"
+          tar -xzf /tmp/opencode.tar.gz -C "$HOME/.opencode/bin"
+          "$HOME/.opencode/bin/opencode" --version
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
       - name: Build harness plugin
@@ -69,9 +81,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
-          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}
           restore-keys: |
-            paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-
+            paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-
 
       - name: Restore calibration evidence
         if: env.PAIRED_DELTA_MODE != 'calibration'
@@ -90,7 +102,9 @@ jobs:
         run: |
           RECORDS="packages/e2e-tests/artifacts/paired-delta-${PAIRED_DELTA_MODE}-records.json"
           REPORT="packages/e2e-tests/artifacts/paired-delta-${PAIRED_DELTA_MODE}-report.json"
-          ARGS=("--${PAIRED_DELTA_MODE}" "--records" "$RECORDS" "--report" "$REPORT" "--deadline-minutes" "290")
+          CALIBRATION="packages/e2e-tests/artifacts/paired-delta-calibration.json"
+          ARGS=("--${PAIRED_DELTA_MODE}" "--records" "$RECORDS" "--report" "$REPORT")
+          ARGS+=("--calibration-record" "$CALIBRATION" "--deadline-minutes" "290")
           if [[ -f "$RECORDS" ]]; then ARGS+=("--resume"); fi
           bun packages/e2e-tests/scripts/run-paired-delta.ts "${ARGS[@]}"
 
@@ -99,7 +113,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
-          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}
 
       - name: Save calibration evidence
         if: always() && env.PAIRED_DELTA_MODE == 'calibration' && hashFiles('packages/e2e-tests/artifacts/paired-delta-calibration.json') != ''

@@ -270,6 +270,7 @@ export async function runPairedDelta(
             reserveUsd = Math.max(reserveUsd, record.costUsd);
             if (record.costSource === "observed") observedCostRollouts++;
             else estimatedCostRollouts++;
+            startedAny = true;
         }
     }
 

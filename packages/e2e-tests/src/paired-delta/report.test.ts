@@ -252,4 +252,23 @@ describe("paired-delta calibration record", () => {
             },
         }).validForPoolSizing).toBe(false);
     });
+
+    it("publishes a partial record when a family has no completed mc-on rollouts", () => {
+        const built = buildCalibrationRecord({
+            records: records.filter(({ scenarioId }) => scenarioId === "var-a"),
+            scenarioFamilies: families,
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            decisions: {
+                poolSize: 20,
+                familyCount: 8,
+                replicateCount: 3,
+                cadence: "weekly-and-release",
+            },
+        });
+
+        expect(built.validForPoolSizing).toBe(false);
+        expect(built.familyNoise.map(({ familyId }) => familyId)).toEqual(["fam-one"]);
+    });
 });
