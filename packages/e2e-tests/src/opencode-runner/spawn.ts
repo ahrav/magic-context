@@ -166,9 +166,9 @@ function writeConfigs(
             `mockProviderURL is a ${urlFormat} value; pass credentials through extraEnv`,
         );
     }
-    /** `credentialValueFormat` anchors its rules at the start of the whole value, so a credential parked in the query string matches neither the userinfo rule nor a vendor prefix. The query is its own key-value namespace and is scanned with the same key and value rules the config channels use. commentlint: allow(JUDGE) */
-    for (const [key, value] of parsedQuery(mockProviderURL)) {
-        if (isCredentialBearingConfigKey(key)) {
+    /** `credentialValueFormat` anchors its rules at the start of the whole value, so a credential parked in the query or fragment matches neither the userinfo rule nor a vendor prefix. Both are key-value namespaces of their own and are scanned with the same key and value rules the config channels use. commentlint: allow(JUDGE) */
+    for (const [key, value] of parsedUrlPairs(mockProviderURL)) {
+        if (key.length > 0 && isCredentialBearingConfigKey(key)) {
             throw new Error(
                 `mockProviderURL carries a credential-shaped query key ${key}; ` +
                     "pass credentials through extraEnv",
@@ -296,13 +296,23 @@ function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
     };
 }
 
-/** A value that does not parse as a URL carries no query namespace to scan, and the userinfo rule above has already read the whole string. commentlint: allow(JUDGE) */
-function parsedQuery(value: string): Array<[string, string]> {
+/** A value that does not parse as a URL carries no key namespace to scan, and the userinfo rule above has already read the whole string. The fragment is included because `searchParams` excludes it while an OAuth implicit-flow redirect puts its access token there, so `#access_token=…` would otherwise reach the file unread. A fragment that is not key-value shaped is offered whole under an empty key, which the value rules still judge. commentlint: allow(JUDGE) */
+function parsedUrlPairs(value: string): Array<[string, string]> {
+    let url: URL;
     try {
-        return [...new URL(value).searchParams.entries()];
+        url = new URL(value);
     } catch {
         return [];
     }
+    const pairs = [...url.searchParams.entries()];
+    const fragment = url.hash.replace(/^#/, "");
+    if (fragment.length === 0) return pairs;
+    if (/[=&]/.test(fragment)) {
+        pairs.push(...new URLSearchParams(fragment).entries());
+    } else {
+        pairs.push(["", decodeURIComponent(fragment)]);
+    }
+    return pairs;
 }
 
 /**

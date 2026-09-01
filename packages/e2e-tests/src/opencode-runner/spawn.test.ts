@@ -387,6 +387,16 @@ describe("opencode child lifecycle", () => {
                         "https://host.internal/v1?trace=sk-ant-abcdefghijklmnopqrstuv",
                         /Anthropic-style key value in query key trace/,
                     ],
+                    // `searchParams` excludes the fragment; an implicit-flow redirect puts
+                    // its access token there.
+                    [
+                        "https://host.internal/v1#access_token=sk-ant-abcdefghijklmnopqrstuv",
+                        /credential-shaped query key access_token/,
+                    ],
+                    [
+                        "https://host.internal/v1#sk-ant-abcdefghijklmnopqrstuv",
+                        /Anthropic-style key value in query key/,
+                    ],
                 ] as const
             ) {
                 expect(() =>
