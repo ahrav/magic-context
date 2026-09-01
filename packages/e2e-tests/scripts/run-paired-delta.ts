@@ -49,6 +49,7 @@ import {
     RolloutRecordsInvalidError,
     RolloutStorePublishConflictError,
     runPairedDelta,
+    tokenCostUsd,
     verifyDualMockResolution,
     type PairedDeltaRunResult,
     type RolloutObservation,
@@ -72,6 +73,8 @@ import {
     r1WireDelivered,
 } from "../src/paired-delta/scenarios/support";
 import { stableStringify } from "../../plugin/src/shared/stable-json";
+import { COMPARTMENT_AWAIT_TIMED_OUT_MARKER } from "../../plugin/src/hooks/magic-context/transform-compartment-phase";
+import { CALIBRATION_SCOPE } from "../src/paired-delta/calibration-scope";
 
 type LiveMode = "calibration" | "weekly" | "release";
 type Mode = "smoke" | LiveMode;
@@ -216,15 +219,24 @@ function scopeDigest(): string {
     const root = worktreeRoot();
     const git = gitAt(root);
     const parts: Uint8Array[] = [];
-    for (const path of CALIBRATION_SCOPE) {
-        parts.push(Buffer.from(`${path}\0`, "utf8"));
-        /** `rev-parse HEAD:<path>` names the tree or blob object, so unrelated commits do not move it. */
-        const object = Bun.spawnSync(["git", "rev-parse", `HEAD:${path}`], { cwd: root });
-        if (object.exitCode !== 0) {
-            throw new Error(`paired-delta calibration scope path is not tracked: ${path}`);
-        }
-        parts.push(Buffer.from(object.stdout.toString().trim(), "utf8"));
+    /** `rev-parse HEAD:<path>` names the tree or blob object, so unrelated commits do not move it. One invocation for the whole scope; a failure re-resolves per path only to name the untracked one. */
+    const objects = Bun.spawnSync(
+        ["git", "rev-parse", ...CALIBRATION_SCOPE.map((path) => `HEAD:${path}`)],
+        { cwd: root },
+    );
+    if (objects.exitCode !== 0) {
+        const untracked = CALIBRATION_SCOPE.find((path) =>
+            Bun.spawnSync(["git", "rev-parse", `HEAD:${path}`], { cwd: root }).exitCode !== 0);
+        throw new Error(`paired-delta calibration scope path is not tracked: ${untracked ?? "<unknown>"}`);
     }
+    const objectIds = objects.stdout.toString().trim().split("\n");
+    if (objectIds.length !== CALIBRATION_SCOPE.length) {
+        throw new Error("paired-delta calibration scope resolved to an unexpected object count");
+    }
+    CALIBRATION_SCOPE.forEach((path, index) => {
+        parts.push(Buffer.from(`${path}\0`, "utf8"));
+        parts.push(Buffer.from(objectIds[index]!, "utf8"));
+    });
     /** One pathspec-bearing invocation per command rather than one per path: the digest needs the whole scope's state, not per-path attribution. */
     const pathspecs = ["--", ...CALIBRATION_SCOPE];
     parts.push(Buffer.from(git(["status", "--porcelain", "--untracked-files=all", ...pathspecs]), "utf8"));
@@ -256,15 +268,18 @@ function scopeDigest(): string {
  * The non-git inputs that execute rollouts or read the ledger, shared by both bindings.
  *
  * Excluding a system input lets the records binding combine coordinates from different session or ledger implementations.
+ * Cached process-wide because both bindings are derived several times per dispatch and these inputs do not change while the runner executes.
  */
 function executingSystemParts(root: string): Uint8Array[] {
-    return [
+    return (executingSystemPartsCache ??= [
         ...loadedBundleParts(root),
         ...resolvedRuntimeParts(),
         ...installedDependencyParts(),
         ...hostRuntimeParts(),
-    ];
+    ]);
 }
+
+let executingSystemPartsCache: Uint8Array[] | null = null;
 
 /**
  * Bun version, revision, and executable bytes bind runs to the same host runtime.
@@ -679,29 +694,6 @@ const POLICY_OWNER = "magic-context-x4l.14";
  * tying it to commits that cannot affect the measurement. The workflow's cache key hashes the same
  * globs, so a scope change misses the cache rather than restoring a record the runner will reject.
  */
-const CALIBRATION_SCOPE = [
-    "packages/plugin/src",
-    /** `canonicalFingerprint` lives here, and every fingerprint in the record and report is its output. */
-    "packages/plugin/scripts/retrieval-benchmark",
-    /**
-     * The whole e2e source tree rather than the lane's own directories. A transitive-import audit of
-     * this script reaches 322 modules, including `prospective-holdout`, `atomic-publish`,
-     * `code-unit-order`, `contract-primitives`, `test-db`, `mock-provider`, and the harness
-     * primitives, so an enumerated list of directories was already incomplete and would drift again
-     * with the next import. Over-triggering costs one re-calibration; under-triggering publishes
-     * noise measured against different code.
-     */
-    "packages/e2e-tests/src",
-    "packages/e2e-tests/scripts/run-paired-delta.ts",
-    "packages/e2e-tests/pools",
-    /** A dependency or build-script change installs a different SDK or builds a different plugin without touching a source file. */
-    "bun.lock",
-    "package.json",
-    "packages/plugin/package.json",
-    "packages/e2e-tests/package.json",
-    /** Pins the OpenCode version and its digest, and native compaction, prompt routing, and the session ledger are all part of the measured behaviour. */
-    ".github/workflows/paired-delta-eval.yml",
-] as const;
 
 function lanePolicy(document: ReturnType<typeof parsePolicyOwnerDocument>): PairedDeltaPolicy {
     if (document.status !== "ready" || document.policy === null) {
@@ -830,9 +822,6 @@ const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
 /** `scriptedCtxSearchTurn` drives one tool-use response and one follow-up, both served by the fixture provider. */
 const SCRIPTED_ORACLE_MOCK_ENTRIES = 2;
 
-/** `awaitCompartmentRun` logs this when its timeout race elapses and it proceeds without the historian. */
-const HISTORIAN_ABANDONED_MARKER = "compartment await timed out";
-
 /** Bounds the quiescence wait. Generous enough for a historian retry to land, short enough that a stuck session fails rather than holding the run. */
 const LEDGER_SETTLE_ATTEMPTS = 12;
 const LEDGER_SETTLE_INTERVAL_MS = 500;
@@ -933,7 +922,7 @@ function historianAbandoned(logPath: string, sessionId: string): boolean {
     return readFileSync(logPath, "utf8")
         .split("\n")
         .filter((line) => line.includes(`[${sessionId}]`))
-        .some((line) => line.includes(HISTORIAN_ABANDONED_MARKER));
+        .some((line) => line.includes(COMPARTMENT_AWAIT_TIMED_OUT_MARKER));
 }
 
 /**
@@ -1603,13 +1592,15 @@ function deskCostCeilingUsd(
     scenarios: readonly ScenarioDeclaration[],
     prices: TokenPrices,
 ): number {
-    const perTokenUsd =
-        (prices.input + prices.output + prices.cacheCreation + prices.cacheRead) /
-        1_000_000;
+    /** Every counter at the context limit, so the ceiling prices each turn at the highest rate `tokenCostUsd` can charge for that many tokens. */
+    const contextLimitUsd = (limit: number): number => tokenCostUsd(
+        { input: limit, output: limit, cacheCreation: limit, cacheRead: limit },
+        prices,
+    );
     const worstUsd = Math.max(
         0.01,
         ...scenarios.map(({ turnScript, modelContextLimit }) =>
-            (turnScript.length + 1) * modelContextLimit * perTokenUsd),
+            (turnScript.length + 1) * contextLimitUsd(modelContextLimit)),
     );
     return Math.ceil(worstUsd * 2 * 100) / 100;
 }

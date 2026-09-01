@@ -106,6 +106,9 @@ interface RunCompartmentPhaseArgs {
  * `prepareCompartmentInjection` reads `context.db`, never raw history.
  * `resolvedSessionId` (transform.ts).
  */
+/** Logged when the ≥95% block times out and the prompt proceeds with the historian still running; the paired-delta harness matches this phrase to reject a ledger with a call in flight, so the two sides share one constant. commentlint: allow(JUDGE) */
+export const COMPARTMENT_AWAIT_TIMED_OUT_MARKER = "compartment await timed out";
+
 export function runCompartmentPhase(
     args: RunCompartmentPhaseArgs,
 ): ReturnType<typeof runCompartmentPhaseImpl> {
@@ -271,7 +274,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         if (result === "timeout") {
             sessionLog(
                 args.sessionId,
-                `transform: compartment await timed out after ${timeoutMs}ms — proceeding without waiting`,
+                `transform: ${COMPARTMENT_AWAIT_TIMED_OUT_MARKER} after ${timeoutMs}ms — proceeding without waiting`,
             );
             return "timed_out";
         }
