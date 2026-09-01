@@ -3,6 +3,7 @@
 //! generation and hits promote entries back into current. Process-local,
 //! never persisted — the durable record is the observations log.
 
+use std::borrow::Borrow;
 use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::Hash;
 
@@ -34,13 +35,25 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
             .reserve(additional.min(self.cap.saturating_sub(self.current.len())));
     }
 
-    pub(super) fn get(&mut self, key: &K) -> Option<V> {
-        if let Some(value) = self.current.get(key) {
-            return Some(value.clone());
+    pub(super) fn get<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.get_key_value(key).map(|(_, value)| value)
+    }
+
+    pub(super) fn get_key_value<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        if let Some((stored_key, value)) = self.current.get_key_value(key) {
+            return Some((stored_key.clone(), value.clone()));
         }
-        if let Some(value) = self.previous.remove(key) {
-            self.insert(key.clone(), value.clone());
-            return Some(value);
+        if let Some((stored_key, value)) = self.previous.remove_entry(key) {
+            self.insert(stored_key.clone(), value.clone());
+            return Some((stored_key, value));
         }
         None
     }
@@ -53,7 +66,11 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
     }
 
     /// Mutates a cached value in place wherever it currently lives.
-    pub(super) fn update(&mut self, key: &K, apply: impl FnOnce(&mut V)) {
+    pub(super) fn update<Q>(&mut self, key: &Q, apply: impl FnOnce(&mut V))
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
         if let Some(value) = self.current.get_mut(key) {
             apply(value);
         } else if let Some(value) = self.previous.get_mut(key) {

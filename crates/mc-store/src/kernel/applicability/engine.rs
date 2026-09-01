@@ -88,7 +88,7 @@ pub struct FailedCheck {
 /// Opaque handle read repair passes back to confirm a durable append for a
 /// cached classification (KTD6 append-confirmed flag).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClassificationToken(ObjectCacheKey);
+pub struct ClassificationToken(Arc<ObjectCacheKey>);
 
 /// Per-object verdict with evidence. `append_pending` marks a non-current
 /// classification whose durable observation has not been confirmed yet;
@@ -309,7 +309,7 @@ impl Hash for CandidateInputs<'_> {
 /// checkout snapshot.
 pub struct ApplicabilityEngine {
     anchor_cache: Mutex<TwoGenerationCache<AnchorCacheKey, GitConditionOutcome>>,
-    object_cache: Mutex<TwoGenerationCache<ObjectCacheKey, CachedClassification>>,
+    object_cache: Mutex<TwoGenerationCache<Arc<ObjectCacheKey>, CachedClassification>>,
     cache_hasher: RandomState,
 }
 
@@ -387,17 +387,17 @@ impl ApplicabilityEngine {
                 }
                 None => digest_prefixes.for_candidate(candidate),
             };
-            let token = ClassificationToken(self.object_cache_key(
+            let key = self.object_cache_key(
                 snapshot,
                 snapshot_hash,
                 cache_context.as_ref(),
                 candidate,
                 inputs_digest,
-            ));
+            );
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
                     candidate,
-                    token,
+                    ClassificationToken(Arc::new(key)),
                     Classification::terminal(
                         ApplicabilityState::LifecycleInvalidated,
                         "object lifecycle-invalidated before applicability evaluation",
@@ -408,7 +408,7 @@ impl ApplicabilityEngine {
             if budget.is_exhausted() {
                 objects.push(finished(
                     candidate,
-                    token,
+                    ClassificationToken(Arc::new(key)),
                     Classification::uncacheable(
                         ApplicabilityState::Uncertain,
                         "evaluation budget exhausted before this object",
@@ -416,7 +416,12 @@ impl ApplicabilityEngine {
                 ));
                 continue;
             }
-            if let Some(cached) = self.object_cache.lock().expect("cache lock").get(&token.0) {
+            if let Some((key, cached)) = self
+                .object_cache
+                .lock()
+                .expect("cache lock")
+                .get_key_value(&key)
+            {
                 stats.object_cache_hits += 1;
                 objects.push(ObjectApplicability {
                     object_id: candidate.object_id.clone(),
@@ -426,11 +431,13 @@ impl ApplicabilityEngine {
                     failed_check: cached.failed_check,
                     append_pending: cached.state.blocks_auto_injection()
                         && !cached.append_confirmed,
-                    token,
+                    token: ClassificationToken(key),
                 });
                 continue;
             }
             stats.object_cache_misses += 1;
+            let key = Arc::new(key);
+            let token = ClassificationToken(Arc::clone(&key));
             batch_memos.key = inputs_digest;
             let classification = self.classify(
                 query,
@@ -442,7 +449,7 @@ impl ApplicabilityEngine {
             );
             if classification.cacheable {
                 self.object_cache.lock().expect("cache lock").insert(
-                    token.0.clone(),
+                    key,
                     CachedClassification {
                         state: classification.state,
                         evidence: classification.evidence.clone(),
@@ -465,7 +472,7 @@ impl ApplicabilityEngine {
         self.object_cache
             .lock()
             .expect("cache lock")
-            .update(&token.0, |cached| cached.append_confirmed = true);
+            .update(token.0.as_ref(), |cached| cached.append_confirmed = true);
     }
 
     fn classify(
@@ -711,7 +718,7 @@ impl ObjectApplicability {
             evidence,
             failed_check: None,
             append_pending: false,
-            token: ClassificationToken(ObjectCacheKey {
+            token: ClassificationToken(Arc::new(ObjectCacheKey {
                 hash: 0,
                 snapshot: SnapshotCacheKey::Owned(SnapshotCacheValues {
                     hash: 0,
@@ -722,7 +729,7 @@ impl ObjectApplicability {
                 object_id: candidate.object_id.clone(),
                 object_revision: candidate.object_revision,
                 inputs_digest: [0; 32],
-            }),
+            })),
         }
     }
 }

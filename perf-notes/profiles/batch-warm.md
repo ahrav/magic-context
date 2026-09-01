@@ -64,3 +64,11 @@ once with the cache's `RandomState`; equality still compares every field on coll
 
 Raw profile: `/tmp/mc-scope-perf/batch-cold-kernel-iter23-199.data`; report:
 `/tmp/mc-scope-perf/batch-cold-kernel-iter23.report`.
+
+After iteration 24 prehashed keys, an engine-only profile retained 1,991 samples with zero loss.
+Allocator internals own about 39%, object-key clone 3.2%, token drop 1.9%, SipHash 7.5%, and
+cache-key `hash_one` 2.2%. Sharing one exact key between the cache and opaque token is therefore
+the next representation treatment; public result strings remain owned.
+
+Raw profile: `/tmp/mc-scope-perf/batch-cold-kernel-iter24-199.data`; report:
+`/tmp/mc-scope-perf/batch-cold-kernel-iter24.report`.
