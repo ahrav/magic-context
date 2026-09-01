@@ -81,6 +81,7 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         pinnedSnapshotId: "anthropic-model-20260830",
         policyDocument: policy,
         implementationDigest: "abc123",
+        limitations: ["absence-precondition-basis=configured-context-limit: fixture caveat"],
         pairs,
         analysis: analysisFixture(policy.policyFingerprint),
         runSummary: {
@@ -193,6 +194,7 @@ describe("paired-delta report", () => {
                 policyFingerprint: built.body.policyFingerprint,
             },
             implementationDigest: "abc123",
+            limitations: [],
             pairs,
             analysis: built.body.analysis,
             exclusions: [],
@@ -219,6 +221,7 @@ describe("paired-delta report", () => {
                 policyFingerprint: H2,
             },
             implementationDigest: "abc123",
+            limitations: [],
             pairs,
             analysis: built.body.analysis,
             exclusions: [],

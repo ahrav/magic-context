@@ -778,6 +778,7 @@ function addUsage(
 }
 
 interface LedgerMessage {
+    role?: unknown;
     providerID?: unknown;
     modelID?: unknown;
     tokens?: {
@@ -801,8 +802,17 @@ function ledgerEntries(payload: unknown): LedgerMessage[] {
     }
     return rows
         .map((row) => (row as { info?: LedgerMessage } | null)?.info)
-        .filter((info): info is LedgerMessage =>
-            info !== null && info !== undefined && typeof info.providerID === "string");
+        .filter((info): info is LedgerMessage => info !== null && info !== undefined)
+        /** A user turn carries no route and nothing to price; an assistant turn missing its route is an incomplete ledger, so it is rejected rather than filtered away with the user rows. */
+        .filter((info) => info.role !== "user")
+        .map((info) => {
+            if (typeof info.providerID !== "string" || info.providerID === "") {
+                throw new Error(
+                    "live paired-delta session ledger has an assistant entry with no route",
+                );
+            }
+            return info;
+        });
 }
 
 /**
@@ -1709,6 +1719,18 @@ async function runLive(args: CliArgs): Promise<void> {
         analysis,
         exclusions: flattenExclusions(result),
         secondaryMetrics: secondaryMetrics(result.records),
+        limitations: [
+            /**
+             * The gate compares generated ballast against `modelContextLimit`, which is the limit
+             * configured in the harness's provider block rather than the snapshot's own window. On
+             * `mc-off`, with the plugin and native compaction both disabled, nothing enforces it, so
+             * the provider can still receive the evidence turn. Stated here because the report is
+             * read on its own, and the delta is only interpretable with this caveat attached.
+             */
+            "absence-precondition-basis=configured-context-limit: the gate proves the burial " +
+            "turn's ballast exceeds the configured limit and follows the evidence turn, not that " +
+            "the evidence left the provider-visible context",
+        ],
         runSummary: {
             status: result.status,
             spentUsd: result.spentUsd,

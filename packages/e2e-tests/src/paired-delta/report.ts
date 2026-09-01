@@ -49,6 +49,8 @@ export interface RawRegretLadder {
 }
 
 export interface PairedDeltaReportBody {
+    /** Caveats a reader needs to interpret the deltas, recorded because the report is read on its own. */
+    limitations: string[];
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
@@ -164,6 +166,7 @@ export function buildPairedDeltaReport(input: {
     analysis: FamilyDeltaAnalysis;
     exclusions: readonly ExclusionCount[];
     secondaryMetrics: SecondaryMetrics;
+    limitations: readonly string[];
     runSummary: PairedDeltaReportBody["runSummary"];
 }): PairedDeltaReport {
     const policy = parsePolicyOwnerDocument(
@@ -232,7 +235,11 @@ export function buildPairedDeltaReport(input: {
     ) {
         throw new Error("paired-delta-report: run-summary-invalid");
     }
+    if (input.limitations.some((line) => line.trim().length === 0)) {
+        throw new Error("paired-delta-report: limitation-invalid");
+    }
     const body: PairedDeltaReportBody = {
+        limitations: [...input.limitations].sort(compareCodeUnits),
         poolManifestFingerprint: input.poolManifestFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         policyFingerprint: policy.policyFingerprint,
