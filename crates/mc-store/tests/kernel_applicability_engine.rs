@@ -2481,3 +2481,113 @@ fn truncation_probe_failure_from_an_absent_commit_is_not_cached() {
     );
     assert_eq!(batch.stats.object_cache_hits, 0);
 }
+
+/// Nothing exists beneath a directory that does not exist, so a check path with
+/// a missing ancestor is as definitely absent as one whose final component is
+/// missing. Reporting it unresolvable leaves the object permanently uncertain
+/// and never hands read repair a failed check.
+#[test]
+fn a_check_path_under_a_missing_ancestor_is_definitely_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    for (index, check) in [
+        CheckSpec::FileExists {
+            path: "missing/child.conf".to_string(),
+        },
+        CheckSpec::ConfigKey {
+            path: "missing/child.conf".to_string(),
+            key: "flag".to_string(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let declared = ApplicabilityCandidate {
+            payload: Some(ObjectApplicabilitySpec::new(vec![], vec![check.clone()]).encode()),
+            ..candidate(&format!("object-missing-ancestor-{index}"))
+        };
+        let batch = engine_batch(&snapshot, &declared);
+        assert_eq!(
+            batch.objects[0].state,
+            ApplicabilityState::Stale,
+            "{check:?} reported uncertainty rather than a definite absence"
+        );
+        assert!(
+            batch.objects[0].failed_check.is_some(),
+            "a definite absence must reach read repair as a failed check"
+        );
+    }
+}
+
+/// Fingerprint construction polls the budget between checks, so it can abandon
+/// a payload before a key exists. This pins the contract around that exit: a
+/// candidate with no key owes `Uncertain`, claims no durable append, and
+/// confirms nothing, while a live budget still classifies and caches a payload
+/// carrying many checks.
+///
+/// The early exit itself is reachable only when cancellation arrives during commentlint: allow(JUDGE)
+/// evaluation, since an already-expired budget is caught before the payload is commentlint: allow(JUDGE)
+/// decoded. That ordering has no deterministic single-threaded seam, so this commentlint: allow(JUDGE)
+/// covers the surrounding contract rather than the read it avoids. commentlint: allow(JUDGE)
+#[test]
+fn a_payload_with_many_checks_keeps_its_cache_contract_across_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let checks: Vec<CheckSpec> = (0..64)
+        .map(|index| CheckSpec::ConfigKey {
+            path: "config.toml".to_string(),
+            key: format!("key{index}"),
+        })
+        .collect();
+    let declared = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec![], checks).encode()),
+        ..candidate("object-expired-fingerprint")
+    };
+
+    let engine = ApplicabilityEngine::new();
+    let expired = EvalBudget::new(
+        Some(Instant::now() - Duration::from_secs(1)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&declared),
+        &expired,
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(
+        !batch.objects[0].append_pending,
+        "a verdict with no cache entry claimed a durable append"
+    );
+    // No key was formed, so there is nothing to confirm.
+    assert!(!engine.confirm_durable_append(&batch.objects[0].token));
+
+    // The same batch under a live budget still classifies and caches, so the
+    // stop above did not disable evaluation for payloads carrying many checks.
+    let live = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&declared),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(live.stats.object_cache_hits, 0);
+    let again = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[declared],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(again.stats.object_cache_hits, 1);
+}

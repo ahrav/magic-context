@@ -31,33 +31,64 @@ const HASH_CHUNK_BYTES: usize = 64 * 1024;
 /// `readlinkat`. commentlint: allow(JUDGE)
 ///
 /// `workdir` is trusted; its resolved directory is the containment root.
-fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> Option<(OwnedFd, OsString)> {
+enum ParentDir {
+    Opened(OwnedFd, OsString),
+    /// An ancestor does not exist, so nothing beneath it exists either. Read commentlint: allow(JUDGE)
+    /// repair needs that separated from a walk that failed: absence is a commentlint: allow(JUDGE)
+    /// definite answer about the checked path, whereas a refused or unreadable commentlint: allow(JUDGE)
+    /// ancestor hides whatever is really there. commentlint: allow(JUDGE)
+    AncestorAbsent,
+    Unresolvable,
+}
+
+impl ParentDir {
+    /// For callers that owe the same answer however the walk stopped.
+    fn opened(self) -> Option<(OwnedFd, OsString)> {
+        match self {
+            Self::Opened(dir, name) => Some((dir, name)),
+            Self::AncestorAbsent | Self::Unresolvable => None,
+        }
+    }
+}
+
+fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> ParentDir {
     let mut names = Vec::new();
     for component in rela_path.components() {
         match component {
             Component::Normal(name) => names.push(name),
             Component::CurDir => {}
             // Absolute roots, prefixes, and `..` leave the worktree.
-            _ => return None,
+            _ => return ParentDir::Unresolvable,
         }
     }
-    let (final_name, ancestors) = names.split_last()?;
-    let mut dir = rfs::open(
+    let Some((final_name, ancestors)) = names.split_last() else {
+        return ParentDir::Unresolvable;
+    };
+    let Ok(mut dir) = rfs::open(
         workdir,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         rfs::Mode::empty(),
-    )
-    .ok()?;
+    ) else {
+        return ParentDir::Unresolvable;
+    };
     for ancestor in ancestors {
-        dir = rfs::openat(
+        match rfs::openat(
             &dir,
             *ancestor,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             rfs::Mode::empty(),
-        )
-        .ok()?;
+        ) {
+            Ok(next) => dir = next,
+            // Only absence is definite. `O_PATH` with `NOFOLLOW` opens a commentlint: allow(JUDGE)
+            // symlinked ancestor rather than refusing it, so `O_DIRECTORY` commentlint: allow(JUDGE)
+            // rejects that link as `ENOTDIR` — indistinguishable here from a commentlint: allow(JUDGE)
+            // plain non-directory, and the link hides whatever it points at. commentlint: allow(JUDGE)
+            // Both stay unresolvable. commentlint: allow(JUDGE)
+            Err(rustix::io::Errno::NOENT) => return ParentDir::AncestorAbsent,
+            Err(_) => return ParentDir::Unresolvable,
+        }
     }
-    Some((dir, (*final_name).to_os_string()))
+    ParentDir::Opened(dir, (*final_name).to_os_string())
 }
 
 /// A path can be replaced after a stat; validate the opened descriptor
@@ -452,10 +483,16 @@ impl CheckoutSnapshot {
                 "path {rela_path} is not a plain relative path inside the checkout"
             ));
         }
-        let Some((dir, name)) = open_parent_beneath(workdir, Path::new(rela_path)) else {
-            return WorktreeEntry::Unresolvable(format!(
-                "path {rela_path} does not resolve beneath this checkout's worktree"
-            ));
+        let (dir, name) = match open_parent_beneath(workdir, Path::new(rela_path)) {
+            ParentDir::Opened(dir, name) => (dir, name),
+            // Nothing exists beneath a missing ancestor, so the checked path is
+            // definitely absent rather than unexamined.
+            ParentDir::AncestorAbsent => return WorktreeEntry::Absent,
+            ParentDir::Unresolvable => {
+                return WorktreeEntry::Unresolvable(format!(
+                    "path {rela_path} does not resolve beneath this checkout's worktree"
+                ));
+            }
         };
         match rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => {
@@ -486,7 +523,7 @@ impl CheckoutSnapshot {
         let Some(workdir) = self.repo.workdir() else {
             return Ok(None);
         };
-        let Some((dir, name)) = open_parent_beneath(workdir, Path::new(rela_path)) else {
+        let Some((dir, name)) = open_parent_beneath(workdir, Path::new(rela_path)).opened() else {
             return Ok(None);
         };
         open_regular_no_follow_at(&dir, name.as_os_str())
@@ -834,7 +871,7 @@ fn worktree_content_hash(
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return Ok("unreadable".to_string());
     };
-    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path).opened() else {
         return Ok("out-of-worktree".to_string());
     };
     // Inspection failures use `unreadable`, distinct from content hashes.
@@ -1065,7 +1102,7 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
         return "absent";
     };
-    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path) else {
+    let Some((dir, name)) = open_parent_beneath(workdir, &rela_path).opened() else {
         return "absent";
     };
     let Ok(stat) = rfs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) else {
@@ -1243,8 +1280,11 @@ mod tests {
         std::fs::write(outside.join("inside"), b"escaped").unwrap();
 
         // Resolve while `real` is a genuine directory, as any check would.
-        let (dir_fd, name) =
-            open_parent_beneath(&workdir, Path::new("real/inside")).expect("a real ancestor opens");
+        let ParentDir::Opened(dir_fd, name) =
+            open_parent_beneath(&workdir, Path::new("real/inside"))
+        else {
+            panic!("a real ancestor opens");
+        };
         assert_eq!(name, OsStr::new("inside"));
 
         // The window a path-based open leaves: swap the validated ancestor.
@@ -1268,10 +1308,18 @@ mod tests {
             "the swap really does redirect the pathname"
         );
 
-        // A symlinked ancestor present up front is refused outright.
-        assert!(open_parent_beneath(&workdir, Path::new("real/inside")).is_none());
-        assert!(open_parent_beneath(&workdir, Path::new("../outside/inside")).is_none());
-        assert!(open_parent_beneath(&workdir, Path::new("")).is_none());
+        // A symlinked ancestor present up front is refused outright, and
+        // `Unresolvable` rather than `AncestorAbsent`: the link hides whatever
+        // it points at, so nothing about the checked path is settled.
+        for spelling in ["real/inside", "../outside/inside", ""] {
+            assert!(
+                matches!(
+                    open_parent_beneath(&workdir, Path::new(spelling)),
+                    ParentDir::Unresolvable
+                ),
+                "spelling {spelling:?} must stay unresolvable"
+            );
+        }
     }
 
     /// Resolving a known child needs search permission, not read permission,
@@ -1300,7 +1348,9 @@ mod tests {
         )
         .unwrap();
 
-        let (dir_fd, name) = resolved.expect("an execute-only ancestor is traversable");
+        let ParentDir::Opened(dir_fd, name) = resolved else {
+            panic!("an execute-only ancestor is traversable");
+        };
         assert!(open_regular_no_follow_at(&dir_fd, name.as_os_str())
             .expect("the file is not a scan failure")
             .is_some());

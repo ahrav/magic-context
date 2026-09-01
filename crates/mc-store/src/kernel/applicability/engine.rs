@@ -276,8 +276,23 @@ impl ApplicabilityEngine {
             });
             let (scope_context, batch_prefix) = batch_context.get_or_init(prepare);
             let payload_decode = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
-            let scoped_dirty =
-                scoped_dirty_fingerprint(snapshot, &payload_decode, &mut check_cache);
+            // A partial digest must not become a key, because a lookup would
+            // compare that digest against entries formed from the full input
+            // set. An expired deadline therefore exits before a key exists.
+            let Some(scoped_dirty) =
+                scoped_dirty_fingerprint(snapshot, &payload_decode, &mut check_cache, budget)
+            else {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted while reading this object's declared inputs",
+                    ),
+                    false,
+                ));
+                continue;
+            };
             let key = self.object_cache_key(
                 snapshot,
                 batch_prefix,
@@ -914,10 +929,11 @@ fn scoped_dirty_fingerprint(
     snapshot: &CheckoutSnapshot,
     payload_decode: &PayloadDecode,
     check_cache: &mut CheckCache,
-) -> String {
+    budget: &EvalBudget,
+) -> Option<String> {
     let spec = match payload_decode {
         PayloadDecode::Present(spec) => spec,
-        PayloadDecode::Absent | PayloadDecode::Undecodable(_) => return String::new(),
+        PayloadDecode::Absent | PayloadDecode::Undecodable(_) => return Some(String::new()),
     };
     let mut hash: Option<Sha256> = None;
     for entry in snapshot.dirty_entries() {
@@ -933,15 +949,21 @@ fn scoped_dirty_fingerprint(
         }
     }
     for check in &spec.checks {
+        // Every observation can read a file up to `MAX_CONFIG_BYTES`, so a
+        // payload's check list is unbounded work and the deadline is polled per
+        // check rather than once after all of them.
+        if budget.is_exhausted() {
+            return None;
+        }
         if let Some(observation) = check_observation(check_cache, snapshot, check) {
             let hash = hash.get_or_insert_with(Sha256::new);
             hash_bytes(hash, observation.as_bytes());
         }
     }
-    match hash {
+    Some(match hash {
         Some(hash) => format!("{:x}", hash.finalize()),
         None => String::new(),
-    }
+    })
 }
 
 fn hash_context(hash: &mut Sha256, query: &QueryContext, dependency: ContextDependency) {
