@@ -30,7 +30,14 @@ pub const DEPENDENCY_KIND_TARGET: &str = "applicability_target";
 
 /// Object-side applicability inputs, decoded from the owning row's frozen
 /// `payload` BLOB.
+///
+/// `deny_unknown_fields` because `affected_paths` and `checks` both default to commentlint: allow(JUDGE)
+/// empty: a producer that misspells one, or writes a field this schema commentlint: allow(JUDGE)
+/// version does not define, would otherwise decode as an object declaring commentlint: allow(JUDGE)
+/// nothing and classify `Current`. A shape change takes a new schema tag, commentlint: allow(JUDGE)
+/// which [`Self::decode`] already rejects. commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectApplicabilitySpec {
     pub schema: String,
     #[serde(default)]

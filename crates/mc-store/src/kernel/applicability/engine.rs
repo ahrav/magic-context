@@ -21,7 +21,7 @@ use super::super::scope::{
 use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
 use super::checkout::{CheckoutSnapshot, EvalBudget};
-use super::checks::{run_cheap_check, CheckCache, CheckOutcome};
+use super::checks::{check_observation, run_cheap_check, CheckCache, CheckOutcome};
 use super::payloads::{
     CheckSpec, ObjectApplicabilitySpec, PayloadDecode, OBSERVATION_KIND_CURRENT,
     OBSERVATION_KIND_DIRTY_TREE_UNCERTAIN, OBSERVATION_KIND_HISTORICAL,
@@ -261,7 +261,8 @@ impl ApplicabilityEngine {
                 }
             });
             let payload_decode = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
-            let scoped_dirty = scoped_dirty_fingerprint(snapshot, &payload_decode);
+            let scoped_dirty =
+                scoped_dirty_fingerprint(snapshot, &payload_decode, &mut check_cache);
             let key = self.object_cache_key(
                 snapshot,
                 &batch_prefix,
@@ -802,36 +803,42 @@ fn anchor_row_fingerprint(anchor: &AnchorRowSpec) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// Hashes dirty entries overlapping declared affected or check paths.
-fn scoped_dirty_fingerprint(snapshot: &CheckoutSnapshot, payload_decode: &PayloadDecode) -> String {
+/// Digests the worktree state this candidate's verdict reads: the dirty
+/// entries overlapping its declared affected paths, and the state each cheap
+/// check observes.
+///
+/// The dirty gate consumes git status, so affected paths need the status commentlint: allow(JUDGE)
+/// entries. A cheap check reads the filesystem directly, and status alone commentlint: allow(JUDGE)
+/// cannot describe what it saw: a checked file can change after the scan, be commentlint: allow(JUDGE)
+/// read by the check, and revert, which would store the check's verdict under commentlint: allow(JUDGE)
+/// the pre-change fingerprint. Both the key and the check read through commentlint: allow(JUDGE)
+/// `check_cache`, so the key names the bytes the verdict actually used. commentlint: allow(JUDGE)
+fn scoped_dirty_fingerprint(
+    snapshot: &CheckoutSnapshot,
+    payload_decode: &PayloadDecode,
+    check_cache: &mut CheckCache,
+) -> String {
     let spec = match payload_decode {
         PayloadDecode::Present(spec) => spec,
         PayloadDecode::Absent | PayloadDecode::Undecodable(_) => return String::new(),
     };
-    fn check_path(check: &CheckSpec) -> Option<&str> {
-        match check {
-            CheckSpec::FileExists { path }
-            | CheckSpec::ConfigKey { path, .. }
-            | CheckSpec::Symbol { path, .. } => Some(path.as_str()),
-            CheckSpec::Unrecognized => None,
-        }
-    }
     let mut hash: Option<Sha256> = None;
     for entry in snapshot.dirty_entries() {
         let relevant = spec
             .affected_paths
             .iter()
-            .any(|affected| paths_overlap(&entry.path, affected))
-            || spec
-                .checks
-                .iter()
-                .filter_map(check_path)
-                .any(|path| paths_overlap(&entry.path, path));
+            .any(|affected| paths_overlap(&entry.path, affected));
         if relevant {
             let hash = hash.get_or_insert_with(Sha256::new);
             hash_bytes(hash, entry.path.as_bytes());
             hash_bytes(hash, entry.status.as_bytes());
             hash_bytes(hash, entry.content_hash.as_bytes());
+        }
+    }
+    for check in &spec.checks {
+        if let Some(observation) = check_observation(check_cache, snapshot, check) {
+            let hash = hash.get_or_insert_with(Sha256::new);
+            hash_bytes(hash, observation.as_bytes());
         }
     }
     match hash {

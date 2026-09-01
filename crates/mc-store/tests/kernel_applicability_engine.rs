@@ -1430,3 +1430,156 @@ fn changing_sparse_patterns_invalidates_the_object_cache() {
     );
     assert_eq!(batch.stats.object_cache_hits, 0);
 }
+
+/// `affected_paths` and `checks` both default to empty, so a misspelled or
+/// unknown top-level field would otherwise decode as an object declaring
+/// nothing and classify `Current`.
+#[test]
+fn an_unknown_payload_field_is_undecodable_rather_than_empty() {
+    let typo =
+        br#"{"schema":"mc.applicability.object.v1","cheks":[{"kind":"file_exists","path":"x"}]}"#;
+    assert!(matches!(
+        ObjectApplicabilitySpec::decode(Some(typo)),
+        mc_store::kernel::applicability::PayloadDecode::Undecodable(_)
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            payload: Some(typo.to_vec()),
+            ..candidate("object-typo")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+}
+
+/// A cheap check reads the live worktree, not the snapshot. A checked file that
+/// changes after the scan, is read by the check, and then reverts would
+/// otherwise store the check's verdict under the pre-change fingerprint, so a
+/// later identical snapshot would serve it.
+#[test]
+fn a_check_verdict_is_keyed_on_the_content_the_check_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("config.toml", "other = 1\n")],
+        "base",
+        1,
+    );
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "config.toml".to_string(),
+                    key: "flag".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-checked")
+    };
+
+    // The snapshot records the committed content, which lacks the key.
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    // The file gains the key after the scan and before the check runs, so the
+    // check observes content the snapshot never saw.
+    write_worktree_file(&fixture.repo, "config.toml", "flag = true\n");
+
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&checked),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    // Reverting restores exactly the scanned content, so the snapshot below is
+    // identical to the one above. The cached verdict must not be reachable.
+    write_worktree_file(&fixture.repo, "config.toml", "other = 1\n");
+    let reverted = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert_eq!(reverted.dirty_fingerprint(), snapshot.dirty_fingerprint());
+    let batch = engine.evaluate_batch(
+        &reverted,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        batch.stats.object_cache_hits, 0,
+        "a verdict formed on content the snapshot never saw was served back"
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+}
+
+/// A file appearing or vanishing under a `FileExists` check moves the key even
+/// when git status reports nothing, since the check reads the filesystem.
+#[test]
+fn a_file_exists_verdict_is_keyed_on_the_observed_path_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[(".gitignore", "generated.txt\n")],
+        "base",
+        1,
+    );
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "generated.txt".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-generated")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&checked),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+
+    // An ignored file is invisible to the status scan, so only the check's own
+    // observation can move the key.
+    std::fs::write(fixture.root.join("generated.txt"), "built\n").unwrap();
+    let with_file = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert_eq!(with_file.dirty_fingerprint(), snapshot.dirty_fingerprint());
+    let batch = engine.evaluate_batch(
+        &with_file,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+}
