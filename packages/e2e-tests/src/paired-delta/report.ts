@@ -541,12 +541,20 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     return record;
 }
 
+/**
+ * The estimator keys one floor per family and rejects a repeated `familyId`, while the record keeps a series per endpoint, so each family collapses to its widest observed floor.
+ * Widest rather than mean, because a floor decides whether an interval is inside measured noise: the narrower endpoint would call a delta resolved that the noisier one cannot separate.
+ */
 export function calibrationNoiseFloors(
     record: PairedDeltaCalibrationRecord,
 ): FamilyNoiseFloor[] {
-    return record.familyNoise.map(({ familyId, spread, interval }) => ({
-        familyId,
-        value: spread,
-        interval,
-    }));
+    const widest = new Map<string, FamilyNoiseFloor>();
+    for (const { familyId, spread, interval } of record.familyNoise) {
+        const existing = widest.get(familyId);
+        if (existing === undefined || spread > existing.value) {
+            widest.set(familyId, { familyId, value: spread, interval });
+        }
+    }
+    return [...widest.values()].sort((left, right) =>
+        compareCodeUnits(left.familyId, right.familyId));
 }

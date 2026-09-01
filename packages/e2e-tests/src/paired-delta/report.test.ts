@@ -11,6 +11,7 @@ import { estimateFamilyDeltas } from "./estimator";
 import {
     PAIRED_DELTA_REPORT_SCHEMA,
     buildCalibrationRecord,
+    calibrationNoiseFloors,
     buildPairedDeltaReport,
     publishPairedDeltaReport,
 } from "./report";
@@ -523,6 +524,42 @@ describe("paired-delta calibration record", () => {
         });
 
         expect(built.validForPoolSizing).toBe(false);
+    });
+
+    it("collapses the endpoint series to one widest floor per family", () => {
+        // `estimateFamilyDeltas` keys one floor per family and rejects a repeated id.
+        const floors = calibrationNoiseFloors(build(split));
+
+        expect(floors.map(({ familyId }) => familyId)).toEqual(["fam-one", "fam-two"]);
+        expect(floors.find(({ familyId }) => familyId === "fam-one")?.value).toBe(1);
+        expect(() => estimateFamilyDeltas({
+            observations: [
+                {
+                    coordinateId: "var-a:0",
+                    familyId: "fam-one",
+                    endpoint: "mc-on-vs-mc-off",
+                    delta: 0.3,
+                    runHealth: "completed",
+                },
+                {
+                    coordinateId: "var-b:0",
+                    familyId: "fam-two",
+                    endpoint: "mc-on-vs-mc-off",
+                    delta: 0.1,
+                    runHealth: "completed",
+                },
+            ],
+            minimumAnalyzableFamilyCount: 2,
+            bootstrapSeed: 17,
+            bootstrapResamples: 2000,
+            lane: {
+                poolManifestFingerprint: H1,
+                pinnedSnapshotId: "anthropic-model-20260830",
+                policyFingerprint: H2,
+                pairedFactsFingerprint: PAIRED_FACTS,
+            },
+            noiseFloors: floors,
+        })).not.toThrow();
     });
 
     it("rejects a record whose policy fingerprint is not a digest", () => {

@@ -757,6 +757,12 @@ export function createLiveDependencies(input: {
                     }
                     const last = responses.at(-1);
                     if (!last) throw new Error("scenario produced no live prompts");
+                    /**
+                     * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
+                     * A rollout whose earlier turns were served by a fallback provider or snapshot produced its outcome, and its persisted memory, partly off the pin.
+                     */
+                    const offPin = responses.find(({ providerId, modelId }) =>
+                        providerId !== input.providerId || modelId !== input.modelId) ?? last;
                     const resolvedLocatorIds = locatorIds();
                     const checks = await scenario.verifier({
                         armId: coordinate.armId,
@@ -819,8 +825,8 @@ export function createLiveDependencies(input: {
                         claimedDone: /\b(?:done|completed|finished)\b/i.test(last.text),
                         absencePreconditionHeld,
                         armIdentityMatches,
-                        echoedProviderId: last.providerId,
-                        echoedModelId: last.modelId,
+                        echoedProviderId: offPin.providerId,
+                        echoedModelId: offPin.modelId,
                         usage: responses.reduce(
                             (sum, response) => ({
                                 input: sum.input + response.usage.input,
@@ -1129,6 +1135,9 @@ async function runLive(args: CliArgs): Promise<void> {
         noiseFloors = calibrationNoiseFloors(calibration);
         calibrationValidForSizing = calibration.validForPoolSizing;
     }
+    const plannedCoordinates = scenarios.length * policy.replicateCount;
+    const healthyCoordinates = result.coordinates.filter(({ cells }) =>
+        PRIMARY_ARM_IDS.every((armId) => cells[armId]?.cell.runHealth === "completed")).length;
     const analysis = buildAnalysis(
         result,
         scenarios,
@@ -1163,6 +1172,8 @@ async function runLive(args: CliArgs): Promise<void> {
         spentUsd: result.spentUsd,
         analyzableFamilyCount: analysis.analyzableFamilyCount,
         evidenceSufficient: analysis.evidenceSufficient,
+        plannedCoordinates,
+        healthyCoordinates,
         validForPoolSizing: mode === "calibration" ? calibrationValidForSizing : null,
     }, null, 2));
     /** A non-completed status outranks the calibration verdict, because the caller keyed on `harness-unreclaimed` must not lose it. */
@@ -1183,6 +1194,19 @@ async function runLive(args: CliArgs): Promise<void> {
             `paired-delta ${mode} completed without sufficient evidence: ` +
             `${analysis.analyzableFamilyCount} of ` +
             `${policy.minimumAnalyzableFamilyCount} families analyzable`,
+        );
+        process.exitCode = INSUFFICIENT_EVIDENCE_EXIT;
+        return;
+    }
+    /**
+     * Family representation is not the preregistered gate. `all-primary-arms-completed` covers
+     * every planned coordinate, so one healthy replicate per family would otherwise pass while
+     * the rest of the matrix failed.
+     */
+    if (mode !== "calibration" && healthyCoordinates < plannedCoordinates) {
+        console.error(
+            `paired-delta ${mode} completed ${healthyCoordinates} of ` +
+            `${plannedCoordinates} planned primary coordinates`,
         );
         process.exitCode = INSUFFICIENT_EVIDENCE_EXIT;
         return;
