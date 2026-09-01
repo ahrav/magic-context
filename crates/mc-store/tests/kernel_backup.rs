@@ -1019,7 +1019,13 @@ fn sensitivity_classification_scans_every_table_carrying_the_column() {
 
     assert!(!scanned.is_empty());
     assert_eq!(scanned, expected);
-    for required in ["domains", "evidence_meta", "outbox", "candidates"] {
+    for required in [
+        "domains",
+        "evidence_meta",
+        "outbox",
+        "candidates",
+        "admission_decisions",
+    ] {
         assert!(
             scanned.iter().any(|name| name == required),
             "{required} missing from the sensitivity scan"

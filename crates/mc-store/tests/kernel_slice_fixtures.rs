@@ -19,7 +19,7 @@ const BRANCH_SCOPE: &str = "scope-redis-branch";
 const AUDIT_SCOPE: &str = "scope-audit";
 const CANDIDATE_ID: &str = "candidate-object";
 const CANDIDATE_TEXT: &str = "unreviewed-redis-candidate";
-const SECRET_CLASSIFICATION: &str = "password=hunter2";
+const SECRET_CLASSIFICATION: &str = "password=hunter-two";
 const OPERATION_KEYS: [&str; 7] = [
     "fixture/domain",
     "fixture/scopes",
@@ -646,9 +646,13 @@ fn canonical_slice_and_projection_are_restart_identical() {
     let alignment = fixture.store.alignment_as_of(fixture.accepted).unwrap();
     let digests = canonical_slice_digests(root.path());
     let first = projection_evidence(root.path());
-    // Require non-empty redaction evidence and one decision event so the
+    // Require the redacted classification and one decision event so the
     // restart-equality assertions cannot pass vacuously.
-    assert!(!first.1.is_empty());
+    let redacted_marker = format!("text:{}", encode_hex(b"password=<REDACTED:password>"));
+    assert!(first
+        .0
+        .iter()
+        .any(|row| row.iter().any(|cell| cell == &redacted_marker)));
     assert_eq!(
         query_count(root.path(), "SELECT COUNT(*) FROM decision_events"),
         1

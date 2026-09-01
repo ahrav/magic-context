@@ -20,13 +20,32 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+gix = { workspace = true }
+semver = { workspace = true }
 md5 = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [features]
 test-support = []
 
+# The benchmark reuses `tests/support/git_fixtures.rs` via `#[path]`. The
+# fixture module depends only on `gix`, so the target needs no
+# required-features.
+[[bench]]
+name = "anchor_resolution"
+path = "benches/anchor_resolution.rs"
+harness = false
+
 [dev-dependencies]
 # Self dev-dependency so integration tests see the `test-support` fixtures.
 mc-store = { path = ".", features = ["test-support"] }
+# Fixture repositories are written with gix object APIs; no git CLI, even in
+# tests.
+gix = { workspace = true }
+criterion = "=0.8.2"
+proptest = "1"
 tempfile = "3"
+
+[[bench]]
+name = "scope_algebra"
+harness = false

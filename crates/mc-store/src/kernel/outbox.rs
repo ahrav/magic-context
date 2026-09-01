@@ -155,8 +155,8 @@ impl Envelope<'_> {
         }
         let (consumer_id, checkpoint) =
             self.consumer_checkpoint(consumer_id, abandonment.abandoned_at)?;
-        let operator_id = redact(&abandonment.operator_id);
-        let reason = redact(&abandonment.reason);
+        let operator_id = redact(&abandonment.operator_id)?;
+        let reason = redact(&abandonment.reason)?;
         // A secret-bearing barrier id is rejected because a redacted id would not
         // match its barrier row.
         let barrier_id = abandonment
@@ -290,8 +290,8 @@ impl Envelope<'_> {
             return Err(KernelError::InvalidInput);
         }
         let barrier_id = barrier_identity(barrier_id)?;
-        let operator_id = redact(operator_id);
-        let reason = redact(reason);
+        let operator_id = redact(operator_id)?;
+        let reason = redact(reason)?;
         let consumer_count: i64 = self
             .tx
             .query_row(

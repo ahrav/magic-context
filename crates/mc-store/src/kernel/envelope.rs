@@ -1,7 +1,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
+use super::admission::{AdmissionKey, StoredAdmission};
 use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
@@ -15,6 +17,8 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
+    // Only the policy digest enumerates the vocabulary.
+    #[cfg(test)]
     pub(super) const ALL: &'static [Self] = &[Self::Normal, Self::Sensitive, Self::Secret];
 
     pub(super) fn as_str(self) -> &'static str {
@@ -167,6 +171,8 @@ pub struct Envelope<'tx> {
     pub(super) tx: &'tx Transaction<'tx>,
     pub(super) commit_seq: i64,
     pub(super) changes: Vec<PendingChange>,
+    pub(super) admission_ordinal: usize,
+    pub(super) admission_latest: HashMap<AdmissionKey, StoredAdmission>,
     poisoned: Option<KernelError>,
 }
 
@@ -287,7 +293,7 @@ impl Envelope<'_> {
         if operator_id.trim().is_empty() || remediated_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let operator_id = redact(operator_id);
+        let operator_id = redact(operator_id)?;
         match target {
             RemediationTarget::CanonicalDomainName { object_id } => {
                 let object_id = identity(&object_id)?;
@@ -448,6 +454,27 @@ impl KernelStore {
     }
 
     fn snapshot(&self, requested: i64, sql: &str) -> Result<KnownAsOf, KernelError> {
+        let (tip, objects) = self.read_snapshot(requested, |tx| {
+            let mut statement = tx.prepare(sql).map_err(map_sqlite)?;
+            let objects = statement
+                .query_map([requested], object_row_from)
+                .map_err(map_sqlite)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_sqlite)?;
+            Ok(objects)
+        })?;
+        Ok(KnownAsOf {
+            known_as_of: requested,
+            tip,
+            objects,
+        })
+    }
+
+    pub(super) fn read_snapshot<T>(
+        &self,
+        requested: i64,
+        read: impl FnOnce(&Transaction<'_>) -> Result<T, KernelError>,
+    ) -> Result<(i64, T), KernelError> {
         if requested < 0 {
             return Err(KernelError::InvalidInput);
         }
@@ -465,19 +492,9 @@ impl KernelStore {
         if requested > tip {
             return Err(KernelError::FutureSnapshot);
         }
-        let mut statement = tx.prepare(sql).map_err(map_sqlite)?;
-        let objects = statement
-            .query_map([requested], object_row_from)
-            .map_err(map_sqlite)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(map_sqlite)?;
-        drop(statement);
+        let result = read(&tx)?;
         tx.commit().map_err(map_sqlite)?;
-        Ok(KnownAsOf {
-            known_as_of: requested,
-            tip,
-            objects,
-        })
+        Ok((tip, result))
     }
 
     pub fn stage_candidate(
@@ -814,6 +831,8 @@ fn commit_prepared_with_writer(
         tx: &tx,
         commit_seq,
         changes: Vec::new(),
+        admission_ordinal: 0,
+        admission_latest: HashMap::new(),
         poisoned: None,
     };
     let result = operation(&mut envelope)?;
@@ -821,7 +840,7 @@ fn commit_prepared_with_writer(
         return Err(error);
     }
     let rebuild_alignment = envelope.changes.iter().any(change_affects_alignment);
-    let result = redact(&result);
+    let result = redact(&result)?;
 
     let payloads = envelope
         .changes
@@ -1037,8 +1056,8 @@ impl RedactedIntent {
             producer: identity(&intent.producer)?,
             operation_key: identity(&intent.operation_key)?,
             request_digest: intent.request_digest,
-            actor: redact(&intent.actor),
-            cause: redact(&intent.cause),
+            actor: redact(&intent.actor)?,
+            cause: redact(&intent.cause)?,
         })
     }
 
@@ -1150,7 +1169,15 @@ fn insert_domain(
     Ok(())
 }
 
-fn object_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
+/// Column projection consumed by [`object_row_from`], aliased on `o`.
+///
+/// The mapper reads positional columns, so every query it maps must select
+/// exactly this projection.
+pub(super) const OBJECT_ROW_COLUMNS: &str = "o.object_id,o.object_kind,o.domain_id,o.source_kind,\
+     o.source_id,o.source_revision,o.created_commit_seq,o.invalidated_commit_seq,\
+     o.superseded_by,o.sensitivity_class";
+
+pub(super) fn object_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
     let sensitivity: String = row.get(9)?;
     Ok(ObjectRow {
         object_id: row.get(0)?,
@@ -1262,8 +1289,8 @@ impl RedactedCandidate {
             source_kind: identity(&spec.source_kind)?,
             source_id: identity(&spec.source_id)?,
             source_revision: spec.source_revision,
-            candidate_kind: redact(&spec.candidate_kind),
-            payload: redact(&spec.payload),
+            candidate_kind: redact(&spec.candidate_kind)?,
+            payload: redact(&spec.payload)?,
             provenance: spec
                 .provenance
                 .filter(|value| {
@@ -1389,8 +1416,8 @@ impl RedactedProjection {
         Ok(Self {
             decision_id: identity(&spec.decision_id)?,
             observation_id: identity(&spec.observation_id)?,
-            alignment_kind: redact(&spec.alignment_kind),
-            alignment_payload: spec.alignment_payload.as_deref().map(redact),
+            alignment_kind: redact(&spec.alignment_kind)?,
+            alignment_payload: spec.alignment_payload.as_deref().map(redact).transpose()?,
             built_through_commit_seq: spec.built_through_commit_seq,
         })
     }

@@ -942,7 +942,7 @@ fn purge_audit_fields_are_redacted_in_every_durable_sink() {
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
     let handle = ingest(&store, "redact-purge", b"redact-purge");
-    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
     let mut request = delete_request("redact", &handle.digest, ArtifactDeletionKind::Purge);
     request.operator_id = Some(format!("operator {secret}"));
     request.target_locator = Some(format!("incident://{secret}"));
@@ -1255,7 +1255,7 @@ fn purge_redactions_are_recorded_in_the_durable_ledger() {
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
     let handle = ingest(&store, "ledger", b"ledger");
-    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
     let mut request = delete_request("ledger", &handle.digest, ArtifactDeletionKind::Purge);
     request.operator_id = Some(format!("operator {secret}"));
     request.target_locator = Some(format!("incident://{secret}"));
@@ -1470,10 +1470,12 @@ fn a_purge_identity_is_validated_before_its_intent_is_durable() {
             as fn(&mut ArtifactDeletionRequest),
         |request: &mut ArtifactDeletionRequest| request.intent.operation_key = String::new(),
         |request: &mut ArtifactDeletionRequest| {
-            request.intent.producer = "producer AKIAIOSFODNN7EXAMPLE".to_string();
+            request.intent.producer =
+                "producer sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678".to_string();
         },
         |request: &mut ArtifactDeletionRequest| {
-            request.intent.operation_key = "key AKIAIOSFODNN7EXAMPLE".to_string();
+            request.intent.operation_key =
+                "key sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678".to_string();
         },
     ] {
         let mut request =
