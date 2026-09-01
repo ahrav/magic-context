@@ -6,6 +6,7 @@
 //! distinct anchors resolve once per batch, never once per candidate.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
@@ -148,6 +149,77 @@ struct CachedClassification {
     append_confirmed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CandidateInputs<'a> {
+    scope_terms: &'a Option<Vec<ScopeTermSpec>>,
+    anchor: &'a Option<AnchorRowSpec>,
+    payload: &'a Option<Vec<u8>>,
+}
+
+impl CandidateInputs<'_> {
+    fn new(candidate: &ApplicabilityCandidate) -> CandidateInputs<'_> {
+        CandidateInputs {
+            scope_terms: &candidate.scope_terms,
+            anchor: &candidate.anchor,
+            payload: &candidate.payload,
+        }
+    }
+}
+
+impl PartialEq for CandidateInputs<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope_terms == other.scope_terms
+            && self.anchor == other.anchor
+            && self.payload == other.payload
+    }
+}
+
+impl Eq for CandidateInputs<'_> {}
+
+impl Hash for CandidateInputs<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.scope_terms {
+            Some(terms) => {
+                true.hash(state);
+                terms.len().hash(state);
+                for term in terms {
+                    term.dimension.hash(state);
+                    term.operator.hash(state);
+                    term.exact_value.hash(state);
+                    term.set_values.hash(state);
+                    term.range_start.hash(state);
+                    term.range_end.hash(state);
+                    term.version_range.hash(state);
+                    term.git_oid.hash(state);
+                    term.git_start_oid.hash(state);
+                    term.git_end_oid.hash(state);
+                    term.payload.hash(state);
+                }
+            }
+            None => false.hash(state),
+        }
+        match self.anchor {
+            Some(anchor) => {
+                true.hash(state);
+                anchor.anchor_id.hash(state);
+                anchor.anchor_kind.hash(state);
+                anchor.exact_value.hash(state);
+                anchor.reachable_from_oid.hash(state);
+                anchor.reachable_between_start_oid.hash(state);
+                anchor.reachable_between_end_oid.hash(state);
+                anchor.deployment_revision.hash(state);
+                anchor.config_revision.hash(state);
+                anchor.platform_version_range.hash(state);
+                anchor.wall_clock_start.hash(state);
+                anchor.wall_clock_end.hash(state);
+                anchor.payload.hash(state);
+            }
+            None => false.hash(state),
+        }
+        self.payload.hash(state);
+    }
+}
+
 /// Single owner of engine state: the two generation caches (KTD6). Owned
 /// alongside the kernel store; requests borrow it together with a fresh
 /// checkout snapshot.
@@ -185,17 +257,26 @@ impl ApplicabilityEngine {
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
         let mut digest_prefixes = InputDigestPrefixes::new(query, &scope_context);
+        let mut batch_input_digests = (candidates.len() > 1).then(HashMap::new);
         // Distinct anchors resolve once per batch even on cache misses. The
         // memo key matches the anchor cache key, so two candidates sharing
         // an anchor id but carrying different rows can never alias.
         let mut batch_anchor_memo: HashMap<AnchorCacheKey, GitConditionOutcome> = HashMap::new();
         let mut objects = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let token = ClassificationToken(self.object_cache_key(
-                snapshot,
-                candidate,
-                digest_prefixes.for_candidate(candidate),
-            ));
+            let inputs_digest = match &mut batch_input_digests {
+                Some(digests) => {
+                    let candidate_inputs = CandidateInputs::new(candidate);
+                    digests.get(&candidate_inputs).copied().unwrap_or_else(|| {
+                        let digest = digest_prefixes.for_candidate(candidate);
+                        digests.insert(candidate_inputs, digest);
+                        digest
+                    })
+                }
+                None => digest_prefixes.for_candidate(candidate),
+            };
+            let token =
+                ClassificationToken(self.object_cache_key(snapshot, candidate, inputs_digest));
             if candidate.lifecycle_invalidated {
                 objects.push(finished(
                     candidate,
