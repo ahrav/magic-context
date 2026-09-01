@@ -10,6 +10,8 @@
 //! auto-inject again.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -225,10 +227,15 @@ fn load_repair_target(
     object_id: &str,
 ) -> Result<Option<RepairTarget>, KernelError> {
     tx.query_row(
+        // The domain has to be live as well. `insert_observation` rejects an
+        // inactive parent with `NotFound`, which would surface as a failed
+        // evaluation rather than a discarded repair.
         "SELECT r.domain_id, r.source_revision, r.sensitivity_class, d.sensitivity_class
          FROM object_registry r
          JOIN domains d ON d.domain_id = r.domain_id
-         WHERE r.object_id=?1 AND r.invalidated_commit_seq IS NULL",
+         WHERE r.object_id=?1
+           AND r.invalidated_commit_seq IS NULL
+           AND d.invalidated_commit_seq IS NULL",
         [object_id],
         |row| {
             Ok(RepairTarget {
@@ -378,6 +385,26 @@ impl Reduction {
 /// the newest kind change, so polling every row would cost more than it saves.
 const BLOCK_SCAN_POLL_INTERVAL: usize = 64;
 
+/// Virtual-machine steps between deadline checks inside SQLite.
+///
+/// The reducer's `ORDER BY` spans two tables, so no index serves it and SQLite
+/// sorts each target's rows into a temporary B-tree before yielding the first
+/// one. The row-loop poll cannot run during that sort, which is the only part
+/// of the scan whose cost grows with a target's history.
+const BLOCK_SCAN_PROGRESS_STEPS: i32 = 1_000;
+
+/// Maps a rusqlite failure raised by the deadline interrupt onto `Deadline`.
+fn scan_error(error: rusqlite::Error) -> KernelError {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            KernelError::Deadline
+        }
+        _ => KernelError::Io,
+    }
+}
+
 /// Object identifiers bound per reducer query. SQLite's default parameter
 /// ceiling is 32766; this leaves headroom for the other bound values.
 const BLOCK_SCAN_ID_CHUNK: usize = 512;
@@ -429,9 +456,8 @@ impl KernelStore {
         known_as_of: Option<i64>,
         budget: &EvalBudget,
     ) -> Result<HashMap<String, InjectionBlock>, KernelError> {
-        let mut states = HashMap::new();
         if object_ids.is_empty() {
-            return Ok(states);
+            return Ok(HashMap::new());
         }
         // `lock_reader` blocks on `Mutex::lock`, which would let a concurrent
         // reader hold this evaluation past its deadline before the scan reaches
@@ -440,30 +466,72 @@ impl KernelStore {
             Some(deadline) => self.lock_reader_before(deadline)?,
             None => self.lock_reader()?,
         };
-        let tx = reader
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(|_| KernelError::Io)?;
-        let tip: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| KernelError::Io)?;
-        let known_as_of = match known_as_of {
-            Some(requested) if requested > tip => return Err(KernelError::FutureSnapshot),
-            Some(requested) => requested,
-            None => tip,
-        };
-        // Hashed once for the whole scan: the payload stores the digest, not the
-        // identity, so the redactor cannot rewrite one side of the comparison.
-        let digest = checkout_identity_digest(checkout_identity);
-        for chunk in object_ids.chunks(BLOCK_SCAN_ID_CHUNK) {
-            reduce_chunk(&tx, chunk, &digest, known_as_of, budget, &mut states)?;
+        let deadline = budget.deadline();
+        if deadline.is_some() || budget.is_exhausted() {
+            let interrupt = budget.interrupt_flag();
+            reader
+                .progress_handler(
+                    BLOCK_SCAN_PROGRESS_STEPS,
+                    Some(move || {
+                        if interrupt.load(Ordering::Relaxed) {
+                            return true;
+                        }
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            interrupt.store(true, Ordering::Relaxed);
+                            return true;
+                        }
+                        false
+                    }),
+                )
+                .map_err(|_| KernelError::Io)?;
         }
-        tx.commit().map_err(|_| KernelError::Io)?;
-        Ok(states)
+        let scanned = reduce_with_reader(
+            &mut reader,
+            object_ids,
+            checkout_identity,
+            known_as_of,
+            budget,
+        );
+        // The connection returns to the pool, so the handler cannot outlive
+        // this scan's deadline.
+        let _ = reader.progress_handler(0, None::<fn() -> bool>);
+        scanned
     }
+}
+
+/// The scan itself, so `reduce_block_states` can clear the progress handler on
+/// every path out.
+fn reduce_with_reader(
+    reader: &mut rusqlite::Connection,
+    object_ids: &[&str],
+    checkout_identity: &str,
+    known_as_of: Option<i64>,
+    budget: &EvalBudget,
+) -> Result<HashMap<String, InjectionBlock>, KernelError> {
+    let mut states = HashMap::new();
+    let tx = reader
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(scan_error)?;
+    let tip: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(scan_error)?;
+    let known_as_of = match known_as_of {
+        Some(requested) if requested > tip => return Err(KernelError::FutureSnapshot),
+        Some(requested) => requested,
+        None => tip,
+    };
+    // Hashed once for the whole scan: the payload stores the digest, not the
+    // identity, so the redactor cannot rewrite one side of the comparison.
+    let digest = checkout_identity_digest(checkout_identity);
+    for chunk in object_ids.chunks(BLOCK_SCAN_ID_CHUNK) {
+        reduce_chunk(&tx, chunk, &digest, known_as_of, budget, &mut states)?;
+    }
+    tx.commit().map_err(scan_error)?;
+    Ok(states)
 }
 
 /// Scans one chunk newest-first, stopping each object at its newest kind
@@ -497,7 +565,7 @@ fn reduce_chunk(
             kind = object_ids.len() + 1,
             as_of = object_ids.len() + 2,
         ))
-        .map_err(|_| KernelError::Io)?;
+        .map_err(scan_error)?;
     let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(object_ids.len() + 2);
     for object_id in object_ids {
         bound.push(object_id);
@@ -506,15 +574,15 @@ fn reduce_chunk(
     bound.push(&known_as_of);
     let mut rows = statement
         .query(rusqlite::params_from_iter(bound))
-        .map_err(|_| KernelError::Io)?;
+        .map_err(scan_error)?;
     let mut pending: HashMap<String, Reduction> = HashMap::new();
     let mut scanned = 0usize;
-    while let Some(row) = rows.next().map_err(|_| KernelError::Io)? {
+    while let Some(row) = rows.next().map_err(scan_error)? {
         scanned += 1;
         if scanned.is_multiple_of(BLOCK_SCAN_POLL_INTERVAL) && budget.is_exhausted() {
             return Err(KernelError::Deadline);
         }
-        let object_id: String = row.get(0).map_err(|_| KernelError::Io)?;
+        let object_id: String = row.get(0).map_err(scan_error)?;
         if matches!(pending.get(&object_id), Some(Reduction::Done(_))) {
             continue;
         }
@@ -522,7 +590,7 @@ fn reduce_chunk(
         let payload: Vec<u8> = row.get(2).map_err(|_| KernelError::Io)?;
         let commit_seq: i64 = row.get(3).map_err(|_| KernelError::Io)?;
         let repair_identity: String = row.get(4).map_err(|_| KernelError::Io)?;
-        if !matches_checkout(&payload, checkout_digest)? {
+        if !matches_checkout(&payload, &kind, checkout_digest)? {
             continue;
         }
         let entry = pending.entry(object_id).or_insert(Reduction::Latest);
@@ -555,7 +623,16 @@ fn reduce_chunk(
 /// A payload that does not decode fails the read. Skipping to an older row
 /// would reduce a corrupt latest record to an older `applicability.current`,
 /// or to no block at all, and let a failing object auto-inject.
-fn matches_checkout(payload: &[u8], checkout_identity_digest: &str) -> Result<bool, KernelError> {
+///
+/// `blocked` comes from the outer observation kind, so a row whose payload
+/// records a different state than that kind is rejected rather than trusted.
+/// The generic `insert_observation` API accepts any kind with any payload, and
+/// such a row would otherwise clear a real block.
+fn matches_checkout(
+    payload: &[u8],
+    observation_kind: &str,
+    checkout_identity_digest: &str,
+) -> Result<bool, KernelError> {
     let payload = serde_json::from_slice::<ObservationPayload>(payload)
         .map_err(|_| KernelError::CorruptCanonicalRow)?;
     let Some(detail) = payload.detail.as_deref() else {
@@ -563,10 +640,18 @@ fn matches_checkout(payload: &[u8], checkout_identity_digest: &str) -> Result<bo
     };
     let detail = serde_json::from_str::<ApplicabilityObservationPayload>(detail)
         .map_err(|_| KernelError::CorruptCanonicalRow)?;
-    if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA {
+    if detail.schema != OBSERVATION_APPLICABILITY_SCHEMA
+        || observation_kind != observation_kind_for_state(&detail.state)
+    {
         return Err(KernelError::CorruptCanonicalRow);
     }
     Ok(detail.checkout_identity_digest == checkout_identity_digest)
+}
+
+/// The observation kind that carries `state`, which is the vocabulary
+/// `payloads.rs` defines: one kind per state label.
+fn observation_kind_for_state(state: &str) -> String {
+    format!("applicability.{state}")
 }
 
 #[cfg(test)]

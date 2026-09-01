@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 
 use git_fixtures::{commit_snapshot, init_repo, materialize, set_head_detached, FixtureRepo};
 use mc_store::kernel::applicability::{
-    commit_read_repair, snapshot_checkout, AppendOutcome, ApplicabilityCandidate,
-    ApplicabilityEngine, ApplicabilityRequest, ApplicabilityState, CheckSpec, EvalBudget,
-    ObjectApplicabilitySpec, RepairIntent, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
+    checkout_identity_digest, commit_read_repair, snapshot_checkout, AppendOutcome,
+    ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityObservationPayload,
+    ApplicabilityRequest, ApplicabilityState, CheckSpec, EvalBudget, ObjectApplicabilitySpec,
+    RepairIntent, DEPENDENCY_KIND_TARGET, OBSERVATION_APPLICABILITY_SCHEMA,
+    OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE, PATCH_ID_ALGORITHM,
 };
 use mc_store::kernel::{
     CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelError, KernelStore,
@@ -1576,4 +1578,181 @@ fn an_unresolvable_oversized_check_path_still_vetoes() {
         report.objects[0].state
     );
     assert!(report.auto_injectable().next().is_none());
+}
+
+/// `blocked` is derived from the outer observation kind, and the generic
+/// `insert_observation` API accepts any kind with any payload. A row claiming
+/// `applicability.current` while its payload records a stale state would
+/// otherwise clear a real block and let the object auto-inject.
+#[test]
+fn an_observation_whose_payload_disagrees_with_its_kind_is_corrupt() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+
+    // A clearing kind carrying a stale payload, written through the generic API.
+    let detail = serde_json::to_string(&ApplicabilityObservationPayload {
+        schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
+        checkout_identity_digest: checkout_identity_digest(snapshot.identity()),
+        head: snapshot.head().to_string(),
+        dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
+        patch_id_algorithm: PATCH_ID_ALGORITHM.to_string(),
+        state: "stale".to_string(),
+        evidence: "forged clear".to_string(),
+    })
+    .unwrap();
+    store
+        .commit(intent("forged-clear", '9'), |envelope| {
+            envelope.insert_observation(ObservationSpec {
+                observation_id: "forged".to_string(),
+                object_id: "forged-object".to_string(),
+                domain_id: DOMAIN.to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                observation_kind: OBSERVATION_KIND_CURRENT.to_string(),
+                payload: ObservationPayload {
+                    summary: "forged clear".to_string(),
+                    classification: OBSERVATION_KIND_CURRENT.to_string(),
+                    detail: Some(detail),
+                },
+                observed_at: 2,
+                dependencies: vec![ObservationDependencySpec {
+                    dependency_object_id: TARGET_OBJECT.to_string(),
+                    dependency_kind: DEPENDENCY_KIND_TARGET.to_string(),
+                    dependency_payload: None,
+                }],
+                source_kind: "fixture".to_string(),
+                source_id: "forged".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let error = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        KernelError::CorruptCanonicalRow,
+        "the forged clear is rejected rather than lifting the block"
+    );
+}
+
+/// A repair whose owning domain went inactive is discarded, not an error: the
+/// slice rejects an inactive parent, and that must not turn the veto this
+/// evaluation already derived into a failed call.
+#[test]
+fn a_retired_domain_discards_the_repair_instead_of_failing_the_evaluation() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    let intent_record =
+        RepairIntent::for_classification(&snapshot, &batch.objects[0], None, "test", 42).unwrap();
+
+    // The owning domain is retired while the repair is in flight.
+    store
+        .commit(intent("retire-domain", 'a'), |envelope| {
+            envelope.retire_domain("domain-object")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let outcome = commit_read_repair(
+        &store,
+        &engine,
+        &snapshot,
+        &batch.objects[0],
+        &intent_record,
+        &EvalBudget::unbounded(),
+    )
+    .unwrap();
+    assert_eq!(outcome, AppendOutcome::Discarded);
+    assert_eq!(
+        count(
+            store_dir.path(),
+            "SELECT COUNT(*) FROM observations WHERE observation_kind LIKE 'applicability.%'"
+        ),
+        0,
+        "nothing durable written under an inactive domain"
+    );
+}
+
+/// The reducer's `ORDER BY` spans two tables, so SQLite sorts each target's rows
+/// into a temporary B-tree before yielding the first one, and the row-loop poll
+/// cannot run during that sort. A progress handler tied to the budget is what
+/// stops the statement itself.
+#[test]
+fn an_interrupted_budget_stops_the_reducer_inside_sqlite() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    ApplicabilityEngine::new()
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+
+    // A deadline far enough out that acquisition succeeds, and an interrupt
+    // already raised, which is what a deadline crossing mid-statement leaves.
+    let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let budget = EvalBudget::new(
+        Some(Instant::now() + Duration::from_secs(60)),
+        std::sync::Arc::clone(&interrupt),
+    );
+    let error = store
+        .applicability_block_states_at_tip(&[TARGET_OBJECT], snapshot.identity(), &budget)
+        .unwrap_err();
+    assert_eq!(error, KernelError::Deadline);
+
+    // The handler is cleared, so the pooled connection still serves later reads.
+    let block = store
+        .applicability_block_state(
+            TARGET_OBJECT,
+            snapshot.identity(),
+            store.known_as_of(0).unwrap().tip,
+        )
+        .unwrap()
+        .expect("the block is still readable");
+    assert!(block.blocked);
 }
