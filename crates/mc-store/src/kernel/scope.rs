@@ -490,6 +490,7 @@ impl std::error::Error for ScopeFormError {}
 pub struct CanonicalScope {
     terms: BTreeMap<Dimension, TermValue>,
     version_requirements: BTreeMap<Dimension, semver::VersionReq>,
+    version_intervals: BTreeMap<Dimension, VersionInterval>,
 }
 
 impl CanonicalScope {
@@ -499,6 +500,7 @@ impl CanonicalScope {
     pub fn from_term_specs(terms: &[ScopeTermSpec]) -> Result<Self, ScopeFormError> {
         let mut canonical = BTreeMap::new();
         let mut version_requirements = BTreeMap::new();
+        let mut version_intervals = BTreeMap::new();
         for term in terms {
             let dimension = Dimension::from_stored(&term.dimension)
                 .ok_or_else(|| ScopeFormError::UnknownDimension(term.dimension.clone()))?;
@@ -512,11 +514,15 @@ impl CanonicalScope {
                     semver::VersionReq::parse(raw)
                         .expect("canonical version ranges were validated while decoding"),
                 );
+                if let Some(interval) = version_req_interval(raw) {
+                    version_intervals.insert(dimension, interval);
+                }
             }
         }
         Ok(Self {
             terms: canonical,
             version_requirements,
+            version_intervals,
         })
     }
 
@@ -525,6 +531,7 @@ impl CanonicalScope {
         Self {
             terms: BTreeMap::new(),
             version_requirements: BTreeMap::new(),
+            version_intervals: BTreeMap::new(),
         }
     }
 
@@ -540,6 +547,10 @@ impl CanonicalScope {
 
     fn version_requirement(&self, dimension: Dimension) -> Option<&semver::VersionReq> {
         self.version_requirements.get(&dimension)
+    }
+
+    fn version_interval(&self, dimension: Dimension) -> Option<&VersionInterval> {
+        self.version_intervals.get(&dimension)
     }
 
     fn has_placeholder(&self) -> bool {
@@ -1247,7 +1258,21 @@ pub fn scope_subsumes(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn Graph
 pub fn scope_overlaps(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
     a.terms()
         .all(|(dimension, term_a)| match b.term(dimension) {
-            Some(term_b) => term_overlaps(term_a, term_b, oracle).unwrap_or(true),
+            Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
+                    match (a.version_interval(dimension), b.version_interval(dimension)) {
+                        (Some(left_interval), Some(right_interval)) => {
+                            if left == right {
+                                !left_interval.is_empty()
+                            } else {
+                                left_interval.overlaps(right_interval)
+                            }
+                        }
+                        _ => true,
+                    }
+                }
+                _ => term_overlaps(term_a, term_b, oracle).unwrap_or(true),
+            },
             None => true,
         })
 }
