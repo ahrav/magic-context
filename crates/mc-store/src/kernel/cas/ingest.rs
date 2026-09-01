@@ -137,11 +137,18 @@ impl PreparedArtifact {
                 (redaction, bytes, true)
             }
             Err(_) => {
-                if !redact(&String::from_utf8_lossy(&request.payload))
-                    .detections
-                    .is_empty()
                 {
-                    return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                    // Each invalid byte widens to a three-byte replacement character, so a
+                    // payload inside the raw limit can still convert to a scan input outside
+                    // it. Measuring the converted text keeps redaction's fail-closed
+                    // placeholder from being read back as proof of a secret.
+                    let inspected_text = String::from_utf8_lossy(&request.payload);
+                    if inspected_text.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
+                        return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
+                    }
+                    if !redact(&inspected_text).detections.is_empty() {
+                        return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                    }
                 }
                 (
                     RedactedField {

@@ -182,6 +182,30 @@ fn payload_limit_is_inclusive() {
 }
 
 #[test]
+fn binary_payload_is_measured_by_what_the_scan_would_inspect() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    // Invalid bytes are scanned through a lossy conversion, and each widens to a
+    // three-byte replacement character. Measuring the raw length would accept this
+    // payload, then the scan would exceed its limit, redaction would fail closed, and
+    // the resulting placeholder detection would report a secret-free payload as one
+    // holding a secret that cannot be redacted.
+    let payload = vec![0xff_u8; 200 * 1024];
+    assert!(payload.len() < mc_core::redaction::MAX_REDACTABLE_BYTES);
+    assert!(
+        String::from_utf8_lossy(&payload).len() > mc_core::redaction::MAX_REDACTABLE_BYTES,
+        "payload no longer expands past the scan limit"
+    );
+
+    let error = store
+        .ingest_artifact(request("wide-binary", payload))
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+}
+
+#[test]
 fn payload_too_large_to_inspect_is_rejected_rather_than_replaced() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
