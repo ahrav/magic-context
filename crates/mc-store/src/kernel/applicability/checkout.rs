@@ -368,3 +368,60 @@ fn fingerprint_entries(entries: &[DirtyEntry]) -> String {
     }
     format!("{:x}", hash.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{fingerprint_entries, DirtyEntry};
+
+    fn fingerprint(discovered: Vec<DirtyEntry>) -> (String, BTreeSet<String>) {
+        let entries: Vec<DirtyEntry> = discovered
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+        (fingerprint_entries(&entries), paths)
+    }
+
+    #[test]
+    fn dirty_fingerprint_is_permutation_invariant_and_field_sensitive() {
+        let first = DirtyEntry {
+            path: "a.txt".to_string(),
+            status: "modified",
+            content_hash: "aaa".to_string(),
+        };
+        let second = DirtyEntry {
+            path: "b.txt".to_string(),
+            status: "untracked",
+            content_hash: "bbb".to_string(),
+        };
+        let (forward, paths) = fingerprint(vec![first.clone(), second.clone()]);
+        let (reverse, reverse_paths) = fingerprint(vec![second.clone(), first.clone()]);
+        assert_eq!(forward, reverse);
+        assert_eq!(paths, reverse_paths);
+        assert_eq!(
+            paths,
+            BTreeSet::from(["a.txt".to_string(), "b.txt".to_string()])
+        );
+
+        for changed in [
+            DirtyEntry {
+                path: "c.txt".to_string(),
+                ..first.clone()
+            },
+            DirtyEntry {
+                status: "staged_modified",
+                ..first.clone()
+            },
+            DirtyEntry {
+                content_hash: "ccc".to_string(),
+                ..first.clone()
+            },
+        ] {
+            assert_ne!(forward, fingerprint(vec![changed, second.clone()]).0);
+        }
+        assert_ne!(forward, fingerprint(vec![first]).0);
+    }
+}
