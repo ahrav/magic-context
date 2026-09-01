@@ -221,6 +221,7 @@ struct BatchMemos {
     key: [u8; 32],
     anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
     anchor_verdict: LastMemo<AnchorVerdict>,
+    dirty_path: LastMemo<Option<String>>,
     payload: LastMemo<DecodedPayload>,
     scope: LastMemo<ScopeVerdict>,
 }
@@ -541,7 +542,10 @@ impl ApplicabilityEngine {
             }
         };
         if let Some(spec) = spec {
-            if let Some(path) = dirty_overlap(snapshot, &spec.affected_paths) {
+            let path = memos
+                .dirty_path
+                .get_or_insert_with(memos.key, || dirty_overlap(snapshot, &spec.affected_paths));
+            if let Some(path) = path {
                 return Classification::terminal(
                     ApplicabilityState::DirtyTreeUncertain,
                     format!("uncommitted path {path} overlaps affected paths"),
