@@ -147,11 +147,13 @@ pub struct BatchEvaluation {
     pub stats: EvaluationStats,
 }
 
+/// `row_fingerprint` covers every `AnchorRowSpec` field, so two rows sharing an
+/// `anchor_id` and payload but differing in a condition column cannot collide.
+/// `anchor_id` alone omits the condition columns the verdict is derived from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AnchorCacheKey {
     checkout_identity: String,
-    anchor_id: String,
-    payload_digest: String,
+    row_fingerprint: [u8; 32],
     head: String,
     repository_state: String,
     patch_id_algorithm: &'static str,
@@ -522,8 +524,7 @@ impl ApplicabilityEngine {
         } else {
             let key = AnchorCacheKey {
                 checkout_identity: snapshot.identity().to_string(),
-                anchor_id: anchor.anchor_id.clone(),
-                payload_digest: digest_optional(anchor.payload.as_deref()),
+                row_fingerprint: anchor_fingerprint,
                 head: snapshot.head().to_string(),
                 // Sparse and shallow state decide how far an ancestry walk
                 // reaches, so unshallowing has to miss this key rather than
@@ -723,12 +724,6 @@ fn paths_overlap(dirty: &str, declared: &str) -> bool {
         || declared
             .strip_prefix(dirty)
             .is_some_and(|rest| rest.starts_with('/'))
-}
-
-fn digest_optional(payload: Option<&[u8]>) -> String {
-    let mut hash = Sha256::new();
-    hash.update(payload.unwrap_or_default());
-    format!("{:x}", hash.finalize())
 }
 
 /// Digest over every non-snapshot input that can change the verdict, so a

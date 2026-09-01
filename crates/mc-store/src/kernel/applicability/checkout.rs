@@ -24,7 +24,9 @@ const HASH_CHUNK_BYTES: usize = 64 * 1024;
 /// symlink, FIFO, directory, or device. `Err` keeps genuine failures commentlint: allow(JUDGE)
 /// distinguishable, since those hide content that still governs the commentlint: allow(JUDGE)
 /// checkout. commentlint: allow(JUDGE)
-fn open_regular_no_follow(path: &Path) -> Result<Option<std::fs::File>, rustix::io::Errno> {
+pub(super) fn open_regular_no_follow(
+    path: &Path,
+) -> Result<Option<std::fs::File>, rustix::io::Errno> {
     let file = match rfs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,

@@ -1114,8 +1114,9 @@ fn noncanonical_affected_paths_still_overlap_the_dirty_entry() {
     }
 }
 
-/// A minified JSON config has no line structure, so the line-oriented
-/// heuristic reports every key missing and marks an applicable object stale.
+/// A minified JSON config has no line structure, so a line-oriented key
+/// heuristic would report every key missing. Present keys must still resolve
+/// `Current`, and only a genuinely absent key reports `Stale`.
 #[test]
 fn a_config_key_resolves_in_single_line_json() {
     let dir = tempfile::tempdir().unwrap();
@@ -1582,4 +1583,129 @@ fn a_file_exists_verdict_is_keyed_on_the_observed_path_shape() {
     );
     assert_eq!(batch.stats.object_cache_hits, 0);
     assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+}
+
+/// The process anchor cache has to key on the whole row too. Two rows sharing
+/// an `anchor_id` *and* payload still differ in their condition columns, so a
+/// key built from id and payload alone serves one row's verdict for the other.
+#[test]
+fn anchor_rows_sharing_an_id_and_payload_do_not_share_a_cache_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let on_main = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    let off_main = commit_snapshot(
+        &fixture.repo,
+        "side",
+        &[],
+        &[("other.rs", "pub fn z() {}\n")],
+        "side",
+        2,
+    );
+    let snapshot = checkout(&fixture, on_main);
+
+    // No payload, so the rows differ only in `reachable_from_oid`.
+    let row = |commit: gix::ObjectId| AnchorRowSpec {
+        anchor_id: "shared-id".to_string(),
+        anchor_kind: "reachable_from".to_string(),
+        reachable_from_oid: Some(commit.to_string()),
+        payload: None,
+        ..AnchorRowSpec::default()
+    };
+    let engine = ApplicabilityEngine::new();
+    // Separate batches, so only the process cache can carry the verdict over.
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            anchor: Some(row(on_main)),
+            ..candidate("object-reachable")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[ApplicabilityCandidate {
+            anchor: Some(row(off_main)),
+            ..candidate("object-unreachable")
+        }],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.anchor_cache_hits, 0);
+    assert_ne!(
+        batch.objects[0].state,
+        ApplicabilityState::Current,
+        "the second row hit the first row's anchor-cache entry"
+    );
+}
+
+/// `worktree_path` clears a path's ancestors but leaves the final component
+/// unresolved, so a checked path that is itself a symlink would otherwise let a
+/// check read host state outside the checkout and report `Current`.
+#[cfg(unix)]
+#[test]
+fn a_checked_path_that_is_a_symlink_never_reads_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside.conf");
+    std::fs::write(&outside, "flag = true\n").unwrap();
+
+    let fixture = init_repo(&dir.path().join("wt"));
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    std::os::unix::fs::symlink(&outside, fixture.root.join("linked.conf")).unwrap();
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    for (index, check) in [
+        CheckSpec::ConfigKey {
+            path: "linked.conf".to_string(),
+            key: "flag".to_string(),
+        },
+        CheckSpec::FileExists {
+            path: "linked.conf".to_string(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            &[ApplicabilityCandidate {
+                payload: Some(ObjectApplicabilitySpec::new(vec![], vec![check.clone()]).encode()),
+                ..candidate(&format!("object-{index}"))
+            }],
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(
+            batch.objects[0].state,
+            ApplicabilityState::Uncertain,
+            "{check:?} resolved a symlink target outside the checkout"
+        );
+        assert!(
+            batch.objects[0].evidence.contains("symlink"),
+            "evidence does not name the symlink: {}",
+            batch.objects[0].evidence
+        );
+    }
 }

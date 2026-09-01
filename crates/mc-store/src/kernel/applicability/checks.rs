@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::checkout::{CheckoutSnapshot, EvalBudget};
+use super::checkout::{open_regular_no_follow, CheckoutSnapshot, EvalBudget};
 use super::payloads::CheckSpec;
 
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -53,12 +53,12 @@ impl ConfigRead {
 /// check reads, separate from any content a `ConfigKey` check reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Resolved {
-    /// Present and a regular file.
+    /// Present and a regular file, established without following a link.
     RegularFile(PathBuf),
-    /// Resolved inside the worktree but absent, or present as something other
-    /// than a regular file.
-    NotAFile(PathBuf, String),
-    /// The declared spelling never resolved, so nothing was read.
+    /// Resolved inside the worktree and definitely not there.
+    Absent,
+    /// The declared spelling never resolved, or resolved to something no check
+    /// can read. Nothing was read.
     Unresolvable(String),
 }
 
@@ -66,15 +66,8 @@ impl Resolved {
     fn observation(&self) -> &str {
         match self {
             Self::RegularFile(_) => "regular-file",
-            Self::NotAFile(_, shape) => shape,
+            Self::Absent => "absent",
             Self::Unresolvable(reason) => reason,
-        }
-    }
-
-    fn path(&self) -> Option<&Path> {
-        match self {
-            Self::RegularFile(path) | Self::NotAFile(path, _) => Some(path),
-            Self::Unresolvable(_) => None,
         }
     }
 }
@@ -133,12 +126,12 @@ pub fn check_observation(
             let shape = resolved.observation().to_string();
             // Only a regular file is read, so only then is there content to
             // name; the shape alone settles the other cases.
-            match resolved.path() {
-                Some(absolute) if matches!(resolved, Resolved::RegularFile(_)) => {
-                    let content = cache.read(absolute).observation();
+            match resolved {
+                Resolved::RegularFile(absolute) => {
+                    let content = cache.read(&absolute).observation();
                     Some(format!("{shape}\u{1f}{content}"))
                 }
-                _ => Some(shape),
+                Resolved::Absent | Resolved::Unresolvable(_) => Some(shape),
             }
         }
         // Both are `Unsupported` whatever the worktree holds.
@@ -146,25 +139,28 @@ pub fn check_observation(
     }
 }
 
-/// FIFOs can block reads. Character devices such as `/dev/zero` produce valid
-/// UTF-8 indefinitely.
+/// Reads through a no-follow descriptor and sizes the file by that descriptor,
+/// so a path swapped for a symlink between resolution and this read cannot
+/// redirect the read outside the checkout.
+///
+/// FIFOs can block reads and character devices such as `/dev/zero` produce commentlint: allow(JUDGE)
+/// valid UTF-8 indefinitely, both of which `open_regular_no_follow` rejects. commentlint: allow(JUDGE)
 fn read_bounded(absolute: &Path) -> ConfigRead {
-    let metadata = match std::fs::metadata(absolute) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigRead::Missing,
+    let file = match open_regular_no_follow(absolute) {
+        Ok(Some(file)) => file,
+        // Resolution already saw a regular file here, so the path moved.
+        Ok(None) => {
+            return ConfigRead::Unevaluated("path is no longer a regular file".to_string());
+        }
         Err(error) => return ConfigRead::Unevaluated(error.to_string()),
     };
-    if !metadata.is_file() {
-        return ConfigRead::Unevaluated("path is not a regular file".to_string());
-    }
-    if metadata.len() > MAX_CONFIG_BYTES {
-        return ConfigRead::Unevaluated(format!("file exceeds {MAX_CONFIG_BYTES} bytes"));
-    }
-    let file = match std::fs::File::open(absolute) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigRead::Missing,
+    match file.metadata() {
+        Ok(metadata) if metadata.len() > MAX_CONFIG_BYTES => {
+            return ConfigRead::Unevaluated(format!("file exceeds {MAX_CONFIG_BYTES} bytes"));
+        }
+        Ok(_) => {}
         Err(error) => return ConfigRead::Unevaluated(error.to_string()),
-    };
+    }
     let mut content = String::new();
     match file.take(MAX_CONFIG_BYTES).read_to_string(&mut content) {
         Ok(_) => ConfigRead::Content(Arc::from(content)),
@@ -192,14 +188,22 @@ fn resolve_uncached(snapshot: &CheckoutSnapshot, path: &str) -> Resolved {
             "check path {path} does not resolve inside this checkout's worktree"
         ));
     };
-    match std::fs::metadata(&absolute) {
+    // `worktree_path` clears the path's ancestors but leaves the final
+    // component unresolved, so this is where a terminal link is caught.
+    // `symlink_metadata` reports the link itself rather than its target.
+    match std::fs::symlink_metadata(&absolute) {
         Ok(metadata) if metadata.is_file() => Resolved::RegularFile(absolute),
-        Ok(metadata) if metadata.is_dir() => Resolved::NotAFile(absolute, "directory".to_string()),
-        Ok(_) => Resolved::NotAFile(absolute, "not-a-regular-file".to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Resolved::NotAFile(absolute, "absent".to_string())
+        Ok(metadata) if metadata.is_symlink() => Resolved::Unresolvable(format!(
+            "check path {path} is a symlink, whose target this check will not follow"
+        )),
+        Ok(metadata) if metadata.is_dir() => Resolved::Unresolvable(format!(
+            "check path {path} is a directory, not a file a check can read"
+        )),
+        Ok(_) => Resolved::Unresolvable(format!("check path {path} is not a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Resolved::Absent,
+        Err(error) => {
+            Resolved::Unresolvable(format!("check path {path} could not be inspected: {error}"))
         }
-        Err(error) => Resolved::NotAFile(absolute, format!("unreadable:{error}")),
     }
 }
 
@@ -224,17 +228,20 @@ pub fn run_cheap_check(
     match check {
         CheckSpec::FileExists { path } => match cache.resolve(snapshot, path) {
             Resolved::RegularFile(_) => CheckOutcome::Passed,
-            Resolved::NotAFile(_, _) => CheckOutcome::Failed {
+            Resolved::Absent => CheckOutcome::Failed {
                 evidence: format!("file {path} does not exist in the checkout"),
             },
+            // A shape this check cannot read is not a definite absence.
             Resolved::Unresolvable(reason) => unevaluated(reason),
         },
         CheckSpec::ConfigKey { path, key } => {
             let absolute = match cache.resolve(snapshot, path) {
                 Resolved::RegularFile(absolute) => absolute,
-                // A resolved path that is not a regular file has no key to
-                // read; whether that is a definite absence is `read`'s call.
-                Resolved::NotAFile(absolute, _) => absolute,
+                Resolved::Absent => {
+                    return CheckOutcome::Failed {
+                        evidence: format!("config file {path} does not exist in the checkout"),
+                    };
+                }
                 Resolved::Unresolvable(reason) => return unevaluated(reason),
             };
             let content = match cache.read(&absolute) {
