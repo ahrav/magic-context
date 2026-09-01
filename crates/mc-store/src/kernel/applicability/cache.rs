@@ -3,7 +3,7 @@
 //! generation and hits promote entries back into current. Process-local,
 //! never persisted — the durable record is the observations log.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::Hash;
 
 /// Per-generation entry cap. Two full generations bound total residency;
@@ -23,6 +23,10 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
             previous: HashMap::new(),
             cap,
         }
+    }
+
+    pub(super) fn hasher(&self) -> &RandomState {
+        self.current.hasher()
     }
 
     pub(super) fn get(&mut self, key: &K) -> Option<V> {

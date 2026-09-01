@@ -5,8 +5,8 @@
 //! snapshot taken once, a typed query context, and the candidate batch;
 //! distinct anchors resolve once per batch, never once per candidate.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::collections::{hash_map::RandomState, HashMap};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -168,11 +168,18 @@ impl Hash for SnapshotCacheKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotCacheValues {
+    hash: u64,
     checkout_identity: String,
     head: String,
     dirty_fingerprint: String,
+}
+
+impl Hash for SnapshotCacheValues {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +267,7 @@ impl Hash for CandidateInputs<'_> {
 pub struct ApplicabilityEngine {
     anchor_cache: Mutex<TwoGenerationCache<AnchorCacheKey, GitConditionOutcome>>,
     object_cache: Mutex<TwoGenerationCache<ObjectCacheKey, CachedClassification>>,
+    snapshot_hasher: RandomState,
 }
 
 impl Default for ApplicabilityEngine {
@@ -270,9 +278,12 @@ impl Default for ApplicabilityEngine {
 
 impl ApplicabilityEngine {
     pub fn new() -> Self {
+        let object_cache = TwoGenerationCache::new(GENERATION_CAP);
+        let snapshot_hasher = object_cache.hasher().clone();
         Self {
             anchor_cache: Mutex::new(TwoGenerationCache::new(GENERATION_CAP)),
-            object_cache: Mutex::new(TwoGenerationCache::new(GENERATION_CAP)),
+            object_cache: Mutex::new(object_cache),
+            snapshot_hasher,
         }
     }
 
@@ -290,8 +301,14 @@ impl ApplicabilityEngine {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
+        let snapshot_hash = self.snapshot_hasher.hash_one((
+            snapshot.identity(),
+            snapshot.head(),
+            snapshot.dirty_fingerprint(),
+        ));
         let cache_context = (candidates.len() > 1).then(|| {
             Arc::new(SnapshotCacheValues {
+                hash: snapshot_hash,
                 checkout_identity: snapshot.identity().to_string(),
                 head: snapshot.head().to_string(),
                 dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
@@ -327,6 +344,7 @@ impl ApplicabilityEngine {
             };
             let token = ClassificationToken(self.object_cache_key(
                 snapshot,
+                snapshot_hash,
                 cache_context.as_ref(),
                 candidate,
                 inputs_digest,
@@ -585,6 +603,7 @@ impl ApplicabilityEngine {
     fn object_cache_key(
         &self,
         snapshot: &CheckoutSnapshot,
+        snapshot_hash: u64,
         context: Option<&Arc<SnapshotCacheValues>>,
         candidate: &ApplicabilityCandidate,
         inputs_digest: [u8; 32],
@@ -592,6 +611,7 @@ impl ApplicabilityEngine {
         let snapshot = match context {
             Some(context) => SnapshotCacheKey::Shared(Arc::clone(context)),
             None => SnapshotCacheKey::Owned(SnapshotCacheValues {
+                hash: snapshot_hash,
                 checkout_identity: snapshot.identity().to_string(),
                 head: snapshot.head().to_string(),
                 dirty_fingerprint: snapshot.dirty_fingerprint().to_string(),
@@ -622,6 +642,7 @@ impl ObjectApplicability {
             append_pending: false,
             token: ClassificationToken(ObjectCacheKey {
                 snapshot: SnapshotCacheKey::Owned(SnapshotCacheValues {
+                    hash: 0,
                     checkout_identity: String::new(),
                     head: String::new(),
                     dirty_fingerprint: String::new(),

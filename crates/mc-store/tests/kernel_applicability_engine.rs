@@ -834,6 +834,45 @@ fn cache_key_distinguishes_relevant_inputs_only() {
 }
 
 #[test]
+fn cache_key_survives_batch_size_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let object = candidate("object-batch-size");
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+
+    let first = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        std::slice::from_ref(&object),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(first.stats.object_cache_misses, 1);
+
+    let second = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &[object.clone(), candidate("other")],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(second.stats.object_cache_hits, 1);
+    assert_eq!(second.stats.object_cache_misses, 1);
+
+    let third = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &[object],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(third.stats.object_cache_hits, 1);
+}
+
+#[test]
 fn shared_anchor_ids_with_different_rows_never_alias() {
     let dir = tempfile::tempdir().unwrap();
     let (fixture, base, tip) = seeded_repo(dir.path());
