@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -178,8 +178,53 @@ pub(crate) struct RuleSet {
     rules: Vec<Rule>,
     anchors: AhoCorasick,
     anchor_owners: Vec<usize>,
+    overlay: RuleMask,
     context_safelist: RegexSet,
     value_safelist: RegexSet,
+}
+
+/// Inline bit set over rule indices, so preselection allocates nothing and
+/// iteration visits only the selected rules.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RuleMask {
+    words: [u64; Self::WORDS],
+}
+
+impl RuleMask {
+    const WORDS: usize = 4;
+    pub const CAPACITY: usize = Self::WORDS * 64;
+
+    fn insert(&mut self, index: usize) {
+        self.words[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        let mut words = [0u64; Self::WORDS];
+        for (slot, (left, right)) in words
+            .iter_mut()
+            .zip(self.words.into_iter().zip(other.words))
+        {
+            *slot = left & right;
+        }
+        Self { words }
+    }
+
+    /// Yields selected indices in ascending order, which is the order the
+    /// rule vector defines.
+    fn iter(self) -> impl Iterator<Item = usize> {
+        self.words
+            .into_iter()
+            .enumerate()
+            .flat_map(|(offset, mut word)| {
+                std::iter::from_fn(move || {
+                    (word != 0).then(|| {
+                        let bit = word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        offset * 64 + bit
+                    })
+                })
+            })
+    }
 }
 
 impl RuleSet {
@@ -221,13 +266,23 @@ impl RuleSet {
             (left.source, left.declaration.name.as_str())
                 .cmp(&(right.source, right.declaration.name.as_str()))
         });
+        if rules.len() > RuleMask::CAPACITY {
+            return Err(ConstructionError::InvalidRulePolicy);
+        }
         let (anchors, anchor_owners) = build_anchor_index(&rules)?;
+        let mut overlay = RuleMask::default();
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.source == RuleSource::ConservativeOverlay {
+                overlay.insert(index);
+            }
+        }
         let context_safelist = build_regex_set(CONTEXT_SAFELIST)?;
         let value_safelist = build_regex_set(VALUE_SAFELIST)?;
         Ok(Self {
             rules,
             anchors,
             anchor_owners,
+            overlay,
             context_safelist,
             value_safelist,
         })
@@ -242,24 +297,20 @@ impl RuleSet {
     /// Returns the active rules whose declared anchors occur in `bytes`.
     ///
     /// A rule runs only after at least one declared anchor matches, compared
-    /// ASCII-case-insensitively. Anchors may overlap.
-    pub fn preselect(&self, profile: ScanProfile, bytes: &[u8]) -> Vec<&Rule> {
-        let mut anchored = vec![false; self.rules.len()];
+    /// ASCII-case-insensitively. Anchors may overlap. `anchor_proof` checks
+    /// that skipping a rule cannot drop one of its findings.
+    pub fn preselect(&self, profile: ScanProfile, bytes: &[u8]) -> impl Iterator<Item = &Rule> {
+        let mut anchored = RuleMask::default();
         for hit in self.anchors.find_overlapping_iter(bytes) {
             if let Some(owner) = self.anchor_owners.get(hit.pattern().as_usize()) {
-                anchored[*owner] = true;
+                anchored.insert(*owner);
             }
         }
-        self.rules
-            .iter()
-            .enumerate()
-            .filter(|(index, rule)| {
-                anchored[*index]
-                    && (profile == ScanProfile::Comprehensive
-                        || rule.source == RuleSource::ConservativeOverlay)
-            })
-            .map(|(_, rule)| rule)
-            .collect()
+        let selected = match profile {
+            ScanProfile::Comprehensive => anchored,
+            ScanProfile::Conservative => anchored.intersect(self.overlay),
+        };
+        selected.iter().map(|index| &self.rules[index])
     }
 
     pub fn context_is_safelisted(&self, bytes: &[u8]) -> bool {
@@ -335,6 +386,9 @@ fn build_anchor_index(rules: &[Rule]) -> Result<(AhoCorasick, Vec<usize>), Const
     let automaton = AhoCorasickBuilder::new()
         .match_kind(MatchKind::Standard)
         .ascii_case_insensitive(true)
+        // Overlapping search cannot use a prefilter, so the automaton walks
+        // every input byte; a DFA resolves each byte with one table lookup.
+        .kind(Some(AhoCorasickKind::DFA))
         .build(&patterns)
         .map_err(|_| ConstructionError::InvalidRulePolicy)?;
     Ok((automaton, owners))
@@ -539,7 +593,6 @@ mod tests {
                 let bytes = input.as_bytes();
                 let selected: BTreeSet<&str> = rules
                     .preselect(profile, bytes)
-                    .iter()
                     .map(|rule| rule.declaration.name.as_str())
                     .collect();
                 for rule in rules.active(profile) {
