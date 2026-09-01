@@ -82,6 +82,15 @@ const LABEL_QUALIFIERS: &[&str] = &[
     "stripe",
     "twilio",
 ];
+/// Payload and encoding words the scanner matches after a secret word.
+/// `apikeyvalue` reads as `api_key_value`.
+/// Rejecting them as label segments keeps `file_key`, `value_key`, and `keyid` structural.
+const LABEL_AFFIXES: &[&str] = &[
+    "b64", "base64", "data", "env", "file", "hash", "hex", "id", "name", "path", "plain", "prefix",
+    "ref", "string", "text", "value",
+];
+/// Longest word in the three vocabularies plus a plural suffix bounds cover-scan spans.
+const MAX_VOCABULARY_WORD_BYTES: usize = "authorization".len() + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
@@ -311,7 +320,7 @@ pub fn qualified_secret_key_label(key: &str) -> Option<String> {
 /// Whether a JSON field name has the shape the keyed scanner rules anchor on.
 ///
 /// Keyed rules accept compound keys, unlike [`secret_key_label`].
-/// Matching covers segments, the separator-free key, and qualifier-prefixed compounds.
+/// Matching covers segments and the separator-free spelling of the same name.
 /// Whole label words only: a substring test reads `author` as `auth`.
 /// A substring test also misses `passWord`, whose split `pass_word` holds no label word.
 ///
@@ -333,31 +342,91 @@ pub fn secret_shaped_json_key(key: &str) -> bool {
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect::<String>();
-    if names_a_label_word(&joined) {
-        return true;
+    undelimited_names_a_credential(&joined)
+}
+
+/// A full vocabulary cover must hold a label word and a non-`key` label segment.
+///
+/// A qualifier can precede the label and an affix can follow it.
+/// [`vocabulary_reach`] searches both ends so `apikeyvalue` is classified like `api_key_value`.
+/// A prefix-only walk classifies `apikeyvalue` as structural.
+///
+/// Affixes cover a name without qualifying it, so `keyvalue` and `keyid` stay structural
+/// exactly as `key_value` and `key_id` do.
+fn undelimited_names_a_credential(joined: &str) -> bool {
+    let from_start = vocabulary_reach(joined, false);
+    let to_end = vocabulary_reach(joined, true);
+    if !from_start[joined.len()] {
+        return false;
     }
-    // A qualifier can be chained: `awssecretaccesskey` carries three before its label word,
-    // so stripping only the first leaves a remainder that matches nothing.
-    let mut remainder = joined.as_str();
-    loop {
-        if names_a_label_word(remainder) {
-            return true;
+    let mut names_a_label = false;
+    let mut names_a_qualified_segment = false;
+    for start in 0..joined.len() {
+        if !from_start[start] {
+            continue;
         }
-        let Some(shorter) = LABEL_QUALIFIERS
-            .iter()
-            .filter_map(|qualifier| remainder.strip_prefix(qualifier))
-            .max_by_key(|stripped| remainder.len() - stripped.len())
-        else {
-            return false;
-        };
-        remainder = shorter;
+        let last = (start + MAX_VOCABULARY_WORD_BYTES).min(joined.len());
+        for end in start + 1..=last {
+            if !to_end[end] {
+                continue;
+            }
+            let word = &joined[start..end];
+            if !names_a_vocabulary_word(word) {
+                continue;
+            }
+            names_a_label |= names_a_label_word(word);
+            names_a_qualified_segment |= is_label_segment(word) && plural_stem(word) != "key";
+        }
     }
+    names_a_label && names_a_qualified_segment
+}
+
+/// Returns positions reachable by a vocabulary cover from either end of `joined`.
+/// A position both walks reach is a word boundary of some cover.
+fn vocabulary_reach(joined: &str, reverse: bool) -> Vec<bool> {
+    let length = joined.len();
+    let mut reach = vec![false; length + 1];
+    reach[if reverse { length } else { 0 }] = true;
+    for step in 0..=length {
+        let at = if reverse { length - step } else { step };
+        if !reach[at] {
+            continue;
+        }
+        for span in 1..=MAX_VOCABULARY_WORD_BYTES {
+            let (start, end) = if reverse {
+                match at.checked_sub(span) {
+                    Some(start) => (start, at),
+                    None => break,
+                }
+            } else if at + span <= length {
+                (at, at + span)
+            } else {
+                break;
+            };
+            if names_a_vocabulary_word(&joined[start..end]) {
+                reach[if reverse { start } else { end }] = true;
+            }
+        }
+    }
+    reach
+}
+
+/// Stemming `aws` yields `aw`, which no vocabulary holds, so a qualifier matches whole.
+fn names_a_vocabulary_word(word: &str) -> bool {
+    let stem = plural_stem(word);
+    LABEL_WORDS.contains(&stem)
+        || LABEL_QUALIFIERS.contains(&word)
+        || LABEL_AFFIXES.contains(&word)
+        || LABEL_AFFIXES.contains(&stem)
 }
 
 /// Whether `word` is a label word, tolerating a plural suffix as the segment test does.
 fn names_a_label_word(word: &str) -> bool {
-    let stem = word.strip_suffix('s').unwrap_or(word);
-    LABEL_WORDS.contains(&stem)
+    LABEL_WORDS.contains(&plural_stem(word))
+}
+
+fn plural_stem(word: &str) -> &str {
+    word.strip_suffix('s').unwrap_or(word)
 }
 
 fn key_names_a_secret(key: &str) -> bool {
@@ -666,6 +735,10 @@ mod qualifier_chain_tests {
             "servicekey",
             "vaultsecret",
             "slacktoken",
+            "APIKEYVALUE",
+            "tokenvalue",
+            "secretname",
+            "passwordhash",
         ] {
             assert!(
                 secret_shaped_json_key(key),
@@ -673,12 +746,63 @@ mod qualifier_chain_tests {
             );
         }
 
-        // The scanner also lists payload and encoding words for matching after a secret
-        // word. Mirroring those would make ordinary structural names credentials.
-        for key in ["file_key", "data_key", "env_key", "path_key", "value_key"] {
+        // A payload word does not qualify a label word when it precedes or follows it.
+        for key in [
+            "file_key",
+            "data_key",
+            "env_key",
+            "path_key",
+            "value_key",
+            "keyvalue",
+            "keyid",
+            "keyfile",
+        ] {
             assert!(
                 !secret_shaped_json_key(key),
                 "{key} carries no credential qualifier and must stay writable"
+            );
+        }
+    }
+
+    /// Undelimited names follow delimiter-separated field-name semantics.
+    /// A trailing qualifier is covered as well as a leading one.
+    #[test]
+    fn an_undelimited_name_is_gated_like_its_delimited_spelling() {
+        for (delimited, undelimited) in [
+            ("api_key_value", "apikeyvalue"),
+            ("api_key_value", "APIKEYVALUE"),
+            ("token_value", "tokenvalue"),
+            ("secret_name", "secretname"),
+            ("password_hash", "passwordhash"),
+            ("aws_secret_access_key", "awssecretaccesskey"),
+            ("api_keys", "apikeys"),
+            ("key_value", "keyvalue"),
+            ("key_id", "keyid"),
+            ("key_file", "keyfile"),
+            ("value_key", "valuekey"),
+            ("file_key", "filekey"),
+            ("data_key", "datakey"),
+            ("public_key", "publickey"),
+        ] {
+            assert_eq!(
+                secret_shaped_json_key(delimited),
+                secret_shaped_json_key(undelimited),
+                "{delimited} and {undelimited} name the same field"
+            );
+        }
+    }
+
+    /// The cover scan stops at [`MAX_VOCABULARY_WORD_BYTES`].
+    #[test]
+    fn the_vocabulary_stays_within_the_scan_bound() {
+        for word in LABEL_WORDS
+            .iter()
+            .chain(LABEL_QUALIFIERS)
+            .chain(LABEL_AFFIXES)
+        {
+            assert!(
+                word.len() < MAX_VOCABULARY_WORD_BYTES,
+                "{word} plus a plural exceeds the cover-scan span"
             );
         }
     }

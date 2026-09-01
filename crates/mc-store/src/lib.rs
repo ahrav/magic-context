@@ -2684,6 +2684,13 @@ pub struct TagMintInput {
     pub source_bytes: Vec<u8>,
 }
 
+struct PreparedTagMint {
+    input: TagMintInput,
+    /// `Some` when a fenced insert of this row must fail instead of writing bytes or an
+    /// identity that preparation left uncovered.
+    insert_refusal: Option<McStoreError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McTagRow {
     pub tag_number: i64,
@@ -8380,24 +8387,55 @@ impl McStore {
         let mut prepared_inputs = Vec::with_capacity(inputs.len());
         for input in inputs {
             let block_id = input.block_id.trim();
-            if block_id.is_empty() || existing_ids.contains(block_id) {
-                prepared_inputs.push(input.clone());
+            if block_id.is_empty() {
+                prepared_inputs.push(PreparedTagMint {
+                    input: input.clone(),
+                    insert_refusal: None,
+                });
                 continue;
             }
-            write.identity("block_id", block_id)?;
-            write.identity("kind", &input.kind)?;
-            prepared_inputs.push(TagMintInput {
-                block_id: input.block_id.clone(),
-                kind: input.kind.clone(),
-                token_count: input.token_count,
-                source_bytes: write.bytes("source_bytes", &input.source_bytes)?,
+            let existed = existing_ids.contains(block_id);
+            let first_scan = write.scans.len();
+            if existed {
+                // Existing block ids are valid during replay.
+                write.existing_identity("block_id", block_id)?;
+                write.existing_identity("kind", &input.kind)?;
+            } else {
+                write.identity("block_id", block_id)?;
+                write.identity("kind", &input.kind)?;
+            }
+            let mut insert_refusal = write.scans[first_scan..]
+                .iter()
+                .any(|scan| !scan.redaction.detections.is_empty())
+                .then(|| McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+            let source_bytes = match write.bytes("source_bytes", &input.source_bytes) {
+                Ok(prepared) => prepared,
+                Err(error) if existed => {
+                    // Bytes the transaction never stores must not fail the call.
+                    insert_refusal = insert_refusal.or(Some(error));
+                    input.source_bytes.clone()
+                }
+                Err(error) => return Err(error),
+            };
+            prepared_inputs.push(PreparedTagMint {
+                input: TagMintInput {
+                    block_id: input.block_id.clone(),
+                    kind: input.kind.clone(),
+                    token_count: input.token_count,
+                    source_bytes,
+                },
+                insert_refusal,
             });
         }
         write.execute(&self.inner, |coordinated| {
             let tx = coordinated.tx();
             let mut out = Vec::with_capacity(inputs.len());
             let mut inserted = false;
-            for input in &prepared_inputs {
+            for prepared in prepared_inputs {
+                let PreparedTagMint {
+                    input,
+                    insert_refusal,
+                } = prepared;
                 let block_id = input.block_id.trim();
                 if block_id.is_empty() {
                     continue;
@@ -8413,6 +8451,11 @@ impl McStore {
                 {
                     out.push(row);
                     continue;
+                }
+                if let Some(error) = insert_refusal {
+                    // The unfenced read saw a row with this identity, but no row survives in
+                    // this transaction.
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
                 }
                 let next = tx
                     .prepare_cached(
@@ -9253,19 +9296,13 @@ impl McStore {
             active_scan_owner_key(&["wrapup", record.command_id]),
         );
         write.existing_identity("session_id", record.session_id)?;
-        let writes_terminal = existing
-            .as_ref()
-            .is_none_or(|row| row.disposition == "failed");
         if existing.is_none() {
             write.identity("command_id", record.command_id)?;
         } else {
             write.existing_identity("command_id", record.command_id)?;
         }
-        let summary = if !writes_terminal {
-            record.summary.to_string()
-        } else {
-            write.content("summary", record.summary)?
-        };
+        let command_id_flagged = write.recorded_detections(&["command_id"]);
+        let summary = write.content("summary", record.summary)?;
         let rounds = i64::try_from(record.rounds)
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
         write.execute(&self.inner, |coordinated| {
@@ -9298,22 +9335,31 @@ impl McStore {
                     },
                 ));
             }
-            let legacy_failure_created_at = transaction
+            let durable_row = transaction
                 .query_row(
                     "SELECT disposition, created_at FROM mc_wrapup_commands
                      WHERE session_id = ?1 AND command_id = ?2",
                     params![record.session_id, record.command_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .optional()?
-                .and_then(|(disposition, created_at)| {
-                    (disposition == "failed").then_some(created_at)
-                });
+                .optional()?;
+            if command_id_flagged && durable_row.is_none() {
+                // A flagged command ID must resolve to a durable row in this transaction.
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["command_id"])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
+            let legacy_failure_created_at = durable_row.and_then(|(disposition, created_at)| {
+                (disposition == "failed").then_some(created_at)
+            });
+            let mut wrote = false;
             if let Some(failed_created_at) = legacy_failure_created_at {
                 // A failed audit row is not replayable. Replace it in this fenced
                 // transaction so a lost successful response becomes durable idempotency.
                 let summary = wrapup_replaced_failure_summary(&summary, failed_created_at);
-                transaction.execute(
+                wrote |= transaction.execute(
                     "UPDATE mc_wrapup_commands
                      SET disposition = ?3, rounds = ?4, summary = ?5, created_at = ?6
                      WHERE session_id = ?1 AND command_id = ?2 AND disposition = 'failed'",
@@ -9325,10 +9371,10 @@ impl McStore {
                         summary,
                         record.created_at
                     ],
-                )?;
+                )? > 0;
             }
 
-            transaction.execute(
+            wrote |= transaction.execute(
                 "INSERT OR IGNORE INTO mc_wrapup_commands
                      (session_id, command_id, disposition, rounds, summary, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -9340,7 +9386,7 @@ impl McStore {
                     summary,
                     record.created_at
                 ],
-            )?;
+            )? > 0;
             let row = transaction.query_row(
                 "SELECT disposition, rounds, summary, created_at
                  FROM mc_wrapup_commands
@@ -9357,7 +9403,8 @@ impl McStore {
                 },
             )?;
             let outcome = RecordWrapupCommandOutcome::Recorded(row);
-            Ok(if writes_terminal {
+            // Scan receipts must not describe a summary the durable row does not hold.
+            Ok(if wrote {
                 WriteDisposition::Applied(outcome)
             } else {
                 WriteDisposition::Replay(outcome)
@@ -18642,6 +18689,62 @@ mod tests {
                 ("cmd-normal".to_string(), None),
             ]
         );
+    }
+
+    /// A legacy row can carry a block id the scanner now flags.
+    /// Re-minting an existing flagged block ID preserves its identity and returns its row.
+    #[test]
+    fn a_flagged_block_id_that_already_has_a_row_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .execute_tag_sql_for_test(
+                "INSERT INTO mc_tags
+                     (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                 VALUES ('ses', 1, 'api_key=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q', 'message', 4, 100, X'')",
+            )
+            .unwrap();
+        let rows = store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: "api_key=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 4,
+                    source_bytes: b"body".to_vec(),
+                }],
+                200,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tag_number, 1);
+    }
+
+    /// Without a durable row, a flagged block ID is new and must not be minted.
+    #[test]
+    fn a_flagged_block_id_without_a_row_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let error = store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: "api_key=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 4,
+                    source_bytes: b"body".to_vec(),
+                }],
+                200,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "{error:?}"
+        );
+        assert!(store.load_tags_for_session("ses").unwrap().is_empty());
     }
 
     #[test]
