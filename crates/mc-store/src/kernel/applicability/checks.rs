@@ -94,7 +94,7 @@ pub fn run_cheap_check(
                 }
             };
             let mut content = String::with_capacity(metadata.len() as usize);
-            let Ok(_) = file.read_to_string(&mut content) else {
+            let Ok(_) = file.by_ref().take(u64::MAX).read_to_string(&mut content) else {
                 return CheckOutcome::Failed {
                     evidence: format!("config file {path} is missing or unreadable"),
                 };
