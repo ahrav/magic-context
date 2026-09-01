@@ -489,6 +489,7 @@ impl std::error::Error for ScopeFormError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalScope {
     terms: BTreeMap<Dimension, TermValue>,
+    version_requirements: BTreeMap<Dimension, semver::VersionReq>,
 }
 
 impl CanonicalScope {
@@ -497,6 +498,7 @@ impl CanonicalScope {
     /// malformed.
     pub fn from_term_specs(terms: &[ScopeTermSpec]) -> Result<Self, ScopeFormError> {
         let mut canonical = BTreeMap::new();
+        let mut version_requirements = BTreeMap::new();
         for term in terms {
             let dimension = Dimension::from_stored(&term.dimension)
                 .ok_or_else(|| ScopeFormError::UnknownDimension(term.dimension.clone()))?;
@@ -504,14 +506,25 @@ impl CanonicalScope {
             if canonical.insert(dimension, value).is_some() {
                 return Err(ScopeFormError::DuplicateDimension(dimension));
             }
+            if let Some(TermValue::VersionRange(raw)) = canonical.get(&dimension) {
+                version_requirements.insert(
+                    dimension,
+                    semver::VersionReq::parse(raw)
+                        .expect("canonical version ranges were validated while decoding"),
+                );
+            }
         }
-        Ok(Self { terms: canonical })
+        Ok(Self {
+            terms: canonical,
+            version_requirements,
+        })
     }
 
     /// The empty scope constrains nothing and matches every context.
     pub fn unconstrained() -> Self {
         Self {
             terms: BTreeMap::new(),
+            version_requirements: BTreeMap::new(),
         }
     }
 
@@ -523,6 +536,10 @@ impl CanonicalScope {
 
     pub fn term(&self, dimension: Dimension) -> Option<&TermValue> {
         self.terms.get(&dimension)
+    }
+
+    fn version_requirement(&self, dimension: Dimension) -> Option<&semver::VersionReq> {
+        self.version_requirements.get(&dimension)
     }
 
     fn has_placeholder(&self) -> bool {
@@ -978,6 +995,10 @@ fn version_req_interval(raw: &str) -> Option<VersionInterval> {
 
 fn version_req_matches(raw: &str, value: &str) -> Option<bool> {
     let req = semver::VersionReq::parse(raw).ok()?;
+    parsed_version_req_matches(&req, value)
+}
+
+fn parsed_version_req_matches(req: &semver::VersionReq, value: &str) -> Option<bool> {
     let version = coerce_version(value)?;
     Some(req.matches(&version))
 }
@@ -1138,6 +1159,7 @@ fn ranges_overlap(
 
 fn term_matches(
     term: &TermValue,
+    version_requirement: Option<&semver::VersionReq>,
     dimension: Dimension,
     ctx: &ScopeMatchContext,
     oracle: &dyn GraphOracle,
@@ -1165,7 +1187,10 @@ fn term_matches(
         TermValue::Exact(expected) => bool_outcome(expected == value),
         TermValue::Set(values) => bool_outcome(values.contains(value)),
         TermValue::Range { start, end } => bool_outcome(range_contains(start, end, value)),
-        TermValue::VersionRange(req) => match version_req_matches(req, value) {
+        TermValue::VersionRange(_) => match parsed_version_req_matches(
+            version_requirement.expect("canonical version range has a parsed requirement"),
+            value,
+        ) {
             Some(holds) => bool_outcome(holds),
             None => MatchOutcome::Uncertain,
         },
@@ -1190,7 +1215,13 @@ pub fn scope_matches(
 ) -> MatchOutcome {
     let mut outcome = MatchOutcome::Matches;
     for (dimension, term) in scope.terms() {
-        match term_matches(term, dimension, ctx, oracle) {
+        match term_matches(
+            term,
+            scope.version_requirement(dimension),
+            dimension,
+            ctx,
+            oracle,
+        ) {
             MatchOutcome::DoesNotMatch => return MatchOutcome::DoesNotMatch,
             MatchOutcome::Uncertain => outcome = MatchOutcome::Uncertain,
             MatchOutcome::Matches => {}
