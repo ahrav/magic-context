@@ -35,7 +35,7 @@ Overlay SHA-256: `da1d1a957374bc48630c247988e09678b8405fde99a7685ff2b17fb36c4508
 The overlay is original Magic Context compatibility policy and is not copied from
 Gossip-rs. Its vendor rules reuse the lengths, alphabets, entropy floors, and
 offline validators of the corpus rule for the same credential, so a credential
-matched by both rule sets resolves to one verdict. Two bounded departures from
+matched by both rule sets resolves to one verdict. Three bounded departures from
 that parity are deliberate:
 
 - Where a corpus rule terminates on an explicit delimiter class, the overlay
@@ -44,6 +44,14 @@ that parity are deliberate:
 - The format and keyed-value rules (`magic-jwt`, `magic-bearer-token`,
   `magic-keyed-*`) are local policy for text the corpus does not cover, so they
   are broader by construction and carry their own `value_suppressors_any`.
+- `magic-anthropic-api-key` keeps the shape the previous Magic Context redaction
+  engine matched, `sk-ant-` with an optional `api03-` or `admin01-` label and a
+  32-character-or-longer body, rather than the fixed 93-character body and `AA`
+  suffix that `anthropic-api-key` and `anthropic-admin-api-key` require. The
+  overlay therefore reports `sk-ant-` candidates the corpus rejects. Narrowing it
+  to the corpus shape would stop redacting credentials the engine it replaces
+  redacted, so the broader shape is the conservative choice here; `upstream_parity`
+  stays set so the engine safelists still run against those candidates.
 
 Anchor matching is case-insensitive, and the pinned corpus already depends on
 this: `aiza`, `t3blbkfj`, and `zxlk` are the only anchors recorded for regexes

@@ -83,6 +83,65 @@ fn dense_maximum_input_succeeds() {
     assert!(!redaction.detections.is_empty());
 }
 
+/// An AWS access key ID with a shape the corpus rule accepts and no safelisted word.
+const AWS_KEY: &str = "AKIAQYLPMN5HGZ3ABCDE";
+const AGE_KEY: &str = "AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE";
+
+#[test]
+fn overlapping_findings_collapse_to_one_placeholder_over_their_union() {
+    // A keyed value class admits `-`, so the keyed span reaches past the provider or
+    // upstream shape nested inside it. Replacing per finding would emit a second
+    // placeholder for the trailing bytes and leave them described as their own secret.
+    for (input, expected, secret_type) in [
+        (
+            format!("token={AWS_KEY}-prod"),
+            "token=<REDACTED:token>",
+            "token",
+        ),
+        (
+            format!("password={AGE_KEY}-prod"),
+            "password=<REDACTED:password>",
+            "password",
+        ),
+    ] {
+        let redaction = redact_durable_text(&input);
+        assert_eq!(redaction.text, expected, "{input}");
+        assert_eq!(redaction.detections.len(), 1, "{input}");
+        let detection = &redaction.detections[0];
+        assert_eq!(detection.secret_type, secret_type, "{input}");
+        // The detection covers the whole redacted region, so a consumer reading it
+        // back against the pre-redaction text sees the bytes that were replaced.
+        let value_start = input.find('=').unwrap() + 1;
+        assert_eq!(detection.offset, value_start, "{input}");
+        assert_eq!(detection.length, input.len() - value_start, "{input}");
+        assert!(!redaction.text.contains("-prod"), "{input}");
+    }
+}
+
+#[test]
+fn a_key_name_supersedes_a_value_shape_on_the_same_span() {
+    // The key name states the operator's intent for the value, so it outranks a
+    // provider shape that matches the same bytes. Without a declared precedence the
+    // winner would follow incidental finding order and flip on a regex edit.
+    let redaction = redact_durable_text(&format!("token={AWS_KEY}"));
+    assert_eq!(redaction.text, "token=<REDACTED:token>");
+    assert_eq!(redaction.detections.len(), 1);
+    assert_eq!(redaction.detections[0].secret_type, "token");
+}
+
+#[test]
+fn a_value_shape_keeps_its_own_label_without_a_key_name() {
+    for (input, expected, secret_type) in [
+        (AWS_KEY, "<AWS_ACCESS_KEY_ID_REDACTED>", "aws_access_key_id"),
+        (AGE_KEY, "<REDACTED:secret>", "secret"),
+    ] {
+        let redaction = redact_durable_text(input);
+        assert_eq!(redaction.text, expected, "{input}");
+        assert_eq!(redaction.detections.len(), 1, "{input}");
+        assert_eq!(redaction.detections[0].secret_type, secret_type, "{input}");
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
@@ -93,6 +152,10 @@ proptest! {
         let input = format!("{prefix}\npassword=property-secret\n{suffix}");
         let redaction = redactor().redact(&input).unwrap();
         prop_assert!(!redaction.detections.is_empty());
+        // Valid spans alone would also hold for an engine that reported the secret and
+        // then emitted it verbatim, so assert the replacement actually happened.
+        prop_assert!(redaction.text.contains("<REDACTED:password>"));
+        prop_assert!(!redaction.text.contains("password=property-secret"));
         for detection in redaction.detections {
             let end = detection.offset + detection.length;
             prop_assert!(end <= input.len());

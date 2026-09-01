@@ -1,3 +1,5 @@
+use std::{cmp::Reverse, mem};
+
 use mc_secret_scanner::{Finding, RuleSource};
 
 use super::{
@@ -45,11 +47,20 @@ fn is_known_rule(rule_id: &str) -> bool {
     provider_label(rule_id).is_some() || KEYED_RULE_IDS.contains(&rule_id)
 }
 
+/// Precedence among findings that cover overlapping bytes; the lowest value wins.
+///
+/// A key name states the operator's own intent for the value, so it outranks a
+/// value-shape guess. An unclassified upstream shape ranks last because its
+/// label carries no provider or key information.
+const KEYED_PRECEDENCE: u8 = 0;
+const PROVIDER_PRECEDENCE: u8 = 1;
+const GENERIC_PRECEDENCE: u8 = 2;
+
 #[derive(Debug)]
 struct Replacement {
     start: usize,
     end: usize,
-    /// Lowest `specificity` wins when findings share a span.
+    /// Lowest `specificity` supplies the label when findings overlap.
     specificity: u8,
     secret_type: String,
     replacement: String,
@@ -59,9 +70,6 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
     let mut replacements = Vec::with_capacity(findings.len());
     for finding in findings {
         let value = finding.value_span;
-        input
-            .get(finding.full_span.start()..finding.full_span.end())
-            .ok_or_else(invalid_span)?;
         input
             .get(value.start()..value.end())
             .ok_or_else(invalid_span)?;
@@ -81,8 +89,15 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
             value.end(),
         )?);
     }
-    replacements
-        .sort_by_key(|replacement| (replacement.start, replacement.end, replacement.specificity));
+    // Widest span first so a cluster's union is known from its first member, then
+    // most specific, so `render` can pick a winner without rescanning.
+    replacements.sort_by(|left, right| {
+        (left.start, Reverse(left.end), left.specificity).cmp(&(
+            right.start,
+            Reverse(right.end),
+            right.specificity,
+        ))
+    });
     render(input, replacements)
 }
 
@@ -98,7 +113,7 @@ fn describe(
         return Ok(Replacement {
             start,
             end,
-            specificity: 0,
+            specificity: KEYED_PRECEDENCE,
             replacement: format!("<REDACTED:{secret_type}>"),
             secret_type,
         });
@@ -107,7 +122,7 @@ fn describe(
         return Ok(Replacement {
             start,
             end,
-            specificity: 0,
+            specificity: PROVIDER_PRECEDENCE,
             secret_type: label.secret_type.to_owned(),
             replacement: label.replacement.to_owned(),
         });
@@ -120,33 +135,45 @@ fn describe(
     Ok(Replacement {
         start,
         end,
-        specificity: 1,
+        specificity: GENERIC_PRECEDENCE,
         secret_type: "secret".to_owned(),
         replacement: "<REDACTED:secret>".to_owned(),
     })
 }
 
-fn render(input: &str, replacements: Vec<Replacement>) -> Result<Redaction, RedactionError> {
+fn render(input: &str, mut replacements: Vec<Replacement>) -> Result<Redaction, RedactionError> {
     let mut text = String::with_capacity(input.len());
     let mut detections = Vec::with_capacity(replacements.len());
     let mut cursor = 0;
-    for replacement in replacements {
-        if replacement.end <= cursor {
-            continue;
+    let mut index = 0;
+    while index < replacements.len() {
+        // One placeholder covers the whole union of an overlapping cluster. Emitting
+        // per finding instead would repeat a placeholder for bytes an earlier finding
+        // already replaced, and leave any byte past that finding's end in cleartext.
+        let start = replacements[index].start;
+        let mut end = replacements[index].end;
+        let mut winner = index;
+        let mut next = index + 1;
+        while next < replacements.len() && replacements[next].start < end {
+            if replacements[next].specificity < replacements[winner].specificity {
+                winner = next;
+            }
+            end = end.max(replacements[next].end);
+            next += 1;
         }
-        let start = replacement.start.max(cursor);
+
+        // A cluster is maximal, so `start` never precedes `cursor`; a span that
+        // violated that would make this range invalid and fail the redaction closed.
         text.push_str(input.get(cursor..start).ok_or_else(invalid_span)?);
-        text.push_str(&replacement.replacement);
+        text.push_str(&replacements[winner].replacement);
         detections.push(Detection {
             detector_id: DETECTOR_ID,
-            secret_type: replacement.secret_type,
+            secret_type: mem::take(&mut replacements[winner].secret_type),
             offset: start,
-            length: replacement
-                .end
-                .checked_sub(start)
-                .ok_or_else(invalid_span)?,
+            length: end.checked_sub(start).ok_or_else(invalid_span)?,
         });
-        cursor = replacement.end;
+        cursor = end;
+        index = next;
     }
     text.push_str(input.get(cursor..).ok_or_else(invalid_span)?);
     Ok(Redaction { text, detections })
