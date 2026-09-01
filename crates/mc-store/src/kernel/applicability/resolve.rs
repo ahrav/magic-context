@@ -3,7 +3,7 @@
 //! fallback ladder with stop-on-ambiguity.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use gix::ObjectId;
 use sha2::{Digest, Sha256};
@@ -57,6 +57,8 @@ pub struct ResolutionLadder<'s> {
     snapshot: &'s CheckoutSnapshot,
     budget: &'s EvalBudget,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
+    graph: RefCell<Option<gix::revwalk::Graph<'s, 's, gix::revwalk::graph::Commit<u64>>>>,
+    graph_query: Cell<u64>,
     window: RefCell<Option<Vec<ObjectId>>>,
     graph_operations: Cell<u64>,
 }
@@ -67,6 +69,8 @@ impl<'s> ResolutionLadder<'s> {
             snapshot,
             budget,
             ancestry_cache: RefCell::new(HashMap::new()),
+            graph: RefCell::new(None),
+            graph_query: Cell::new(0),
             window: RefCell::new(None),
             graph_operations: Cell::new(0),
         }
@@ -309,6 +313,65 @@ impl<'s> ResolutionLadder<'s> {
     /// unreachable. Budget exhaustion or missing objects answer unknown.
     fn walk_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
         self.count_graph_operation();
+        if self
+            .snapshot
+            .repo()
+            .shallow_commits()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return self.walk_ancestry_revwalk(ancestor, descendant);
+        }
+        let mut graph = self.graph.borrow_mut();
+        let graph = graph.get_or_insert_with(|| self.snapshot.revision_graph());
+        let ancestor_generation = graph
+            .get_or_insert_commit(ancestor, |_| {})
+            .ok()??
+            .generation;
+        let mut query = self.graph_query.get().wrapping_add(1);
+        if query == 0 {
+            graph.clear_commit_data(|seen| *seen = 0);
+            query = 1;
+        }
+        self.graph_query.set(query);
+
+        let mut pending = VecDeque::from([descendant]);
+        let mut steps = 0usize;
+        while let Some(id) = pending.pop_front() {
+            if self.budget.is_exhausted() {
+                return None;
+            }
+            let mut seen = false;
+            let commit = graph
+                .get_or_insert_commit(id, |last_query| {
+                    seen = *last_query == query;
+                    *last_query = query;
+                })
+                .ok()??;
+            if seen {
+                continue;
+            }
+            if steps >= ANCESTRY_WALK_CAP {
+                return None;
+            }
+            steps += 1;
+            if id == ancestor {
+                return Some(true);
+            }
+            if commit
+                .generation
+                .zip(ancestor_generation)
+                .is_some_and(|(generation, ancestor)| generation < ancestor)
+            {
+                continue;
+            }
+            pending.extend(commit.parents.iter().copied());
+        }
+        Some(false)
+    }
+
+    fn walk_ancestry_revwalk(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
             return None;

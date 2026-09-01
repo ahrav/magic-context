@@ -1,6 +1,7 @@
 //! Checkout snapshots: worktree-aware open, HEAD resolution, and a
 //! content-addressed dirty fingerprint, taken once per request.
 
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,6 +107,7 @@ pub struct CheckoutSnapshot {
     head: String,
     dirty_fingerprint: String,
     dirty_entries: Vec<DirtyEntry>,
+    commit_graph: OnceCell<Option<gix::commitgraph::Graph>>,
 }
 
 impl CheckoutSnapshot {
@@ -142,6 +144,15 @@ impl CheckoutSnapshot {
 
     pub(crate) fn repo(&self) -> &gix::Repository {
         &self.repo
+    }
+
+    pub(crate) fn revision_graph<T>(
+        &self,
+    ) -> gix::revwalk::Graph<'_, '_, gix::revwalk::graph::Commit<T>> {
+        let commit_graph = self
+            .commit_graph
+            .get_or_init(|| self.repo.commit_graph_if_enabled().ok().flatten());
+        self.repo.revision_graph(commit_graph.as_ref())
     }
 
     /// Absolute path of a repo-relative worktree file.
@@ -193,6 +204,7 @@ pub fn snapshot_checkout(
         head,
         dirty_fingerprint,
         dirty_entries,
+        commit_graph: OnceCell::new(),
     })
 }
 
