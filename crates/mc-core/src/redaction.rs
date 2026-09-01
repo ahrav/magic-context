@@ -72,6 +72,10 @@ pub enum RedactionErrorKind {
     WorkLimit,
     InvalidSpan,
     UnknownRule,
+    /// A field that must stay verbatim was found to hold a secret, so the
+    /// write is refused rather than redacted: redaction would alias
+    /// distinct values onto one placeholder.
+    SecretDetected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +99,7 @@ impl fmt::Display for RedactionError {
             RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
             RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
             RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
+            RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
         })
     }
 }
@@ -150,8 +155,24 @@ impl Redactor {
 
 static REDACTOR: LazyLock<Result<Redactor, RedactionError>> = LazyLock::new(Redactor::new);
 
+/// Transaction bodies carry many fields at once, so they scan under higher
+/// candidate and work ceilings than a single durable field. Without them a
+/// large transaction would exhaust the default budget and be replaced whole.
+const TRANSACTION_SCAN_LIMITS: ScanLimits = ScanLimits {
+    max_input_bytes: mc_secret_scanner::MAX_INPUT_BYTES,
+    max_candidates: 131_072,
+    max_work_bytes: 1024 * 1024 * 1024,
+};
+
+static TRANSACTION_REDACTOR: LazyLock<Result<Redactor, RedactionError>> =
+    LazyLock::new(|| Redactor::with_limits(TRANSACTION_SCAN_LIMITS));
+
 pub fn redact_durable_text(input: &str) -> Redaction {
-    match REDACTOR
+    redact_with(&REDACTOR, input)
+}
+
+fn redact_with(redactor: &Result<Redactor, RedactionError>, input: &str) -> Redaction {
+    match redactor
         .as_ref()
         .map_err(|error| *error)
         .and_then(|redactor| redactor.redact(input))
@@ -169,12 +190,99 @@ pub fn redact_durable_text(input: &str) -> Redaction {
     }
 }
 
+/// Redacts a transaction body under the transaction ceilings. Fails closed
+/// the same way `redact_durable_text` does.
+pub fn redact_transaction_durable_text(input: &str) -> Redaction {
+    redact_with(&TRANSACTION_REDACTOR, input)
+}
+
+/// Identifies the detector build that produced a redaction, for the audit
+/// receipt a durable write records alongside it.
+pub fn detector_revision() -> String {
+    REDACTOR.as_ref().map_or_else(
+        |_| "unavailable".to_owned(),
+        |redactor| {
+            let revision = redactor.scanner.revision();
+            format!(
+                "{}:{}:{}",
+                revision.crate_version,
+                revision.semantic_digest_version,
+                revision.upstream_commit
+            )
+        },
+    )
+}
+
+/// Digest of the rule semantics the detector ran, or `None` when the
+/// detector could not be built.
+pub fn detector_semantic_digest() -> Option<[u8; 32]> {
+    REDACTOR
+        .as_ref()
+        .ok()
+        .map(|redactor| redactor.scanner.semantic_digest())
+}
+
+/// Refuses `input` when the scanner classifies any of it as secret. Used
+/// for fields that must stay verbatim, such as lookup keys and dedup
+/// identities, where substituting a placeholder would merge distinct
+/// values.
+pub fn reject_secret_text(input: &str) -> Result<(), RedactionError> {
+    reject(redact_durable_text(input))
+}
+
+/// Transaction-ceiling counterpart of `reject_secret_text`.
+pub fn reject_transaction_secret_text(input: &str) -> Result<(), RedactionError> {
+    reject(redact_transaction_durable_text(input))
+}
+
+fn reject(redaction: Redaction) -> Result<(), RedactionError> {
+    if redaction.detections.is_empty() {
+        Ok(())
+    } else {
+        Err(RedactionError {
+            kind: RedactionErrorKind::SecretDetected,
+        })
+    }
+}
+
+/// Label for a key whose name alone marks its value secret, so a value
+/// written under it is replaced even when the scanner finds nothing in it.
+/// `None` when the name carries no secret word.
+pub fn secret_key_label(key: &str) -> Option<String> {
+    key_names_a_secret(key).then(|| redaction_type_for_key(key))
+}
+
+fn key_names_a_secret(key: &str) -> bool {
+    separate_words(key)
+        .to_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|segment| {
+            let stem = segment.strip_suffix('s').unwrap_or(segment);
+            LABEL_WORDS.contains(&stem)
+        })
+}
+
 #[must_use]
 pub fn contains_redaction_token(text: &str) -> bool {
     text.contains("_REDACTED>") || text.contains("<REDACTED:")
 }
 
 fn redaction_type_for_key(key: &str) -> String {
+    let label = separate_words(key)
+        .to_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|segment| is_label_segment(segment))
+        .collect::<Vec<_>>()
+        .join("_");
+    if label.is_empty() {
+        "secret".to_owned()
+    } else {
+        label
+    }
+}
+
+/// Splits camel case so `apiKey` yields the same segments as `api_key`.
+fn separate_words(key: &str) -> String {
     let mut separated = String::with_capacity(key.len() + 8);
     let mut previous: Option<char> = None;
     for character in key.chars() {
@@ -187,18 +295,7 @@ fn redaction_type_for_key(key: &str) -> String {
         separated.push(character);
         previous = Some(character);
     }
-
-    let label = separated
-        .to_lowercase()
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|segment| is_label_segment(segment))
-        .collect::<Vec<_>>()
-        .join("_");
-    if label.is_empty() {
-        "secret".to_owned()
-    } else {
-        label
-    }
+    separated
 }
 
 fn is_label_segment(segment: &str) -> bool {

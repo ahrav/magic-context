@@ -508,7 +508,8 @@ fn u10_scenario_8_reseed_reproduces_state_across_restart() {
     assert_eq!(state.projects[&42].acked_effect_id, 11);
 }
 
-///
+/// A receipt stamps every row it observed, not only the rows it changed,
+/// so a restart seeded from generation stamps sees the same mirror.
 #[test]
 fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -565,7 +566,8 @@ fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches(
     );
 }
 
-///
+/// A revision identifies content, so the same revision arriving with
+/// different content is a conflict rather than an idempotent replay.
 #[test]
 fn receipt_rejects_equal_revision_carrying_different_content() {
     let dir = tempfile::tempdir().unwrap();
