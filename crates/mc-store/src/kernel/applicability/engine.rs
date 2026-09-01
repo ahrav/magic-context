@@ -214,14 +214,14 @@ impl<T> LastMemo<T> {
 }
 
 type DecodedPayload = Result<Option<ObjectApplicabilitySpec>, PayloadDecodeError>;
-type DecodedScope = Result<CanonicalScope, ScopeFormError>;
+type ScopeVerdict = Result<MatchOutcome, ScopeFormError>;
 
 #[derive(Default)]
 struct BatchMemos {
     key: [u8; 32],
     anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
     payload: LastMemo<DecodedPayload>,
-    scope: LastMemo<DecodedScope>,
+    scope: LastMemo<ScopeVerdict>,
 }
 
 #[derive(Clone, Copy)]
@@ -468,11 +468,11 @@ impl ApplicabilityEngine {
         let budget = ladder.budget();
         // Scope gate.
         if let Some(terms) = &candidate.scope_terms {
-            let scope = match memos
-                .scope
-                .get_or_insert_with(memos.key, || CanonicalScope::from_term_specs(terms))
-            {
-                Ok(scope) => scope,
+            let outcome = match memos.scope.get_or_insert_with(memos.key, || {
+                CanonicalScope::from_term_specs(terms)
+                    .map(|scope| scope_matches(&scope, scope_context, ladder))
+            }) {
+                Ok(outcome) => *outcome,
                 Err(error) => {
                     return Classification::terminal(
                         ApplicabilityState::Uncertain,
@@ -480,7 +480,7 @@ impl ApplicabilityEngine {
                     );
                 }
             };
-            match scope_matches(scope, scope_context, ladder) {
+            match outcome {
                 MatchOutcome::Matches => {}
                 MatchOutcome::DoesNotMatch => {
                     return Classification::terminal(
