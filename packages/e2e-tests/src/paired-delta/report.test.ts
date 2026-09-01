@@ -79,6 +79,7 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         poolManifestFingerprint: H1,
         pinnedSnapshotId: "anthropic-model-20260830",
         policyDocument: policy,
+        implementationCommit: "abc123",
         pairs,
         analysis: analysisFixture(policy.policyFingerprint),
         runSummary: {
@@ -185,6 +186,7 @@ describe("paired-delta report", () => {
                 policy: { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0.1 },
                 policyFingerprint: built.body.policyFingerprint,
             },
+            implementationCommit: "abc123",
             pairs,
             analysis: built.body.analysis,
             exclusions: [],
@@ -210,6 +212,7 @@ describe("paired-delta report", () => {
                 policy: {},
                 policyFingerprint: H2,
             },
+            implementationCommit: "abc123",
             pairs,
             analysis: built.body.analysis,
             exclusions: [],
@@ -500,6 +503,8 @@ describe("paired-delta calibration record", () => {
         expect(built.measuredCostUsd).toBe(18 * 1.25);
         expect(built.estimatedReserveUsd).toBe(1.25);
         expect(built.retrySpendUsd).toBe(0.75);
+        // Duration is the surviving attempts only: the record keeps prior spend, not prior wall clock.
+        expect(built.finalAttemptWallClockMs).toBe(19 * 1000);
     });
 
     it("ignores coordinates whose paired baseline arms did not complete", () => {

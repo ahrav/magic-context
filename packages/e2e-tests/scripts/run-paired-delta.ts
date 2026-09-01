@@ -123,7 +123,9 @@ function parseArgs(argv: string[]): CliArgs {
     let mode: Mode | null = null;
     let recordsPath: string | null = null;
     let reportPath: string | null = null;
-    let calibrationRecordPath = "artifacts/paired-delta-calibration.json";
+    /** Relative to this file, not the working directory: the CLI runs from the repository root, where a bare `artifacts/` is unignored and its contents would enter the implementation digest. */
+    const artifacts = resolve(import.meta.dir, "../artifacts");
+    let calibrationRecordPath: string | null = null;
     let resume = false;
     let maxCostUsd: number | null = null;
     let deadlineMinutes: number | null = null;
@@ -166,9 +168,11 @@ function parseArgs(argv: string[]): CliArgs {
     const stem = selected === "smoke" ? "paired-delta-smoke" : `paired-delta-${selected}`;
     return {
         mode: selected,
-        recordsPath: resolve(recordsPath ?? `artifacts/${stem}-records.json`),
-        reportPath: resolve(reportPath ?? `artifacts/${stem}-report.json`),
-        calibrationRecordPath: resolve(calibrationRecordPath),
+        recordsPath: resolve(recordsPath ?? join(artifacts, `${stem}-records.json`)),
+        reportPath: resolve(reportPath ?? join(artifacts, `${stem}-report.json`)),
+        calibrationRecordPath: resolve(
+            calibrationRecordPath ?? join(artifacts, "paired-delta-calibration.json"),
+        ),
         resume,
         maxCostUsd: selected === "smoke" ? maxCostUsd ?? 100 : maxCostUsd,
         deadlineMinutes: deadline,
@@ -185,7 +189,7 @@ function relativeTo(root: string, target: string): string | null {
 }
 
 /** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change run report success without executing the changed code. commentlint: allow(JUDGE) */
-function recordsRepoCommit(recordsPath: string): string {
+function recordsRepoCommit(ownedPaths: readonly string[]): string {
     const started = resolve(import.meta.dir, "..");
     const at = (cwd: string) => (args: string[]): string => {
         const run = Bun.spawnSync(["git", ...args], { cwd });
@@ -204,15 +208,16 @@ function recordsRepoCommit(recordsPath: string): string {
     /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
     const relative = (path: string): string | null => relativeTo(root, path);
     /** The exact paths are excluded as literals because they come from `--records`: a value carrying pathspec metacharacters — `artifacts/run[1].json` — would otherwise exclude unrelated matching paths, dropping their changes from the status, the diff, and the untracked hash, so a resume could reuse records produced against different working code. commentlint: allow(JUDGE) */
-    const exact = [recordsPath, `${recordsPath}.lock`]
+    const exact = ownedPaths.flatMap((path) => [path, `${path}.lock`])
         .map(relative)
         .filter((path): path is string => path !== null)
         .map((path) => `:(exclude,literal)${path}`);
     /** The suffix families need pattern meaning, so they cannot be literal; the caller-supplied prefix is escaped instead, leaving only the trailing `*` as a wildcard. commentlint: allow(JUDGE) */
     const escapeGlob = (path: string): string => path.replace(/[\\[\]*?]/g, "\\$&");
-    const globbed = [".lock.reclaimed-", ".tmp-"]
-        .map((suffix) => {
-            const prefix = relative(`${recordsPath}${suffix}`);
+    const globbed = ownedPaths
+        .flatMap((path) => [".lock.reclaimed-", ".tmp-"].map((suffix) => `${path}${suffix}`))
+        .map((owned) => {
+            const prefix = relative(owned);
             return prefix === null ? null : `:(exclude)${escapeGlob(prefix)}*`;
         })
         .filter((path): path is string => path !== null);
@@ -386,7 +391,7 @@ async function runSmoke(args: CliArgs): Promise<void> {
         {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
-            repoCommit: recordsRepoCommit(args.recordsPath),
+            repoCommit: recordsRepoCommit([args.recordsPath, args.reportPath, args.calibrationRecordPath]),
             pinnedProviderId: "mock-live",
             pinnedSnapshotId: "mock-snapshot-2026-08-31",
             replicateCount: 1,
@@ -833,13 +838,13 @@ export function createLiveDependencies(input: {
 
 /**
  * A completion word is only a claim when it is not negated: `invalidSuccess` counts an arm asserting success it did not achieve, so a refusal that says "not done" is the opposite of the thing being measured.
- * The negation window is deliberately narrow, covering the contraction and auxiliary forms a refusal uses rather than attempting sentence parsing.
+ * The window covers the bare negations plus any `n't` contraction, which reaches `haven't`, `isn't`, and `wasn't` without enumerating auxiliaries, rather than attempting sentence parsing.
  */
 export function claimsCompletion(text: string): boolean {
     const completion = /\b(?:done|completed|finished|complete)\b/gi;
     for (const match of text.matchAll(completion)) {
         const before = text.slice(Math.max(0, match.index - 40), match.index).toLowerCase();
-        if (/\b(?:not|never|cannot|can't|couldn't|didn't|doesn't|won't|unable|failed|without)\b[\s\w,'-]*$/.test(before)) {
+        if (/(?:\b(?:not|never|cannot|unable|failed|without|no)\b|n't)[\s\w,'-]*$/.test(before)) {
             continue;
         }
         return true;
@@ -941,6 +946,9 @@ function buildAnalysis(
 
 const BOOTSTRAP_SEED = 20260831;
 
+/** The one endpoint `buildAnalysis` estimates. A policy naming another is rejected rather than silently estimating this one. */
+const SUPPORTED_ENDPOINT = "paired-valid-success-delta";
+
 /** Bound on R1 database reseeds. Each attempt draws fresh 32-hex ids, so exhausting the bound is a contract failure rather than bad luck, and it is reported as one. */
 const R1_RESEED_ATTEMPTS = 8;
 
@@ -1033,6 +1041,13 @@ async function runLive(args: CliArgs): Promise<void> {
     if (!model || !/-\d{8}$/.test(model.modelId)) {
         throw new Error("paired-delta policy requires a dated model snapshot");
     }
+    /** `buildAnalysis` computes one endpoint unconditionally, so a policy naming a different one would publish a fingerprint claiming an estimator this lane does not implement. */
+    if (policy.endpoint !== SUPPORTED_ENDPOINT) {
+        throw new Error(
+            `paired-delta lane implements ${SUPPORTED_ENDPOINT}; the policy declares ` +
+            `${policy.endpoint}`,
+        );
+    }
     /** The estimator runs only after the experiment, so its own floor is checked before the budget is spent. */
     if (policy.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES) {
         throw new Error(
@@ -1045,7 +1060,7 @@ async function runLive(args: CliArgs): Promise<void> {
      * Calibration evidence is validated before the first provider call rather than after the experiment.
      * A weekly or release dispatch with a missing or unbound record would otherwise spend its whole budget and then discard the result.
      */
-    const implementationCommit = recordsRepoCommit(args.recordsPath);
+    const implementationCommit = recordsRepoCommit([args.recordsPath, args.reportPath, args.calibrationRecordPath]);
     let noiseFloors: FamilyNoiseFloor[] = [];
     if (mode !== "calibration") {
         if (!existsSync(args.calibrationRecordPath)) {
@@ -1078,6 +1093,14 @@ async function runLive(args: CliArgs): Promise<void> {
     // The fingerprinted policy documents the executed configuration, so the
     // context limit it pins must match what the scenarios actually request.
     for (const scenario of scenarios) {
+        /** Rejected here rather than mid-rollout: the throw inside `run` lands after earlier user turns have already billed, and records every arm as a harness failure. */
+        const authored = scenario.turnScript.find(({ role }) => role !== "user");
+        if (authored) {
+            throw new Error(
+                `paired-delta live lane replays authored user turns only; ` +
+                `${scenario.scenarioId} declares a ${authored.role} turn (${authored.id})`,
+            );
+        }
         if (scenario.modelContextLimit !== model.contextLimit) {
             throw new Error(
                 `paired-delta policy pins contextLimit ${model.contextLimit} but ` +
@@ -1150,6 +1173,7 @@ async function runLive(args: CliArgs): Promise<void> {
         poolManifestFingerprint: manifestFingerprint,
         pinnedSnapshotId: model.modelId,
         policyDocument: policyJson,
+        implementationCommit,
         pairs: LIVE_LANE_PAIRS,
         analysis,
         exclusions: flattenExclusions(result),

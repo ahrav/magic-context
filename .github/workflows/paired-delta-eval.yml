@@ -126,11 +126,12 @@ jobs:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
           key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.sha }}-${{ github.run_id }}
 
+      # `upload-artifact@v4` artifacts are immutable, so the attempt is part of the name: a rerun uploading under the prior attempt's name conflicts instead of replacing it.
       - name: Archive reports and rollout records
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ github.run_id }}
+          name: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: packages/e2e-tests/artifacts/
           if-no-files-found: warn
           retention-days: 30

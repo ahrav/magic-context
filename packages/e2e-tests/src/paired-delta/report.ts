@@ -48,6 +48,8 @@ export interface PairedDeltaReportBody {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
+    /** The manifest digest excludes the plugin and live runner, so a standalone artifact identifies its implementation here. */
+    implementationCommit: string;
     analysis: FamilyDeltaAnalysis;
     exclusions: ExclusionCount[];
     secondaryMetrics: SecondaryMetrics;
@@ -145,6 +147,7 @@ export function buildPairedDeltaReport(input: {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyDocument: unknown;
+    implementationCommit: string;
     pairs: readonly PairedCaseFact[];
     analysis: FamilyDeltaAnalysis;
     exclusions: readonly ExclusionCount[];
@@ -161,6 +164,9 @@ export function buildPairedDeltaReport(input: {
     requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
     if (input.pinnedSnapshotId.trim().length === 0) {
         throw new Error("paired-delta-report: pinned-snapshot-id-invalid");
+    }
+    if (input.implementationCommit.trim().length === 0) {
+        throw new Error("paired-delta-report: implementation-commit-invalid");
     }
     if (
         input.analysis.poolManifestFingerprint !== input.poolManifestFingerprint ||
@@ -211,6 +217,7 @@ export function buildPairedDeltaReport(input: {
         poolManifestFingerprint: input.poolManifestFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         policyFingerprint: policy.policyFingerprint,
+        implementationCommit: input.implementationCommit,
         analysis: input.analysis,
         exclusions,
         secondaryMetrics: {
@@ -274,7 +281,8 @@ export interface PairedDeltaCalibrationRecord {
     estimatedReserveUsd: number;
     /** Charges from superseded attempts of retried coordinates, which carry no cost source of their own on the surviving record. */
     retrySpendUsd: number;
-    measuredWallClockMs: number;
+    /** A retried coordinate keeps prior spend but not prior duration, so this is the surviving attempts' wall clock rather than lifetime wall clock. */
+    finalAttemptWallClockMs: number;
     familyNoise: CalibrationFamilyNoise[];
     decisions: CalibrationDecision;
     recordFingerprint: string;
@@ -486,7 +494,7 @@ export function buildCalibrationRecord(input: {
             (sum, record) => sum + record.priorAttemptsCostUsd,
             0,
         ),
-        measuredWallClockMs: input.records.reduce(
+        finalAttemptWallClockMs: input.records.reduce(
             (sum, record) => sum + record.wallClockMs,
             0,
         ),
