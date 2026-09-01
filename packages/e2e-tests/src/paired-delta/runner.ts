@@ -1416,8 +1416,30 @@ function finiteUsage(usage: TokenUsage): TokenUsage | null {
 }
 
 /** Prices a rollout whose real usage is unknown at the scenario's context limit in and out. commentlint: allow(JUDGE) */
-/** `scriptedCtxSearchTurn` is required of an R1 runner by the declaration contract, and it drives `runScriptedToolCall`, whose one extra prompt is billed as a `tool_use` response and its follow-up. Those two calls appear nowhere in `turnScript`, so an arm that inserts the oracle turn bills past a bound derived from the script alone. The other arms add none: R2 seeds before the session and R3 rewrites a declared turn rather than adding one. commentlint: allow(JUDGE) */
-const ORACLE_CALLS_BY_ARM: Readonly<Partial<Record<ArmId, number>>> = { r1: 2 };
+/**
+ * Extra provider calls an intervention adds beyond `turnScript`, keyed by the intervention
+ * rather than by the arm: the calls are caused by the mechanism, so an arm that adopts
+ * `scripted-retrieval` is counted without this table being touched, and a new arm reusing an
+ * existing intervention cannot be forgotten here.
+ *
+ * `scripted-retrieval` drives `scriptedCtxSearchTurn`, whose extra prompt is billed as a
+ * `tool_use` response and its follow-up. Those two calls appear nowhere in `turnScript`, so
+ * pricing from the script alone bills short. The others add none: `gold-memory` seeds before
+ * the session, `gold-evidence` rewrites a declared turn rather than adding one, and `none`
+ * leaves the script as authored.
+ *
+ * The record is total rather than partial, so adding an intervention kind is a compile error
+ * until its call cost is declared instead of silently defaulting to zero.
+ * commentlint: allow(JUDGE)
+ */
+const ORACLE_CALLS_BY_INTERVENTION: Readonly<
+    Record<InterventionDescriptor["kind"], number>
+> = {
+    none: 0,
+    "scripted-retrieval": 2,
+    "gold-memory": 0,
+    "gold-evidence": 0,
+};
 
 function worstCaseUsd(
     scenario: ScenarioDeclaration,
@@ -1435,7 +1457,9 @@ function worstCaseUsd(
         1,
         scenario.turnScript.filter(({ role }) => role === "user").length,
     );
-    const oracleCalls = armId === undefined ? 0 : ORACLE_CALLS_BY_ARM[armId] ?? 0;
+    const oracleCalls = armId === undefined
+        ? 0
+        : ORACLE_CALLS_BY_INTERVENTION[interventionFor(scenario, armId).kind];
     return perCallUsd * (billableTurns + oracleCalls);
 }
 
