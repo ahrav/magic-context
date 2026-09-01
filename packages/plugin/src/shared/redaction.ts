@@ -262,8 +262,9 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         // `turkey` end in these letters without naming a key at all, so a glued credential
         // has to be recognized positively rather than by ruling out structural words:
         // `apikey` is a credential, `hotkey` is a keystroke, `monkey` is neither.
+        /** `endsWith` rather than equality: the common all-caps form glues a vendor onto the field, so `OPENAIAPIKEY` compacts to `openaiapikey` and never equals `apikey`. An ordinary word cannot reach this by accident — `monkey` ends with no recognized prefix followed by `key`. commentlint: allow(JUDGE) */
         return CREDENTIAL_KEY_PREFIXES.some(
-            (word) => compact === `${word}key` || compact === `${word}keys`,
+            (word) => compact.endsWith(`${word}key`) || compact.endsWith(`${word}keys`),
         );
     }
     if (CREDENTIAL_TAIL_WORDS.some(endsWith)) return true;
@@ -368,13 +369,13 @@ export function urlCredentialFinding(value: string): string | null {
         if (SIGNED_URL_CREDENTIAL_PARAMS.has(key.toLowerCase())) {
             return `signed-URL credential parameter ${key}`;
         }
-        if (key.length > 0 && isCredentialBearingConfigKey(key)) {
-            return `credential-shaped query key ${key}`;
-        }
-        /** A bare parameter — `?sk-ant-…` or a structured fragment's first entry — is parsed as a key with an empty value, so the value rules would read nothing. The key is judged by shape as well as by name, and the label omits it because the key is the credential. commentlint: allow(JUDGE) */
+        /** A bare parameter — `?sk-ant-…` or a structured fragment's first entry — is parsed as a key with an empty value, so the value rules would read nothing. The key is judged by shape as well as by name, and this runs first because a composite key satisfies both: the semantic label renders the key, so whichever branch wins must be the one that does not. commentlint: allow(JUDGE) */
         if (key.length > 0) {
             const keyFormat = credentialValueFormat(key);
             if (keyFormat !== null) return `${keyFormat} as a URL parameter name`;
+        }
+        if (key.length > 0 && isCredentialBearingConfigKey(key)) {
+            return `credential-shaped query key ${key}`;
         }
         const format = credentialValueFormat(part);
         if (format !== null) {

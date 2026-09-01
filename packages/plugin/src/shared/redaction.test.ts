@@ -164,6 +164,10 @@ describe("isCredentialBearingConfigKey", () => {
             "dbkey",
             "oauthkey",
             "jwtkey",
+            // The common all-caps form glues a vendor onto the field.
+            "OPENAIAPIKEY",
+            "ANTHROPICAPIKEY",
+            "AZUREOPENAIAPIKEY",
             // An enumerator can sit outside the descriptor as easily as inside it.
             "apiKeyValue2",
             "passwordValue2",
@@ -239,6 +243,10 @@ describe("urlCredentialFinding", () => {
         expect(urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv")).not.toContain(
             "sk-ant-",
         );
+        // A composite query key satisfies both key rules; the winner must not name it.
+        expect(
+            urlCredentialFinding("https://host/?sk-ant-abcdefghijklmnopqrstuv-apiKey=1"),
+        ).not.toContain("sk-ant-");
         expect(urlCredentialFinding("https://host/v1?trace=sk-ant-abcdefghijklmnopqrstuv")).toBe(
             "Anthropic-style key value in query key trace",
         );

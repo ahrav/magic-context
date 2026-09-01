@@ -217,6 +217,7 @@ const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
 /** Raised when a records file cannot be parsed. A distinct type because the exit code a caller keys off has to separate "this file needs inspection" from "the run stopped on budget"; matching diagnostic prose would couple the CLI to wording that is free to change. Every rejection `parseRolloutRecords` raises uses it — syntax, per-record shape, duplicate coordinates, and the file-wide spend total all mean the same thing to a caller, so a rule that threw a plain `Error` would silently downgrade to the resumable code. commentlint: allow(JUDGE) */
 export class RolloutRecordsInvalidError extends Error {}
 
+
 function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
     if (!Array.isArray(raw)) {
         throw new RolloutRecordsInvalidError(`rollout store ${path} must contain an array`);
@@ -321,6 +322,8 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
 
 /** Two runners over one records path each cache the pre-run array and publish a private snapshot, so the later rename erases the other's record after both paid calls happened — and the erased spend is then repeated on resume. The lock is taken before the first read, because by the time a write conflicts the money is already gone. commentlint: allow(JUDGE) */
 export class RolloutStoreBusyError extends Error {}
+/** A publication that lost its lock may have replaced a coordinate another owner wrote, so the file is suspect in the same way a malformed one is: it must be inspected, not resumed. A subclass of the busy error because callers that retry on contention should keep doing so, while the exit-code mapping can tell the two apart. commentlint: allow(JUDGE) */
+export class RolloutStorePublishConflictError extends RolloutStoreBusyError {}
 
 /** Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. commentlint: allow(JUDGE) */
 const ownedRecordPaths = new Set<string>();
@@ -436,7 +439,7 @@ export class FileRolloutStore implements RolloutStore {
             /** Checked again after the rename, because the checks before it cannot span the syscall. A clobber requires the lock to have moved, so observing it still held here is what licenses treating the publication as sound; observing it lost means this rename may have replaced a coordinate a new holder published, and that snapshot was never read, so it cannot be merged back. The loss is therefore reported rather than repaired — the file is left as written and the caller is told not to trust it as a complete ledger. commentlint: allow(JUDGE) */
             if (!lockHeldByThisProcess(this.lockPath)) {
                 this.invalidate();
-                throw new RolloutStoreBusyError(
+                throw new RolloutStorePublishConflictError(
                     `rollout store ${this.path} lost its lock during publication; the file ` +
                         "may have replaced a concurrent owner's coordinate; inspect it before " +
                         "resuming",
@@ -1286,7 +1289,7 @@ function completedRecord(
             reasonCode,
         },
         checks,
-        usage: usage ?? ZERO_USAGE,
+        usage: usage ?? zeroUsage(),
         costUsd,
         priorAttemptsCostUsd,
         /** The record's own cost, not the rejected `observedCostUsd`: a price that overflowed is the reason `usage` is null, and storing `Infinity` here would serialize as `null` and fail the next resume's parse. commentlint: allow(JUDGE) */
@@ -1350,7 +1353,7 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
             reasonCode,
         },
         checks: [],
-        usage: ZERO_USAGE,
+        usage: zeroUsage(),
         costUsd: attemptCostUsd,
         priorAttemptsCostUsd,
         maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, attemptCostUsd),
@@ -1398,7 +1401,10 @@ export function computeRegretRungs(
     };
 }
 
-const ZERO_USAGE: TokenUsage = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
+/** A fresh object per record rather than one shared constant: the record is handed to the caller and to the store, and a single instance made every estimated record in the process alias the same counters — editing one result's usage changed all of them, and later runs in the same process would emit the mutated values beside independently estimated costs. commentlint: allow(JUDGE) */
+function zeroUsage(): TokenUsage {
+    return { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
+}
 
 /** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. commentlint: allow(JUDGE) */
 function finiteUsage(usage: TokenUsage): TokenUsage | null {

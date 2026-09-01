@@ -1727,6 +1727,24 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("does not share one usage object across estimated records", async () => {
+        // The record is handed to the caller and to the store; a shared constant made every
+        // estimated record in the process alias the same counters.
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies(() => new Error("boom")),
+        );
+        const estimated = result.records.filter(({ costSource }) => costSource === "estimated");
+        expect(estimated.length).toBeGreaterThan(1);
+
+        const first = estimated[0];
+        const second = estimated[1];
+        if (!first || !second) throw new Error("missing estimated records");
+        first.usage.input = 99;
+        expect(second.usage.input).toBe(0);
+    });
+
     it("reports a lock lost during publication instead of returning success", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-clobber-"));
         try {

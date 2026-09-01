@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 
-import { lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import {
     FileRolloutStore,
     ProviderUnavailableError,
     RolloutRecordsInvalidError,
+    RolloutStorePublishConflictError,
     runPairedDelta,
     verifyDualMockResolution,
     type PairedDeltaRunResult,
@@ -44,11 +45,24 @@ async function runOrReportInvalidRecords(
     try {
         return await run();
     } catch (error) {
-        if (!(error instanceof RolloutRecordsInvalidError)) throw error;
-        console.error(`paired-delta: ${error.message}`);
+        /** A publication that lost its lock is classified with a malformed file, not with a budget stop: both mean the records path has to be inspected before any resume, and the generic code is the one automation is entitled to retry. commentlint: allow(JUDGE) */
+        const inspectable = error instanceof RolloutRecordsInvalidError ||
+            error instanceof RolloutStorePublishConflictError;
+        if (!inspectable) throw error;
+        console.error(`paired-delta: ${(error as Error).message}`);
         process.exitCode = EXIT_CODES["invalid-stored-records"];
         return null;
     }
+}
+
+/** Names the filesystem type so two different non-regular entries at one path do not hash alike. commentlint: allow(JUDGE) */
+function entryKind(entry: Stats): string {
+    if (entry.isDirectory()) return "directory";
+    if (entry.isFIFO()) return "fifo";
+    if (entry.isSocket()) return "socket";
+    if (entry.isBlockDevice()) return "block-device";
+    if (entry.isCharacterDevice()) return "character-device";
+    return "unknown";
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -146,8 +160,12 @@ function smokeRepoCommit(recordsPath: string): string {
         try {
             const absolute = resolve(root, path);
             /** A symlink's worktree identity is the text it points at, not the bytes it resolves to: following it left the digest unchanged when the same path was retargeted at another module with identical contents, so a resume could reuse records produced against different working code. `lstat` because `readFileSync` and `statSync` both dereference. commentlint: allow(JUDGE) */
-            if (lstatSync(absolute).isSymbolicLink()) {
+            const entry = lstatSync(absolute);
+            if (entry.isSymbolicLink()) {
                 parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
+            } else if (!entry.isFile()) {
+                /** Only a regular file has contents to hash. Opening anything else can block indefinitely — a named pipe waits for a writer — and this runs before the experiment starts, so its deadline cannot interrupt it. The type is recorded so the entry still changes the digest. commentlint: allow(JUDGE) */
+                parts.push(Buffer.from(`<non-file>${entryKind(entry)}`, "utf8"));
             } else {
                 parts.push(readFileSync(absolute));
             }
