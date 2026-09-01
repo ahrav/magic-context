@@ -116,9 +116,19 @@ function monotonicNow(): number {
 }
 
 export class WaiterDetachedError extends Error {
+    /**
+     * `ETIMEDOUT` for a deadline detach, so callers that classify retryability on `code`
+     * see a timeout. The class itself still tells the transport this was one caller's
+     * deadline and must not arm the transport-wide connect backoff.
+     */
+    readonly code?: string;
+
     constructor(readonly cause_kind: "aborted" | "deadline") {
         super(`managed startup waiter detached: ${cause_kind}`);
         this.name = "WaiterDetachedError";
+        if (cause_kind === "deadline") {
+            this.code = "ETIMEDOUT";
+        }
     }
 }
 

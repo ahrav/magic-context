@@ -302,3 +302,45 @@ legitimate public answer given that it disagrees with `should_archive` by design
 and whether the repair completion flag should move out of `mc_cache_state`, where
 it currently writes invalid JSON and falsifies `has_cache_state`'s documented
 provenance claim.
+
+## Addendum: Group H, the durable-write redaction contract
+
+Three records, and their fault requirements differ sharply, which is the useful
+part of mapping them together.
+
+1. **`preserved-identity-name-does-not-exempt-its-value` needs no fault at all.**
+   A single ordinary write carrying the field name reaches it. That is why both
+   bypasses it covers were cheap to reproduce and cheap to exercise, and why the
+   record is high confidence with an audited check. No harness work is owed.
+
+2. **`durable-identity-decision-is-made-inside-the-write-transaction` needs a
+   same-process thread race plus a specific caller argument.** The fault is a
+   second thread sharing one `McStore` that removes the row between the
+   classification and the write, and the enabling state is `expected: None`,
+   because with `expected: Some(v)` the CAS already refuses a write whose row
+   vanished. Cross-process interleaving is unavailable: the exclusive
+   single-writer lease means only one `SqliteStore` exists per database.
+
+   The change makes the property structural, so the fault is no longer needed to
+   satisfy the record. It is still needed to *falsify a regression*, and that is
+   the open gap: the deterministic test pins both branches of the contract but
+   cannot observe the interleaving, so reintroducing an out-of-transaction
+   classification would not fail it. This is the one Group H item that wants
+   harness work, and it is the same enabling state
+   `write-predicates-are-re-evaluated-inside-the-write-transaction` already needs,
+   so the two should share whatever oracle gets built.
+
+3. **`refused-durable-write-leaves-no-row-and-no-receipt` needs a detected secret
+   reaching the deferred refusal path.** The pre-transaction refusal form is
+   trivially safe; only the in-transaction form depends on the rollback, and at
+   the facade site the mutation callback has already run by then. Constructing it
+   is easy; the missing piece is an observation of the audit tables after a
+   refusal, not a fault.
+
+**Records that need a product decision rather than a harness.** Whether a benign
+structural string under a secret-shaped name should be scanned rather than refused,
+which currently makes `{"stream_key": "main"}` unwritable in claim integrity JSON
+(`OQ-H2`); and whether `mc_scan_detections.action = 'reject'` is reachable at all,
+since every refusal path found so far either predates the transaction or rolls it
+back (`OQ-H3`).
+

@@ -1,14 +1,15 @@
+//! Magic Context durable cache-state store.
 //!
-//! This module persists each session's `cortexkit-cache-core` [`CoreState`] and `module_meta`.
-//! `module_meta` stores `initialized`, `last_render_config`, and `coverage_ordinal`.
+//! Persists the per-session `cortexkit-cache-core` [`CoreState`] plus a small
+//! `module_meta` blob (`initialized`, `last_render_config`, `coverage_ordinal`).
 //!
 //! Concurrency: writes go through `cortexkit-store`'s epoch-fenced transaction
-//! The `row_version` CAS runs inside the epoch-fenced transaction.
-//! The epoch fence rejects only strictly newer writers.
-//! Equal-epoch writers are not fenced; `row_version` CAS detects same-epoch conflicts.
-//! The persistence pass uses `row_version` CAS to catch a second same-epoch writer and writes conditionally.
-//! A pass writes only when durable state changed; a pure SoftPlus replay writes nothing.
-//! A deferred pass performs no write.
+//! (rejects a superseded lease handover) AND an app-level `row_version` CAS inside
+//! that same transaction. The epoch fence only rejects a STRICTLY-NEWER writer
+//! (lease handover) — an equal-epoch writer is NOT fenced — so the row_version CAS
+//! is what catches a same-epoch second writer. It is conditional: a pass writes
+//! ONLY when durable state actually changed (a pure SoftPlus replay mutates
+//! nothing and writes nothing), so the no-write-on-defer guarantee holds.
 
 #![forbid(unsafe_code)]
 
@@ -26,7 +27,15 @@ use mc_core::claim_operation::{
     ClaimIntentBinding, ClaimIntentState, ClaimResultOutcome, SnapshotVector,
     CLAIM_REQUEST_ENCODING_VERSION,
 };
-use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
+use mc_core::redaction::{
+    detector_revision, detector_semantic_digest, protected_json_key_label,
+    qualified_secret_key_label, redact_durable_text, redact_transaction_durable_text,
+    reject_secret_text, reject_transaction_secret_text, Detection, Redaction, RedactionErrorKind,
+    DETECTOR_ID,
+};
+use rusqlite::{
+    functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension, Transaction,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,11 +52,13 @@ pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
 static NEXT_TAG_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
+/// Canonicalize a filesystem route root before using it as lineage state.
 ///
 /// Transform and facade lanes can observe the same directory through different spellings when
 /// a project is reached through a symlink. Comparing those spellings as strings would make a
 /// valid session look unresolved, so filesystem roots share this boundary normalization. A root
-/// `canonical_root` retains the input spelling when canonicalization fails so requests do not fail for removed roots.
+/// may have been removed by the time a request arrives; retain the input spelling in that case
+/// instead of turning canonicalization into a request failure.
 pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -67,7 +78,8 @@ pub struct HarnessMeta {
     pub errored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<String>,
-    /// `created_at_ms` stores the harness-provided creation time for temporal compartment headings without affecting message identity.
+    /// Native message creation time, when the harness provides it. Used for temporal
+    /// compartment heading dates without making dates part of message identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<i64>,
 }
@@ -86,7 +98,7 @@ pub struct CkWireMessage {
     pub origin: Option<MessageOrigin>,
     pub provider_extras: ProviderExtras,
     pub meta: HarnessMeta,
-    /// `original` retains parsed JSON for pass-through messages and must remain a `Value` rather than a typed-struct round-trip.
+    /// Original parsed JSON for pass-through messages. Pass-through MUST stay
     /// Value-level: serializing this retained value, never a typed-struct round-trip,
     /// preserves harmless unknown fields and keeps replay lossless as the CK wire evolves.
     original: Option<Value>,
@@ -189,7 +201,8 @@ impl CkWireMessage {
 pub struct CkWireBlock {
     pub kind: CkKind,
     pub provider_extras: ProviderExtras,
-    /// Serializing retained block JSON directly preserves unknown fields.
+    /// Original parsed JSON for pass-through blocks. Keep this Value-level for the same
+    /// lossless-pass-through reason as CkWireMessage::original.
     original: Option<Value>,
 }
 
@@ -249,9 +262,9 @@ impl CkWireBlock {
         }
     }
 
-    /// Mutators must clear `original` after editing typed content so serialization emits the edit.
-    /// Every mutator that edits `kind` through a live block must clear `original`.
-    /// `Serialize` prefers `original` for lossless pass-through.
+    /// Drop the retained ingress bytes so serialization reflects an in-place
+    /// mutation of the typed content. Every mutator that edits `kind` through a
+    /// live block MUST call this: `Serialize` prefers `original` for lossless
     /// pass-through, so an uncleared block silently serializes its pre-mutation
     /// bytes and the edit never reaches the wire.
     pub fn mark_modified(&mut self) {
@@ -392,13 +405,15 @@ pub enum MediaKind {
     Document,
 }
 
-/// This namespace isolates cache-state migrations from other namespaces in the same database.
+/// Migration namespace for the cache-state domain (one DB can host several
+/// independent namespaces; this is ours).
 const NS: &str = "mc_cache";
 
-/// The transaction's `COALESCE` default for `row_version` denotes an absent row.
+/// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
+const MAX_DURABLE_TEXT_BYTES: usize = 512 * 1024;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
-/// Decompression limits prevent a small compressed row from allocating an unbounded transcript.
+/// Cap decompression so a small compressed row cannot allocate an unbounded transcript.
 const MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES: usize = 512 * 1024;
 const CHUNK_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[truncated: transcript exceeded the inflated-byte limit]";
@@ -406,27 +421,31 @@ const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 const PASS_SCHEDULER_HISTORY_CAP: usize = 256;
 const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
 const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
-/// The recency entry is at most 99 bytes.
-/// An interesting entry is at most 1,906 bytes; JSON escapes fingerprint bytes as `\u00xx`.
+/// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
+/// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
 const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
 const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
-/// `PASS_SCHEDULER_TELEMETRY_MAX_BYTES` caps the combined UTF-8 bytes for both scheduler JSON arrays on one session row.
+/// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
 pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
     + 1
     + PASS_SCHEDULER_INTERESTING_HISTORY_CAP
         * (MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1);
 
-pub(crate) fn current_time_ms() -> i64 {
+fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 57,
-    statements: r#"
+/// Migration 57 initializes an empty `main` database; add later schema changes as new
+/// migrations. The runner skips `version <= current`, so extending 57's statements is a
+/// silent no-op on every store that already recorded 57.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 57,
+        statements: r#"
 CREATE TABLE mc_cache_state (
             session_id   TEXT PRIMARY KEY,
             row_version  INTEGER NOT NULL,
@@ -1304,10 +1323,94 @@ CREATE TABLE mc_claim_mirror_receipts (
             PRIMARY KEY (database_incarnation_id, receipt_id)
         ) WITHOUT ROWID;
     "#,
-}];
+    },
+    Migration {
+        version: 58,
+        statements: r#"
+-- Migration 57 shipped these two indexes with column lists identical to the
+-- implicit indexes of their tables' UNIQUE and PRIMARY KEY constraints, so
+-- every write maintained two copies of the same B-tree.
+DROP INDEX IF EXISTS idx_mc_tags_session_block;
+DROP INDEX IF EXISTS idx_shadow_user_profile_project;
 
+CREATE TABLE mc_scan_batches (
+            scan_batch_id TEXT PRIMARY KEY CHECK (length(scan_batch_id) = 32),
+            owner_kind TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+
+CREATE TABLE mc_scan_owner_scopes (
+            owner_scope_id TEXT PRIMARY KEY CHECK (length(owner_scope_id) = 32),
+            scope_kind TEXT NOT NULL CHECK (length(scope_kind) > 0),
+            scope_key TEXT NOT NULL CHECK (length(scope_key) = 64),
+            UNIQUE (scope_kind, scope_key)
+        );
+
+CREATE TABLE mc_scan_domain_owners (
+            domain_owner_id TEXT PRIMARY KEY CHECK (length(domain_owner_id) = 32),
+            owner_scope_id TEXT NOT NULL
+                REFERENCES mc_scan_owner_scopes(owner_scope_id) ON DELETE CASCADE,
+            owner_kind TEXT NOT NULL,
+            owner_key TEXT NOT NULL CHECK (length(owner_key) = 64),
+            UNIQUE (owner_scope_id, owner_kind, owner_key)
+        );
+
+CREATE TABLE mc_field_scans (
+            scan_id TEXT PRIMARY KEY CHECK (length(scan_id) = 32),
+            scan_batch_id TEXT NOT NULL REFERENCES mc_scan_batches(scan_batch_id)
+                ON DELETE CASCADE,
+            detector_id TEXT NOT NULL,
+            detector_revision TEXT NOT NULL,
+            semantic_digest TEXT CHECK (semantic_digest IS NULL OR length(semantic_digest) = 64),
+            finding_count INTEGER NOT NULL CHECK (finding_count >= 0)
+        );
+
+CREATE INDEX idx_mc_field_scans_batch
+            ON mc_field_scans(scan_batch_id, scan_id);
+
+CREATE TABLE mc_scan_owner_copies (
+            owner_copy_id TEXT PRIMARY KEY CHECK (length(owner_copy_id) = 32),
+            scan_id TEXT NOT NULL REFERENCES mc_field_scans(scan_id) ON DELETE CASCADE,
+            domain_owner_id TEXT NOT NULL
+                REFERENCES mc_scan_domain_owners(domain_owner_id) ON DELETE CASCADE,
+            owner_kind TEXT NOT NULL,
+            field_id TEXT NOT NULL CHECK (length(field_id) > 0)
+        );
+
+CREATE INDEX idx_mc_scan_owner_copies_scan
+            ON mc_scan_owner_copies(scan_id, owner_copy_id);
+
+CREATE INDEX idx_mc_scan_owner_copies_domain_owner
+            ON mc_scan_owner_copies(domain_owner_id, owner_copy_id);
+
+CREATE TABLE mc_scan_detections (
+            scan_id TEXT NOT NULL REFERENCES mc_field_scans(scan_id) ON DELETE CASCADE,
+            detection_ordinal INTEGER NOT NULL CHECK (detection_ordinal >= 0),
+            exactness TEXT NOT NULL CHECK (exactness = 'exact'),
+            -- Labels derive from key names, so the set is open; the shape
+            -- stays bounded so a label cannot carry secret text.
+            label_id TEXT NOT NULL CHECK (
+                length(label_id) BETWEEN 1 AND 64
+                AND label_id NOT GLOB '*[^abcdefghijklmnopqrstuvwxyz0-9_]*'
+            ),
+            span_kind TEXT NOT NULL CHECK (span_kind = 'value'),
+            -- 'substitute': the span was replaced before storage.
+            -- 'preserve': an existing identity was stored verbatim; rejecting it
+            --             retroactively would orphan rows already keyed by it.
+            -- 'reject': reserved; rejected writes roll back with their receipts.
+            action TEXT NOT NULL CHECK (action IN ('substitute', 'preserve', 'reject')),
+            PRIMARY KEY (scan_id, detection_ordinal)
+        ) WITHOUT ROWID;
+    "#,
+    },
+];
+
+/// The highest `mc_cache` schema migration this binary ships.
 ///
-/// `McStore::open` applies all bundled migrations, so this value is the highest schema version the binary supports.
+/// The store has no separate fence constant: `McStore::open` applies every bundled
+/// migration on open, so the newest bundled migration IS the binary's supported
+/// ceiling. Status surfaces report this value to answer "which schema does this
+/// binary support" without a second source of truth that could drift from the
 /// migration list.
 pub const LATEST_MIGRATION_VERSION: u32 = {
     let mut latest = 0;
@@ -1321,12 +1424,23 @@ pub const LATEST_MIGRATION_VERSION: u32 = {
     latest
 };
 
+/// Lowest `mc_cache` version this binary can adopt without reinterpreting an
 /// older schema.
 ///
-const OLDEST_ADOPTABLE_MIGRATION_VERSION: u32 = LATEST_MIGRATION_VERSION;
+/// `OLDEST_ADOPTABLE_MIGRATION_VERSION` tracks the bootstrap entry in [`MIGRATIONS`],
+/// not the newest one. A store at the bootstrap version has the complete schema;
+/// incremental migrations upgrade it. A store below the bootstrap version predates that
+/// schema, so the runner would replay the bootstrap over a populated `main` and fail on
+/// the first `CREATE TABLE`; such a store is classified and refused before the runner
+/// sees it. Deriving this bound from the newest version instead would refuse exactly the
+/// stores an incremental migration exists to upgrade.
+const OLDEST_ADOPTABLE_MIGRATION_VERSION: u32 = BOOTSTRAP_MIGRATION_VERSION;
 
-/// The version lookup returns the highest `mc_cache` migration in `store.db`, or `None` when the namespace has no history.
-/// The version lookup returns `None` for a fresh `store.db` or one predating the version table.
+/// Version of the [`MIGRATIONS`] entry that composes the schema from an empty `main`.
+const BOOTSTRAP_MIGRATION_VERSION: u32 = 57;
+
+/// Highest `mc_cache` migration recorded in `store.db`, or `None` when the
+/// namespace has no history: a fresh file, or one predating the version table.
 fn recorded_mc_cache_version(inner: &SqliteStore) -> Result<Option<u32>, McStoreError> {
     Ok(inner.with_conn(|conn| {
         let tracked: bool = conn.query_row(
@@ -1349,8 +1463,13 @@ fn recorded_mc_cache_version(inner: &SqliteStore) -> Result<Option<u32>, McStore
     })?)
 }
 
-/// Migration validation refuses `store.db` histories predating the consolidated bootstrap before applying migrations.
+/// Refuse a `store.db` whose `mc_cache` history predates the consolidated
+/// bootstrap, before the migration runner can apply that bootstrap over it.
 ///
+/// The alternative is the runner's raw `table mc_cache_state already exists`,
+/// which names a symptom rather than the family, and leaves an operator with no
+/// stated action. Old version ranges are not supported inputs
+/// (`docs/migration-version-lanes.md`), so this refuses rather than migrating.
 fn refuse_pre_cutover_store(inner: &SqliteStore) -> Result<(), McStoreError> {
     match recorded_mc_cache_version(inner)? {
         Some(recorded) if recorded < OLDEST_ADOPTABLE_MIGRATION_VERSION => {
@@ -1363,7 +1482,10 @@ fn refuse_pre_cutover_store(inner: &SqliteStore) -> Result<(), McStoreError> {
     }
 }
 
-/// Every statement requires the authority predicate so bindings outside MODULE-owned domains cannot modify rows.
+/// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
+/// Deletes only content twins, then rekeys remaining route rows and their mutation/note
+/// companions. The authority predicate is repeated on every statement so a binding is
+/// harmless until its domain is actually MODULE-owned.
 fn normalize_authority_note_route_tx(
     tx: &rusqlite::Transaction<'_>,
     context_store_uuid: &str,
@@ -1386,8 +1508,11 @@ fn normalize_authority_note_route_tx(
     Ok(())
 }
 
-/// A project's workspace membership is the union of identities it reads: OWN has full visibility; FOREIGN is visible only in `share_categories`.
-/// The row-version CAS that guards cache-state commits also guards writer orchestration, preventing stale producers from publishing against newer module state.
+/// A project's workspace membership: the union of member identities it reads, which of
+/// them are its OWN (full visibility) vs FOREIGN (visible only in `share_categories`),
+/// The durable historian single-flight phase. The phase lives in [`ModuleMeta`] so
+/// the same row-version CAS that guards cache-state commits also guards writer
+/// orchestration: a stale producer can never publish against a newer module state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistorianPhase {
@@ -1411,24 +1536,25 @@ impl HistorianPhase {
     }
 }
 
-/// The historian run pins an inclusive ordinal range.
+/// Inclusive ordinal range pinned for one historian run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianChunkRange {
     pub from_ordinal: u64,
     pub to_ordinal: u64,
 }
 
-/// The historian firing uses a content-sensitive identity for each selected message.
-/// The outer firing vector preserves message order; each block vector preserves the canonical block order in [`ModuleMeta::block_identity_by_mid`].
+/// Content-sensitive identity for one message selected into a historian firing.
+/// The outer firing vector preserves message order; each block vector preserves
+/// the canonical block order already tracked by [`ModuleMeta::block_identity_by_mid`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianSelectedMessageIdentity {
     pub mid: String,
     pub block_identities: Vec<BlockIdentity>,
 }
 
-/// `ModuleMeta` stores durable historian state.
-/// When idle, `firing_seq` remains the monotonic last-issued sequence and the state clears in-flight identifiers.
-/// Abandon paths clear in-flight identifiers and set `failure_backoff_at_ms`.
+/// The durable historian state stored inside [`ModuleMeta`]. Idle keeps
+/// `firing_seq` as the monotonic last-issued sequence and clears the in-flight
+/// identifiers; abandon paths additionally set `failure_backoff_at_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianDurableState {
     #[serde(default)]
@@ -1439,44 +1565,52 @@ pub struct HistorianDurableState {
     pub chunk_range: Option<HistorianChunkRange>,
     #[serde(default)]
     pub chunk_fingerprint: String,
-    /// The producer receives durable content identities for exactly the message range.
-    /// The write transaction permits later tail extension but rejects drift in selected bytes.
+    /// Durable content identities for exactly the message range sent to the producer.
+    /// Publication compares these with the current store metadata inside the write
+    /// transaction, allowing later tail extension while rejecting selected-byte drift.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     #[serde(default)]
     pub producer_session_id: Option<String>,
     #[serde(default)]
     pub producer_run_id: Option<String>,
-    /// Broca identifies a run by `(project_root, harness, session)`.
-    /// Recovery reattaches with the recorded harness rather than the resuming binding.
-    /// After a cross-harness handoff, the resuming binding resolves the original run as `missing`.
-    /// The resuming binding abandons and refires a run resolved as `missing`.
-    /// An absent recorded harness makes recovery fall back to the resuming binding.
+    /// The harness the producer run was started under. Broca scopes a run's
+    /// identity by `(project_root, harness, session)`, so recovery must
+    /// reattach with THIS harness rather than whatever the resuming route is
+    /// bound to: after a cross-harness handoff the current binding would
+    /// resolve to `missing` and abandon-then-refire a run the original
+    /// harness may still be executing. `None` is a state written before this
+    /// field existed; recovery falls back to the resuming binding there.
     #[serde(default)]
     pub producer_harness: Option<String>,
     #[serde(default)]
     pub fired_at_ms: Option<i64>,
-    /// `expected_revert_epoch` records the session-level revert epoch observed when the chunk was assembled.
-    /// A reattached producer publishes against `expected_revert_epoch` rather than the session's current epoch.
+    /// Session-level revert epoch observed when the chunk was assembled. It is copied
+    /// into the firing state so a producer reattached after restart publishes against the
+    /// same epoch it originally saw, not the session's current epoch.
     #[serde(default)]
     pub expected_revert_epoch: u64,
-    /// `compartment_set_generation` records the generation observed with the firing snapshot.
-    /// Publication rechecks `compartment_set_generation` inside its transaction.
-    /// The transactional recheck detects compartment-set changes after the snapshot before append.
+    /// The compartment-set generation observed with the firing snapshot. Publication
+    /// rechecks it inside its transaction so an overlapping external sync cannot slip
+    /// between the producer's snapshot and the append.
     #[serde(default)]
     pub compartment_set_generation: CompartmentSetGeneration,
     #[serde(default)]
     pub failure_backoff_at_ms: Option<i64>,
-    /// `last_failure` records human-readable detail of the most recent failed firing.
-    /// A later firing clears `last_failure` after establishing its producer run.
+    /// Human-readable detail of the most recent failed firing. The producer runs in a
+    /// spawned task whose stderr a supervised deployment never captures, so the error
+    /// must live in durable state to be diagnosable from a state dump. Cleared when a
+    /// later firing establishes its producer run.
     #[serde(default)]
     pub last_failure: Option<String>,
-    /// `last_no_fire` records why the most recent pass declined to fire without numeric details.
-    /// A firing clears `last_no_fire`.
+    /// Why the most recent pass declined to fire (reason discriminant only, no numbers,
+    /// so steady-state passes rewrite nothing). The twin of `last_failure` for the
+    /// pre-fire half: a supervised rig cannot read the transform response's diagnostics
+    /// block, so the skip branch must be readable from the state dump. Cleared on fire.
     #[serde(default)]
     pub last_no_fire: Option<String>,
-    /// `consecutive_publish_failures` is diagnostic only.
-    /// Historian publication failures do not affect emitted bytes.
+    /// Consecutive failures on the historian publication path. This is diagnostic-only
+    /// state: it makes repeated fence/outbox failures visible without affecting bytes.
     #[serde(default)]
     pub consecutive_publish_failures: u32,
 }
@@ -1503,7 +1637,7 @@ impl Default for HistorianDurableState {
     }
 }
 
-/// `PassSchedulerObservation` records one accepted pass in the bounded scheduler history attached to [`PassTrace`].
+/// One accepted pass in the bounded scheduler history attached to [`PassTrace`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSchedulerObservation {
     pub timestamp_ms: i64,
@@ -1511,31 +1645,31 @@ pub struct PassSchedulerObservation {
     pub drain_latch_active: bool,
 }
 
-/// `InterestingPassSchedulerObservation` retains incident-worthy scheduler evidence independently of the recency ring.
+/// Incident-worthy scheduler evidence retained independently of the recency ring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterestingPassSchedulerObservation {
     pub timestamp_ms: i64,
     pub scheduler_decision: String,
     pub drain_latch_active: bool,
-    /// `request_observed_at_ms` must not use the module clock as a fallback.
-    /// The module clock and sender clock are not interchangeable correlation keys.
+    /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
+    /// module clock because the two clocks are not interchangeable correlation keys.
     pub request_observed_at_ms: Option<u64>,
-    /// The transform response echoes the caller-owned full-array fingerprint.
-    /// `full_array_fingerprint` is omitted only when the caller supplied no identity or exceeded the diagnostic byte bound.
+    /// Caller-owned full-array fingerprint echoed by the transform response. This is omitted
+    /// only when the caller supplied no identity or exceeded the diagnostic byte bound.
     pub full_array_fingerprint: Option<String>,
-    /// The field contains live superseded tool arcs observed when the ride gate opened, before downstream filters.
-    /// A missing value means the gate stayed shut and selection did not run; zero means selection observed an empty set.
+    /// Live superseded tool arcs observed when the ride gate opened, before downstream filters.
+    /// Missing means the gate stayed shut and selection did not run; zero is an observed empty set.
     #[serde(default)]
     pub eligible_supersession_count: Option<u64>,
-    /// The newest-tag block window can remove all final decisions for eligible supersession arcs.
-    /// `withheld_by_tag_window` counts tool arcs.
+    /// Eligible supersession arcs whose final decisions were entirely removed by the newest-tag
+    /// block window. Unit: tool arcs.
     #[serde(default)]
     pub withheld_by_tag_window: Option<u64>,
-    /// Mutation-exempt or lineage-anchor messages can remove all final decisions for eligible supersession arcs.
-    /// `withheld_by_exempt_message` counts tool arcs.
+    /// Eligible supersession arcs whose final decisions were entirely removed by mutation-exempt
+    /// or lineage-anchor messages. Unit: tool arcs.
     #[serde(default)]
     pub withheld_by_exempt_message: Option<u64>,
-    /// The final reduction decision list contains eligible supersession tool arcs.
+    /// Eligible supersession tool arcs represented in the final reduction decision list.
     #[serde(default)]
     pub applied_supersession_count: Option<u64>,
 }
@@ -1609,8 +1743,9 @@ fn serialize_interesting_scheduler_observation(
     .map_err(|error| McStoreError::Serde(error.to_string()))
 }
 
-/// The breadcrumb record retains durable receive, complete, and reject events for one session's transform passes.
-/// `PassTrace` records the breadcrumb trail without advancing the cache `row_version`.
+/// Durable receive/complete/reject breadcrumbs for one session's transform passes.
+/// Stored separately from `mc_cache_state` so a rejected pass can still leave a readable
+/// trail without advancing the cache row_version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassTrace {
     pub last_received_at_ms: i64,
@@ -1619,12 +1754,17 @@ pub struct PassTrace {
     pub last_reject_at_ms: Option<i64>,
     pub reject_count: u64,
     pub receive_count: u64,
+    /// JSON for the current pass's first-divergence attribution, when one was observed.
     pub first_divergence: Option<String>,
+    /// JSON for the most recent diverging pass, including its accepted pass id and timestamp.
     pub last_divergence: Option<String>,
-    /// The bounded history stores accepted scheduler decisions and latch state from oldest to newest.
+    /// Oldest-to-newest bounded history of accepted scheduler decisions and latch state.
     pub scheduler_history: Vec<PassSchedulerObservation>,
 }
 
+/// A validated historian fact that may become a project memory. Validation owns
+/// A historian event retained for a future module-to-TS mirror. `at_compartment` keeps the
+/// producer's one-based anchor even when the module-side compartment surrogate is unavailable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianEventCandidate {
     pub kind: String,
@@ -1635,7 +1775,9 @@ pub struct HistorianEventCandidate {
     pub harness: String,
 }
 
-/// A primer candidate remains available across sessions.
+/// A primer candidate records a question that should remain available across sessions, along with
+/// the project, session, and source-compartment information needed to trace where it came from.
+/// Its fields match the corresponding TypeScript primer record.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianPrimerCandidate {
     pub project_path: String,
@@ -1649,7 +1791,8 @@ pub struct HistorianPrimerCandidate {
     pub created_at: i64,
 }
 
-/// `Project memory` must not receive privacy-gated user observations until the user opts into collection.
+/// A privacy-gated user observation candidate. It is intentionally not a project memory:
+/// the TS review task owns promotion after the user opts into collection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianUserMemoryCandidate {
     pub content: String,
@@ -1659,15 +1802,17 @@ pub struct HistorianUserMemoryCandidate {
     pub created_at: i64,
 }
 
-/// The predicate must match every durable state field before additive writes occur.
+/// A newly promoted project-memory row, returned so post-commit embedding can target
+/// The stale-producer predicate checked inside the publish transaction before any
+/// additive writes occur. Every field must match the durable state row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianPublishPredicate {
     pub firing_seq: u64,
     pub producer_run_id: String,
     pub chunk_fingerprint: String,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
-    /// The generation captures the complete compartment set used to assemble the raw chunk.
-    /// `count` distinguishes sequence reuse that `max_sequence` alone cannot.
+    /// Cheap generation of the complete compartment set captured when this firing
+    /// assembled its raw chunk. Count closes the sequence-reuse case that max alone
     /// cannot distinguish.
     pub compartment_set_generation: CompartmentSetGeneration,
 }
@@ -1690,14 +1835,15 @@ pub struct HistorianSideChannelStatus {
     pub last_failure: Option<String>,
 }
 
-/// `CompartmentSetGeneration` provides a snapshot-consistent generation for the compartment set.
+/// A cheap, snapshot-consistent identifier for the complete compartment set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompartmentSetGeneration {
     pub max_sequence: i64,
     pub count: i64,
 }
 
-/// `HistorianAssemblySnapshot` stores the epoch and compartment generation with the compartments that determine the chunk.
+/// Session data read atomically for historian assembly. The epoch and compartment
+/// generation must be snapped with the set that determines the chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianAssemblySnapshot {
     pub compartments: Vec<StoredCompartment>,
@@ -1705,8 +1851,9 @@ pub struct HistorianAssemblySnapshot {
     pub compartment_set_generation: CompartmentSetGeneration,
 }
 
-/// The caller must use the returned `row_version` for the subsequent pass commit.
-/// The caller must patch the returned metadata fields into the whole-blob `ModuleMeta`.
+/// Result of a deterministic revert re-cut. The caller must use the returned
+/// row_version for the subsequent pass commit and patch the returned metadata fields
+/// into the whole-blob ModuleMeta it commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateOutcome {
     pub revert_epoch: u64,
@@ -1726,11 +1873,12 @@ pub struct HistorianPublishRequest<'a> {
     pub user_memory_candidates: &'a [HistorianUserMemoryCandidate],
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: Option<&'a str>,
-    /// `raw_chunk_messages` preserves original CK messages, including full tool output, for `ctx_expand` recovery.
+    /// JSON-encoded original CK messages for the compacted range. Unlike the condensed
+    /// transcript, this preserves full tool output for durable ctx_expand recovery.
     pub raw_chunk_messages: Option<&'a str>,
 }
 
-/// `HistorianPublishError` distinguishes CAS conflicts from stale-producer state mismatches.
+/// Typed publish failures. CAS and state mismatches are deliberately separate so a
 /// caller can tell "another writer already committed" from "this producer is stale."
 #[derive(Debug)]
 pub enum HistorianPublishError {
@@ -1741,14 +1889,15 @@ pub enum HistorianPublishError {
         reason: Option<String>,
     },
     /// A caller-supplied publication fence refused the publish before any write.
-    /// A fence rejection does not indicate producer failure.
-    /// A fresh snapshot may retry immediately after a fence rejection.
+    /// Distinct from CasConflict so callers can abandon the run WITHOUT arming a
+    /// model-failure cooldown: a fence rejection is a fast local race, not a
+    /// producer failure, and an immediate retry with a fresh snapshot is valid.
     FenceRejected {
         reason: String,
     },
-    /// An overlap with a durable range rejects the publish.
-    /// The rejection lets callers abandon a stale firing without treating it as a SQLite failure.
-    /// The rejection leaves the session immediately reusable.
+    /// An appended historian compartment intersects an already durable range. This
+    /// is a publish rejection rather than a SQLite failure so callers can abandon the
+    /// stale firing and leave the session immediately reusable.
     CompartmentOverlap {
         existing_sequence: i64,
         incoming_start_message: i64,
@@ -1820,16 +1969,16 @@ impl From<StoreError> for HistorianPublishError {
     }
 }
 
-/// Persisted provider usage keeps pressure bands stable across retries and restarts.
-/// A non-zero request-supplied value replaces the persisted value.
-/// An absent or all-zero request uses the persisted value.
+/// Persisted provider-usage ground truth used to keep pressure bands stable across
+/// retries and restarts. A request-supplied non-zero value replaces this value; an
+/// absent or all-zero request falls back to it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleUsage {
     #[serde(default)]
     pub current_total_input_tokens: u64,
     #[serde(default)]
     pub context_limit_tokens: u64,
-    /// The host uses the final-wire estimate only to clear an armed emergency latch.
+    /// Host final-wire estimate used only to clear an already armed emergency latch.
     #[serde(default)]
     pub final_wire_input_tokens: u64,
     #[serde(default)]
@@ -1847,7 +1996,8 @@ pub struct DeferredExecuteState {
     pub reason: String,
 }
 
-/// Cache metadata stores fake-compaction lineage counters so status reads match their terminal disposition.
+/// Durable counters for fake-compaction lineage handling. Keeping them in the cache meta
+/// blob makes status reads consistent with the terminal disposition they describe.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageDescentCounters {
     #[serde(default)]
@@ -1874,8 +2024,8 @@ pub struct LineageDescentCounters {
     pub pending_no_responses: u64,
 }
 
-/// Each edge stores the epoch of `new_key`.
-/// For the first hop, `prior_epoch` is the prior node's epoch.
+/// One hop in a composed lineage edge. `epoch` is the epoch of `new_key`; the prior
+/// node's epoch is the edge's `prior_epoch` for the first hop and the preceding hop's
 /// epoch thereafter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageConstituent {
@@ -1892,8 +2042,9 @@ pub struct LineageAnchor {
     pub ordinal: u64,
 }
 
-/// `mc-module` recognizes canonical pre-overlay blocks.
-/// The store owns source selection, validation, copying, terminal recording, and the prior-lineage publish fence.
+/// Input to the single fenced lineage operation. Recognition is performed by mc-module
+/// over canonical pre-overlay blocks; the store owns source selection, validation, copy,
+/// terminal recording, and the prior-lineage publish fence.
 pub struct LineageDescentRequest<'a> {
     pub target_key: &'a str,
     pub expected_target_row_version: Option<u64>,
@@ -1940,8 +2091,11 @@ pub struct LineageDescentOutcome {
     pub disposition: LineageDescentDisposition,
     pub source_key: Option<String>,
     pub prior_last_ordinal: Option<u64>,
+    /// True only while the copied state still requires the hard, state-committing pass that
+    /// consumes this lineage edge.
     pub materialization_required: bool,
-    /// The store may acknowledge a terminal record for this target only after the transform returns successfully.
+    /// A terminal record was observed durably for this target and may be acknowledged
+    /// after the transform returns successfully.
     pub acknowledge: bool,
 }
 
@@ -2010,8 +2164,9 @@ fn record_lineage_disposition(
     }
 }
 
-/// The module retains this TypeScript-owned compaction marker until the consuming transform pass handles it.
-/// The module retains the marker so a restart cannot silently lose the pending boundary reconciliation.
+/// A TypeScript-owned compaction marker waiting for the consuming transform pass.
+/// The module retains the marker during a TS-to-Rust transition so a restart cannot
+/// silently lose the pending boundary reconciliation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCompactionMarkerState {
     pub ordinal: u64,
@@ -2019,7 +2174,10 @@ pub struct PendingCompactionMarkerState {
     pub published_at: i64,
 }
 
-/// The transform arms this durable alarm for a boundary-absent request that shares no prefix with the session's held lineage.
+/// Durable alarm state for a boundary-absent request that shares no prefix with the
+/// session's held lineage. The transform arms this once and then serves matching
+/// absent-shape traffic raw without more writes; only boundary-present recovery or a
+/// later re-arm advances the diagnostic counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRewriteState {
     pub armed_at_ms: i64,
@@ -2030,28 +2188,31 @@ pub struct PendingRewriteState {
     pub last_present_at_ms: Option<i64>,
 }
 
-/// The transform records the ordered block-identity vector per `mid` and rejects later drift to avoid applying frozen reductions to a different block list.
+/// The durable identity fingerprint for one block of a message. The transform records
+/// the ordered vector per `mid` and rejects later drift instead of silently applying
+/// frozen reductions to a different block list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockIdentity {
     pub kind_tag: String,
     pub byte_fingerprint: String,
 }
 
-/// Module metadata persists the frozen CK-native synthetic `todowrite` pair.
+/// Frozen CK-native synthetic todowrite pair persisted in module metadata.
 ///
-/// The transform replays the pair exactly at its stored anchor until the task-list content changes.
-/// Rebuilding or moving the pair changes the exact prompt bytes seen by the provider.
-/// Store both CK messages byte-complete to preserve the exact prompt bytes seen by the provider.
+/// The pair is replayed exactly at its stored anchor until the todo content changes.
+/// Rebuilding or moving it would alter the exact prompt bytes seen by the provider,
+/// so both CK messages are stored byte-complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FrozenSyntheticTodoPair {
-    /// The assistant `ToolCall` and tool result use the same synthetic tool-call ID.
+    /// Shared synthetic tool-call id used by both the assistant ToolCall and tool result.
     pub call_id: String,
-    /// The stored ID identifies the real tail message after which the pair is inserted; `None` means no real tail exists.
+    /// Real tail message id the pair is inserted after. None means no real tail existed
+    /// when the pair was frozen, so it is appended at the output end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_mid: Option<String>,
-    /// The stored assistant-role CK message carries the synthetic `todowrite` `ToolCall`.
+    /// Frozen assistant-role CK message carrying the synthetic todowrite ToolCall.
     pub assistant_msg: CkWireMessage,
-    /// The stored tool-role CK message carries the matching synthetic `todowrite` `ToolResult`.
+    /// Frozen tool-role CK message carrying the matching synthetic todowrite ToolResult.
     pub tool_msg: CkWireMessage,
 }
 
@@ -2072,8 +2233,9 @@ impl<'de> Deserialize<'de> for FrozenSyntheticTodoPair {
         let data = FrozenSyntheticTodoPairData::deserialize(deserializer)?;
         let mut assistant_msg = data.assistant_msg;
         let mut tool_msg = data.tool_msg;
-        // Frozen synthetic task-list messages are generated by this crate, not passed through from inbound messages.
-        // Clear the retained `Value` after loading metadata so replay uses canonical typed serialization.
+        // Frozen synthetic todo messages are generated by this crate, not inbound
+        // pass-through messages. Clear the retained Value after loading metadata so
+        // replay uses the same canonical typed serialization as the original freeze.
         assistant_msg.mark_fully_typed();
         tool_msg.mark_fully_typed();
         Ok(Self {
@@ -2106,7 +2268,7 @@ fn u8_is_zero(value: &u8) -> bool {
     *value == 0
 }
 
-/// The state retains a response-side Channel-2 directive until gateway delivery acknowledges it.
+/// A response-side Channel-2 directive awaiting a gateway delivery acknowledgement.
 /// The text is stored verbatim because Claude Code does not retain the injected prompt block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingChannel2Directive {
@@ -2116,6 +2278,7 @@ pub struct PendingChannel2Directive {
     pub arming_watermark: u64,
 }
 
+/// Content class recorded by the rendered-tail hygiene walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TailHygienePartKind {
@@ -2126,8 +2289,9 @@ pub enum TailHygienePartKind {
     Excluded,
 }
 
-/// Persist measurements so later passes can record appended content without tokenizing the historical prefix again.
-/// Later passes record appended content and update recency from persisted measurements.
+/// One typed part from the rendered-tail hygiene walk. Persisting its measurements lets later
+/// passes record newly appended content and update which content is considered recent without
+/// tokenizing the historical prefix again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailHygienePartMeasurement {
     pub key: String,
@@ -2140,7 +2304,8 @@ pub struct TailHygienePartMeasurement {
     pub protected: bool,
 }
 
-/// `TailHygieneBaseline` measures hygiene metrics against the live tail, not the full history.
+/// Durable hygiene metrics used by both reminder channels, measured relative to the currently
+/// live tail rather than the full history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
     pub baseline_u: i64,
@@ -2155,17 +2320,21 @@ pub struct TailHygieneBaseline {
     pub content_signature: String,
 }
 
+/// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
-    /// `bootstrap_complete` is true after durable bootstrap completes; a seeded session can still await its first module fold.
-    /// `bootstrap_seed_fold_pending` keeps a seeded session pending until its first module fold.
+    /// Durable bootstrap has completed. A seeded session may still await its first module fold
+    /// while `bootstrap_seed_fold_pending` is true.
     pub initialized: bool,
-    /// `bootstrap_seed_fold_pending` means a bootstrap state-sync adopted its boundary before the module rendered frozen prefix regions `m0` and `m1`.
+    /// A bootstrap state-sync adopted its boundary, but the module has not yet rendered the
+    /// initial frozen prefix regions (`m0` and `m1`).
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub bootstrap_seed_fold_pending: bool,
-    /// `last_render_config` stores the render-config fingerprint from the last Hard fold; a differing incoming fingerprint starts a new Hard epoch.
+    /// The render-config fingerprint as of the last Hard fold; an incoming pass whose
+    /// fingerprint differs is an epoch change → Hard.
     pub last_render_config: String,
-    /// The module uses provider, model, system-prompt, and upgrade observations to adopt legacy rows without treating the first non-empty observation as a cache eviction.
+    /// Provider/model/system/upgrade identity observations used to adopt legacy rows without
+    /// treating the first non-empty observation as a cache eviction.
     #[serde(default)]
     pub last_provider_id: String,
     #[serde(default)]
@@ -2174,111 +2343,125 @@ pub struct ModuleMeta {
     pub last_system_prompt_hash: String,
     #[serde(default)]
     pub last_upgrade_state: String,
-    /// `coverage_ordinal` stores the terminal ordinal covered by the last baseline; it is monotonic-absolute, not positional, and may decrease on revert-Hard.
+    /// The terminal covered ordinal as of the last baseline. Monotonic-absolute,
+    /// never positional; can DECREASE on a revert-Hard.
     pub coverage_ordinal: Option<u64>,
-    /// `last_todo_state` stores the normalized `todowrite` view captured on a bust pass; task lists are session-scoped working state, not project-shared memory or preferences.
+    /// Last normalized `todowrite` view captured on a bust pass. This is deliberately
+    /// session-scoped: a todo list is the working state of one conversation, not a
+    /// project-shared memory or preference.
     #[serde(default)]
     pub last_todo_state: Option<String>,
-    /// Host-side task-list forwarding uses `last_todo_state_owner_message_id` to make retries of one tool result harmless without suppressing newer states.
+    /// Message id that owns the last captured todo state. Host-side todo forwarding uses
+    /// this to make retries of one tool result harmless without suppressing newer states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_todo_state_owner_message_id: Option<String>,
-    /// `last_todo_state_hash` stores the SHA-256 of normalized task-list state and combines with the owner id to detect replays.
+    /// SHA-256 of the normalized todo state, used with the owner id for replay detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_todo_state_hash: Option<String>,
-    /// `soft_refresh_pending` causes the next eligible transform to perform a SOFT refresh after `session.flush` sets it.
+    /// Set by session.flush and consumed by the next eligible transform as a SOFT refresh.
     #[serde(default)]
     pub soft_refresh_pending: bool,
-    /// `guidance_date` stores this session's `Today's date: ...` guidance line.
-    /// Passes update `guidance_date` only when they already rewrite cached content because the guidance line changes with the wall clock.
+    /// This session's `Today's date: ...` guidance line. Because it changes with the
+    /// wall clock, we update it only during a pass that already rewrites cached content.
     #[serde(default)]
     pub guidance_date: String,
-    /// `revert_epoch` increments atomically with each revert re-cut.
-    /// `firings` carry the epoch observed at assembly, preventing stale publishers from appending output.
+    /// Monotonic session-level epoch bumped atomically with a revert re-cut. Historian
+    /// firings carry the epoch observed at assembly so stale publishers cannot append
+    /// rows after the covered prefix has been truncated.
     #[serde(default)]
     pub revert_epoch: u64,
-    /// `last_recut` records the suffix dropped by the most recent deterministic re-cut.
+    /// Diagnostic for the most recent deterministic re-cut. It is stored with the epoch
+    /// bump so state dumps explain which suffix was dropped without retaining history.
     #[serde(default)]
     pub last_recut: Option<String>,
-    /// The module marks a boundary-absent, share-nothing request on a key with lineage as an alarmed raw-pass-through state.
-    /// The alarmed raw-pass-through state does not permit a future truncate.
+    /// A boundary-absent, share-nothing request on a key that already has lineage. This
+    /// is an alarmed raw-pass-through state, not a predicate for a future truncate.
     #[serde(default)]
     pub pending_rewrite: Option<PendingRewriteState>,
-    /// The module counts interleave edges between pending raw traffic and boundary-present traffic.
-    /// The interleave-edge counter is diagnostic and triggers the durable ambiguous alarm.
+    /// Interleave edges between pending raw traffic and boundary-present traffic. The
+    /// counter is diagnostic and drives the durable ambiguous alarm.
     #[serde(default)]
     pub pending_rewrite_trip_count: u32,
-    /// Repeated arm/clear interleaving sets the ambiguous alarm.
-    /// When the ambiguous alarm is true, serving continues but boundary-absent traffic remains raw.
+    /// True after repeated arm/clear interleaving proves two conversations are sharing
+    /// one session key. Serving continues, but absent-shape traffic remains raw.
     #[serde(default)]
     pub pending_rewrite_ambiguous: bool,
-    /// pending_rewrite_last_failure is independent of historian failures because no historian run owns the alarm state.
+    /// Durable loud detail for the pending/ambiguous rewrite alarm. It is separate from
+    /// historian failures because no historian run owns this state.
     #[serde(default)]
     pub pending_rewrite_last_failure: Option<String>,
-    /// synthetic_todo stores a CK-native task-list pair and the real tail message ID preceding it.
-    /// Replays preserve the synthetic pair's position; changed task-list content moves it to a new tail end.
+    /// Frozen CK-native synthetic todo pair plus the real tail message id it follows.
+    /// Replays keep this exact position; only changed todo content moves it to a new
     /// tail end.
     #[serde(default)]
     pub synthetic_todo: Option<FrozenSyntheticTodoPair>,
-    /// The host replays bootstrap-copied note-nudge anchors after native serving so mode transitions retain them.
+    /// Sticky note-nudge decisions copied from TypeScript during bootstrap. The host
+    /// replays these anchors after native serving so a mode transition keeps them visible.
     #[serde(default)]
     pub note_nudge_anchors: Vec<NoteNudgeAnchorSeed>,
-    /// m1_revision records the in-session revision used to render the frozen m1 block.
-    /// An `m1` signal mismatch marks pending work but does not permit a provider-cache bust.
-    /// m1_revision == 0 denotes pre-materialization metadata.
+    /// The applied in-session revision the frozen m1 block was last rendered from.
+    /// A signal mismatch is pending work; it is not itself permission to bust the provider
+    /// cache. 0 is retained for pre-materialization metadata.
     #[serde(default)]
     pub m1_revision: u64,
-    /// m1_compartment_seq stores the highest compartment sequence represented by m1_revision.
-    /// m1_compartment_seq is unaffected by project memories, notes, or profile churn.
+    /// Highest compartment sequence represented by the applied m1 revision. Unlike the combined
+    /// revision digest, this component is unaffected by project memories, notes, or profile churn.
     /// `None` identifies metadata written before the component watermark was persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m1_compartment_seq: Option<i64>,
-    /// boundary_divergence_pending_count records coherent divergence observations suppressed by a pending compartment revision.
-    /// Active historian and wrapup publication windows neither increment nor reset boundary_divergence_pending_count.
-    /// After active historian and wrapup publication windows close, legacy or damaged rows resume escalation.
+    /// Counted coherent divergence observations suppressed by a pending compartment revision.
+    /// Active historian and wrapup publication windows retain this value without incrementing or
+    /// resetting it; legacy or damaged rows resume escalation after those bounded windows close.
     #[serde(default, skip_serializing_if = "u8_is_zero")]
     pub boundary_divergence_pending_count: u8,
-    /// memory_disabled records whether the last materializing pass disabled cross-session memory.
-    /// `false` keeps pre-field metadata and fresh default state compatible with the historical enabled mode.
+    /// The last materializing pass had cross-session memory disabled. The negative form keeps
+    /// pre-field metadata and fresh default state compatible with the historical enabled mode.
     #[serde(default)]
     pub memory_disabled: bool,
-    /// m1_external_revision records the external render-lane fingerprint applied by the last HARD fold.
-    /// Workspace changes trigger eager HARD folds and remain separate from deferred in-session changes.
+    /// External render lane fingerprint applied by the last HARD fold. Workspace changes
+    /// remain eager-HARD and are kept separate from the deferred in-session lane.
     #[serde(default)]
     pub m1_external_revision: u64,
-    /// project_memory_epoch stores the latest project-memory epoch received from TypeScript state-sync.
-    /// A project-memory epoch update arms an eager HARD fold on the next transform instead of becoming an m1 delta.
+    /// Latest project memory epoch received from TypeScript state-sync. A changed epoch
+    /// arms an eager HARD on the next transform instead of silently becoming an m1 delta.
     #[serde(default)]
     pub project_memory_epoch: u64,
     #[serde(default)]
     pub project_memory_epoch_pending: bool,
-    /// user_profile_version participates in the in-session m1 signal.
-    /// `user_profile_version` defers until a provider-cache bust opportunity.
+    /// Latest global user-profile version received from state-sync. It participates in the
+    /// in-session m1 signal and therefore defers until a genuine bust opportunity.
     #[serde(default)]
     pub user_profile_version: u64,
-    /// m1_user_profile_version records the profile version whose rows were rendered into m0 or m1.
-    /// Separating rendered and current profile versions prevents acknowledgment of empty or budget-trimmed profile deltas before their bodies reach the provider.
+    /// The profile version whose rows were actually rendered into m0 or m1. Keeping this
+    /// separate from the current state-sync version prevents an empty/budget-trimmed profile
+    /// delta from being acknowledged before its body reaches the provider.
     #[serde(default)]
     pub m1_user_profile_version: u64,
-    /// State-sync watermark edges populate the durable start of a pending in-session delta.
-    /// Pure defer transforms do not write the pending in-session delta start.
-    /// A defer transform performs no writes, preserving replay behavior.
+    /// Best-effort durable start of the currently pending in-session delta. It is populated
+    /// by state-sync watermark edges, not by a pure defer transform, so defer remains a
+    /// zero-write replay path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m1_pending_since_ms: Option<i64>,
 
-    // m0 uses separate coverage watermarks and a memory manifest.
-    /// folded_compartment_seq stores the highest compartment sequence folded into m0.
-    /// folded_compartment_seq advances only on a HARD fold.
-    /// `m0` renders compartments with `sequence > folded_compartment_seq` at P1 as new.
+    // --- slice 4d-m0: the two-watermark coverage model + memory manifest ---
+    // (all serde(default) so pre-4d meta JSON loads cleanly)
+    /// The highest compartment `sequence` folded INTO m0. The "in-m0 vs riding-m1"
+    /// divider — advances ONLY on a HARD fold. The m1 renderer treats compartments with
+    /// `sequence > folded_compartment_seq` as new (renders them at P1); the HARD folds
+    /// them and advances this. Distinct from `coverage_ordinal` (the m0+m1 coverage end /
+    /// tail-trim point, which advances on a coverage-extending SOFT too).
     #[serde(default)]
     pub folded_compartment_seq: i64,
-    /// `coverage_start_ordinal` is the first ordinal covered by the compartment span reflected in `coverage_ordinal`.
-    /// Leading system messages below coverage_start_ordinal are not summarized by compartments.
-    /// Leading system messages below `coverage_start_ordinal` remain pass-through on full-array profiles.
+    /// The first ordinal covered by the compartment span reflected in `coverage_ordinal`.
+    /// Leading system messages below this start are not summarized by compartments and
+    /// must remain pass-through on full-array profiles.
     #[serde(default)]
     pub coverage_start_ordinal: Option<u64>,
-    /// `coverage_compartment_seq` is the highest compartment `sequence` reflected in `coverage_ordinal` after a HARD fold or coverage-extending SOFT.
-    /// `coverage_compartment_seq` avoids loading full rows for covered-system absorption on steady defer passes.
-    /// Callers fall back to `folded_compartment_seq` when `coverage_compartment_seq` is `None`.
+    /// The highest compartment `sequence` reflected in `coverage_ordinal` after either a
+    /// HARD fold or a coverage-extending SOFT. The transform compares the live scalar max
+    /// against this before loading full rows for covered-system absorption, keeping steady
+    /// defer passes off the compartment-row hot path. `None` means legacy metadata; callers
+    /// fall back to `folded_compartment_seq`.
     #[serde(default)]
     pub coverage_compartment_seq: Option<i64>,
     /// The frozen m0 contains these claim revisions.
@@ -2287,93 +2470,120 @@ pub struct ModuleMeta {
     /// The frozen m0/m1 pair represents this claim generation vector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_snapshot_vector: Option<SnapshotVector>,
-    /// `expiry_cutoff_ms` freezes the module clock at the last HARD materialization.
-    /// Memory expiry is judged against expiry_cutoff_ms, not a live clock.
-    /// `compose` uses the memory set that built the `m0` baseline.
-    /// Memory that expires between a HARD fold and a later pass must not change the rendered bytes.
-    /// `expiry_cutoff_ms` is 0 before the first HARD fold.
+    /// The expiry cutoff FROZEN at the last HARD (the module clock at materialization). A
+    /// memory's expiry is judged against THIS, not a live clock, so every later SOFT/defer
+    /// compose sees the SAME memory set the m0 baseline was built against — a memory
+    /// expiring between the HARD and a later pass must not change the rendered bytes.
+    /// 0 before the first HARD.
     #[serde(default)]
     pub expiry_cutoff_ms: i64,
 
-    /// `historian` and `publication_floor_ordinal` never affect rendered bytes.
+    // --- historian writer orchestration ---
+    /// Durable single-flight state for the background historian. It is intentionally
+    /// colocated with the cache meta blob: publish can CAS the state row and append
+    /// rows in one SQLite transaction without introducing a second concurrency token.
+    /// These fields never feed render bytes; they only decide whether a producer may
+    /// publish or be reattached after restart.
     #[serde(default)]
     pub historian: HistorianDurableState,
-    /// A successful publication advances `publication_floor_ordinal`, the trigger-only protected-tail floor.
-    /// `publication_floor_ordinal` only anchors future historian trigger selection; `coverage_ordinal` drives render and splice output.
+    /// The trigger-only protected-tail floor advanced by a successful publication.
+    /// This is distinct from `coverage_ordinal`: coverage drives render/splice output,
+    /// while this floor only anchors future historian trigger selection.
     #[serde(default)]
     pub publication_floor_ordinal: Option<u64>,
 
-    /// `mid` identifies the producer message.
-    /// Each `BlockIdentity` stores its block kind and a fingerprint of canonical reduction-accounting bytes.
+    /// Ordered block identity vectors keyed by producer message id. Each vector stores
+    /// the block kind and a fingerprint of the canonical reduction-accounting bytes, so
+    /// a later request that changes a live message's block layout fails closed.
     #[serde(default)]
     pub block_identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
-    /// Covered and frozen identities reject changes, but OpenCode may rewrite an uncovered queued message in place.
+    /// Number of accepted live-tail identity changes. Covered and frozen identities still
+    /// reject, but OpenCode may legitimately rewrite an uncovered queued message in place.
     #[serde(default)]
     pub tail_identity_re_adopt_count: u64,
-    /// `newest_live_block_id` is the newest non-synthetic flat block ID seen in a successful live pass.
-    /// A created note uses `newest_live_block_id` as a best-effort pointer to the conversation end it refers to.
+    /// Record the newest non-synthetic flat block id seen in a successful live pass.
+    /// When a note is created, this value is used as a best-effort pointer to the end
+    /// of the conversation that the note refers to.
     #[serde(default)]
     pub newest_live_block_id: Option<String>,
-    /// Absent or zero usage retains the prior value; any later non-zero usage replaces it, even after reclaim.
+    /// Last non-zero provider usage reported by the caller. Used when a retry or restart
+    /// sends absent/zero usage, but overwritten by any later non-zero usage even when it
+    /// decreases after reclaim.
     #[serde(default)]
     pub last_usage: Option<ModuleUsage>,
+    /// The most recent serializer profile observed on this durable conversation key.
     #[serde(default)]
     pub last_serializer_profile: String,
-    /// `reasoning_cleared_through_ordinal` stores the OpenCode reasoning cutoff captured on the last bust for pre-tag compatibility.
+    /// Durable compatibility copy of the OpenCode reasoning cutoff captured on the last bust.
     /// A defer pass replays the same cutoff after OpenCode rebuilds the native message array.
     #[serde(default)]
     pub reasoning_cleared_through_ordinal: u64,
-    /// `reasoning_cleared_through_tag` stores the tag-number cutoff from the last independently busting pass.
-    /// `reasoning_cleared_through_tag` is the cycle basis, not the highest changed message; retaining it across restart prevents later tag mints from adding reasoning strips to the cached prefix.
-    /// Writers keep the older ordinal field populated so pre-tag readers remain compatible.
+    /// Tag-number cutoff captured on the last independently busting pass. This is the cycle
+    /// basis, not merely the highest message changed on that pass: preserving it across restart
+    /// prevents later tag mints from trickling reasoning strips into the cached prefix.
+    /// Keep the older ordinal field populated so pre-tag readers remain compatible.
     #[serde(default)]
     pub reasoning_cleared_through_tag: u64,
-    /// `caveman_age_basis_tag` stores the highest tag number used as the immutable caveman age basis by the last caveman-enabled bust.
-    /// `caveman_age_basis_tag` persists across defer passes and restarts; newly tagged text waits for the next independently busting pass.
-    /// Zero means no caveman-enabled bust has captured an age basis yet.
+    /// Highest tag number used as the immutable caveman age basis by the last
+    /// caveman-enabled genuine bust. Defer passes and restarts retain this value while
+    /// newly tagged text waits for the next independently busting pass. Zero means no
+    /// caveman-enabled bust has captured an age basis yet.
     #[serde(default)]
     pub caveman_age_basis_tag: u64,
-    /// `cc_u1_active` stores the request-local Claude Code mechanics state committed with the rendered identity.
+    /// The request-local Claude Code mechanics state committed with the rendered identity.
+    /// Missing legacy metadata is false, which preserves the dormant render path.
     #[serde(default)]
     pub cc_u1_active: bool,
-    /// `tagging_surface_active` stores the request-local tagging-surface latch committed with the rendered identity.
-    /// The dual latch lets a transition pass issue one cache-breaking HARD first.
+    /// The request-local tagging surface latch committed with the rendered identity.
+    /// Both the current request and this durable latch must be active before overlay bytes
+    /// render, so a transition pass can coordinate one cache-breaking HARD first.
     #[serde(default)]
     pub tagging_surface_active: bool,
-    /// `channel1_last_nudge_undropped` stores the reclaimable-token amount at the last Channel-1 append or suppression reset.
+    /// Reclaimable-token amount at the last Channel-1 append or suppression reset.
     #[serde(default)]
     pub channel1_last_nudge_undropped: i64,
-    /// An empty `channel1_last_nudge_level` means no active band.
+    /// Last Channel-1 severity band that appended a reminder. Empty means no active band.
     #[serde(default)]
     pub channel1_last_nudge_level: String,
-    /// `tail_hygiene_baseline` stores measurements from one shared tail walk so both nudge channels use the same baseline.
+    /// Baseline calculated by one shared tail walk so both nudge channels use the same measurements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_hygiene_baseline: Option<TailHygieneBaseline>,
-    /// Auto-search decisions for served blocks remain hidden until an independent cache-busting pass; a new physical tail renders immediately and is never added.
+    /// Auto-search decisions targeting a previously served block remain hidden until an
+    /// independent cache-busting pass. A genuinely new physical tail renders immediately and
+    /// never enters this set.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pending_user_hint_block_ids: BTreeSet<String>,
-    /// After `ctx_reduce` records that the agent acted on a reminder, the next transform suppresses new Channel-1 appends but replays every stored append row.
+    /// Set by ctx_reduce after the agent has acted on a reminder. The next transform
+    /// suppresses new Channel-1 appends while still replaying every stored append row.
     #[serde(default)]
     pub channel1_reduce_suppressed: bool,
 
-    /// `last_execute_ordinal` stores the highest tail ordinal observed on an execute pass that froze reductions.
+    /// Highest tail ordinal observed on an execute pass that actually froze reductions.
     #[serde(default)]
     pub last_execute_ordinal: u64,
+    /// Provider input-token sample from the prior emergency drop-producing pass.
     #[serde(default)]
     pub last_emergency_input_sample: f64,
+    /// Whether the emergency idempotence sample is valid.
     #[serde(default)]
     pub has_prior_emergency_drop: bool,
+    /// Execute intent recorded when mid-turn tool-use defers a scheduler execute.
     #[serde(default)]
     pub deferred_execute_state: Option<DeferredExecuteState>,
+    /// Pending TypeScript compaction marker retained across authority transitions.
     #[serde(default)]
     pub pending_compaction_marker: Option<PendingCompactionMarkerState>,
 
-    /// Descent uses newest_live_ordinal, rather than compacted coverage, as the provisional base for the replacement array.
+    // --- fake-compaction lineage descent ---
+    /// Highest real live ordinal observed on this lineage. Descent uses this durable tail,
+    /// rather than compacted coverage, as the provisional base for the replacement array.
     #[serde(default)]
     pub newest_live_ordinal: u64,
-    /// A successful cross-lineage copy sets descent_completed after writing the real boundary row; terminal refusal records leave it false so they cannot be selected as copy sources.
+    /// A successful cross-lineage copy wrote the real boundary row for this key. Terminal
+    /// refusal records deliberately leave this false so they are never selected as copy sources.
     #[serde(default)]
     pub descent_completed: bool,
+    /// Target key and edge whose durable terminal record makes response-loss retries ackable.
     #[serde(default)]
     pub lineage_descent_target_key: String,
     #[serde(default)]
@@ -2382,7 +2592,7 @@ pub struct ModuleMeta {
     pub lineage_descent_disposition: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_descent_source_key: Option<String>,
-    /// New-array ordinals start immediately after the prior lineage's final ordinal.
+    /// Prior lineage's final ordinal. New-array ordinals start immediately after this base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinal_continuation_base: Option<u64>,
     /// The summary block is the durable mutation/trim anchor, not the mutable whole message.
@@ -2390,50 +2600,59 @@ pub struct ModuleMeta {
     pub anchor_block_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_content_hash: Option<String>,
-    /// The fenced copy commits before transform composition; lineage_descent_materialized is set only by the hard pass that consumes the copy.
-    /// If the process crashes after the fenced copy commits but before a hard pass consumes it, replay materializes the copied state again.
+    /// The fenced copy commits before transform composition. The materialized flag is set only
+    /// by the hard pass that consumes the copy; if the process crashes between those steps,
+    /// replay must materialize the copied state again.
     #[serde(default)]
     pub lineage_descent_materialized: bool,
     #[serde(default)]
     pub lineage_descent_counters: LineageDescentCounters,
 
+    /// Channel-2 host lease state copied from the TypeScript session metadata.
     #[serde(default)]
     pub channel2_nudge_state: String,
-    /// Claude Code directive bytes await an idempotent gateway delivery echo.
+    /// Claude Code directive bytes awaiting an idempotent delivery echo from the gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_channel2_directive: Option<PendingChannel2Directive>,
-    /// The pressure-cycle latch remains true from a pressure crossing until a later below-threshold observation rearms the cycle.
+    /// True from a pressure crossing until a later below-threshold observation rearms the cycle.
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub channel2_pressure_latched: bool,
-    /// The monotonic cycle identity makes directive IDs deterministic across retries.
+    /// Monotonic cycle identity used to make directive IDs deterministic across retries.
     #[serde(default)]
     pub channel2_arming_watermark: u64,
+    /// Emergency drain latch active bit.
     #[serde(default)]
     pub emergency_drain_active: bool,
-    /// The drain-latch timestamp is 0 when inactive; otherwise, it is the Unix-millisecond entry time.
+    /// Unix milliseconds when the drain latch was entered; 0 when inactive.
     #[serde(default)]
     pub emergency_drain_entered_at_ms: i64,
-    /// The system persists the response-recency anchor only on passes that already commit.
+    /// Sparse response-recency anchor, piggybacked only on passes already committing.
     #[serde(default)]
     pub last_committed_pass_at_ms: i64,
-    /// The fingerprint vector contains exactly the blocks served to the provider on that pass, so it is bounded by the output size.
+    /// Fingerprints of the blocks most recently served to the provider. The vector is exactly
+    /// the served block set for that pass, so it stays bounded by the output size.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served_output_fingerprint: Vec<ServedBlockFingerprint>,
 
-    /// The record tracks its shadow reset generation; the system rejects operations created before the most recent reset so they cannot write rows from an older generation.
+    /// Tracks which shadow reset generation this record belongs to. Operations created
+    /// before the most recent reset are rejected so they cannot write rows from an older
     /// session state.
     #[serde(default)]
     pub shadow_generation: u64,
-    /// The sequence number can be zero; callers must compare it directly rather than treating zero as missing.
+    /// Monotonic sequence number for accepted shadow state-sync transactions. Zero is a
+    /// valid first value, so callers must compare it directly instead of treating it as
     /// missing.
     #[serde(default)]
     pub shadow_seq: u64,
-    /// The record enters quarantine when the shadow session first diverges from the source state; quarantine remains terminal for that generation until a reset clears the quarantine state and counter.
-    /// After quarantine, later passes increment the divergence counter without adding duplicate divergence rows until a reset clears the counter and quarantine state.
+    /// Set when the shadow session first diverges from the source state. Quarantine is
+    /// terminal for that generation: later passes increment the counter without adding
+    /// duplicate divergence rows until a reset clears both fields.
     #[serde(default)]
     pub shadow_quarantined: bool,
     #[serde(default)]
     pub shadow_quarantined_pass_count: u64,
+    /// Stores the last watermarks acknowledged from the sender, using the same
+    /// compare-and-swap update as the mirror rows so restarts and retries see one
     /// consistent state.
     #[serde(default)]
     pub shadow_acked_watermarks: Value,
@@ -2452,8 +2671,8 @@ pub struct PendingAgentDrop {
 pub struct AppendOutcome {
     pub queued: u64,
     pub duplicate: bool,
-    /// The ledger row's disposition becomes terminal when the command resolves zero targets.
-    /// NULL indicates that the command produced pending drops.
+    /// Terminal disposition for the ledger row, set when the command resolved zero targets.
+    /// NULL means the command produced pending drops (normal path).
     pub disposition: Option<String>,
 }
 
@@ -2463,6 +2682,13 @@ pub struct TagMintInput {
     pub kind: String,
     pub token_count: i64,
     pub source_bytes: Vec<u8>,
+}
+
+struct PreparedTagMint {
+    input: TagMintInput,
+    /// `Some` when a fenced insert of this row must fail instead of writing bytes or an
+    /// identity that preparation left uncovered.
+    insert_refusal: Option<McStoreError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2481,9 +2707,9 @@ pub struct TagNumberRow {
     pub tag_number: i64,
 }
 
-/// The tag identity validates the module's in-process baseline.
+/// A cheap tag-table identity used to validate the module's in-process baseline.
 ///
-/// SQLite triggers advance `generation` on every insert, update, and delete.
+/// `generation` is advanced by SQLite triggers for every insert, update, and delete. The
 /// count/max fields make normal append deltas recognizable without rehydrating old payloads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TagCacheSummary {
@@ -2527,8 +2753,8 @@ pub struct UserHintDecisionInput {
     pub hint_text: String,
 }
 
-/// A transform commits staged overlay writes only after every local validation accepts the pass.
-/// The cache-state CAS serializes competing speculative renders.
+/// Overlay writes staged by a transform and committed only after every local validation
+/// has accepted the pass. The cache-state CAS serializes competing speculative renders.
 #[derive(Debug, Default)]
 pub struct TransformOverlayBatch<'a> {
     pub max_seen_ordinal: Option<u64>,
@@ -2555,26 +2781,29 @@ pub struct TransformCommit<'a> {
     pub meta: &'a ModuleMeta,
     pub consumed_drop_ids: &'a [i64],
     pub first_applied_command_ids: &'a [String],
-    /// The cache commit fences the snapshot vector.
+    /// Snapshot vector fenced by this cache commit.
     pub claim_snapshot_vector: Option<&'a SnapshotVector>,
-    /// The fenced commit re-reads the highest observed compartment sequence before publishing rendered m1 bytes.
-    /// Re-reading the compartment sequence prevents an interleaved publication from being hidden by stale rendered m1 bytes.
+    /// Highest compartment sequence observed while composing a bust. The fenced commit
+    /// re-reads this scalar so a publication interleaved between signal read and commit
+    /// cannot be hidden behind the older rendered m1 bytes.
     pub compartment_max_seq: Option<i64>,
-    /// The transform records the authenticated filesystem root for this cache commit.
+    /// Authenticated filesystem root observed by the transform that owns this cache commit.
     pub project_root: Option<&'a str>,
-    /// The transaction stores first-divergence attribution with the accepted pass.
+    /// Serialized first-divergence attribution to store with the accepted pass.
     pub first_divergence: Option<&'a str>,
-    /// The transaction stores the scheduler arm and drain-latch state only for accepted transform passes.
+    /// Scheduler arm and updated drain-latch state for a real accepted transform pass.
+    /// Maintenance callers that reuse this transaction leave it absent.
     pub scheduler_observation: Option<&'a PassSchedulerObservation>,
-    /// The transform request carries the sender clock and exact full-array identity.
+    /// Sender clock and exact full-array identity already carried on the transform request.
     pub scheduler_request_observed_at_ms: Option<u64>,
     pub scheduler_full_array_fingerprint: Option<&'a str>,
-    /// An absent eligible-supersession-tool-arc count means selection did not run; zero means it ran and found none.
+    /// Eligible supersession tool arcs counted when an open ride gate runs selection. Missing
+    /// means selection did not run; zero means it ran and found none.
     pub scheduler_eligible_supersession_count: Option<u64>,
     pub scheduler_withheld_by_tag_window: Option<u64>,
     pub scheduler_withheld_by_exempt_message: Option<u64>,
     pub scheduler_applied_supersession_count: Option<u64>,
-    /// A true value means the pass added a previously unfrozen reduction to the served output.
+    /// Whether this pass added a previously-unfrozen reduction to the served output.
     pub scheduler_applied_reductions: bool,
     pub overlays: TransformOverlayBatch<'a>,
 }
@@ -2589,7 +2818,7 @@ pub struct SessionStatusSnapshot {
     pub compartment_page: Option<CompartmentPage>,
 }
 
-/// `CompartmentPage` contains a bounded chronological page of module-owned compartments.
+/// A bounded chronological page of module-owned compartments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompartmentPage {
     pub compartments: Vec<StoredCompartment>,
@@ -2616,8 +2845,8 @@ pub enum TodoStateSetOutcome {
     Noop,
 }
 
-/// A stored compartment row supplies the m0/m1 history source.
-/// A value of 1 denotes the oldest row.
+/// A stored compartment row (the m0/m1 history source). `sequence` is the
+/// chronological order (1 = oldest).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredCompartment {
     pub sequence: i64,
@@ -2628,17 +2857,17 @@ pub struct StoredCompartment {
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub title: String,
-    /// The field contains v2 P1 text or the flat legacy body and is always present.
+    /// v2 P1 text, or the flat legacy body. Always present.
     pub content: String,
-    /// The field contains v2 paraphrase tiers and is `None` for legacy rows.
+    /// v2 paraphrase tiers; None for legacy rows.
     pub p1: Option<String>,
     pub p2: Option<String>,
     pub p3: Option<String>,
     pub p4: Option<String>,
-    /// The decay rate ranges from 1 through 100 and defaults to 50.
+    /// Decay rate (1..100), defaults to 50.
     pub importance: i32,
     pub episode_type: Option<String>,
-    /// A value of 1 denotes a pre-v2 flat compartment; 0 denotes a v2 tiered compartment.
+    /// 1 = pre-v2 flat compartment, 0 = v2 tiered.
     pub legacy: i32,
     pub created_at: i64,
 }
@@ -2675,8 +2904,8 @@ pub struct StoredChunkTranscript {
     pub start_ordinal: i64,
     pub end_ordinal: i64,
     pub transcript: Option<String>,
-    /// The field stores JSON-encoded original CK messages for this compacted range.
-    /// Old transcript rows lack this payload, so callers retain the condensed transcript fallback.
+    /// JSON-encoded original CK messages for this compacted range. Old transcript rows do not
+    /// have this migration-era payload, so callers retain the condensed transcript fallback.
     pub raw_messages_json: Option<String>,
     pub created_at_ms: i64,
 }
@@ -2684,6 +2913,7 @@ pub struct StoredChunkTranscript {
 #[derive(Debug, Clone, Copy)]
 pub struct NoteInput<'a> {
     pub project_path: &'a str,
+    /// Bound route root for facade writes. The note remains keyed by `project_path`.
     pub route_project_root: Option<&'a str>,
     pub session_id: &'a str,
     pub content: &'a str,
@@ -2692,13 +2922,1532 @@ pub struct NoteInput<'a> {
     pub now_ms: i64,
 }
 
-/// `surface_condition` selects the pending smart-note path.
-/// An absent `surface_condition` creates an ordinary active note for legacy callers.
+#[derive(Debug)]
+struct PreparedFieldScan {
+    field_id: &'static str,
+    redaction: Redaction,
+    /// Disposition of each detected span, persisted verbatim into
+    /// `mc_scan_detections.action`.
+    detection_action: &'static str,
+    owners: Vec<PreparedDomainOwner>,
+}
+
+#[derive(Debug)]
+struct PreparedWrite {
+    owner_kind: &'static str,
+    scans: Vec<PreparedFieldScan>,
+    domain_owners: Vec<PreparedDomainOwner>,
+    existing_scan_links: BTreeSet<PreparedExistingScanLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PreparedDomainOwner {
+    scope_kind: &'static str,
+    scope_key: String,
+    owner_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PreparedExistingScanLink {
+    scan_id: String,
+    owner: PreparedDomainOwner,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedScanLayer {
+    Durable,
+    Transaction,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedFieldPolicy {
+    Content,
+    NewIdentity,
+    ExistingIdentity,
+}
+
+enum WriteDisposition<T> {
+    Applied(T),
+    Replay(T),
+}
+
+struct ActiveWriteTransaction<'tx> {
+    tx: &'tx Transaction<'tx>,
+    prepared: std::cell::RefCell<PreparedWrite>,
+}
+
+impl PreparedWrite {
+    fn new(family: DurableWriteFamily) -> Self {
+        Self {
+            owner_kind: family.registration().family.owner_kind(),
+            scans: Vec::new(),
+            domain_owners: Vec::new(),
+            existing_scan_links: BTreeSet::new(),
+        }
+    }
+
+    fn domain_owner(
+        &mut self,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+    ) {
+        let owner = PreparedDomainOwner {
+            scope_kind,
+            scope_key: scope_key.into(),
+            owner_key: owner_key.into(),
+        };
+        if !self.domain_owners.contains(&owner) {
+            for scan in self.scans.iter_mut().filter(|scan| scan.owners.is_empty()) {
+                scan.owners.push(owner.clone());
+            }
+            self.domain_owners.push(owner);
+        }
+    }
+
+    fn domain_owner_for_scans_since(
+        &mut self,
+        first_scan: usize,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+    ) {
+        let owner = PreparedDomainOwner {
+            scope_kind,
+            scope_key: scope_key.into(),
+            owner_key: owner_key.into(),
+        };
+        if !self.domain_owners.contains(&owner) {
+            self.domain_owners.push(owner.clone());
+        }
+        for scan in &mut self.scans[first_scan..] {
+            if !scan.owners.contains(&owner) {
+                scan.owners.push(owner.clone());
+            }
+        }
+    }
+
+    fn link_existing_scans(
+        &mut self,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+        scan_ids: impl IntoIterator<Item = String>,
+    ) {
+        let owner = PreparedDomainOwner {
+            scope_kind,
+            scope_key: scope_key.into(),
+            owner_key: owner_key.into(),
+        };
+        if !self.domain_owners.contains(&owner) {
+            self.domain_owners.push(owner.clone());
+        }
+        for scan_id in scan_ids {
+            self.existing_scan_links.insert(PreparedExistingScanLink {
+                scan_id,
+                owner: owner.clone(),
+            });
+        }
+    }
+
+    fn content(&mut self, field_id: &'static str, input: &str) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Durable,
+            PreparedFieldPolicy::Content,
+        )
+    }
+
+    fn record_content(&mut self, field_id: &'static str, input: &str) -> Result<(), McStoreError> {
+        self.content(field_id, input).map(drop)
+    }
+
+    fn bytes(&mut self, field_id: &'static str, input: &[u8]) -> Result<Vec<u8>, McStoreError> {
+        if input.len() > MAX_DURABLE_TEXT_BYTES {
+            return Err(McStoreError::Redaction(RedactionErrorKind::InputLimit));
+        }
+        let text = std::str::from_utf8(input)
+            .map_err(|_| McStoreError::Serde("durable text bytes are not UTF-8".to_string()))?;
+        Ok(self.content(field_id, text)?.into_bytes())
+    }
+
+    fn identity(&mut self, field_id: &'static str, input: &str) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Durable,
+            PreparedFieldPolicy::NewIdentity,
+        )
+    }
+
+    fn existing_identity(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Durable,
+            PreparedFieldPolicy::ExistingIdentity,
+        )
+    }
+
+    /// Records a scan from detections an earlier preparation already produced.
+    ///
+    /// Lets a caller that prepared its text through a JSON-aware path attach the audit
+    /// receipt without running the scanner over the same bytes a second time.
+    fn record_observed_scan(
+        &mut self,
+        field_id: &'static str,
+        detections: Vec<Detection>,
+        detection_action: &'static str,
+    ) {
+        self.scans.push(PreparedFieldScan {
+            field_id,
+            redaction: Redaction {
+                text: String::new(),
+                detections,
+            },
+            detection_action,
+            owners: self.domain_owners.clone(),
+        });
+    }
+
+    /// Whether any recorded scan for `field_ids` carried a detection.
+    ///
+    /// A caller checks this before spending an existence query it would only need in order
+    /// to refuse; a clean identity, which is the ordinary case, skips the query entirely.
+    fn recorded_detections(&self, field_ids: &[&str]) -> bool {
+        self.scans
+            .iter()
+            .any(|scan| field_ids.contains(&scan.field_id) && !scan.redaction.detections.is_empty())
+    }
+
+    fn reject_recorded_identities(&self, field_ids: &[&str]) -> Result<(), McStoreError> {
+        if self.recorded_detections(field_ids) {
+            Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn transaction_content(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Transaction,
+            PreparedFieldPolicy::Content,
+        )
+    }
+
+    fn transaction_identity(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Transaction,
+            PreparedFieldPolicy::NewIdentity,
+        )
+    }
+
+    fn transaction_existing_identity(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Transaction,
+            PreparedFieldPolicy::ExistingIdentity,
+        )
+    }
+
+    fn prepare_field(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+        layer: PreparedScanLayer,
+        policy: PreparedFieldPolicy,
+    ) -> Result<String, McStoreError> {
+        ensure_durable_text_bound(input)?;
+        let redaction = match layer {
+            PreparedScanLayer::Durable => redact_durable_text(input),
+            PreparedScanLayer::Transaction => redact_transaction_durable_text(input),
+        };
+        if matches!(policy, PreparedFieldPolicy::NewIdentity) && !redaction.detections.is_empty() {
+            return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+        }
+        let output = match policy {
+            PreparedFieldPolicy::Content => redaction.text.clone(),
+            PreparedFieldPolicy::NewIdentity | PreparedFieldPolicy::ExistingIdentity => {
+                input.to_owned()
+            }
+        };
+        let detection_action = match policy {
+            PreparedFieldPolicy::Content => "substitute",
+            PreparedFieldPolicy::NewIdentity => "reject",
+            PreparedFieldPolicy::ExistingIdentity => "preserve",
+        };
+        self.scans.push(PreparedFieldScan {
+            field_id,
+            redaction,
+            detection_action,
+            owners: self.domain_owners.clone(),
+        });
+        Ok(output)
+    }
+
+    fn execute<T>(
+        self,
+        store: &SqliteStore,
+        operation: impl FnOnce(&mut ActiveWriteTransaction<'_>) -> rusqlite::Result<WriteDisposition<T>>,
+    ) -> Result<T, McStoreError> {
+        let redaction_failure = std::cell::Cell::new(None);
+        let redaction_failure_in_tx = &redaction_failure;
+        let result = store.with_conn_fenced(move |tx| {
+            let mut coordinated = ActiveWriteTransaction {
+                tx,
+                prepared: std::cell::RefCell::new(self),
+            };
+            let disposition = operation(&mut coordinated).inspect_err(|error| {
+                redaction_failure_in_tx.set(sqlite_redaction_kind(error));
+            })?;
+            match disposition {
+                WriteDisposition::Applied(value) => {
+                    coordinated.persist_audit()?;
+                    Ok(value)
+                }
+                WriteDisposition::Replay(value) => Ok(value),
+            }
+        });
+        match redaction_failure.get() {
+            Some(kind) => Err(McStoreError::Redaction(kind)),
+            None => result.map_err(Into::into),
+        }
+    }
+}
+
+impl ActiveWriteTransaction<'_> {
+    fn tx(&self) -> &Transaction<'_> {
+        self.tx
+    }
+
+    fn domain_owner(
+        &self,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+    ) {
+        self.prepared
+            .borrow_mut()
+            .domain_owner(scope_kind, scope_key, owner_key);
+    }
+
+    fn persist_audit(&self) -> rusqlite::Result<()> {
+        let prepared = self.prepared.borrow();
+        if prepared.scans.is_empty() {
+            return Ok(());
+        }
+        if prepared.domain_owners.is_empty() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                McStoreError::Serde("scan audit write has no domain owner".to_string()),
+            )));
+        }
+        let mut domain_owner_ids = Vec::with_capacity(prepared.domain_owners.len());
+        {
+            let mut insert_scope = self.tx.prepare_cached(
+                "INSERT OR IGNORE INTO mc_scan_owner_scopes(
+                     owner_scope_id,scope_kind,scope_key
+                 ) VALUES (?1,?2,?3)",
+            )?;
+            let mut select_scope = self.tx.prepare_cached(
+                "SELECT owner_scope_id FROM mc_scan_owner_scopes
+                  WHERE scope_kind = ?1 AND scope_key = ?2",
+            )?;
+            let mut insert_owner = self.tx.prepare_cached(
+                "INSERT OR IGNORE INTO mc_scan_domain_owners(
+                     domain_owner_id,owner_scope_id,owner_kind,owner_key
+                 ) VALUES (?1,?2,?3,?4)",
+            )?;
+            let mut select_owner = self.tx.prepare_cached(
+                "SELECT domain_owner_id FROM mc_scan_domain_owners
+                  WHERE owner_scope_id = ?1 AND owner_kind = ?2 AND owner_key = ?3",
+            )?;
+            for owner in &prepared.domain_owners {
+                let private_scope_key = active_scan_private_key(owner.scope_kind, &owner.scope_key);
+                let private_owner_key =
+                    active_scan_private_key(prepared.owner_kind, &owner.owner_key);
+                let proposed_scope_id = opaque_sqlite_id(self.tx)?;
+                insert_scope.execute(params![
+                    proposed_scope_id,
+                    owner.scope_kind,
+                    private_scope_key
+                ])?;
+                let owner_scope_id: String = select_scope
+                    .query_row(params![owner.scope_kind, private_scope_key], |row| {
+                        row.get(0)
+                    })?;
+                let proposed_owner_id = opaque_sqlite_id(self.tx)?;
+                insert_owner.execute(params![
+                    proposed_owner_id,
+                    owner_scope_id,
+                    prepared.owner_kind,
+                    private_owner_key
+                ])?;
+                let domain_owner_id = select_owner.query_row(
+                    params![owner_scope_id, prepared.owner_kind, private_owner_key],
+                    |row| row.get::<_, String>(0),
+                )?;
+                domain_owner_ids.push((owner.clone(), domain_owner_id));
+            }
+        }
+        let batch_id = opaque_sqlite_id(self.tx)?;
+        self.tx
+            .prepare_cached(
+                "INSERT INTO mc_scan_batches(scan_batch_id,owner_kind,created_at_ms)
+                 VALUES (?1,?2,?3)",
+            )?
+            .execute(params![batch_id, prepared.owner_kind, current_time_ms()])?;
+        // The detector build is constant across one audit batch.
+        let semantic_digest = detector_semantic_digest().map(hex_digest);
+        let revision = detector_revision();
+        let mut insert_scan = self.tx.prepare_cached(
+            "INSERT INTO mc_field_scans(
+                 scan_id,scan_batch_id,detector_id,detector_revision,
+                 semantic_digest,finding_count
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        let mut insert_copy = self.tx.prepare_cached(
+            "INSERT INTO mc_scan_owner_copies(
+                 owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
+             ) VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        let mut insert_detection = self.tx.prepare_cached(
+            "INSERT INTO mc_scan_detections(
+                 scan_id,detection_ordinal,exactness,label_id,span_kind,action
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        for field in &prepared.scans {
+            if field.owners.is_empty() {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    McStoreError::Serde(format!(
+                        "scan field {} has no durable owner",
+                        field.field_id
+                    )),
+                )));
+            }
+            let scan_id = opaque_sqlite_id(self.tx)?;
+            insert_scan.execute(params![
+                scan_id,
+                batch_id,
+                DETECTOR_ID,
+                revision,
+                semantic_digest,
+                i64::try_from(field.redaction.detections.len()).unwrap_or(i64::MAX),
+            ])?;
+            for owner in &field.owners {
+                let domain_owner_id = domain_owner_ids
+                    .iter()
+                    .find_map(|(candidate, id)| (candidate == owner).then_some(id))
+                    .ok_or_else(|| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(McStoreError::Serde(
+                            "scan field references an unregistered durable owner".to_string(),
+                        )))
+                    })?;
+                insert_copy.execute(params![
+                    opaque_sqlite_id(self.tx)?,
+                    scan_id,
+                    domain_owner_id,
+                    prepared.owner_kind,
+                    field.field_id,
+                ])?;
+            }
+            // The detector build is recorded once per field scan, so a
+            // detection row carries only what varies within one scan.
+            for (ordinal, label) in persisted_detection_labels(&field.redaction.detections)
+                .into_iter()
+                .enumerate()
+            {
+                insert_detection.execute(params![
+                    scan_id,
+                    i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    "exact",
+                    label,
+                    "value",
+                    field.detection_action,
+                ])?;
+            }
+        }
+        for link in &prepared.existing_scan_links {
+            let domain_owner_id = domain_owner_ids
+                .iter()
+                .find_map(|(candidate, id)| (candidate == &link.owner).then_some(id))
+                .ok_or_else(|| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(McStoreError::Serde(
+                        "existing scan link references an unregistered durable owner".to_string(),
+                    )))
+                })?;
+            // The id expression sits inside the SELECT so it evaluates per row;
+            // a bound parameter evaluates once for the whole statement.
+            self.tx.execute(
+                "INSERT INTO mc_scan_owner_copies(
+                     owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
+                 )
+                 SELECT lower(hex(randomblob(16))),scan_id,?1,?2,field_id
+                   FROM mc_scan_owner_copies
+                  WHERE scan_id=?3
+                  GROUP BY scan_id,field_id",
+                params![domain_owner_id, prepared.owner_kind, link.scan_id],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Repeated labels carry no additional type information.
+/// The count a caller needs lives in `mc_field_scans.finding_count`.
+fn persisted_detection_labels(detections: &[Detection]) -> Vec<&str> {
+    let mut labels: Vec<&str> = Vec::new();
+    for detection in detections {
+        if labels.len() == MAX_PERSISTED_DETECTION_LABELS {
+            break;
+        }
+        let label = detection.secret_type.as_str();
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+const MAX_PERSISTED_DETECTION_LABELS: usize = 64;
+
+fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
+    tx.prepare_cached("SELECT lower(hex(randomblob(16)))")?
+        .query_row([], |row| row.get(0))
+}
+
+/// Deletes the audit rows that lost their last owner, restricted to `scan_ids`.
+///
+/// An unrestricted sweep would scan `mc_field_scans` and `mc_scan_batches` in full, and
+/// callers retire owners one row at a time inside loops, so the cost per retirement would
+/// grow with every scan the store has ever recorded.
+fn prune_retired_active_scan_audit(
+    tx: &Transaction<'_>,
+    retired_scans: &[(String, String)],
+    owner_scope_id: &str,
+) -> rusqlite::Result<()> {
+    for (scan_id, _) in retired_scans {
+        tx.execute(
+            "DELETE FROM mc_field_scans
+              WHERE scan_id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM mc_scan_owner_copies
+                     WHERE mc_scan_owner_copies.scan_id = mc_field_scans.scan_id
+                )",
+            params![scan_id],
+        )?;
+    }
+    let mut pruned_batches = BTreeSet::new();
+    for (_, batch_id) in retired_scans {
+        if !pruned_batches.insert(batch_id) {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM mc_scan_batches
+              WHERE scan_batch_id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM mc_field_scans
+                     WHERE mc_field_scans.scan_batch_id = mc_scan_batches.scan_batch_id
+                )",
+            params![batch_id],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM mc_scan_owner_scopes
+          WHERE owner_scope_id = ?1
+            AND NOT EXISTS (
+                SELECT 1 FROM mc_scan_domain_owners
+                 WHERE mc_scan_domain_owners.owner_scope_id = mc_scan_owner_scopes.owner_scope_id
+            )",
+        params![owner_scope_id],
+    )?;
+    Ok(())
+}
+
+/// Retires the domain owners in one scope, optionally narrowed to an owner kind and key,
+/// then prunes only the audit rows those owners held.
+fn retire_active_scan_domain_owners(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+    owner_kind: Option<&str>,
+    owner_key: Option<&str>,
+) -> rusqlite::Result<()> {
+    let private_scope_key = active_scan_private_key(scope_kind, scope_key);
+    let owner_scope_id: Option<String> = tx
+        .query_row(
+            "SELECT owner_scope_id FROM mc_scan_owner_scopes
+              WHERE scope_kind = ?1 AND scope_key = ?2",
+            params![scope_kind, private_scope_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(owner_scope_id) = owner_scope_id else {
+        return Ok(());
+    };
+    let private_owner_key =
+        owner_key.map(|key| active_scan_private_key(owner_kind.unwrap_or(scope_kind), key));
+
+    let retired_scans = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT copies.scan_id, scans.scan_batch_id
+               FROM mc_scan_owner_copies copies
+               JOIN mc_scan_domain_owners owners USING(domain_owner_id)
+               JOIN mc_field_scans scans ON scans.scan_id = copies.scan_id
+              WHERE owners.owner_scope_id = ?1
+                AND (?2 IS NULL OR owners.owner_kind = ?2)
+                AND (?3 IS NULL OR owners.owner_key = ?3)",
+        )?;
+        let rows = statement
+            .query_map(
+                params![owner_scope_id, owner_kind, private_owner_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    tx.execute(
+        "DELETE FROM mc_scan_domain_owners
+          WHERE owner_scope_id = ?1
+            AND (?2 IS NULL OR owner_kind = ?2)
+            AND (?3 IS NULL OR owner_key = ?3)",
+        params![owner_scope_id, owner_kind, private_owner_key],
+    )?;
+    prune_retired_active_scan_audit(tx, &retired_scans, &owner_scope_id)
+}
+
+fn retire_active_scan_domain_owner(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+    owner_kind: &str,
+    owner_key: &str,
+) -> rusqlite::Result<()> {
+    retire_active_scan_domain_owners(tx, scope_kind, scope_key, Some(owner_kind), Some(owner_key))
+}
+
+fn retire_active_scan_owner_kind(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+    owner_kind: &str,
+) -> rusqlite::Result<()> {
+    retire_active_scan_domain_owners(tx, scope_kind, scope_key, Some(owner_kind), None)
+}
+
+fn retire_active_scan_scope(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+) -> rusqlite::Result<()> {
+    retire_active_scan_domain_owners(tx, scope_kind, scope_key, None, None)
+}
+
+fn active_scan_owner_key(parts: &[&str]) -> String {
+    let mut key = String::new();
+    for part in parts {
+        use std::fmt::Write;
+        let _ = write!(key, "{}:{part}", part.len());
+    }
+    key
+}
+
+fn active_scan_private_key(kind: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"magic-context-active-scan-owner-v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn hex_digest(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+struct PreparedNoteFields {
+    content: String,
+    surface_condition: Option<String>,
+    anchor_block_id: Option<String>,
+}
+
+struct PreparedNoteUpdate<'a> {
+    content: Option<String>,
+    surface_condition: Option<Option<String>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+}
+
+fn prepare_note_update<'a>(
+    prepared: &mut PreparedWrite,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+) -> Result<PreparedNoteUpdate<'a>, McStoreError> {
+    prepare_note_update_with(
+        prepared,
+        PreparedScanLayer::Durable,
+        content,
+        surface_condition,
+        condition_compile,
+    )
+}
+
+fn prepare_note_update_with<'a>(
+    prepared: &mut PreparedWrite,
+    layer: PreparedScanLayer,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+) -> Result<PreparedNoteUpdate<'a>, McStoreError> {
+    if let Some(compile) = condition_compile {
+        for (field_id, value) in [
+            ("compiled_provider", compile.compiled_provider),
+            ("compiled_config", compile.compiled_config),
+            ("compile_status", compile.compile_status),
+        ] {
+            if let Some(value) = value {
+                prepared.prepare_field(field_id, value, layer, PreparedFieldPolicy::NewIdentity)?;
+            }
+        }
+    }
+    Ok(PreparedNoteUpdate {
+        content: content
+            .map(|value| {
+                prepared.prepare_field("content", value, layer, PreparedFieldPolicy::Content)
+            })
+            .transpose()?,
+        surface_condition: surface_condition
+            .map(|value| {
+                value
+                    .map(|value| {
+                        prepared.prepare_field(
+                            "surface_condition",
+                            value,
+                            layer,
+                            PreparedFieldPolicy::Content,
+                        )
+                    })
+                    .transpose()
+            })
+            .transpose()?,
+        condition_compile,
+    })
+}
+
+fn prepare_transaction_note_update<'a>(
+    prepared: &std::cell::RefCell<PreparedWrite>,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+) -> Result<PreparedNoteUpdate<'a>, McStoreError> {
+    let mut prepared = prepared.borrow_mut();
+    prepare_note_update_with(
+        &mut prepared,
+        PreparedScanLayer::Transaction,
+        content,
+        surface_condition,
+        condition_compile,
+    )
+}
+
+fn prepare_note_fields(
+    prepared: &mut PreparedWrite,
+    content: &str,
+    surface_condition: Option<&str>,
+    anchor_block_id: Option<&str>,
+) -> Result<PreparedNoteFields, McStoreError> {
+    prepare_note_fields_with(
+        prepared,
+        PreparedScanLayer::Durable,
+        content,
+        surface_condition,
+        anchor_block_id,
+    )
+}
+
+fn prepare_note_fields_with(
+    prepared: &mut PreparedWrite,
+    layer: PreparedScanLayer,
+    content: &str,
+    surface_condition: Option<&str>,
+    anchor_block_id: Option<&str>,
+) -> Result<PreparedNoteFields, McStoreError> {
+    Ok(PreparedNoteFields {
+        content: prepared.prepare_field("content", content, layer, PreparedFieldPolicy::Content)?,
+        surface_condition: surface_condition
+            .map(|value| {
+                prepared.prepare_field(
+                    "surface_condition",
+                    value,
+                    layer,
+                    PreparedFieldPolicy::Content,
+                )
+            })
+            .transpose()?,
+        anchor_block_id: anchor_block_id
+            .map(|value| {
+                prepared.prepare_field(
+                    "anchor_block_id",
+                    value,
+                    layer,
+                    PreparedFieldPolicy::NewIdentity,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+fn prepare_transaction_note_fields(
+    prepared: &std::cell::RefCell<PreparedWrite>,
+    content: &str,
+    surface_condition: Option<&str>,
+    anchor_block_id: Option<&str>,
+) -> Result<PreparedNoteFields, McStoreError> {
+    let mut prepared = prepared.borrow_mut();
+    prepare_note_fields_with(
+        &mut prepared,
+        PreparedScanLayer::Transaction,
+        content,
+        surface_condition,
+        anchor_block_id,
+    )
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFieldPolicy {
+    Redact,
+    Reject,
+    Mixed,
+    NoUntrustedText,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DurableWriteFamily {
+    CacheState,
+    TransformDiagnostics,
+    TransformOverlays,
+    CommandLedgers,
+    Notes,
+    NoteEvaluationLedgers,
+    Compartments,
+    ChunkTranscripts,
+    Tags,
+    HistorianSideChannels,
+    WorkspaceProfileMemory,
+    AuthorityRoutes,
+    AuthorityControl,
+    AuthoritySeedRows,
+    ProjectMuralArtifacts,
+    ClaimIntents,
+    ClaimMirror,
+    FacadeMutationLedger,
+    LineageCopies,
+    KernelCommitEnvelope,
+    KernelDomainsRegistry,
+    KernelStaging,
+    KernelAlignmentProjection,
+    KernelConsumerControl,
+    RedactionReceipts,
+}
+
+impl DurableWriteFamily {
+    /// Every variant, so a test can enumerate the families instead of restating the list.
+    pub const ALL: &'static [Self] = &[
+        Self::CacheState,
+        Self::TransformDiagnostics,
+        Self::TransformOverlays,
+        Self::CommandLedgers,
+        Self::Notes,
+        Self::NoteEvaluationLedgers,
+        Self::Compartments,
+        Self::ChunkTranscripts,
+        Self::Tags,
+        Self::HistorianSideChannels,
+        Self::WorkspaceProfileMemory,
+        Self::AuthorityRoutes,
+        Self::AuthorityControl,
+        Self::AuthoritySeedRows,
+        Self::ProjectMuralArtifacts,
+        Self::ClaimIntents,
+        Self::ClaimMirror,
+        Self::FacadeMutationLedger,
+        Self::LineageCopies,
+        Self::KernelCommitEnvelope,
+        Self::KernelDomainsRegistry,
+        Self::KernelStaging,
+        Self::KernelAlignmentProjection,
+        Self::KernelConsumerControl,
+        Self::RedactionReceipts,
+    ];
+
+    /// Panics when the family is absent from [`DURABLE_WRITE_REGISTRY`].
+    ///
+    /// `PreparedWrite::new` resolves this, so a family cannot reach storage without
+    /// declaring the policy it follows and the test that proves it.
+    fn registration(self) -> &'static DurableWriteRegistration {
+        DURABLE_WRITE_REGISTRY
+            .iter()
+            .find(|entry| entry.family == self)
+            .expect("durable-write family is declared in DURABLE_WRITE_REGISTRY")
+    }
+
+    pub const fn owner_kind(self) -> &'static str {
+        match self {
+            Self::CacheState => "cache_state",
+            Self::TransformDiagnostics => "transform_diagnostics",
+            Self::TransformOverlays => "transform_overlays",
+            Self::CommandLedgers => "command_ledgers",
+            Self::Notes => "notes",
+            Self::NoteEvaluationLedgers => "note_evaluation_ledgers",
+            Self::Compartments => "compartments",
+            Self::ChunkTranscripts => "chunk_transcripts",
+            Self::Tags => "tags",
+            Self::HistorianSideChannels => "historian_side_channels",
+            Self::WorkspaceProfileMemory => "workspace_profile_memory",
+            Self::AuthorityRoutes => "authority_routes",
+            Self::AuthorityControl => "authority_control",
+            Self::AuthoritySeedRows => "authority_seed_rows",
+            Self::ProjectMuralArtifacts => "project_mural_artifacts",
+            Self::ClaimIntents => "claim_intents",
+            Self::ClaimMirror => "claim_mirror",
+            Self::FacadeMutationLedger => "facade_mutation",
+            Self::LineageCopies => "lineage_copies",
+            Self::KernelCommitEnvelope => "kernel_commit_envelope",
+            Self::KernelDomainsRegistry => "kernel_domains_registry",
+            Self::KernelStaging => "kernel_staging",
+            Self::KernelAlignmentProjection => "kernel_alignment_projection",
+            Self::KernelConsumerControl => "kernel_consumer_control",
+            Self::RedactionReceipts => "redaction_receipts",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableWriteRegistration {
+    pub family: DurableWriteFamily,
+    pub policy: DurableFieldPolicy,
+    pub preparation: &'static str,
+    pub test: &'static str,
+}
+
+#[doc(hidden)]
+pub const DURABLE_WRITE_REGISTRY: &[DurableWriteRegistration] = &[
+    DurableWriteRegistration { family: DurableWriteFamily::CacheState, policy: DurableFieldPolicy::Mixed, preparation: "prepare_core_state + prepare_json_content", test: "production_redaction::cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity" },
+    DurableWriteRegistration { family: DurableWriteFamily::TransformDiagnostics, policy: DurableFieldPolicy::Redact, preparation: "prepare_content / prepare_json_content", test: "production_redaction::transform_diagnostics_redact_before_persistence" },
+    DurableWriteRegistration { family: DurableWriteFamily::TransformOverlays, policy: DurableFieldPolicy::Mixed, preparation: "prepared overlay fields", test: "lib::tags_mint_monotonically_and_channel1_appends_are_idempotent" },
+    DurableWriteRegistration { family: DurableWriteFamily::CommandLedgers, policy: DurableFieldPolicy::Mixed, preparation: "exact replay then integrity rejection / prepare_json_content", test: "production_redaction::new_idempotency_identities_reject_without_substitution_or_collapse" },
+    DurableWriteRegistration { family: DurableWriteFamily::Notes, policy: DurableFieldPolicy::Mixed, preparation: "prepared note content and integrity metadata", test: "production_redaction::note_fields_follow_content_and_integrity_policy" },
+    DurableWriteRegistration { family: DurableWriteFamily::NoteEvaluationLedgers, policy: DurableFieldPolicy::Mixed, preparation: "exact replay then bounded prepared response", test: "lib::note_evaluation_callback_errors_are_redacted" },
+    DurableWriteRegistration { family: DurableWriteFamily::Compartments, policy: DurableFieldPolicy::Mixed, preparation: "prepare_compartment", test: "production_redaction::compartment_content_redacts_and_new_message_identities_reject" },
+    DurableWriteRegistration { family: DurableWriteFamily::ChunkTranscripts, policy: DurableFieldPolicy::Redact, preparation: "prepare_content / prepare_json_content before compression", test: "lib::publish_historian_chunk_persists_transcript_inside_cas" },
+    DurableWriteRegistration { family: DurableWriteFamily::Tags, policy: DurableFieldPolicy::Mixed, preparation: "exact replay then identity rejection and prepare_transaction_bytes", test: "lib::tags_mint_monotonically_and_channel1_appends_are_idempotent" },
+    DurableWriteRegistration { family: DurableWriteFamily::HistorianSideChannels, policy: DurableFieldPolicy::Mixed, preparation: "prepare_json_content", test: "lib::historian_side_channel_outbox_recovers_after_restart" },
+    DurableWriteRegistration { family: DurableWriteFamily::WorkspaceProfileMemory, policy: DurableFieldPolicy::Redact, preparation: "typed prepared state-sync rows", test: "lib::state_sync_sections_distinguish_absent_empty_and_legacy_always_present" },
+    DurableWriteRegistration { family: DurableWriteFamily::AuthorityRoutes, policy: DurableFieldPolicy::Reject, preparation: "exact binding lookup then structural validation or identity rejection", test: "production_redaction::authority_routes_reject_new_secret_identities_and_preserve_exact_existing_bindings" },
+    DurableWriteRegistration { family: DurableWriteFamily::AuthorityControl, policy: DurableFieldPolicy::Reject, preparation: "structural existing authority keys and rejected new identities/checksums", test: "production_redaction::authority_creation_and_checksums_reject_secret_material" },
+    DurableWriteRegistration { family: DurableWriteFamily::AuthoritySeedRows, policy: DurableFieldPolicy::Mixed, preparation: "prepare_json_content and bind prepared snapshot", test: "lib::authority_note_seed_frame_uses_one_fenced_transaction_and_is_idempotent" },
+    DurableWriteRegistration { family: DurableWriteFamily::ProjectMuralArtifacts, policy: DurableFieldPolicy::Reject, preparation: "identity, data URL, and hash rejection before transaction", test: "production_redaction::mural_artifacts_reject_secret_bytes_hashes_and_new_identity" },
+    DurableWriteRegistration { family: DurableWriteFamily::ClaimIntents, policy: DurableFieldPolicy::Reject, preparation: "integrity rejection and canonical integrity JSON", test: "production_redaction::fresh_claim_intent_identities_and_integrity_payloads_reject" },
+    DurableWriteRegistration { family: DurableWriteFamily::ClaimMirror, policy: DurableFieldPolicy::Reject, preparation: "exact receipt replay then whole-value integrity scan", test: "production_redaction::integrity_bound_claim_content_rejects_without_identity_collapse" },
+    DurableWriteRegistration { family: DurableWriteFamily::FacadeMutationLedger, policy: DurableFieldPolicy::Mixed, preparation: "exact command replay then prepared tags and bounded transaction result", test: "production_redaction::transaction_produced_facade_text_is_redacted_and_bounded" },
+    DurableWriteRegistration { family: DurableWriteFamily::LineageCopies, policy: DurableFieldPolicy::Mixed, preparation: "link existing source scan receipts to copied rows", test: "production_redaction::lineage_copy_links_source_scans_without_rescanning_and_survives_source_deletion" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelCommitEnvelope, policy: DurableFieldPolicy::Mixed, preparation: "caller intent before lock and transaction-budget result", test: "kernel_redaction::envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelDomainsRegistry, policy: DurableFieldPolicy::Reject, preparation: "RedactedDomain", test: "kernel_redaction::new_kernel_identities_reject_instead_of_collapsing" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelStaging, policy: DurableFieldPolicy::Mixed, preparation: "exact run lookup then prepared run and candidate fields", test: "kernel_redaction::staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelAlignmentProjection, policy: DurableFieldPolicy::Mixed, preparation: "exact existing foreign keys plus prepared kind and payload", test: "kernel_envelope::projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelConsumerControl, policy: DurableFieldPolicy::Mixed, preparation: "exact consumer lookup then prepared operator and reason", test: "kernel_outbox::deregistration_uses_commit_tip_without_publication_and_abandonment_records_four_facts" },
+    DurableWriteRegistration { family: DurableWriteFamily::RedactionReceipts, policy: DurableFieldPolicy::NoUntrustedText, preparation: "opaque batch, child scan, and owner-copy IDs with normalized detector metadata only", test: "kernel_schema::scan_audit_is_digest_covered_and_contains_no_secret_shape" },
+];
+
+fn prepare_content(input: &str) -> Result<String, McStoreError> {
+    prepare_content_with(input, PreparedScanLayer::Durable)
+}
+
+fn prepare_content_with(input: &str, layer: PreparedScanLayer) -> Result<String, McStoreError> {
+    ensure_durable_text_bound(input)?;
+    Ok(match layer {
+        PreparedScanLayer::Durable => redact_durable_text(input),
+        PreparedScanLayer::Transaction => redact_transaction_durable_text(input),
+    }
+    .text)
+}
+
+fn prepare_transaction_content(input: &str) -> Result<String, McStoreError> {
+    prepare_content_with(input, PreparedScanLayer::Transaction)
+}
+
+fn prepare_json_content(input: &str) -> Result<String, McStoreError> {
+    prepare_json_content_with(input, JsonScanPolicy::DurableRejectProtected)
+}
+
+fn prepare_json_content_preserving_identities(input: &str) -> Result<String, McStoreError> {
+    prepare_json_content_with(input, JsonScanPolicy::DurablePreserveIdentities)
+}
+
+fn prepare_transaction_json_preserving_identities(input: &str) -> Result<String, McStoreError> {
+    prepare_json_content_with(input, JsonScanPolicy::TransactionPreserveIdentities)
+}
+
+fn prepare_transaction_response_collecting(
+    input: &str,
+    detections: &mut Vec<Detection>,
+) -> Result<String, McStoreError> {
+    if serde_json::from_str::<Value>(input).is_ok() {
+        prepare_json_content_collecting(
+            input,
+            JsonScanPolicy::TransactionPreserveIdentities,
+            detections,
+        )
+    } else {
+        ensure_durable_text_bound(input)?;
+        let redaction = redact_transaction_durable_text(input);
+        detections.extend(redaction.detections);
+        Ok(redaction.text)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JsonScanPolicy {
+    DurableRejectProtected,
+    DurablePreserveIdentities,
+    TransactionRejectProtected,
+    TransactionPreserveIdentities,
+}
+
+impl JsonScanPolicy {
+    fn transaction(self) -> bool {
+        matches!(
+            self,
+            Self::TransactionRejectProtected | Self::TransactionPreserveIdentities
+        )
+    }
+
+    fn reject_protected(self) -> bool {
+        matches!(
+            self,
+            Self::DurableRejectProtected | Self::TransactionRejectProtected
+        )
+    }
+}
+
+fn prepare_json_content_with(input: &str, policy: JsonScanPolicy) -> Result<String, McStoreError> {
+    prepare_json_content_collecting(input, policy, &mut Vec::new())
+}
+
+/// Appends every detection the preparation observed to `detections`, so an audit receipt can
+/// be recorded without scanning the same text a second time.
+fn prepare_json_content_collecting(
+    input: &str,
+    policy: JsonScanPolicy,
+    detections: &mut Vec<Detection>,
+) -> Result<String, McStoreError> {
+    ensure_durable_text_bound(input)?;
+    fn identity_json_field(key: &str) -> bool {
+        matches!(key, "id" | "key" | "locator" | "revision")
+            || key.ends_with("_id")
+            || key.ends_with("_ids")
+            || key.ends_with("_key")
+            || key.ends_with("_keys")
+            || key.ends_with("_locator")
+            || key.ends_with("_revision")
+    }
+
+    fn integrity_json_field(key: &str) -> bool {
+        let key = key.to_ascii_lowercase();
+        [
+            "password",
+            "secret",
+            "token",
+            "signature",
+            "integrity",
+            "signed",
+            "digest",
+            "hash",
+            "fingerprint",
+        ]
+        .iter()
+        .any(|marker| key.contains(marker))
+    }
+
+    fn validate_existing_value(value: &Value) -> Result<(), McStoreError> {
+        match value {
+            Value::String(text) => ensure_durable_text_bound(text),
+            Value::Array(values) => values.iter().try_for_each(validate_existing_value),
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    ensure_durable_text_bound(key)?;
+                    validate_existing_value(value)?;
+                }
+                Ok(())
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        }
+    }
+
+    fn validate_json_keys(value: &Value) -> Result<(), McStoreError> {
+        match value {
+            Value::Array(values) => values.iter().try_for_each(validate_json_keys),
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    ensure_durable_text_bound(key)?;
+                    reject_secret_text(key)?;
+                    validate_json_keys(value)?;
+                }
+                Ok(())
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
+        }
+    }
+
+    fn contains_nonempty_text(value: &Value) -> bool {
+        match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Array(values) => values.iter().any(contains_nonempty_text),
+            Value::Object(fields) => fields.values().any(contains_nonempty_text),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    fn prepare_value(
+        value: &mut Value,
+        key: Option<&str>,
+        policy: JsonScanPolicy,
+        detections: &mut Vec<Detection>,
+    ) -> Result<(), McStoreError> {
+        if let Some(key) = key.filter(|key| identity_json_field(key) || integrity_json_field(key)) {
+            // `api_key` passes `identity_json_field` and matches no `integrity_json_field`
+            // marker, so the length-only path would store a credential unscanned.
+            let preserved_identity = identity_json_field(key)
+                && !integrity_json_field(key)
+                && qualified_secret_key_label(key).is_none()
+                && !policy.reject_protected();
+            if preserved_identity {
+                ensure_durable_text_bound(key)?;
+                // Only a scalar is preserved. A container's members carry their own policy:
+                // an object supplies new field names, and an array's elements inherit this
+                // key through the walk below, so a scalar element stays verbatim while an
+                // object element is scanned under its own names. Exempting a whole subtree
+                // stores the secret in `{"id":{"message":"password=.."}}` and in
+                // `{"ids":[{"password":".."}]}` verbatim.
+                if !value.is_object() && !value.is_array() {
+                    return validate_existing_value(value);
+                }
+            } else if contains_nonempty_text(value) {
+                let encoded = canonical_json_encode(value)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                let redaction = if policy.transaction() {
+                    redact_transaction_durable_text(&encoded)
+                } else {
+                    redact_durable_text(&encoded)
+                };
+                if !redaction.detections.is_empty() || protected_json_key_label(key).is_some() {
+                    return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+                }
+                detections.extend(redaction.detections);
+                return Ok(());
+            } else {
+                return Ok(());
+            }
+        }
+        // Protected-key containers with nested text can expose it under unprotected member keys.
+        // `{"credential":{"value":".."}}` reads its text under `value`.
+        // `claim_mirror::prepare_integrity_json` refuses the same shape.
+        if key.is_some_and(|key| protected_json_key_label(key).is_some())
+            && (value.is_object() || value.is_array())
+            && contains_nonempty_text(value)
+        {
+            return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+        }
+        match value {
+            Value::String(text) => {
+                let redaction = if policy.transaction() {
+                    redact_transaction_durable_text(text)
+                } else {
+                    redact_durable_text(text)
+                };
+                let scanner_found = !redaction.detections.is_empty();
+                detections.extend(redaction.detections);
+                *text = match key.and_then(protected_json_key_label) {
+                    Some(label) if !text.is_empty() => {
+                        if !scanner_found {
+                            // Protected-key redaction can change a value the value-only
+                            // scanner did not detect; record a synthetic detection so
+                            // `finding_count` reflects the change.
+                            detections.push(Detection {
+                                detector_id: DETECTOR_ID,
+                                secret_type: label.clone(),
+                                offset: 0,
+                                length: text.len(),
+                            });
+                        }
+                        format!("<REDACTED:{label}>")
+                    }
+                    _ => redaction.text,
+                };
+            }
+            Value::Array(values) => {
+                for value in values {
+                    prepare_value(value, key, policy, detections)?;
+                }
+            }
+            Value::Object(fields) => {
+                for (field, value) in fields {
+                    ensure_durable_text_bound(field)?;
+                    reject_secret_text(field)?;
+                    prepare_value(value, Some(field), policy, detections)?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+        Ok(())
+    }
+
+    let mut value: Value = parse_json_with_unique_names(input)?;
+    validate_json_keys(&value)?;
+    let original = value.clone();
+    prepare_value(&mut value, None, policy, detections)?;
+    if value == original {
+        Ok(input.to_string())
+    } else {
+        serde_json::to_string(&value).map_err(|error| McStoreError::Serde(error.to_string()))
+    }
+}
+
+/// `serde_json::Value` retains only the last duplicate object name, allowing earlier
+/// secret-bearing values to bypass `prepare_value` and persist when unchanged input is returned.
+fn parse_json_with_unique_names(input: &str) -> Result<Value, McStoreError> {
+    struct UniqueNames(Value);
+
+    struct UniqueNamesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueNamesVisitor {
+        type Value = Value;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("JSON whose object names are unique")
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+            Ok(Value::Bool(value))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+            Ok(Value::from(value))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+            Ok(Value::from(value))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+            Ok(Value::from(value))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+            Ok(Value::String(value.to_owned()))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Value, A::Error> {
+            let mut items = Vec::new();
+            while let Some(UniqueNames(item)) = sequence.next_element()? {
+                items.push(item);
+            }
+            Ok(Value::Array(items))
+        }
+
+        // Error messages omit object names because validation scans them for credentials only
+        // after parsing.
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut fields = serde_json::Map::new();
+            while let Some(name) = map.next_key::<String>()? {
+                let UniqueNames(value) = map.next_value()?;
+                if fields.insert(name, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate JSON object name"));
+                }
+            }
+            Ok(Value::Object(fields))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for UniqueNames {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(UniqueNamesVisitor).map(Self)
+        }
+    }
+
+    serde_json::from_str::<UniqueNames>(input)
+        .map(|UniqueNames(value)| value)
+        .map_err(|error| McStoreError::Serde(error.to_string()))
+}
+
+fn ensure_durable_text_bound(input: &str) -> Result<(), McStoreError> {
+    if input.len() > MAX_DURABLE_TEXT_BYTES {
+        Err(McStoreError::Redaction(RedactionErrorKind::InputLimit))
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_core_state(core: &CoreState) -> Result<CoreState, McStoreError> {
+    fn prepare_unit(unit: &FrozenUnit) -> Result<FrozenUnit, McStoreError> {
+        ensure_durable_text_bound(&unit.key)?;
+        ensure_durable_text_bound(&unit.kind)?;
+        ensure_durable_text_bound(&unit.reset_rule)?;
+        Ok(FrozenUnit {
+            key: unit.key.clone(),
+            kind: unit.kind.clone(),
+            frozen_payload: prepare_content(&unit.frozen_payload)?,
+            durability_class: unit.durability_class,
+            reset_rule: unit.reset_rule.clone(),
+        })
+    }
+
+    ensure_durable_text_bound(&core.boundary_id)?;
+    Ok(CoreState {
+        version: core.version,
+        boundary_id: core.boundary_id.clone(),
+        frozen_units: core
+            .frozen_units
+            .iter()
+            .map(prepare_unit)
+            .collect::<Result<Vec<_>, _>>()?,
+        pending_changes: core
+            .pending_changes
+            .iter()
+            .map(prepare_unit)
+            .collect::<Result<Vec<_>, _>>()?,
+        reconcile_pending: core.reconcile_pending,
+    })
+}
+
+fn prepare_core_state_for_write(
+    write: &mut PreparedWrite,
+    core: &CoreState,
+) -> Result<CoreState, McStoreError> {
+    fn prepare_unit(
+        write: &mut PreparedWrite,
+        unit: &FrozenUnit,
+    ) -> Result<FrozenUnit, McStoreError> {
+        Ok(FrozenUnit {
+            key: write.existing_identity("unit_key", &unit.key)?,
+            kind: write.existing_identity("unit_kind", &unit.kind)?,
+            frozen_payload: write.content("frozen_payload", &unit.frozen_payload)?,
+            durability_class: unit.durability_class,
+            reset_rule: write.existing_identity("reset_rule", &unit.reset_rule)?,
+        })
+    }
+
+    Ok(CoreState {
+        version: core.version,
+        boundary_id: write.existing_identity("boundary_id", &core.boundary_id)?,
+        frozen_units: core
+            .frozen_units
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        pending_changes: core
+            .pending_changes
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        reconcile_pending: core.reconcile_pending,
+    })
+}
+
+fn prepare_transaction_core_state_for_write(
+    write: &mut PreparedWrite,
+    core: &CoreState,
+) -> Result<CoreState, McStoreError> {
+    fn prepare_unit(
+        write: &mut PreparedWrite,
+        unit: &FrozenUnit,
+    ) -> Result<FrozenUnit, McStoreError> {
+        Ok(FrozenUnit {
+            key: write.transaction_existing_identity("unit_key", &unit.key)?,
+            kind: write.transaction_existing_identity("unit_kind", &unit.kind)?,
+            frozen_payload: write.transaction_content("frozen_payload", &unit.frozen_payload)?,
+            durability_class: unit.durability_class,
+            reset_rule: write.transaction_existing_identity("reset_rule", &unit.reset_rule)?,
+        })
+    }
+
+    Ok(CoreState {
+        version: core.version,
+        boundary_id: write.transaction_existing_identity("boundary_id", &core.boundary_id)?,
+        frozen_units: core
+            .frozen_units
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        pending_changes: core
+            .pending_changes
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        reconcile_pending: core.reconcile_pending,
+    })
+}
+
+fn sqlite_redaction_kind(error: &rusqlite::Error) -> Option<RedactionErrorKind> {
+    let rusqlite::Error::ToSqlConversionFailure(source) = error else {
+        return None;
+    };
+    source
+        .downcast_ref::<McStoreError>()
+        .and_then(|error| match error {
+            McStoreError::Redaction(kind) => Some(*kind),
+            _ => None,
+        })
+}
+
+fn prepare_compartment(
+    write: &mut PreparedWrite,
+    compartment: &StoredCompartment,
+) -> Result<StoredCompartment, McStoreError> {
+    write.identity("start_message_id", &compartment.start_message_id)?;
+    write.identity("end_message_id", &compartment.end_message_id)?;
+    if let Some(episode_type) = &compartment.episode_type {
+        write.identity("episode_type", episode_type)?;
+    }
+    Ok(StoredCompartment {
+        sequence: compartment.sequence,
+        start_message: compartment.start_message,
+        end_message: compartment.end_message,
+        start_message_id: compartment.start_message_id.clone(),
+        end_message_id: compartment.end_message_id.clone(),
+        start_date: compartment
+            .start_date
+            .as_deref()
+            .map(|value| write.content("start_date", value))
+            .transpose()?,
+        end_date: compartment
+            .end_date
+            .as_deref()
+            .map(|value| write.content("end_date", value))
+            .transpose()?,
+        title: write.content("title", &compartment.title)?,
+        content: write.content("content", &compartment.content)?,
+        p1: compartment
+            .p1
+            .as_deref()
+            .map(|value| write.content("p1", value))
+            .transpose()?,
+        p2: compartment
+            .p2
+            .as_deref()
+            .map(|value| write.content("p2", value))
+            .transpose()?,
+        p3: compartment
+            .p3
+            .as_deref()
+            .map(|value| write.content("p3", value))
+            .transpose()?,
+        p4: compartment
+            .p4
+            .as_deref()
+            .map(|value| write.content("p4", value))
+            .transpose()?,
+        importance: compartment.importance,
+        episode_type: compartment.episode_type.clone(),
+        legacy: compartment.legacy,
+        created_at: compartment.created_at,
+    })
+}
+
+fn prepare_compartments(
+    write: &mut PreparedWrite,
+    compartments: &[StoredCompartment],
+) -> Result<Vec<StoredCompartment>, McStoreError> {
+    compartments
+        .iter()
+        .map(|compartment| prepare_compartment(write, compartment))
+        .collect()
+}
+
+fn prepare_workspace(
+    write: &mut PreparedWrite,
+    workspace: &ModuleWorkspaceRow,
+) -> Result<ModuleWorkspaceRow, McStoreError> {
+    write.identity("workspace_name", &workspace.name)?;
+    for category in &workspace.share_categories {
+        write.identity("workspace_share_category", category)?;
+    }
+    let members = workspace
+        .members
+        .iter()
+        .map(|member| {
+            write.identity("workspace_project_path", &member.project_path)?;
+            write.identity("workspace_display_path", &member.display_path)?;
+            Ok(ModuleWorkspaceMemberRow {
+                project_path: member.project_path.clone(),
+                display_name: write.content("workspace_display_name", &member.display_name)?,
+                display_path: member.display_path.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    Ok(ModuleWorkspaceRow {
+        name: workspace.name.clone(),
+        share_categories: workspace.share_categories.clone(),
+        members,
+    })
+}
+
+/// Full module-side note write input. `surface_condition` selects the pending smart-note
+/// state; an absent condition creates an ordinary active note for legacy callers, while the
 /// Rust-mode adapter keeps session-only notes on the TypeScript-owned path.
 #[derive(Debug, Clone, Copy)]
 pub struct NoteWriteInput<'a> {
     pub project_path: &'a str,
-    /// Facade writes use the bound route root, while the note remains keyed by `project_path`.
+    /// Bound route root for facade writes. The note remains keyed by `project_path`.
     pub route_project_root: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub content: &'a str,
@@ -2782,6 +4531,22 @@ pub enum NoteCasOutcome {
     Conflict { current: Option<StoredNote> },
 }
 
+/// Mutation-neutral updates return `Applied` without executing a statement.
+/// An active-write disposition uses `wrote` rather than the outcome variant.
+struct NoteCasApplication {
+    outcome: NoteCasOutcome,
+    wrote: bool,
+}
+
+impl NoteCasApplication {
+    fn unwritten(outcome: NoteCasOutcome) -> Self {
+        Self {
+            outcome,
+            wrote: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteTransitionInput<'a> {
     pub project_path: &'a str,
@@ -2805,20 +4570,21 @@ pub struct NoteEvaluationInput<'a> {
     pub now_ms: i64,
 }
 
-/// A durable smart-note evaluation claim expires after this lease length.
+/// Lease length for one durable smart-note evaluation claim.
 pub const NOTE_EVAL_CLAIM_LEASE_MS: i64 = 2 * 60_000;
-/// `no_work` acquisition decisions remain replayable for this retention period.
+/// Replay retention for a `no_work` acquisition decision.
 pub const NOTE_EVAL_NO_WORK_RETENTION_MS: i64 = 10 * 60_000;
-/// Terminal claim results remain replayable for this retention period.
+/// Replay retention for a terminal claim result.
 pub const NOTE_EVAL_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60_000;
-/// Terminal claims redact `terminal_response` after 24 hours.
-/// Redact `terminal_response` before terminal-row expiry.
-/// The system retains `terminal_response` for 24 hours, then redacts it before terminal-row expiry.
-/// Redacting `terminal_response` prevents evaluator-supplied response text from surviving for the terminal-retention window.
+/// How long a terminal claim keeps its `terminal_response` before redaction.
+/// The response exists only so a worker that lost the completion reply can
+/// replay it; that window is minutes, not days. Nulling it well before the
+/// row itself ages out keeps evaluator-supplied response text from being
+/// retained for the full terminal-retention window.
 pub const NOTE_EVAL_RESPONSE_REDACT_MS: i64 = 24 * 60 * 60_000;
-/// Each project retains at most 10,000 rows in each evaluation ledger.
+/// Per-project row cap for each evaluation ledger.
 pub const NOTE_EVAL_LEDGER_CAP: i64 = 10_000;
-/// Each committed compiled-artifact repair batch repairs 500 rows.
+/// Rows repaired per committed batch by the v51 compiled-artifact repair.
 const NOTE_ARTIFACT_REPAIR_BATCH: i64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2839,10 +4605,11 @@ pub struct NoteEvalClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// The acquisition transaction stores the caller closure's selection decision.
-/// `NoWork` records its cause so the acquisition ledger can replay the decision after response loss.
-/// `cycle_exhausted` tells the client to poll again after the selection cursor is spent.
-/// An empty selection result ends the drain.
+/// One selection decision produced by the caller's closure inside the
+/// acquisition transaction. `NoWork` carries its cause so the durable
+/// ledger can replay the full decision after response loss: a spent
+/// cursor (`cycle_exhausted`) tells the client to poll again, while a
+/// plain empty answer ends the drain.
 pub enum NoteEvalSelection {
     Claim { note_id: i64, phase: String },
     NoWork { cycle_exhausted: bool },
@@ -2858,7 +4625,8 @@ pub enum NoteEvalAcquireOutcome {
     },
     NoWork {
         replayed: bool,
-        /// The acquisition ledger records cursor exhaustion so response-loss replay re-announces it.
+        /// The selection cursor, not the queue, ended this pass. Durable in
+        /// the acquisition ledger so response-loss replays re-announce it.
         cycle_exhausted: bool,
     },
     /// The acquisition identity replays an expired decision.
@@ -2938,7 +4706,7 @@ pub struct StoredNoteSearchRow {
     pub updated_at_ms: i64,
 }
 
-/// The ledger persists one claim command intent and its committed result JSON.
+/// Persists one claim command intent and its committed result JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimIntentRecord {
     pub binding: ClaimIntentBinding,
@@ -2956,7 +4724,7 @@ pub struct ClaimIntentMutationOutcome {
     pub replayed: bool,
 }
 
-/// The authority state covers one context store, project, and owned domain.
+/// Durable authority state for one context store, project, and owned domain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityRow {
     pub context_store_uuid: String,
@@ -2976,7 +4744,7 @@ pub struct AuthorityRow {
     pub step_flip: bool,
     pub coordinator_lease: Option<String>,
     pub lease_expires_at: Option<i64>,
-    /// Drain begin or takeover mints an attempt-unique token; step and finish require that token.
+    /// Attempt-unique token minted at drain begin/takeover. Step and finish require it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_token: Option<String>,
     pub checksum_expected: Option<String>,
@@ -2984,7 +4752,7 @@ pub struct AuthorityRow {
     pub checksum_ok: Option<bool>,
 }
 
-/// Each `mirror.pull` call returns one append-only row; its snapshot contains the complete row.
+/// One append-only row returned by `mirror.pull`. The snapshot is the complete row
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangefeedRow {
     pub feed_seq: i64,
@@ -3010,26 +4778,29 @@ pub struct DreamTaskCommandRow {
     pub created_at: i64,
 }
 
-/// The crash-idempotent authority seed uses the persisted context-store row.
-/// The module persists owned fields and separately verifies the host-provided content hash without interpreting the JSON payload.
+/// A context row used by the crash-idempotent authority seed. The JSON payload is
+/// intentionally opaque here; the module persists the fields it owns and verifies
+/// the host-provided content hash separately.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritySeedRow {
     pub source_row_id: i64,
     pub snapshot: Value,
 }
 
+/// A loaded per-session row: the core state, the meta blob, and the CAS token.
 #[derive(Debug, Clone)]
 pub struct LoadedState {
     pub core: CoreState,
     pub meta: ModuleMeta,
-    /// Callers pass `row_version` to [`McStore::commit`] as the CAS expectation.
-    /// `None` selects [`McStore::commit`]'s INSERT path when no row exists.
+    /// The row_version read from disk; pass it back to [`McStore::commit`] as the CAS
+    /// expectation. `None` when no row existed yet (first bootstrap → INSERT path).
     pub row_version: Option<u64>,
 }
 
-/// The module collects these query-family timings while loading a transform snapshot.
+/// Query-family timings collected while loading a transform snapshot.
 ///
-/// These fields expose the read-transaction breakdown in the module's per-pass diagnostic line without changing snapshot contents or transaction scope.
+/// These fields are not durable state. They expose the read-transaction breakdown to the
+/// module's per-pass diagnostic line without changing snapshot contents or transaction scope.
 #[derive(Debug, Clone, Default)]
 pub struct TransformSnapshotTimings {
     pub cache_state_ms: f64,
@@ -3039,9 +4810,9 @@ pub struct TransformSnapshotTimings {
     pub overlay_frontier_ms: f64,
 }
 
-/// The module reads cache state and every non-tag byte-affecting transform overlay from one SQLite snapshot.
+/// Cache state and every non-tag byte-affecting transform overlay from one SQLite snapshot.
 ///
-/// The module caches tag rows as immutable payloads and validates them with [`TagCacheSummary`].
+/// Tag rows are immutable payloads cached module-side and validated with [`TagCacheSummary`].
 #[derive(Debug, Clone)]
 pub struct TransformSnapshot {
     pub loaded: LoadedState,
@@ -3107,8 +4878,9 @@ pub struct UserHintSeedRow {
     pub hint_text: String,
 }
 
-/// The module replays the TypeScript-owned strip decision before its first transform.
-/// Message-level strips carry the message ID because one source operation can cover several CK blocks.
+/// A TypeScript-owned strip decision that must be replayed by the module before its
+/// first transform. Message-level strips intentionally carry the message id rather
+/// than a block id because the source operation may have covered several CK blocks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleStripSeedRow {
     pub message_id: String,
@@ -3120,7 +4892,7 @@ pub struct ModuleStateSyncRequest<'a> {
     pub project_path: &'a str,
     pub shadow_generation: u64,
     pub expected_shadow_seq: u64,
-    /// A full seed includes the producer's current flat compaction boundary.
+    /// The producer's current flat compaction boundary. Present only on a full seed.
     pub seed_boundary_id: Option<&'a str>,
     pub drop_seeds: &'a [ModuleDropSeedRow],
     pub drop_seed_skipped: usize,
@@ -3128,11 +4900,11 @@ pub struct ModuleStateSyncRequest<'a> {
     pub pending_agent_drops_skipped: usize,
     pub user_hint_seeds: &'a [UserHintSeedRow],
     pub auto_search_hint_skipped: usize,
-    /// When user_hints_replace_session is true, the seed batch is the host's complete hint-decision list for the session.
-    /// When user_hints_replace_session is true, an absent stored hint block has no backing decision the host can validate.
-    /// A pre-policy hint whose raw message is gone has no backing decision the host can validate.
-    /// Keeping a hint without a validatable backing decision replays unvalidated overlay bytes forever.
-    /// When user_hints_replace_session is true, seed rows are upserted and absent stored rows are deleted.
+    /// When true, the seed batch is the host's COMPLETE hint-decision list
+    /// for this session: any stored hint block absent from the batch has no
+    /// backing decision the host can still validate (a pre-policy hint whose
+    /// raw message is gone), and keeping it would replay unvalidated overlay
+    /// bytes forever. Rows in the batch are upserted; absent rows deleted.
     pub user_hints_replace_session: bool,
     pub note_nudge_anchors: Option<&'a [NoteNudgeAnchorSeed]>,
     pub todo_synthetic_anchor: Option<&'a FrozenSyntheticTodoPair>,
@@ -3225,16 +4997,171 @@ pub enum ModuleStateSyncError {
     Serde(String),
 }
 
+struct PreparedStateSync {
+    drop_seeds: Vec<ModuleDropSeedRow>,
+    pending_agent_drops: Vec<PendingAgentDropSeedRow>,
+    compartments: Vec<StoredCompartment>,
+    user_profile: Vec<String>,
+    user_hint_seeds: Vec<UserHintSeedRow>,
+    workspace: Option<ModuleWorkspaceRow>,
+    note_nudge_anchors: Option<Vec<NoteNudgeAnchorSeed>>,
+    pending_compaction_marker: Option<Option<PendingCompactionMarkerState>>,
+    deferred_execute_state: Option<Option<DeferredExecuteState>>,
+    channel2_nudge_state: Option<String>,
+    strip_seeds: Vec<ModuleStripSeedRow>,
+    last_todo_state: Option<String>,
+}
+
+fn prepare_state_sync(
+    write: &mut PreparedWrite,
+    request: &ModuleStateSyncRequest<'_>,
+) -> Result<PreparedStateSync, ModuleStateSyncError> {
+    write.domain_owner("session", request.session_id, "authority_state_sync");
+    write.existing_identity("session_id", request.session_id)?;
+    if let Some(boundary_id) = request.seed_boundary_id {
+        write.identity("seed_boundary_id", boundary_id)?;
+    }
+    let drop_seeds = request
+        .drop_seeds
+        .iter()
+        .map(|seed| {
+            write.identity("drop_seed_block_id", &seed.block_id)?;
+            for related in &seed.related_block_ids {
+                write.identity("related_block_id", related)?;
+            }
+            write.identity("drop_mode", &seed.drop_mode)?;
+            Ok(ModuleDropSeedRow {
+                block_id: seed.block_id.clone(),
+                related_block_ids: seed.related_block_ids.clone(),
+                drop_mode: seed.drop_mode.clone(),
+                payload: seed
+                    .payload
+                    .as_deref()
+                    .map(|value| write.content("drop_seed_payload", value))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let pending_agent_drops = request
+        .pending_agent_drops
+        .iter()
+        .map(|seed| {
+            write.identity("pending_drop_block_id", &seed.block_id)?;
+            Ok(seed.clone())
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let compartments = prepare_compartments(write, request.compartments)?;
+    let user_profile = request
+        .user_profile
+        .iter()
+        .map(|line| write.content("user_profile", line))
+        .collect::<Result<Vec<_>, _>>()?;
+    let user_hint_seeds = request
+        .user_hint_seeds
+        .iter()
+        .map(|seed| {
+            write.identity("user_hint_block_id", &seed.block_id)?;
+            Ok(UserHintSeedRow {
+                block_id: seed.block_id.clone(),
+                hint_text: write.content("user_hint_text", &seed.hint_text)?,
+            })
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let workspace = request
+        .workspace
+        .map(|workspace| prepare_workspace(write, workspace))
+        .transpose()?;
+    let note_nudge_anchors = request
+        .note_nudge_anchors
+        .map(|anchors| {
+            anchors
+                .iter()
+                .map(|anchor| {
+                    write.identity("note_nudge_message_id", &anchor.message_id)?;
+                    Ok(NoteNudgeAnchorSeed {
+                        message_id: anchor.message_id.clone(),
+                        text: write.content("note_nudge_text", &anchor.text)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, McStoreError>>()
+        })
+        .transpose()?;
+    if let Some(pair) = request.todo_synthetic_anchor {
+        let pair_json = serde_json::to_string(pair)
+            .map_err(|error| ModuleStateSyncError::Serde(error.to_string()))?;
+        write.identity("todo_synthetic_anchor", &pair_json)?;
+    }
+    let pending_compaction_marker = request
+        .pending_compaction_marker
+        .map(|marker| {
+            marker
+                .map(|marker| {
+                    write.identity("compaction_end_message_id", &marker.end_message_id)?;
+                    Ok::<_, McStoreError>(marker.clone())
+                })
+                .transpose()
+        })
+        .transpose()?;
+    let deferred_execute_state = request
+        .deferred_execute_state
+        .map(|state| {
+            state
+                .map(|state| {
+                    Ok::<_, McStoreError>(DeferredExecuteState {
+                        reason: write.content("deferred_execute_reason", &state.reason)?,
+                    })
+                })
+                .transpose()
+        })
+        .transpose()?;
+    let channel2_nudge_state = request
+        .channel2_nudge_state
+        .map(|value| write.content("channel2_nudge_state", value))
+        .transpose()?;
+    let strip_seeds = request
+        .strip_seeds
+        .iter()
+        .map(|seed| {
+            write.identity("strip_message_id", &seed.message_id)?;
+            write.identity("strip_kind", &seed.strip_kind)?;
+            Ok(seed.clone())
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let last_todo_state = request
+        .last_todo_state
+        .as_deref()
+        .map(|value| write.content("last_todo_state", value))
+        .transpose()?;
+    let acked_watermarks_json = serde_json::to_string(&request.acked_watermarks)
+        .map_err(|error| ModuleStateSyncError::Serde(error.to_string()))?;
+    write.identity("acked_watermarks", &acked_watermarks_json)?;
+    Ok(PreparedStateSync {
+        drop_seeds,
+        pending_agent_drops,
+        compartments,
+        user_profile,
+        user_hint_seeds,
+        workspace,
+        note_nudge_anchors,
+        pending_compaction_marker,
+        deferred_execute_state,
+        channel2_nudge_state,
+        strip_seeds,
+        last_todo_state,
+    })
+}
+
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
-    /// `store.db` contains pre-consolidation `mc_cache` history that this binary cannot adopt or migrate.
-    /// `store.db` contains pre-consolidation `mc_cache` history that this binary cannot adopt or migrate.
+    Redaction(RedactionErrorKind),
+    /// `store.db` carries `mc_cache` history older than the consolidated
+    /// bootstrap, so this binary cannot adopt it and does not migrate it.
     PreCutoverModuleStore {
         recorded_version: u32,
         bootstrap_version: u32,
     },
-    /// A concurrent writer committed first, changing the on-disk row_version.
+    /// The on-disk row_version moved under us (a concurrent writer committed first).
     /// The caller re-loads and re-steps.
     CasConflict {
         expected: Option<u64>,
@@ -3276,8 +5203,8 @@ pub enum McStoreError {
         incoming_start_message: i64,
         incoming_end_message: i64,
     },
-    /// A facade route bound to an authority-managed identity must use the domain identity, not filesystem-path transport vocabulary, to write.
-    /// A facade route bound to an authority-managed identity must use the domain identity, not filesystem-path transport vocabulary, to write.
+    /// A facade route bound to an authority-managed identity attempted to write
+    /// using filesystem-path transport vocabulary instead of the domain identity.
     FacadeProjectVocabularyMismatch {
         route_project_root: String,
         authority_project: String,
@@ -3316,6 +5243,7 @@ impl std::fmt::Display for McStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McStoreError::Store(e) => write!(f, "store: {e}"),
+            McStoreError::Redaction(kind) => write!(f, "durable text rejected: {kind:?}"),
             McStoreError::PreCutoverModuleStore {
                 recorded_version,
                 bootstrap_version,
@@ -3419,8 +5347,24 @@ impl std::fmt::Display for McStoreError {
     }
 }
 impl std::error::Error for McStoreError {}
+
+impl From<mc_core::redaction::RedactionError> for McStoreError {
+    fn from(error: mc_core::redaction::RedactionError) -> Self {
+        Self::Redaction(error.kind())
+    }
+}
 impl From<StoreError> for McStoreError {
     fn from(e: StoreError) -> Self {
+        let mut source: &dyn std::error::Error = &e;
+        loop {
+            if let Some(McStoreError::Redaction(kind)) = source.downcast_ref::<McStoreError>() {
+                return McStoreError::Redaction(*kind);
+            }
+            let Some(next) = source.source() else {
+                break;
+            };
+            source = next;
+        }
         McStoreError::Store(e)
     }
 }
@@ -3516,8 +5460,9 @@ impl From<StoreError> for ModuleStateSyncError {
     }
 }
 
-/// The fenced commit transaction returns either the new row_version or a CAS conflict containing the on-disk version.
-/// CAS conflicts are return values so the transaction can commit no changes and the caller can reload cleanly.
+/// Outcome of the fenced commit txn: either the new row_version, or a CAS conflict
+/// carrying the version observed on disk. Modeled as a return value (not an error)
+/// so a conflicting pass commits an empty txn and the caller re-loads cleanly.
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
@@ -3537,9 +5482,9 @@ enum ClaimIntentTxnOutcome {
         found: String,
     },
     Frozen(String),
-    /// No `mc_authority` row is reachable from the bound daemon route.
-    /// `RouteNotManaged` indicates that no `mc_authority` row is reachable from the bound daemon route.
-    /// `RouteNotManaged` means "never managed here"; `Frozen` means "managed but transitioning".
+    /// No `mc_authority` row is reachable from the bound daemon route, so this route
+    /// has no proven memories ownership. Distinct from `Frozen` so callers can tell
+    /// "never managed here" from "managed but transitioning".
     RouteNotManaged,
     NotFound,
     Transition {
@@ -3884,9 +5829,17 @@ fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -
 impl std::error::Error for AuthorityTransitionError {}
 
 fn map_authority_sql_error(error: StoreError) -> McStoreError {
-    // cortexkit-store erases driver-specific errors at its connection boundary.
-    // Do not report a successful transition when a generation or state check fails.
+    // cortexkit-store intentionally erases driver-specific errors at its connection
+    // boundary. Keep the durable operation error rather than pretending it was a
+    // successful transition when a generation or state check failed.
     McStoreError::Store(error)
+}
+
+fn map_prepared_authority_error(error: McStoreError) -> McStoreError {
+    match error {
+        McStoreError::Store(error) => map_authority_sql_error(error),
+        error => error,
+    }
 }
 
 fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
@@ -3899,14 +5852,30 @@ fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
     }
 }
 
+/// Resolve the memories/notes authority bound to a daemon route, inside an open
 /// transaction.
 ///
-/// Callers must not key `mc_authority` by caller-supplied identity fields.
-/// The bound route is the only trustworthy authority identity on a facade request.
+/// This is the transaction-scoped twin of `authority_project_state_for_route`.
+/// Callers that hold caller-supplied identity fields must not key `mc_authority`
+/// by those fields: the authority row is keyed by `context_store_uuid`, which the
+/// host mints separately from the format marker's `database_incarnation_id`, so
+/// keying by the marker identity matches no row and silently fails open. Route
+/// bindings are installed server-side by `bind_authority_route`, which makes the
+/// bound route the only trustworthy authority identity on a facade request.
 ///
+/// Both legs are index seeks: `mc_authority_route_bindings.route_project_root` is
+/// the primary key, and `mc_authority` is keyed by
+/// `(context_store_uuid, project, domain)`.
 ///
-/// A caller can distinguish an unmanaged route from a non-`MODULE` route.
+/// Unlike the non-transactional helpers, this does not filter on state; the caller
+/// decides which states it accepts so it can distinguish "not managed" from
+/// "managed but draining".
+/// The live fence a claim intent must clear before its context mutation may run.
 ///
+/// `Ok(None)` means staging may proceed; `Ok(Some(outcome))` is the rejection to
+/// return. Both the fresh insert and a `staged` replay call this, because a replay
+/// executes the same mutation and the stored binding only proves what was true
+/// when the row was written.
 fn claim_intent_stage_fence(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
@@ -3922,7 +5891,10 @@ fn claim_intent_stage_fence(
     if let Some(state) = transition.filter(|state| state != "accepting") {
         return Ok(Some(ClaimIntentTxnOutcome::Frozen(state)));
     }
-    // The lookup resolves the authority from the bound route, never from the caller-supplied binding.
+    // Resolve the authority from the bound route, never from the caller-supplied
+    // binding. `mc_authority` is keyed by `context_store_uuid`, which the host mints
+    // independently of the format marker's `database_incarnation_id`, so keying this
+    // lookup by the binding identity matches no row and fails open.
     let Some((authority_project, state, generation)) =
         authority_for_route_tx(tx, route_project_root, "memories")?
     else {
@@ -3931,6 +5903,8 @@ fn claim_intent_stage_fence(
     if state != "MODULE" {
         return Ok(Some(ClaimIntentTxnOutcome::Frozen(state)));
     }
+    // The route owns the project vocabulary; a binding naming another project must
+    // not be able to stage against this route's authority.
     if authority_project != binding.authority_project {
         return Ok(Some(ClaimIntentTxnOutcome::BindingMismatch {
             field: "authority project",
@@ -4174,6 +6148,8 @@ fn validated_seed_boundary(
     }
 
     Ok(ValidatedSeedBoundary {
+        // The compartment publisher's end-block form is canonical even if a future
+        // sender derives the same identity through a different marker representation.
         boundary_id: tail.end_message_id.clone(),
         coverage_start_ordinal: ordered[0].start_message as u64,
         coverage_end_ordinal: tail.end_message as u64,
@@ -4196,6 +6172,7 @@ type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut
 type BeforeMaxCompartmentEndReadHook =
     std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&McStore) + Send>>>>;
 
+/// The Magic Context cache-state store: one single-writer SQLite handle for the
 /// module's lifetime.
 struct FacadeAuthorityScope {
     owner: std::thread::ThreadId,
@@ -4230,14 +6207,20 @@ impl Drop for FacadeNoteScopeGuard<'_> {
     }
 }
 
+/// The result of one command-aware facade mutation. `Duplicate` contains the exact response bytes
+/// committed by the original command; it is returned without entering the mutation operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacadeMutationOutcome {
     Applied(Vec<u8>),
     Duplicate(Vec<u8>),
 }
 
+/// Transaction-scoped ports used by the module facade. Every method operates on the transaction
+/// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
 pub struct FacadeMutationTxn<'a> {
     tx: &'a rusqlite::Transaction<'a>,
+    audit: &'a std::cell::RefCell<PreparedWrite>,
+    redaction_failure: &'a std::cell::Cell<Option<RedactionErrorKind>>,
 }
 
 impl<'a> FacadeMutationTxn<'a> {
@@ -4246,7 +6229,32 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        insert_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
+        let first_scan = self.audit.borrow().scans.len();
+        let prepared = prepare_transaction_note_fields(
+            self.audit,
+            content,
+            input.surface_condition,
+            input.anchor_block_id,
+        )
+        .map_err(|error| {
+            if let McStoreError::Redaction(kind) = error {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        let note = insert_note_tx(self.tx, &input, &prepared).map_err(|error| {
+            if let Some(kind) = sqlite_redaction_kind(&error) {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        self.audit.borrow_mut().domain_owner_for_scans_since(
+            first_scan,
+            "project",
+            input.project_path,
+            note.id.to_string(),
+        );
+        Ok(note)
     }
 
     pub fn insert_project_note(&self, input: NoteWriteInput<'_>) -> Result<StoredNote, String> {
@@ -4254,7 +6262,50 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        insert_project_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
+        let surface_condition = input
+            .surface_condition
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let first_scan = self.audit.borrow().scans.len();
+        let prepared = prepare_transaction_note_fields(
+            self.audit,
+            content,
+            surface_condition,
+            input.anchor_block_id,
+        )
+        .map_err(|error| {
+            if let McStoreError::Redaction(kind) = error {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        {
+            let mut audit = self.audit.borrow_mut();
+            for (field_id, value) in [
+                ("compiled_provider", input.compiled_provider),
+                ("compiled_config", input.compiled_config),
+                ("compile_status", input.compile_status),
+            ] {
+                if let Some(value) = value {
+                    audit
+                        .transaction_identity(field_id, value)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        let note = insert_project_note_tx(self.tx, &input, &prepared).map_err(|error| {
+            if let Some(kind) = sqlite_redaction_kind(&error) {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        self.audit.borrow_mut().domain_owner_for_scans_since(
+            first_scan,
+            "project",
+            input.project_path,
+            note.id.to_string(),
+        );
+        Ok(note)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4269,17 +6320,35 @@ impl<'a> FacadeMutationTxn<'a> {
         condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
+        let first_scan = self.audit.borrow().scans.len();
+        let prepared = prepare_transaction_note_update(
+            self.audit,
+            content,
+            surface_condition,
+            condition_compile,
+        )
+        .map_err(|error| {
+            if let McStoreError::Redaction(kind) = error {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        self.audit.borrow_mut().domain_owner_for_scans_since(
+            first_scan,
+            "project",
+            project_path,
+            note_id.to_string(),
+        );
         update_note_cas_tx(
             self.tx,
             project_path,
             note_id,
             expected_status,
             expected_version,
-            content,
-            surface_condition,
-            condition_compile,
+            &prepared,
             now_ms,
         )
+        .map(|application| application.outcome)
         .map_err(|error| error.to_string())
     }
 
@@ -4291,8 +6360,12 @@ impl<'a> FacadeMutationTxn<'a> {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, String> {
+        self.audit
+            .borrow_mut()
+            .domain_owner("project", project_path, note_id.to_string());
         dismiss_note_tx(
             self.tx,
+            self.audit,
             project_path,
             Some(session_id),
             note_id,
@@ -4305,8 +6378,15 @@ impl<'a> FacadeMutationTxn<'a> {
 
 pub struct McStore {
     inner: SqliteStore,
+    // Distinguishes independent stores in the process-local tag baseline cache. Production
+    // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: u64,
+    /// The connection-local caller identity used by note ownership triggers. It is
+    /// installed only while a fenced note mutation is executing, so an unwrapped SQL
+    /// writer fails closed instead of inheriting a previous operation's project.
     note_caller_project: Arc<Mutex<Option<String>>>,
+    /// Facade scope is visible to SQLite triggers for the duration of a mutation. A separate
+    /// lock serializes scopes so one request cannot lend its authority identity to another.
     facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
     facade_mutation_lock: Mutex<()>,
     #[cfg(any(test, feature = "test-support"))]
@@ -4356,6 +6436,9 @@ fn seeded_drop_unit(
     })
 }
 
+/// Materialize the TypeScript drop snapshot before the first transform. A tag
+/// may name a tool arc, so its paired result receives the module's normal drop
+/// unit while the call block keeps the requested skeleton or edit marker kind.
 fn materialize_drop_seed_units(
     core: &mut CoreState,
     session_id: &str,
@@ -4443,6 +6526,9 @@ fn valid_strip_seed_kind(kind: &str) -> bool {
     )
 }
 
+/// Materialize frozen message-level strips from the TypeScript authority. The unit
+/// payload is only a compatibility marker; the transform chooses the provider-aware
+/// sentinel at egress, while the unit key keeps detection/replay id-keyed.
 fn materialize_strip_seed_units(
     core: &mut CoreState,
     session_id: &str,
@@ -4507,6 +6593,14 @@ fn commit_lineage_disposition(
     acknowledge: bool,
 ) -> rusqlite::Result<LineageDescentTxnOutcome> {
     let next_version = current_target_version.max(0) as u64 + 1;
+    let target_core = match prepare_core_state(&target_core) {
+        Ok(core) => core,
+        Err(_) => {
+            return Ok(LineageDescentTxnOutcome::Invalid(
+                "lineage core state failed secret scanning".to_string(),
+            ))
+        }
+    };
     let core_json = match serde_json::to_string(&target_core) {
         Ok(json) => json,
         Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
@@ -4514,6 +6608,14 @@ fn commit_lineage_disposition(
     let meta_json = match serde_json::to_string(&target_meta) {
         Ok(json) => json,
         Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+    };
+    let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+        Ok(json) => json,
+        Err(_) => {
+            return Ok(LineageDescentTxnOutcome::Invalid(
+                "lineage metadata failed secret scanning".to_string(),
+            ))
+        }
     };
     tx.execute(
         "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
@@ -4546,6 +6648,7 @@ fn commit_lineage_disposition(
 }
 
 impl McStore {
+    /// Process-local identity for cache entries that otherwise use a session id as their key.
     pub fn tag_cache_namespace(&self) -> u64 {
         self.tag_cache_namespace
     }
@@ -4557,6 +6660,8 @@ impl McStore {
         let note_udf_scope = Arc::clone(&note_caller_project);
         let facade_domain_scope = Arc::clone(&facade_authority_scope);
         let facade_route_scope = Arc::clone(&facade_authority_scope);
+        // Register before migrations: migrations create triggers that call these functions,
+        // and the same connection must expose them before the first guarded write is possible.
         inner.with_conn(move |conn| {
             conn.create_scalar_function(
                 "mc_note_caller_project",
@@ -4603,10 +6708,78 @@ impl McStore {
                         .map(|scope| scope.route_project_root.clone())
                         .unwrap_or_default())
                 },
-            )
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_text",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let input = context.get::<String>(0)?;
+                    prepare_transaction_content(&input)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_json",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let input = context.get::<String>(0)?;
+                    prepare_json_content_with(&input, JsonScanPolicy::TransactionRejectProtected)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_reject_transaction_text",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let input = context.get::<String>(0)?;
+                    reject_transaction_secret_text(&input)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    Ok(input)
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_transcript",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let blob = context.get::<Vec<u8>>(0)?;
+                    let input =
+                        decompress_durable_text_exact(&blob, MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES)
+                            .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    let prepared = prepare_transaction_content(&input)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    compress_transcript(&prepared)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_raw_messages",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let blob = context.get::<Vec<u8>>(0)?;
+                    let input =
+                        decompress_durable_text_exact(&blob, MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES)
+                            .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    let prepared = prepare_json_content_with(
+                        &input,
+                        JsonScanPolicy::TransactionRejectProtected,
+                    )
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    compress_raw_messages(&prepared)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            Ok(())
         })?;
         refuse_pre_cutover_store(&inner)?;
         inner.migrate(NS, MIGRATIONS)?;
+        // Per-pass statements run through prepare_cached; the rusqlite default cache
+        // holds 16 statements, which the hot set alone exceeds. 128 keeps every hot
+        // shape resident without meaningful memory cost.
         inner.with_conn(|conn| {
             conn.set_prepared_statement_cache_capacity(128);
             Ok(())
@@ -4641,7 +6814,10 @@ impl McStore {
         let now_ms = current_time_ms();
         self.inner
             .with_conn(|conn| {
-                // The pruner removes lineage only when both the root observation and cache activity watermark predate the inactivity window.
+                // Cache rows are retained across session teardown, so row existence is not
+                // activity. Prune lineage only when both the root observation and its cache
+                // activity watermark are older than the inactivity window. This keeps active
+                // sessions alive without depending on a deletion path that does not exist.
                 conn.execute(
                     "DELETE FROM mc_transform_session_roots AS roots
                       WHERE roots.observed_at < ?1
@@ -4657,6 +6833,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Recover the authenticated transform lineage after a module process restart. Cache state
+    /// alone is insufficient: the exact project root must have been committed with that session.
     pub fn knows_transform_session_root(
         &self,
         session_id: &str,
@@ -4665,6 +6843,9 @@ impl McStore {
         let candidate = canonical_root(project_root);
         self.inner
             .with_conn(|conn| {
+                // Older stores may contain symlink spellings. Load the tiny per-session set and
+                // canonicalize both sides in Rust rather than relying on SQL string equality;
+                // this keeps migration compatibility without changing the durable schema.
                 let mut statement = conn.prepare_cached(
                     "SELECT project_root
                        FROM mc_transform_session_roots
@@ -4682,6 +6863,10 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Execute a command-aware facade mutation in one fenced transaction. The operation callback
+    /// must return the exact response bytes that the caller would receive; those bytes are stored
+    /// before the transaction commits. A duplicate command returns the stored bytes without
+    /// invoking the callback.
     #[allow(clippy::too_many_arguments)]
     pub fn with_facade_command(
         &self,
@@ -4694,10 +6879,54 @@ impl McStore {
         command_id: Option<&str>,
         mutation: impl FnOnce(&FacadeMutationTxn<'_>) -> Result<Vec<u8>, String>,
     ) -> Result<FacadeMutationOutcome, McStoreError> {
+        for value in [
+            route_project_root,
+            caller_project,
+            identity_scope,
+            tool,
+            action,
+        ] {
+            ensure_durable_text_bound(value)?;
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::FacadeMutationLedger);
+        write.domain_owner(
+            "facade",
+            identity_scope,
+            active_scan_owner_key(&[tool, action, command_id.unwrap_or("")]),
+        );
+        let domain = write.identity("domain", domain)?;
+        if let Some(command_id) = command_id {
+            ensure_durable_text_bound(command_id)?;
+            let replay = self.inner.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT response_json
+                       FROM mc_facade_mutation_ledger
+                      WHERE identity_scope = ?1 AND tool = ?2
+                        AND action = ?3 AND command_id = ?4",
+                    params![identity_scope, tool, action, command_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+            })?;
+            if let Some(response) = replay {
+                return Ok(FacadeMutationOutcome::Duplicate(response));
+            }
+        }
+        // Record the scans without deciding on them. The transaction below reads whether
+        // this `(identity_scope, tool, action)` triple is already stored, so a ledger row
+        // added or removed after an out-of-transaction read cannot leave a stale decision
+        // that preserves a detected secret on a genuinely new triple.
+        let tool = write.existing_identity("tool", tool)?;
+        let action = write.existing_identity("action", action)?;
+        if let Some(command_id) = command_id {
+            write.identity("command_id", command_id)?;
+        }
+        write.existing_identity("identity_scope", identity_scope)?;
         let _mutation_guard = self
             .facade_mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let identity_scope = identity_scope.to_string();
         let previous_note_scope = self
             .note_caller_project
             .lock()
@@ -4715,14 +6944,15 @@ impl McStore {
             *scope = Some(FacadeAuthorityScope {
                 owner: std::thread::current().id(),
                 route_project_root: route_project_root.to_string(),
-                domain: domain.to_string(),
+                domain,
             });
         }
         let _scope_guard = FacadeMutationScopeGuard {
             scope: &self.facade_authority_scope,
         };
-        self.inner
-            .with_conn_fenced(|tx| {
+        let redaction_failure = std::cell::Cell::new(None);
+        let outcome = write.execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 if let Some(command_id) = command_id {
                     let stored = tx
                         .query_row(
@@ -4735,15 +6965,67 @@ impl McStore {
                         )
                         .optional()?;
                     if let Some(response) = stored {
-                        return Ok(FacadeMutationOutcome::Duplicate(response));
+                        return Ok(WriteDisposition::Replay(
+                            FacadeMutationOutcome::Duplicate(response),
+                        ));
                     }
                 }
 
-                let response = mutation(&FacadeMutationTxn { tx }).map_err(|error| {
+                let stored_triple: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM mc_facade_mutation_ledger
+                          WHERE identity_scope = ?1 AND tool = ?2 AND action = ?3
+                     )",
+                    params![identity_scope, tool, action],
+                    |row| row.get(0),
+                )?;
+                if !stored_triple {
+                    // No ledger row carries this triple, so the command introduces it rather
+                    // than adding another command under an identity already stored.
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["identity_scope", "tool", "action"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+
+                let response = mutation(&FacadeMutationTxn {
+                    tx,
+                    audit: &coordinated.prepared,
+                    redaction_failure: &redaction_failure,
+                })
+                .map_err(|error| {
                     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
                         error,
                     )))
                 })?;
+                let response_text = std::str::from_utf8(&response).map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                        "facade response is not UTF-8",
+                    )))
+                })?;
+                let mut response_detections = Vec::new();
+                let response =
+                    prepare_transaction_response_collecting(response_text, &mut response_detections)
+                        .map_err(|error| {
+                            if let McStoreError::Redaction(kind) = error {
+                                redaction_failure.set(Some(kind));
+                            }
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other("facade response failed secret scanning"),
+                            ))
+                        })?
+                        .into_bytes();
+                // The receipt reuses the detections from the preparation above; scanning
+                // `response_text` again would run the scanner over the whole payload twice on
+                // every command.
+                coordinated.prepared.borrow_mut().record_observed_scan(
+                    "response_json",
+                    response_detections,
+                    "substitute",
+                );
                 if let Some(command_id) = command_id {
                     let created_at_ms = current_time_ms();
                     tx.execute(
@@ -4759,7 +7041,41 @@ impl McStore {
                             created_at_ms
                         ],
                     )?;
-                    // Old outcomes are forgettable because the host session has a bounded replay horizon.
+                    // Keep only the newest 512 commands for each session identity. The command
+                    // key remains unique while it is retained; old outcomes are intentionally
+                    // forgettable because the host session has a bounded replay horizon.
+                    let expired_commands = {
+                        let mut statement = tx.prepare(
+                            "SELECT tool, action, command_id
+                               FROM mc_facade_mutation_ledger
+                              WHERE identity_scope = ?1
+                              ORDER BY created_at_ms DESC, tool DESC, action DESC, command_id DESC
+                              LIMIT -1 OFFSET 512",
+                        )?;
+                        let rows = statement
+                            .query_map(params![identity_scope], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                ))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    for (expired_tool, expired_action, expired_command_id) in expired_commands {
+                        retire_active_scan_domain_owner(
+                            tx,
+                            "facade",
+                            &identity_scope,
+                            "facade_mutation",
+                            &active_scan_owner_key(&[
+                                &expired_tool,
+                                &expired_action,
+                                &expired_command_id,
+                            ]),
+                        )?;
+                    }
                     tx.execute(
                         "DELETE FROM mc_facade_mutation_ledger
                           WHERE identity_scope = ?1
@@ -4773,13 +7089,21 @@ impl McStore {
                         params![identity_scope],
                     )?;
                 }
-                Ok(FacadeMutationOutcome::Applied(response))
-            })
-            .map_err(Into::into)
+                Ok(WriteDisposition::Applied(FacadeMutationOutcome::Applied(
+                    response,
+                )))
+            });
+        match (outcome, redaction_failure.get()) {
+            (Err(_), Some(kind)) => Err(McStoreError::Redaction(kind)),
+            (result, _) => result,
+        }
     }
 
-    /// Replay this idempotent repair on every store open because SQL migration cannot safely rekey several note owners under one caller identity.
-    /// The repair records completion in mc_cache_state after verifying pre-v51 compiled artifacts.
+    /// Complete route normalization after schema upgrades using the same caller-identity
+    /// check as runtime note writes. Because the SQL migration cannot safely rekey several
+    /// note owners under one caller identity, replay this idempotent repair on every store
+    /// open, including stores that already recorded the upgraded schema version.
+    /// Verify pre-v51 compiled artifacts once, then record completion in mc_cache_state.
     /// This repair does not advance any note revision.
     fn repair_note_artifacts_v51(&self) -> Result<(), McStoreError> {
         const FLAG_KEY: &str = "note_artifact_repair_v51_done";
@@ -4805,7 +7129,10 @@ impl McStore {
             Ok(rows)
         })?;
         for project in projects {
-            // The repair commits bounded batches so a mid-repair kill preserves completed work; each pass reselects unrepaired rows to resume later.
+            // Commit in bounded batches so a kill mid-repair keeps the work
+            // already done instead of rolling back a whole project and redoing it
+            // on every subsequent boot. The query re-selects unrepaired rows each
+            // pass, so this is naturally resumable.
             loop {
                 let processed = self
                     .with_note_conn_fenced(&project, |tx| repair_note_artifacts_tx(tx, &project))?;
@@ -4825,14 +7152,41 @@ impl McStore {
         Ok(())
     }
 
-    /// Domain rows use the authority identity as their key; route paths are transport-only.
+    /// Associate a daemon-bound route root with an authority identity. The route path
+    /// is transport vocabulary; the identity remains the key used by domain rows.
     pub fn bind_authority_route(
         &self,
         context_store_uuid: &str,
         project: &str,
         route_project_root: &str,
     ) -> Result<(), McStoreError> {
-        self.with_note_conn_fenced(route_project_root, |tx| {
+        let exact_binding = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT context_store_uuid, project FROM mc_authority_route_bindings
+                  WHERE route_project_root = ?1",
+                params![route_project_root],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+        })?;
+        let is_replay = exact_binding.as_ref().is_some_and(|(uuid, bound_project)| {
+            uuid == context_store_uuid && bound_project == project
+        });
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityRoutes);
+        write.domain_owner("route", route_project_root, "binding");
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("route_project_root", route_project_root),
+        ] {
+            if is_replay {
+                write.existing_identity(field_id, value)?;
+            } else {
+                write.identity(field_id, value)?;
+            }
+        }
+        self.with_prepared_note_conn_fenced(route_project_root, write, |coordinated| {
+            let tx = coordinated.tx();
             tx.execute(
                 "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
                  VALUES (?1, ?2, ?3)
@@ -4841,13 +7195,22 @@ impl McStore {
                     project = excluded.project",
                 params![route_project_root, context_store_uuid, project],
             )?;
-            // Cleanup runs after every upsert because binds can precede twin creation and cached authority-status checks may not retry.
+            // The trigger remains the direct-SQL safety net, but cleanup also belongs to
+            // this operation: a bind can happen before twins exist and never be retried
+            // by the cached authority-status path. Running it after every upsert makes
+            // the vocabulary law independent of write ordering.
             normalize_authority_note_route_tx(tx, context_store_uuid, project, route_project_root)?;
-            Ok(())
+            Ok(if is_replay {
+                WriteDisposition::Replay(())
+            } else {
+                WriteDisposition::Applied(())
+            })
         })
     }
 
-    /// The lookup returns the MODULE authority identity and context UUID so writes can bind routes even when authority-status results are cached.
+    /// Resolve a requested facade identity to the MODULE authority that owns it. The
+    /// context UUID is returned with the identity so a write can establish the route
+    /// binding even when the transform's authority-status result was cached.
     pub fn module_authority_for_project(
         &self,
         project: &str,
@@ -4870,7 +7233,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Exposing DRAINING lets callers return a retryable transition error.
+    /// Resolve a facade-supplied identity while it is module-owned or draining. DRAINING remains
+    /// visible so callers can return a retryable transition error instead of falling back to a
     /// filesystem route.
     pub fn facade_authority_for_project(
         &self,
@@ -4895,7 +7259,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// The route lookup returns the authority identity and state for an ACTIVE or DRAINING route; mutations use the state while transforms and reads preserve continuity.
+    /// Return the authority identity and state bound to this daemon route while ownership is
+    /// active or draining. Mutation callers use the state; transforms and reads keep continuity.
     pub fn authority_project_state_for_route(
         &self,
         route_project_root: &str,
@@ -4921,7 +7286,9 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// The route lookup returns the authority identity only for ACTIVE routes; PREPARING remains route-keyed until verified MODULE acknowledgement publishes the identity-key flip.
+    /// Return the authority identity bound to this daemon route only while ownership is active
+    /// or draining. PREPARING remains route-keyed so transforms cannot observe a partial seed;
+    /// the verified MODULE acknowledgement publishes the identity-key flip.
     pub fn authority_project_for_route(
         &self,
         route_project_root: &str,
@@ -4959,7 +7326,7 @@ impl McStore {
             .insert(kind.to_string());
     }
 
-    /// The facade write path rejects writes that cross the route's active authority identity.
+    /// Reject a facade write that crosses the route's active authority identity.
     pub fn enforce_facade_project_vocabulary(
         &self,
         route_project_root: &str,
@@ -4978,7 +7345,9 @@ impl McStore {
         Ok(())
     }
 
-    /// The hook runs once immediately before the max-compartment-end query so detector tests can publish after an earlier revision read without a production scheduling seam.
+    /// Install a one-shot callback immediately before the max-compartment-end query. It lets
+    /// detector tests place a publication after an earlier revision read without adding a
+    /// production scheduling seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_before_max_compartment_end_read_hook(&self, hook: Box<dyn FnMut(&McStore) + Send>) {
         *self
@@ -4987,7 +7356,9 @@ impl McStore {
             .expect("max compartment-end read hook mutex") = Some(hook);
     }
 
-    /// The callback runs while cleanup holds SQLite's writer lock to verify that a competing write cannot occur between reading the match and storing the idle state.
+    /// Install a test callback while cleanup of a matching pending historian run holds
+    /// SQLite's writer lock. The callback checks that a competing write cannot slip
+    /// between reading the match and storing the idle state.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_abandon_historian_hook(&self, hook: Box<dyn FnMut() + Send>) {
         *self
@@ -5040,7 +7411,30 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// The applied `mc_cache` schema version is the maximum version recorded for this namespace in `cortexkit_schema_version`.
+    fn with_prepared_note_conn_fenced<T>(
+        &self,
+        caller_project: &str,
+        prepared: PreparedWrite,
+        operation: impl FnOnce(&mut ActiveWriteTransaction<'_>) -> rusqlite::Result<WriteDisposition<T>>,
+    ) -> Result<T, McStoreError> {
+        let caller_project = caller_project.to_string();
+        let caller_scope = Arc::clone(&self.note_caller_project);
+        prepared.execute(&self.inner, |coordinated| {
+            let previous = caller_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .replace(caller_project);
+            let result = operation(coordinated);
+            *caller_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
+            result
+        })
+    }
+
+    /// The applied schema version of this store's `mc_cache` migration chain:
+    /// MAX(version) recorded in the shared `cortexkit_schema_version` table for this
+    /// namespace. Read-only probe for status surfaces; it never writes.
     pub fn module_store_schema_version(&self) -> Result<u32, McStoreError> {
         self.inner
             .with_conn(|conn| {
@@ -5053,8 +7447,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Facade identity shortcuts use committed module cache state as a provenance check.
-    /// A client-supplied harness label cannot create a committed module cache-state row.
+    /// Whether a session has committed module cache state. Facade identity shortcuts use
+    /// this as a provenance check; a client-supplied harness label cannot create this row.
     pub fn has_cache_state(&self, session_id: &str) -> Result<bool, McStoreError> {
         self.inner
             .with_conn(|conn| {
@@ -5067,6 +7461,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Return the last OC-host-rendered mural for a resolved project identity.
     pub fn load_project_mural_artifact(
         &self,
         project_path: &str,
@@ -5092,8 +7487,10 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Store a host-rendered mural only when its content identity changes.
     ///
-    /// Updating `updated_at` when the host artifact is unchanged would turn ordinary defer traffic into a write stream, so the hash is the sole gate.
+    /// A transform can carry the same host artifact on every pass. Updating `updated_at` in that
+    /// case would turn ordinary defer traffic into a write stream, so the hash is the sole gate.
     pub fn upsert_project_mural_artifact(
         &self,
         project_path: &str,
@@ -5101,10 +7498,22 @@ impl McStore {
         content_hash: &str,
         updated_at: i64,
     ) -> Result<bool, McStoreError> {
-        self.inner
-            .with_conn_fenced(|tx| {
-                let changed = tx.execute(
-                    "INSERT INTO mc_project_mural_artifacts(
+        let existing = self.load_project_mural_artifact(project_path)?.is_some();
+        let mut write = PreparedWrite::new(DurableWriteFamily::ProjectMuralArtifacts);
+        write.domain_owner("project", project_path, "mural");
+        if existing {
+            write.existing_identity("project_path", project_path)?;
+        } else {
+            write.identity("project_path", project_path)?;
+        }
+        let data_url_text = std::str::from_utf8(data_url)
+            .map_err(|_| McStoreError::Serde("mural data URL is not UTF-8".to_string()))?;
+        write.identity("data_url", data_url_text)?;
+        write.identity("content_hash", content_hash)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let changed = tx.execute(
+                "INSERT INTO mc_project_mural_artifacts(
                          project_path, data_url, content_hash, updated_at
                      ) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(project_path) DO UPDATE SET
@@ -5112,21 +7521,46 @@ impl McStore {
                          content_hash = excluded.content_hash,
                          updated_at = excluded.updated_at
                      WHERE mc_project_mural_artifacts.content_hash <> excluded.content_hash",
-                    params![project_path, data_url, content_hash, updated_at],
-                )?;
-                Ok(changed != 0)
+                params![project_path, data_url, content_hash, updated_at],
+            )?;
+            let changed = changed != 0;
+            Ok(if changed {
+                WriteDisposition::Applied(true)
+            } else {
+                WriteDisposition::Replay(false)
             })
-            .map_err(Into::into)
+        })
     }
 
-    /// Project memories and smart notes survive because their ownership is project-scoped.
-    /// The cleanup atomically removes session notes and cache, overlay, and producer ledger rows.
+    /// Delete every row whose ownership is expressed by an exact `session_id` column.
+    /// Project memories and smart notes survive because their ownership is project-scoped;
+    /// session notes and every cache/overlay/producer ledger row are removed atomically.
     pub fn delete_session(
         &self,
         session_id: &str,
         project_path: &str,
     ) -> Result<usize, McStoreError> {
         self.with_note_conn_fenced(project_path, |tx| {
+            let note_ids = {
+                let mut statement = tx.prepare_cached(
+                    "SELECT id FROM mc_notes
+                      WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id, project_path], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            for note_id in note_ids {
+                retire_active_scan_domain_owner(
+                    tx,
+                    "project",
+                    project_path,
+                    "notes",
+                    &note_id.to_string(),
+                )?;
+            }
+            retire_active_scan_scope(tx, "session", session_id)?;
             let tables = {
                 let mut stmt = tx.prepare_cached(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -5140,7 +7574,8 @@ impl McStore {
             for table in tables {
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
                 let has_session_id = {
-                    // The query uses `prepare` because its SQL text embeds the table name, so one-shot entries would only churn the LRU cache.
+                    // Not prepare_cached: the SQL text embeds the table name, so
+                    // each entry is one-shot and would only churn the LRU cache.
                     let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
                     let columns = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
@@ -5167,7 +7602,8 @@ impl McStore {
         })
     }
 
-    /// The loader returns uninitialized defaults when no session row exists; the classifier then bootstraps.
+    /// Load a session's persisted state. Returns defaults (uninitialized, no row)
+    /// when the session has never been seen — the classifier then bootstraps.
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
         let row = self.inner.with_conn(|conn| {
             Ok(conn
@@ -5198,8 +7634,9 @@ impl McStore {
         }
     }
 
-    /// The loader reads cache state and non-tag render overlays in one SQLite read transaction.
-    /// No-write passes linearize reads at this snapshot; tag payloads use a separately validated module baseline to avoid streaming every source blob on stable passes.
+    /// Load cache state and non-tag render overlays from one SQLite read transaction.
+    /// No-write passes use this snapshot as their read linearization point; tag payloads use the
+    /// separately validated module baseline so a stable pass does not stream every source blob.
     pub fn load_transform_snapshot(
         &self,
         session_id: &str,
@@ -5334,7 +7771,7 @@ impl McStore {
         Ok(snapshot)
     }
 
-    /// The loader reads all durable fields used by `session.status` in one SQLite read transaction.
+    /// Load all durable fields used by session.status from one SQLite read transaction.
     pub fn load_session_status_snapshot(
         &self,
         session_id: &str,
@@ -5458,10 +7895,36 @@ impl McStore {
         Ok(snapshot)
     }
 
-    /// The acceptance recorder uses a one-statement UPSERT outside the fenced cache-state transaction so the observability write does not contend with or extend the pass commit.
+    /// Record that the module accepted a transform request for this session. This is a
+    /// plain one-statement UPSERT outside the fenced cache-state transaction so the
+    /// observability write never contends with or extends the pass commit.
     pub fn trace_pass_received(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
-        self.inner.with_conn(|conn| {
-            conn.prepare_cached(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A clean identity skips this query, so the ordinary pass pays one UPSERT.
+            // A detected one is only tolerable when the session is already keyed by it;
+            // a trace breadcrumb must not be what introduces a secret-bearing session.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.prepare_cached(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -5478,12 +7941,14 @@ impl McStore {
                      first_divergence = NULL",
             )?
             .execute(params![session_id, now_ms])?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
 
-    /// The transform clears current-pass divergence after a successful stable transform. Current-pass divergence remains separate from `trace_pass_received` because direct module callers skip the daemon receive hook and daemon callers must not count a pass twice.
+    /// Clear the current-pass divergence for a successful stable transform. This is separate
+    /// from `trace_pass_received` because direct module callers do not use the daemon receive
+    /// hook, while daemon callers must not count the same pass twice.
     pub fn trace_pass_stable(
         &self,
         session_id: &str,
@@ -5493,8 +7958,33 @@ impl McStore {
     ) -> Result<(), McStoreError> {
         let observation_json = serialize_scheduler_observation(observation)?;
         let interesting_json: Option<String> = None;
-        self.inner.with_conn(|conn| {
-            conn.execute(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let observation_json = write.content("scheduler_history", &observation_json)?;
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A clean identity skips this query, so the ordinary pass pays one UPSERT.
+            // A detected one is only tolerable when the session is already keyed by it;
+            // a trace breadcrumb must not be what introduces a secret-bearing session.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -5548,15 +8038,41 @@ impl McStore {
                     interesting_json
                 ],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
 
-    /// The completion recorder runs outside the fenced cache-state transaction so the breadcrumb cannot alter CAS semantics or extend the transaction beyond the cache write.
+    /// Record that a transform request finished successfully. This remains outside the
+    /// fenced cache-state transaction so a pass completion breadcrumb cannot alter CAS
+    /// semantics or hold the commit transaction open longer than the cache write itself.
     pub fn trace_pass_completed(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
-        self.inner.with_conn(|conn| {
-            conn.execute(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A clean identity skips this query, so the ordinary pass pays one UPSERT.
+            // A detected one is only tolerable when the session is already keyed by it;
+            // a trace breadcrumb must not be what introduces a secret-bearing session.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -5571,21 +8087,49 @@ impl McStore {
                      last_completed_at_ms = excluded.last_completed_at_ms",
                 params![session_id, now_ms],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
 
-    /// The store caps rejection errors to prevent unbounded diagnostic rows.
+    /// Record the last rejected transform for a session. The error string is capped so
+    /// the durable diagnostic stays readable even if an upstream failure produces a huge
+    /// message. Like the other trace writes, this is a single plain UPSERT outside the
+    /// fenced cache-state transaction.
     pub fn trace_pass_rejected(
         &self,
         session_id: &str,
         error: &str,
         now_ms: i64,
     ) -> Result<(), McStoreError> {
-        let error = capped_trace_error(error);
-        self.inner.with_conn(|conn| {
-            conn.execute(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let error = write.content("last_reject_error", error)?;
+        let error = capped_trace_error(&error);
+        let flagged = write.recorded_detections(&["session_id"]);
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // A rejected pass is still a pass: the diagnostic must not be the write that
+            // introduces a secret-bearing session. A clean identity skips the query, so
+            // the ordinary reject path keeps costing one UPSERT.
+            if flagged {
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if !known {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["session_id"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+            }
+            tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -5602,11 +8146,12 @@ impl McStore {
                      reject_count = mc_pass_trace.reject_count + 1",
                 params![session_id, error, now_ms],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
 
+    /// Load the durable pass breadcrumbs for one session, if any have been written.
     pub fn load_pass_trace(&self, session_id: &str) -> Result<Option<PassTrace>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             conn.query_row(
@@ -5649,7 +8194,9 @@ impl McStore {
         })?)
     }
 
-    /// The session row stores the JSON ring so appends reuse pass writes; `json_each` makes bounded records directly filterable during an incident.
+    /// Load accepted scheduler observations whose request timestamps fall in an inclusive range.
+    /// The JSON ring stays on the session row so appends reuse existing pass writes; `json_each`
+    /// makes the bounded records directly filterable during an incident.
     pub fn load_pass_scheduler_history(
         &self,
         session_id: &str,
@@ -5685,7 +8232,9 @@ impl McStore {
         })?)
     }
 
-    /// The loader reads incident-worthy scheduler observations from the independently bounded retention set.
+    /// Load incident-worthy scheduler observations from the independently bounded retention set.
+    /// The inclusive module-clock range narrows candidates; sender time and fingerprint remain
+    /// available on each result for exact cross-system correlation.
     pub fn load_interesting_pass_scheduler_history(
         &self,
         session_id: &str,
@@ -5721,6 +8270,7 @@ impl McStore {
         })?)
     }
 
+    /// Find retained passes by the sender-stamped instant shared by both sides of an exchange.
     pub fn load_interesting_pass_scheduler_history_by_request_time(
         &self,
         session_id: &str,
@@ -5754,6 +8304,7 @@ impl McStore {
         })?)
     }
 
+    /// Find retained passes by the caller-owned full-array fingerprint.
     pub fn load_interesting_pass_scheduler_history_by_fingerprint(
         &self,
         session_id: &str,
@@ -5784,8 +8335,8 @@ impl McStore {
         })?)
     }
 
-    /// The store appends block IDs requested by `ctx_reduce` to the durable per-session queue.
-    /// Repeated delivery does not add duplicate pending IDs.
+    /// Append flat block ids requested by ctx_reduce to the durable per-session queue.
+    /// Duplicate pending ids are ignored so repeated command delivery is harmless.
     pub fn append_pending_agent_drops(
         &self,
         session_id: &str,
@@ -5802,11 +8353,12 @@ impl McStore {
         Ok(outcome.queued as usize)
     }
 
-    /// The store appends `ctx_reduce` drops and records the requesting command when supplied.
-    /// A repeated command is acknowledged without modifying pending queue rows.
+    /// Append ctx_reduce drops and, when supplied, durably record the command that requested
+    /// them. A repeated command is acknowledged without touching pending queue rows.
     ///
-    /// When `zero_targets` is true, the store records the ledger row as `no_targets` so retries deduplicate without counting it as pending.
-    /// The store sets the ledger row's disposition to `no_targets` so it is not counted as pending.
+    /// When `zero_targets` is true the ledger row is still recorded (idempotency correctness
+    /// requires it — a retry of the same command_id must still dedupe), but the disposition
+    /// is set to "no_targets" so the row is not counted as pending.
     pub fn append_pending_agent_drops_with_command(
         &self,
         session_id: &str,
@@ -5815,7 +8367,36 @@ impl McStore {
         queued_at_ms: i64,
         zero_targets: bool,
     ) -> Result<AppendOutcome, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["reduce", command_id.unwrap_or("pending_drops")]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        if let Some(command_id) = command_id {
+            let duplicate = self.inner.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_reduce_command_ledger WHERE session_id = ?1 AND command_id = ?2)",
+                    params![session_id, command_id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })?;
+            if duplicate {
+                return Ok(AppendOutcome {
+                    queued: 0,
+                    duplicate: true,
+                    disposition: None,
+                });
+            }
+            write.identity("command_id", command_id)?;
+        }
+        for target_id in target_ids {
+            write.identity("target_id", target_id.trim())?;
+        }
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let mut recorded_command = false;
             if let Some(command_id) = command_id {
                 let recorded = tx.execute(
                     "INSERT OR IGNORE INTO mc_reduce_command_ledger
@@ -5824,12 +8405,13 @@ impl McStore {
                     params![session_id, command_id, queued_at_ms],
                 )?;
                 if recorded == 0 {
-                    return Ok(AppendOutcome {
+                    return Ok(WriteDisposition::Replay(AppendOutcome {
                         queued: 0,
                         duplicate: true,
                         disposition: None,
-                    });
+                    }));
                 }
+                recorded_command = true;
             }
 
             let mut queued = 0u64;
@@ -5846,9 +8428,11 @@ impl McStore {
                 )? as u64;
             }
 
-            // Command IDs remain until lineage teardown because pruning could make an old outcome-unknown retry destructive.
+            // Command ids are lineage-durable. Pruning would make an old outcome-unknown
+            // retry destructive again, so rows leave only with real lineage teardown.
 
-            // When the caller resolves zero targets, the store marks the ledger row terminal so retries deduplicate without creating pending work.
+            // When the caller resolved zero targets, mark the ledger row as terminal so it
+            // is not counted among pending commands. The row still exists for idempotency.
             if zero_targets {
                 if let Some(command_id) = command_id {
                     tx.execute(
@@ -5862,7 +8446,7 @@ impl McStore {
                 }
             }
 
-            Ok(AppendOutcome {
+            let outcome = AppendOutcome {
                 queued,
                 duplicate: false,
                 disposition: if zero_targets {
@@ -5870,12 +8454,17 @@ impl McStore {
                 } else {
                     None
                 },
+            };
+            Ok(if recorded_command || queued != 0 {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
             })
         })?;
         Ok(outcome)
     }
 
-    /// The loader reads queued `ctx_reduce` drops in deterministic drain order.
+    /// Load queued ctx_reduce drops in the deterministic drain order.
     pub fn load_pending_agent_drops(
         &self,
         session_id: &str,
@@ -5907,9 +8496,11 @@ impl McStore {
         })?)
     }
 
-    /// The store mints tag rows for newly observed block IDs and returns every requested row.
+    /// Mint tag rows for newly-observed block ids and return every requested row.
     /// Existing rows keep their original numbers; fresh rows consume the next numbers
-    /// Fresh rows consume the next numbers in caller order within one transaction.
+    /// in the caller's order inside one transaction.
+    // Production callers live module-side behind the test-support seeds; without that
+    // feature only in-crate tests reach these write paths, so silence the lint there.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn mint_or_get_tags(
         &self,
@@ -5917,9 +8508,79 @@ impl McStore {
         inputs: &[TagMintInput],
         created_at_ms: i64,
     ) -> Result<Vec<McTagRow>, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
-            let mut out = Vec::with_capacity(inputs.len());
+        let mut write = PreparedWrite::new(DurableWriteFamily::Tags);
+        write.domain_owner("session", session_id, "tags");
+        write.existing_identity("session_id", session_id)?;
+        let existing_ids = self.inner.with_conn(|conn| {
+            let mut ids = HashSet::new();
             for input in inputs {
+                let block_id = input.block_id.trim();
+                if conn
+                    .query_row(
+                        "SELECT 1 FROM mc_tags WHERE session_id = ?1 AND block_id = ?2",
+                        params![session_id, block_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    ids.insert(block_id.to_string());
+                }
+            }
+            Ok(ids)
+        })?;
+        let mut prepared_inputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let block_id = input.block_id.trim();
+            if block_id.is_empty() {
+                prepared_inputs.push(PreparedTagMint {
+                    input: input.clone(),
+                    insert_refusal: None,
+                });
+                continue;
+            }
+            let existed = existing_ids.contains(block_id);
+            let first_scan = write.scans.len();
+            if existed {
+                // Existing block ids are valid during replay.
+                write.existing_identity("block_id", block_id)?;
+                write.existing_identity("kind", &input.kind)?;
+            } else {
+                write.identity("block_id", block_id)?;
+                write.identity("kind", &input.kind)?;
+            }
+            let mut insert_refusal = write.scans[first_scan..]
+                .iter()
+                .any(|scan| !scan.redaction.detections.is_empty())
+                .then_some(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+            let source_bytes = match write.bytes("source_bytes", &input.source_bytes) {
+                Ok(prepared) => prepared,
+                Err(error) if existed => {
+                    // Bytes the transaction never stores must not fail the call.
+                    insert_refusal = insert_refusal.or(Some(error));
+                    input.source_bytes.clone()
+                }
+                Err(error) => return Err(error),
+            };
+            prepared_inputs.push(PreparedTagMint {
+                input: TagMintInput {
+                    block_id: input.block_id.clone(),
+                    kind: input.kind.clone(),
+                    token_count: input.token_count,
+                    source_bytes,
+                },
+                insert_refusal,
+            });
+        }
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let mut out = Vec::with_capacity(inputs.len());
+            let mut inserted = false;
+            for prepared in prepared_inputs {
+                let PreparedTagMint {
+                    input,
+                    insert_refusal,
+                } = prepared;
                 let block_id = input.block_id.trim();
                 if block_id.is_empty() {
                     continue;
@@ -5935,6 +8596,11 @@ impl McStore {
                 {
                     out.push(row);
                     continue;
+                }
+                if let Some(error) = insert_refusal {
+                    // The unfenced read saw a row with this identity, but no row survives in
+                    // this transaction.
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
                 }
                 let next = tx
                     .prepare_cached(
@@ -5954,7 +8620,7 @@ impl McStore {
                         input.kind.as_str(),
                         input.token_count.max(0),
                         created_at_ms,
-                        input.source_bytes.as_slice(),
+                        input.source_bytes,
                     ],
                 )?;
                 out.push(McTagRow {
@@ -5965,11 +8631,17 @@ impl McStore {
                     created_at_ms,
                     source_bytes: input.source_bytes.clone(),
                 });
+                inserted = true;
             }
-            Ok(out)
-        })?)
+            Ok(if inserted {
+                WriteDisposition::Applied(out)
+            } else {
+                WriteDisposition::Replay(out)
+            })
+        })
     }
 
+    /// Load all minted tags for a session in tag-number order. This is the cold baseline fill.
     pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -5987,6 +8659,7 @@ impl McStore {
         })?)
     }
 
+    /// Load only rows minted after `after_tag_number`, in primary-key order.
     pub fn load_tags_after(
         &self,
         session_id: &str,
@@ -6004,10 +8677,11 @@ impl McStore {
         })?)
     }
 
-    /// The method returns the trigger-maintained tag identity for cache validation without reading blobs.
+    /// Return the trigger-maintained tag identity for cache validation without reading blobs.
     ///
-    /// Triggers maintain the cached count and maximum; replacements and deletions recompute the maximum from the primary-key prefix.
-    /// Steady transforms read the cached row instead of tag payloads.
+    /// Triggers maintain count and max during rare writes; replacements and deletions derive a
+    /// fresh max from the primary-key prefix. Steady transforms read this one small row instead of
+    /// scanning immutable tag payloads.
     pub fn tag_cache_summary(&self, session_id: &str) -> Result<TagCacheSummary, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             conn.prepare_cached(
@@ -6027,7 +8701,7 @@ impl McStore {
         })?)
     }
 
-    /// The query loads only the fields used to decide whether native reasoning is old enough to clear.
+    /// Load only the fields used to decide whether native reasoning is old enough to clear.
     pub fn load_tag_numbers_for_session(
         &self,
         session_id: &str,
@@ -6050,6 +8724,7 @@ impl McStore {
         })?)
     }
 
+    /// Load only tag-number rows minted after `after_tag_number`, in primary-key order.
     pub fn load_tag_numbers_after(
         &self,
         session_id: &str,
@@ -6080,8 +8755,8 @@ impl McStore {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Test-only raw SQL seam verifies trigger-backed cache invalidation after out-of-band writes.
-    /// Production tag changes use the fenced transform transaction.
+    /// Test-only raw SQL seam for proving trigger-backed cache invalidation against out-of-band
+    /// writes. Production tag changes use the fenced transform transaction instead.
     #[cfg(any(test, feature = "test-support"))]
     pub fn execute_tag_sql_for_test(&self, sql: &str) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
@@ -6091,6 +8766,7 @@ impl McStore {
         Ok(())
     }
 
+    /// Sum stored token counts for a caller-selected block-id set.
     pub fn sum_tag_token_counts_for_blocks(
         &self,
         session_id: &str,
@@ -6107,7 +8783,7 @@ impl McStore {
             .sum())
     }
 
-    /// The store inserts one Channel-1 append row only if the block has not already received one.
+    /// Insert one Channel-1 append row if this block has not already received one.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn append_channel1_nudge(
         &self,
@@ -6116,18 +8792,38 @@ impl McStore {
         reminder_text: &str,
         fired_at_ms: i64,
     ) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformOverlays);
+        write.domain_owner("session", session_id, "channel1_appends");
+        write.existing_identity("session_id", session_id)?;
+        write.existing_identity("channel1_block_id", block_id)?;
+        let reminder_text = write.content("reminder_text", reminder_text)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_channel1_appends
+                  WHERE session_id = ?1 AND block_id = ?2)",
+                params![session_id, block_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                return Ok(WriteDisposition::Replay(false));
+            }
+            coordinated
+                .prepared
+                .borrow()
+                .reject_recorded_identities(&["channel1_block_id"])
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_channel1_appends
                      (session_id, block_id, reminder_text, fired_at_ms)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, block_id, reminder_text, fired_at_ms],
             )?;
-            Ok(inserted > 0)
-        })?)
+            Ok(WriteDisposition::Applied(inserted > 0))
+        })
     }
 
-    /// The loader returns stored Channel-1 append bytes in deterministic order.
+    /// Load stored Channel-1 append bytes in deterministic order.
     pub fn load_channel1_appends(
         &self,
         session_id: &str,
@@ -6154,7 +8850,7 @@ impl McStore {
         })?)
     }
 
-    /// The query reads the ordinal frontier that prevents first-applying overlays to closed turns.
+    /// Read the ordinal frontier used to avoid first-applying overlays to closed turns.
     /// A missing row is distinct from ordinal zero, which is a valid first message.
     pub fn overlay_watermark(&self, session_id: &str) -> Result<Option<u64>, McStoreError> {
         let value = self.inner.with_conn(|conn| {
@@ -6168,9 +8864,10 @@ impl McStore {
         Ok(value.map(|ordinal| ordinal.max(0) as u64))
     }
 
-    /// The store freezes first-sight overlay decisions and advances the pass watermark atomically.
-    /// Every candidate is compared with the watermark from before this transaction.
-    /// A racing hint writer returns the already-stored bytes so both callers render the same canonical decision.
+    /// Freeze first-sight overlay decisions and advance the pass watermark atomically.
+    /// Every candidate is compared with the watermark from before this transaction. A
+    /// racing hint writer returns the already-stored bytes so both callers render the
+    /// same canonical decision.
     #[cfg(test)]
     pub(crate) fn apply_active_overlay_decisions(
         &self,
@@ -6193,7 +8890,7 @@ impl McStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let hint_ordinal = user_hint
-            .map(|hint| {
+            .map(|hint| -> Result<_, McStoreError> {
                 i64::try_from(hint.ordinal).map_err(|_| {
                     McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
                 })
@@ -6280,7 +8977,7 @@ impl McStore {
         })?)
     }
 
-    /// The store persists one auto-search decision, including an empty no-result decision.
+    /// Persist one auto-search decision, including an empty no-result decision.
     #[cfg(test)]
     pub(crate) fn append_user_hint(
         &self,
@@ -6289,15 +8986,35 @@ impl McStore {
         hint_text: &str,
         created_at: i64,
     ) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformOverlays);
+        write.domain_owner("session", session_id, "user_hints");
+        write.existing_identity("session_id", session_id)?;
+        write.existing_identity("user_hint_block_id", block_id)?;
+        let hint_text = write.content("user_hint_text", hint_text)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_user_hints
+                  WHERE session_id = ?1 AND block_id = ?2)",
+                params![session_id, block_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                return Ok(WriteDisposition::Replay(false));
+            }
+            coordinated
+                .prepared
+                .borrow()
+                .reject_recorded_identities(&["user_hint_block_id"])
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_user_hints
                      (session_id, block_id, hint_text, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, block_id, hint_text, created_at],
             )?;
-            Ok(inserted > 0)
-        })?)
+            Ok(WriteDisposition::Applied(inserted > 0))
+        })
     }
 
     /// Canonical test descriptor: an `mc_cache`-namespace module store on
@@ -6344,7 +9061,7 @@ impl McStore {
         self.append_channel1_nudge(session_id, block_id, reminder_text, fired_at_ms)
     }
 
-    /// The loader returns exact auto-search overlay bytes and durable empty decisions.
+    /// Load exact auto-search overlay bytes and durable empty decisions.
     pub fn load_user_hints(&self, session_id: &str) -> Result<Vec<UserHintRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -6368,7 +9085,7 @@ impl McStore {
         })?)
     }
 
-    /// The loader returns persisted marker bytes, including empty no-marker decisions.
+    /// Load persisted marker bytes, including empty no-marker decisions.
     pub fn load_temporal_marks(
         &self,
         session_id: &str,
@@ -6395,7 +9112,8 @@ impl McStore {
         })?)
     }
 
-    /// `set_todo_state` treats matching owner_message_id and state_hash as a replay no-op.
+    /// Set the normalized todo snapshot with replay-safe owner/hash semantics. A cache row
+    /// CAS makes a retry harmless even when a transform commits between the read and update.
     pub fn set_todo_state(
         &self,
         session_id: &str,
@@ -6403,6 +9121,9 @@ impl McStore {
         owner_message_id: &str,
         state_hash: &str,
     ) -> Result<TodoStateSetOutcome, McStoreError> {
+        ensure_durable_text_bound(state_json)?;
+        reject_secret_text(owner_message_id)?;
+        reject_secret_text(state_hash)?;
         let mut last_conflict = None;
         for _ in 0..8 {
             let loaded = self.load(session_id)?;
@@ -6428,7 +9149,7 @@ impl McStore {
         }))
     }
 
-    /// `arm_soft_refresh` persists a one-shot refresh for the next eligible transform pass.
+    /// Arm the durable one-shot refresh consumed by the next eligible transform pass.
     pub fn arm_soft_refresh(&self, session_id: &str) -> Result<bool, McStoreError> {
         let mut last_conflict = None;
         for _ in 0..8 {
@@ -6485,14 +9206,26 @@ impl McStore {
                 "invalid recomp disposition {disposition:?}"
             )));
         }
-        Ok(self.inner.with_conn_fenced(|tx| {
-            tx.execute(
+        if let Some(existing) = self.load_recomp_command(session_id, command_id)? {
+            return Ok(existing);
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["recomp", command_id]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        write.identity("command_id", command_id)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_recomp_commands
                  (session_id, command_id, disposition, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, command_id, disposition, created_at],
             )?;
-            tx.query_row(
+            let row = tx.query_row(
                 "SELECT disposition, created_at FROM mc_recomp_commands
                  WHERE session_id = ?1 AND command_id = ?2",
                 params![session_id, command_id],
@@ -6502,8 +9235,13 @@ impl McStore {
                         created_at: row.get(1)?,
                     })
                 },
-            )
-        })?)
+            )?;
+            Ok(if inserted == 0 {
+                WriteDisposition::Replay(row)
+            } else {
+                WriteDisposition::Applied(row)
+            })
+        })
     }
 
     pub fn load_wrapup_command(
@@ -6531,7 +9269,7 @@ impl McStore {
         })?)
     }
 
-    /// The transaction records a terminal wrapup outcome and returns the canonical row on a retry race.
+    /// Record a terminal wrapup outcome and return the canonical row on a retry race.
     pub fn record_wrapup_command(
         &self,
         session_id: &str,
@@ -6548,10 +9286,23 @@ impl McStore {
             )));
         }
         debug_assert!(valid_disposition);
+        if let Some(existing) = self.load_wrapup_command(session_id, command_id)? {
+            return Ok(existing);
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["wrapup", command_id]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        write.identity("command_id", command_id)?;
+        let summary = write.content("summary", summary)?;
         let rounds = i64::try_from(rounds)
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
-        Ok(self.inner.with_conn_fenced(|tx| {
-            tx.execute(
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_wrapup_commands
                      (session_id, command_id, disposition, rounds, summary, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -6564,7 +9315,7 @@ impl McStore {
                     created_at
                 ],
             )?;
-            tx.query_row(
+            let row = tx.query_row(
                 "SELECT disposition, rounds, summary, created_at
                  FROM mc_wrapup_commands
                  WHERE session_id = ?1 AND command_id = ?2",
@@ -6578,11 +9329,16 @@ impl McStore {
                         created_at: row.get(3)?,
                     })
                 },
-            )
-        })?)
+            )?;
+            Ok(if inserted == 0 {
+                WriteDisposition::Replay(row)
+            } else {
+                WriteDisposition::Applied(row)
+            })
+        })
     }
 
-    /// The method returns a recorded dream-task result for command-id retry deduplication.
+    /// Return a recorded dream-task result for command-id retry deduplication.
     pub fn load_dream_task_command(
         &self,
         session_id: &str,
@@ -6605,7 +9361,8 @@ impl McStore {
         })?)
     }
 
-    /// `INSERT OR IGNORE` preserves the first dream-task response across command-id retries.
+    /// Record the first terminal dream-task response. INSERT OR IGNORE makes a response-loss
+    /// retry replay the original provider outcome instead of executing a second child session.
     pub fn record_dream_task_command(
         &self,
         session_id: &str,
@@ -6613,14 +9370,28 @@ impl McStore {
         response_json: &str,
         created_at: i64,
     ) -> Result<DreamTaskCommandRow, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
-            tx.execute(
+        if let Some(existing) = self.load_dream_task_command(session_id, command_id)? {
+            return Ok(existing);
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["dream", command_id]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        write.identity("command_id", command_id)?;
+        write.record_content("response_json", response_json)?;
+        let response_json = prepare_json_content(response_json)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_dream_task_commands
                      (session_id, command_id, response_json, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, command_id, response_json, created_at],
             )?;
-            tx.query_row(
+            let row = tx.query_row(
                 "SELECT response_json, created_at
                    FROM mc_dream_task_commands
                   WHERE session_id = ?1 AND command_id = ?2",
@@ -6631,14 +9402,26 @@ impl McStore {
                         created_at: row.get(1)?,
                     })
                 },
-            )
-        })?)
+            )?;
+            Ok(if inserted == 0 {
+                WriteDisposition::Replay(row)
+            } else {
+                WriteDisposition::Applied(row)
+            })
+        })
     }
 
+    /// Apply classifier metadata under the memories authority, updating each row only when its
+    /// content hash still matches the supplied hash. Importance and classification writes that
+    /// keep foreign visibility unchanged remain mutation-neutral. A visibility grant/revocation
+    /// appends an internal correction marker in this same transaction so m1 can reconcile the row
+    /// without waiting for a HARD fold.
     pub fn record_wrapup_command_if_current(
         &self,
         record: WrapupCommandRecord<'_>,
     ) -> Result<RecordWrapupCommandOutcome, McStoreError> {
+        // Failed rows can be terminal command results; the module keeps a marker in
+        // their summary so older recoverable failure rows retain their retry behavior.
         let valid_disposition = matches!(
             record.disposition,
             "completed" | "nothing_to_compact" | "failed"
@@ -6650,9 +9433,25 @@ impl McStore {
             )));
         }
         debug_assert!(valid_disposition);
+        let existing = self.load_wrapup_command(record.session_id, record.command_id)?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            record.session_id,
+            active_scan_owner_key(&["wrapup", record.command_id]),
+        );
+        write.existing_identity("session_id", record.session_id)?;
+        if existing.is_none() {
+            write.identity("command_id", record.command_id)?;
+        } else {
+            write.existing_identity("command_id", record.command_id)?;
+        }
+        let command_id_flagged = write.recorded_detections(&["command_id"]);
+        let summary = write.content("summary", record.summary)?;
         let rounds = i64::try_from(record.rounds)
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
-        Ok(self.inner.with_conn_fenced(|transaction| {
+        write.execute(&self.inner, |coordinated| {
+            let transaction = coordinated.tx();
             let current = transaction
                 .query_row(CACHE_STATE_META_SELECT, params![record.session_id], |row| {
                     Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
@@ -6674,25 +9473,38 @@ impl McStore {
             if found_row_version != record.expected_row_version
                 || found_revert_epoch != record.expected_revert_epoch
             {
-                return Ok(RecordWrapupCommandOutcome::Stale {
-                    found_row_version,
-                    found_revert_epoch,
-                });
+                return Ok(WriteDisposition::Replay(
+                    RecordWrapupCommandOutcome::Stale {
+                        found_row_version,
+                        found_revert_epoch,
+                    },
+                ));
             }
-            let legacy_failure_created_at = transaction
+            let durable_row = transaction
                 .query_row(
                     "SELECT disposition, created_at FROM mc_wrapup_commands
                      WHERE session_id = ?1 AND command_id = ?2",
                     params![record.session_id, record.command_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .optional()?
-                .and_then(|(disposition, created_at)| {
-                    (disposition == "failed").then_some(created_at)
-                });
+                .optional()?;
+            if command_id_flagged && durable_row.is_none() {
+                // A flagged command ID must resolve to a durable row in this transaction.
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["command_id"])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
+            let legacy_failure_created_at = durable_row.and_then(|(disposition, created_at)| {
+                (disposition == "failed").then_some(created_at)
+            });
+            let mut wrote = false;
             if let Some(failed_created_at) = legacy_failure_created_at {
-                let summary = wrapup_replaced_failure_summary(record.summary, failed_created_at);
-                transaction.execute(
+                // A failed audit row is not replayable. Replace it in this fenced
+                // transaction so a lost successful response becomes durable idempotency.
+                let summary = wrapup_replaced_failure_summary(&summary, failed_created_at);
+                wrote |= transaction.execute(
                     "UPDATE mc_wrapup_commands
                      SET disposition = ?3, rounds = ?4, summary = ?5, created_at = ?6
                      WHERE session_id = ?1 AND command_id = ?2 AND disposition = 'failed'",
@@ -6704,10 +9516,10 @@ impl McStore {
                         summary,
                         record.created_at
                     ],
-                )?;
+                )? > 0;
             }
 
-            transaction.execute(
+            wrote |= transaction.execute(
                 "INSERT OR IGNORE INTO mc_wrapup_commands
                      (session_id, command_id, disposition, rounds, summary, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -6716,10 +9528,10 @@ impl McStore {
                     record.command_id,
                     record.disposition,
                     rounds,
-                    record.summary,
+                    summary,
                     record.created_at
                 ],
-            )?;
+            )? > 0;
             let row = transaction.query_row(
                 "SELECT disposition, rounds, summary, created_at
                  FROM mc_wrapup_commands
@@ -6735,8 +9547,14 @@ impl McStore {
                     })
                 },
             )?;
-            Ok(RecordWrapupCommandOutcome::Recorded(row))
-        })?)
+            let outcome = RecordWrapupCommandOutcome::Recorded(row);
+            // Scan receipts must not describe a summary the durable row does not hold.
+            Ok(if wrote {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
+            })
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6769,6 +9587,8 @@ impl McStore {
         })?)
     }
 
+    /// Check whether an import attempt may begin without staging anything durably.
+    /// The final commit repeats these predicates inside its fenced transaction.
     pub fn preflight_state_import(
         &self,
         session_id: &str,
@@ -6796,6 +9616,10 @@ impl McStore {
         }
     }
 
+    /// Atomically seed compartments into a never-used real-session key and record the
+    /// completed import id. No cache row is created: the normal first transform observes
+    /// the compartments with an empty boundary and performs the bootstrap HARD fold that
+    /// mints the live boundary anchor.
     pub fn commit_state_import(
         &self,
         session_id: &str,
@@ -6803,7 +9627,22 @@ impl McStore {
         compartments: &[StoredCompartment],
         completed_at_ms: i64,
     ) -> Result<StateImportResult, StateImportError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        match self.preflight_state_import(session_id, import_id)? {
+            StateImportPreflight::Duplicate { imported } => {
+                return Ok(StateImportResult {
+                    imported,
+                    duplicate: true,
+                });
+            }
+            StateImportPreflight::Ready => {}
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", session_id, "state_import");
+        write.identity("session_id", session_id)?;
+        write.identity("import_id", import_id)?;
+        let compartments = prepare_compartments(&mut write, compartments)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             let completed = tx
                 .query_row(
                     "SELECT import_id, imported_count FROM mc_state_imports WHERE session_id = ?1",
@@ -6813,19 +9652,30 @@ impl McStore {
                 .optional()?;
             if let Some((completed_id, imported)) = completed {
                 if completed_id == import_id {
-                    return Ok(StateImportTxnOutcome::Duplicate(imported.max(0) as usize));
+                    return Ok(WriteDisposition::Replay(StateImportTxnOutcome::Duplicate(
+                        imported.max(0) as usize,
+                    )));
                 }
-                return Ok(StateImportTxnOutcome::SessionNotEmpty);
+                return Ok(WriteDisposition::Replay(
+                    StateImportTxnOutcome::SessionNotEmpty,
+                ));
             }
 
+            // This is the fresh-row form of the cache-state CAS. The predicate and all
+            // compartment writes share one fenced transaction, so a racing bootstrap
+            // cannot slip state between the emptiness check and the imported rows.
             if session_has_durable_state(tx, session_id)? {
-                return Ok(StateImportTxnOutcome::SessionNotEmpty);
+                return Ok(WriteDisposition::Replay(
+                    StateImportTxnOutcome::SessionNotEmpty,
+                ));
             }
-            if let Err(error) = validate_state_import_compartments(compartments) {
-                return Ok(StateImportTxnOutcome::Validation(error));
+            if let Err(error) = validate_state_import_compartments(&compartments) {
+                return Ok(WriteDisposition::Replay(StateImportTxnOutcome::Validation(
+                    error,
+                )));
             }
 
-            for compartment in compartments {
+            for compartment in &compartments {
                 insert_compartment_tx(tx, session_id, compartment.sequence, compartment)?;
             }
             tx.execute(
@@ -6839,7 +9689,9 @@ impl McStore {
                     completed_at_ms
                 ],
             )?;
-            Ok(StateImportTxnOutcome::Imported(compartments.len()))
+            Ok(WriteDisposition::Applied(StateImportTxnOutcome::Imported(
+                compartments.len(),
+            )))
         })?;
 
         match outcome {
@@ -6856,6 +9708,13 @@ impl McStore {
         }
     }
 
+    /// Commit new state under the row_version CAS, inside the epoch-fenced txn.
+    ///
+    /// `expected` is the row_version from [`load`] (`None` = expect no row → INSERT).
+    /// On success the row_version is bumped by one. A `CasConflict` means a
+    /// concurrent writer won; the caller re-loads and re-steps. Call ONLY when
+    /// durable state changed — a pure SoftPlus replay must skip the commit entirely
+    /// so the no-write-on-defer guarantee holds.
     pub fn commit(
         &self,
         session_id: &str,
@@ -6866,6 +9725,7 @@ impl McStore {
         self.commit_with_consumed_drops(session_id, expected, core, meta, &[])
     }
 
+    /// Commit cache state and delete consumed ctx_reduce queue rows in one fenced tx.
     pub fn commit_with_consumed_drops(
         &self,
         session_id: &str,
@@ -6899,11 +9759,20 @@ impl McStore {
         )
     }
 
+    /// Commit accepted cache state and its speculative overlays in one CAS transaction.
     pub fn commit_transform(
         &self,
         session_id: &str,
         request: TransformCommit<'_>,
     ) -> Result<u64, McStoreError> {
+        ensure_durable_text_bound(session_id)?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::CacheState);
+        write.domain_owner("session", session_id, "cache_state");
+        // Record the scan without deciding on it. Whether this `session_id` is a new
+        // identity is settled by the row this transaction actually finds, because a
+        // `delete_session` landing after an out-of-transaction existence read would leave a
+        // stale decision to preserve a detected secret on a genuine first insert.
+        write.existing_identity("session_id", session_id)?;
         let TransformCommit {
             expected,
             core,
@@ -6924,16 +9793,86 @@ impl McStore {
             scheduler_applied_reductions,
             overlays,
         } = request;
-        let max_seen_ordinal = overlays
-            .max_seen_ordinal
+        let TransformOverlayBatch {
+            max_seen_ordinal,
+            tag_mints,
+            temporal_marks,
+            user_hint,
+            channel1_append,
+            created_at_ms,
+        } = overlays;
+        // Canonicalize before scanning, because the canonical form is what the row stores.
+        // A symlink whose own spelling is clean can resolve to a detectable target, and
+        // scanning the caller's spelling would clear bytes that are never persisted while
+        // the bytes that are persisted go unscanned.
+        let canonical_project_root = project_root
+            .filter(|root| !root.is_empty())
+            .map(|root| canonical_root(root).to_string_lossy().into_owned());
+        if let Some(project_root) = canonical_project_root.as_deref() {
+            write.identity("project_root", project_root)?;
+        }
+        if let Some(fingerprint) = scheduler_full_array_fingerprint {
+            write.identity("scheduler_full_array_fingerprint", fingerprint)?;
+        }
+        if let Some(value) = first_divergence {
+            write.record_content("first_divergence", value)?;
+        }
+        let first_divergence = first_divergence.map(prepare_json_content).transpose()?;
+        let tag_mints = tag_mints
+            .iter()
+            .map(|input| {
+                let block_id = input.block_id.trim();
+                if !block_id.is_empty() {
+                    write.identity("tag_block_id", block_id)?;
+                    write.identity("tag_kind", &input.kind)?;
+                }
+                Ok(TagMintInput {
+                    block_id: input.block_id.clone(),
+                    kind: input.kind.clone(),
+                    token_count: input.token_count,
+                    source_bytes: write.bytes("tag_source_bytes", &input.source_bytes)?,
+                })
+            })
+            .collect::<Result<Vec<_>, McStoreError>>()?;
+        let temporal_marks = temporal_marks
+            .iter()
+            .map(|mark| {
+                write.identity("temporal_mark_block_id", &mark.block_id)?;
+                Ok(TemporalMarkInput {
+                    ordinal: mark.ordinal,
+                    block_id: mark.block_id.clone(),
+                    marker_text: write.content("marker_text", &mark.marker_text)?,
+                })
+            })
+            .collect::<Result<Vec<_>, McStoreError>>()?;
+        let user_hint = user_hint
+            .map(|hint| -> Result<_, McStoreError> {
+                write.identity("user_hint_block_id", &hint.block_id)?;
+                Ok(UserHintDecisionInput {
+                    ordinal: hint.ordinal,
+                    block_id: hint.block_id.clone(),
+                    hint_text: write.content("hint_text", &hint.hint_text)?,
+                })
+            })
+            .transpose()?;
+        let channel1_append = channel1_append
+            .map(|append| -> Result<_, McStoreError> {
+                write.identity("channel1_block_id", &append.block_id)?;
+                Ok(Channel1AppendRow {
+                    block_id: append.block_id.clone(),
+                    reminder_text: write.content("reminder_text", &append.reminder_text)?,
+                    fired_at_ms: append.fired_at_ms,
+                })
+            })
+            .transpose()?;
+        let max_seen_ordinal = max_seen_ordinal
             .map(|ordinal| {
                 i64::try_from(ordinal).map_err(|_| {
                     McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
                 })
             })
             .transpose()?;
-        let temporal_marks = overlays
-            .temporal_marks
+        let temporal_marks = temporal_marks
             .iter()
             .map(|mark| {
                 i64::try_from(mark.ordinal)
@@ -6943,20 +9882,28 @@ impl McStore {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let hint_ordinal = overlays
-            .user_hint
+        let hint_ordinal = user_hint
+            .as_ref()
             .map(|hint| {
                 i64::try_from(hint.ordinal).map_err(|_| {
                     McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
                 })
             })
             .transpose()?;
+        let core = prepare_core_state_for_write(&mut write, core)?;
         let core_json =
-            serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
+            serde_json::to_string(&core).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
+        write.record_content("meta", &meta_json)?;
+        let meta_json = prepare_json_content_preserving_identities(&meta_json)?;
         let scheduler_observation_json = scheduler_observation
             .map(serialize_scheduler_observation)
+            .transpose()?
+            .map(|value| {
+                write.record_content("scheduler_observation", &value)?;
+                prepare_json_content(&value)
+            })
             .transpose()?;
         let next = expected.unwrap_or(0) + 1;
         let scheduler_interesting_json = scheduler_observation
@@ -6977,19 +9924,25 @@ impl McStore {
                     scheduler_applied_supersession_count,
                 )
             })
+            .transpose()?
+            .map(|value| {
+                write.record_content("scheduler_interesting", &value)?;
+                prepare_json_content(&value)
+            })
             .transpose()?;
-        let canonical_project_root = project_root
-            .filter(|root| !root.is_empty())
-            .map(|root| canonical_root(root).to_string_lossy().into_owned());
+        // The accepted cache row version is a stable identity for the pass that produced the
+        // divergence. Overlay timestamps are the request clock when available; direct callers
+        // that omit one still receive a real commit timestamp.
         let divergence_pass_id = next as i64;
-        let divergence_at_ms = if overlays.created_at_ms > 0 {
-            overlays.created_at_ms
+        let divergence_at_ms = if created_at_ms > 0 {
+            created_at_ms
         } else {
             current_time_ms()
         };
 
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            // The fenced transaction reads the current row_version; it returns NO_ROW when no row exists.
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // Read the current row_version inside the fenced txn; NO_ROW when absent.
             let current: i64 = tx.query_row(
                 "SELECT COALESCE((SELECT row_version FROM mc_cache_state WHERE session_id = ?1), ?2)",
                 params![session_id, NO_ROW],
@@ -7001,8 +9954,19 @@ impl McStore {
                 Some(v) => current == v as i64,
             };
             if !cas_ok {
-                // The transaction commits nothing on a CAS conflict.
-                return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                // Empty txn (commits nothing); the caller re-loads and re-steps.
+                return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
+                    current.max(0) as u64,
+                )));
+            }
+            if current == NO_ROW {
+                // No row to key, so this write introduces the identity rather than
+                // replaying one already stored under it.
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["session_id"])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             }
             if let Some(expected_vector) = claim_snapshot_vector {
                 let current_vector = claim_mirror::snapshot_vector_from_connection(tx)?;
@@ -7011,7 +9975,9 @@ impl McStore {
                     .and_then(|vector| canonical_snapshot_vector(vector).ok())
                     == canonical_snapshot_vector(expected_vector).ok();
                 if !vector_matches {
-                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                    return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
+                        current.max(0) as u64,
+                    )));
                 }
             }
             if let Some(expected_seq) = compartment_max_seq {
@@ -7021,11 +9987,13 @@ impl McStore {
                     |row| row.get(0),
                 )?;
                 if current_seq != expected_seq {
-                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                    return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
+                        current.max(0) as u64,
+                    )));
                 }
             }
 
-            // The fenced transaction uses INSERT because bootstrap has no row to update.
+            // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
             tx.execute(
                 "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
                   VALUES (?1, ?2, ?3, ?4, ?5)
@@ -7037,7 +10005,7 @@ impl McStore {
                 params![session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
             // Every accepted transform owns the current-pass value: stable passes write NULL
-            // Stable passes write NULL so an older divergence is not reported as current.
+            // rather than leaving an older divergence looking like a present observation.
             tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
@@ -7107,17 +10075,19 @@ impl McStore {
                  ],
             )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
+                // Durable root lineage is committed with the cache CAS, so a restart cannot
+                // authenticate a root that never produced the accepted session state.
                 tx.execute(
                      "INSERT INTO mc_transform_session_roots(
                          session_id, project_root, observed_at
                      ) VALUES (?1, ?2, ?3)
                      ON CONFLICT(session_id, project_root) DO UPDATE SET
                          observed_at = excluded.observed_at",
-                    params![session_id, project_root, overlays.created_at_ms],
+                    params![session_id, project_root, created_at_ms],
                 )?;
             }
 
-            for input in overlays.tag_mints {
+            for input in &tag_mints {
                 let block_id = input.block_id.trim();
                 if block_id.is_empty() {
                     continue;
@@ -7147,7 +10117,7 @@ impl McStore {
                         block_id,
                         input.kind,
                         input.token_count.max(0),
-                        overlays.created_at_ms,
+                            created_at_ms,
                         input.source_bytes,
                     ],
                 )?;
@@ -7170,12 +10140,12 @@ impl McStore {
                             session_id,
                             mark.block_id,
                             mark.marker_text,
-                            overlays.created_at_ms
+                            created_at_ms
                         ],
                     )?;
                 }
             }
-            if let Some(hint) = overlays.user_hint {
+            if let Some(hint) = user_hint.as_ref() {
                 let eligible = hint_ordinal.is_some_and(|ordinal| {
                     previous_frontier.is_none_or(|frontier| ordinal > frontier)
                 });
@@ -7188,12 +10158,12 @@ impl McStore {
                             session_id,
                             hint.block_id,
                             hint.hint_text,
-                            overlays.created_at_ms
+                            created_at_ms
                         ],
                     )?;
                 }
             }
-            if let Some(append) = overlays.channel1_append {
+            if let Some(append) = channel1_append.as_ref() {
                 tx.execute(
                     "INSERT OR IGNORE INTO mc_channel1_appends
                          (session_id, block_id, reminder_text, fired_at_ms)
@@ -7223,7 +10193,7 @@ impl McStore {
                      WHERE session_id = ?1
                        AND command_id = ?2
                        AND first_applied_at_ms IS NULL",
-                    params![session_id, command_id, overlays.created_at_ms],
+                    params![session_id, command_id, created_at_ms],
                 )?;
             }
             for drop_id in consumed_drop_ids {
@@ -7232,7 +10202,7 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
-            Ok(CommitOutcome::Committed(next))
+            Ok(WriteDisposition::Applied(CommitOutcome::Committed(next)))
         })?;
 
         match outcome {
@@ -7241,6 +10211,9 @@ impl McStore {
         }
     }
 
+    /// Apply an authority state update atomically after validating its sequence. Authority
+    /// rows use the regular memory and profile tables read by real-session transforms, while
+    /// compartment and cache-state tables are shared by both lanes.
     pub fn apply_authority_state_sync(
         &self,
         request: ModuleStateSyncRequest<'_>,
@@ -7252,9 +10225,24 @@ impl McStore {
         &self,
         request: ModuleStateSyncRequest<'_>,
     ) -> Result<ModuleStateSyncResult, ModuleStateSyncError> {
-        let default_core_json = serde_json::to_string(&CoreState::default())
-            .map_err(|e| ModuleStateSyncError::Serde(e.to_string()))?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthoritySeedRows);
+        let PreparedStateSync {
+            drop_seeds,
+            pending_agent_drops,
+            compartments,
+            user_profile,
+            user_hint_seeds,
+            workspace,
+            note_nudge_anchors,
+            pending_compaction_marker,
+            deferred_execute_state,
+            channel2_nudge_state,
+            strip_seeds,
+            last_todo_state,
+        } = prepare_state_sync(&mut write, &request)?;
+        let session_id_flagged = write.recorded_detections(&["session_id"]);
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
             let row = tx
                 .query_row(
                     CACHE_STATE_FULL_SELECT,
@@ -7273,53 +10261,60 @@ impl McStore {
                 Some((row_version, core_state_json, meta_json)) => {
                     let core = match serde_json::from_str::<CoreState>(&core_state_json) {
                         Ok(core) => core,
-                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
                     };
                     let meta = match serde_json::from_str::<ModuleMeta>(&meta_json) {
                         Ok(meta) => meta,
-                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
                     };
                     (row_version, core, meta)
                 }
-                None => {
-                    let core = match serde_json::from_str::<CoreState>(&default_core_json) {
-                        Ok(core) => core,
-                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
-                    };
-                    (NO_ROW, core, ModuleMeta::default())
-                }
+                None => (NO_ROW, CoreState::default(), ModuleMeta::default()),
             };
+            if session_id_flagged && current == NO_ROW {
+                // No `mc_cache_state` row means this sync creates the session, so its ID is a
+                // new identity rather than one already keying durable rows.
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["session_id"])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
             let initialized_before_sync = meta.initialized;
 
             if !request.compartments.is_empty()
                 && meta.historian.state != HistorianPhase::Idle
             {
-                return Ok(ModuleStateSyncTxnOutcome::HistorianBusy {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::HistorianBusy {
                     phase: meta.historian.state,
-                });
+                }));
             }
             if meta.shadow_generation != request.shadow_generation {
-                return Ok(ModuleStateSyncTxnOutcome::GenerationMismatch {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::GenerationMismatch {
                     found: meta.shadow_generation,
-                });
+                }));
             }
             if meta.shadow_seq != request.expected_shadow_seq {
-                return Ok(ModuleStateSyncTxnOutcome::AuthoritySeqMismatch {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::AuthoritySeqMismatch {
                     found: meta.shadow_seq,
-                });
+                }));
             }
 
             if let Some(declared) = request.seed_boundary_id {
                 let adoption = match validated_seed_boundary(declared, request.compartments) {
                     Ok(adoption) => adoption,
                     Err(detail) => {
-                        return Ok(ModuleStateSyncTxnOutcome::InvalidSeedBoundary {
+                        return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::InvalidSeedBoundary {
                             declared: declared.to_string(),
                             detail,
-                        })
+                        }))
                     }
                 };
                 if meta.initialized {
+                    // A force seed is process-local cold-start behavior, but this cache state is
+                    // durable. Re-adopting a lagging TypeScript mirror would move only the trim
+                    // cursor while retaining the module's newer m0/m1 bytes, so the next defer
+                    // would silently re-emit the already-folded interval as raw tail messages.
                     eprintln!(
                         "mc-store: retained materialized boundary {:?} over state-sync seed {:?} for session {}",
                         core.boundary_id, adoption.boundary_id, request.session_id
@@ -7340,12 +10335,12 @@ impl McStore {
             let drop_seeds_skipped = materialize_drop_seed_units(
                 &mut core,
                 request.session_id,
-                request.drop_seeds,
+                &drop_seeds,
                 request.drop_seed_skipped,
             );
             let mut pending_agent_drops_seeded = 0usize;
             let mut pending_agent_drops_skipped = request.pending_agent_drops_skipped;
-            for seed in request.pending_agent_drops {
+            for seed in &pending_agent_drops {
                 if !valid_drop_seed_block_id(&seed.block_id) {
                     pending_agent_drops_skipped = pending_agent_drops_skipped.saturating_add(1);
                     eprintln!(
@@ -7364,8 +10359,14 @@ impl McStore {
             let mut user_hint_seeds_seeded = 0usize;
             let mut auto_search_hint_skipped = request.auto_search_hint_skipped;
             if request.user_hints_replace_session {
+                // The host's decision list is the complete policy authority
+                // for this session's overlays. One batched NOT IN delete (the
+                // same json_each shape the scope prune uses) keeps the kept
+                // rows' created_at stable and avoids a round-trip per stale
                 // row.
-                // The method skips the replace-delete when serializing hint IDs fails, retaining existing hints.
+                // Serializing a Vec<&str> cannot fail in practice; if it
+                // ever does, SKIP the replace-delete (fail closed toward
+                // retention) rather than deleting every hint with an empty
                 // kept set.
                 if let Ok(kept_json) = serde_json::to_string(
                     &request
@@ -7382,12 +10383,18 @@ impl McStore {
                     )?;
                 }
             }
-            for seed in request.user_hint_seeds {
+            for seed in &user_hint_seeds {
                 if !valid_drop_seed_block_id(&seed.block_id) {
                     auto_search_hint_skipped = auto_search_hint_skipped.saturating_add(1);
                     continue;
                 }
                 user_hint_seeds_seeded += tx.execute(
+                    // Upsert, not ignore: the host's decision list is the
+                    // policy authority for these overlays, and a reseed can
+                    // legitimately REVOKE a hint whose contributing memory
+                    // was hidden (the host sends the empty no-result shape).
+                    // Benign reseeds carry byte-identical text, so old turns
+                    // stay stable unless policy demanded the change.
                     "INSERT INTO mc_user_hints(session_id, block_id, hint_text, created_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(session_id, block_id) DO UPDATE SET
@@ -7395,8 +10402,8 @@ impl McStore {
                     params![request.session_id, seed.block_id, seed.hint_text, current_time_ms()],
                 )?;
             }
-            let note_nudge_anchors_seeded = request
-                .note_nudge_anchors
+            let note_nudge_anchors_seeded = note_nudge_anchors
+                .as_deref()
                 .map(|anchors| {
                     meta.note_nudge_anchors = anchors.to_vec();
                     anchors.len()
@@ -7416,24 +10423,24 @@ impl McStore {
             } else {
                 false
             };
-            if let Some(marker) = request.pending_compaction_marker {
-                meta.pending_compaction_marker = marker.cloned();
+            if let Some(marker) = pending_compaction_marker.as_ref() {
+                meta.pending_compaction_marker = marker.clone();
             }
-            if let Some(deferred) = request.deferred_execute_state {
-                meta.deferred_execute_state = deferred.cloned();
+            if let Some(deferred) = deferred_execute_state.as_ref() {
+                meta.deferred_execute_state = deferred.clone();
             }
-            if let Some(state) = request.channel2_nudge_state {
+            if let Some(state) = channel2_nudge_state.as_deref() {
                 meta.channel2_nudge_state = state.to_string();
             }
             let strip_seeds_skipped = materialize_strip_seed_units(
                 &mut core,
                 request.session_id,
-                request.strip_seeds,
+                &strip_seeds,
                 request.strip_seed_skipped,
             );
 
             let mut compartment_overwrites_skipped = 0usize;
-            for compartment in request.compartments {
+            for compartment in &compartments {
                 if initialized_before_sync {
                     let retained_sequence = meta.folded_compartment_seq;
                     if compartment.sequence <= retained_sequence
@@ -7460,14 +10467,14 @@ impl McStore {
                 );
             }
             if request.workspace_present {
-                replace_workspace_tx(tx, request.project_path, request.workspace)?;
+                replace_workspace_tx(tx, request.project_path, workspace.as_ref())?;
             }
             if request.user_profile_present {
-                replace_authority_user_profile_tx(tx, request.user_profile)?;
+                replace_authority_user_profile_tx(tx, &user_profile)?;
             }
 
             let in_session_watermark_changed = meta.shadow_acked_watermarks != request.acked_watermarks;
-            meta.last_todo_state = request.last_todo_state.clone();
+            meta.last_todo_state = last_todo_state.clone();
             if in_session_watermark_changed && meta.m1_pending_since_ms.is_none() {
                 meta.m1_pending_since_ms = Some(current_time_ms());
             }
@@ -7483,6 +10490,7 @@ impl McStore {
             if let Some(watermark) = request.reasoning_cleared_through_tag {
                 meta.reasoning_cleared_through_tag =
                     meta.reasoning_cleared_through_tag.max(watermark);
+                // Keep legacy state readers monotone while the tag-based field rolls out.
                 meta.reasoning_cleared_through_ordinal =
                     meta.reasoning_cleared_through_ordinal.max(watermark);
             }
@@ -7490,13 +10498,38 @@ impl McStore {
             meta.shadow_acked_watermarks = request.acked_watermarks.clone();
 
             let next = current.max(0) as u64 + 1;
+            core = match prepare_transaction_core_state_for_write(
+                &mut coordinated.prepared.borrow_mut(),
+                &core,
+            ) {
+                Ok(core) => core,
+                // Fail the transaction rather than reporting a refusal through a successful
+                // disposition. Pending drops, hint seeds, compartments, the workspace, and the
+                // user profile are already written by this point, and `Replay` commits them.
+                Err(error) => {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                }
+            };
             let core_json = match serde_json::to_string(&core) {
                 Ok(json) => json,
-                Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
             };
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
-                Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
+            };
+            if let Err(error) = coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("meta", &meta_json)
+            {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(error) => {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                }
             };
             tx.execute(
                 "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
@@ -7509,7 +10542,7 @@ impl McStore {
                 params![request.session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
 
-            Ok(ModuleStateSyncTxnOutcome::Committed(ModuleStateSyncResult {
+            Ok(WriteDisposition::Applied(ModuleStateSyncTxnOutcome::Committed(ModuleStateSyncResult {
                 shadow_generation: meta.shadow_generation,
                 shadow_seq: meta.shadow_seq,
                 row_version: next,
@@ -7522,7 +10555,7 @@ impl McStore {
                 todo_synthetic_anchor_seeded,
                 emergency_latches_seeded,
                 strip_seeds_skipped,
-            }))
+            })))
         })?;
 
         match outcome {
@@ -7571,8 +10604,8 @@ impl McStore {
         })
     }
 
-    /// The decay renderer requires compartments in oldest-first order because it indexes them from newest.
-    /// The caller must pass compartments oldest-first because the decay renderer indexes them from newest.
+    /// Read a session's compartments in chronological order (oldest first), the order
+    /// the decay renderer expects (it indexes from newest internally).
     pub fn load_compartments(
         &self,
         session_id: &str,
@@ -7590,6 +10623,9 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Return the greatest message ordinal covered by a session's compartments without
+    /// materializing the wide compartment rows. The migration-42 index covers both the session
+    /// predicate and the aggregate value.
     pub fn max_compartment_end_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -7615,11 +10651,13 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Return the newest ordinal covered by a persisted compacted compartment.
     pub fn last_compacted_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
         self.max_compartment_end_ordinal(session_id)
     }
 
-    /// Expansion must not materialize every historical compartment before applying its response.
+    /// Read only the compacted rows intersecting a range. The SQL limit is intentional: facade
+    /// expansion must not materialize every historical compartment before applying its response
     /// budget.
     pub fn load_compartments_for_range(
         &self,
@@ -7704,7 +10742,10 @@ impl McStore {
         })
     }
 
-    /// The method returns 0 when no compartment exists.
+    /// The highest compartment `sequence` for a session (0 when none). A cheap read the
+    /// transform does every pass to detect "a new compartment was published" without
+    /// loading the full compartment rows (those load only on the pass that actually
+    /// re-composes the m1 delta block).
     pub fn max_compartment_seq(&self, session_id: &str) -> Result<i64, McStoreError> {
         let max = self.inner.with_conn(|conn| {
             let v: i64 = conn.query_row(
@@ -7717,7 +10758,13 @@ impl McStore {
         Ok(max)
     }
 
-    /// `SELECT EXISTS` distinguishes an empty session from sequence 0, which `max_compartment_seq` maps to 0.
+    /// Whether the session has any compartment at all. This is a presence check, NOT a
+    /// count or a max-sequence read: `max_compartment_seq` COALESCEs a missing MAX to 0,
+    /// which is indistinguishable from a real first compartment at sequence 0, so it
+    /// cannot answer "does a compartment exist". The first-fold HARD trigger needs the
+    /// unambiguous existence answer (empty boundary + a compartment present => the first
+    /// fold is due), so this returns a true/false from `SELECT EXISTS` on the session
+    /// index — O(1), never touches the sequence value.
     pub fn has_compartments(&self, session_id: &str) -> Result<bool, McStoreError> {
         let exists = self.inner.with_conn(|conn| {
             let v: i64 = conn.query_row(
@@ -7730,14 +10777,71 @@ impl McStore {
         Ok(exists != 0)
     }
 
-    /// The writer-fenced transaction resolves and persists one fake-compaction lineage edge.
-    /// The fenced transaction atomically writes copied compartments with their marker, anchor, ordinal base, and prior-lineage publish fence.
+    fn link_lineage_copy_scans(
+        coordinated: &ActiveWriteTransaction<'_>,
+        source_key: &str,
+        target_key: &str,
+    ) -> rusqlite::Result<()> {
+        const MAX_LINKED_SCANS_PER_DESCENT: usize = 100_000;
+        let source_scope_key = active_scan_private_key("session", source_key);
+        let mut statement = coordinated.tx.prepare_cached(
+            "SELECT DISTINCT copies.scan_id
+               FROM mc_scan_owner_copies copies
+               JOIN mc_scan_domain_owners owners USING(domain_owner_id)
+               JOIN mc_scan_owner_scopes scopes USING(owner_scope_id)
+              WHERE scopes.scope_kind='session' AND scopes.scope_key=?1
+              ORDER BY copies.scan_id LIMIT ?2",
+        )?;
+        let scan_ids = statement
+            .query_map(
+                params![
+                    source_scope_key,
+                    i64::try_from(MAX_LINKED_SCANS_PER_DESCENT + 1).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if scan_ids.len() > MAX_LINKED_SCANS_PER_DESCENT {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                McStoreError::Serde("lineage scan-link limit exceeded".to_string()),
+            )));
+        }
+        coordinated
+            .prepared
+            .borrow_mut()
+            .link_existing_scans("session", target_key, "lineage", scan_ids);
+        Ok(())
+    }
+
+    /// Resolve and persist one fake-compaction lineage edge under the store's writer fence.
+    /// The method owns every row participating in adoption so callers cannot observe a copied
+    /// compartment set without its marker, anchor, ordinal base, or prior-lineage publish fence.
     pub fn descend_lineage(
         &self,
         request: LineageDescentRequest<'_>,
     ) -> Result<LineageDescentOutcome, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::LineageCopies);
+        write.domain_owner("session", request.target_key, "lineage");
+        for (field_id, value) in [
+            ("target_key", request.target_key),
+            ("prior_key", request.prior_key),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        for constituent in request.constituents {
+            write.existing_identity("constituent_prior_key", &constituent.prior_key)?;
+            write.existing_identity("constituent_new_key", &constituent.new_key)?;
+        }
+        if let Some(anchor) = request.anchor {
+            write.existing_identity("anchor_block_id", &anchor.block_id)?;
+            write.existing_identity("anchor_message_id", &anchor.message_id)?;
+            write.existing_identity("anchor_content_hash", &anchor.content_hash)?;
+        }
         let note_caller_project = Arc::clone(&self.note_caller_project);
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
+            let outcome = (|| -> rusqlite::Result<LineageDescentTxnOutcome> {
             let current_target = tx
                 .query_row(
                     CACHE_STATE_FULL_SELECT,
@@ -7800,6 +10904,19 @@ impl McStore {
                     },
                 }));
             }
+            coordinated
+                .prepared
+                .borrow()
+                .reject_recorded_identities(&[
+                    "target_key",
+                    "prior_key",
+                    "constituent_prior_key",
+                    "constituent_new_key",
+                    "anchor_block_id",
+                    "anchor_message_id",
+                    "anchor_content_hash",
+                ])
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
 
             let mut path_is_cycle = request.new_epoch <= request.prior_epoch;
             let mut path_is_contiguous = true;
@@ -8019,7 +11136,11 @@ impl McStore {
                     ))
                 }
             };
-            // Fresh lineages require anchor 0 or 1; continued lineages require the placeholder.
+            // Fresh-lineage anchors sit at the assigner's origin, and both live
+            // origin bases are legitimate: 1-based (Pi-style) and 0-based (the
+            // CC-leg assigner, whose first message is ordinal 0 on every pass
+            // the module already accepts). Continued lineages anchor at the
+            // placeholder. Anything else is a mid-space anchor and refuses.
             if anchor.ordinal > 1 && anchor.ordinal != placeholder_ordinal {
                 return Ok(LineageDescentTxnOutcome::Invalid(format!(
                     "descent anchor {} has ordinal {}, expected a fresh origin (0 or 1) or continued ordinal {}",
@@ -8038,8 +11159,9 @@ impl McStore {
                 .last()
                 .map_or(1, |(sequence, _, _)| sequence.saturating_add(1));
 
-            // The transaction prepares every fallible blob mutation before copying the first row.
-            // After the first row copy, any SQL failure must unwind the fenced transaction rather than return a validation outcome that could commit a partial adoption.
+            // Prepare every fallible blob mutation before the first row copy. From this point
+            // onward any SQL failure unwinds the fenced transaction instead of returning a
+            // success-shaped validation outcome that could commit a partial adoption.
             let prior_row = tx
                 .query_row(
                     CACHE_STATE_META_SELECT,
@@ -8064,6 +11186,19 @@ impl McStore {
             let prior_meta_json = match serde_json::to_string(&prior_meta) {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("prior_meta", &prior_meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let prior_meta_json = match prepare_transaction_json_preserving_identities(&prior_meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "prior lineage metadata failed secret scanning".to_string(),
+                    ))
+                }
             };
 
             target_core = source_core;
@@ -8093,6 +11228,23 @@ impl McStore {
                 true,
             );
             let next_target_version = current_target_version.max(0) as u64 + 1;
+            let unprepared_target_core_json = match serde_json::to_string(&target_core) {
+                Ok(json) => json,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("target_core_state", &unprepared_target_core_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            target_core = match prepare_core_state(&target_core) {
+                Ok(core) => core,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "target lineage core state failed secret scanning".to_string(),
+                    ))
+                }
+            };
             let target_core_json = match serde_json::to_string(&target_core) {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
@@ -8101,7 +11253,35 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("target_meta", &target_meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let target_meta_json = match prepare_transaction_json_preserving_identities(&target_meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "target lineage metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
 
+            Self::link_lineage_copy_scans(coordinated, &source_key, request.target_key)?;
+
+            for owner_kind in [
+                "compartments",
+                "historian_side_channels",
+                "authority_seed_rows",
+                "lineage_copies",
+            ] {
+                retire_active_scan_owner_kind(
+                    tx,
+                    "session",
+                    request.target_key,
+                    owner_kind,
+                )?;
+            }
             for table in [
                 "mc_chunk_transcripts",
                 "mc_compartments",
@@ -8116,7 +11296,8 @@ impl McStore {
                     params![request.target_key],
                 )?;
             }
-            // Session notes follow the descended conversation key; the method does not copy smart notes because their project-wide visibility is independent of retained lineage history.
+            // Session notes follow the descended conversation key. Do not copy smart notes:
+            // their project-wide visibility is independent of one lineage's retained history.
             let note_projects = {
                 let mut statement = tx.prepare_cached(
                     "SELECT DISTINCT project_path FROM mc_notes
@@ -8133,6 +11314,27 @@ impl McStore {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .replace(note_project.clone());
                 let copy_result = (|| -> rusqlite::Result<()> {
+                    let note_ids = {
+                        let mut statement = tx.prepare_cached(
+                            "SELECT id FROM mc_notes
+                              WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
+                        )?;
+                        let rows = statement
+                            .query_map(params![request.target_key, note_project], |row| {
+                                row.get::<_, i64>(0)
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    for note_id in note_ids {
+                        retire_active_scan_domain_owner(
+                            tx,
+                            "project",
+                            &note_project,
+                            "notes",
+                            &note_id.to_string(),
+                        )?;
+                    }
                     tx.execute(
                         "DELETE FROM mc_notes
                           WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
@@ -8141,17 +11343,46 @@ impl McStore {
                     tx.execute(
                         &format!(
                             "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
-                             SELECT type, project_path, ?1, content, status, surface_condition,
-                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
-                                    check_cron, check_failure_count, check_network_failure_count,
+                             SELECT mc_reject_transaction_text(type),
+                                    mc_reject_transaction_text(project_path), ?1,
+                                    mc_redact_transaction_text(content),
+                                    mc_reject_transaction_text(status),
+                                    CASE WHEN surface_condition IS NULL THEN NULL
+                                         ELSE mc_redact_transaction_text(surface_condition) END,
+                                    ready_at,
+                                    CASE WHEN ready_reason IS NULL THEN NULL
+                                         ELSE mc_redact_transaction_text(ready_reason) END,
+                                    CASE WHEN manifest_json IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(manifest_json) END,
+                                    CASE WHEN compiled_check IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_check) END,
+                                    CASE WHEN check_hash IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(check_hash) END,
+                                    CASE WHEN check_cron IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(check_cron) END,
+                                    check_failure_count, check_network_failure_count,
                                     check_quarantined_until, check_next_due_at, check_compiled_at,
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
-                                    check_status, check_version, policy_version, harness,
-                                    anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
+                                    CASE WHEN check_status IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(check_status) END,
+                                    check_version, policy_version,
+                                    mc_reject_transaction_text(harness),
+                                    CASE WHEN anchor_block_id IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(anchor_block_id) END,
+                                    anchor_ordinal, dismissed_at,
+                                    CASE WHEN dismissal_resolution IS NULL THEN NULL
+                                         ELSE mc_redact_transaction_text(dismissal_resolution) END,
                                     status_version, created_at_ms, updated_at_ms, NULL, NULL,
                                     source_revision, state_version, compiled_source_revision,
-                                    compiled_project_path, compiled_provider, compiled_config,
-                                    compiled_at, compile_status
+                                    CASE WHEN compiled_project_path IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_project_path) END,
+                                    CASE WHEN compiled_provider IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_provider) END,
+                                    CASE WHEN compiled_config IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_config) END,
+                                    compiled_at,
+                                    CASE WHEN compile_status IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compile_status) END
                                FROM mc_notes
                               WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
                         ),
@@ -8170,9 +11401,23 @@ impl McStore {
                      end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
                      importance, episode_type, legacy, created_at
                  )
-                 SELECT ?1, sequence, start_message, end_message, start_message_id,
-                        end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-                        importance, episode_type, legacy, created_at
+                  SELECT ?1, sequence, start_message, end_message,
+                         mc_reject_transaction_text(start_message_id),
+                         mc_reject_transaction_text(end_message_id),
+                         CASE WHEN start_date IS NULL THEN NULL
+                              ELSE mc_redact_transaction_text(start_date) END,
+                         CASE WHEN end_date IS NULL THEN NULL
+                              ELSE mc_redact_transaction_text(end_date) END,
+                         mc_redact_transaction_text(title),
+                         mc_redact_transaction_text(content),
+                         CASE WHEN p1 IS NULL THEN NULL ELSE mc_redact_transaction_text(p1) END,
+                         CASE WHEN p2 IS NULL THEN NULL ELSE mc_redact_transaction_text(p2) END,
+                         CASE WHEN p3 IS NULL THEN NULL ELSE mc_redact_transaction_text(p3) END,
+                         CASE WHEN p4 IS NULL THEN NULL ELSE mc_redact_transaction_text(p4) END,
+                         importance,
+                         CASE WHEN episode_type IS NULL THEN NULL
+                              ELSE mc_reject_transaction_text(episode_type) END,
+                         legacy, created_at
                    FROM mc_compartments WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -8181,8 +11426,11 @@ impl McStore {
                      session_id, compartment_seq, start_ordinal, end_ordinal,
                      transcript_deflate, raw_messages_deflate, created_at_ms
                  )
-                 SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
-                        transcript_deflate, raw_messages_deflate, created_at_ms
+                  SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
+                         mc_redact_transaction_transcript(transcript_deflate),
+                         CASE WHEN raw_messages_deflate IS NULL THEN NULL
+                              ELSE mc_redact_transaction_raw_messages(raw_messages_deflate) END,
+                         created_at_ms
                    FROM mc_chunk_transcripts WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -8190,25 +11438,32 @@ impl McStore {
                 "INSERT INTO mc_tags (
                      session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                  )
-                 SELECT ?1, tag_number, block_id, kind, token_count, created_at_ms, source_bytes
+                  SELECT ?1, tag_number,
+                         mc_reject_transaction_text(block_id),
+                         mc_reject_transaction_text(kind),
+                         token_count, created_at_ms,
+                         CAST(mc_redact_transaction_text(CAST(source_bytes AS TEXT)) AS BLOB)
                    FROM mc_tags WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
                 "INSERT INTO mc_temporal_marks (session_id, block_id, marker_text, created_at)
-                 SELECT ?1, block_id, marker_text, created_at
+                  SELECT ?1, mc_reject_transaction_text(block_id),
+                         mc_redact_transaction_text(marker_text), created_at
                    FROM mc_temporal_marks WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
                 "INSERT INTO mc_user_hints (session_id, block_id, hint_text, created_at)
-                 SELECT ?1, block_id, hint_text, created_at
+                  SELECT ?1, mc_reject_transaction_text(block_id),
+                         mc_redact_transaction_text(hint_text), created_at
                    FROM mc_user_hints WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
                 "INSERT INTO mc_channel1_appends (session_id, block_id, reminder_text, fired_at_ms)
-                 SELECT ?1, block_id, reminder_text, fired_at_ms
+                  SELECT ?1, mc_reject_transaction_text(block_id),
+                         mc_redact_transaction_text(reminder_text), fired_at_ms
                    FROM mc_channel1_appends WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -8299,6 +11554,12 @@ impl McStore {
                 materialization_required: true,
                 acknowledge: true,
             }))
+            })()?;
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
+            })
         })?;
 
         match outcome {
@@ -8341,13 +11602,24 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// The method replaces a session's entire compartment set in one fenced transaction.
+    /// Replace a session's entire compartment set in one fenced transaction. The
+    /// history producer republishes the full chronological set each time, so a
+    /// wholesale delete-then-insert (rather than an incremental upsert) keeps the
+    /// stored `sequence` contiguous. Writes are serialized by the store's single-writer
+    /// lease (the same one guarding the cache-state commit).
     pub fn replace_compartments(
         &self,
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", session_id, "compartments");
+        write.existing_identity("session_id", session_id)?;
+        let compartments = prepare_compartments(&mut write, compartments)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            // Retire only the owner whose rows the deletes below remove.
+            retire_active_scan_owner_kind(tx, "session", session_id, "compartments")?;
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
                 params![session_id],
@@ -8356,16 +11628,21 @@ impl McStore {
                 "DELETE FROM mc_compartments WHERE session_id = ?1",
                 params![session_id],
             )?;
-            for c in compartments {
+            for c in &compartments {
                 insert_compartment_tx(tx, session_id, c.sequence, c)?;
             }
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
 
+    /// Reset the module cache to the never-minted boundary used by native recomp.
     ///
-    /// The reset writes default `CoreState` and `ModuleMeta` values with a bumped revert epoch.
+    /// This is the full-session form of the revert re-cut: compartments and their
+    /// recoverable transcripts are removed, while the cache row is replaced with a
+    /// fresh core/meta pair carrying a bumped revert epoch. The epoch and row-version
+    /// update share one fenced transaction, so an in-flight historian cannot publish
+    /// against the retired compartment set.
     pub fn reset_session_for_recomp(
         &self,
         session_id: &str,
@@ -8407,6 +11684,14 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
             };
+            for owner_kind in [
+                "compartments",
+                "historian_side_channels",
+                "authority_seed_rows",
+                "lineage_copies",
+            ] {
+                retire_active_scan_owner_kind(tx, "session", session_id, owner_kind)?;
+            }
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
                 params![session_id],
@@ -8460,7 +11745,9 @@ impl McStore {
         }
     }
 
-    /// The truncation increments the revert epoch under the same row-version CAS. A no-op returns the current epoch and version without rewriting `meta`.
+    /// Delete every compartment after `keep_through_seq` and bump the session revert
+    /// epoch under the same row-version CAS. A no-op truncation returns the current
+    /// epoch/version without rewriting the meta blob.
     pub fn truncate_compartments_for_revert(
         &self,
         session_id: &str,
@@ -8550,6 +11837,14 @@ impl McStore {
                 Ok(json) => json,
                 Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
             };
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(TruncateTxnOutcome::Serde(
+                        "cache metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
 
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq > ?2",
@@ -8609,17 +11904,26 @@ impl McStore {
         }
     }
 
-    /// The transaction appends compartments at the current tail without renumbering existing rows.
-    /// The store treats incoming `sequence` values as producer-local hints.
-    /// The store assigns durable sequences contiguously after the current maximum.
+    /// Append compartments at the current tail without renumbering existing rows.
+    /// The incoming `sequence` values are treated as producer-local hints; durable
+    /// sequences are assigned contiguously after the current max so concurrent readers
+    /// never observe gaps or rewritten history.
     pub fn append_compartments(
         &self,
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
-        let outcome = self
-            .inner
-            .with_conn_fenced(|tx| append_compartments_tx(tx, session_id, compartments))?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", session_id, "compartments");
+        write.existing_identity("session_id", session_id)?;
+        let compartments = prepare_compartments(&mut write, compartments)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let outcome = append_compartments_tx(coordinated.tx(), session_id, &compartments)?;
+            Ok(match outcome {
+                AppendCompartmentsTxnOutcome::Appended => WriteDisposition::Applied(outcome),
+                AppendCompartmentsTxnOutcome::Overlap { .. } => WriteDisposition::Replay(outcome),
+            })
+        })?;
         match outcome {
             AppendCompartmentsTxnOutcome::Appended => Ok(()),
             AppendCompartmentsTxnOutcome::Overlap {
@@ -8634,6 +11938,10 @@ impl McStore {
         }
     }
 
+    /// Promote validated historian facts into project memories using exact-content
+    /// de-duplication against the active render set. This path is additive only: it
+    /// inserts new `mc_memories` rows and never writes mutation-log rows, so the next
+    /// m1/materialization pass observes the rows solely through the max-memory-id
     /// watermark.
     pub fn abandon_historian_run_if_matching(
         &self,
@@ -8651,8 +11959,9 @@ impl McStore {
         )
     }
 
-    /// The transaction releases a matching run and optionally records a failed publish attempt.
-    /// The durable historian state records publish failures because publication can fail after producer success.
+    /// Release a matching run and optionally record a failed publish attempt.
+    /// Publication errors can occur after the producer succeeded, so this counter
+    /// lives with the durable historian state rather than producer diagnostics.
     pub fn abandon_historian_run_if_matching_with_publish_failure(
         &self,
         session_id: &str,
@@ -8661,18 +11970,31 @@ impl McStore {
         detail: Option<&str>,
         count_publish_failure: bool,
     ) -> Result<Option<u64>, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::HistorianSideChannels);
+        write.domain_owner("session", session_id, "historian");
+        write.existing_identity("session_id", session_id)?;
+        let detail = detail
+            .map(|value| write.content("last_failure", value))
+            .transpose()?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
             let row = tx
                 .query_row(CACHE_STATE_META_SELECT, params![session_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })
                 .optional()?;
             let Some((current, meta_json)) = row else {
-                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+                return Ok(WriteDisposition::Replay(
+                    AbandonHistorianTxnOutcome::Unchanged,
+                ));
             };
             let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
                 Ok(meta) => meta,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => {
+                    return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                        error.to_string(),
+                    )))
+                }
             };
             let historian = &meta.historian;
             let predicate_matches = historian.firing_seq == predicate.firing_seq
@@ -8681,7 +12003,9 @@ impl McStore {
                 && historian.selected_range_identities == predicate.selected_range_identities
                 && historian.compartment_set_generation == predicate.compartment_set_generation;
             if !predicate_matches || historian.state == HistorianPhase::Idle {
-                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+                return Ok(WriteDisposition::Replay(
+                    AbandonHistorianTxnOutcome::Unchanged,
+                ));
             }
 
             #[cfg(any(test, feature = "test-support"))]
@@ -8694,9 +12018,7 @@ impl McStore {
                 hook();
             }
 
-            let last_failure = detail
-                .map(str::to_string)
-                .or_else(|| historian.last_failure.clone());
+            let last_failure = detail.clone().or_else(|| historian.last_failure.clone());
             meta.historian = HistorianDurableState {
                 state: HistorianPhase::Idle,
                 firing_seq: historian.firing_seq,
@@ -8712,14 +12034,38 @@ impl McStore {
             let next = current.max(0) as u64 + 1;
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => {
+                    return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                        error.to_string(),
+                    )))
+                }
+            };
+            if coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("meta", &meta_json)
+                .is_err()
+            {
+                return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                    "historian metadata failed secret scanning".to_string(),
+                )));
+            }
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                        "historian metadata failed secret scanning".to_string(),
+                    )))
+                }
             };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
                  WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
             )?;
-            Ok(AbandonHistorianTxnOutcome::Committed(next))
+            Ok(WriteDisposition::Applied(
+                AbandonHistorianTxnOutcome::Committed(next),
+            ))
         })?;
 
         match outcome {
@@ -8729,6 +12075,9 @@ impl McStore {
         }
     }
 
+    /// Increment publication health without changing the in-flight state. This covers
+    /// failures before a publish transaction can safely abandon the producer run, such
+    /// as side-channel outbox preparation errors.
     pub fn record_historian_publish_failure_if_matching(
         &self,
         session_id: &str,
@@ -8767,6 +12116,14 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
             };
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(AbandonHistorianTxnOutcome::Serde(
+                        "historian metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
@@ -8780,11 +12137,12 @@ impl McStore {
         }
     }
 
-    /// The transaction publishes a validated historian chunk in one CAS-gated transaction.
-    /// The publish predicate requires the producer to match the exact firing that created the chunk.
-    /// Stale reattaches and racing publishers fail before the transaction writes any rows.
-    /// The transaction leaves render state unchanged; later materialization exposes new rows through existing store watermarks.
-    /// The transaction leaves `CoreState`, `coverage_ordinal`, watermarks, and m1 revision unchanged.
+    /// Publish a validated historian chunk in one CAS-gated transaction. The publish
+    /// predicate proves the producer still matches the exact firing that created the
+    /// chunk; stale reattaches or a second racing publisher fail before any rows are
+    /// appended. The transaction intentionally leaves render state (`CoreState`,
+    /// `coverage_ordinal`, watermarks, and m1 revision) untouched: new rows become
+    /// visible only through the existing store watermarks on a later materializing pass.
     pub fn publish_historian_chunk(
         &self,
         request: HistorianPublishRequest<'_>,
@@ -8792,9 +12150,30 @@ impl McStore {
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
-        let side_channel_items =
+        let mut write = PreparedWrite::new(DurableWriteFamily::HistorianSideChannels);
+        write.domain_owner("session", session_id, "historian");
+        write.existing_identity("session_id", session_id)?;
+        let compartments = prepare_compartments(&mut write, request.compartments)?;
+        let chunk_transcript = request
+            .chunk_transcript
+            .map(|value| write.content("chunk_transcript", value))
+            .transpose()?;
+        let raw_chunk_messages = request
+            .raw_chunk_messages
+            .map(|value| {
+                write.record_content("raw_chunk_messages", value)?;
+                prepare_json_content(value)
+            })
+            .transpose()?;
+        let mut side_channel_items =
             historian_side_channel_pending_items(&request).map_err(HistorianPublishError::Serde)?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        for item in &mut side_channel_items {
+            write.record_content("side_channel_payload", &item.payload_json)?;
+            item.payload_json = prepare_json_content(&item.payload_json)?;
+        }
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
+            let outcome = (|| -> rusqlite::Result<PublishTxnOutcome> {
             let row = tx
                 .query_row(
                     CACHE_STATE_META_SELECT,
@@ -8843,8 +12222,10 @@ impl McStore {
                 return Ok(PublishTxnOutcome::StateMismatch(Box::new(meta.historian)));
             }
 
-            // Block identities verify content freshness.
-            // An empty vector cannot establish that the selected content is current.
+            // `chunk_fingerprint` remains a readable structural diagnostic; exact
+            // content freshness is verified using the durable block identities. An empty
+            // vector means the firing predates selected-range identity persistence, so it
+            // cannot establish that the selected content is still current.
             if predicate.selected_range_identities.is_empty() {
                 return Ok(PublishTxnOutcome::FenceRejected(
                     "historian firing has no selected-range content identities".to_string(),
@@ -8890,7 +12271,7 @@ impl McStore {
             }
 
             let first_appended_sequence = next_compartment_sequence_tx(tx, session_id)?;
-            match append_compartments_tx(tx, session_id, request.compartments)? {
+            match append_compartments_tx(tx, session_id, &compartments)? {
                 AppendCompartmentsTxnOutcome::Appended => {}
                 AppendCompartmentsTxnOutcome::Overlap {
                     existing_sequence,
@@ -8904,14 +12285,14 @@ impl McStore {
                     });
                 }
             }
-            if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
+            if chunk_transcript.is_some() || raw_chunk_messages.is_some() {
                 insert_chunk_transcripts_tx(
                     tx,
                     session_id,
                     first_appended_sequence,
-                    request.compartments,
-                    request.chunk_transcript,
-                    request.raw_chunk_messages,
+                    &compartments,
+                    chunk_transcript.as_deref(),
+                    raw_chunk_messages.as_deref(),
                 )?;
             }
             enqueue_historian_side_channels_tx(tx, session_id, &side_channel_items)?;
@@ -8928,6 +12309,13 @@ impl McStore {
                 Ok(json) => json,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
             };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("meta", &meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let meta_json = prepare_transaction_json_preserving_identities(&meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
                  WHERE session_id = ?1 AND row_version = ?4",
@@ -8937,12 +12325,17 @@ impl McStore {
             Ok(PublishTxnOutcome::Committed(HistorianPublishResult {
                 row_version: next,
             }))
+            })()?;
+            Ok(match outcome {
+                PublishTxnOutcome::Committed(_) => WriteDisposition::Applied(outcome),
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
 
         match outcome {
             PublishTxnOutcome::Committed(result) => {
-                // The compartment commit already makes the accepted payload durable.
-                // The transaction drains each historian side-channel kind independently and retains failed work for a later transform.
+                // The accepted payload is already durable beside the compartment commit. Drain
+                // each kind independently now; any failure remains queued for a later transform.
                 let _ = self.drain_historian_side_channels(
                     session_id,
                     current_time_ms(),
@@ -8980,7 +12373,9 @@ impl McStore {
         }
     }
 
-    /// The transaction drains due historian side-channel work without coupling target tables.
+    /// Drain due historian side-channel work without coupling any target table to another.
+    /// A successful target write marks the outbox row delivered in the same transaction; the
+    /// acknowledgement row is deleted only after that commit, so restart replay is idempotent.
     pub fn drain_historian_side_channels(
         &self,
         session_id: &str,
@@ -9307,11 +12702,13 @@ impl McStore {
         })?)
     }
 
-    /// `expires_at = NULL` means the row never expires; `expires_at <= now_ms` excludes the row.
-    /// `importance DESC, id ASC` makes trimming retain the highest-importance rows deterministically.
-    /// The caller supplies `now_ms` to fix the expiry cutoff for rendering and replay.
-    /// Caller-supplied `now_ms` makes rendering and replay apply the same expiry cutoff.
-    /// `now_ms` prevents replay from expiring a memory after the original render and changing the rendered bytes.
+    /// Load a project's render-eligible memories: `active` + `permanent`, excluding
+    /// expired ones (an `expires_at` at/before `now_ms`, NULL = never expires), ordered
+    /// by importance descending then id ascending (the budget-trim order — highest
+    /// importance survives a trim; id breaks ties deterministically). The expiry cutoff
+    /// is supplied by the caller, NOT read from the live clock, so the full render and
+    /// every later byte-identical replay of it observe the SAME memory set — a live
+    /// clock would expire a memory mid-replay and silently change the rendered bytes.
     pub fn load_compartment_candidates(
         &self,
         session_id: &str,
@@ -9348,10 +12745,11 @@ impl McStore {
         Ok(rows)
     }
 
-    /// The query searches active, permanent memory visible to `project_path` with literal, case-insensitive SQL `LIKE`.
-    /// Workspace visibility must use the shared visibility fence.
-    /// The query searches the resolved session's compartment title and tier text with literal, case-insensitive SQL `LIKE`.
-    /// The caller supplies the resolved session ID; this store layer does not route sessions.
+    /// Search active/permanent memory content visible to `project_path` with a literal,
+    /// case-insensitive SQL LIKE. Workspace visibility is built by the same helper used by
+    /// Search a session's compartment title and tier text with a literal, case-insensitive
+    /// SQL LIKE. The caller supplies the already-resolved session id; no routing is done in
+    /// this store layer.
     pub fn search_compartments_like(
         &self,
         session_id: &str,
@@ -9403,7 +12801,8 @@ impl McStore {
         self.load_chunk_transcripts_for_range_bounded(session_id, start, end, usize::MAX)
     }
 
-    /// The `limit` bounds database reads and transcript decompression.
+    /// Read and decompress at most `limit` transcript rows. Callers serving bounded responses
+    /// should use this variant so the database query and decompression work are bounded before
     /// rendering starts.
     pub fn load_chunk_transcripts_for_range_bounded(
         &self,
@@ -9484,9 +12883,9 @@ impl McStore {
         Ok(())
     }
 
-    /// The lookup uses the facade's project/session visibility fence.
-    /// Smart notes are project-visible across sessions; session notes require matching provenance.
-    /// The SQL predicate keeps this lookup independent of page size.
+    /// Load one note through the same project/session visibility fence used by the facade.
+    /// Smart notes are project-visible across sessions; session notes require the provenance
+    /// session to match. The SQL predicate keeps this lookup independent of page size.
     pub fn get_note_by_id(
         &self,
         project_path: &str,
@@ -9509,7 +12908,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// A session sees all project smart notes and its ordinary notes; SQL enforces ownership and pagination.
+    /// Page the notes visible to one session: all project smart notes plus that session's
+    /// ordinary notes. Ownership and pagination both remain in SQL.
     pub fn read_visible_notes(
         &self,
         project_path: &str,
@@ -9569,10 +12969,21 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        let prepared = prepare_note_fields(
+            &mut write,
+            content,
+            input.surface_condition,
+            input.anchor_block_id,
+        )?;
         // This compatibility entry point keeps legacy callers on the active-status path
         // used by the previous context-note surface; the full project smart-note writer
         // below deliberately uses pending instead while still recording condition text.
-        self.with_note_conn_fenced(input.project_path, |tx| insert_note_tx(tx, &input, content))
+        self.with_prepared_note_conn_fenced(input.project_path, write, |coordinated| {
+            let note = insert_note_tx(coordinated.tx(), &input, &prepared)?;
+            coordinated.domain_owner("project", input.project_path, note.id.to_string());
+            Ok(WriteDisposition::Applied(note))
+        })
     }
 
     pub fn insert_project_note(
@@ -9592,8 +13003,30 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
-        self.with_note_conn_fenced(input.project_path, |tx| {
-            insert_project_note_tx(tx, &input, content)
+        let surface_condition = input
+            .surface_condition
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        let prepared = prepare_note_fields(
+            &mut write,
+            content,
+            surface_condition,
+            input.anchor_block_id,
+        )?;
+        for (field_id, value) in [
+            ("compiled_provider", input.compiled_provider),
+            ("compiled_config", input.compiled_config),
+            ("compile_status", input.compile_status),
+        ] {
+            if let Some(value) = value {
+                write.identity(field_id, value)?;
+            }
+        }
+        self.with_prepared_note_conn_fenced(input.project_path, write, |coordinated| {
+            let note = insert_project_note_tx(coordinated.tx(), &input, &prepared)?;
+            coordinated.domain_owner("project", input.project_path, note.id.to_string());
+            Ok(WriteDisposition::Applied(note))
         })
     }
 
@@ -9607,8 +13040,8 @@ impl McStore {
         self.read_project_notes(project_path, Some(session_id), &["active"], limit, offset)
     }
 
-    /// The query selects project-owned notes by project ownership, not `session_id`.
-    /// `session_id` remains an optional provenance filter only for the legacy session-note view.
+    /// Read project-owned notes without using session_id as the ownership key. Session id
+    /// remains an optional provenance filter for the legacy session-note view only.
     pub fn read_project_notes(
         &self,
         project_path: &str,
@@ -9783,7 +13216,8 @@ impl McStore {
         }
     }
 
-    /// The update changes content or condition only when status and revision match the caller's snapshot; changing the condition clears compiled evaluation state.
+    /// Update note content and/or condition only when both the status and revision still
+    /// match the caller's snapshot. A changed condition clears compiled evaluation state.
     #[allow(clippy::too_many_arguments)]
     pub fn update_note_cas(
         &self,
@@ -9797,18 +13231,28 @@ impl McStore {
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
-        let result = self.with_note_conn_fenced(project_path, |tx| {
-            update_note_cas_tx(
-                tx,
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", project_path, note_id.to_string());
+        write.existing_identity("project_path", project_path)?;
+        let prepared =
+            prepare_note_update(&mut write, content, surface_condition, condition_compile)?;
+        let result = self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let application = update_note_cas_tx(
+                coordinated.tx(),
                 project_path,
                 note_id,
                 expected_status,
                 expected_version,
-                content,
-                surface_condition,
-                condition_compile,
+                &prepared,
                 now_ms,
-            )
+            )?;
+            // A mutation-neutral update stores none of the prepared `condition_compile` bytes,
+            // so committing its scans would describe a compile the note never took.
+            Ok(if application.wrote {
+                WriteDisposition::Applied(application.outcome)
+            } else {
+                WriteDisposition::Replay(application.outcome)
+            })
         })?;
         Ok(result)
     }
@@ -9821,17 +13265,29 @@ impl McStore {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        if self
-            .get_note_by_id(project_path, session_id, note_id)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        self.with_note_conn_fenced(project_path, |tx| {
-            dismiss_note_tx(tx, project_path, None, note_id, resolution, now_ms)
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", project_path, note_id.to_string());
+        write.existing_identity("project_path", project_path)?;
+        write.existing_identity("session_id", session_id)?;
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let outcome = dismiss_note_tx(
+                coordinated.tx,
+                &coordinated.prepared,
+                project_path,
+                Some(session_id),
+                note_id,
+                resolution,
+                now_ms,
+            )?;
+            Ok(match outcome {
+                Some(note) => WriteDisposition::Applied(Some(note)),
+                None => WriteDisposition::Replay(None),
+            })
         })
     }
 
+    /// Dismissal is a status CAS. It wins over a later surfacing claim, but never rewrites
+    /// bytes that a previous claim already placed in a frozen transform response.
     pub fn dismiss_note_cas(
         &self,
         project_path: &str,
@@ -9856,6 +13312,8 @@ impl McStore {
         } = &outcome
         {
             if current.status != "dismissed" {
+                // Dismissal is the terminal user decision. Re-read the winner and apply
+                // one fresh CAS so a concurrent surface/update cannot resurrect the note.
                 return self.transition_note_internal(
                     project_path,
                     note_id,
@@ -9870,20 +13328,40 @@ impl McStore {
         Ok(outcome)
     }
 
+    /// Store a host-evaluated smart-note verdict under the evaluator's source revision.
+    /// The module never interprets condition text; it only performs this CAS write and
+    /// promotes a true verdict to `ready` for a later natural cache bust.
     pub fn write_note_evaluation(
         &self,
         input: NoteEvaluationInput<'_>,
     ) -> Result<NoteCasOutcome, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", input.project_path, input.note_id.to_string());
+        write.existing_identity("project_path", input.project_path)?;
+        for (field_id, value) in [
+            ("compiled_check", input.compiled_check),
+            ("manifest_json", input.manifest_json),
+            ("check_hash", input.check_hash),
+        ] {
+            if let Some(value) = value {
+                write.identity(field_id, value)?;
+            }
+        }
         self.require_note_project(input.project_path, input.note_id)?;
-        self.with_note_conn_fenced(input.project_path, |tx| {
+        self.with_prepared_note_conn_fenced(input.project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let Some(current) = load_note_tx(tx, input.note_id).optional()? else {
-                return Ok(NoteCasOutcome::Conflict { current: None });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: None,
+                }));
             };
             if current.project_path != input.project_path
                 || current.status != "pending"
                 || current.status_version != input.source_revision
             {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                }));
             }
             let status = if input.verdict { "ready" } else { "pending" };
             tx.execute(
@@ -9907,7 +13385,9 @@ impl McStore {
                     input.source_revision,
                 ],
             )?;
-            Ok(NoteCasOutcome::Applied(load_note_tx(tx, input.note_id)?))
+            Ok(WriteDisposition::Applied(NoteCasOutcome::Applied(
+                load_note_tx(tx, input.note_id)?,
+            )))
         })
     }
 
@@ -9937,6 +13417,12 @@ impl McStore {
         result: Option<&str>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", project_path, note_id.to_string());
+        write.existing_identity("project_path", project_path)?;
+        let result = result
+            .map(|value| write.content("transition_result", value))
+            .transpose()?;
         self.require_note_project(project_path, note_id)?;
         if !matches!(
             to_status,
@@ -9946,15 +13432,20 @@ impl McStore {
                 "invalid note transition target {to_status}"
             )));
         }
-        self.with_note_conn_fenced(project_path, |tx| {
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let Some(current) = load_note_tx(tx, note_id).optional()? else {
-                return Ok(NoteCasOutcome::Conflict { current: None });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: None,
+                }));
             };
             if current.project_path != project_path
                 || current.status != expected_status
                 || current.status_version != expected_version
             {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                }));
             }
             tx.execute(
                 "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
@@ -9967,16 +13458,24 @@ impl McStore {
                   WHERE id = ?4 AND project_path = ?5 AND status = ?6 AND status_version = ?7",
                 params![to_status, now_ms, result, note_id, project_path, expected_status, expected_version],
             )?;
-            Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+            Ok(WriteDisposition::Applied(NoteCasOutcome::Applied(
+                load_note_tx(tx, note_id)?,
+            )))
         })
     }
 
+    /// Claim one due pending smart note for an evaluator. The source revision is the
+    /// status_version observed by the evaluator; the lease itself is represented by the
+    /// module-internal `surfacing` state and is released by a CAS transition.
     pub fn claim_due_note(
         &self,
         project_path: &str,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.existing_identity("project_path", project_path)?;
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let note = tx
                 .query_row(
                     &format!(
@@ -9990,19 +13489,25 @@ impl McStore {
                     stored_note_from_row,
                 )
                 .optional()?;
-            let Some(note) = note else { return Ok(None) };
+            let Some(note) = note else {
+                return Ok(WriteDisposition::Replay(None));
+            };
             let changed = tx.execute(
                 "UPDATE mc_notes SET status_version = status_version + 1,
                     state_version = state_version + 1, updated_at_ms = ?1
                    WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND status_version = ?4",
                 params![now_ms, note.id, project_path, note.status_version],
             )?;
-            if changed == 0 { return Ok(None); }
-            tx.query_row(
+            if changed == 0 {
+                return Ok(WriteDisposition::Replay(None));
+            }
+            let stored = tx.query_row(
                 &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
                 params![note.id],
                 stored_note_from_row,
-            ).map(Some)
+            )?;
+            coordinated.domain_owner("project", project_path, note.id.to_string());
+            Ok(WriteDisposition::Applied(Some(stored)))
         })
     }
 
@@ -10014,7 +13519,19 @@ impl McStore {
         transform_pass_id: &str,
         now_ms: i64,
     ) -> Result<Vec<(StoredNote, NoteDelivery)>, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("session", session_id, "note_deliveries");
+        for (field_id, value) in [
+            ("project_path", project_path),
+            ("session_id", session_id),
+            ("delivered_pass_fingerprint", delivered_pass_fingerprint),
+            ("transform_pass_id", transform_pass_id),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
             let notes = {
                 let mut stmt = tx.prepare_cached(&format!(
                     "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
@@ -10029,6 +13546,7 @@ impl McStore {
             };
             let mut candidates = Vec::new();
             for note in notes {
+                coordinated.domain_owner("project", project_path, note.id.to_string());
                 let unacked = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM mc_note_deliveries
                        WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3 AND disposition IS NULL)",
@@ -10063,6 +13581,18 @@ impl McStore {
                     }
                     continue;
                 }
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&[
+                        "project_path",
+                        "session_id",
+                        "delivered_pass_fingerprint",
+                        "transform_pass_id",
+                    ])
+                    .map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
                 if note.status == "ready" {
                     let changed = tx.execute(
                         "UPDATE mc_notes SET status = 'surfacing', status_version = status_version + 1,
@@ -10081,6 +13611,11 @@ impl McStore {
                     session_id.len(),
                     note.id
                 );
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_identity("delivery_id", &delivery_id)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 tx.execute(
                     "INSERT INTO mc_note_deliveries
                        (delivery_id, note_id, session_id, delivered_pass_fingerprint,
@@ -10109,7 +13644,11 @@ impl McStore {
                     },
                 ));
             }
-            Ok(candidates)
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(candidates)
+            } else {
+                WriteDisposition::Replay(candidates)
+            })
         })
     }
 
@@ -10120,7 +13659,17 @@ impl McStore {
         transform_pass_id: &str,
         now_ms: i64,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("session", session_id, "note_deliveries");
+        for (field_id, value) in [
+            ("project_path", project_path),
+            ("session_id", session_id),
+            ("transform_pass_id", transform_pass_id),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let ids = tx
                 .prepare(
                     "SELECT DISTINCT note_id FROM mc_note_deliveries
@@ -10139,6 +13688,7 @@ impl McStore {
                 params![now_ms, project_path, session_id, transform_pass_id],
             )?;
             for id in ids {
+                coordinated.domain_owner("project", project_path, id.to_string());
                 tx.execute(
                     "UPDATE mc_note_deliveries SET disposition = 'superseded'
                        WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3
@@ -10152,7 +13702,11 @@ impl McStore {
                     params![now_ms, id, project_path],
                 )?;
             }
-            Ok(changed)
+            Ok(if changed == 0 {
+                WriteDisposition::Replay(changed)
+            } else {
+                WriteDisposition::Applied(changed)
+            })
         })
     }
 
@@ -10163,7 +13717,17 @@ impl McStore {
         transform_pass_id: &str,
         now_ms: i64,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("session", session_id, "note_deliveries");
+        for (field_id, value) in [
+            ("project_path", project_path),
+            ("session_id", session_id),
+            ("transform_pass_id", transform_pass_id),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let ids = tx
                 .prepare(
                     "SELECT DISTINCT note_id FROM mc_note_deliveries
@@ -10181,6 +13745,7 @@ impl McStore {
                 params![project_path, session_id, transform_pass_id],
             )?;
             for id in &ids {
+                coordinated.domain_owner("project", project_path, id.to_string());
                 tx.execute(
                     "UPDATE mc_notes SET status = 'ready', status_version = status_version + 1,
                         state_version = state_version + 1, updated_at_ms = ?1
@@ -10188,7 +13753,11 @@ impl McStore {
                     params![now_ms, id, project_path],
                 )?;
             }
-            Ok(changed)
+            Ok(if changed == 0 {
+                WriteDisposition::Replay(changed)
+            } else {
+                WriteDisposition::Applied(changed)
+            })
         })
     }
 
@@ -10229,6 +13798,10 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Load active user-memory contents (the `<user-profile>` baseline source), ordered
+    /// `promoted_at ASC, id ASC`. The id tiebreaker is load-bearing: `promoted_at` can
+    /// tie at ms granularity and a non-deterministic order would drift the rendered
+    /// bytes between passes. Returns just the contents (the render is `- <content>`).
     pub fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -10243,13 +13816,23 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Register `project_path` as a member of `workspace`, creating the workspace when it is
+    /// absent. Both writes are conflict-tolerant, so re-seeding an existing member is a no-op
+    /// rather than an error.
     pub fn seed_workspace_member(
         &self,
         workspace: &str,
         project_path: &str,
         share_categories_json: &str,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::WorkspaceProfileMemory);
+        write.domain_owner("project", project_path, "workspace_profile_memory");
+        let workspace = write.identity("workspace_name", workspace)?;
+        let project_path = write.identity("workspace_project_path", project_path)?;
+        let share_categories_json =
+            write.content("workspace_share_category", share_categories_json)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             tx.execute(
                 "INSERT INTO mc_workspaces (name, share_categories) VALUES (?1, ?2)
                  ON CONFLICT(name) DO NOTHING",
@@ -10265,11 +13848,16 @@ impl McStore {
                  VALUES (?1, ?2, ?2, ?2, 0)",
                 params![ws_id, project_path],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
 
+    /// Durably stage one claim command before the host mutates `context.db`.
+    ///
+    /// `route_project_root` is the daemon-bound route this request arrived on. The
+    /// memories authority is resolved from that route, not from `binding`, because
+    /// the binding's identity fields are caller-supplied.
     pub fn stage_claim_intent(
         &self,
         route_project_root: &str,
@@ -10279,84 +13867,132 @@ impl McStore {
         now_ms: i64,
     ) -> Result<ClaimIntentMutationOutcome, McStoreError> {
         validate_claim_intent_fields(binding, command)?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimIntents);
+        write.domain_owner(
+            "project",
+            &binding.authority_project,
+            active_scan_owner_key(&[&command.producer, &command.operation_key]),
+        );
+        for (field_id, identity) in [
+            ("producer", command.producer.as_str()),
+            ("operation_key", command.operation_key.as_str()),
+            (
+                "database_incarnation_id",
+                binding.database_incarnation_id.as_str(),
+            ),
+            ("authority_project", binding.authority_project.as_str()),
+        ] {
+            write.existing_identity(field_id, identity)?;
+        }
+        let request_json = serde_json::to_string(request)
+            .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
+        write.existing_identity("request", &request_json)?;
         let request_digest = compute_claim_operation_request_digest(request)
             .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
         let authority_generation = i64::try_from(binding.authority_generation).map_err(|_| {
             McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
         })?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let existing = tx
-                .query_row(
-                    &format!(
-                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let outcome = (|| -> rusqlite::Result<ClaimIntentTxnOutcome> {
+                let existing = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                           WHERE producer = ?1 AND operation_key = ?2"
-                    ),
-                    params![command.producer, command.operation_key],
-                    claim_intent_record_from_row,
-                )
-                .optional()?;
-            if let Some(record) = existing {
-                if record.request_digest != request_digest {
-                    return Ok(ClaimIntentTxnOutcome::IdentityConflict);
-                }
-                if let Err(McStoreError::ClaimIntentBindingMismatch {
-                    field,
-                    expected,
-                    found,
-                }) = require_claim_intent_binding(&record, binding)
-                {
-                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        ),
+                        params![command.producer, command.operation_key],
+                        claim_intent_record_from_row,
+                    )
+                    .optional()?;
+                if let Some(record) = existing {
+                    if record.request_digest != request_digest {
+                        return Ok(ClaimIntentTxnOutcome::IdentityConflict);
+                    }
+                    if let Err(McStoreError::ClaimIntentBindingMismatch {
                         field,
                         expected,
                         found,
-                    });
-                }
-                if record.state == ClaimIntentState::Staged {
-                    if let Some(rejection) =
-                        claim_intent_stage_fence(tx, route_project_root, binding)?
+                    }) = require_claim_intent_binding(&record, binding)
                     {
-                        return Ok(rejection);
+                        return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                            field,
+                            expected,
+                            found,
+                        });
                     }
+                    // A staged replay goes on to execute the context mutation, so it has to
+                    // clear the same live fence as a fresh stage. The stored binding proves
+                    // only what was true when the row was written: a drain committed since
+                    // then has already moved the authority to DRAINING and bumped the
+                    // generation, and returning here would commit under the obsolete one.
+                    // Terminal and already-committed records are recovery reads and stay
+                    // idempotent so a crashed attempt can still be resolved.
+                    if record.state == ClaimIntentState::Staged {
+                        if let Some(rejection) =
+                            claim_intent_stage_fence(tx, route_project_root, binding)?
+                        {
+                            return Ok(rejection);
+                        }
+                    }
+                    return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                        record,
+                        replayed: true,
+                    }));
                 }
-                return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
-                    record,
-                    replayed: true,
-                }));
-            }
 
-            if let Some(rejection) = claim_intent_stage_fence(tx, route_project_root, binding)? {
-                return Ok(rejection);
-            }
-            tx.execute(
-                "INSERT INTO mc_claim_intents(
+                if let Some(rejection) = claim_intent_stage_fence(tx, route_project_root, binding)?
+                {
+                    return Ok(rejection);
+                }
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&[
+                        "producer",
+                        "operation_key",
+                        "database_incarnation_id",
+                        "authority_project",
+                        "request",
+                    ])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "INSERT INTO mc_claim_intents(
                     producer, operation_key, database_incarnation_id, format_epoch,
                     authority_project, authority_generation, request_encoding_version,
                     request_digest, state, result_json, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'staged', NULL, ?9, ?9)",
-                params![
-                    command.producer,
-                    command.operation_key,
-                    binding.database_incarnation_id,
-                    binding.format_epoch,
-                    binding.authority_project,
-                    authority_generation,
-                    CLAIM_REQUEST_ENCODING_VERSION,
-                    request_digest,
-                    now_ms,
-                ],
-            )?;
-            let record = tx.query_row(
-                &format!(
-                    "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                    params![
+                        command.producer,
+                        command.operation_key,
+                        binding.database_incarnation_id,
+                        binding.format_epoch,
+                        binding.authority_project,
+                        authority_generation,
+                        CLAIM_REQUEST_ENCODING_VERSION,
+                        request_digest,
+                        now_ms,
+                    ],
+                )?;
+                let record = tx.query_row(
+                    &format!(
+                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                       WHERE producer = ?1 AND operation_key = ?2"
-                ),
-                params![command.producer, command.operation_key],
-                claim_intent_record_from_row,
-            )?;
-            Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
-                record,
-                replayed: false,
-            }))
+                    ),
+                    params![command.producer, command.operation_key],
+                    claim_intent_record_from_row,
+                )?;
+                Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                    record,
+                    replayed: false,
+                }))
+            })()?;
+            Ok(match &outcome {
+                ClaimIntentTxnOutcome::Applied(result) if !result.replayed => {
+                    WriteDisposition::Applied(outcome)
+                }
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
         claim_intent_mutation_result(outcome, command)
     }
@@ -10434,98 +14070,139 @@ impl McStore {
                 ));
             }
         }
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimIntents);
+        write.domain_owner(
+            "project",
+            &binding.authority_project,
+            active_scan_owner_key(&[&command.producer, &command.operation_key]),
+        );
+        for (field_id, value) in [
+            ("producer", command.producer.as_str()),
+            ("operation_key", command.operation_key.as_str()),
+            (
+                "database_incarnation_id",
+                binding.database_incarnation_id.as_str(),
+            ),
+            ("authority_project", binding.authority_project.as_str()),
+            ("request_digest", request_digest),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        if let Some(result) = result_json {
+            write.existing_identity("result_json", result)?;
+        }
 
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let Some(record) = tx
-                .query_row(
-                    &format!(
-                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let outcome = (|| -> rusqlite::Result<ClaimIntentTxnOutcome> {
+                let Some(record) = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                           WHERE producer = ?1 AND operation_key = ?2"
-                    ),
-                    params![command.producer, command.operation_key],
-                    claim_intent_record_from_row,
-                )
-                .optional()?
-            else {
-                return Ok(ClaimIntentTxnOutcome::NotFound);
-            };
-            if record.request_digest != request_digest {
-                return Ok(ClaimIntentTxnOutcome::IdentityConflict);
-            }
-            if let Err(McStoreError::ClaimIntentBindingMismatch {
-                field,
-                expected,
-                found,
-            }) = require_claim_intent_binding(&record, binding)
-            {
-                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        ),
+                        params![command.producer, command.operation_key],
+                        claim_intent_record_from_row,
+                    )
+                    .optional()?
+                else {
+                    return Ok(ClaimIntentTxnOutcome::NotFound);
+                };
+                if record.request_digest != request_digest {
+                    return Ok(ClaimIntentTxnOutcome::IdentityConflict);
+                }
+                if let Err(McStoreError::ClaimIntentBindingMismatch {
                     field,
                     expected,
                     found,
-                });
-            }
-
-            let next_state = match (kind, record.state) {
-                (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Staged) => {
-                    Some(ClaimIntentState::ContextCommitted)
-                }
-                (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::Staged) => {
-                    Some(ClaimIntentState::TerminalRejected)
-                }
-                (ClaimIntentAckKind::Acknowledged, ClaimIntentState::ContextCommitted) => {
-                    Some(ClaimIntentState::Acknowledged)
-                }
-                (ClaimIntentAckKind::Acknowledged, ClaimIntentState::Acknowledged)
-                | (ClaimIntentAckKind::Acknowledged, ClaimIntentState::TerminalRejected) => None,
-                (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::ContextCommitted)
-                | (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Acknowledged)
-                | (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::TerminalRejected)
-                    if record.result_json.as_deref() == result_json =>
+                }) = require_claim_intent_binding(&record, binding)
                 {
-                    None
-                }
-                _ => {
-                    return Ok(ClaimIntentTxnOutcome::Transition {
-                        expected: match kind {
-                            ClaimIntentAckKind::ContextCommitted
-                            | ClaimIntentAckKind::TerminalRejected => "staged",
-                            ClaimIntentAckKind::Acknowledged => "context-committed",
-                        }
-                        .to_string(),
-                        found: record.state.as_str().to_string(),
+                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        field,
+                        expected,
+                        found,
                     });
                 }
-            };
-            if let Some(next_state) = next_state {
-                tx.execute(
-                    "UPDATE mc_claim_intents
+
+                let next_state = match (kind, record.state) {
+                    (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Staged) => {
+                        Some(ClaimIntentState::ContextCommitted)
+                    }
+                    (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::Staged) => {
+                        Some(ClaimIntentState::TerminalRejected)
+                    }
+                    (ClaimIntentAckKind::Acknowledged, ClaimIntentState::ContextCommitted) => {
+                        Some(ClaimIntentState::Acknowledged)
+                    }
+                    (ClaimIntentAckKind::Acknowledged, ClaimIntentState::Acknowledged)
+                    | (ClaimIntentAckKind::Acknowledged, ClaimIntentState::TerminalRejected) => {
+                        None
+                    }
+                    (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::ContextCommitted)
+                    | (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Acknowledged)
+                    | (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::TerminalRejected)
+                        if record.result_json.as_deref() == result_json =>
+                    {
+                        None
+                    }
+                    _ => {
+                        return Ok(ClaimIntentTxnOutcome::Transition {
+                            expected: match kind {
+                                ClaimIntentAckKind::ContextCommitted
+                                | ClaimIntentAckKind::TerminalRejected => "staged",
+                                ClaimIntentAckKind::Acknowledged => "context-committed",
+                            }
+                            .to_string(),
+                            found: record.state.as_str().to_string(),
+                        });
+                    }
+                };
+                if let Some(next_state) = next_state {
+                    if record.result_json.as_deref() != result_json {
+                        coordinated
+                            .prepared
+                            .borrow()
+                            .reject_recorded_identities(&["result_json"])
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                    }
+                    tx.execute(
+                        "UPDATE mc_claim_intents
                         SET state = ?1, result_json = COALESCE(?2, result_json), updated_at_ms = ?3
                       WHERE producer = ?4 AND operation_key = ?5",
-                    params![
-                        next_state.as_str(),
-                        result_json,
-                        now_ms,
-                        command.producer,
-                        command.operation_key,
-                    ],
-                )?;
-                let record = tx.query_row(
-                    &format!(
-                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                        params![
+                            next_state.as_str(),
+                            result_json,
+                            now_ms,
+                            command.producer,
+                            command.operation_key,
+                        ],
+                    )?;
+                    let record = tx.query_row(
+                        &format!(
+                            "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                           WHERE producer = ?1 AND operation_key = ?2"
-                    ),
-                    params![command.producer, command.operation_key],
-                    claim_intent_record_from_row,
-                )?;
-                return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                        ),
+                        params![command.producer, command.operation_key],
+                        claim_intent_record_from_row,
+                    )?;
+                    return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                        record,
+                        replayed: false,
+                    }));
+                }
+                Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
                     record,
-                    replayed: false,
-                }));
-            }
-            Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
-                record,
-                replayed: true,
-            }))
+                    replayed: true,
+                }))
+            })()?;
+            Ok(match &outcome {
+                ClaimIntentTxnOutcome::Applied(result) if !result.replayed => {
+                    WriteDisposition::Applied(outcome)
+                }
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
         claim_intent_mutation_result(outcome, command)
     }
@@ -10558,7 +14235,12 @@ impl McStore {
         let generation = i64::try_from(authority_generation).map_err(|_| {
             McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
         })?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimIntents);
+        write.domain_owner("database", database_incarnation_id, "claim_intent_control");
+        let database_incarnation_id =
+            write.identity("database_incarnation_id", database_incarnation_id)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             let unresolved: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM mc_claim_intents
                   WHERE state IN ('staged', 'context-committed')",
@@ -10566,7 +14248,9 @@ impl McStore {
                 |row| row.get(0),
             )?;
             if unresolved > 0 {
-                return Ok(ClaimIntentTxnOutcome::ResetBlocked(unresolved as usize));
+                return Ok(WriteDisposition::Replay(
+                    ClaimIntentTxnOutcome::ResetBlocked(unresolved as usize),
+                ));
             }
             tx.execute(
                 "INSERT INTO mc_claim_intent_controls(
@@ -10579,7 +14263,9 @@ impl McStore {
                     transition_state = 'resetting', updated_at_ms = excluded.updated_at_ms",
                 params![database_incarnation_id, generation, now_ms],
             )?;
-            Ok(ClaimIntentTxnOutcome::ResetGranted)
+            Ok(WriteDisposition::Applied(
+                ClaimIntentTxnOutcome::ResetGranted,
+            ))
         })?;
         match outcome {
             ClaimIntentTxnOutcome::ResetGranted => Ok(()),
@@ -10590,6 +14276,8 @@ impl McStore {
         }
     }
 
+    /// Read the durable authority row. A missing row is normal for a store that has
+    /// never opted a project into module ownership.
     pub fn authority_status(
         &self,
         context_store_uuid: &str,
@@ -10608,6 +14296,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Enter PREPARING and bump the generation. Repeating the request is idempotent
+    /// only when the row is already preparing at the same generation.
     pub fn authority_begin_prepare(
         &self,
         context_store_uuid: &str,
@@ -10615,7 +14305,39 @@ impl McStore {
         domain: &str,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.with_note_conn_fenced(project, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+                let tx = coordinated.tx;
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM mc_authority
+                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
+                        params![context_store_uuid, project, domain],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["context_store_uuid", "project", "domain"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
                 tx.execute(
                     "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
                      VALUES (?1, ?2, ?3, 'TS') ON CONFLICT(context_store_uuid, project, domain) DO NOTHING",
@@ -10626,18 +14348,51 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )?;
-                if current.state == "TS" {
+                let applied = current.state == "TS";
+                if applied {
                     if domain == "notes" {
+                        let note_ids = {
+                            let mut statement = tx.prepare_cached(
+                                "SELECT id FROM mc_notes
+                                  WHERE context_store_uuid = ?1 AND project_path = ?2",
+                            )?;
+                            let rows = statement
+                                .query_map(params![context_store_uuid, project], |row| {
+                                    row.get::<_, i64>(0)
+                                })?
+                                .collect::<Result<Vec<_>, _>>()?;
+                            rows
+                        };
+                        for note_id in note_ids {
+                            retire_active_scan_domain_owner(
+                                tx,
+                                "project",
+                                project,
+                                "notes",
+                                &note_id.to_string(),
+                            )?;
+                        }
                         tx.execute(
                             "DELETE FROM mc_notes WHERE context_store_uuid = ?1 AND project_path = ?2",
                             params![context_store_uuid, project],
                         )?;
                     }
+                    retire_active_scan_domain_owner(
+                        tx,
+                        "project",
+                        project,
+                        "authority_seed_rows",
+                        &active_scan_owner_key(&["authority", context_store_uuid, domain]),
+                    )?;
                     tx.execute(
                         "DELETE FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
                         params![context_store_uuid, project, domain],
                     )?;
                     if domain == "notes" {
+                        // A claim surviving from an earlier MODULE period must
+                        // not block its note under the new generation for a
+                        // full lease; completion is already generation-fenced,
+                        // so terminalize it like the drain transition does.
                         fence_active_note_claims_tx(
                             tx,
                             project,
@@ -10673,7 +14428,11 @@ impl McStore {
                         "resetting",
                     )?;
                 }
-                Ok(row)
+                Ok(if applied {
+                    WriteDisposition::Applied(row)
+                } else {
+                    WriteDisposition::Replay(row)
+                })
             })
     }
 
@@ -10688,8 +14447,24 @@ impl McStore {
         checksum_actual: &str,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write.identity("checksum_expected", checksum_expected)?;
+        write.identity("checksum_actual", checksum_actual)?;
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -10715,13 +14490,14 @@ impl McStore {
                         domain
                     ],
                 )?;
-                tx.query_row(
+                let row = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
-                )
+                )?;
+                Ok(WriteDisposition::Applied(row))
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
     pub fn authority_ack_prepare(
@@ -10732,8 +14508,22 @@ impl McStore {
         expected_generation: u64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -10753,6 +14543,9 @@ impl McStore {
                     )));
                 }
                 if domain == "notes" {
+                    // Same fence as the drain transition: a stale claim from a
+                    // prior MODULE period cannot complete under the new
+                    // generation, but left active it blocks its note for a
                     // full lease.
                     fence_active_note_claims_tx(
                         tx,
@@ -10774,10 +14567,15 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )
+                .map(WriteDisposition::Applied)
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
+    /// Record seed verification and complete TS -> MODULE. The host keeps its
+    /// context.db barrier until this transition has committed on the module side.
+    /// The arguments are kept explicit because each value is part of the durable
+    /// transition record and must be validated together.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_finish_prepare(
         &self,
@@ -10790,8 +14588,24 @@ impl McStore {
         verified: bool,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write.identity("checksum_expected", checksum_expected)?;
+        write.identity("checksum_actual", checksum_actual)?;
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -10823,6 +14637,9 @@ impl McStore {
                 }
                 let next_state = if verified { "MODULE" } else { "TS" };
                 if domain == "notes" {
+                    // Same fence as the drain transition: a stale claim from a
+                    // prior MODULE period cannot complete under the new
+                    // generation, but left active it blocks its note for a
                     // full lease.
                     fence_active_note_claims_tx(
                         tx,
@@ -10873,11 +14690,12 @@ impl McStore {
                         },
                     )?;
                 }
-                Ok(row)
+                Ok(WriteDisposition::Applied(row))
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
+    /// Abort a failed preparation without erasing the diagnostic checksum.
     pub fn authority_abort_prepare(
         &self,
         context_store_uuid: &str,
@@ -10906,8 +14724,23 @@ impl McStore {
         now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+            ("coordinator_lease", lease),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -10915,6 +14748,15 @@ impl McStore {
                 )?;
                 if current.state == "DRAINING" {
                     let held_by_other = current.coordinator_lease.as_deref() != Some(lease);
+                    if held_by_other {
+                        coordinated
+                            .prepared
+                            .borrow()
+                            .reject_recorded_identities(&["coordinator_lease"])
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                    }
                     let lease_live = current.lease_expires_at.unwrap_or(0) > now_ms;
                     if held_by_other && lease_live {
                         return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -10925,7 +14767,17 @@ impl McStore {
                             },
                         )));
                     }
+                    // Takeover or same-lease resume mints a fresh token so the prior
+                    // coordinator cannot keep journaling with a stale attempt identity. It also
+                    // captures a new feed head after a finish fence reports a late append.
                     let token = mint_coordinator_token(lease, lease_expires_at, current.generation);
+                    coordinated
+                        .prepared
+                        .borrow_mut()
+                        .transaction_identity("coordinator_token", &token)
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
                     let feed_head: i64 = tx.query_row(
                         "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
                         params![domain],
@@ -10963,7 +14815,7 @@ impl McStore {
                             "draining",
                         )?;
                     }
-                    return Ok(row);
+                    return Ok(WriteDisposition::Applied(row));
                 }
                 if current.state != "MODULE" {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -10983,6 +14835,20 @@ impl McStore {
                 }
                 let next_generation = current.generation + 1;
                 let token = mint_coordinator_token(lease, lease_expires_at, next_generation);
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["coordinator_lease"])
+                    .map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_identity("coordinator_token", &token)
+                    .map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
                 tx.execute(
                     "UPDATE mc_authority
                         SET state = 'DRAINING', generation = generation + 1,
@@ -11015,11 +14881,12 @@ impl McStore {
                         "draining",
                     )?;
                 }
-                Ok(row)
+                Ok(WriteDisposition::Applied(row))
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
+    /// Advance one idempotent DRAINING journal bit or its feed cursor.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_drain_step(
         &self,
@@ -11043,8 +14910,23 @@ impl McStore {
             "flip" => "step_flip",
             _ => return Err(McStoreError::Serde(format!("unknown drain step {step}"))),
         };
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+            ("coordinator_token", coordinator_token),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11076,10 +14958,14 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )
+                .map(WriteDisposition::Applied)
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
+    /// Complete DRAINING after the host has verified every journal step.
+    /// The checksum, generation, coordinator token, and captured feed head are checked
+    /// together so a stale coordinator cannot publish a partial handoff.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_finish_drain(
         &self,
@@ -11094,9 +14980,25 @@ impl McStore {
         now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        let outcome = self
-            .inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+            ("coordinator_token", coordinator_token),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write.identity("checksum_expected", checksum_expected)?;
+        write.identity("checksum_actual", checksum_actual)?;
+        let outcome = write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11140,10 +15042,14 @@ impl McStore {
                 )?;
                 let captured = current.captured_upper_bound.unwrap_or(0);
                 if feed_head != captured {
-                    return Ok(AuthorityFinishDrainOutcome::FeedHeadAdvanced {
-                        captured,
-                        found: feed_head,
-                    });
+                    // This comparison shares the transaction with the ownership flip. A writer
+                    // either commits before the flip and forces replay, or after TypeScript owns the domain.
+                    return Ok(WriteDisposition::Replay(
+                        AuthorityFinishDrainOutcome::FeedHeadAdvanced {
+                            captured,
+                            found: feed_head,
+                        },
+                    ));
                 }
                 tx.execute(
                     "UPDATE mc_authority SET state = 'TS', generation = generation + 1,
@@ -11167,8 +15073,9 @@ impl McStore {
                 )
                 .map(Box::new)
                 .map(AuthorityFinishDrainOutcome::Finished)
+                .map(WriteDisposition::Applied)
             })
-            .map_err(map_authority_sql_error)?;
+            .map_err(map_prepared_authority_error)?;
         match outcome {
             AuthorityFinishDrainOutcome::Finished(row) => Ok(*row),
             AuthorityFinishDrainOutcome::FeedHeadAdvanced { captured, found } => {
@@ -11177,6 +15084,13 @@ impl McStore {
         }
     }
 
+    /// Seed every row in one authority wire frame under one epoch-fenced transaction.
+    ///
+    /// The transaction carries the same active store fence that each old per-row call
+    /// carried. N rows under one fence is equivalent to N fences here: seeding is a
+    /// single-writer operation per project, and the fence rejects strictly-newer epochs.
+    /// A frame is validated and committed atomically, so a bad row fails loudly without
+    /// leaving a partially applied frame behind.
     pub fn seed_authority_rows(
         &self,
         context_store_uuid: &str,
@@ -11239,10 +15153,24 @@ impl McStore {
         project: &str,
         rows: &[AuthoritySeedRow],
     ) -> Result<Vec<i64>, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthoritySeedRows);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, "notes"]),
+        );
+        write.existing_identity("context_store_uuid", context_store_uuid)?;
+        write.existing_identity("project", project)?;
         let prepared = rows
             .iter()
             .map(|row| {
-                let object = row.snapshot.as_object().ok_or_else(|| {
+                let snapshot_json = serde_json::to_string(&row.snapshot)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                write.record_content("snapshot_json", &snapshot_json)?;
+                let snapshot_json = prepare_json_content(&snapshot_json)?;
+                let snapshot: Value = serde_json::from_str(&snapshot_json)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                let object = snapshot.as_object().ok_or_else(|| {
                     McStoreError::Serde("note seed snapshot must be an object".to_string())
                 })?;
                 if object.get("project_path").and_then(Value::as_str) != Some(project) {
@@ -11251,9 +15179,7 @@ impl McStore {
                             .to_string(),
                     ));
                 }
-                let snapshot_json = serde_json::to_string(&row.snapshot)
-                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                Ok((row.source_row_id, snapshot_json))
+                Ok((row.source_row_id, snapshot, snapshot_json))
             })
             .collect::<Result<Vec<_>, McStoreError>>()?;
 
@@ -11261,7 +15187,8 @@ impl McStore {
         self.authority_seed_transaction_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        self.with_note_conn_fenced(project, |tx| {
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx();
             let mut note_upsert = tx.prepare_cached(&format!(
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
@@ -11308,8 +15235,8 @@ impl McStore {
             )?;
             let mut module_row_ids = Vec::with_capacity(rows.len());
 
-            for ((source_row_id, snapshot_json), row) in prepared.iter().zip(rows) {
-                let object = row.snapshot.as_object().expect("validated note seed object");
+            for (source_row_id, snapshot, snapshot_json) in &prepared {
+                let object = snapshot.as_object().expect("validated note seed object");
                 let text = |name: &str| object.get(name).and_then(Value::as_str);
                 let integer = |name: &str| object.get(name).and_then(Value::as_i64);
                 note_upsert.execute(params![
@@ -11371,17 +15298,21 @@ impl McStore {
                 ])?;
                 module_row_ids.push(module_row_id);
             }
-            // Verification prevents an unvalidated compiled check from becoming selectable.
+            // Seeds can import pre-v51 artifacts (compiled_check present,
+            // compiled_source_revision NULL) after the boot-time repair
+            // already recorded its completion marker; verify them here so an
+            // unvalidated compiled check never becomes selectable.
             loop {
                 let processed = repair_note_artifacts_tx(tx, project)?;
                 if processed < NOTE_ARTIFACT_REPAIR_BATCH as usize {
                     break;
                 }
             }
-            Ok(module_row_ids)
+            Ok(WriteDisposition::Applied(module_row_ids))
         })
     }
 
+    /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
     /// filtering by domain preserves monotonic retry semantics even when domains interleave.
     pub fn pull_changefeed(
         &self,
@@ -11835,8 +15766,9 @@ fn append_compartments_tx(
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
 
-    // The append validator rejects the whole batch before writing its first row.
-    // Whole-batch validation prevents partial batches and ordinal-overlap corruption.
+    // Validate the whole append before writing its first row. This keeps a rejected
+    // batch atomic and makes ordinal-overlap corruption impossible even if a caller
+    // bypassed the historian's optimistic publish fence.
     for (index, compartment) in compartments.iter().enumerate() {
         if let Some((existing_sequence, _, _)) = ranges.iter().find(|(_, start, end)| {
             compartment.start_message <= *end && *start <= compartment.end_message
@@ -11894,7 +15826,8 @@ fn insert_chunk_transcripts_tx(
     if compressed.is_none() && raw_messages_compressed.is_none() {
         return Ok(());
     }
-    // Raw-only rows store a condensed payload because transcript_deflate is NOT NULL.
+    // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
+    // harmless condensed payload so durable raw recovery is not discarded with an oversized
     // historian transcript.
     let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
     for (idx, compartment) in compartments.iter().enumerate() {
@@ -11948,8 +15881,8 @@ fn evict_chunk_transcripts_tx(
             return Ok(());
         };
         if retains_raw_messages {
-            // Full-message recovery retains the raw payload.
-            // The transcript budget reclaims only the optional condensed transcript.
+            // Full message recovery is durable by contract. Retain its raw payload and reclaim
+            // only the optional condensed transcript when the legacy transcript budget fills.
             tx.execute(
                 "UPDATE mc_chunk_transcripts
                     SET transcript_deflate = ?3
@@ -11977,6 +15910,25 @@ fn compress_raw_messages(raw_messages: &str) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+fn decompress_durable_text_exact(blob: &[u8], limit: usize) -> std::io::Result<String> {
+    let decoder = DeflateDecoder::new(blob);
+    let mut limited = decoder.take((limit + 1) as u64);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "durable compressed text exceeds the scan limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "durable compressed text is not UTF-8",
+        )
+    })
+}
+
 fn decompress_raw_messages(blob: &[u8]) -> std::io::Result<String> {
     let mut decoder = DeflateDecoder::new(blob);
     let mut raw_messages = String::new();
@@ -11986,8 +15938,8 @@ fn decompress_raw_messages(blob: &[u8]) -> std::io::Result<String> {
 
 fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
     let decoder = DeflateDecoder::new(blob);
-    // The reader reads only the suffix needed to complete a UTF-8 code point split at the output cap.
-    // The suffix permits discarding a UTF-8 code point split at the cap without unbounded decompressor buffering.
+    // Read only a small suffix beyond the output cap so a UTF-8 code point split at the cap can
+    // be discarded cleanly without allowing the decompressor to grow an unbounded buffer.
     let mut limited = decoder.take((MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES + 4) as u64);
     let mut inflated_prefix = Vec::new();
     limited.read_to_end(&mut inflated_prefix)?;
@@ -12047,9 +15999,9 @@ macro_rules! note_columns {
 const NOTE_INSERT_COLUMNS: &str = note_columns!();
 const NOTE_SELECT_COLUMNS: &str = concat!("id, ", note_columns!());
 
-// Parameter ?2 denotes a condition change; parameter ?5 denotes a compiler-input edit.
-// A compiler-input edit advances source_revision and resets compiled evaluation state.
-// Parameters ?7 through ?10 replace compile authoring metadata only when the condition changes.
+// ?2 = condition changed, ?5 = compiler-input edit (content or condition). A compiler-input
+// edit advances source_revision and resets compiled evaluation state; ?7..?10 replace the
+// compile authoring metadata only when the condition changed.
 const NOTE_CAS_UPDATE_SQL: &str = "UPDATE mc_notes SET content = ?1,
     surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
     status = ?4, status_version = status_version + 1, state_version = state_version + 1,
@@ -12141,7 +16093,7 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
 fn insert_note_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &NoteInput<'_>,
-    content: &str,
+    prepared: &PreparedNoteFields,
 ) -> rusqlite::Result<StoredNote> {
     tx.execute(
         "INSERT INTO mc_notes
@@ -12151,9 +16103,9 @@ fn insert_note_tx(
         params![
             input.project_path,
             input.session_id,
-            content,
-            input.surface_condition,
-            input.anchor_block_id,
+            prepared.content,
+            prepared.surface_condition,
+            prepared.anchor_block_id,
             input.now_ms,
         ],
     )?;
@@ -12167,12 +16119,9 @@ fn insert_note_tx(
 fn insert_project_note_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &NoteWriteInput<'_>,
-    content: &str,
+    prepared: &PreparedNoteFields,
 ) -> rusqlite::Result<StoredNote> {
-    let status = if input
-        .surface_condition
-        .is_some_and(|condition| !condition.trim().is_empty())
-    {
+    let status = if prepared.surface_condition.is_some() {
         "pending"
     } else {
         "active"
@@ -12186,13 +16135,10 @@ fn insert_project_note_tx(
         params![
             input.project_path,
             input.session_id,
-            content,
+            prepared.content,
             status,
-            input
-                .surface_condition
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-            input.anchor_block_id,
+            prepared.surface_condition,
+            prepared.anchor_block_id,
             input.anchor_ordinal,
             input.compiled_provider,
             input.compiled_config,
@@ -12213,31 +16159,37 @@ fn update_note_cas_tx(
     note_id: i64,
     expected_status: &str,
     expected_version: i64,
-    content: Option<&str>,
-    surface_condition: Option<Option<&str>>,
-    condition_compile: Option<NoteConditionCompile<'_>>,
+    prepared: &PreparedNoteUpdate<'_>,
     now_ms: i64,
-) -> rusqlite::Result<NoteCasOutcome> {
+) -> rusqlite::Result<NoteCasApplication> {
     let current = load_note_tx(tx, note_id).optional()?;
     let Some(current) = current else {
-        return Ok(NoteCasOutcome::Conflict { current: None });
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
+            current: None,
+        }));
     };
     if current.project_path != project_path
         || current.status != expected_status
         || current.status_version != expected_version
     {
-        return Ok(NoteCasOutcome::Conflict {
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
             current: Some(current),
-        });
+        }));
     }
-    let next_content = content.map(str::trim).unwrap_or(&current.content);
+    let next_content = prepared
+        .content
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&current.content);
     if next_content.is_empty() {
-        return Ok(NoteCasOutcome::Conflict {
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
             current: Some(current),
-        });
+        }));
     }
-    let next_condition = surface_condition
-        .flatten()
+    let next_condition = prepared
+        .surface_condition
+        .as_ref()
+        .and_then(|value| value.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let current_condition = current
@@ -12248,14 +16200,17 @@ fn update_note_cas_tx(
     // Presence alone is not an edit: an update that re-supplies the
     // existing condition unchanged must not invalidate the compiled
     // artifact, reset a ready note to pending, or fence active claims.
-    let condition_changed = surface_condition.is_some() && next_condition != current_condition;
+    let condition_changed =
+        prepared.surface_condition.is_some() && next_condition != current_condition;
     let content_changed = next_content != current.content;
     let compiler_edit = condition_changed || content_changed;
     if !compiler_edit {
         // A fully unchanged update is mutation-neutral: bumping the
         // versions would fence an active evaluation claim and re-run
         // billable work for compiler inputs that did not change.
-        return Ok(NoteCasOutcome::Applied(current));
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Applied(
+            current,
+        )));
     }
     let remaining_condition = if condition_changed {
         next_condition
@@ -12267,7 +16222,7 @@ fn update_note_cas_tx(
     } else {
         current.status.as_str()
     };
-    let compile = condition_compile.unwrap_or_default();
+    let compile = prepared.condition_compile.unwrap_or_default();
     let changed = tx.execute(
         NOTE_CAS_UPDATE_SQL,
         params![
@@ -12288,14 +16243,17 @@ fn update_note_cas_tx(
         ],
     )?;
     if changed == 0 {
-        return Ok(NoteCasOutcome::Conflict {
+        return Ok(NoteCasApplication::unwritten(NoteCasOutcome::Conflict {
             current: load_note_tx(tx, note_id).optional()?,
-        });
+        }));
     }
     if compiler_edit {
         fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
     }
-    Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+    Ok(NoteCasApplication {
+        outcome: NoteCasOutcome::Applied(load_note_tx(tx, note_id)?),
+        wrote: true,
+    })
 }
 
 /// Single definition of the note dismissal executed by both the `McStore`
@@ -12305,6 +16263,7 @@ fn update_note_cas_tx(
 /// session-scoped precheck.
 fn dismiss_note_tx(
     tx: &rusqlite::Transaction<'_>,
+    audit: &std::cell::RefCell<PreparedWrite>,
     project_path: &str,
     session_id: Option<&str>,
     note_id: i64,
@@ -12323,10 +16282,24 @@ fn dismiss_note_tx(
     {
         return Ok(None);
     }
-    let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
+    let resolution = resolution
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            audit
+                .borrow_mut()
+                .transaction_content("dismissal_resolution", value)
+        })
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let content = resolution
+        .as_deref()
         .map(|value| format!("{}\n\nResolution: {value}", current.content))
         .unwrap_or_else(|| current.content.clone());
+    let content = audit
+        .borrow_mut()
+        .transaction_content("content", &content)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let changed = tx.execute(
         "UPDATE mc_notes
             SET status = 'dismissed', content = ?1,
@@ -12357,13 +16330,16 @@ const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id,
     state_version, policy_version, protocol_epoch, authority_generation, expires_at, \
     completion_id, terminal_kind, terminal_response";
 
-/// Acquisition polls the pending set on every call, so the selector excludes content and manifest_json.
-/// Polling omits the compiled artifact body to avoid loading up to `MAX_COMPILED_CHECK_BYTES` per call.
-/// The selector needs only whether an artifact exists.
+/// Columns the work selector actually reads. Acquisition polls the pending set on
+/// every call, so this deliberately excludes `content`, `manifest_json`, and the
+/// compiled artifact body (bounded at `MAX_COMPILED_CHECK_BYTES`); the selector
+/// only needs to know WHETHER an artifact exists. The full row is loaded once, for
+/// the single note that wins selection.
 const NOTE_EVAL_CANDIDATE_COLUMNS: &str = "id, status, compile_status, created_at_ms, \
     compiled_check IS NOT NULL, check_status, check_quarantined_until, check_next_due_at, \
     check_false_since_at, check_last_liveness_at, policy_version, last_checked_at";
 
+/// One pending smart note as seen by the work selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteEvalCandidate {
     pub id: i64,
@@ -12449,7 +16425,9 @@ fn note_eval_kind_response(kind: &str) -> String {
     serde_json::json!({ "result": kind }).to_string()
 }
 
-/// The lookup resolves the notes-authority row that fences this project's evaluation protocol.
+/// Resolve the notes-authority row this project's evaluation protocol is fenced on.
+/// A MODULE row wins over stale twins under other context store UUIDs, matching
+/// `module_authority_for_project`; otherwise the lowest UUID reports current state.
 fn note_eval_authority_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -12509,8 +16487,8 @@ fn mark_note_eval_claim_terminal_tx(
     )
 }
 
-/// The update terminally fences active claims so in-flight evaluations cannot complete.
-/// `note_id = None` terminally fences every active claim in the project, preventing stale completions.
+/// Terminally fence active claims so in-flight evaluations lose their completion
+/// instead of surfacing stale work. `note_id = None` fences the whole project.
 fn fence_active_note_claims_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -12532,11 +16510,12 @@ fn fence_active_note_claims_tx(
     )
 }
 
-/// The cleanup expires overdue active claims and tombstones expired `no_work` decisions.
-/// `decision = ''` preserves replay identity for tombstoned `no_work` decisions.
-/// The cleanup sets terminal responses to `NULL` after their completion-replay window.
-/// `NOTE_EVAL_RESPONSE_REDACT_MS` nulls terminal responses before terminal-row deletion.
-/// Tombstoned rows replay as `Expired` and do not count against either cap.
+/// Ledger garbage collection: expire overdue active claims, tombstone expired
+/// `no_work` decisions (`decision = ''` keeps replay identity), then null the
+/// response of terminal claims once their completion-replay window has passed
+/// (`NOTE_EVAL_RESPONSE_REDACT_MS`, well before row deletion at
+/// `NOTE_EVAL_TERMINAL_RETENTION_MS`). Tombstoned rows replay as `Expired`;
+/// they no longer count against either cap.
 fn collect_note_eval_ledgers_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -12559,16 +16538,61 @@ fn collect_note_eval_ledgers_tx(
             AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
         params![project, now_ms - NOTE_EVAL_RESPONSE_REDACT_MS],
     )?;
-    // The cleanup deletes tombstoned acquisitions and terminal claims after their retention periods.
-    // `decision = ''` and `terminal_response = NULL` leave rows until retention-based deletion.
-    // Without cleanup, recording every idle `no_work` poll would grow the ledger without bound.
-    // Idle `no_work` polls also create acquisition rows.
-    // Unbounded ledger growth makes per-poll GC and cap counts scan progressively more rows.
+    // Reclaim rows, not just columns. Blanking `decision`/`terminal_response`
+    // stops a row counting toward the cap but leaves it on disk forever, so both
+    // ledgers would grow without bound - one acquisition row per poll, including
+    // every idle no-work poll - and the per-poll GC and cap counts would degrade
+    // into ever-longer scans.
+    let expired_acquisitions = {
+        let mut statement = tx.prepare(
+            "SELECT acquisition_id FROM mc_note_eval_acquisitions
+              WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![project, now_ms - NOTE_EVAL_NO_WORK_RETENTION_MS],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for acquisition_id in expired_acquisitions {
+        retire_active_scan_domain_owner(
+            tx,
+            "project",
+            project,
+            "note_evaluation_ledgers",
+            &active_scan_owner_key(&["acquisition", &acquisition_id]),
+        )?;
+    }
     tx.execute(
         "DELETE FROM mc_note_eval_acquisitions
           WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
         params![project, now_ms - NOTE_EVAL_NO_WORK_RETENTION_MS],
     )?;
+    let expired_claims = {
+        let mut statement = tx.prepare(
+            "SELECT claim_id FROM mc_note_eval_claims
+              WHERE project = ?1 AND terminal_kind IS NOT NULL
+                AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for claim_id in expired_claims {
+        retire_active_scan_domain_owner(
+            tx,
+            "project",
+            project,
+            "note_evaluation_ledgers",
+            &active_scan_owner_key(&["claim", &claim_id]),
+        )?;
+    }
     tx.execute(
         "DELETE FROM mc_note_eval_claims
           WHERE project = ?1 AND terminal_kind IS NOT NULL
@@ -12579,10 +16603,12 @@ fn collect_note_eval_ledgers_tx(
 }
 
 impl McStore {
-    /// The operation acquires one durable evaluation claim or a replayable `no_work` decision.
-    /// `select` receives pending, unclaimed smart notes and returns either a `(note, phase)` claim or a classified `no_work` decision.
-    /// `no_work` decisions retain their `cycle_exhausted` cause and commit atomically under `(project, acquisition_id)` uniqueness.
-    /// For a given `(project, acquisition_id)`, response loss replays the original decision.
+    /// Acquire one durable evaluation claim or a replayable `no_work` decision.
+    /// `select` receives the pending, unclaimed smart notes and returns either a
+    /// (note, phase) claim or a classified `no_work`; the decision — including a
+    /// `no_work`'s `cycle_exhausted` cause — commits atomically under
+    /// (project, acquisition_id) uniqueness so the same acquisition ID always
+    /// returns the same decision after response loss.
     #[allow(clippy::too_many_arguments)]
     pub fn acquire_note_evaluation(
         &self,
@@ -12625,7 +16651,12 @@ impl McStore {
         {
             return Ok(NoteEvalAcquireOutcome::Invalid);
         }
-        self.with_note_conn_fenced(project, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.existing_identity("project", project)?;
+        write.identity("acquisition_id", acquisition_id)?;
+        write.identity("evaluator_instance", evaluator_instance)?;
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx;
             collect_note_eval_ledgers_tx(tx, project, now_ms)?;
             let replayed_claim = tx
                 .query_row(
@@ -12639,15 +16670,15 @@ impl McStore {
                 .optional()?;
             if let Some(row) = replayed_claim {
                 if let Some(kind) = row.terminal_kind {
-                    return Ok(NoteEvalAcquireOutcome::Terminal {
+                    return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Terminal {
                         kind,
                         response: row.terminal_response,
-                    });
+                    }));
                 }
                 if row.claim.evaluator_instance != evaluator_instance
                     || row.claim.evaluator_slot != evaluator_slot
                 {
-                    return Ok(NoteEvalAcquireOutcome::Invalid);
+                    return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Invalid));
                 }
                 return rebind_note_eval_claim_tx(
                     tx,
@@ -12656,7 +16687,8 @@ impl McStore {
                     acquisition_id,
                     registration_generation,
                     now_ms,
-                );
+                )
+                .map(WriteDisposition::Replay);
             }
             let replayed_decision = tx
                 .query_row(
@@ -12667,19 +16699,25 @@ impl McStore {
                 )
                 .optional()?;
             if let Some(decision) = replayed_decision {
-                return Ok(if decision.is_empty() {
+                return Ok(WriteDisposition::Replay(if decision.is_empty() {
                     NoteEvalAcquireOutcome::Expired
                 } else {
+                    // Replay the full recorded decision: a client only sees a
+                    // replay after losing the original response, so the
+                    // exhaustion cause must survive or the worker mistakes a
+                    // reset cursor for a drained queue.
                     NoteEvalAcquireOutcome::NoWork {
                         replayed: true,
                         cycle_exhausted: decision == "no_work_exhausted",
                     }
-                });
+                }));
             }
             let Some((authority_generation, protocol_epoch)) =
                 note_eval_module_authority_tx(tx, project)?
             else {
-                return Ok(NoteEvalAcquireOutcome::AuthorityChanged);
+                return Ok(WriteDisposition::Replay(
+                    NoteEvalAcquireOutcome::AuthorityChanged,
+                ));
             };
             let slot_claim = tx
                 .query_row(
@@ -12693,6 +16731,11 @@ impl McStore {
                 )
                 .optional()?;
             if let Some(row) = slot_claim {
+                coordinated.domain_owner(
+                    "project",
+                    project,
+                    active_scan_owner_key(&["claim", &row.claim.claim_id]),
+                );
                 return rebind_note_eval_claim_tx(
                     tx,
                     project,
@@ -12700,7 +16743,8 @@ impl McStore {
                     acquisition_id,
                     registration_generation,
                     now_ms,
-                );
+                )
+                .map(WriteDisposition::Applied);
             }
             let candidates = {
                 let mut stmt = tx.prepare_cached(&format!(
@@ -12725,7 +16769,7 @@ impl McStore {
                         |row| row.get(0),
                     )?;
                     if live >= ledger_cap {
-                        return Ok(NoteEvalAcquireOutcome::Busy);
+                        return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Busy));
                     }
                     tx.execute(
                         "INSERT INTO mc_note_eval_acquisitions(
@@ -12743,19 +16787,33 @@ impl McStore {
                             now_ms + NOTE_EVAL_NO_WORK_RETENTION_MS
                         ],
                     )?;
-                    return Ok(NoteEvalAcquireOutcome::NoWork {
+                    coordinated.domain_owner(
+                        "project",
+                        project,
+                        active_scan_owner_key(&["acquisition", acquisition_id]),
+                    );
+                    return Ok(WriteDisposition::Applied(NoteEvalAcquireOutcome::NoWork {
                         replayed: false,
                         cycle_exhausted,
-                    });
+                    }));
                 }
             };
             if !matches!(phase.as_str(), "compile" | "due" | "liveness" | "fallback") {
-                return Ok(NoteEvalAcquireOutcome::Invalid);
+                return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Invalid));
             }
             let Some(candidate) = candidates.into_iter().find(|note| note.id == note_id) else {
-                return Ok(NoteEvalAcquireOutcome::Invalid);
+                return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Invalid));
             };
+            // Selection ran on the narrow projection; load the full row once for
+            // the note that actually won so the claim snapshot has content,
+            // condition, and the compiled artifact.
             let note = load_note_tx(tx, candidate.id)?;
+            // Bound IN-FLIGHT claims only. Counting terminal rows still inside the
+            // replay-retention window would turn this cap into a rolling
+            // throughput ceiling: once a project completed `ledger_cap`
+            // evaluations within the retention window every further acquisition
+            // would return Busy and all evaluation would stall until rows aged
+            // out. Terminal-row volume is bounded by deletion in
             // `collect_note_eval_ledgers_tx` instead.
             let live: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM mc_note_eval_claims
@@ -12764,9 +16822,15 @@ impl McStore {
                 |row| row.get(0),
             )?;
             if live >= ledger_cap {
-                return Ok(NoteEvalAcquireOutcome::Busy);
+                return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Busy));
             }
             let claim = NoteEvalClaim {
+                // The module's wire protocol caps id fields at 128 bytes and
+                // the client echoes this id on every renew/complete/abandon,
+                // so it must stay bounded regardless of how long the project
+                // identity or acquisition id are. The digest keeps it
+                // deterministic per (project, acquisition); a replayed
+                // acquisition reads the stored row.
                 claim_id: {
                     let mut hasher = Sha256::new();
                     hasher.update(project.as_bytes());
@@ -12787,6 +16851,16 @@ impl McStore {
                 authority_generation,
                 expires_at: now_ms + NOTE_EVAL_CLAIM_LEASE_MS,
             };
+            for (field_id, value) in [
+                ("claim_id", claim.claim_id.as_str()),
+                ("phase", claim.phase.as_str()),
+            ] {
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_identity(field_id, value)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
             tx.execute(
                 "INSERT INTO mc_note_eval_claims(
                      claim_id, project, note_id, phase, acquisition_id, evaluator_instance,
@@ -12812,14 +16886,20 @@ impl McStore {
                     now_ms,
                 ],
             )?;
-            Ok(NoteEvalAcquireOutcome::Claim {
+            coordinated.domain_owner(
+                "project",
+                project,
+                active_scan_owner_key(&["claim", &claim.claim_id]),
+            );
+            Ok(WriteDisposition::Applied(NoteEvalAcquireOutcome::Claim {
                 claim,
                 note,
                 replayed: false,
-            })
+            }))
         })
     }
 
+    /// Extend an active claim's lease by one lease interval.
     pub fn renew_note_evaluation_claim(
         &self,
         project: &str,
@@ -12829,48 +16909,74 @@ impl McStore {
         registration_generation: i64,
         now_ms: i64,
     ) -> Result<NoteEvalRenewOutcome, McStoreError> {
-        self.with_note_conn_fenced(project, |tx| {
-            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
-                return Ok(NoteEvalRenewOutcome::UnknownClaim);
-            };
-            if let Some(kind) = row.terminal_kind {
-                return Ok(NoteEvalRenewOutcome::TerminalReplay {
-                    kind,
-                    response: row.terminal_response,
-                });
-            }
-            if row.claim.evaluator_instance != evaluator_instance
-                || row.claim.evaluator_slot != evaluator_slot
-            {
-                return Ok(NoteEvalRenewOutcome::Invalid);
-            }
-            if row.claim.expires_at <= now_ms {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "expired",
-                    None,
-                    &note_eval_kind_response("expired"),
-                    now_ms,
-                )?;
-                return Ok(NoteEvalRenewOutcome::Expired);
-            }
-            match note_eval_module_authority_tx(tx, project)? {
-                Some((generation, _)) if generation == row.claim.authority_generation => {}
-                _ => return Ok(NoteEvalRenewOutcome::AuthorityChanged),
-            }
-            let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
-            tx.execute(
-                "UPDATE mc_note_eval_claims
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["claim", claim_id]),
+        );
+        for (field_id, value) in [
+            ("project", project),
+            ("claim_id", claim_id),
+            ("evaluator_instance", evaluator_instance),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
+            let outcome = (|| -> rusqlite::Result<NoteEvalRenewOutcome> {
+                let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                    return Ok(NoteEvalRenewOutcome::UnknownClaim);
+                };
+                if let Some(kind) = row.terminal_kind {
+                    return Ok(NoteEvalRenewOutcome::TerminalReplay {
+                        kind,
+                        response: row.terminal_response,
+                    });
+                }
+                if row.claim.evaluator_instance != evaluator_instance
+                    || row.claim.evaluator_slot != evaluator_slot
+                {
+                    return Ok(NoteEvalRenewOutcome::Invalid);
+                }
+                if row.claim.expires_at <= now_ms {
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "expired",
+                        None,
+                        &note_eval_kind_response("expired"),
+                        now_ms,
+                    )?;
+                    return Ok(NoteEvalRenewOutcome::Expired);
+                }
+                match note_eval_module_authority_tx(tx, project)? {
+                    Some((generation, _)) if generation == row.claim.authority_generation => {}
+                    _ => return Ok(NoteEvalRenewOutcome::AuthorityChanged),
+                }
+                let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+                tx.execute(
+                    "UPDATE mc_note_eval_claims
                     SET expires_at = ?1, registration_generation = ?2
                   WHERE project = ?3 AND claim_id = ?4 AND terminal_kind IS NULL",
-                params![expires_at, registration_generation, project, claim_id],
-            )?;
-            Ok(NoteEvalRenewOutcome::Renewed { expires_at })
+                    params![expires_at, registration_generation, project, claim_id],
+                )?;
+                Ok(NoteEvalRenewOutcome::Renewed { expires_at })
+            })()?;
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
+            })
         })
     }
 
+    /// Commit one evaluation outcome. `apply` receives the fenced note snapshot and
+    /// returns the reduced lifecycle columns; every fence (identity, lease, authority
+    /// generation, source revision, state version, pending status) is revalidated in
+    /// the same transaction that writes the note and the replayable terminal result.
     #[allow(clippy::too_many_arguments)]
     pub fn complete_note_evaluation(
         &self,
@@ -12885,121 +16991,194 @@ impl McStore {
         if !note_eval_valid_id(completion_id) {
             return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
         }
-        self.with_note_conn_fenced(project, |tx| {
-            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
-                return Ok(NoteEvalCompleteOutcome::Conflict {
-                    kind: "unknown_claim",
-                });
-            };
-            if let Some(kind) = row.terminal_kind {
-                return Ok(match row.completion_id {
-                    Some(stored) if stored == completion_id => match row.terminal_response {
-                        Some(response_json) => NoteEvalCompleteOutcome::Replayed { response_json },
-                        None => NoteEvalCompleteOutcome::Conflict { kind: "expired" },
-                    },
-                    Some(_) => NoteEvalCompleteOutcome::Conflict {
-                        kind: "completion_conflict",
-                    },
-                    None => NoteEvalCompleteOutcome::Conflict {
-                        kind: match kind.as_str() {
-                            "stale" => "stale",
-                            "expired" => "expired",
-                            "authority_changed" => "authority_changed",
-                            _ => "invalid",
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["claim", claim_id]),
+        );
+        for (field_id, value) in [
+            ("project", project),
+            ("claim_id", claim_id),
+            ("completion_id", completion_id),
+            ("evaluator_instance", evaluator_instance),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
+            let outcome = (|| -> rusqlite::Result<NoteEvalCompleteOutcome> {
+                let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                    return Ok(NoteEvalCompleteOutcome::Conflict {
+                        kind: "unknown_claim",
+                    });
+                };
+                if let Some(kind) = row.terminal_kind {
+                    return Ok(match row.completion_id {
+                        Some(stored) if stored == completion_id => match row.terminal_response {
+                            Some(response_json) => {
+                                NoteEvalCompleteOutcome::Replayed { response_json }
+                            }
+                            None => NoteEvalCompleteOutcome::Conflict { kind: "expired" },
                         },
-                    },
-                });
-            }
-            if row.claim.evaluator_instance != evaluator_instance
-                || row.claim.evaluator_slot != evaluator_slot
-            {
-                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
-            }
-            if row.claim.expires_at <= now_ms {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "expired",
-                    None,
-                    &note_eval_kind_response("expired"),
-                    now_ms,
-                )?;
-                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "expired" });
-            }
-            match note_eval_module_authority_tx(tx, project)? {
-                Some((generation, _)) if generation == row.claim.authority_generation => {}
-                _ => {
+                        Some(_) => NoteEvalCompleteOutcome::Conflict {
+                            kind: "completion_conflict",
+                        },
+                        None => NoteEvalCompleteOutcome::Conflict {
+                            kind: match kind.as_str() {
+                                "stale" => "stale",
+                                "expired" => "expired",
+                                "authority_changed" => "authority_changed",
+                                _ => "invalid",
+                            },
+                        },
+                    });
+                }
+                if row.claim.evaluator_instance != evaluator_instance
+                    || row.claim.evaluator_slot != evaluator_slot
+                {
+                    return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+                }
+                if row.claim.expires_at <= now_ms {
                     mark_note_eval_claim_terminal_tx(
                         tx,
                         project,
                         claim_id,
-                        "authority_changed",
+                        "expired",
                         None,
-                        &note_eval_kind_response("authority_changed"),
+                        &note_eval_kind_response("expired"),
                         now_ms,
                     )?;
-                    return Ok(NoteEvalCompleteOutcome::Conflict {
-                        kind: "authority_changed",
-                    });
+                    return Ok(NoteEvalCompleteOutcome::Conflict { kind: "expired" });
                 }
-            }
-            let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "stale",
-                    None,
-                    &note_eval_kind_response("stale"),
-                    now_ms,
-                )?;
-                Ok(NoteEvalCompleteOutcome::Conflict { kind: "stale" })
-            };
-            let note = load_note_tx(tx, row.claim.note_id).optional()?;
-            let Some(note) = note.filter(|note| note.project_path == project) else {
-                return stale(tx);
-            };
-            if note.source_revision != row.claim.source_revision
-                || note.state_version != row.claim.state_version
-                || note.status != "pending"
-            {
-                return stale(tx);
-            }
-            let reduced = match apply(&row.claim, &note) {
-                Ok(reduced) => reduced,
-                Err(message) => {
-                    let response = serde_json::json!({
-                        "result": "invalid",
-                        "error": note_eval_bound_response(&message),
-                    })
-                    .to_string();
+                match note_eval_module_authority_tx(tx, project)? {
+                    Some((generation, _)) if generation == row.claim.authority_generation => {}
+                    _ => {
+                        mark_note_eval_claim_terminal_tx(
+                            tx,
+                            project,
+                            claim_id,
+                            "authority_changed",
+                            None,
+                            &note_eval_kind_response("authority_changed"),
+                            now_ms,
+                        )?;
+                        return Ok(NoteEvalCompleteOutcome::Conflict {
+                            kind: "authority_changed",
+                        });
+                    }
+                }
+                let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "stale",
+                        None,
+                        &note_eval_kind_response("stale"),
+                        now_ms,
+                    )?;
+                    Ok(NoteEvalCompleteOutcome::Conflict { kind: "stale" })
+                };
+                let note = load_note_tx(tx, row.claim.note_id).optional()?;
+                let Some(note) = note.filter(|note| note.project_path == project) else {
+                    return stale(tx);
+                };
+                coordinated.domain_owner("project", project, note.id.to_string());
+                if note.source_revision != row.claim.source_revision
+                    || note.state_version != row.claim.state_version
+                    || note.status != "pending"
+                {
+                    return stale(tx);
+                }
+                let mut reduced = match apply(&row.claim, &note) {
+                    Ok(reduced) => reduced,
+                    Err(message) => {
+                        let message = coordinated
+                            .prepared
+                            .borrow_mut()
+                            .transaction_content("evaluation_error", &message)
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                        let response = serde_json::json!({
+                            "result": "invalid",
+                            "error": note_eval_bound_response(&message),
+                        })
+                        .to_string();
+                        mark_note_eval_claim_terminal_tx(
+                            tx,
+                            project,
+                            claim_id,
+                            "invalid",
+                            None,
+                            &note_eval_bound_response(&response),
+                            now_ms,
+                        )?;
+                        return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+                    }
+                };
+                if !matches!(reduced.status.as_str(), "pending" | "ready") {
                     mark_note_eval_claim_terminal_tx(
                         tx,
                         project,
                         claim_id,
                         "invalid",
                         None,
-                        &note_eval_bound_response(&response),
+                        &note_eval_kind_response("invalid"),
                         now_ms,
                     )?;
                     return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
                 }
-            };
-            if !matches!(reduced.status.as_str(), "pending" | "ready") {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "invalid",
-                    None,
-                    &note_eval_kind_response("invalid"),
-                    now_ms,
-                )?;
-                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
-            }
-            let changed = tx.execute(
-                "UPDATE mc_notes SET status = ?1, ready_at = ?2, ready_reason = ?3,
+                reduced.ready_reason = reduced
+                    .ready_reason
+                    .as_deref()
+                    .map(|value| {
+                        coordinated
+                            .prepared
+                            .borrow_mut()
+                            .transaction_content("ready_reason", value)
+                    })
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                reduced
+                    .manifest_json
+                    .as_deref()
+                    .map(|value| {
+                        coordinated
+                            .prepared
+                            .borrow_mut()
+                            .transaction_identity("manifest_json", value)
+                            .map(drop)
+                    })
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                for (field_id, value) in [
+                    ("check_status", reduced.check_status.as_deref()),
+                    ("compiled_check", reduced.compiled_check.as_deref()),
+                    ("check_hash", reduced.check_hash.as_deref()),
+                    ("check_cron", reduced.check_cron.as_deref()),
+                    (
+                        "compiled_project_path",
+                        reduced.compiled_project_path.as_deref(),
+                    ),
+                ] {
+                    value
+                        .map(|value| {
+                            coordinated
+                                .prepared
+                                .borrow_mut()
+                                .transaction_identity(field_id, value)
+                                .map(drop)
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+                let changed = tx.execute(
+                    "UPDATE mc_notes SET status = ?1, ready_at = ?2, ready_reason = ?3,
                     last_checked_at = ?4, updated_at_ms = ?5, compiled_check = ?6,
                     manifest_json = ?7, check_hash = ?8, check_cron = ?9, check_version = ?10,
                     check_status = ?11, check_failure_count = ?12,
@@ -13011,57 +17190,73 @@ impl McStore {
                     status_version = status_version + 1, state_version = state_version + 1
                   WHERE id = ?22 AND project_path = ?23 AND status = 'pending'
                     AND state_version = ?24",
-                params![
-                    reduced.status,
-                    reduced.ready_at,
-                    reduced.ready_reason,
-                    reduced.last_checked_at,
-                    reduced.updated_at_ms,
-                    reduced.compiled_check,
-                    reduced.manifest_json,
-                    reduced.check_hash,
-                    reduced.check_cron,
-                    reduced.check_version.unwrap_or(0),
-                    reduced.check_status,
-                    reduced.check_failure_count,
-                    reduced.check_network_failure_count,
-                    reduced.check_quarantined_until,
-                    reduced.check_next_due_at,
-                    reduced.check_compiled_at,
-                    reduced.check_false_since_at,
-                    reduced.check_last_liveness_at,
-                    reduced.policy_version.unwrap_or(1),
-                    reduced.compiled_source_revision,
-                    reduced.compiled_project_path,
-                    row.claim.note_id,
+                    params![
+                        reduced.status,
+                        reduced.ready_at,
+                        reduced.ready_reason,
+                        reduced.last_checked_at,
+                        reduced.updated_at_ms,
+                        reduced.compiled_check,
+                        reduced.manifest_json,
+                        reduced.check_hash,
+                        reduced.check_cron,
+                        reduced.check_version.unwrap_or(0),
+                        reduced.check_status,
+                        reduced.check_failure_count,
+                        reduced.check_network_failure_count,
+                        reduced.check_quarantined_until,
+                        reduced.check_next_due_at,
+                        reduced.check_compiled_at,
+                        reduced.check_false_since_at,
+                        reduced.check_last_liveness_at,
+                        reduced.policy_version.unwrap_or(1),
+                        reduced.compiled_source_revision,
+                        reduced.compiled_project_path,
+                        row.claim.note_id,
+                        project,
+                        row.claim.state_version,
+                    ],
+                )?;
+                if changed == 0 {
+                    return stale(tx);
+                }
+                // Every response field is already known locally (the CAS above
+                // asserted `state_version = row.claim.state_version`), so no
+                // re-read of the row is needed.
+                let response_json = serde_json::json!({
+                    "result": "applied",
+                    "note_id": row.claim.note_id,
+                    "status": reduced.status,
+                    "state_version": row.claim.state_version + 1,
+                    "check_status": reduced.check_status,
+                })
+                .to_string();
+                let response_json = coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_content("terminal_response", &response_json)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                mark_note_eval_claim_terminal_tx(
+                    tx,
                     project,
-                    row.claim.state_version,
-                ],
-            )?;
-            if changed == 0 {
-                return stale(tx);
-            }
-            let response_json = serde_json::json!({
-                "result": "applied",
-                "note_id": row.claim.note_id,
-                "status": reduced.status,
-                "state_version": row.claim.state_version + 1,
-                "check_status": reduced.check_status,
+                    claim_id,
+                    "applied",
+                    Some(completion_id),
+                    &response_json,
+                    now_ms,
+                )?;
+                Ok(NoteEvalCompleteOutcome::Applied { response_json })
+            })()?;
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
             })
-            .to_string();
-            mark_note_eval_claim_terminal_tx(
-                tx,
-                project,
-                claim_id,
-                "applied",
-                Some(completion_id),
-                &response_json,
-                now_ms,
-            )?;
-            Ok(NoteEvalCompleteOutcome::Applied { response_json })
         })
     }
 
+    /// Terminally release a claim for controlled cancellation. Never touches
+    /// `mc_notes`; abandoning an already-terminal claim replays its terminal kind.
     pub fn abandon_note_evaluation_claim(
         &self,
         project: &str,
@@ -13070,17 +17265,35 @@ impl McStore {
         evaluator_slot: i64,
         now_ms: i64,
     ) -> Result<NoteEvalAbandonOutcome, McStoreError> {
-        self.with_note_conn_fenced(project, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["claim", claim_id]),
+        );
+        for (field_id, value) in [
+            ("project", project),
+            ("claim_id", claim_id),
+            ("evaluator_instance", evaluator_instance),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx();
             let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
-                return Ok(NoteEvalAbandonOutcome::UnknownClaim);
+                return Ok(WriteDisposition::Replay(
+                    NoteEvalAbandonOutcome::UnknownClaim,
+                ));
             };
             if let Some(kind) = row.terminal_kind {
-                return Ok(NoteEvalAbandonOutcome::Replayed { kind });
+                return Ok(WriteDisposition::Replay(NoteEvalAbandonOutcome::Replayed {
+                    kind,
+                }));
             }
             if row.claim.evaluator_instance != evaluator_instance
                 || row.claim.evaluator_slot != evaluator_slot
             {
-                return Ok(NoteEvalAbandonOutcome::Invalid);
+                return Ok(WriteDisposition::Replay(NoteEvalAbandonOutcome::Invalid));
             }
             mark_note_eval_claim_terminal_tx(
                 tx,
@@ -13091,11 +17304,16 @@ impl McStore {
                 &note_eval_kind_response("abandoned"),
                 now_ms,
             )?;
-            Ok(NoteEvalAbandonOutcome::Abandoned)
+            Ok(WriteDisposition::Applied(NoteEvalAbandonOutcome::Abandoned))
         })
     }
 }
 
+/// Rebind an active claim to the caller's registration and replay it with the
+/// current note snapshot. The lease is refreshed alongside the rebind: a
+/// re-registered worker schedules its first renewal a full heartbeat interval
+/// out, so replaying a claim with its original near-expiry lease would let the
+/// lease lapse mid-execution and force the billable phase to run again.
 fn rebind_note_eval_claim_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -13105,6 +17323,10 @@ fn rebind_note_eval_claim_tx(
     now_ms: i64,
 ) -> rusqlite::Result<NoteEvalAcquireOutcome> {
     let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+    // The slot-recovery path reaches this rebind with a NEW acquisition id.
+    // Persisting it keeps the replay guarantee: a retry of that id hits the
+    // acquisition-keyed lookup and replays this rebind instead of re-entering
+    // slot recovery and extending the lease again.
     tx.execute(
         "UPDATE mc_note_eval_claims
             SET registration_generation = ?1, expires_at = ?2, acquisition_id = ?3
@@ -13133,8 +17355,15 @@ fn rebind_note_eval_claim_tx(
     })
 }
 
+/// Canonical digest binding a compiled smart-note artifact to the condition it was
+/// compiled from. Mirrors hashCheck in packages/plugin smart-notes/compiler.ts;
+/// `manifest_json` is hashed exactly as stored so both sides produce the same hex
 /// digest.
 ///
+/// This is the ONE definition of that digest: `mc-module` recomputes it from the
+/// authoritative condition to admit a compile completion, and the v51 repair uses it
+/// to decide whether a legacy artifact is trustworthy. A second copy would let those
+/// two decisions drift, which either rejects every valid completion or discards every
 /// legacy artifact.
 pub fn note_check_digest(
     surface_condition: Option<&str>,
@@ -13193,6 +17422,11 @@ fn repair_note_artifacts_tx(
     };
     let processed = candidates.len();
     for candidate in candidates {
+        // A row with no recorded digest cannot be verified either way. Treat it as
+        // trusted-as-is rather than discarding a real compiled artifact: wiping it
+        // forces a fresh LLM compile per note and is unrecoverable, whereas
+        // adopting it only carries forward a pre-v51 artifact the previous binary
+        // was already serving.
         let verified = match candidate.check_hash.as_deref() {
             None => true,
             Some(hash) => {
@@ -13240,6 +17474,8 @@ fn sql_like_pattern(query: &str) -> String {
     format!("%{escaped}%")
 }
 
+/// Compute the ctx_memory normalized hash used for duplicate detection. This mirrors the
+/// plugin path: lowercase, collapse whitespace runs to one space, trim, then MD5 hex.
 fn canonical_authority_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
@@ -13303,6 +17539,381 @@ mod tests {
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         McStore::test_descriptor(dir, "magic-context-test")
+    }
+
+    /// The value-only scanner finds nothing in `{"credential":"fixture"}`, so a receipt built
+    /// from its detections alone would report no finding for bytes the key gate replaced.
+    #[test]
+    fn a_key_directed_substitution_records_its_own_detection() {
+        let mut detections = Vec::new();
+        let prepared = prepare_json_content_collecting(
+            r#"{"credential":"fixture"}"#,
+            JsonScanPolicy::DurableRejectProtected,
+            &mut detections,
+        )
+        .unwrap();
+        assert_eq!(prepared, r#"{"credential":"<REDACTED:credential>"}"#);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].secret_type, "credential");
+        assert_eq!(detections[0].length, "fixture".len());
+
+        // A value the scanner already flagged keeps its own findings and gains no duplicate.
+        let mut scanned = Vec::new();
+        prepare_json_content_collecting(
+            r#"{"credential":"password=hunter-two"}"#,
+            JsonScanPolicy::DurableRejectProtected,
+            &mut scanned,
+        )
+        .unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].secret_type, "password");
+
+        // An unprotected name still reports only what the scanner found.
+        let mut none = Vec::new();
+        prepare_json_content_collecting(
+            r#"{"payload":"fixture"}"#,
+            JsonScanPolicy::DurableRejectProtected,
+            &mut none,
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// A detection row varies only by its label, so repeats add nothing while a near-limit
+    /// field can hold tens of thousands of them.
+    #[test]
+    fn persisted_detection_rows_collapse_repeats_and_stay_bounded() {
+        let repeated = std::iter::repeat_n(
+            Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: "password".to_string(),
+                offset: 0,
+                length: 4,
+            },
+            5_000,
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(persisted_detection_labels(&repeated), vec!["password"]);
+
+        let distinct = (0..MAX_PERSISTED_DETECTION_LABELS + 10)
+            .map(|index| Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: format!("label_{index}"),
+                offset: 0,
+                length: 4,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_detection_labels(&distinct).len(),
+            MAX_PERSISTED_DETECTION_LABELS
+        );
+
+        // First-appearance order is what a reader sees, so it must not depend on sorting.
+        let mixed = ["token", "password", "token", "api_key"]
+            .into_iter()
+            .map(|label| Detection {
+                detector_id: DETECTOR_ID,
+                secret_type: label.to_string(),
+                offset: 0,
+                length: 4,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_detection_labels(&mixed),
+            vec!["token", "password", "api_key"]
+        );
+    }
+
+    /// `serde_json::Value` keeps only the last member of a repeated name, so the scan never
+    /// reads the earlier one while the unchanged-input path returns the original text.
+    #[test]
+    fn duplicate_json_object_names_are_refused() {
+        let error = prepare_json_content(r#"{"x":"password=secret","x":"ok"}"#).unwrap_err();
+        assert!(matches!(error, McStoreError::Serde(_)), "{error:?}");
+        assert!(!error.to_string().contains("secret"), "{error:?}");
+        // A nested repeat is refused on the same grounds as a top-level one.
+        let nested = prepare_json_content(r#"{"a":{"x":"password=secret","x":"ok"}}"#).unwrap_err();
+        assert!(matches!(nested, McStoreError::Serde(_)), "{nested:?}");
+        // Unique names across sibling objects are ordinary JSON.
+        assert_eq!(
+            prepare_json_content(r#"{"a":{"x":"ok"},"b":{"x":"ok"}}"#).unwrap(),
+            r#"{"a":{"x":"ok"},"b":{"x":"ok"}}"#
+        );
+    }
+
+    /// A protected name substitutes its scalar, so a container under the same name must not
+    /// hand its members to their own field names and escape that policy.
+    #[test]
+    fn a_protected_key_holding_a_container_is_refused() {
+        for input in [
+            r#"{"credential":{"value":"fixture"}}"#,
+            r#"{"credential":["fixture"]}"#,
+            r#"{"credential":{"nested":{"value":"fixture"}}}"#,
+            r#"{"apikey":{"value":"fixture"}}"#,
+        ] {
+            let error = prepare_json_content(input).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+                ),
+                "{input} -> {error:?}"
+            );
+        }
+        // The scalar form still substitutes rather than refusing.
+        assert_eq!(
+            prepare_json_content(r#"{"credential":"fixture"}"#).unwrap(),
+            r#"{"credential":"<REDACTED:credential>"}"#
+        );
+        // A container carrying no text has nothing to conceal.
+        assert_eq!(
+            prepare_json_content(r#"{"credential":{"count":3}}"#).unwrap(),
+            r#"{"credential":{"count":3}}"#
+        );
+        // An unprotected name keeps its nested walk.
+        assert_eq!(
+            prepare_json_content(r#"{"payload":{"value":"fixture"}}"#).unwrap(),
+            r#"{"payload":{"value":"fixture"}}"#
+        );
+    }
+
+    #[test]
+    fn preserved_json_identities_do_not_exempt_integrity_fields() {
+        let content = prepare_json_content_preserving_identities(
+            r#"{"content":"password=content-secret","block_id":"password=legacy-id"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            content,
+            r#"{"block_id":"password=legacy-id","content":"password=<REDACTED:password>"}"#
+        );
+        for field in ["password", "token", "signature", "integrity"] {
+            let input = format!(r#"{{"{field}":"password=protected-secret"}}"#);
+            let error = prepare_json_content_preserving_identities(&input).unwrap_err();
+            assert!(matches!(error, McStoreError::Redaction(_)), "{field}");
+            assert!(!error.to_string().contains("protected-secret"));
+        }
+    }
+
+    /// A name can satisfy `identity_json_field` and still name a credential, and an
+    /// identity-named field can hold a nested object rather than a scalar. Both reach the
+    /// preserving policy, so neither may exempt its value from scanning.
+    #[test]
+    fn preserved_json_identities_do_not_exempt_credential_names_or_nested_values() {
+        // `api_key` and `private_key` end in `_key`, so they satisfy `identity_json_field`,
+        // and no `integrity_json_field` marker matches them.
+        for field in ["api_key", "private_key", "access_key"] {
+            let input = format!(r#"{{"{field}":"password=protected-secret"}}"#);
+            let error = prepare_json_content_preserving_identities(&input).unwrap_err();
+            assert!(
+                matches!(error, McStoreError::Redaction(_)),
+                "{field} must not reach durable storage unscanned"
+            );
+            assert!(!error.to_string().contains("protected-secret"));
+        }
+
+        // `apiKey` ends in `Key`, not `_key`, so it is no identity field and never reached
+        // the preserving policy. Substitution rather than rejection is its contract.
+        let substituted =
+            prepare_json_content_preserving_identities(r#"{"apiKey":"password=protected-secret"}"#)
+                .unwrap();
+        assert_eq!(substituted, r#"{"apiKey":"<REDACTED:api_key>"}"#);
+        assert!(!substituted.contains("protected-secret"));
+
+        // A structural identity keeps its bytes, which is the behaviour the credential
+        // names above are distinguished from.
+        for field in ["block_id", "target_key", "revision_locator"] {
+            let input = format!(r#"{{"{field}":"password=legacy-id"}}"#);
+            let preserved = prepare_json_content_preserving_identities(&input).unwrap();
+            assert_eq!(preserved, format!(r#"{{"{field}":"password=legacy-id"}}"#));
+        }
+
+        // The nested field name `message` carries no identity policy, so its value is
+        // scanned even though the enclosing `id` is preserved.
+        let nested = prepare_json_content_preserving_identities(
+            r#"{"id":{"message":"password=nested-secret"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            nested,
+            r#"{"id":{"message":"password=<REDACTED:password>"}}"#
+        );
+        assert!(!nested.contains("nested-secret"));
+
+        // `apikey` names a credential without a separator, so the leaf scanner sees only the
+        // value and no key context. Substitution has to come from the key name.
+        // A compound name that also matches an integrity marker is refused; one that matches
+        // none is substituted. Either way the value must not survive verbatim.
+        for field in ["apikey", "authtoken", "passWord"] {
+            let input = format!(r#"{{"{field}":"fixture"}}"#);
+            match prepare_json_content_preserving_identities(&input) {
+                Ok(prepared) => assert!(
+                    !prepared.contains("fixture"),
+                    "{field} left its value unprotected: {prepared}"
+                ),
+                Err(error) => assert!(
+                    matches!(error, McStoreError::Redaction(_)),
+                    "{field} failed for the wrong reason: {error:?}"
+                ),
+            }
+        }
+
+        // An array element that is an object supplies its own field names, so it is scanned
+        // even though the enclosing identity name preserves scalars.
+        let nested_in_array = prepare_json_content_preserving_identities(
+            r#"{"related_ids":[{"message":"password=array-secret"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            nested_in_array,
+            r#"{"related_ids":[{"message":"password=<REDACTED:password>"}]}"#
+        );
+        assert!(!nested_in_array.contains("array-secret"));
+
+        // An array under an identity name inherits that name, so its elements stay verbatim.
+        let inherited =
+            prepare_json_content_preserving_identities(r#"{"block_ids":["password=legacy-id"]}"#)
+                .unwrap();
+        assert_eq!(inherited, r#"{"block_ids":["password=legacy-id"]}"#);
+    }
+
+    /// The transaction, not an earlier read, decides whether `session_id` is a new identity.
+    /// A first insert refuses a detected secret; a replay of a stored row keeps its bytes.
+    #[test]
+    fn cache_state_identity_decision_comes_from_the_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let secret_session = "password=session-secret";
+
+        // No row keys this session, so the write introduces the identity and must refuse.
+        let error = store
+            .commit_transform(secret_session, base_commit(None, &core, &meta))
+            .expect_err("a new secret-bearing session_id must not reach storage");
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "unexpected error: {error:?}"
+        );
+        let rows: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_cache_state WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "a refused write must leave no row");
+
+        // A release that predates the scanner could store this identity. Rejecting it now
+        // would orphan the row, so a replay preserves the stored bytes.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, 1, '{}', '{}', 0)",
+                    params![secret_session],
+                )
+            })
+            .unwrap();
+        let version = store
+            .commit_transform(secret_session, base_commit(Some(1), &core, &meta))
+            .expect("a stored identity must replay rather than fail closed");
+        assert_eq!(version, 2);
+        let stored: String = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT session_id FROM mc_cache_state WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            stored, secret_session,
+            "the stored identity must stay verbatim"
+        );
+    }
+
+    /// A pass-trace breadcrumb runs outside the cache transaction and before it, so it must
+    /// not be the write that introduces a secret-bearing session. A session already keyed by
+    /// such an identity still gets its breadcrumb.
+    #[test]
+    fn pass_trace_refuses_a_new_secret_session_and_keeps_tracing_a_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let secret_session = "password=trace-secret";
+
+        for outcome in ["received", "completed", "rejected"] {
+            let error = match outcome {
+                "received" => store.trace_pass_received(secret_session, 10),
+                "completed" => store.trace_pass_completed(secret_session, 10),
+                // The reject breadcrumb runs after a transform has already failed, so it is
+                // the one trace write most likely to be reached by an unknown session.
+                _ => store.trace_pass_rejected(secret_session, "transform failed", 10),
+            }
+            .expect_err("a trace write must not introduce a secret-bearing session");
+            assert!(
+                matches!(
+                    error,
+                    McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+                ),
+                "{outcome}: unexpected error {error:?}"
+            );
+        }
+        let traced: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_pass_trace WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(traced, 0, "a refused trace write must leave no row");
+
+        // Once the session is keyed by that identity, refusing its breadcrumb would strand
+        // the row without removing the identity from storage.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, 1, '{}', '{}', 0)",
+                    params![secret_session],
+                )
+            })
+            .unwrap();
+        store.trace_pass_received(secret_session, 20).unwrap();
+        store.trace_pass_completed(secret_session, 21).unwrap();
+        store
+            .trace_pass_rejected(secret_session, "transform failed", 22)
+            .unwrap();
+        let traced: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT receive_count FROM mc_pass_trace WHERE session_id = ?1",
+                    params![secret_session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(traced, 1, "a stored session must still be traced");
+
+        // A clean session is unaffected and pays no extra query.
+        store.trace_pass_received("clean-session", 30).unwrap();
+        store.trace_pass_completed("clean-session", 31).unwrap();
     }
 
     /// A "nothing happened" commit: every optional effect empty. Tests
@@ -13666,6 +18277,60 @@ mod tests {
         assert!(!reopened.has_cache_state("deleted").unwrap());
     }
 
+    /// The row stores the canonical root, so the canonical form is what must be scanned. A
+    /// symlink whose own spelling is clean can resolve to a detectable target, and scanning
+    /// the caller's spelling would clear bytes that are never persisted while the bytes that
+    /// are persisted reach storage unscanned.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_root_is_scanned_as_the_canonical_path_it_stores() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The link spelling carries nothing detectable; its target does.
+        let target = dir.path().join("password=root-secret");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("clean-link");
+        symlink(&target, &link).unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let link_text = link.to_str().unwrap();
+        assert!(
+            mc_core::redaction::reject_secret_text(link_text).is_ok(),
+            "the link spelling must be clean for this test to mean anything"
+        );
+
+        let initial = store.load("symlinked-root").unwrap();
+        let error = store
+            .commit_transform(
+                "symlinked-root",
+                TransformCommit {
+                    project_root: Some(link_text),
+                    ..base_commit(initial.row_version, &initial.core, &initial.meta)
+                },
+            )
+            .expect_err("the canonical root carries a secret and must be refused");
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "unexpected error {error:?}"
+        );
+
+        let stored: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_transform_session_roots
+                      WHERE session_id = 'symlinked-root'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stored, 0, "a refused root must leave no row");
+    }
+
     #[cfg(unix)]
     #[test]
     fn transform_session_roots_canonicalize_writes_and_match_legacy_symlink_rows() {
@@ -13710,6 +18375,7 @@ mod tests {
             .knows_transform_session_root("canonical-write", target_text)
             .unwrap());
 
+        // Simulate a pre-migration row that retained the symlink spelling.
         store
             .commit(
                 "legacy-row",
@@ -13770,6 +18436,7 @@ mod tests {
         let meta = ModuleMeta::default();
 
         store.commit("ses_a", None, &core, &meta).unwrap(); // row_version now 1
+                                                            // A writer that still thinks the row is absent must conflict.
         let err = store.commit("ses_a", None, &core, &meta).unwrap_err();
         match err {
             McStoreError::CasConflict { expected, found } => {
@@ -14264,6 +18931,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
 
+        // Zero targets: the ledger row is recorded with disposition='no_targets'
+        // so a retry of the same command_id still dedupes.
         let outcome = store
             .append_pending_agent_drops_with_command("ses", Some("cmd-zero"), &[], 1, true)
             .unwrap();
@@ -14277,6 +18946,7 @@ mod tests {
         );
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
+        // Retry of the same command_id must still dedupe (idempotency).
         let retry = store
             .append_pending_agent_drops_with_command("ses", Some("cmd-zero"), &[], 2, true)
             .unwrap();
@@ -14289,6 +18959,9 @@ mod tests {
             }
         );
 
+        // A normal command with actual targets still queues pending drops and does not
+        // set any disposition — the no_targets path only applies when canonicalization
+        // resolved zero block_ids.
         let normal = store
             .append_pending_agent_drops_with_command(
                 "ses",
@@ -14308,6 +18981,8 @@ mod tests {
         );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
+        // The diagnostic ledger must distinguish the terminal no-target result from work
+        // that is still pending; a constant disposition would make incident reads misleading.
         assert_eq!(
             command_ledger_rows(&store, "ses"),
             vec![
@@ -14315,6 +18990,62 @@ mod tests {
                 ("cmd-normal".to_string(), None),
             ]
         );
+    }
+
+    /// A legacy row can carry a block id the scanner now flags.
+    /// Re-minting an existing flagged block ID preserves its identity and returns its row.
+    #[test]
+    fn a_flagged_block_id_that_already_has_a_row_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .execute_tag_sql_for_test(
+                "INSERT INTO mc_tags
+                     (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                 VALUES ('ses', 1, 'api_key=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q', 'message', 4, 100, X'')",
+            )
+            .unwrap();
+        let rows = store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: "api_key=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 4,
+                    source_bytes: b"body".to_vec(),
+                }],
+                200,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tag_number, 1);
+    }
+
+    /// Without a durable row, a flagged block ID is new and must not be minted.
+    #[test]
+    fn a_flagged_block_id_without_a_row_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let error = store
+            .mint_or_get_tags(
+                "ses",
+                &[TagMintInput {
+                    block_id: "api_key=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 4,
+                    source_bytes: b"body".to_vec(),
+                }],
+                200,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "{error:?}"
+        );
+        assert!(store.load_tags_for_session("ses").unwrap().is_empty());
     }
 
     #[test]
@@ -14326,7 +19057,7 @@ mod tests {
                 block_id: "m1#0".to_string(),
                 kind: "message".to_string(),
                 token_count: 11,
-                source_bytes: b"message source".to_vec(),
+                source_bytes: b"password=tag-secret".to_vec(),
             },
             TagMintInput {
                 block_id: "m2#0".to_string(),
@@ -14346,13 +19077,13 @@ mod tests {
                 block_id: "m1#0".to_string(),
                 kind: "message".to_string(),
                 token_count: 999,
-                source_bytes: b"changed source must not overwrite".to_vec(),
+                source_bytes: vec![b'x'; 512 * 1024 + 1],
             },
             TagMintInput {
                 block_id: "m3#0".to_string(),
                 kind: "tool_call".to_string(),
                 token_count: 33,
-                source_bytes: b"new source".to_vec(),
+                source_bytes: b"password=new-tag-secret".to_vec(),
             },
         ];
         let rows = store.mint_or_get_tags("ses", &second, 200).unwrap();
@@ -14363,6 +19094,14 @@ mod tests {
         );
         let all = store.load_tags_for_session("ses").unwrap();
         assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[0].source_bytes,
+            b"password=<REDACTED:password>".to_vec()
+        );
+        assert_eq!(
+            all[2].source_bytes,
+            b"password=<REDACTED:password>".to_vec()
+        );
         assert_eq!(store.tag_number_query_count_for_test(), 0);
         assert_eq!(
             store.load_tag_numbers_for_session("ses").unwrap(),
@@ -14427,7 +19166,7 @@ mod tests {
             "token count is computed once at mint"
         );
         assert_eq!(
-            all[0].source_bytes, b"message source",
+            all[0].source_bytes, b"password=<REDACTED:password>",
             "pre-overlay provenance is immutable after the first mint"
         );
         let token_sum_ids = ["m1#0".to_string(), "m3#0".to_string()]
@@ -15345,6 +20084,9 @@ mod tests {
     fn schema_version_probe_reads_the_live_store_and_matches_the_shipped_ceiling() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // The live probe must read the namespace this store actually migrates, and the
+        // compile-time ceiling must equal the newest migration the binary ships; a
+        // drift between either pair is exactly the skew the status surface exists to
         // expose.
         let shipped_max = MIGRATIONS
             .iter()
@@ -15362,6 +20104,10 @@ mod tests {
     fn pre_cutover_module_store_is_refused_by_family_not_by_ddl_collision() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
+        // A store written by a pre-cutover binary: `mc_cache` history below the
+        // consolidated bootstrap, with that history's first table already present.
+        // The migration runner would apply the bootstrap over it and fail on
+        // `CREATE TABLE mc_cache_state`, naming a symptom instead of the family.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -15406,15 +20152,143 @@ mod tests {
     }
 
     #[test]
+    fn every_durable_write_family_is_declared_once_with_a_distinct_owner_kind() {
+        let mut seen_families = BTreeSet::new();
+        let mut seen_owner_kinds = BTreeSet::new();
+        for entry in DURABLE_WRITE_REGISTRY {
+            assert!(
+                seen_families.insert(entry.family),
+                "{:?} is declared more than once",
+                entry.family
+            );
+            let owner_kind = entry.family.owner_kind();
+            assert!(
+                !owner_kind.is_empty(),
+                "{:?} has an empty owner kind",
+                entry.family
+            );
+            assert!(
+                seen_owner_kinds.insert(owner_kind),
+                "owner kind {owner_kind} is claimed by more than one family"
+            );
+            assert!(
+                !entry.preparation.is_empty(),
+                "{:?} does not name its preparation path",
+                entry.family
+            );
+            assert!(
+                !entry.test.is_empty(),
+                "{:?} does not name a proving test",
+                entry.family
+            );
+        }
+        // `PreparedWrite::new` resolves the registration, so an undeclared family panics on
+        // first use rather than writing without a declared policy.
+        for family in DurableWriteFamily::ALL {
+            assert!(
+                seen_families.contains(family),
+                "{family:?} is missing from DURABLE_WRITE_REGISTRY"
+            );
+        }
+        assert_eq!(seen_families.len(), DurableWriteFamily::ALL.len());
+    }
+
+    #[test]
+    fn store_recorded_at_the_bootstrap_adopts_later_migrations_and_can_still_audit_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let bootstrap = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == BOOTSTRAP_MIGRATION_VERSION)
+            .expect("the bootstrap migration is bundled");
+        // Schema created by the bootstrap cannot reach stores already recorded at the
+        // bootstrap version, so the audit tables have to come from a later migration.
+        // Otherwise the fixture below would seed them itself and prove nothing.
+        for table in [
+            "mc_scan_batches",
+            "mc_scan_owner_scopes",
+            "mc_scan_domain_owners",
+            "mc_field_scans",
+            "mc_scan_owner_copies",
+            "mc_scan_detections",
+        ] {
+            assert!(
+                !bootstrap.statements.contains(table),
+                "{table} must be created by a migration above v{BOOTSTRAP_MIGRATION_VERSION}, \
+                 not folded into the frozen bootstrap"
+            );
+        }
+        // Migration runners skip versions at or below the recorded version, so
+        // later-added bootstrap tables do not reach existing stores.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 );",
+            )
+            .unwrap();
+            conn.execute_batch(bootstrap.statements).unwrap();
+            conn.execute(
+                "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                 VALUES (?1, ?2, 0)",
+                params![NS, BOOTSTRAP_MIGRATION_VERSION],
+            )
+            .unwrap();
+        }
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        assert_eq!(
+            store.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION,
+            "a store at the bootstrap version must be carried to the newest migration, not refused"
+        );
+
+        // `replace_compartments` records a scan receipt in `mc_field_scans`; an
+        // unmigrated store lacks that table.
+        let compartment = StoredCompartment {
+            sequence: 1,
+            start_message: 0,
+            end_message: 10,
+            start_message_id: "a#0".to_string(),
+            end_message_id: "m10".to_string(),
+            title: "c".to_string(),
+            content: "p1".to_string(),
+            p1: Some("p1".to_string()),
+            importance: 50,
+            ..Default::default()
+        };
+        store
+            .replace_compartments("ses_upgrade", &[compartment])
+            .unwrap();
+        let receipts: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_field_scans", [], |row| row.get(0))
+            })
+            .unwrap();
+        assert!(
+            receipts > 0,
+            "the upgraded store must persist scan receipts for the write it just accepted"
+        );
+    }
+
+    #[test]
     fn fresh_and_current_module_stores_open_without_a_pre_cutover_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let descriptor = descriptor(dir.path());
+        // Fresh: no version history at all.
         let first = McStore::open(&descriptor).unwrap();
         assert_eq!(
             first.module_store_schema_version().unwrap(),
             LATEST_MIGRATION_VERSION
         );
         drop(first);
+        // Reopen: history now records exactly the bootstrap this binary composes,
+        // which the refusal must not mistake for pre-cutover history.
         let second = McStore::open(&descriptor).unwrap();
         assert_eq!(
             second.module_store_schema_version().unwrap(),
@@ -15427,7 +20301,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = descriptor(dir.path());
         let _first = McStore::open(&d).unwrap();
+        // Second live handle on the same database must be rejected (single-writer).
         assert!(McStore::open(&d).is_err());
+    }
+
+    /// A preserved existing identity stores its value verbatim and records a
+    /// `preserve` audit action, never a `substitute` one.
+    #[test]
+    fn detection_receipts_record_preserve_for_existing_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let secret = "x_auth_token=hunter-two";
+
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", "ses_actions", "receipt_probe");
+        let kept = write.existing_identity("unit_key", secret).unwrap();
+        assert_eq!(kept, secret, "an existing identity is stored verbatim");
+        let substituted = write.content("content", secret).unwrap();
+        assert_ne!(
+            substituted, secret,
+            "content preparation substitutes the detected span"
+        );
+        write
+            .execute(&store.inner, |_| Ok(WriteDisposition::Applied(())))
+            .unwrap();
+
+        let actions: Vec<(String, String)> = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT copies.field_id, det.action
+                       FROM mc_scan_detections det
+                       JOIN mc_scan_owner_copies copies USING(scan_id)
+                      ORDER BY copies.field_id",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                ("content".to_string(), "substitute".to_string()),
+                ("unit_key".to_string(), "preserve".to_string()),
+            ],
+            "each detection receipt must carry the disposition its field actually took"
+        );
     }
 
     fn import_compartment(
@@ -15647,6 +20568,7 @@ mod tests {
         );
         assert_eq!(read[0].sequence, 1, "oldest first");
 
+        // a wholesale replace fully supplants the prior set
         let replacement = vec![StoredCompartment {
             sequence: 1,
             title: "only".into(),
@@ -15659,6 +20581,7 @@ mod tests {
         assert_eq!(read2.len(), 1);
         assert_eq!(read2[0].title, "only");
 
+        // distinct sessions are isolated
         assert!(store.load_compartments("ses_b").unwrap().is_empty());
     }
 
@@ -15745,6 +20668,7 @@ mod tests {
                 })
                 .unwrap();
         };
+        // two share promoted_at=100 → id breaks the tie deterministically (3 before 4).
         insert(1, "first", "active", 50);
         insert(4, "tie-later-id", "active", 100);
         insert(3, "tie-earlier-id", "active", 100);
@@ -16262,7 +21186,7 @@ mod tests {
                 primer_candidates: &[],
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
-                chunk_transcript: Some("U: hello\nA: world"),
+                chunk_transcript: Some("U: password=transcript-secret"),
                 raw_chunk_messages: None,
             })
             .unwrap();
@@ -16272,7 +21196,10 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].compartment_seq, 1);
-        assert_eq!(rows[0].transcript.as_deref(), Some("U: hello\nA: world"));
+        assert_eq!(
+            rows[0].transcript.as_deref(),
+            Some("U: password=<REDACTED:password>")
+        );
     }
 
     #[test]
@@ -16320,7 +21247,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_chunk_transcript_is_evicted_as_unrecoverable() {
+    fn oversized_chunk_transcript_is_rejected_before_publish() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
@@ -16333,7 +21260,7 @@ mod tests {
             compress_transcript(&transcript).unwrap().len() > MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES
         );
         let expected = store.load("ses").unwrap().row_version;
-        store
+        let error = store
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
@@ -16348,7 +21275,11 @@ mod tests {
                 chunk_transcript: Some(&transcript),
                 raw_chunk_messages: None,
             })
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianPublishError::Store(McStoreError::Redaction(RedactionErrorKind::InputLimit))
+        ));
         assert!(store
             .load_chunk_transcripts_for_range("ses", 10, 21)
             .unwrap()
@@ -16424,7 +21355,7 @@ mod tests {
             compartment_set_generation: replay_meta.historian.compartment_set_generation,
             ..publish_predicate()
         };
-        store
+        let error = store
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
@@ -16446,19 +21377,15 @@ mod tests {
                 chunk_transcript: Some(&oversized),
                 raw_chunk_messages: None,
             })
-            .unwrap();
-        let transcript = store
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianPublishError::Store(McStoreError::Redaction(RedactionErrorKind::InputLimit))
+        ));
+        assert!(store
             .load_chunk_transcripts_for_range("ses", 100, 101)
             .unwrap()
-            .pop()
-            .unwrap()
-            .transcript
-            .unwrap();
-        assert!(transcript.contains(CHUNK_TRANSCRIPT_TRUNCATION_MARKER.trim()));
-        assert!(
-            transcript.len()
-                <= MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES + CHUNK_TRANSCRIPT_TRUNCATION_MARKER.len()
-        );
+            .is_empty());
     }
 
     #[test]
@@ -16672,6 +21599,8 @@ mod tests {
         assert_eq!(unchanged.status, ready.status);
         assert_eq!(unchanged.source_revision, ready.source_revision);
         assert_eq!(unchanged.compiled_check, ready.compiled_check);
+        // Mutation-neutral: a version bump would fence an active claim for
+        // compiler inputs that did not change.
         assert_eq!(unchanged.status_version, ready.status_version);
         assert_eq!(unchanged.state_version, ready.state_version);
 
@@ -16898,6 +21827,8 @@ mod tests {
                 .unwrap(),
             1
         );
+        // A newer acknowledged delivery closes the older lost attempt, so the
+        // surfaced note cannot be delivered forever.
         assert!(store
             .claim_note_delivery("git:proj", "serve-session", "pass-3", "pass-3", 70)
             .unwrap()
@@ -17876,6 +22807,10 @@ mod tests {
             } => {
                 assert_eq!(replayed.claim_id, claim.claim_id);
                 assert_eq!(replayed.registration_generation, 2);
+                // The rebind refreshes the lease: a reconnecting worker
+                // schedules its first renewal a full heartbeat interval out,
+                // so replaying with the original near-expiry lease would let
+                // it lapse mid-execution.
                 assert_eq!(replayed.expires_at, 200 + NOTE_EVAL_CLAIM_LEASE_MS);
             }
             other => panic!("expected replayed claim, got {other:?}"),
@@ -17893,6 +22828,8 @@ mod tests {
     fn note_eval_claim_ids_fit_the_wire_id_limit_for_long_project_identities() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // The module rejects id fields over 128 bytes, so a claim id must stay
+        // bounded even when the project identity alone exceeds that budget.
         let project = format!("dir:/{}", "p".repeat(200));
         let preparing = store
             .authority_begin_prepare("ctx", &project, "notes")
@@ -17991,6 +22928,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = note_eval_store(dir.path());
         eval_note(&store, "hidden by a spent cursor");
+        // The caller classifies this pass as cursor-spent, not queue-empty.
         let outcome = store
             .acquire_note_evaluation(
                 EVAL_PROJECT,
@@ -18011,6 +22949,9 @@ mod tests {
                 cycle_exhausted: true
             }
         );
+        // A response-loss retry must reproduce the exhaustion cause, or the
+        // worker mistakes the reset cursor for a drained queue and strands the
+        // work the spent cursor hid.
         assert_eq!(
             store
                 .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 1, pick_first, 200)
@@ -18046,6 +22987,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(recovered.claim_id, claim.claim_id);
+                // The rebind adopts the new acquisition id so a retry of it
+                // replays this decision from the acquisition-keyed lookup
+                // instead of re-entering slot recovery.
                 assert_eq!(recovered.acquisition_id, "acq-2");
             }
             other => panic!("expected recovered claim, got {other:?}"),
@@ -18077,6 +23021,7 @@ mod tests {
         let store = note_eval_store(dir.path());
         eval_note(&store, "note");
 
+        // One no-work acquisition, then one terminal claim.
         let idle_at = 1_000;
         store
             .acquire_note_evaluation(EVAL_PROJECT, "idle-1", "eval-a", 0, 1, pick_none, idle_at)
@@ -18115,6 +23060,8 @@ mod tests {
         );
         assert_eq!(count("mc_note_eval_claims"), 1);
 
+        // Past both retention windows the GC must RECLAIM rows, not merely blank
+        // their columns; otherwise the ledgers grow for the life of the store.
         let after_retention =
             idle_at + NOTE_EVAL_TERMINAL_RETENTION_MS + NOTE_EVAL_NO_WORK_RETENTION_MS + 1;
         store
@@ -18160,6 +23107,8 @@ mod tests {
             )
             .unwrap();
 
+        // Trigger GC via an idle poll at `at`, then report
+        // (terminal rows, terminal rows still carrying a response).
         let response_state = |at: i64| -> (i64, i64) {
             store
                 .acquire_note_evaluation(
@@ -18219,6 +23168,7 @@ mod tests {
         eval_note(&store, "note");
         let now = 1_000;
 
+        // Retire one claim, leaving a terminal row inside the retention window.
         let claim = eval_claim(&store, "acq-1", 0, now);
         store
             .complete_note_evaluation(
@@ -18232,6 +23182,9 @@ mod tests {
             )
             .unwrap();
 
+        // With the cap squeezed to 1, a retained terminal row must NOT deny new
+        // work: counting it would turn the cap into a rolling throughput ceiling
+        // that stalls the project until rows aged out.
         match store
             .acquire_note_evaluation_with_cap(
                 EVAL_PROJECT,
@@ -18256,6 +23209,10 @@ mod tests {
         let store = note_eval_store(dir.path());
         let note = eval_note(&store, "note");
 
+        // Legacy shape: a compiled artifact with NO check_hash, so verification is
+        // impossible either way. Discarding it would force a fresh LLM compile.
+        // The repair is one-shot per store and already ran during open(), so clear
+        // its completion flag to exercise it against this row.
         store
             .inner
             .with_conn(|conn| {
@@ -18496,6 +23453,39 @@ mod tests {
             }
             other => panic!("expected second completion to apply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn note_evaluation_callback_errors_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let _note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-error", 0, 0);
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-error",
+                    "eval-a",
+                    0,
+                    50,
+                    |_, _| Err("password=callback-secret".to_string()),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "invalid" }
+        );
+        let NoteEvalRenewOutcome::TerminalReplay {
+            response: Some(response),
+            ..
+        } = store
+            .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 60)
+            .unwrap()
+        else {
+            panic!("invalid callback result must be replayable");
+        };
+        assert!(response.contains("password=<REDACTED:password>"));
+        assert!(!response.contains("callback-secret"));
     }
 
     #[test]
@@ -18786,6 +23776,97 @@ mod shadow_tests {
         }
     }
 
+    /// A state sync whose metadata fails preparation must roll back. Pending drops, hint
+    /// seeds, compartments, the workspace, and the profile are written before that scan runs,
+    /// so reporting the refusal through a successful disposition commits them.
+    #[test]
+    fn state_sync_metadata_scan_failure_rolls_back_earlier_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "rollback-session";
+        let drop = PendingAgentDropSeedRow {
+            block_id: "ccm-0#7".to_string(),
+            queued_at_ms: 5,
+        };
+        // The request's own fields are bounded before the transaction opens, so the in-transaction
+        // metadata scan is reached through state a previous release already stored. A grandfathered
+        // `last_model_key` past the durable bound makes the assembled metadata fail that scan.
+        let legacy = ModuleMeta {
+            last_model_key: "x".repeat(MAX_DURABLE_TEXT_BYTES + 1),
+            ..Default::default()
+        };
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, 1, ?2, ?3, 0)",
+                    params![
+                        session,
+                        serde_json::to_string(&CoreState::default()).unwrap(),
+                        serde_json::to_string(&legacy).unwrap(),
+                    ],
+                )
+            })
+            .unwrap();
+
+        let error = store
+            .apply_authority_state_sync(ModuleStateSyncRequest {
+                session_id: session,
+                project_path: "project",
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
+                pending_agent_drops: &[drop],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
+                compartments: &[],
+                user_profile: &[],
+                user_profile_present: false,
+                workspace: None,
+                workspace_present: false,
+                last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
+                acked_watermarks: serde_json::json!({"section_seq": 0}),
+            })
+            .expect_err("oversized metadata must not be accepted");
+        assert!(
+            !matches!(error, ModuleStateSyncError::GenerationMismatch { .. }),
+            "the sync must fail on its metadata, not on a fence: {error:?}"
+        );
+
+        let seeded: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_agent_drops WHERE session_id = ?1",
+                    params![session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            seeded, 0,
+            "a refused state sync committed its pending-drop seed"
+        );
+    }
+
     fn apply_state_sync_sections(
         store: &McStore,
         expected_shadow_seq: u64,
@@ -18931,7 +24012,7 @@ mod shadow_tests {
                     "id": source_row_id,
                     "project_path": "project",
                     "session_id": format!("session-{source_row_id}"),
-                    "content": format!("note {source_row_id}"),
+                    "content": format!("note {source_row_id} password=seed-secret"),
                     "status": "active"
                 }),
             })
@@ -18966,6 +24047,12 @@ mod shadow_tests {
             state_before_retry,
             "re-seeding the same frame must be a no-op"
         );
+        assert!(store
+            .read_project_notes("project", None, &["active"], 20, 0)
+            .unwrap()
+            .iter()
+            .all(|note| note.content.contains("password=<REDACTED:password>")
+                && !note.content.contains("seed-secret")));
     }
 
     #[test]
@@ -19374,6 +24461,10 @@ mod lineage_descent_tests {
         }]
     }
 
+    /// The CC-leg mid assigner is zero-based: a fresh replacement array's
+    /// anchor sits at ordinal 0 (measured on the rig — ccm-0#1 carrying the
+    /// stored summary). A fresh-origin anchor at 0 must descend exactly like
+    /// the 1-based form; the placeholder still lands at prior_last+1.
     #[test]
     fn descent_accepts_a_zero_based_fresh_anchor() {
         let dir = tempfile::tempdir().unwrap();
@@ -19407,6 +24498,8 @@ mod lineage_descent_tests {
         assert_eq!(target.core.boundary_id, "ccm-0#1");
     }
 
+    /// A mid-space anchor (neither a fresh origin nor the placeholder) must
+    /// refuse — the widened origin acceptance is exactly {0, 1}, not "small".
     #[test]
     fn descent_refuses_a_mid_space_anchor() {
         let dir = tempfile::tempdir().unwrap();
@@ -19461,14 +24554,25 @@ mod lineage_descent_tests {
             .inner
             .with_conn(|conn| {
                 conn.execute(
-                    "INSERT INTO mc_tags
-                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
-                      VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
+                    "UPDATE mc_notes SET content = 'password=legacy-note-secret' WHERE id = ?1",
+                    [source_note.id],
+                )?;
+                conn.execute(
+                    "UPDATE mc_compartments
+                        SET title = 'password=legacy-title-secret',
+                            content = 'password=legacy-content-secret'
+                      WHERE session_id = 'A'",
                     [],
                 )?;
                 conn.execute(
+                    "INSERT INTO mc_tags
+                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                      VALUES ('A', 1, 'm2#0', 'message', 7, 1, ?1)",
+                    params![b"password=legacy-tag-secret".as_slice()],
+                )?;
+                conn.execute(
                     "INSERT INTO mc_temporal_marks(session_id, block_id, marker_text, created_at)
-                     VALUES ('A', 'm2#0', '<!-- +1m -->', 1)",
+                     VALUES ('A', 'm2#0', 'password=legacy-marker-secret', 1)",
                     [],
                 )?;
                 conn.execute(
@@ -19476,7 +24580,7 @@ mod lineage_descent_tests {
                          session_id, compartment_seq, start_ordinal, end_ordinal,
                          transcript_deflate, created_at_ms
                      ) VALUES ('A', 1, 1, 3, ?1, 1)",
-                    params![compress_transcript("U: pre-compaction transcript").unwrap()],
+                    params![compress_transcript("U: password=legacy-transcript-secret").unwrap()],
                 )?;
                 Ok(())
             })
@@ -19532,17 +24636,38 @@ mod lineage_descent_tests {
                 conn.query_row(
                     "SELECT
                          (SELECT COUNT(*) FROM mc_tags WHERE session_id = 'B'),
-                         (SELECT COUNT(*) FROM mc_temporal_marks WHERE session_id = 'B')",
+                         (SELECT COUNT(*) FROM mc_temporal_marks WHERE session_id = 'B'),
+                         (SELECT CAST(source_bytes AS TEXT) FROM mc_tags WHERE session_id = 'B'),
+                         (SELECT marker_text FROM mc_temporal_marks WHERE session_id = 'B')",
                     [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
                 )
             })
             .unwrap();
-        assert_eq!(copied_markers, (1, 1));
+        assert_eq!(
+            copied_markers,
+            (
+                1,
+                1,
+                "password=<REDACTED:password>".to_string(),
+                "password=<REDACTED:password>".to_string(),
+            )
+        );
+        assert!(copied[..copied.len() - 1].iter().all(|row| {
+            row.title == "password=<REDACTED:password>"
+                && row.content == "password=<REDACTED:password>"
+        }));
         let inherited_notes = store.read_notes("git:project", "B", 10, 0).unwrap();
         assert_eq!(inherited_notes.len(), 1);
         assert_ne!(inherited_notes[0].id, source_note.id);
-        assert_eq!(inherited_notes[0].content, source_note.content);
+        assert_eq!(inherited_notes[0].content, "password=<REDACTED:password>");
         assert_eq!(
             inherited_notes[0].anchor_block_id.as_deref(),
             source_note.anchor_block_id.as_deref()
@@ -19551,7 +24676,7 @@ mod lineage_descent_tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(
             transcript[0].transcript.as_deref(),
-            Some("U: pre-compaction transcript")
+            Some("U: password=<REDACTED:password>")
         );
         assert_eq!(
             (transcript[0].start_ordinal, transcript[0].end_ordinal),
