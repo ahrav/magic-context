@@ -86,14 +86,15 @@ jobs:
           restore-keys: |
             paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-
 
+      # The policy is part of the key because noise measured at one replicate depth or family minimum does not transfer to another; the runner rejects a mismatch, and keying it here avoids restoring a record only to fail closed on it.
       - name: Restore calibration evidence
         if: env.PAIRED_DELTA_MODE != 'calibration'
         uses: actions/cache/restore@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.run_id }}
           restore-keys: |
-            paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-
+            paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-
 
       - name: Run live paired-delta lane
         timeout-minutes: 300
@@ -123,7 +124,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-calibration.json
-          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json', 'packages/e2e-tests/pools/paired-delta-policy.json') }}-${{ github.run_id }}
 
       - name: Archive reports and rollout records
         if: always()

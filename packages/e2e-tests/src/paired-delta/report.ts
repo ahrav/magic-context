@@ -252,7 +252,8 @@ export interface CalibrationDecision {
 
 export interface CalibrationFamilyNoise {
     familyId: string;
-    /** Paired deltas contributing to the family, which is two per analysable coordinate rather than a replicate depth. */
+    /** One entry per primary endpoint, because pooling both dilutes a noisy baseline with a constant one. */
+    endpoint: "mc-on-vs-mc-off" | "mc-on-vs-compaction";
     observationCount: number;
     spread: number;
     variance: number;
@@ -262,11 +263,15 @@ export interface CalibrationFamilyNoise {
 export interface PairedDeltaCalibrationRecord {
     schema: typeof PAIRED_DELTA_CALIBRATION_SCHEMA;
     poolManifestFingerprint: string;
+    /** Noise measured under one policy does not transfer to another: replicate depth and the family minimum both change what the floor means. */
+    policyFingerprint: string;
     pinnedSnapshotId: string;
     runStatus: PairedDeltaRunResult["status"];
     validForPoolSizing: boolean;
     measuredCostUsd: number;
     estimatedReserveUsd: number;
+    /** Charges from superseded attempts of retried coordinates, which carry no cost source of their own on the surviving record. */
+    retrySpendUsd: number;
     measuredWallClockMs: number;
     familyNoise: CalibrationFamilyNoise[];
     decisions: CalibrationDecision;
@@ -338,35 +343,48 @@ function coordinateKey(record: RolloutRecord): string {
 }
 
 /**
- * The paired endpoint is `mc-on` minus a baseline, so the noise floor is measured on those deltas rather than on `mc-on` scores alone.
- * A baseline that alternates between success and failure while `mc-on` stays constant moves the endpoint the lane sizes for, and scoring only `mc-on` would publish a zero floor for it.
+ * The preregistered endpoint is a valid-success delta, so a cell scores 1 only when every applicable critical check passed.
+ * Averaging the whole check vector let an arm that wrote the file with the wrong answer score 0.5 despite zero valid successes.
+ */
+function validSuccess(record: RolloutRecord): number {
+    if (record.cell.criticalTotal === 0) {
+        throw new Error(`paired-delta-calibration: empty-critical-vector-${record.scenarioId}`);
+    }
+    return record.cell.criticalPassed === record.cell.criticalTotal ? 1 : 0;
+}
+
+const CALIBRATION_ENDPOINTS = [
+    ["mc-off", "mc-on-vs-mc-off"],
+    ["compaction", "mc-on-vs-compaction"],
+] as const;
+
+/**
+ * The paired endpoint is `mc-on` minus a baseline, so the noise floor is measured on those deltas rather than on `mc-on` outcomes alone.
+ * Endpoint identity is retained, because pooling a noisy baseline with a constant one dilutes the variance the noisy endpoint has to be sized for.
  */
 function coordinateDeltas(
     records: readonly RolloutRecord[],
     analysable: ReadonlySet<string>,
-): Map<string, number[]> {
+): Map<string, Map<CalibrationFamilyNoise["endpoint"], number>> {
     const cells = new Map<string, Map<ArmId, number>>();
     for (const record of records) {
         if (record.cell.runHealth !== "completed") continue;
         const key = coordinateKey(record);
         if (!analysable.has(key)) continue;
-        if (record.cell.checksTotal === 0) {
-            throw new Error(`paired-delta-calibration: empty-check-vector-${record.scenarioId}`);
-        }
         const scores = cells.get(key) ?? new Map<ArmId, number>();
-        scores.set(record.armId, record.cell.checksPassed / record.cell.checksTotal);
+        scores.set(record.armId, validSuccess(record));
         cells.set(key, scores);
     }
-    const deltas = new Map<string, number[]>();
+    const deltas = new Map<string, Map<CalibrationFamilyNoise["endpoint"], number>>();
     for (const [key, scores] of cells) {
         const treatment = scores.get("mc-on");
         if (treatment === undefined) continue;
-        const observed: number[] = [];
-        for (const baseline of ["mc-off", "compaction"] as const) {
+        const observed = new Map<CalibrationFamilyNoise["endpoint"], number>();
+        for (const [baseline, endpoint] of CALIBRATION_ENDPOINTS) {
             const value = scores.get(baseline);
-            if (value !== undefined) observed.push(treatment - value);
+            if (value !== undefined) observed.set(endpoint, treatment - value);
         }
-        if (observed.length > 0) deltas.set(key, observed);
+        if (observed.size > 0) deltas.set(key, observed);
     }
     return deltas;
 }
@@ -377,15 +395,24 @@ export function buildCalibrationRecord(input: {
     runStatus: PairedDeltaRunResult["status"];
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
+    policyFingerprint: string;
     targetMinimumDetectableDelta: number;
     decisions: Omit<CalibrationDecision, "poolSize">;
 }): PairedDeltaCalibrationRecord {
     requireHex64(input.poolManifestFingerprint, "pool-manifest-fingerprint");
+    requireHex64(input.policyFingerprint, "policy-fingerprint");
     const analysable = completePrimaryCoordinates(input.records);
     const deltasByCoordinate = coordinateDeltas(input.records, analysable);
-    const byFamily = new Map<string, number[]>();
-    for (const familyId of new Set(input.scenarioFamilies.values())) {
-        byFamily.set(familyId, []);
+    const families = new Set(input.scenarioFamilies.values());
+    const bySeries = new Map<string, number[]>();
+    const seriesKey = (
+        familyId: string,
+        endpoint: CalibrationFamilyNoise["endpoint"],
+    ): string => JSON.stringify([familyId, endpoint]);
+    for (const familyId of families) {
+        for (const [, endpoint] of CALIBRATION_ENDPOINTS) {
+            bySeries.set(seriesKey(familyId, endpoint), []);
+        }
     }
     /** Replicate depth is counted per scenario, so one scenario's complete replicates cannot stand in for another scenario that failed outright in the same family. */
     const depthByScenario = new Map<string, number>();
@@ -397,16 +424,22 @@ export function buildCalibrationRecord(input: {
         }
         const observed = deltasByCoordinate.get(coordinateKey(record));
         if (observed === undefined) continue;
-        byFamily.get(familyId)!.push(...observed);
+        for (const [endpoint, delta] of observed) {
+            bySeries.get(seriesKey(familyId, endpoint))!.push(delta);
+        }
         depthByScenario.set(
             record.scenarioId,
             (depthByScenario.get(record.scenarioId) ?? 0) + 1,
         );
     }
-    const familyNoise = [...byFamily]
+    const familyNoise = [...bySeries]
         .filter(([, values]) => values.length > 0)
         .sort(([left], [right]) => compareCodeUnits(left, right))
-        .map(([familyId, values]): CalibrationFamilyNoise => {
+        .map(([key, values]): CalibrationFamilyNoise => {
+            const [familyId, endpoint] = JSON.parse(key) as [
+                string,
+                CalibrationFamilyNoise["endpoint"],
+            ];
             const average = values.reduce((sum, value) => sum + value, 0) / values.length;
             const variance = values.length === 1
                 ? 0
@@ -415,12 +448,14 @@ export function buildCalibrationRecord(input: {
             const spread = Math.max(...values) - Math.min(...values);
             return {
                 familyId,
+                endpoint,
                 observationCount: values.length,
                 spread,
                 variance,
                 interval: { lower: 0, upper: spread },
             };
         });
+    const measuredFamilies = new Set(familyNoise.map(({ familyId }) => familyId));
     /** Every selected scenario reaches the configured replicate depth, and one measurement per family reports zero variance, so pool sizing requires the depth the run was configured for. */
     const depthComplete = [...input.scenarioFamilies.keys()].every((scenarioId) =>
         (depthByScenario.get(scenarioId) ?? 0) >= input.decisions.replicateCount);
@@ -429,16 +464,21 @@ export function buildCalibrationRecord(input: {
         ({ ...body, recordFingerprint: canonicalFingerprint(body) }))({
         schema: PAIRED_DELTA_CALIBRATION_SCHEMA,
         poolManifestFingerprint: input.poolManifestFingerprint,
+        policyFingerprint: input.policyFingerprint,
         pinnedSnapshotId: input.pinnedSnapshotId,
         runStatus: input.runStatus,
         validForPoolSizing: input.runStatus === "completed" &&
-            familyNoise.length === byFamily.size &&
+            measuredFamilies.size === families.size &&
             depthComplete,
         /** A failed rollout is priced from its worst-case reserve, so those dollars are reported apart from provider-observed spend rather than inflating a measured total that later budgets read. */
         measuredCostUsd: observed.reduce((sum, record) => sum + record.costUsd, 0),
         estimatedReserveUsd: input.records
             .filter(({ costSource }) => costSource === "estimated")
             .reduce((sum, record) => sum + record.costUsd, 0),
+        retrySpendUsd: input.records.reduce(
+            (sum, record) => sum + record.priorAttemptsCostUsd,
+            0,
+        ),
         measuredWallClockMs: input.records.reduce(
             (sum, record) => sum + record.wallClockMs,
             0,
@@ -484,8 +524,10 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     }
     const record = raw as unknown as PairedDeltaCalibrationRecord;
     requireHex64(record.poolManifestFingerprint, "pool-manifest-fingerprint");
+    requireHex64(record.policyFingerprint, "policy-fingerprint");
     if (
         typeof record.pinnedSnapshotId !== "string" ||
+        typeof record.policyFingerprint !== "string" ||
         typeof record.validForPoolSizing !== "boolean" ||
         !Array.isArray(record.familyNoise) ||
         record.familyNoise.some((noise) =>

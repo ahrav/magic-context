@@ -320,10 +320,11 @@ function rolloutRecord(
     scenarioId: string,
     replicateIndex: number,
     armId: PrimaryArm,
-    checksPassed: number,
+    validSuccess: boolean,
     options: {
         runHealth?: RolloutRecord["cell"]["runHealth"];
         costSource?: RolloutRecord["costSource"];
+        priorAttemptsCostUsd?: number;
     } = {},
 ): RolloutRecord {
     const runHealth = options.runHealth ?? "completed";
@@ -342,21 +343,22 @@ function rolloutRecord(
         intervention: { kind: "none", value: null },
         cell: {
             armId,
-            checksPassed,
+            /** `check-file` passes either way, so a wrong answer is a passing check with no valid success. */
+            checksPassed: validSuccess ? 2 : 1,
             checksTotal: 2,
-            criticalPassed: checksPassed > 0 ? 1 : 0,
+            criticalPassed: validSuccess ? 1 : 0,
             criticalTotal: 1,
             invalidSuccess: false,
             runHealth,
             reasonCode: runHealth === "completed" ? null : "provider-unavailable",
         },
         checks: [
-            { id: "check-file", passed: checksPassed > 0 },
-            { id: "check-answer", passed: checksPassed > 1 },
+            { id: "check-file", passed: true },
+            { id: "check-answer", passed: validSuccess },
         ],
         usage: { input: 10, output: 5, cacheCreation: 0, cacheRead: 0 },
         costUsd: 1.25,
-        priorAttemptsCostUsd: 0,
+        priorAttemptsCostUsd: options.priorAttemptsCostUsd ?? 0,
         maxAttemptCostUsd: 1.25,
         costSource: options.costSource ?? "observed",
         wallClockMs: 1000,
@@ -369,10 +371,10 @@ function rolloutRecord(
 function coordinate(
     scenarioId: string,
     replicateIndex: number,
-    scores: Partial<Record<PrimaryArm, number>> & { "mc-on": number },
+    outcomes: Record<PrimaryArm, boolean>,
 ): RolloutRecord[] {
     return PRIMARY_ARM_IDS.map((armId) =>
-        rolloutRecord(scenarioId, replicateIndex, armId, scores[armId] ?? 2));
+        rolloutRecord(scenarioId, replicateIndex, armId, outcomes[armId]));
 }
 
 describe("paired-delta calibration record", () => {
@@ -388,9 +390,7 @@ describe("paired-delta calibration record", () => {
     const build = (
         records: readonly RolloutRecord[],
         overrides: {
-            runStatus?: RolloutRecord["cell"]["runHealth"] extends never ? never : Parameters<
-                typeof buildCalibrationRecord
-            >[0]["runStatus"];
+            runStatus?: Parameters<typeof buildCalibrationRecord>[0]["runStatus"];
             targetMinimumDetectableDelta?: number;
             scenarioFamilies?: ReadonlyMap<string, string>;
         } = {},
@@ -400,111 +400,121 @@ describe("paired-delta calibration record", () => {
         runStatus: overrides.runStatus ?? "completed",
         poolManifestFingerprint: H1,
         pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+        policyFingerprint: H2,
         targetMinimumDetectableDelta: overrides.targetMinimumDetectableDelta ?? 0.15,
         decisions,
     });
-    const noisy = [
-        ...coordinate("var-a", 0, { "mc-on": 2, "mc-off": 0, compaction: 0 }),
-        ...coordinate("var-a", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-        ...coordinate("var-a", 2, { "mc-on": 2, "mc-off": 1, compaction: 1 }),
-        ...coordinate("var-b", 0, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-        ...coordinate("var-b", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-        ...coordinate("var-b", 2, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
+
+    /**
+     * `fam-one` alternates `mc-off` while `compaction` tracks `mc-on`, so the
+     * mc-off endpoint is noisy and the compaction endpoint is constant.
+     * `fam-two` is quiet on both.
+     */
+    const split = [
+        ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: true }),
+        ...coordinate("var-a", 1, { "mc-on": true, "mc-off": true, compaction: true }),
+        ...coordinate("var-a", 2, { "mc-on": true, "mc-off": false, compaction: true }),
+        ...coordinate("var-b", 0, { "mc-on": true, "mc-off": true, compaction: true }),
+        ...coordinate("var-b", 1, { "mc-on": true, "mc-off": true, compaction: true }),
+        ...coordinate("var-b", 2, { "mc-on": true, "mc-off": true, compaction: true }),
     ];
 
-    it("measures family noise on the paired deltas, not on mc-on scores alone", () => {
-        const built = build(noisy);
+    it("scores the preregistered valid-success endpoint as binary", () => {
+        // Every arm passes `check-file`, so a check average would report 0.5 rather than 0.
+        const built = build(split);
+        const mcOff = built.familyNoise
+            .find((noise) => noise.familyId === "fam-one" && noise.endpoint === "mc-on-vs-mc-off");
 
+        expect(mcOff?.spread).toBe(1);
+        expect(mcOff?.observationCount).toBe(3);
+    });
+
+    it("keeps endpoint identity so a constant baseline cannot dilute a noisy one", () => {
+        const built = build(split);
+
+        expect(built.familyNoise.map(({ familyId, endpoint }) => `${familyId}:${endpoint}`))
+            .toEqual([
+                "fam-one:mc-on-vs-compaction",
+                "fam-one:mc-on-vs-mc-off",
+                "fam-two:mc-on-vs-compaction",
+                "fam-two:mc-on-vs-mc-off",
+            ]);
+        const worst = Math.max(...built.familyNoise.map(({ variance }) => variance));
+        const pooled = [1, 0, 1, 0, 0, 0];
+        const pooledMean = pooled.reduce((sum, value) => sum + value, 0) / pooled.length;
+        const pooledVariance = pooled
+            .reduce((sum, value) => sum + (value - pooledMean) ** 2, 0) / (pooled.length - 1);
+
+        expect(worst).toBeGreaterThan(pooledVariance);
         expect(built.validForPoolSizing).toBe(true);
-        // Every mc-on cell scores 1.0, so an mc-on-only floor would be zero for both families.
-        expect(built.familyNoise).toEqual([
-            {
-                familyId: "fam-one",
-                observationCount: 6,
-                spread: 1,
-                variance: 0.2,
-                interval: { lower: 0, upper: 1 },
-            },
-            {
-                familyId: "fam-two",
-                observationCount: 6,
-                spread: 0,
-                variance: 0,
-                interval: { lower: 0, upper: 0 },
-            },
-        ]);
         const { recordFingerprint, ...body } = built;
         expect(recordFingerprint).toBe(canonicalFingerprint(body));
     });
 
-    it("reports estimated reserves apart from provider-observed spend", () => {
+    it("sizes the pool from the worst endpoint variance and the target delta", () => {
+        const quiet = build([
+            ...coordinate("var-a", 0, { "mc-on": true, "mc-off": true, compaction: true }),
+            ...coordinate("var-a", 1, { "mc-on": true, "mc-off": true, compaction: true }),
+            ...coordinate("var-a", 2, { "mc-on": true, "mc-off": true, compaction: true }),
+            ...coordinate("var-b", 0, { "mc-on": true, "mc-off": true, compaction: true }),
+            ...coordinate("var-b", 1, { "mc-on": true, "mc-off": true, compaction: true }),
+            ...coordinate("var-b", 2, { "mc-on": true, "mc-off": true, compaction: true }),
+        ]);
+        const built = build(split);
+        const worst = Math.max(...built.familyNoise.map(({ variance }) => variance));
+
+        expect(quiet.decisions.poolSize).toBe(decisions.familyCount);
+        expect(built.decisions.poolSize).toBe(
+            Math.ceil(((1.959964 + 0.841621) ** 2 * worst) / 0.15 ** 2) * decisions.familyCount,
+        );
+    });
+
+    it("widens the pool as the target delta shrinks", () => {
+        expect(build(split, { targetMinimumDetectableDelta: 0.05 }).decisions.poolSize)
+            .toBeGreaterThan(build(split).decisions.poolSize);
+    });
+
+    it("rejects a non-positive target delta", () => {
+        expect(() => build(split, { targetMinimumDetectableDelta: 0 }))
+            .toThrow(/target-delta-invalid/);
+    });
+
+    it("marks cap-terminated calibration invalid for sizing", () => {
+        expect(build(split, { runStatus: "cost-cap-reached" }).validForPoolSizing).toBe(false);
+    });
+
+    it("separates observed spend, estimated reserves, and retry spend", () => {
         const built = build([
-            ...noisy,
-            rolloutRecord("var-a", 0, "mc-off", 0, {
+            ...split,
+            rolloutRecord("var-a", 0, "mc-off", false, {
                 runHealth: "crash",
                 costSource: "estimated",
+                priorAttemptsCostUsd: 0.75,
             }),
         ]);
 
         expect(built.measuredCostUsd).toBe(18 * 1.25);
         expect(built.estimatedReserveUsd).toBe(1.25);
-    });
-
-    it("sizes the pool from the worst measured variance and the target delta", () => {
-        const quiet = build([
-            ...coordinate("var-a", 0, { "mc-on": 2 }),
-            ...coordinate("var-a", 1, { "mc-on": 2 }),
-            ...coordinate("var-a", 2, { "mc-on": 2 }),
-            ...coordinate("var-b", 0, { "mc-on": 2 }),
-            ...coordinate("var-b", 1, { "mc-on": 2 }),
-            ...coordinate("var-b", 2, { "mc-on": 2 }),
-        ]);
-
-        expect(quiet.decisions.poolSize).toBe(decisions.familyCount);
-        expect(build(noisy).decisions.poolSize).toBeGreaterThan(quiet.decisions.poolSize);
-        expect(build(noisy).decisions.poolSize).toBe(
-            Math.ceil(((1.959964 + 0.841621) ** 2 * 0.2) / 0.15 ** 2) * decisions.familyCount,
-        );
-    });
-
-    it("widens the pool as the target delta shrinks", () => {
-        expect(build(noisy, { targetMinimumDetectableDelta: 0.05 }).decisions.poolSize)
-            .toBeGreaterThan(build(noisy).decisions.poolSize);
-    });
-
-    it("rejects a non-positive target delta", () => {
-        expect(() => build(noisy, { targetMinimumDetectableDelta: 0 }))
-            .toThrow(/target-delta-invalid/);
-    });
-
-    it("marks cap-terminated calibration invalid for sizing", () => {
-        expect(build(noisy, { runStatus: "cost-cap-reached" }).validForPoolSizing).toBe(false);
+        expect(built.retrySpendUsd).toBe(0.75);
     });
 
     it("ignores coordinates whose paired baseline arms did not complete", () => {
         const built = build([
-            ...coordinate("var-a", 0, { "mc-on": 2, "mc-off": 0, compaction: 0 }),
-            ...coordinate("var-a", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-            ...coordinate("var-a", 2, { "mc-on": 2, "mc-off": 1, compaction: 1 }),
-            rolloutRecord("var-b", 0, "mc-on", 2),
-            rolloutRecord("var-b", 0, "mc-off", 0, { runHealth: "unavailable" }),
-            rolloutRecord("var-b", 0, "compaction", 2),
+            ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: true }),
+            ...coordinate("var-a", 1, { "mc-on": true, "mc-off": true, compaction: true }),
+            ...coordinate("var-a", 2, { "mc-on": true, "mc-off": false, compaction: true }),
+            rolloutRecord("var-b", 0, "mc-on", true),
+            rolloutRecord("var-b", 0, "mc-off", false, { runHealth: "unavailable" }),
+            rolloutRecord("var-b", 0, "compaction", true),
         ]);
 
-        expect(built.familyNoise.map(({ familyId }) => familyId)).toEqual(["fam-one"]);
+        expect(new Set(built.familyNoise.map(({ familyId }) => familyId)))
+            .toEqual(new Set(["fam-one"]));
         expect(built.validForPoolSizing).toBe(false);
     });
 
     it("requires every selected scenario to reach the configured replicate depth", () => {
-        // `var-b` and `var-c` share a family, so one scenario's full depth must not cover the other's absence.
-        const built = build([
-            ...coordinate("var-a", 0, { "mc-on": 2, "mc-off": 0, compaction: 0 }),
-            ...coordinate("var-a", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-            ...coordinate("var-a", 2, { "mc-on": 2, "mc-off": 1, compaction: 1 }),
-            ...coordinate("var-b", 0, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-            ...coordinate("var-b", 1, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-            ...coordinate("var-b", 2, { "mc-on": 2, "mc-off": 2, compaction: 2 }),
-        ], {
+        const built = build(split, {
             scenarioFamilies: new Map([
                 ["var-a", "fam-one"],
                 ["var-b", "fam-two"],
@@ -512,8 +522,19 @@ describe("paired-delta calibration record", () => {
             ]),
         });
 
-        expect(built.familyNoise.map(({ familyId }) => familyId))
-            .toEqual(["fam-one", "fam-two"]);
         expect(built.validForPoolSizing).toBe(false);
+    });
+
+    it("rejects a record whose policy fingerprint is not a digest", () => {
+        expect(() => buildCalibrationRecord({
+            records: split,
+            scenarioFamilies: families,
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            policyFingerprint: "not-a-digest",
+            targetMinimumDetectableDelta: 0.15,
+            decisions,
+        })).toThrow(/policy-fingerprint-invalid/);
     });
 });

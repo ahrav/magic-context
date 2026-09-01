@@ -23,6 +23,7 @@ import {
 import { parsePolicyOwnerDocument } from "../src/prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../src/prospective-holdout/report";
 import {
+    MIN_BOOTSTRAP_RESAMPLES,
     estimateFamilyDeltas,
     type FamilyDeltaAnalysis,
     type FamilyDeltaObservation,
@@ -844,10 +845,15 @@ export function createLiveDependencies(input: {
     };
 }
 
-function score(record: RolloutRecord, checkIds: readonly string[]): number {
-    const selected = record.checks.filter(({ id }) => checkIds.includes(id));
-    if (selected.length === 0) throw new Error("paired delta has no shared checks");
-    return selected.filter(({ passed }) => passed).length / selected.length;
+/**
+ * The policy declares `paired-valid-success-delta`, so an arm scores 1 only when every applicable critical check passed.
+ * Averaging the whole check vector estimated a different quantity: an arm that wrote the answer file with the wrong contents scored 0.5 with zero valid successes.
+ */
+function validSuccess(record: RolloutRecord): number {
+    if (record.cell.criticalTotal === 0) {
+        throw new Error("paired delta cell declares no critical checks");
+    }
+    return record.cell.criticalPassed === record.cell.criticalTotal ? 1 : 0;
 }
 
 function buildAnalysis(
@@ -876,8 +882,8 @@ function buildAnalysis(
                     familyId: scenario.familyId,
                     endpoint,
                     delta:
-                        score(coordinate.cells["mc-on"]!, scenario.checks) -
-                        score(coordinate.cells[baseline]!, scenario.checks),
+                        validSuccess(coordinate.cells["mc-on"]!) -
+                        validSuccess(coordinate.cells[baseline]!),
                     runHealth: "completed",
                 });
             }
@@ -936,8 +942,8 @@ const BOOTSTRAP_SEED = 20260831;
 /** Bound on R1 database reseeds. Each attempt draws fresh 32-hex ids, so exhausting the bound is a contract failure rather than bad luck, and it is reported as one. */
 const R1_RESEED_ATTEMPTS = 8;
 
-/** A calibration run that completes without producing sizing-valid evidence exits with its own code, so the workflow does not cache a record every later dispatch rejects. */
-const INVALID_CALIBRATION_EXIT = 5;
+/** A run that completes without meeting its evidence gate exits with its own code: a calibration would otherwise be cached and rejected by every later dispatch, and a weekly or release dispatch would report green with nothing to monitor. */
+const INSUFFICIENT_EVIDENCE_EXIT = 5;
 
 /** The live lane derives its deltas from rollout records, so it publishes no prospective paired-case facts. */
 const LIVE_LANE_PAIRS = [] as const;
@@ -1025,6 +1031,14 @@ async function runLive(args: CliArgs): Promise<void> {
     if (!model || !/-\d{8}$/.test(model.modelId)) {
         throw new Error("paired-delta policy requires a dated model snapshot");
     }
+    /** The estimator runs only after the experiment, so its own floor is checked before the budget is spent. */
+    if (policy.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES) {
+        throw new Error(
+            `paired-delta policy declares bootstrapResamples ` +
+            `${policy.bootstrapResamples}; the estimator requires at least ` +
+            `${MIN_BOOTSTRAP_RESAMPLES}`,
+        );
+    }
     /**
      * Calibration evidence is validated before the first provider call rather than after the experiment.
      * A weekly or release dispatch with a missing or unbound record would otherwise spend its whole budget and then discard the result.
@@ -1041,6 +1055,7 @@ async function runLive(args: CliArgs): Promise<void> {
         if (
             calibration.poolManifestFingerprint !== manifestFingerprint ||
             calibration.pinnedSnapshotId !== model.modelId ||
+            calibration.policyFingerprint !== policyDocument.policyFingerprint ||
             !calibration.validForPoolSizing
         ) {
             throw new Error("paired-delta calibration record does not bind this run");
@@ -1102,6 +1117,7 @@ async function runLive(args: CliArgs): Promise<void> {
             runStatus: result.status,
             poolManifestFingerprint: manifestFingerprint,
             pinnedSnapshotId: model.modelId,
+            policyFingerprint: policyDocument.policyFingerprint,
             targetMinimumDetectableDelta: policy.targetMinimumDetectableDelta,
             decisions: {
                 familyCount: policy.minimumAnalyzableFamilyCount,
@@ -1158,7 +1174,17 @@ async function runLive(args: CliArgs): Promise<void> {
         console.error(
             "paired-delta calibration completed without evidence valid for pool sizing",
         );
-        process.exitCode = INVALID_CALIBRATION_EXIT;
+        process.exitCode = INSUFFICIENT_EVIDENCE_EXIT;
+        return;
+    }
+    /** A weekly or release dispatch whose cells were all excluded still completes, so the preregistered evidence gate decides the exit rather than the run status alone. */
+    if (mode !== "calibration" && !analysis.evidenceSufficient) {
+        console.error(
+            `paired-delta ${mode} completed without sufficient evidence: ` +
+            `${analysis.analyzableFamilyCount} of ` +
+            `${policy.minimumAnalyzableFamilyCount} families analyzable`,
+        );
+        process.exitCode = INSUFFICIENT_EVIDENCE_EXIT;
         return;
     }
     process.exitCode = EXIT_CODES[result.status];
