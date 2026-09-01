@@ -30,7 +30,7 @@ pub const DEPENDENCY_KIND_TARGET: &str = "applicability_target";
 
 /// Object-side applicability inputs, decoded from the owning row's frozen
 /// `payload` BLOB.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectApplicabilitySpec {
     pub schema: String,
     #[serde(default)]
@@ -47,6 +47,14 @@ pub enum PayloadDecode {
     Absent,
     Present(ObjectApplicabilitySpec),
     Undecodable(String),
+}
+
+/// A derived `Default` would leave `schema` empty, and [`Self::decode`]
+/// rejects that, so the default spec has to carry the schema tag.
+impl Default for ObjectApplicabilitySpec {
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
 }
 
 impl ObjectApplicabilitySpec {

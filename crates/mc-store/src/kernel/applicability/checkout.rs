@@ -261,6 +261,7 @@ pub struct CheckoutSnapshot {
     repo: gix::Repository,
     identity: String,
     head: String,
+    repository_state: String,
     dirty_fingerprint: String,
     dirty_entries: Vec<DirtyEntry>,
 }
@@ -276,6 +277,15 @@ impl CheckoutSnapshot {
     /// HEAD commit OID, lower hex.
     pub fn head(&self) -> &str {
         &self.head
+    }
+
+    /// `repository_state` digests sparse-checkout configuration and shallow boundary. commentlint: allow(JUDGE)
+    ///
+    /// Unshallowing or a sparse-pattern edit moves neither HEAD nor the commentlint: allow(JUDGE)
+    /// worktree, so a cache key for a verdict that read history reach or path commentlint: allow(JUDGE)
+    /// materialization has to carry this generation. commentlint: allow(JUDGE)
+    pub fn repository_state(&self) -> &str {
+        &self.repository_state
     }
 
     /// Digest over the sorted set of (path, status, content hash) for
@@ -380,6 +390,7 @@ pub fn snapshot_checkout(
         repo,
         identity,
         head,
+        repository_state: hex_digest(&repository_state),
         dirty_fingerprint,
         dirty_entries,
     })
@@ -728,6 +739,16 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(joined)
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> String {

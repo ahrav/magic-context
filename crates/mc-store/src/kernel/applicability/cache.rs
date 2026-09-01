@@ -39,6 +39,12 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
         Some(value)
     }
 
+    /// Reads without promoting, so a caller already holding the lock to
+    /// replace an entry can carry a field forward from the old value.
+    pub(super) fn peek(&self, key: &K) -> Option<&V> {
+        self.current.get(key).or_else(|| self.previous.get(key))
+    }
+
     /// Returns the generation displaced by a rotation so the caller can
     /// drop its entries after releasing any lock guarding the cache.
     pub(super) fn insert(&mut self, key: K, value: V) -> Option<HashMap<K, V>> {

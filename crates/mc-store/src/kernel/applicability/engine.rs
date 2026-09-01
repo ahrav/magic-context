@@ -5,6 +5,7 @@
 //! snapshot taken once, a typed query context, and the candidate batch;
 //! distinct anchors resolve once per batch, never once per candidate.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -106,9 +107,12 @@ pub struct FailedCheck {
 }
 
 /// Opaque handle read repair passes back to confirm a durable append for a
-/// cached classification (KTD6 append-confirmed flag).
+/// cached classification (KTD6 append-confirmed flag). commentlint: allow(JUDGE)
+///
+/// A verdict the engine declined to cache carries no key, so confirming it commentlint: allow(JUDGE)
+/// has nothing to record. commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClassificationToken(ObjectCacheKey);
+pub struct ClassificationToken(Option<ObjectCacheKey>);
 
 /// Per-object verdict with evidence. `append_pending` marks a non-current
 /// classification whose durable observation has not been confirmed yet;
@@ -149,6 +153,7 @@ struct AnchorCacheKey {
     anchor_id: String,
     payload_digest: String,
     head: String,
+    repository_state: String,
     patch_id_algorithm: &'static str,
 }
 
@@ -158,6 +163,7 @@ struct ObjectCacheKey {
     object_id: String,
     object_revision: i64,
     head: String,
+    repository_state: String,
     scoped_dirty_fingerprint: String,
     inputs_digest: String,
 }
@@ -207,14 +213,42 @@ impl ApplicabilityEngine {
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
         let batch_prefix = batch_digest_prefix(&scope_context);
-        // Distinct anchors resolve once per batch even on cache misses.
-        let mut batch_anchor_memo: HashMap<String, GitConditionOutcome> = HashMap::new();
-        // Memoize each anchor row separately because multiple rows can share an `anchor_id`.
+        // Distinct anchor rows resolve once per batch even on cache misses.
+        // Rows sharing an `anchor_id` can carry different conditions, so the
+        // row fingerprint keys the memo rather than the id.
+        let mut batch_anchor_memo: HashMap<[u8; 32], GitConditionOutcome> = HashMap::new();
         let mut batch_decode_memo: DecodeMemo<'_> = HashMap::new();
         let mut batch_fingerprint_memo: FingerprintMemo<'_> = HashMap::new();
         let mut check_cache = CheckCache::new();
         let mut objects = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            // Neither early exit is cacheable, so neither needs a cache key.
+            // Building one first would hash every payload byte in a batch
+            // this request never evaluates.
+            if candidate.lifecycle_invalidated {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::terminal(
+                        ApplicabilityState::LifecycleInvalidated,
+                        "object lifecycle-invalidated before applicability evaluation",
+                    ),
+                    false,
+                ));
+                continue;
+            }
+            if budget.is_exhausted() {
+                objects.push(finished(
+                    candidate,
+                    ClassificationToken(None),
+                    Classification::uncacheable(
+                        ApplicabilityState::Uncertain,
+                        "evaluation budget exhausted before this object",
+                    ),
+                    false,
+                ));
+                continue;
+            }
             let anchor_fingerprint = candidate.anchor.as_ref().map(|anchor| {
                 match batch_fingerprint_memo.get(anchor.anchor_id.as_str()) {
                     Some((row, fingerprint)) if **row == *anchor => *fingerprint,
@@ -228,39 +262,16 @@ impl ApplicabilityEngine {
             });
             let payload_decode = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
             let scoped_dirty = scoped_dirty_fingerprint(snapshot, &payload_decode);
-            let token = ClassificationToken(self.object_cache_key(
+            let key = self.object_cache_key(
                 snapshot,
                 &batch_prefix,
                 query,
                 candidate,
                 anchor_fingerprint.as_ref(),
                 scoped_dirty,
-            ));
-            if candidate.lifecycle_invalidated {
-                objects.push(finished(
-                    candidate,
-                    token,
-                    Classification::terminal(
-                        ApplicabilityState::LifecycleInvalidated,
-                        "object lifecycle-invalidated before applicability evaluation",
-                    ),
-                    false,
-                ));
-                continue;
-            }
-            if budget.is_exhausted() {
-                objects.push(finished(
-                    candidate,
-                    token,
-                    Classification::uncacheable(
-                        ApplicabilityState::Uncertain,
-                        "evaluation budget exhausted before this object",
-                    ),
-                    false,
-                ));
-                continue;
-            }
-            if let Some(cached) = self.object_cache.lock().expect("cache lock").get(&token.0) {
+            );
+            let token = ClassificationToken(Some(key.clone()));
+            if let Some(cached) = lock(&self.object_cache).get(&key) {
                 stats.object_cache_hits += 1;
                 objects.push(ObjectApplicability {
                     object_id: candidate.object_id.clone(),
@@ -286,27 +297,36 @@ impl ApplicabilityEngine {
                 &mut check_cache,
                 &mut stats,
                 candidate,
+                anchor_fingerprint.as_ref(),
                 &payload_decode,
                 budget,
             );
             stats.graph_operations += ladder.graph_operations() - graph_ops_before;
+            // An uncacheable verdict has no cache entry, so its token could
+            // never be confirmed; claiming a pending append would make read
+            // repair re-append it on every request forever.
+            let mut append_pending = classification.cacheable;
             if classification.cacheable {
+                let mut cache = lock(&self.object_cache);
+                // A concurrent request that missed this same key can have
+                // landed and confirmed the append already. Overwriting the
+                // entry with `false` sends repair back over confirmed work.
+                let append_confirmed = cache
+                    .peek(&key)
+                    .is_some_and(|cached| cached.append_confirmed);
+                append_pending = !append_confirmed;
                 // Binding the evicted generation frees its entries after the
                 // lock guard drops, keeping the critical section bounded.
-                let _evicted = self.object_cache.lock().expect("cache lock").insert(
-                    token.0.clone(),
+                let _evicted = cache.insert(
+                    key,
                     CachedClassification {
                         state: classification.state,
                         evidence: classification.evidence.clone(),
                         failed_check: classification.failed_check.clone(),
-                        append_confirmed: false,
+                        append_confirmed,
                     },
                 );
             }
-            // An uncacheable verdict has no cache entry, so its token could
-            // never be confirmed; claiming a pending append would make read
-            // repair re-append it on every request forever.
-            let append_pending = classification.cacheable;
             objects.push(finished(candidate, token, classification, append_pending));
         }
         BatchEvaluation { objects, stats }
@@ -317,10 +337,10 @@ impl ApplicabilityEngine {
     /// cached; a `false` return means the confirmation was dropped.
     #[must_use]
     pub fn confirm_durable_append(&self, token: &ClassificationToken) -> bool {
-        self.object_cache
-            .lock()
-            .expect("cache lock")
-            .update(&token.0, |cached| cached.append_confirmed = true)
+        let Some(key) = &token.0 else {
+            return false;
+        };
+        lock(&self.object_cache).update(key, |cached| cached.append_confirmed = true)
     }
 
     #[expect(clippy::too_many_arguments, reason = "internal classify pipeline")]
@@ -330,11 +350,12 @@ impl ApplicabilityEngine {
         query: &QueryContext,
         scope_context: &ScopeMatchContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<String, GitConditionOutcome>,
+        batch_anchor_memo: &mut HashMap<[u8; 32], GitConditionOutcome>,
         batch_decode_memo: &mut DecodeMemo<'batch>,
         check_cache: &mut CheckCache,
         stats: &mut EvaluationStats,
         candidate: &'batch ApplicabilityCandidate,
+        anchor_fingerprint: Option<&[u8; 32]>,
         payload_decode: &PayloadDecode,
         budget: &EvalBudget,
     ) -> Classification {
@@ -370,6 +391,9 @@ impl ApplicabilityEngine {
         }
         // Anchor gate.
         if let Some(anchor) = &candidate.anchor {
+            let fingerprint = anchor_fingerprint
+                .copied()
+                .unwrap_or_else(|| anchor_row_fingerprint(anchor));
             match self.evaluate_anchor(
                 snapshot,
                 query,
@@ -378,6 +402,7 @@ impl ApplicabilityEngine {
                 batch_decode_memo,
                 stats,
                 anchor,
+                fingerprint,
             ) {
                 AnchorVerdict::Holds => {}
                 AnchorVerdict::Historical(evidence) => {
@@ -454,10 +479,11 @@ impl ApplicabilityEngine {
         snapshot: &CheckoutSnapshot,
         query: &QueryContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<String, GitConditionOutcome>,
+        batch_anchor_memo: &mut HashMap<[u8; 32], GitConditionOutcome>,
         batch_decode_memo: &mut DecodeMemo<'batch>,
         stats: &mut EvaluationStats,
         anchor: &'batch AnchorRowSpec,
+        anchor_fingerprint: [u8; 32],
     ) -> AnchorVerdict {
         let reusable = matches!(
             batch_decode_memo.get(anchor.anchor_id.as_str()),
@@ -490,7 +516,7 @@ impl ApplicabilityEngine {
         let AnchorCondition::Git(git_condition) = condition else {
             unreachable!("NeedsGitResolution is only reported for git conditions");
         };
-        let outcome = if let Some(outcome) = batch_anchor_memo.get(&anchor.anchor_id) {
+        let outcome = if let Some(outcome) = batch_anchor_memo.get(&anchor_fingerprint) {
             *outcome
         } else {
             let key = AnchorCacheKey {
@@ -498,9 +524,13 @@ impl ApplicabilityEngine {
                 anchor_id: anchor.anchor_id.clone(),
                 payload_digest: digest_optional(anchor.payload.as_deref()),
                 head: snapshot.head().to_string(),
+                // Sparse and shallow state decide how far an ancestry walk
+                // reaches, so unshallowing has to miss this key rather than
+                // reuse the verdict it produced under a truncated history.
+                repository_state: snapshot.repository_state().to_string(),
                 patch_id_algorithm: PATCH_ID_ALGORITHM,
             };
-            let cached = self.anchor_cache.lock().expect("cache lock").get(&key);
+            let cached = lock(&self.anchor_cache).get(&key);
             let outcome = match cached {
                 Some(outcome) => {
                     stats.anchor_cache_hits += 1;
@@ -512,16 +542,12 @@ impl ApplicabilityEngine {
                     // Budget-driven uncertainty is transient; caching it
                     // would pin a degraded verdict to this (HEAD, anchor).
                     if outcome != GitConditionOutcome::Uncertain || !ladder.budget_was_exhausted() {
-                        let _evicted = self
-                            .anchor_cache
-                            .lock()
-                            .expect("cache lock")
-                            .insert(key, outcome);
+                        let _evicted = lock(&self.anchor_cache).insert(key, outcome);
                     }
                     outcome
                 }
             };
-            batch_anchor_memo.insert(anchor.anchor_id.clone(), outcome);
+            batch_anchor_memo.insert(anchor_fingerprint, outcome);
             outcome
         };
         match outcome {
@@ -549,6 +575,10 @@ impl ApplicabilityEngine {
             object_id: candidate.object_id.clone(),
             object_revision: candidate.object_revision,
             head: snapshot.head().to_string(),
+            // The scoped fingerprint covers only worktree entries. Sparse and
+            // shallow state decide which paths materialize and how far
+            // history reaches, and moves neither HEAD nor the worktree.
+            repository_state: snapshot.repository_state().to_string(),
             scoped_dirty_fingerprint,
             inputs_digest: inputs_digest(batch_prefix, query, candidate, anchor_fingerprint),
         }
@@ -638,12 +668,60 @@ fn dirty_overlap(snapshot: &CheckoutSnapshot, affected_paths: &[String]) -> Opti
     None
 }
 
-fn paths_overlap(a: &str, b: &str) -> bool {
-    let a = a.trim_end_matches('/');
-    let b = b.trim_end_matches('/');
-    a == b
-        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
-        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+/// A poisoned cache mutex means some other request panicked, not that this
+/// cache's contents are unsound; the engine is process-wide and long-lived,
+/// so propagating the poison would wedge classification permanently.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Git reports dirty paths in one canonical spelling: slash-separated,
+/// relative to the worktree root, with no `.` or `..` component. A declared
+/// path is author-supplied and can arrive spelled otherwise.
+///
+/// `None` marks a spelling this comparison cannot interpret. Callers treat commentlint: allow(JUDGE)
+/// that as overlapping every dirty path, since a declaration the engine commentlint: allow(JUDGE)
+/// cannot read is no evidence that the entry is unrelated. commentlint: allow(JUDGE)
+fn canonical_declared_path(path: &str) -> Option<Cow<'_, str>> {
+    let trimmed = path.trim_end_matches('/');
+    let mut needs_rewrite = trimmed.starts_with('/');
+    for segment in trimmed.split('/') {
+        match segment {
+            // Resolving `..` needs the real tree; refuse instead of guessing.
+            ".." => return None,
+            "" | "." => needs_rewrite = true,
+            _ => {}
+        }
+    }
+    if !needs_rewrite {
+        return Some(Cow::Borrowed(trimmed));
+    }
+    let segments: Vec<&str> = trimmed
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    // No segment survives only for the worktree root, which covers the whole
+    // checkout rather than nothing.
+    (!segments.is_empty()).then(|| Cow::Owned(segments.join("/")))
+}
+
+/// `dirty` arrives from the status scan already canonical; only the declared
+/// side needs rewriting.
+fn paths_overlap(dirty: &str, declared: &str) -> bool {
+    let Some(declared) = canonical_declared_path(declared) else {
+        return true;
+    };
+    let dirty = dirty.trim_end_matches('/');
+    let declared = declared.as_ref();
+    dirty == declared
+        || dirty
+            .strip_prefix(declared)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || declared
+            .strip_prefix(dirty)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn digest_optional(payload: Option<&[u8]>) -> String {
@@ -694,7 +772,16 @@ fn inputs_digest(
         hash.update([0]);
     }
     hash.update(b"\0");
-    hash.update(candidate.payload.as_deref().unwrap_or_default());
+    // An absent payload declares nothing and can classify `Current`, while a
+    // zero-byte payload fails to decode and classifies `Uncertain`; an
+    // untagged hash would let the first verdict answer for the second.
+    match &candidate.payload {
+        Some(payload) => {
+            hash.update([1]);
+            hash_bytes(&mut hash, payload);
+        }
+        None => hash.update([0]),
+    }
     format!("{:x}", hash.finalize())
 }
 

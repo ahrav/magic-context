@@ -991,3 +991,442 @@ fn reverting_an_overlapping_edit_restores_the_original_cache_entry() {
     assert_eq!(batch.stats.object_cache_hits, 1);
     assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
 }
+
+/// An absent payload declares nothing and reaches `Current`; a zero-byte
+/// payload fails to decode and is `Uncertain`. Sharing a cache key would let
+/// the first verdict auto-inject the second object.
+#[test]
+fn an_empty_payload_does_not_share_a_cache_key_with_an_absent_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let absent = candidate("object-1");
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&absent),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    let empty = ApplicabilityCandidate {
+        payload: Some(Vec::new()),
+        ..candidate("object-1")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[empty],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+}
+
+/// Two anchor rows can share an `anchor_id` and disagree: the batch memo has
+/// to evaluate the second row's own condition rather than reuse the first's
+/// outcome.
+#[test]
+fn anchor_rows_sharing_an_id_are_evaluated_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let on_main = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    // A commit on a disjoint branch is unreachable from `on_main`.
+    let off_main = commit_snapshot(
+        &fixture.repo,
+        "side",
+        &[],
+        &[("other.rs", "pub fn z() {}\n")],
+        "side",
+        2,
+    );
+    let snapshot = checkout(&fixture, on_main);
+
+    let engine = ApplicabilityEngine::new();
+    let reachable = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "shared-id", on_main)),
+        ..candidate("object-reachable")
+    };
+    let unreachable = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "shared-id", off_main)),
+        ..candidate("object-unreachable")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[reachable, unreachable],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_ne!(
+        batch.objects[1].state,
+        ApplicabilityState::Current,
+        "the second anchor row reused the first row's outcome"
+    );
+}
+
+/// Git spells dirty paths one way; a declared path can arrive spelled
+/// otherwise, and the dirty gate must still fire.
+#[test]
+fn noncanonical_affected_paths_still_overlap_the_dirty_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    write_worktree_file(&fixture.repo, "src/lib.rs", "pub fn a() { /* dirty */ }\n");
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    for (index, spelling) in ["./src/lib.rs", "/src/lib.rs", "src/./lib.rs", "src/", ""]
+        .into_iter()
+        .enumerate()
+    {
+        let declared = ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(vec![spelling.to_string()], vec![]).encode(),
+            ),
+            ..candidate(&format!("object-{index}"))
+        };
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            &[declared],
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(
+            batch.objects[0].state,
+            ApplicabilityState::DirtyTreeUncertain,
+            "affected path {spelling:?} skipped the dirty-tree gate"
+        );
+    }
+}
+
+/// A minified JSON config has no line structure, so the line-oriented
+/// heuristic reports every key missing and marks an applicable object stale.
+#[test]
+fn a_config_key_resolves_in_single_line_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("app.json", "{\"flag\":true,\"nested\":{\"deep\":1}}")],
+        "base",
+        1,
+    );
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    for (index, key) in ["flag", "nested", "deep"].into_iter().enumerate() {
+        let checked = ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(
+                    vec![],
+                    vec![CheckSpec::ConfigKey {
+                        path: "app.json".to_string(),
+                        key: key.to_string(),
+                    }],
+                )
+                .encode(),
+            ),
+            ..candidate(&format!("object-{index}"))
+        };
+        let batch = engine.evaluate_batch(
+            &snapshot,
+            &QueryContext::default(),
+            &ScopeMatchContext::new(),
+            &[checked],
+            &EvalBudget::unbounded(),
+        );
+        assert_eq!(
+            batch.objects[0].state,
+            ApplicabilityState::Current,
+            "key {key:?} was not found in minified JSON"
+        );
+    }
+
+    let missing = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "app.json".to_string(),
+                    key: "absent".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-missing")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[missing],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+}
+
+/// A config file the check could not read leaves the key unevaluated, so the
+/// object is uncertain rather than definitely stale, and read repair records
+/// no repairable failure.
+#[test]
+fn an_unreadable_config_file_is_uncertain_not_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    let snapshot = checkout(&fixture, tip);
+    // A directory is present but is not a config file to read.
+    std::fs::create_dir_all(fixture.root.join("config.d")).unwrap();
+
+    let engine = ApplicabilityEngine::new();
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "config.d".to_string(),
+                    key: "flag".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-unreadable")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(
+        batch.objects[0].failed_check.is_none(),
+        "an unevaluated read attached a repairable failure"
+    );
+}
+
+/// A missing config file is a definite failure, unlike one that could not be
+/// read.
+#[test]
+fn a_missing_config_file_stays_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let tip = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::ConfigKey {
+                    path: "absent.toml".to_string(),
+                    key: "flag".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-missing-config")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
+    assert!(batch.objects[0].failed_check.is_some());
+}
+
+/// The default spec has to survive an encode/decode round trip; a derived
+/// `Default` leaves the schema tag empty and decodes as undecodable.
+#[test]
+fn the_default_object_spec_round_trips() {
+    let encoded = ObjectApplicabilitySpec::default().encode();
+    assert_eq!(
+        ObjectApplicabilitySpec::decode(Some(&encoded)),
+        mc_store::kernel::applicability::PayloadDecode::Present(ObjectApplicabilitySpec::default())
+    );
+}
+
+/// Read repair confirms an append once. A later evaluation of the same key
+/// must not report the append pending again.
+#[test]
+fn a_confirmed_append_stays_confirmed_across_evaluations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let invalid_scope = ApplicabilityCandidate {
+        scope_terms: Some(vec![ScopeTermSpec {
+            dimension: Dimension::Project.as_str().to_string(),
+            operator: "exact".to_string(),
+            ..ScopeTermSpec::default()
+        }]),
+        ..candidate("object-uncertain")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&invalid_scope),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(batch.objects[0].append_pending);
+    assert!(engine.confirm_durable_append(&batch.objects[0].token));
+
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[invalid_scope],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 1);
+    assert!(
+        !batch.objects[0].append_pending,
+        "a confirmed append was reported pending again"
+    );
+}
+
+/// A verdict the engine declined to cache has no entry to confirm, so the
+/// confirmation is dropped rather than applied to some other key's entry.
+#[test]
+fn confirming_an_uncacheable_verdict_reports_the_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[candidate("object-1")],
+        // An already-expired budget yields the uncacheable early exit.
+        &EvalBudget::new(
+            Some(Instant::now() - Duration::from_millis(1)),
+            Default::default(),
+        ),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Uncertain);
+    assert!(!batch.objects[0].append_pending);
+    assert!(!engine.confirm_durable_append(&batch.objects[0].token));
+}
+
+/// The shallow boundary decides how far an ancestry walk reaches, and
+/// unshallowing moves neither HEAD nor the worktree. Both caches have to miss
+/// so a verdict formed under a truncated history is re-derived.
+#[test]
+fn changing_the_shallow_boundary_invalidates_both_caches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let anchored = ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-1", base)),
+        ..candidate("object-anchored")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&anchored),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(batch.stats.anchor_cache_misses, 1);
+
+    // A grafted boundary is the state `git fetch --unshallow` removes.
+    std::fs::write(fixture.repo.git_dir().join("shallow"), format!("{base}\n")).unwrap();
+    let grafted = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert_ne!(grafted.repository_state(), snapshot.repository_state());
+    let batch = engine.evaluate_batch(
+        &grafted,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[anchored],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+    assert_eq!(batch.stats.anchor_cache_hits, 0);
+}
+
+/// Sparse patterns decide which declared paths materialize, so a check verdict
+/// formed under one pattern set cannot answer under another.
+#[test]
+fn changing_sparse_patterns_invalidates_the_object_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+
+    let engine = ApplicabilityEngine::new();
+    let checked = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "src/lib.rs".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..candidate("object-checked")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        std::slice::from_ref(&checked),
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+
+    let info = fixture.repo.git_dir().join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("sparse-checkout"), "/docs/\n").unwrap();
+    let sparse = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &sparse,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[checked],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.stats.object_cache_hits, 0);
+}

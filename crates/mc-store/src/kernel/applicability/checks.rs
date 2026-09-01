@@ -21,9 +21,19 @@ pub enum CheckOutcome {
     BudgetExhausted,
 }
 
+/// A file that is definitely not there is a definite check failure. Anything
+/// else — a permission error, a transient I/O error, a non-regular file, or a
+/// file past the size cap — leaves the key unevaluated.
+#[derive(Debug, Clone)]
+enum ConfigRead {
+    Content(Arc<str>),
+    Missing,
+    Unevaluated(String),
+}
+
 #[derive(Debug, Default)]
 pub struct CheckCache {
-    files: HashMap<PathBuf, Option<Arc<str>>>,
+    files: HashMap<PathBuf, ConfigRead>,
 }
 
 impl CheckCache {
@@ -31,49 +41,68 @@ impl CheckCache {
         Self::default()
     }
 
-    fn read(&mut self, absolute: &Path) -> Option<Arc<str>> {
+    fn read(&mut self, absolute: &Path) -> ConfigRead {
         if let Some(cached) = self.files.get(absolute) {
             return cached.clone();
         }
-        let content = read_bounded(absolute).map(Arc::<str>::from);
-        self.files.insert(absolute.to_path_buf(), content.clone());
-        content
+        let outcome = read_bounded(absolute);
+        self.files.insert(absolute.to_path_buf(), outcome.clone());
+        outcome
     }
 }
 
 /// FIFOs can block reads. Character devices such as `/dev/zero` produce valid
 /// UTF-8 indefinitely.
-fn read_bounded(absolute: &Path) -> Option<String> {
-    let metadata = std::fs::metadata(absolute).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
-        return None;
+fn read_bounded(absolute: &Path) -> ConfigRead {
+    let metadata = match std::fs::metadata(absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigRead::Missing,
+        Err(error) => return ConfigRead::Unevaluated(error.to_string()),
+    };
+    if !metadata.is_file() {
+        return ConfigRead::Unevaluated("path is not a regular file".to_string());
     }
-    let file = std::fs::File::open(absolute).ok()?;
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return ConfigRead::Unevaluated(format!("file exceeds {MAX_CONFIG_BYTES} bytes"));
+    }
+    let file = match std::fs::File::open(absolute) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigRead::Missing,
+        Err(error) => return ConfigRead::Unevaluated(error.to_string()),
+    };
     let mut content = String::new();
-    file.take(MAX_CONFIG_BYTES)
-        .read_to_string(&mut content)
-        .ok()?;
-    Some(content)
+    match file.take(MAX_CONFIG_BYTES).read_to_string(&mut content) {
+        Ok(_) => ConfigRead::Content(Arc::from(content)),
+        Err(error) => ConfigRead::Unevaluated(error.to_string()),
+    }
 }
 
 /// `Path::join` lets an absolute path replace the workdir and never resolves
 /// `..`.
-fn confined_path(snapshot: &CheckoutSnapshot, path: &str) -> Option<PathBuf> {
+///
+/// `Err` distinguishes a malformed declared path from a checkout that has no commentlint: allow(JUDGE)
+/// worktree to resolve it against, which read repair and debugging otherwise commentlint: allow(JUDGE)
+/// cannot tell apart. commentlint: allow(JUDGE)
+fn confined_path(snapshot: &CheckoutSnapshot, path: &str) -> Result<PathBuf, CheckOutcome> {
     if !Path::new(path)
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
     {
-        return None;
+        return Err(unevaluated(format!(
+            "check path {path} is not a plain relative path inside the checkout"
+        )));
     }
-    snapshot.worktree_path(path)
+    snapshot.worktree_path(path).ok_or_else(|| {
+        unevaluated(format!(
+            "check path {path} does not resolve inside this checkout's worktree"
+        ))
+    })
 }
 
 /// `Unsupported` rather than `Failed`: the check was never evaluated, so the
 /// checked object is uncertain rather than definitely stale.
-fn escaped(path: &str) -> CheckOutcome {
-    CheckOutcome::Unsupported {
-        evidence: format!("check path {path} is not a plain relative path inside the checkout"),
-    }
+fn unevaluated(evidence: String) -> CheckOutcome {
+    CheckOutcome::Unsupported { evidence }
 }
 
 /// Runs one check natively against the snapshot's worktree. File existence
@@ -90,8 +119,9 @@ pub fn run_cheap_check(
     }
     match check {
         CheckSpec::FileExists { path } => {
-            let Some(absolute) = confined_path(snapshot, path) else {
-                return escaped(path);
+            let absolute = match confined_path(snapshot, path) {
+                Ok(absolute) => absolute,
+                Err(outcome) => return outcome,
             };
             if absolute.is_file() {
                 CheckOutcome::Passed
@@ -102,13 +132,21 @@ pub fn run_cheap_check(
             }
         }
         CheckSpec::ConfigKey { path, key } => {
-            let Some(absolute) = confined_path(snapshot, path) else {
-                return escaped(path);
+            let absolute = match confined_path(snapshot, path) {
+                Ok(absolute) => absolute,
+                Err(outcome) => return outcome,
             };
-            let Some(content) = cache.read(&absolute) else {
-                return CheckOutcome::Failed {
-                    evidence: format!("config file {path} is missing, unreadable, or too large"),
-                };
+            let content = match cache.read(&absolute) {
+                ConfigRead::Content(content) => content,
+                ConfigRead::Missing => {
+                    return CheckOutcome::Failed {
+                        evidence: format!("config file {path} does not exist in the checkout"),
+                    };
+                }
+                // The key may well be defined; the read never got to look.
+                ConfigRead::Unevaluated(reason) => {
+                    return unevaluated(format!("config file {path} could not be read: {reason}"));
+                }
             };
             if config_contains_key(&content, key) {
                 CheckOutcome::Passed
@@ -127,10 +165,28 @@ pub fn run_cheap_check(
     }
 }
 
+/// JSON carries no line structure, so a minified document has to be parsed
+/// rather than scanned; the line heuristic below reports every key in
+/// `{"flag":true}` missing.
+fn json_contains_key(value: &serde_json::Value, key: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Any depth, matching what the line scan finds in a pretty-printed
+            // document.
+            map.contains_key(key) || map.values().any(|value| json_contains_key(value, key))
+        }
+        serde_json::Value::Array(items) => items.iter().any(|item| json_contains_key(item, key)),
+        _ => false,
+    }
+}
+
 /// Presence heuristic over line-oriented config formats: the key must open
 /// a line (after whitespace and optional quoting) and be followed by a
 /// delimiter, which holds across TOML, YAML, INI, and JSON object keys.
 fn config_contains_key(content: &str, key: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        return json_contains_key(&value, key);
+    }
     content.lines().any(|line| {
         let line = line.trim_start();
         let line = line.strip_prefix(['"', '\'']).unwrap_or(line);
