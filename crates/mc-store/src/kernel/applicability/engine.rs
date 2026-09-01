@@ -229,7 +229,7 @@ impl Hash for SnapshotCacheValues {
 #[derive(Debug, Clone)]
 struct CachedClassification {
     state: ApplicabilityState,
-    evidence: String,
+    evidence: Box<str>,
     failed_check: Option<FailedCheck>,
     append_confirmed: bool,
 }
@@ -473,7 +473,7 @@ impl ApplicabilityEngine {
                     object_id: candidate.object_id.clone(),
                     object_revision: candidate.object_revision,
                     state: cached.state,
-                    evidence: cached.evidence,
+                    evidence: cached.evidence.into(),
                     failed_check: cached.failed_check,
                     append_pending: cached.state.blocks_auto_injection()
                         && !cached.append_confirmed,
@@ -500,7 +500,7 @@ impl ApplicabilityEngine {
                     key,
                     CachedClassification {
                         state: classification.state,
-                        evidence: classification.evidence.clone(),
+                        evidence: classification.evidence.as_str().into(),
                         failed_check: classification.failed_check.clone(),
                         append_confirmed: false,
                     },
