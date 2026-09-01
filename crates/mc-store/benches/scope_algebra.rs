@@ -519,6 +519,7 @@ fn profile_kernel(kernel: &str) {
             let snapshot = checkout(&history.fixture, *history.commits.last().unwrap());
             let ancestor = history.commits[history.commits.len() - 10].to_string();
             let tip = history.commits.last().unwrap().to_string();
+            let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
                 let budget = EvalBudget::unbounded();
                 black_box(
