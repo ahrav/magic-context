@@ -1247,6 +1247,18 @@ pub fn scope_subsumes(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn Graph
     a.terms()
         .all(|(dimension, term_a)| match b.term(dimension) {
             Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(_), TermValue::Exact(value)) => a
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(false),
+                (TermValue::VersionRange(_), TermValue::Set(values)) => {
+                    let Some(requirement) = a.version_requirement(dimension) else {
+                        return false;
+                    };
+                    values.iter().all(|value| {
+                        parsed_version_req_matches(requirement, value).unwrap_or(false)
+                    })
+                }
                 (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
                     if left == right {
                         true
@@ -1270,6 +1282,30 @@ pub fn scope_overlaps(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn Graph
     a.terms()
         .all(|(dimension, term_a)| match b.term(dimension) {
             Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(_), TermValue::Exact(value)) => a
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(true),
+                (TermValue::Exact(value), TermValue::VersionRange(_)) => b
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(true),
+                (TermValue::VersionRange(_), TermValue::Set(values)) => a
+                    .version_requirement(dimension)
+                    .map(|requirement| {
+                        values.iter().any(|value| {
+                            parsed_version_req_matches(requirement, value).unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
+                (TermValue::Set(values), TermValue::VersionRange(_)) => b
+                    .version_requirement(dimension)
+                    .map(|requirement| {
+                        values.iter().any(|value| {
+                            parsed_version_req_matches(requirement, value).unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
                 (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
                     match (a.version_interval(dimension), b.version_interval(dimension)) {
                         (Some(left_interval), Some(right_interval)) => {
