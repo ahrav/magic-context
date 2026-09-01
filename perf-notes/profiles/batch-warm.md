@@ -29,3 +29,17 @@ must preserve input/staleness discrimination and the zero-I/O-on-hit counter con
 
 Raw profile: `/tmp/mc-scope-perf/batch-warm-199.data`.
 
+## After iteration 18
+
+At `088fc0a5f`, a fresh 199 Hz profile captured 2,001 samples with zero loss. SHA-256 no longer
+appears among material symbols. `evaluate_batch` owns 18.0% self cycles; allocator internals own
+about 36%; `String::clone` owns 2.4% self and 26.6% including children; cached-classification
+cloning owns 11.3% including children. SipHash writes are 7.3%, and object-cache lookup is 5.6%.
+
+The remaining warm allocations materialize the public owned result strings and opaque cache token.
+An `Arc` cache value alone cannot remove those allocations without a public result-type change, so
+it is not an eligible loop treatment. Continue on cold repeated work before revisiting cache-key
+representation.
+
+Raw profile: `/tmp/mc-scope-perf/batch-warm-iter18-199.data`; report:
+`/tmp/mc-scope-perf/batch-warm-iter18.report`.

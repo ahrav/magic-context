@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::anchor::{evaluate_non_git, AnchorCondition, AnchorEvaluation, AnchorRowSpec};
 use super::super::scope::{
-    scope_matches, CanonicalScope, MatchOutcome, ScopeMatchContext, ScopeTermSpec,
+    scope_matches, CanonicalScope, MatchOutcome, ScopeFormError, ScopeMatchContext, ScopeTermSpec,
 };
 use super::super::QueryContext;
 use super::cache::{TwoGenerationCache, GENERATION_CAP};
@@ -190,37 +190,38 @@ struct CachedClassification {
     append_confirmed: bool,
 }
 
-#[derive(Default)]
-struct PayloadMemo {
-    key: [u8; 32],
-    last: Option<([u8; 32], DecodedPayload)>,
+struct LastMemo<T> {
+    last: Option<([u8; 32], T)>,
 }
 
-type DecodedPayload = Result<Option<ObjectApplicabilitySpec>, PayloadDecodeError>;
-
-impl PayloadMemo {
-    fn decode(
-        &mut self,
-        payload: Option<&[u8]>,
-    ) -> Result<Option<&ObjectApplicabilitySpec>, PayloadDecodeError> {
-        if self
-            .last
-            .as_ref()
-            .is_none_or(|(last_key, _)| *last_key != self.key)
-        {
-            self.last = Some((self.key, ObjectApplicabilitySpec::decode(payload)));
-        }
-        match &self.last.as_ref().expect("payload memo initialized").1 {
-            Ok(spec) => Ok(spec.as_ref()),
-            Err(error) => Err(*error),
-        }
+impl<T> Default for LastMemo<T> {
+    fn default() -> Self {
+        Self { last: None }
     }
 }
 
+impl<T> LastMemo<T> {
+    fn get_or_insert_with(&mut self, key: [u8; 32], create: impl FnOnce() -> T) -> &T {
+        if self
+            .last
+            .as_ref()
+            .is_none_or(|(last_key, _)| *last_key != key)
+        {
+            self.last = Some((key, create()));
+        }
+        &self.last.as_ref().expect("batch memo initialized").1
+    }
+}
+
+type DecodedPayload = Result<Option<ObjectApplicabilitySpec>, PayloadDecodeError>;
+type DecodedScope = Result<CanonicalScope, ScopeFormError>;
+
 #[derive(Default)]
 struct BatchMemos {
+    key: [u8; 32],
     anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
-    payload: PayloadMemo,
+    payload: LastMemo<DecodedPayload>,
+    scope: LastMemo<DecodedScope>,
 }
 
 #[derive(Clone, Copy)]
@@ -417,7 +418,7 @@ impl ApplicabilityEngine {
                 continue;
             }
             stats.object_cache_misses += 1;
-            batch_memos.payload.key = inputs_digest;
+            batch_memos.key = inputs_digest;
             let classification = self.classify(
                 query,
                 &scope_context,
@@ -467,7 +468,10 @@ impl ApplicabilityEngine {
         let budget = ladder.budget();
         // Scope gate.
         if let Some(terms) = &candidate.scope_terms {
-            let scope = match CanonicalScope::from_term_specs(terms) {
+            let scope = match memos
+                .scope
+                .get_or_insert_with(memos.key, || CanonicalScope::from_term_specs(terms))
+            {
                 Ok(scope) => scope,
                 Err(error) => {
                     return Classification::terminal(
@@ -476,7 +480,7 @@ impl ApplicabilityEngine {
                     );
                 }
             };
-            match scope_matches(&scope, scope_context, ladder) {
+            match scope_matches(scope, scope_context, ladder) {
                 MatchOutcome::Matches => {}
                 MatchOutcome::DoesNotMatch => {
                     return Classification::terminal(
@@ -513,8 +517,10 @@ impl ApplicabilityEngine {
         // present-but-undecodable payload fails closed: the declared paths
         // and checks are unknowable, so the object is uncertain, never
         // silently current.
-        let spec = match memos.payload.decode(candidate.payload.as_deref()) {
-            Ok(spec) => spec,
+        let spec = match memos.payload.get_or_insert_with(memos.key, || {
+            ObjectApplicabilitySpec::decode(candidate.payload.as_deref())
+        }) {
+            Ok(spec) => spec.as_ref(),
             Err(_) => {
                 return Classification::terminal(
                     ApplicabilityState::Uncertain,
