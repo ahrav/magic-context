@@ -328,6 +328,31 @@ describe("cohort store lock", () => {
         }
     });
 
+    it("removes and claims nothing when a takeover cannot rename the lock aside", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            const lock = seedLock(root, null);
+            const orphaned = new Date(Date.now() - 600_000);
+            utimesSync(lock, orphaned, orphaned);
+            const judged = lockAbandoned(lock);
+            expect(judged).not.toBeNull();
+            if (judged === null) return;
+
+            // A read-execute parent makes the rename fail whatever path it targets, so this
+            // exercises the branch without depending on where the sideline lands.
+            chmodSync(root, 0o500);
+            takeOverLock(lock, judged);
+            chmodSync(root, 0o700);
+
+            // A lost takeover deletes nothing: removing `lock` would let two reclaimers
+            // enter the guarded operation.
+            expect(existsSync(lock)).toBe(true);
+        } finally {
+            chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("reclaims an abandoned lock even when a stale sideline is left behind", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         try {

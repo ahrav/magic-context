@@ -405,9 +405,10 @@ export class FileRolloutStore implements RolloutStore {
                     `rollout store ${this.path} lock was taken over by another owner`,
                 );
             }
-            const fingerprint = this.recordsFingerprint();
             /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so a coordinate this process never knew about survives the merge. commentlint: allow(JUDGE) */
             const merged = [...this.reload()];
+            /** Taken from the reload rather than by reading again: it is the same bytes, one fewer read, and it removes the window a separate read opened between hashing and parsing. commentlint: allow(JUDGE) */
+            const fingerprint = this.loadedFingerprint;
             const key = coordinateKey(record);
             const index = this.indexByCoordinate.get(key);
             if (index !== undefined && merged[index]?.cell.runHealth === "completed") {
@@ -449,7 +450,9 @@ export class FileRolloutStore implements RolloutStore {
         }
     }
 
-    /** Identifies the exact contents the merge was built from. A hash rather than a timestamp because two writes inside one filesystem timestamp tick are exactly the interleaving being fenced, and an absent file is a state to distinguish rather than an error. commentlint: allow(JUDGE) */
+    /** Identifies the exact contents a load was built from. A hash rather than a timestamp because two writes inside one filesystem timestamp tick are exactly the interleaving being fenced, and an absent file is a state to distinguish rather than an error. Recorded by `load` from the same bytes it parsed, so the fence compares against what was actually merged rather than against a second read that could already differ. commentlint: allow(JUDGE) */
+    private loadedFingerprint = "absent";
+
     private recordsFingerprint(): string {
         try {
             return createHash("sha256").update(readFileSync(this.path)).digest("hex");
@@ -474,8 +477,10 @@ export class FileRolloutStore implements RolloutStore {
         /** The cache is only ever authoritative while the lock is held, and a read-only store never takes it: `acquire` is a no-op and neither `reload` nor `invalidate` is reachable without `put`. A reader that cached would answer every later `list` from its first snapshot while writers advance the file, so it re-reads instead. commentlint: allow(JUDGE) */
         if (this.records && !this.readOnly) return this.records;
         let records: RolloutRecord[] = [];
+        this.loadedFingerprint = "absent";
         try {
             const text = readFileSync(this.path, "utf8");
+            this.loadedFingerprint = createHash("sha256").update(text).digest("hex");
             /** Parsed separately so a truncated file is reported as an unusable records file rather than a bare `SyntaxError`: both mean the same thing to a caller — inspect this path — and only the typed error reaches the exit code that says so. commentlint: allow(JUDGE) */
             let parsed: unknown;
             try {
@@ -818,8 +823,7 @@ export async function runPairedDelta(
                 );
             }
         }
-        /** The reserve is the expected price of the next single call, so it takes the dearest attempt this coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit. commentlint: allow(JUDGE) */
-        reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
+        reserveUsd = bumpReserve(reserveUsd, record);
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
         /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. commentlint: allow(JUDGE) */
         if (!Number.isFinite(spentUsd)) {
@@ -1025,8 +1029,7 @@ export async function runPairedDelta(
                 records.push(record);
                 coordinateResult.cells[armId] = record;
                 spentUsd += record.costUsd;
-                /** The dearest attempt this coordinate has seen, not just this one's cost: a coordinate that failed expensively and then succeeded cheaply carries the earlier figure in `maxAttemptCostUsd`, and folding only the cheap success would size the reserve below the price of a retry. Same expression the pre-scan uses over stored records. commentlint: allow(JUDGE) */
-        reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
+                reserveUsd = bumpReserve(reserveUsd, record);
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
                 if (disposalFailed) status = "harness-unreclaimed";
                 else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
@@ -1474,6 +1477,11 @@ function detachedIntervention(
     } catch {
         return expected;
     }
+}
+
+/** The reserve is the expected price of the next single call, so it takes the dearest attempt a coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit, and not this attempt's cost alone, which a coordinate that failed expensively and then succeeded cheaply would understate. One function because the pre-scan over stored records and the post-rollout bookkeeping must agree: a change applied to one site and not the other would silently undercount the reserve at the other. commentlint: allow(JUDGE) */
+function bumpReserve(reserveUsd: number, record: RolloutRecord): number {
+    return Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
 }
 
 function coordinateKey(coordinate: RolloutCoordinate): string {

@@ -1745,8 +1745,9 @@ describe("paired-delta runner", () => {
             proto.recordsFingerprint = function patched(this: FileRolloutStore): string {
                 const value = original.call(this);
                 checks += 1;
-                // The second call is the pre-rename check; displace the lock just after it.
-                if (checks === 2) {
+                // The pre-rename check is the only call now that the merge supplies its own
+                // fingerprint; displace the lock just after it reads.
+                if (checks === 1) {
                     writeFileSync(
                         owner,
                         JSON.stringify({

@@ -217,6 +217,7 @@ describe("isCredentialBearingConfigKey", () => {
             "cached_tokens_value_2",
             // A camelCase split leaves the digit attached to the descriptor.
             "publicKeyValue2",
+            "primaryKeyValue2",
             "primaryKeyId2",
             "cachedTokensValue2",
         ]) {
