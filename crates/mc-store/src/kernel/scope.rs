@@ -1234,3 +1234,58 @@ pub fn scope_equivalent(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn Gra
     }
     scope_subsumes(a, b, oracle) && scope_subsumes(b, a, oracle)
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{coerce_version, version_req_matches};
+
+    fn requirement_strategy() -> impl Strategy<Value = String> {
+        (0u64..5, 0u64..5, 0u64..5, 0u8..8).prop_map(|(major, minor, patch, shape)| match shape {
+            0 => format!("={major}.{minor}.{patch}"),
+            1 => format!(">={major}.{minor}.{patch}"),
+            2 => format!("<{major}.{minor}.{patch}"),
+            3 => format!("^{major}.{minor}.{patch}"),
+            4 => format!("~{major}.{minor}.{patch}"),
+            5 => format!("{major}.{minor}.*"),
+            6 => format!(">={major}.{minor}.{patch}, <{}.0.0", major + 1),
+            _ => format!(">={major}.{minor}.{patch}-beta.1"),
+        })
+    }
+
+    fn version_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            (0u64..7, 0u64..7, 0u64..7)
+                .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}")),
+            (0u64..7, 0u64..7).prop_map(|(major, minor)| format!("{major}.{minor}")),
+            (0u64..7).prop_map(|major| major.to_string()),
+            (0u64..7, 0u64..7, 0u64..7)
+                .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}-beta.1")),
+            Just("not-a-version".to_string()),
+            Just(String::new()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_algorithm: prop::test_runner::RngAlgorithm::ChaCha,
+            rng_seed: prop::test_runner::RngSeed::Fixed(0x5C0BEA16F),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn version_matching_agrees_with_semver(
+            requirement in requirement_strategy(),
+            value in version_strategy(),
+        ) {
+            let expected = semver::VersionReq::parse(&requirement)
+                .ok()
+                .and_then(|requirement| {
+                    coerce_version(&value).map(|version| requirement.matches(&version))
+                });
+            prop_assert_eq!(version_req_matches(&requirement, &value), expected);
+        }
+    }
+}
