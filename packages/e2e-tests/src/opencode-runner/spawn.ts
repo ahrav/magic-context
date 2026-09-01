@@ -305,6 +305,15 @@ function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
     };
 }
 
+/** A segment that is not valid percent-encoding is judged as written rather than refused: `decodeURIComponent` throws on a stray `%`, and a malformed escape is not itself a credential. commentlint: allow(JUDGE) */
+function decodeSegment(segment: string): string {
+    try {
+        return decodeURIComponent(segment);
+    } catch {
+        return segment;
+    }
+}
+
 /** Parameter names by which the major signed-URL schemes carry their bearer signature: Azure SAS `sig`, SigV4 `x-amz-signature`, Google `signature`, and the `token`-style forms `isCredentialBearingConfigKey` already rejects are omitted because it covers them. commentlint: allow(JUDGE) */
 const SIGNED_URL_CREDENTIAL_PARAMS: ReadonlySet<string> = new Set([
     "sig",
@@ -322,13 +331,18 @@ function parsedUrlPairs(value: string): Array<[string, string]> {
     } catch {
         return [];
     }
-    const pairs = [...url.searchParams.entries()];
+    /** A path segment carries no key to judge and the value rules anchor at the start of the whole URL, so a credential parked in the path is read by neither. Each segment is offered whole under an empty key, decoded first so a percent-encoded credential is judged as itself. commentlint: allow(JUDGE) */
+    const pairs: Array<[string, string]> = url.pathname
+        .split("/")
+        .filter((segment) => segment.length > 0)
+        .map((segment) => ["", decodeSegment(segment)]);
+    pairs.push(...url.searchParams.entries());
     const fragment = url.hash.replace(/^#/, "");
     if (fragment.length === 0) return pairs;
     if (/[=&]/.test(fragment)) {
         pairs.push(...new URLSearchParams(fragment).entries());
     } else {
-        pairs.push(["", decodeURIComponent(fragment)]);
+        pairs.push(["", decodeSegment(fragment)]);
     }
     return pairs;
 }

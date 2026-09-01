@@ -337,7 +337,8 @@ export class FileRolloutStore implements RolloutStore {
     list(): RolloutRecord[] {
         this.acquire();
         try {
-            return [...this.load()];
+            /** Detached for the same reason the write is: a consumer that edits a returned record must not be editing the cache. commentlint: allow(JUDGE) */
+            return this.load().map((record) => structuredClone(record));
         } catch (error) {
             /** A records file this store cannot parse leaves nothing to release the claim: the run throws, and only an explicit `release()` — which the caller never reaches — would free the path for the corrected retry. commentlint: allow(JUDGE) */
             this.release();
@@ -403,8 +404,10 @@ export class FileRolloutStore implements RolloutStore {
         if (index !== undefined && merged[index]?.cell.runHealth === "completed") {
             throw new Error(`refusing to replace completed rollout ${key}`);
         }
-        if (index !== undefined) merged[index] = record;
-        else merged.push(record);
+        /** The caller keeps a reference to the record it passed and the run returns the same object in its result, so installing it directly made the cache an alias of caller-owned state: an edited result — a `costUsd` set to zero — would then be served by `list()` in place of the correct file, understating restored spend and letting further paid arms pass the cap. commentlint: allow(JUDGE) */
+        const stored = structuredClone(record);
+        if (index !== undefined) merged[index] = stored;
+        else merged.push(stored);
         // The records file feeds spend and resume decisions for later runs, so
         // it stays owner-only even though report artifacts are world-readable.
         /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. commentlint: allow(JUDGE) */

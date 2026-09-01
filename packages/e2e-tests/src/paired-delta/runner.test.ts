@@ -1459,6 +1459,52 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("retries removing the lock directory after a failure clears", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-release-retry-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.put(storedRecord("mc-on"));
+
+            chmodSync(root, 0o500);
+            expect(() => store.release()).toThrow();
+
+            // Once the cause clears, the second attempt has to do the work the first
+            // did not, rather than report success over a lock that is still there.
+            chmodSync(root, 0o700);
+            store.release();
+
+            const next = new FileRolloutStore(path);
+            expect(() => next.put(storedRecord("mc-off"))).not.toThrow();
+            next.release();
+        } finally {
+            chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("does not let an edited result reach the cache", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-alias-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            const record = storedRecord("mc-on");
+            store.put(record);
+
+            // The caller still holds the object it passed, and the run returns it.
+            record.costUsd = 0;
+            const listed = store.list();
+            expect(listed[0]?.costUsd).toBe(storedRecord("mc-on").costUsd);
+
+            // Editing what `list()` returned must not reach the cache either.
+            (listed[0] as { costUsd: number }).costUsd = 0;
+            expect(store.list()[0]?.costUsd).toBe(storedRecord("mc-on").costUsd);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("re-reads the file on every list when the store is read-only", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-readonly-stale-"));
         try {

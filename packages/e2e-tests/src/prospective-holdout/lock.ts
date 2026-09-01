@@ -274,10 +274,11 @@ export function acquireRecoverableLock(
     }
     let released = false;
     return {
+        /** The flag is set only once cleanup returns. Setting it first made a transient failure permanent: the directory still carried this live owner record, and a second call — believing the work was done — reported success to a caller that then disowned the claim, leaving a lock nothing could reclaim until the process exited. commentlint: allow(JUDGE) */
         release(): void {
             if (released) return;
-            released = true;
             releaseLock(lockPath);
+            released = true;
         },
     };
 }
