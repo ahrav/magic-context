@@ -220,6 +220,7 @@ type ScopeVerdict = Result<MatchOutcome, ScopeFormError>;
 struct BatchMemos {
     key: [u8; 32],
     anchors: HashMap<AnchorCacheKey, GitConditionOutcome>,
+    anchor_verdict: LastMemo<AnchorVerdict>,
     payload: LastMemo<DecodedPayload>,
     scope: LastMemo<ScopeVerdict>,
 }
@@ -498,17 +499,28 @@ impl ApplicabilityEngine {
         }
         // Anchor gate.
         if let Some(anchor) = &candidate.anchor {
-            match self.evaluate_anchor(snapshot, query, ladder, &mut memos.anchors, stats, anchor) {
+            let BatchMemos {
+                key,
+                anchors,
+                anchor_verdict,
+                ..
+            } = memos;
+            match anchor_verdict.get_or_insert_with(*key, || {
+                self.evaluate_anchor(snapshot, query, ladder, anchors, stats, anchor)
+            }) {
                 AnchorVerdict::Holds => {}
                 AnchorVerdict::Historical(evidence) => {
-                    return Classification::terminal(ApplicabilityState::Historical, evidence);
+                    return Classification::terminal(
+                        ApplicabilityState::Historical,
+                        evidence.clone(),
+                    );
                 }
                 AnchorVerdict::Uncertain(evidence) => {
                     let state = ApplicabilityState::Uncertain;
                     return if budget.is_exhausted() {
-                        Classification::uncacheable(state, evidence)
+                        Classification::uncacheable(state, evidence.clone())
                     } else {
-                        Classification::terminal(state, evidence)
+                        Classification::terminal(state, evidence.clone())
                     };
                 }
             }
