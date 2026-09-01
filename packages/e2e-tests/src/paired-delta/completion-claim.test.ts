@@ -1,6 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import { claimsCompletion } from "./completion-claim";
 
+/**
+ * A denial phrased without a declared completion word returns false before any negation logic runs,
+ * so the case would prove nothing about the filler it was written for. Every negative case is
+ * checked to contain one.
+ */
+const COMPLETION_WORDS = ["done", "completed", "finished", "complete"];
+
+function reachesTheClassifier(text: string): boolean {
+    return COMPLETION_WORDS.some((word) => new RegExp(`\\b${word}\\b`, "i").test(text));
+}
+
 describe("paired-delta completion claims", () => {
     it("reads an affirmative completion claim", () => {
         for (const text of [
@@ -24,6 +35,7 @@ describe("paired-delta completion claims", () => {
             "I have not finished the task.",
             "I failed to complete the request.",
         ]) {
+            expect(reachesTheClassifier(text)).toBe(true);
             expect(claimsCompletion(text)).toBe(false);
         }
     });
@@ -53,9 +65,10 @@ describe("paired-delta completion claims: negation scope", () => {
         for (const text of [
             "I have not yet completed the task.",
             "I was not able to complete it.",
-            "I could not quite finish the task.",
+            "I could not quite complete the task.",
             "I have not managed to complete this.",
         ]) {
+            expect(reachesTheClassifier(text)).toBe(true);
             expect(claimsCompletion(text)).toBe(false);
         }
     });
