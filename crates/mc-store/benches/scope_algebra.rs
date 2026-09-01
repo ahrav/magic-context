@@ -72,6 +72,7 @@ fn algebra_benches(c: &mut Criterion) {
         CanonicalScope::from_term_specs(&[version_range("platform", ">=1.0.0, <3.0.0")]).unwrap();
     let inner_version =
         CanonicalScope::from_term_specs(&[version_range("platform", ">=1.5.0, <2.0.0")]).unwrap();
+    let exact_version = CanonicalScope::from_term_specs(&[exact("platform", "1.5.0")]).unwrap();
 
     let mut group = c.benchmark_group("algebra");
     for (name, scope) in [("one-term", &one), ("eight-term", &eight)] {
@@ -93,6 +94,24 @@ fn algebra_benches(c: &mut Criterion) {
             scope_subsumes(
                 black_box(&outer_version),
                 black_box(&inner_version),
+                &UnknownGraph,
+            )
+        });
+    });
+    group.bench_function("subsumes/version-exact", |b| {
+        b.iter(|| {
+            scope_subsumes(
+                black_box(&outer_version),
+                black_box(&exact_version),
+                &UnknownGraph,
+            )
+        });
+    });
+    group.bench_function("overlaps/version-exact", |b| {
+        b.iter(|| {
+            scope_overlaps(
+                black_box(&outer_version),
+                black_box(&exact_version),
                 &UnknownGraph,
             )
         });
