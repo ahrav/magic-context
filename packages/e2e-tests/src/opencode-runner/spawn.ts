@@ -258,6 +258,22 @@ function writeConfigs(
 }
 
 /**
+ * Every decision that reads a caller-supplied config reads the same serialized value: `writeConfigs` persists it, and the provisioning path reads `compaction.auto` from it to decide whether to initialize the isolated database. Canonicalizing in only one of the two would let a `toJSON()` hook write one configuration and provision for another.
+ * commentlint: allow(JUDGE)
+ */
+function canonicalizeSpawnConfigs(opts: SpawnOptions): SpawnOptions {
+    return {
+        ...opts,
+        openCodeConfigExtra: canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra"),
+        magicContextConfig: canonicalConfig(opts.magicContextConfig, "magicContextConfig"),
+        projectMagicContextConfig: canonicalConfig(
+            opts.projectMagicContextConfig,
+            "projectMagicContextConfig",
+        ),
+    };
+}
+
+/**
  * Serialize before validation so `toJSON()` transformations cannot bypass credential checks.
  * Cyclic input causes `JSON.stringify` to throw before credential validation.
  */
@@ -542,17 +558,19 @@ async function spawnOpencodeWithProvision(
     let stdoutBuf = "";
     let stderrBuf = "";
     try {
+        /** Canonicalized once here so the database decision below and `writeConfigs` cannot read different representations of the same config. commentlint: allow(JUDGE) */
+        const canonicalOpts = canonicalizeSpawnConfigs(opts);
         const resolvedOpts: SpawnOptions = resources
             ? {
-                  ...opts,
+                  ...canonicalOpts,
                   existingEnv: resources.env,
                   userMcHostConnectionFile: resources.connectionFile,
                   projectMagicContextConfig: {
-                      ...(opts.projectMagicContextConfig ?? {}),
+                      ...(canonicalOpts.projectMagicContextConfig ?? {}),
                       transform_mode: "rust",
                   },
               }
-            : opts;
+            : canonicalOpts;
 
         const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
         const port = resolvedOpts.port ?? (await pickFreePort());
@@ -642,6 +660,7 @@ export function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
 
 export const __spawnOpencodeTest = {
     assertSecretsBoundToLoopback,
+    canonicalizeSpawnConfigs,
     isInheritableEnvKey,
     initializeIsolatedContextDb,
     rejectOnSpawnError,

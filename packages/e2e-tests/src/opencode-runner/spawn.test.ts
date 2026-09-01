@@ -311,6 +311,28 @@ describe("opencode child lifecycle", () => {
                 ).toThrow(/magicContextConfig\.embedding\.api_key/);
             }
 
+            // `spawnOpencodeWithProvision` reads `compaction.auto` to decide whether to
+            // initialize the isolated database, and `writeConfigs` persists the config. Both
+            // must read the same representation.
+            const hiddenCompaction: Record<string, unknown> = { compaction: { auto: true } };
+            Object.defineProperty(hiddenCompaction, "toJSON", {
+                value: () => ({}),
+                enumerable: false,
+            });
+            const canonical = __spawnOpencodeTest.canonicalizeSpawnConfigs({
+                mockProviderURL: "http://127.0.0.1:4321",
+                openCodeConfigExtra: hiddenCompaction,
+            });
+            const decidedAuto = (canonical.openCodeConfigExtra?.compaction as { auto?: unknown })
+                ?.auto;
+            __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", canonical);
+            const written = JSON.parse(
+                readFileSync(join(env.configDir, "opencode.json"), "utf8"),
+            ) as { compaction?: { auto?: unknown } };
+            // Reading the original object decided to skip the database while writing `auto: false`.
+            expect(decidedAuto !== true).toBe(written.compaction?.auto !== true);
+            expect(written.compaction?.auto).toBe(false);
+
             for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {                expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
                         mockProviderURL: "http://127.0.0.1:4321",
