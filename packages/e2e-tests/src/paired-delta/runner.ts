@@ -587,7 +587,7 @@ export async function runPairedDelta(
     for (const record of stored) {
         const key = coordinateKey(record);
         if (duplicateKeys.has(key)) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file contains duplicate rollouts for ${key}; ` +
                     "point at a fresh records path",
@@ -620,7 +620,7 @@ export async function runPairedDelta(
     if (!options.resume) {
         const conflict = stored.find(inMatrix);
         if (conflict) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file already contains rollouts for this matrix ` +
                     `(${coordinateKey(conflict)}); resume the run or point ` +
@@ -643,7 +643,7 @@ export async function runPairedDelta(
             ["wall-clock-ms", record.wallClockMs],
         ] as const) {
             if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-                options.store.release?.();
+                releaseBeforeThrowing(options.store);
                 throw new Error(
                     `records file ${label} is not a non-negative finite number at ` +
                         `${coordinateKey(record)}; point at a fresh records path`,
@@ -652,7 +652,7 @@ export async function runPairedDelta(
         }
         /** `coordinateKey` renders a numeric `0` and the string `"0"` identically and the matrix comparisons coerce, so a non-integer index would key and resume as a replicate it is not. commentlint: allow(JUDGE) */
         if (!Number.isSafeInteger(record.replicateIndex) || record.replicateIndex < 0) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file replicate index ${String(record.replicateIndex)} is not a ` +
                     `non-negative safe integer at ${coordinateKey(record)}; ` +
@@ -661,7 +661,7 @@ export async function runPairedDelta(
         }
         /** The envelope names the shape every later read assumes, so a record from another schema cannot stand in as completed evidence for this one. commentlint: allow(JUDGE) */
         if (record.schema !== ROLLOUT_RECORD_SCHEMA) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file schema ${String(record.schema)} is not ${ROLLOUT_RECORD_SCHEMA} at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
@@ -669,7 +669,7 @@ export async function runPairedDelta(
         }
         /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. commentlint: allow(JUDGE) */
         if (record.cell.armId !== record.armId) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file cell arm ${record.cell.armId} does not match coordinate ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
@@ -679,7 +679,7 @@ export async function runPairedDelta(
         try {
             parseArmedCellResult(record.cell);
         } catch (error) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             if (!(error instanceof PairedDeltaContractError)) throw error;
             throw new Error(
                 `records file cell is invalid at ${coordinateKey(record)} ` +
@@ -688,7 +688,7 @@ export async function runPairedDelta(
         }
         /** A record counted as neither observed nor estimated disappears from the run's provenance totals while still suppressing its rollout. commentlint: allow(JUDGE) */
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file cost source ${String(record.costSource)} is not recognized at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
@@ -703,7 +703,7 @@ export async function runPairedDelta(
             ["usage-cache-read", usage.cacheRead],
         ] as const) {
             if (!Number.isSafeInteger(value) || (value as number) < 0) {
-                options.store.release?.();
+                releaseBeforeThrowing(options.store);
                 throw new Error(
                     `records file ${label} is not a non-negative safe integer at ` +
                         `${coordinateKey(record)}; point at a fresh records path`,
@@ -715,7 +715,7 @@ export async function runPairedDelta(
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
         /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. commentlint: allow(JUDGE) */
         if (!Number.isFinite(spentUsd)) {
-            options.store.release?.();
+            releaseBeforeThrowing(options.store);
             throw new Error(
                 `records file spend total overflows the finite range at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
@@ -1308,6 +1308,13 @@ function exclusionCountsOf(
         byReason[cell.reasonCode] = (byReason[cell.reasonCode] ?? 0) + 1;
     }
     return counts;
+}
+
+/** A validation failure reports what is wrong with the records file, and that diagnostic is what the caller acts on; a lock-removal error raised while standing down would replace it with an unrelated filesystem message. The release failure is dropped rather than reported because the store keeps its claim on a throw, so the next acquisition names it. commentlint: allow(JUDGE) */
+function releaseBeforeThrowing(store: RolloutStore): void {
+    try {
+        store.release?.();
+    } catch {}
 }
 
 function coordinateKey(coordinate: RolloutCoordinate): string {

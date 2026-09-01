@@ -1405,6 +1405,23 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("reports the records diagnostic when standing down from the store fails", async () => {
+        // A release failure while standing down must not replace the reason for standing down.
+        class ThrowingReleaseStore extends MemoryStore {
+            release(): void {
+                throw new Error("EACCES: permission denied, rmdir");
+            }
+        }
+        const store = new ThrowingReleaseStore([{
+            ...storedRecord("mc-on"),
+            replicateIndex: "0" as unknown as number,
+        }]);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /replicate index 0 is not a non-negative safe integer/,
+        );
+    });
+
     it("refuses a non-integer replicate index from a store that does not validate", async () => {
         // `coordinateKey` renders "0" and 0 identically, so the record would key as replicate 0.
         const store = new MemoryStore([{

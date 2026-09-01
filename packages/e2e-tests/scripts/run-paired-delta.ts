@@ -16,6 +16,7 @@ import {
     type ArmId,
     type ScenarioDeclaration,
 } from "../src/paired-delta/contract";
+import { stableStringify } from "../../plugin/src/shared/stable-json";
 
 interface CliArgs {
     recordsPath: string;
@@ -212,16 +213,8 @@ function smokeExpectationDrift(
     args: CliArgs,
 ): string[] {
     const drift: string[] = [];
-    /** Keys are sorted before comparing: `exclusionCounts` and `providerCalls` are built in iteration order, so a change in arm scheduling or route resolution would otherwise report drift for identical content. commentlint: allow(JUDGE) */
-    const canonical = (value: unknown): string =>
-        JSON.stringify(value, (_key, nested: unknown) =>
-            nested !== null && typeof nested === "object" && !Array.isArray(nested)
-                ? Object.fromEntries(
-                    Object.entries(nested as Record<string, unknown>).sort(([left], [right]) =>
-                        left < right ? -1 : left > right ? 1 : 0
-                    ),
-                )
-                : nested);
+    /** Keys are sorted before comparing: `exclusionCounts` and `providerCalls` are built in iteration order, so a change in arm scheduling or route resolution would otherwise report drift for identical content. `stableStringify` is the shared implementation of that ordering, so a fix to its edge cases reaches this comparison too. commentlint: allow(JUDGE) */
+    const canonical = stableStringify;
     const expect = (label: string, actual: unknown, expected: unknown): void => {
         const shown = canonical(actual);
         const wanted = canonical(expected);

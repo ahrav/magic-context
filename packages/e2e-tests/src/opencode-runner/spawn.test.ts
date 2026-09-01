@@ -315,6 +315,37 @@ describe("opencode child lifecycle", () => {
                 ).toThrow(/magicContextConfig\.embedding\.api_key/);
             }
 
+            // An innocuous name is not covered by the sensitive-name exemption, so the
+            // value it will resolve to has to be read.
+            process.env.PAIRED_DELTA_BUILD_ID = "sk-ant-abcdefghijklmnopqrstuv";
+            try {
+                expect(() =>
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        openCodeConfigExtra: {
+                            trace: { buildId: "{env:PAIRED_DELTA_BUILD_ID}" },
+                        },
+                    })
+                ).toThrow(/references PAIRED_DELTA_BUILD_ID .* Anthropic-style key value/);
+            } finally {
+                delete process.env.PAIRED_DELTA_BUILD_ID;
+            }
+
+            // `typeof [] === "object"`, so an array would spread into the provider map as
+            // numeric keys rather than being ignored.
+            __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                mockProviderURL: "http://127.0.0.1:4321",
+                openCodeConfigExtra: { provider: ["bogus"] },
+            });
+            const providerKeys = Object.keys(
+                (
+                    JSON.parse(
+                        readFileSync(join(env.configDir, "opencode.json"), "utf8"),
+                    ) as { provider?: Record<string, unknown> }
+                ).provider ?? {},
+            );
+            expect(providerKeys).not.toContain("0");
+
             // `spawnOpencodeWithProvision` reads `compaction.auto` to decide whether to
             // initialize the isolated database, and `writeConfigs` persists the config. Both
             // must read the same representation.

@@ -209,7 +209,9 @@ function writeConfigs(
         // When compaction is enabled, magic-context disables its conflict detector and the plugin does nothing.
         compaction: { auto: false, prune: false },
         provider: {
-            ...(contributedProviders && typeof contributedProviders === "object"
+            ...(contributedProviders &&
+                    typeof contributedProviders === "object" &&
+                    !Array.isArray(contributedProviders)
                 ? contributedProviders
                 : {}),
             "mock-anthropic": {
@@ -377,7 +379,20 @@ function assertConfigHasNoCredentials(value: unknown, label: string): void {
             const childPath = `${path}.${key}`;
             /** A placeholder is not a credential: what reaches disk is the token, and the value it stands for is resolved from the environment after the file is read. Checked before the key rule so a credential-shaped name can still carry one. commentlint: allow(JUDGE) */
             const placeholder = typeof child === "string" ? ENV_PLACEHOLDER.exec(child) : null;
-            if (placeholder !== null && isSensitiveEnvKey(placeholder[1] as string)) continue;
+            if (placeholder !== null) {
+                const name = placeholder[1] as string;
+                if (isSensitiveEnvKey(name)) continue;
+                /** A name the sensitive-key rule does not recognize is the case the exemption cannot cover by name alone: `substituteConfigVariables` expands every `{env:NAME}` without consulting that rule, and `isInheritableEnvKey` only strips names it recognizes, so an ambient variable holding a real token under an innocuous label would resolve into the written config. The resolved value is read here so the shape rules judge what the placeholder will become. commentlint: allow(JUDGE) */
+                const resolvedFormat = credentialValueFormat(process.env[name] ?? "");
+                if (resolvedFormat !== null) {
+                    throw new Error(
+                        `config references ${name} at ${childPath}, which holds a ` +
+                            `${resolvedFormat} value; rename it so it is recognized as ` +
+                            "sensitive, or pass it through extraEnv",
+                    );
+                }
+                /** No `continue`: an unrecognized name falls through to the rules below, where the credential-bearing-key rule is what refuses it. Only a name the sensitive-key rule recognizes is an approved channel. commentlint: allow(JUDGE) */
+            }
             if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
                 throw new Error(
                     `config contains credential-shaped key: ${childPath}; ` +
