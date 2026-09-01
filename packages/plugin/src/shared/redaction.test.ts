@@ -231,6 +231,9 @@ describe("isCredentialBearingConfigKey", () => {
             "publicSigningKey",
             "publicSshKey",
             "publicVerificationKey",
+            // The exemption has to cover the plural the credential rule accepts.
+            "publicSigningKeys",
+            "publicSshKeys",
             // A separated enumerator must not become the qualifier.
             "public_key_value_2",
             "primary_key_id_2",

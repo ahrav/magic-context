@@ -278,7 +278,9 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         /** A published keypair half is not a secret and cannot be routed through `extraEnv`, so `public` still exempts the fields that name one — `publicSigningKey`, `publicSshKey`. It does not exempt every compound: an API key is a credential whatever qualifies it, so `publicAPIKey` stays refused. The two are told apart by which word precedes `key`, because only some key kinds have a publishable half. commentlint: allow(JUDGE) */
         const publishedHalf =
             allSegments.includes("public") &&
-            PUBLISHABLE_KEY_PREFIXES.some((word) => compact.endsWith(`${word}key`));
+            PUBLISHABLE_KEY_PREFIXES.some(
+                (word) => compact.endsWith(`${word}key`) || compact.endsWith(`${word}keys`),
+            );
         /** The glued credential tail is checked before the qualifier, because acronym casing puts the whole compound in one segment: `primaryAPIKey` splits as `primary`/`apikey`, so the qualifier rule would read `primary` as structural and return before the compound was ever considered. commentlint: allow(JUDGE) */
         if (
             !publishedHalf &&
