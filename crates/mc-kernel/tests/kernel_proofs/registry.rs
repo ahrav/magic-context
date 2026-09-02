@@ -861,6 +861,11 @@ fn declares_module(source: &str, name: &str) -> Result<(), String> {
         }
         attributes.reverse();
         for attribute in join_attributes(&attributes) {
+            if attribute.starts_with("#[cfg_attr(") {
+                return Err(format!(
+                    "`mod {name}` is behind #[cfg_attr(..)], which can expand to a disabling cfg"
+                ));
+            }
             if let Some(condition) = attribute
                 .strip_prefix("#[cfg(")
                 .and_then(|rest| rest.strip_suffix(")]"))
@@ -880,6 +885,9 @@ fn declares_module(source: &str, name: &str) -> Result<(), String> {
 }
 
 fn line_declares_module(line: &str, name: &str) -> bool {
+    // `strip_block_comments` keeps line comments so the attribute scan can walk past doc lines, so
+    // cut the comment here; a commented-out declaration compiles nothing.
+    let line = line.split_once("//").map_or(line, |(code, _)| code);
     let Some((_, after)) = line.split_once("mod ") else {
         return false;
     };
@@ -1270,11 +1278,52 @@ fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
 /// `cargo test <selector>` runs the tests whose path contains `selector`, so a substring match here
 /// would accept `not_epic_close`, which selects nothing while containing the function name.
 fn selects_function_exactly(attribute: &str, function: &str) -> bool {
-    let suffix = format!("::{function}");
-    attribute
-        .split(|character: char| character.is_whitespace() || character == '"')
-        .any(|token| token == function || token.ends_with(&suffix))
+    let Some((_, command)) = attribute.split_once("run with: ") else {
+        return false;
+    };
+    // `cargo test [OPTIONS] [TESTNAME] [-- [ARGS]..]`: only the positional selector filters tests,
+    // so prose elsewhere in the reason string must not stand in for it.
+    let command = command.split(" -- ").next().unwrap_or(command);
+    let mut tokens = command
+        .split_whitespace()
+        .skip_while(|token| *token != "test")
+        .skip(1)
+        .peekable();
+    let mut selector = None;
+    while let Some(token) = tokens.next() {
+        if let Some(flag) = token.strip_prefix("--") {
+            if !flag.contains('=') && FLAGS_TAKING_A_VALUE.contains(&flag) {
+                tokens.next();
+            }
+            continue;
+        }
+        if token.starts_with('-') {
+            if token.len() == 2 && SHORT_FLAGS_TAKING_A_VALUE.contains(&token) {
+                tokens.next();
+            }
+            continue;
+        }
+        selector = Some(token.trim_end_matches('"'));
+        break;
+    }
+    selector.is_some_and(|selector| {
+        selector == function || selector.ends_with(&format!("::{function}"))
+    })
 }
+
+const FLAGS_TAKING_A_VALUE: &[&str] = &[
+    "test",
+    "bench",
+    "bin",
+    "example",
+    "package",
+    "features",
+    "target",
+    "manifest-path",
+    "profile",
+    "jobs",
+];
+const SHORT_FLAGS_TAKING_A_VALUE: &[&str] = &["-p", "-j", "-F"];
 
 /// Reports whether `line` defines `signature` rather than merely mentioning it.
 /// Restricting the prefix to `LEADING` prevents comments and strings that
@@ -1449,6 +1498,8 @@ const MODULE_DISABLED: &str = "#[cfg(any())]\nmod disabled {\n    #[test]\n    f
 const MODULE_ENABLED: &str = "#[cfg(test)]\nmod enabled {\n    #[test]\n    fn proven() {}\n}\n";
 const MULTILINE_CFG_DISABLED: &str = "#[cfg(\n    any()\n)]\n#[test]\nfn proven() {}\n";
 const MULTILINE_CFG_ENABLED: &str = "#[cfg(\n    unix\n)]\n#[test]\nfn proven() {}\n";
+const IGNORED_PROSE_SELECTOR: &str =
+    "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const MACRO_ONLY: &str =
     "macro_rules! never_used {\n    () => {\n        #[test]\n        fn proven() {}\n    };\n}\n";
 const SHOULD_PANIC: &str = "#[test]\n#[should_panic]\nfn proven() {}\n";
@@ -1659,6 +1710,18 @@ fn an_ignored_test_needs_a_runnable_rerun_command() {
         &[],
     )
     .unwrap();
+
+    // Prose before `run with:` must not stand in for the positional selector.
+    let errors = validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_PROSE_SELECTOR))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("without a rerun command for"),
+        "{errors:?}"
+    );
 
     // `cargo test not_proven` selects nothing, yet the string contains `proven`.
     let errors = validate(
