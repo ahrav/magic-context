@@ -39,11 +39,20 @@ That field write is not always dead:
   not `Defer`, the branch calls `step` with `Action::Soft` at `:4235-4249`.
 - `step` computes `boundary_match` and dispatches to `step_soft` at
   `commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:164-173`.
-- `step_soft` preserves `self.reconcile_pending` and, when `boundary_match` is
-  true, reads it in the boundary-advance guard at
+- `step_soft` leaves `self.reconcile_pending` unchanged and, when
+  `boundary_match` is true, reads it in the boundary-advance guard at
   `commons@cb5a5c01:crates/cortexkit-cache-core/src/lib.rs:234-241`. This call
   supplies `new_boundary_id: None` (`transform.rs:4246`), so the guard cannot
-  move the boundary. The pre-step write remains the post-step latch value.
+  move the boundary.
+- The post-step latch value does not rest on that external behavior. The
+  subagent sub-branch spans `crates/mc-module/src/transform.rs:4235-4250` and
+  contains no `return` and no `?`, so a subagent pass always reaches
+  `if lineage_anchor_failure { core.reconcile_pending = true; }` at `:4813-4815`.
+  That write sits after the `req.is_subagent` block closes at `:4790`, so it
+  re-asserts the latch on the subagent and non-subagent paths alike. The
+  in-repo restore, not `step_soft`, is what keeps the pre-step write observable
+  here; the cache-core citation above records why the boundary cannot move, not
+  why the latch survives.
 
 The non-subagent path has different ordering:
 

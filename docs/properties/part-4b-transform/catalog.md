@@ -26,7 +26,7 @@ The cache-state machine itself is **not in this repository**. `Cargo.toml:15`
 points `cortexkit-cache-core` at `../commons/crates/cortexkit-cache-core`, a
 separate checkout at commit `d2208eda`, and the fenced-transaction wrapper that
 defines this part's commit boundary is `../commons/crates/cortexkit-store/src/lib.rs:185-231`.
-The transition rules mapped below, and the guard at cache-core `:227` whose own
+The transition rules mapped below, and the guard at cache-core `:236-239` whose own
 comment says it is "enforced in the core, not assumed", can change with no diff in
 this repository and no CI signal here. Part 3 recorded that as its bias 1 and it
 is unresolved; treat every `cortexkit-*:NNN` citation as needing re-verification at
@@ -43,6 +43,15 @@ references are given at `76cd6f41`. The portfolio evaluation ran at `e447c927`
 ("refactor(shm): trim final review leftovers") and confirmed `crates/mc-module`
 and `crates/mc-store` are byte-identical across that whole span, so every Rust
 line reference below resolves at all three commits.
+
+Two sections are re-pinned past that span, because the cache-state evidence
+records they summarize were rewritten against the U6 cache-core consumer
+migration: "The legal transitions, and what the engine does outside them", and
+the `exactly-one-core-step-executes-per-pass`,
+`core-fields-mutated-outside-the-step-machine`, and
+`defer-commit-carries-no-compartment-fence` entries. Their `transform.rs` and
+`mc-store` citations resolve at `eae8f72b`, and their `cache-core` citations
+resolve at `commons@cb5a5c01` rather than the `d2208eda` checkout named above.
 
 **Reconstruction note.** This file was rebuilt from the three lens files in
 `_lenses/` after the working tree was cleaned while it was untracked. Every
@@ -231,29 +240,36 @@ panic instead, and only one of the three release-live panics has one.
 ### The legal transitions, and what the engine does outside them
 
 Durable state is two JSON blobs in one row plus `row_version`. Exactly three
-transitions exist, all in the out-of-repo core (`cache-core:154-165`): `SoftPlus`
+transitions exist, all in the out-of-repo core (`cache-core:166-174`): `SoftPlus`
 (defer) queues `pending_changes` and sets
-`reconcile_pending = !boundary_match && !boundary_id.is_empty()` (`:197`) without
+`reconcile_pending = !boundary_match && !boundary_id.is_empty()` (`:206`) without
 bumping `version`; `Soft` requires `boundary_match && !reconcile_pending` to advance
-`boundary_id` (`:227`), freezes rendered units, and bumps `version` (`:232`); `Hard`
+`boundary_id` (`:236-239`), freezes rendered units, and bumps `version` (`:241`); `Hard`
 drains all `pending_changes` into this bust, mints `boundary_id`, clears
-`reconcile_pending` (`:250`), and bumps `version`. Note that defer both **sets and
-clears** the latch at `:197`, so a defer that finds the boundary again clears it with
-no rematerialize, which the core acknowledges in prose at `:221-222` while
-`:214-215` says `reconcile_pending` "is cleared only by a HARD rematerialize, never a
-SOFT"; a reader who takes `:214-215` as the general rule will mis-model the machine.
+`reconcile_pending` (`:259`), and bumps `version`. Note that defer both **sets and
+clears** the latch at `:206`, so a defer that finds the boundary again clears it with
+no rematerialize, which the core acknowledges in prose at `:230-231` while
+`:223-224` says `reconcile_pending` "is cleared only by a HARD rematerialize, never a
+SOFT"; a reader who takes `:223-224` as the general rule will mis-model the machine.
 
-The engine reaches exactly one `core.step` per pass, from five mutually exclusive
-call sites (`:4541` subagent, `:4794` Hard/MigrateHard, `:5002` and `:5098` the two
-Soft arms, `:5151` Defer), and the compiler helps because `boundary_token: String`
-(`:3540-3544`) is *moved* into whichever `PassInput` runs. But an illegal transition
-is representable: `CoreState`'s fields are all `pub`, and the engine writes three of
-them directly outside `step` — `core.reconcile_pending = true` at `:4430` on
-lineage-anchor validation failure, and `core.frozen_units.retain(..)` through
-`prune_covered_red_units` (`:5117`) and `prune_covered_caveman_units` (`:5118`), both
-called *after* the Soft step has already bumped `core.version`. Every `core.step`
-call also discards its `StepResult`, so the `reconcile_pending` the machine reports is
-never compared against what the engine believes.
+The engine reaches at most one `core.step` per pass, from seven mutually exclusive
+call sites (`:2785` and `:2852`, the additive-only Hard/MigrateHard and Soft arms;
+`:4236` subagent; `:4453` Hard/MigrateHard; `:4649` and `:4737`, the pressure-refold
+Hard and the plain Soft inside the one `PassPlan::Soft` arm; `:4782` Defer), and the
+compiler helps because `boundary_token: String` (`:3334-3338`) is *moved* into
+whichever `PassInput` runs. At most, not exactly, one: an accepted Defer path can
+execute no step at all. Note also that the executed `Action` is not a function of
+`PassPlan` — `:4649` and `:4737` sit in the same `PassPlan::Soft` arm and run `Hard`
+and `Soft` respectively, because a pressure refold escalates the pass and then
+reassigns `plan` at `:4657`. But an illegal transition is representable:
+`CoreState`'s fields are all `pub`, and the engine writes them directly outside
+`step` at four sites — `core.reconcile_pending = true` at `:4129` (which also forces
+`plan = PassPlan::Defer`) and again at `:4814` on lineage-anchor validation failure,
+and `core.frozen_units.retain(..)` through `prune_covered_red_units` (`:4748`) and
+`prune_covered_caveman_units` (`:4749`), both called *after* the Soft step has already
+bumped `core.version`. Every `core.step` call also discards its `StepResult`, so the
+`reconcile_pending` the machine reports is never compared against what the engine
+believes.
 
 ## Index
 
@@ -484,35 +500,44 @@ Open questions:
 ### defer-commit-carries-no-compartment-fence
 
 Type: safety
-Reachability: default-production
-Status: active
-Exercised: not yet — `claim_vector_commit_fence_never_publishes_interleaved_stale_bytes`
-(`transform.rs:14185`) covers the claim-vector predicate; nothing covers the compartment
-predicate's absence on Defer.
+Reachability: default-production — the Defer commit path itself runs on every
+compaction-enabled non-subagent Defer pass; what no production caller can reach is the
+violating interleaving, so the record is retained and its check is allowed to pass by
+never firing.
+Status: active — **premise corrected after the U6 evidence rewrite**
+Exercised: not applicable — the proposed race has no production call path. No test should
+assert that a production historian publish lets a stale Defer commit succeed; that expected
+result is false.
 Guarantee: A committing Defer pass does not persist a compartment watermark that a
 concurrent publish has already invalidated.
-Check: `always` — whenever a Defer commit writes `meta.coverage_compartment_seq`, assert
-the value equals `MAX(sequence)` of `mc_compartments` for that session as observed inside
-the commit transaction. `always` because a stale watermark is wrong every time it is
-written, not only under a specific interleaving.
-Fault/timing angle: `compartment_max_seq` is passed only when `is_bust_pass` (`:5574`),
-and `is_bust_pass` excludes Defer (`:4439`, `:4435-4438`). So the store's compartment
-check (`mc-store/src/lib.rs:7378-7387`) is skipped, while `:5155-5157` writes the
-watermark from a read taken outside any predicate. A historian publish landing in that
-window is not detected.
-Required faults and enabling state: A Defer pass with
-`compartment_seq_changed_since_meta` true and
-`current_m1_digest == loaded.meta.m1_revision` (`:5155-5156`), plus a compartment append
-committing between the m1 revision read and `:5565`. The `row_version` CAS does not help:
-`append_compartments` (`mc-store/src/lib.rs:9169`) does not touch `mc_cache_state`.
+Check: `always-or-unreached` — whenever a Defer commit writes
+`meta.coverage_compartment_seq`, the value equals `MAX(sequence)` of `mc_compartments` for
+that session as observed inside the commit transaction. `always-or-unreached` rather than
+`always` because no production caller can currently reach a violating interleaving, so the
+check must be allowed to pass by never firing.
+Fault/timing angle: the asymmetry is real. `compartment_max_seq` is passed only when
+`is_bust_pass` (`:5173`), and `is_bust_pass` excludes Defer (`:4138`, `:4134-4137`), so the
+store's compartment check (`mc-store/src/lib.rs:7018-7027`) is skipped while `:4783-4786`
+writes the watermark from a read taken outside any predicate. What closes the hazard is not
+that fence but the row-version bump: production historian publication does not go through
+the standalone `append_compartments` wrapper (`mc-store/src/lib.rs:8615`), and the paths it
+does use bump the cache-state row version, so a concurrent publish turns the interval
+between the signal read (`:3619-3680`) and `commit_transform` (`:5164-5174`) into an
+ordinary stale-CAS retry rather than a stale-watermark commit.
+Required faults and enabling state: None constructible today. The earlier entry required a
+compartment append landing inside that interval via the T1 hook, but it reached that
+requirement by treating production historian publication as the standalone
+`append_compartments` path, which it is not. A future production caller of standalone
+`append_compartments` would reopen the question, because that wrapper alone does not bump
+the cache-state row version.
 Confidence: high — [evidence](evidence/defer-commit-carries-no-compartment-fence.md).
 Verified `is_bust_pass` excludes Defer, verified `append_compartments` writes no
-`row_version`.
+`row_version`, and enumerated the production compartment-insertion callers.
 Existing check: none.
-Impact: `coverage_compartment_seq` is the watermark `compartment_revision_matches`
-(`:3913-3918`) and `compartment_seq_changed_since_meta` (`:3951`) read to decide whether
-new compartments need folding. A stale value recorded by a Defer can suppress the next
-SOFT that would have folded them.
+Impact: if a future caller reopens this, `coverage_compartment_seq` is the watermark
+`compartment_revision_matches` (`:3682-3687`) and `compartment_seq_changed_since_meta`
+(`:3714-3716`) read to decide whether new compartments need folding, so a stale value
+recorded by a Defer could suppress the next SOFT that would have folded them.
 Open questions:
 
 - Does any other writer append compartments concurrently with a live transform for the
@@ -622,15 +647,15 @@ exceeds one per `apply_once`. `always` because a second transition on one pass w
 double-bump `version` and double-drain `pending_changes`, and that must never happen.
 Fault/timing angle: none. This is structural.
 Required faults and enabling state: None. The property is worth recording because it is
-enforced only by control-flow shape plus the move of `boundary_token` (`:3540-3544`) into
+enforced only by control-flow shape plus the move of `boundary_token` (`:3334-3338`) into
 whichever `PassInput` is built. A future refactor that clones the token instead of moving it
 silently removes the compiler's help.
 Confidence: high — [evidence](evidence/exactly-one-core-step-executes-per-pass.md).
-Enumerated all five call sites (`:4541`, `:4794`, `:5002`, `:5098`, `:5151`) and confirmed
-mutual exclusion.
+Enumerated all seven call sites (`:2785`, `:2852`, `:4236`, `:4453`, `:4649`, `:4737`,
+`:4782`) and confirmed mutual exclusion.
 Existing check: none as an explicit assertion.
 Impact: A second `Hard` step on one pass drains `pending_changes` twice and re-applies units;
-`apply_units` replaces by key (cache-core `:261-270`) so the bytes may survive, but `version`
+`apply_units` replaces by key (cache-core `:271-279`) so the bytes may survive, but `version`
 and the drain accounting would not.
 Open questions: None.
 
@@ -648,18 +673,19 @@ Check: `always` — for each committed pass, assert the committed `core` is repr
 replaying the pass's declared action plus the declared coverage-prune rule from
 `loaded.core`. `always` because the machine's invariants are what the byte-stability contract
 rests on.
-Fault/timing angle: The relevant ordering is that `prune_covered_red_units` (`:5117`) and
-`prune_covered_caveman_units` (`:5118`) run **after** `step_soft` has bumped `core.version`
-(cache-core `:232`), so the committed `version` does not identify the committed frozen set.
+Fault/timing angle: The relevant ordering is that `prune_covered_red_units` (`:4748`) and
+`prune_covered_caveman_units` (`:4749`) run **after** `step_soft` has bumped `core.version`
+(cache-core `:241`), so the committed `version` does not identify the committed frozen set.
 Required faults and enabling state: A coverage-extending SOFT (`m1.new_coverage.is_some()`,
-`:5107`) with at least one frozen `red:` or `cav:` unit whose target the advance folds below
+`:4720`) with at least one frozen `red:` or `cav:` unit whose target the advance folds below
 coverage. Also, separately, a lineage-anchor validation failure (`validate_lineage_anchor` at
-`:2484-2547`, failure handled at `:4429-4433`) which sets `reconcile_pending` directly.
+`:2316-2377`, failure handled at `:4128-4132` and again at `:4813-4815`) which sets
+`reconcile_pending` directly.
 Confidence: high — [evidence](evidence/core-fields-mutated-outside-the-step-machine.md). Read
-both prune bodies and confirmed they `retain` on `core.frozen_units`; confirmed `:4430`
-assigns the field; confirmed all five `step` calls discard `StepResult`.
+both prune bodies and confirmed they `retain` on `core.frozen_units`; confirmed `:4129` and
+`:4814` assign the field; confirmed all seven `step` calls discard `StepResult`.
 Existing check: `transform.rs:25052` for the HARD-fold orphan GC.
-Impact: The out-of-repo core enforces its guards (cache-core `:227`) precisely because it is
+Impact: The out-of-repo core enforces its guards (cache-core `:236-239`) precisely because it is
 "a shared cache-stability primitive, so the guard is enforced in the core, not assumed".
 Direct field writes route around that reasoning, and the discarded `StepResult` means the
 engine never cross-checks the machine's own verdict.
@@ -1413,9 +1439,9 @@ scope executes in CI.
   [sel-budget-execute-threshold-unvalidated-from-request](#sel-budget-execute-threshold-unvalidated-from-request),
   [sel-budget-ceiling-clamp-diverges-from-scheduler-cap](#sel-budget-ceiling-clamp-diverges-from-scheduler-cap).
   Four records whose shared shape is that the thing which would enforce them does not exist.
-  One transition per pass is enforced by control-flow shape plus a `String` move
-  (`:3540-3544`), which a refactor that clones instead of moves silently removes. The
-  machine's own guard at cache-core `:227` is routed around by three direct writes to `pub`
+  At most one transition per pass is enforced by control-flow shape plus a `String` move
+  (`:3334-3338`), which a refactor that clones instead of moves silently removes. The
+  machine's own guard at cache-core `:236-239` is routed around by four direct writes to `pub`
   fields, and every `step` call discards the `StepResult` that would let the engine cross-check
   the machine's verdict. And one threshold number is read twice with two different
   sanitizations, `clamp(1.0, 100.0)` at `transform.rs:4231` against
