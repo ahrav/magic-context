@@ -96,6 +96,17 @@ fn count_sql(proof: &Proof, sql: &str) -> i64 {
     proof.db().query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
+fn ids_sql(proof: &Proof, sql: &str) -> Vec<String> {
+    proof
+        .db()
+        .prepare(sql)
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 fn propagation_rows(proof: &Proof, commit_seq: i64) -> Vec<(String, serde_json::Value)> {
     proof
         .db()
@@ -133,20 +144,29 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     assert_eq!(result.commit_seq, proof.tip());
     assert_eq!(count_sql(&proof, live_refs), 0);
     assert_eq!(
-        count_sql(
-            &proof,
-            &format!(
-                "SELECT COUNT(*) FROM object_registry WHERE invalidated_commit_seq={}",
-                result.commit_seq
-            )
-        ),
-        result.affected_object_ids.len() as i64
-    );
-
-    assert_eq!(
         result.affected_object_ids, evidence_object_ids,
         "deletion invalidates every evidence reference, not the admitted subject"
     );
+    // `evidence_meta` and `object_registry` are stamped by separate statements.
+    assert_eq!(
+        ids_sql(
+            &proof,
+            &format!(
+                "SELECT object_id FROM object_registry WHERE invalidated_commit_seq={}
+                 ORDER BY object_id",
+                result.commit_seq
+            )
+        ),
+        result.affected_object_ids
+    );
+    let known = proof.store().known_as_of(proof.tip()).unwrap();
+    for id in &result.affected_object_ids {
+        assert!(
+            !known.objects.iter().any(|row| &row.object_id == id),
+            "{id} is still live after deletion"
+        );
+    }
+
     let check_state = |proof: &Proof| {
         let rows = propagation_rows(proof, result.commit_seq);
         let mut kinds = rows
@@ -182,7 +202,14 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     assert_eq!(proof.store().rebuild_alignment().unwrap(), projection);
     assert_eq!(proof.digest(), before_restart);
 
-    // Replaying the deletion adds no rows and reports the original commit.
+    // A reingested live reference makes the repeated deletion return its
+    // operation receipt rather than take the no-live-references branch.
+    let reingested = ingest("evidence-third", b"evidence bytes", Sensitivity::Normal);
+    let reingested_object_id = reingested.object_id.clone();
+    let reingested_handle = proof.store().ingest_artifact(reingested).unwrap();
+    assert_eq!(reingested_handle.digest, handle.digest);
+    assert_eq!(count_sql(&proof, live_refs), 1);
+
     let replayed = proof
         .store()
         .delete_artifact(deletion("delete", &handle.digest))
@@ -190,7 +217,25 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     assert!(replayed.already_applied);
     assert_eq!(replayed.commit_seq, result.commit_seq);
     assert_eq!(replayed.barrier_id, result.barrier_id);
-    assert_eq!(proof.digest(), before_restart);
+    assert_eq!(replayed.affected_object_ids, result.affected_object_ids);
+    // A replay serves the receipt instead of re-running the deletion, so the
+    // reference ingested after the original commit stays live.
+    assert_eq!(count_sql(&proof, live_refs), 1);
+    assert!(proof
+        .store()
+        .known_as_of(proof.tip())
+        .unwrap()
+        .objects
+        .iter()
+        .any(|row| row.object_id == reingested_object_id));
+    assert_eq!(
+        count_sql(
+            &proof,
+            "SELECT COUNT(*) FROM deletion_backfill_barriers WHERE completed_at IS NULL"
+        ),
+        1,
+        "the replay opened a second barrier"
+    );
 }
 
 #[test]

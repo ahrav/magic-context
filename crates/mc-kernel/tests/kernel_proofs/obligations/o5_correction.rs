@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use mc_kernel::{KernelError, ObjectRow};
+use mc_kernel::{DecisionRow, KernelError, ObjectRow};
 
 use crate::fixtures::{decision, domain, intent, root_domain};
 use crate::harness::Proof;
@@ -17,10 +17,7 @@ enum Kind {
     Decision,
 }
 
-/// `Frozen` excludes `tip` because each commit advances it. History is captured
-/// per sequence, not only at the final tip, because `object_history_as_of` masks
-/// an invalidation later than the requested sequence.
-type Frozen = BTreeMap<i64, (Vec<ObjectRow>, Vec<ObjectRow>)>;
+type Frozen = BTreeMap<i64, (Vec<ObjectRow>, Vec<ObjectRow>, Vec<DecisionRow>)>;
 
 fn snapshots(proof: &Proof) -> Frozen {
     (0..=proof.tip())
@@ -30,6 +27,7 @@ fn snapshots(proof: &Proof) -> Frozen {
                 (
                     proof.store().known_as_of(seq).unwrap().objects,
                     proof.store().object_history_as_of(seq).unwrap().objects,
+                    proof.store().slice_as_of(seq).unwrap().decisions,
                 ),
             )
         })
@@ -160,7 +158,7 @@ fn run_chain(kind: Kind, length: usize) {
         invalidated_at.insert(old.clone(), proof.tip());
         chain.push(new.clone());
         // Every snapshot that existed before the correction is unchanged.
-        for (seq, (known, history)) in &frozen {
+        for (seq, (known, history, decisions)) in &frozen {
             assert_eq!(
                 &proof.store().known_as_of(*seq).unwrap().objects,
                 known,
@@ -170,6 +168,11 @@ fn run_chain(kind: Kind, length: usize) {
                 &proof.store().object_history_as_of(*seq).unwrap().objects,
                 history,
                 "history snapshot {seq}"
+            );
+            assert_eq!(
+                &proof.store().slice_as_of(*seq).unwrap().decisions,
+                decisions,
+                "decision slice {seq}"
             );
         }
         let after = content(&proof, kind);
