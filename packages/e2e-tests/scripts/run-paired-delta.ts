@@ -10,6 +10,9 @@ import policyJson from "../pools/paired-delta-policy.json";
 import { ballastProse } from "../src/ballast";
 import { compareCodeUnits } from "../src/code-unit-order";
 import { TestHarness, type TestHarnessOptions } from "../src/harness";
+import { MagicContextRpcClient } from "../../plugin/src/shared/rpc-client";
+import { storageSubtreePath } from "../../plugin/src/shared/data-path";
+import { CHARS_PER_TOKEN } from "../src/ballast";
 import { goldEvidencePrompt } from "../src/oracle-arms/gold-evidence";
 import {
     liveModelSpawnOptions,
@@ -349,7 +352,7 @@ function installedDependencyParts(): Uint8Array[] {
             for (const file of bundleFiles(root)) {
                 parts.push(Buffer.from(`${relative(root, file)}\0`, "utf8"));
                 /** The bytes, not the declared version: a locally patched install keeps its version string. */
-                parts.push(readFileSync(file));
+                parts.push(fileDigestParts(file));
             }
         } catch (error) {
             parts.push(Buffer.from(
@@ -374,7 +377,7 @@ const MEASUREMENT_RUNTIME_MODULES: readonly { specifier: string; importedFrom: (
     { specifier: "@opencode-ai/plugin", importedFrom: () => dirname(pluginEntryPath()) },
 ];
 
-/** Walks up from the resolved entry to the directory named `node_modules/<specifier>`, which is the installed package's root regardless of the entry's depth within it. */
+/** Walks up from the resolved entry to the directory named `node_modules/<specifier>`, which is the installed package's root regardless of the entry's depth within it. `Bun.resolveSync` returns the real path, so a `bun link`-ed or `file:` package whose realpath is outside any `node_modules` throws here and fails every live mode; the smoke lane never digests, so that failure is install-specific even though it looks mode-specific. commentlint: allow(JUDGE) */
 function installedPackageRoot(entry: string, specifier: string): string {
     const suffix = join("node_modules", ...specifier.split("/"));
     for (let directory = dirname(entry); directory !== dirname(directory); directory = dirname(directory)) {
@@ -395,25 +398,33 @@ function installedPackageRoot(entry: string, specifier: string): string {
  */
 function loadedBundleParts(root: string): Uint8Array[] {
     const entry = pluginEntryPath();
-    const parts = [Buffer.from(`${relative(root, entry)}\0`, "utf8")];
+    const parts: Uint8Array[] = [Buffer.from(`${relative(root, entry)}\0`, "utf8")];
     const files = entry === PLUGIN_BUNDLE_ENTRY ? bundleFiles(dirname(entry)) : [entry];
     for (const file of files) {
         parts.push(Buffer.from(`${relative(root, file)}\0`, "utf8"));
-        try {
-            parts.push(readFileSync(file));
-        } catch {
-            parts.push(Buffer.from("<unreadable>", "utf8"));
-        }
+        parts.push(fileDigestParts(file));
     }
     return parts;
 }
 
-/** Every regular file under the bundle directory in code-unit order, so the digest is independent of directory enumeration order. */
+/** Every regular file and symlink under the directory in code-unit order, so the digest is independent of enumeration order. A symlink is hashed as its target text by `fileDigestParts`, matching the untracked-file walk: a `bun link`-ed package retargeted at identical bytes must still move the digest. commentlint: allow(JUDGE) */
 function bundleFiles(directory: string): string[] {
     return readdirSync(directory, { recursive: true, withFileTypes: true })
-        .filter((entry) => entry.isFile())
+        .filter((entry) => entry.isFile() || entry.isSymbolicLink())
         .map((entry) => join(entry.parentPath, entry.name))
         .sort(compareCodeUnits);
+}
+
+/** The bytes a path contributes to a digest: a symlink's target text, a regular file's contents, or a marker for anything unreadable. */
+function fileDigestParts(absolute: string): Uint8Array {
+    try {
+        const entry = lstatSync(absolute);
+        if (entry.isSymbolicLink()) return Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8");
+        if (!entry.isFile()) return Buffer.from(`<non-file>${entryKind(entry)}`, "utf8");
+        return readFileSync(absolute);
+    } catch {
+        return Buffer.from("<unreadable>", "utf8");
+    }
 }
 
 function worktreeRoot(): string {
@@ -995,6 +1006,33 @@ function historianState(
 }
 
 /**
+ * Whether the plugin has dropped any log write in this process.
+ *
+ * The logger clears its buffer before `appendFileSync` and swallows the error, so a disk-full or
+ * permission failure can discard exactly the flush carrying the timeout marker while every earlier
+ * line for the session survives. The dropped count is exposed over the plugin's local RPC, so a
+ * clean-looking log is trusted only when the plugin confirms it dropped nothing. Unreachable RPC
+ * reads as dropped: the check exists to fail closed. commentlint: allow(JUDGE)
+ */
+async function pluginDroppedLogWrites(harness: TestHarness, sessionId: string): Promise<boolean> {
+    try {
+        const client = new MagicContextRpcClient(
+            storageSubtreePath(harness.opencode.env.dataDir),
+            harness.opencode.env.workdir,
+        );
+        const detail = await client.call<{
+            error?: unknown;
+            loggerDiagnostics?: { swallowedWriteCount?: unknown };
+        }>("status-detail", { sessionId, directory: harness.opencode.env.workdir });
+        if (detail.error !== undefined) return true;
+        const swallowed = detail.loggerDiagnostics?.swallowedWriteCount;
+        return typeof swallowed !== "number" || swallowed > 0;
+    } catch {
+        return true;
+    }
+}
+
+/**
  * Read the ledger until two consecutive passes agree, so a call still running is not missed.
  *
  * The plugin resumes the parent prompt when the historian exceeds its pressure wait, so a child call
@@ -1034,7 +1072,17 @@ async function settledSessionUsage(
         const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
         const signature = JSON.stringify(reading);
         /** Two agreeing reads settle only a ledger whose historian is known clear: a running historian can append rows after them, and an unobservable log cannot say one is not running. Charged incomplete ledgers wait for all attempts. commentlint: allow(JUDGE) */
-        if (signature === previous && state === "clear") return { ...reading, settled: true };
+        if (signature === previous && state === "clear") {
+            /** A clean log is only evidence when nothing was dropped from it; a swallowed flush could be the marker. Checked once, at the point of trusting the log, rather than every pass. commentlint: allow(JUDGE) */
+            if (pluginBacked && await pluginDroppedLogWrites(harness, sessionId)) {
+                state = "unobservable";
+                previous = signature;
+                last = reading;
+                await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
+                continue;
+            }
+            return { ...reading, settled: true };
+        }
         previous = signature;
         last = reading;
         await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
@@ -1088,22 +1136,26 @@ async function sessionUsage(
             };
             const tokens = info.tokens;
             /** An assistant entry names a route, so absent counters are an incomplete ledger rather than a message with nothing to price. */
+            /** Safe non-negative integers, not merely numbers: a `NaN`, negative, or fractional counter would price to a value `completedRecord` nulls and replaces with the estimate while the status stays `completed`, admitting later arms against it. commentlint: allow(JUDGE) */
             if (
-                typeof tokens?.input !== "number" ||
-                typeof tokens.output !== "number" ||
-                typeof tokens.cache?.write !== "number" ||
-                typeof tokens.cache.read !== "number"
+                ![tokens?.input, tokens?.output, tokens?.cache?.write, tokens?.cache?.read]
+                    .every((count) => Number.isSafeInteger(count) && (count as number) >= 0)
             ) {
                 throw new Error(
-                    `live paired-delta session ledger entry from ${route.providerId} carries no ` +
-                    "token counters",
+                    `live paired-delta session ledger entry from ${route.providerId} carries ` +
+                    "malformed token counters",
                 );
             }
+            const counters = tokens as {
+                input: number;
+                output: number;
+                cache: { write: number; read: number };
+            };
             const spent = {
-                input: tokens.input,
-                output: tokens.output,
-                cacheCreation: tokens.cache.write,
-                cacheRead: tokens.cache.read,
+                input: counters.input,
+                output: counters.output,
+                cacheCreation: counters.cache.write,
+                cacheRead: counters.cache.read,
             };
             /**
              * Only R1's scripted `ctx_search` turn is served by the fixture provider by design.
@@ -1349,7 +1401,7 @@ export function createLiveDependencies(input: {
                             /** The authored floor is bytes and the window is tokens, so the burial turn carries whichever demand is larger once converted. */
                             ballastTokens = Math.max(
                                 Math.ceil(
-                                    scenario.absencePrecondition.minimumBallastBytes / 4,
+                                    scenario.absencePrecondition.minimumBallastBytes / CHARS_PER_TOKEN,
                                 ),
                                 scenario.modelContextLimit + 1,
                             );
@@ -1932,6 +1984,11 @@ async function runLive(args: CliArgs): Promise<void> {
         }
         /** Depth is validated for the keys present, so the key set itself has to be the calibration pool's. */
         const calibrationScenarios = scenarioIdsForMode(manifest, "calibration");
+        const calibrationScenarioFamilies = new Set(
+            manifestFamilies
+                .filter(({ scenarioId }) => calibrationScenarios.has(scenarioId))
+                .map(({ familyId }) => familyId),
+        );
         const measuredScenarios = new Set(Object.keys(calibration.scenarioDepth));
         if (
             measuredScenarios.size !== calibrationScenarios.size ||
@@ -1967,13 +2024,24 @@ async function runLive(args: CliArgs): Promise<void> {
                 miscounted.join(", "),
             );
         }
-        /** The record's own family set, not only its declared count: a record binding this policy could still have measured a different selection. */
-        const measuredFamilies = new Set(calibration.familyNoise.map(({ familyId }) => familyId));
-        const expected = new Set(
+        /** Every family this dispatch runs must have a calibrated floor: `estimateFamilyDeltas` labels an uncalibrated family `no-noise-floor` and keeps going, so a scenario tagged for weekly or release without a calibration sibling would spend budget on a family whose deltas the gate cannot compare. */
+        const dispatchedFamilies = new Set(
             manifestFamilies
-                .filter(({ scenarioId }) => scenarioIdsForMode(manifest, "calibration").has(scenarioId))
+                .filter(({ scenarioId }) => scenarioIdsForMode(manifest, mode).has(scenarioId))
                 .map(({ familyId }) => familyId),
         );
+        const uncalibrated = [...dispatchedFamilies]
+            .filter((familyId) => !calibrationScenarioFamilies.has(familyId))
+            .sort(compareCodeUnits);
+        if (uncalibrated.length > 0) {
+            throw new Error(
+                `paired-delta ${mode} dispatches families the calibration pool never measured: ` +
+                uncalibrated.join(", "),
+            );
+        }
+        /** The record's own family set, not only its declared count: a record binding this policy could still have measured a different selection. */
+        const measuredFamilies = new Set(calibration.familyNoise.map(({ familyId }) => familyId));
+        const expected = calibrationScenarioFamilies;
         if (
             measuredFamilies.size !== expected.size ||
             [...expected].some((familyId) => !measuredFamilies.has(familyId))
@@ -2050,6 +2118,15 @@ async function runLive(args: CliArgs): Promise<void> {
         }),
     ));
     if (result === null) return;
+    /** Written before any report or calibration work, which can throw — an unwritable `--report` destination, a malformed record — and would otherwise leave the records file unmarked for the always-on cache save. commentlint: allow(JUDGE) */
+    if (result.usageUnmeasured) {
+        writeFileSync(marker, `${JSON.stringify({
+            status: result.status,
+            recordsPath: args.recordsPath,
+            spentUsd: result.spentUsd,
+            writtenAt: new Date().toISOString(),
+        }, null, 2)}\n`);
+    }
     const scenarioFamilies = new Map(
         scenarios.map(({ scenarioId, familyId }) => [scenarioId, familyId]),
     );
@@ -2143,14 +2220,6 @@ async function runLive(args: CliArgs): Promise<void> {
         refusedRegretLadders,
         validForPoolSizing: mode === "calibration" ? calibrationValidForSizing : null,
     }, null, 2));
-    if (result.status === "usage-unmeasured") {
-        writeFileSync(marker, `${JSON.stringify({
-            status: result.status,
-            recordsPath: args.recordsPath,
-            spentUsd: result.spentUsd,
-            writtenAt: new Date().toISOString(),
-        }, null, 2)}\n`);
-    }
     /** A non-completed status outranks the calibration verdict, because the caller keyed on `harness-unreclaimed` must not lose it. */
     if (result.status !== "completed") {
         process.exitCode = EXIT_CODES[result.status];

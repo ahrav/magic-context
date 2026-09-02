@@ -762,6 +762,31 @@ describe("paired-delta runner", () => {
         expect(result.status).toBe("usage-unmeasured");
     });
 
+    it("reports unmeasured usage separately when disposal also fails", async () => {
+        const result = await runPairedDelta(
+            options(new MemoryStore()),
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            throw new Error("session ledger unavailable");
+                        },
+                        async dispose() {
+                            throw new Error("harness would not stop");
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.usageUnmeasured).toBe(true);
+    });
+
     it("charges a failed rollout's measured usage when it exceeds the estimate", async () => {
         const store = new MemoryStore();
         const measured = { input: 50_000_000, output: 0, cacheCreation: 0, cacheRead: 0 };

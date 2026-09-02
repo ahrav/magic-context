@@ -168,6 +168,13 @@ export interface PairedDeltaRunResult {
         | "harness-unreclaimed"
         /** A failed rollout's billed usage could not be read, so its record carries only the worst-case estimate, which the historian's retry tree can exceed; the run stops rather than admit later arms against an understated `spentUsd`. commentlint: allow(JUDGE) */
         | "usage-unmeasured";
+    /**
+     * Whether some failed rollout's spend could not be measured, independent of `status`.
+     *
+     * `status` is one value, and an unreclaimed harness in the same rollout outranks it; the refusal
+     * to resume has to survive that, so it is carried separately for the caller that persists it.
+     */
+    usageUnmeasured: boolean;
     records: RolloutRecord[];
     coordinates: CoordinateResult[];
     spentUsd: number;
@@ -700,6 +707,7 @@ export async function runPairedDelta(
     let resumedRollouts = 0;
     let reserveUsd = options.deskCostCeilingUsd;
     let status: PairedDeltaRunResult["status"] = "completed";
+    let anyUsageUnmeasured = false;
     let startedAny = false;
     /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. commentlint: allow(JUDGE) */
     const lateDisposals: Promise<boolean>[] = [];
@@ -1108,6 +1116,7 @@ export async function runPairedDelta(
                 spentUsd += record.costUsd;
                 reserveUsd = bumpReserve(reserveUsd, record);
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
+                if (usageUnmeasured) anyUsageUnmeasured = true;
                 if (disposalFailed) status = "harness-unreclaimed";
                 else if (usageUnmeasured) status = "usage-unmeasured";
                 else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
@@ -1195,6 +1204,7 @@ export async function runPairedDelta(
     /** Derived from `records` at the end rather than counted along the way: every field they summarize already lives on each record, and a future path that pushes one — a new arm, another resume branch — cannot forget to update a counter it does not touch. commentlint: allow(JUDGE) */
     return {
         status,
+        usageUnmeasured: anyUsageUnmeasured,
         records,
         coordinates,
         spentUsd,
