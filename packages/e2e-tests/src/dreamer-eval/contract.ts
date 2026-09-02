@@ -212,12 +212,7 @@ export class DreamerEvalContractError extends Error {
 }
 
 const primitives = makeContractPrimitives(DreamerEvalContractError);
-const { fail, record, exact, string, staticId, enumeration, array, integer, boundedInteger, unique } = primitives;
-
-function boolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") fail(`${label}: boolean-invalid`);
-    return value as boolean;
-}
+const { fail, record, exact, string, staticId, enumeration, array, integer, boundedInteger, boolean, unique } = primitives;
 
 /**
  */
