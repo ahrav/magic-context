@@ -1660,3 +1660,492 @@ async fn egress_gate_rejects_an_under_declared_normal_request_without_a_request(
     assert_eq!(recorder.requests(), 0);
     daemon.handler.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// `kernel.artifact.ingest.begin | page | finish`
+// ---------------------------------------------------------------------------
+
+const MIB: usize = 1024 * 1024;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn ingest_begin_request(project: &Path, upload_id: &str, payload: &[u8], page_count: u32) -> Value {
+    json!({
+        "method": "kernel.artifact.ingest.begin",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "upload_id": upload_id,
+        "total_bytes": payload.len(),
+        "page_count": page_count,
+        "payload_digest": sha256_hex(payload),
+        "intent": wire_intent(upload_id, &sha256_hex(payload)),
+        "request": {
+            "evidence_id": format!("evidence-{upload_id}"),
+            "object_id": format!("evidence-object-{upload_id}"),
+            "object_kind": "evidence",
+            "domain_id": DOMAIN,
+            "source_kind": "repository",
+            "source_id": format!("src/{upload_id}"),
+            "source_revision": 1,
+            "media_type": "text/plain",
+            "retention_class": "canonical",
+            "asserted_sensitivity": "normal",
+            "provider_egress": "remote_allowed",
+            "provenance": {"repository_id": "repo", "revision": "abc123"},
+        },
+    })
+}
+
+fn ingest_page_request(project: &Path, upload_id: &str, index: u32, bytes: &[u8]) -> Value {
+    use base64::Engine as _;
+    json!({
+        "method": "kernel.artifact.ingest.page",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "upload_id": upload_id,
+        "index": index,
+        "bytes_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "page_digest": sha256_hex(bytes),
+    })
+}
+
+fn ingest_finish_request(project: &Path, upload_id: &str) -> Value {
+    json!({
+        "method": "kernel.artifact.ingest.finish",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "upload_id": upload_id,
+    })
+}
+
+/// UTF-8 payload of `total` bytes made of neutral lines, with `line` inserted
+/// at the first line boundary at or before `target_offset`.
+fn large_text_payload(total: usize, target_offset: usize, line: &str) -> Vec<u8> {
+    const FILLER: &str = "plain filler line without any credential words 0123\n";
+    let mut text = String::with_capacity(total + FILLER.len() + line.len());
+    while text.len() + FILLER.len() <= target_offset {
+        text.push_str(FILLER);
+    }
+    text.push_str(line);
+    text.push('\n');
+    while text.len() < total {
+        text.push_str(FILLER);
+    }
+    text.truncate(total);
+    text.into_bytes()
+}
+
+fn contains_secret(bytes: &[u8]) -> bool {
+    bytes
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes())
+}
+
+/// Every byte of every regular file under `path`.
+fn tree_bytes(path: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else if metadata.is_file() {
+            bytes.extend(fs::read(path).unwrap());
+        }
+    }
+    bytes
+}
+
+fn live_reservations(daemon: &Daemon) -> i64 {
+    core_connection(daemon)
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_ingestion_reservations WHERE state='Live'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+impl Daemon {
+    async fn ingest_begin(
+        &self,
+        route: RouteHandle,
+        upload_id: &str,
+        payload: &[u8],
+        pages: u32,
+    ) -> Value {
+        self.call(
+            route,
+            ingest_begin_request(&self.project, upload_id, payload, pages),
+        )
+        .await
+    }
+
+    async fn ingest_page(
+        &self,
+        route: RouteHandle,
+        upload_id: &str,
+        index: u32,
+        bytes: &[u8],
+    ) -> Value {
+        self.call(
+            route,
+            ingest_page_request(&self.project, upload_id, index, bytes),
+        )
+        .await
+    }
+
+    async fn ingest_finish(&self, route: RouteHandle, upload_id: &str) -> Value {
+        self.call(route, ingest_finish_request(&self.project, upload_id))
+            .await
+    }
+
+    /// Begins the upload, sends every page in order, and finishes it.
+    async fn ingest_paged(
+        &self,
+        route: RouteHandle,
+        upload_id: &str,
+        payload: &[u8],
+        page_size: usize,
+    ) -> Value {
+        let pages: Vec<&[u8]> = payload.chunks(page_size).collect();
+        let begun = self
+            .ingest_begin(route, upload_id, payload, pages.len() as u32)
+            .await;
+        assert_state(&begun, "available", None);
+        for (index, page) in pages.iter().enumerate() {
+            let staged = self.ingest_page(route, upload_id, index as u32, page).await;
+            assert_state(&staged, "available", None);
+            assert_eq!(staged["received_pages"], index + 1);
+        }
+        self.ingest_finish(route, upload_id).await
+    }
+
+    /// Binds a second route on the same session and project as the first.
+    async fn bind_sibling(&self, channel: u16) -> RouteHandle {
+        let route = RouteHandle { channel, epoch: 1 };
+        assert!(matches!(
+            self.handler
+                .bind(route, identity(&self.project, SESSION))
+                .await,
+            BindOutcome::Accept
+        ));
+        route
+    }
+
+    fn read_artifact(&self, response: &Value) -> Vec<u8> {
+        let handle = mc_kernel::ArtifactHandle {
+            digest: response["handle"]["digest"].as_str().unwrap().to_string(),
+            evidence_id: response["handle"]["evidence_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        };
+        self.store().read_artifact(&handle).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn ingest_route_accepts_a_payload_at_the_artifact_cap() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    assert_eq!(mc_kernel::MAX_PAYLOAD_BYTES, 64 * MIB);
+
+    let payload = large_text_payload(mc_kernel::MAX_PAYLOAD_BYTES, 0, "first");
+    let finished = daemon
+        .ingest_paged(daemon.route, "at-cap", &payload, 8 * MIB)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(finished["handle"]["digest"], sha256_hex(&payload));
+    assert_eq!(daemon.read_artifact(&finished), payload);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    // One byte over the cap is staged whole and refused by the kernel at finish.
+    let payload = large_text_payload(mc_kernel::MAX_PAYLOAD_BYTES + 1, 0, "first");
+    let finished = daemon
+        .ingest_paged(daemon.route, "over-cap", &payload, 8 * MIB)
+        .await;
+    assert_state(&finished, "invalid", Some("payload_too_large"));
+    assert_eq!(live_reservations(&daemon), 0);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    assert!(
+        !fs::read_dir(kernel_root(&daemon.descriptor).join("artifacts/tmp"))
+            .map(|entries| entries.count() > 0)
+            .unwrap_or(false)
+    );
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ingest_route_redacts_a_secret_before_every_durable_surface() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let secret_line = format!("key {SECRET} tail");
+    let payload = large_text_payload(12 * 1024, 5 * 1024, &secret_line);
+    assert!(contains_secret(&payload));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "secret", &payload, 4 * 1024)
+        .await;
+    assert_state(&finished, "available", None);
+
+    let stored = daemon.read_artifact(&finished);
+    assert!(!contains_secret(&stored));
+    assert!(stored
+        .windows(b"<ANTHROPIC_API_KEY_REDACTED>".len())
+        .any(|window| window == b"<ANTHROPIC_API_KEY_REDACTED>"));
+    // The response digest names the redacted bytes, not the submitted ones.
+    assert_eq!(finished["handle"]["digest"], sha256_hex(&stored));
+    assert_ne!(finished["handle"]["digest"], sha256_hex(&payload));
+
+    let evidence_id = finished["handle"]["evidence_id"].as_str().unwrap();
+    let (detector, secret_type, meta_detector): (String, String, String) = core_connection(&daemon)
+        .query_row(
+            "SELECT r.detector_id, r.secret_type, m.detector_id
+             FROM durable_text_redactions r JOIN evidence_meta m ON m.evidence_id = r.owner_id
+             WHERE r.owner_kind='evidence' AND r.owner_id=?1",
+            [evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(detector, "mc-secret-scanner");
+    assert_eq!(secret_type, "anthropic_api_key");
+    assert_eq!(meta_detector, "mc-secret-scanner");
+    assert!(!contains_secret(&tree_bytes(&kernel_root(
+        &daemon.descriptor
+    ))));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_bad_page_leaves_the_upload_resumable_and_pages_assemble_by_index() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let payload: Vec<u8> = (0..3000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let pages: Vec<&[u8]> = payload.chunks(1000).collect();
+    let project = daemon.project.clone();
+
+    let begun = daemon
+        .ingest_begin(daemon.route, "resume", &payload, 3)
+        .await;
+    assert_state(&begun, "available", None);
+    assert_eq!(begun["upload_id"], "resume");
+    assert!(begun["page_bytes_max"].as_u64().unwrap() >= 16 * MIB as u64);
+
+    // Declared digest does not match the bytes.
+    let mut wrong = ingest_page_request(&project, "resume", 1, pages[1]);
+    wrong["page_digest"] = json!(sha256_hex(b"other"));
+    assert_state(
+        &daemon.call(daemon.route, wrong).await,
+        "invalid",
+        Some("page_digest"),
+    );
+    // Out of order: the last page first.
+    let staged = daemon
+        .ingest_page(daemon.route, "resume", 2, pages[2])
+        .await;
+    assert_eq!(staged["received_pages"], 1);
+    assert_eq!(staged["received_bytes"], 1000);
+    // Finish before every page arrived leaves the upload staged.
+    assert_state(
+        &daemon.ingest_finish(daemon.route, "resume").await,
+        "invalid",
+        Some("page_index"),
+    );
+    daemon
+        .ingest_page(daemon.route, "resume", 0, pages[0])
+        .await;
+    // A duplicate of the same bytes is acknowledged; different bytes are refused.
+    let repeat = daemon
+        .ingest_page(daemon.route, "resume", 0, pages[0])
+        .await;
+    assert_state(&repeat, "available", None);
+    assert_eq!(repeat["received_bytes"], 2000);
+    assert_state(
+        &daemon
+            .ingest_page(daemon.route, "resume", 0, pages[2])
+            .await,
+        "invalid",
+        Some("page_digest"),
+    );
+    assert_state(
+        &daemon
+            .ingest_page(daemon.route, "resume", 3, pages[1])
+            .await,
+        "invalid",
+        Some("page_index"),
+    );
+    assert_state(
+        &daemon.ingest_page(daemon.route, "other", 1, pages[1]).await,
+        "invalid",
+        Some("upload_not_found"),
+    );
+    let staged = daemon
+        .ingest_page(daemon.route, "resume", 1, pages[1])
+        .await;
+    assert_eq!(staged["received_pages"], 3);
+
+    let finished = daemon.ingest_finish(daemon.route, "resume").await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.read_artifact(&finished), payload);
+    assert_state(
+        &daemon.ingest_finish(daemon.route, "resume").await,
+        "invalid",
+        Some("upload_not_found"),
+    );
+
+    // A whole-payload digest that does not match the assembled bytes lands nothing.
+    let mut lying = ingest_begin_request(&project, "lying", &payload, 1);
+    lying["payload_digest"] = json!(sha256_hex(b"not the payload"));
+    assert_state(&daemon.call(daemon.route, lying).await, "available", None);
+    daemon.ingest_page(daemon.route, "lying", 0, &payload).await;
+    assert_state(
+        &daemon.ingest_finish(daemon.route, "lying").await,
+        "invalid",
+        Some("payload_digest"),
+    );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn route_teardown_releases_the_staged_upload_while_the_session_stays_bound() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let sibling = daemon.bind_sibling(8).await;
+    let payload = vec![b'x'; 5000];
+
+    assert_state(
+        &daemon.ingest_begin(daemon.route, "torn", &payload, 5).await,
+        "available",
+        None,
+    );
+    daemon
+        .ingest_page(daemon.route, "torn", 0, &payload[..1000])
+        .await;
+    assert_eq!(daemon.handler.staging_budget_for_test(), (5000, 1));
+
+    CompositeComponent::route_gone(&daemon.handler, daemon.route).await;
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    // The sibling route on the same session is untouched and can still upload.
+    let finished = daemon
+        .ingest_paged(sibling, "sibling", &payload, 1000)
+        .await;
+    assert_state(&finished, "available", None);
+
+    // A rebound route starts from zero pages: the torn upload's id is unknown.
+    let rebound = RouteHandle {
+        channel: daemon.route.channel,
+        epoch: 2,
+    };
+    assert!(matches!(
+        daemon
+            .handler
+            .bind(rebound, identity(&daemon.project, SESSION))
+            .await,
+        BindOutcome::Accept
+    ));
+    assert_state(
+        &daemon
+            .ingest_page(rebound, "torn", 1, &payload[1000..2000])
+            .await,
+        "invalid",
+        Some("upload_not_found"),
+    );
+    let begun = daemon.ingest_begin(rebound, "torn", &payload, 5).await;
+    assert_state(&begun, "available", None);
+    let staged = daemon
+        .ingest_page(rebound, "torn", 0, &payload[..1000])
+        .await;
+    assert_eq!(staged["received_pages"], 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let payload = vec![b'y'; 100];
+
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "first", &payload, 1)
+            .await,
+        "available",
+        None,
+    );
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "second", &payload, 1)
+            .await,
+        "unavailable",
+        Some("queue_full"),
+    );
+
+    // Three more routes fill the handler-wide pending cap of four.
+    let mut routes = Vec::new();
+    for channel in 20..23u16 {
+        let route = daemon.bind_sibling(channel).await;
+        assert_state(
+            &daemon.ingest_begin(route, "fill", &payload, 1).await,
+            "available",
+            None,
+        );
+        routes.push(route);
+    }
+    assert_eq!(daemon.handler.staging_budget_for_test(), (400, 4));
+    let overflow = daemon.bind_sibling(30).await;
+    assert_state(
+        &daemon.ingest_begin(overflow, "overflow", &payload, 1).await,
+        "unavailable",
+        Some("queue_full"),
+    );
+
+    // Finishing one upload frees a slot for the waiting route.
+    daemon.ingest_page(daemon.route, "first", 0, &payload).await;
+    assert_state(
+        &daemon.ingest_finish(daemon.route, "first").await,
+        "available",
+        None,
+    );
+    assert_state(
+        &daemon.ingest_begin(overflow, "overflow", &payload, 1).await,
+        "available",
+        None,
+    );
+
+    // A total above the allowance is refused before it reserves anything.
+    let huge = json!({
+        "method": "kernel.artifact.ingest.begin",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": daemon.project.to_str().unwrap(),
+        "upload_id": "huge",
+        "total_bytes": 66 * MIB,
+        "page_count": 8,
+        "payload_digest": sha256_hex(b""),
+        "intent": wire_intent("huge", "huge"),
+        "request": ingest_begin_request(&daemon.project, "huge", b"", 1)["request"].clone(),
+    });
+    let fresh = daemon.bind_sibling(31).await;
+    assert_state(
+        &daemon.call(fresh, huge).await,
+        "invalid",
+        Some("payload_too_large"),
+    );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (400, 4));
+    daemon.handler.shutdown().await.unwrap();
+}

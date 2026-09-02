@@ -51,6 +51,9 @@ pub enum UnavailableReason {
     NoRequiredConsumer,
     /// The client's `as_of` is ahead of the store's tip.
     SnapshotDiverged,
+    /// The staging budget for paged artifact uploads is exhausted, or the
+    /// route already has an upload in flight.
+    QueueFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -75,12 +78,21 @@ pub enum InvalidReason {
     InvalidInput,
     AdmissionPolicy,
     PayloadTooLarge,
-    /// A staged page's bytes do not match its declared digest.
+    /// A staged page's bytes do not match its declared digest, or a page index
+    /// was resent with different bytes.
     PageDigest,
+    /// A page does not fit the declared upload layout: its index is past
+    /// `page_count`, its bytes overrun `total_bytes`, or `finish` was called
+    /// with pages still missing.
+    PageIndex,
+    /// A page decodes to more bytes than one page may carry.
+    PageTooLarge,
+    /// The assembled payload does not hash to the declared payload digest.
+    PayloadDigest,
+    /// The named upload is not in flight on this route.
+    UploadNotFound,
     /// Artifact ingestion is fail-closed until the store reopens.
     IngestionFailClosed,
-    /// The upload coordinator has no room for another staged upload.
-    QueueFull,
     /// An artifact is referenced but not live, or the payload holds a secret
     /// the redactor cannot rewrite.
     ArtifactUnusable,

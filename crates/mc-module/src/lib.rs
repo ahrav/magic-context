@@ -4237,6 +4237,9 @@ impl McHandler {
     /// Final binding closure removes the route and evicts process-local session state.
     fn unbind_route(&self, channel: RouteHandle) {
         self.remove_note_evaluator_registrations_for_channel(channel);
+        // Artifact uploads are keyed by route, not session, so the route's
+        // upload goes whether or not a sibling route keeps the session bound.
+        self.kernel.uploads().discard(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -12020,6 +12023,13 @@ impl McHandler {
         self.kernel.eligibility_cache().len()
     }
 
+    /// `(total_bytes, pending)` of the artifact upload staging budget.
+    #[cfg(feature = "test-support")]
+    pub fn staging_budget_for_test(&self) -> (u64, usize) {
+        let budget = self.kernel.uploads().budget();
+        (budget.total_bytes, budget.pending)
+    }
+
     #[cfg(feature = "test-support")]
     pub fn kernel_unavailable_reason_for_test(&self) -> Option<kernel_routes::UnavailableReason> {
         (self.kernel.state() == kernel_routes::KernelState::Unavailable)
@@ -12106,6 +12116,15 @@ impl McHandler {
                         .await
                 }
                 "kernel.egress.decide" => self.handle_kernel_egress_decide(channel, &request).await,
+                "kernel.artifact.ingest.begin" => {
+                    self.handle_kernel_ingest_begin(channel, &request).await
+                }
+                "kernel.artifact.ingest.page" => {
+                    self.handle_kernel_ingest_page(channel, &request).await
+                }
+                "kernel.artifact.ingest.finish" => {
+                    self.handle_kernel_ingest_finish(channel, &request).await
+                }
                 // The handler echoes only explicit wire-debugging requests.
                 // Unknown request bodies must fail so misrouted callers cannot mistake an echo for success.
                 // An unconditional echo lets a misrouted caller mistake an echo for success.
@@ -14008,6 +14027,8 @@ impl RequestMethodProbe {
         named(&self.kind, "transform")
             // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
             || named(&self.method, "state_sync")
+            // One base64 artifact page carries up to 16 MiB decoded.
+            || named(&self.method, kernel_routes::ingest::PAGE)
     }
 }
 
@@ -17182,6 +17203,14 @@ mod tests {
         let two_mib = 2 * 1024 * 1024;
         assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
         assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
+        assert!(
+            enforce_request_byte_cap(&pad("kernel.artifact.ingest.page", "method", two_mib))
+                .is_ok()
+        );
+        assert!(
+            enforce_request_byte_cap(&pad("kernel.artifact.ingest.begin", "method", two_mib))
+                .is_err()
+        );
         // Oversized facade bodies reject at 1 MiB.
         assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
         // Unparseable oversized bodies reject conservatively.

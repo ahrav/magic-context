@@ -9,6 +9,7 @@ pub mod commit;
 pub mod egress;
 pub mod eligibility;
 pub mod health;
+pub mod ingest;
 pub(crate) mod project;
 pub mod read;
 pub mod serving;
@@ -77,6 +78,9 @@ pub(crate) struct KernelOpenCoordinator {
     /// Derived from the store in the slot, so it is emptied whenever the slot
     /// changes hands.
     eligibility_cache: Mutex<eligibility::VerdictCache>,
+    /// Staged artifact uploads never outlive the store they were begun
+    /// against, so they are dropped whenever the slot changes hands.
+    uploads: Mutex<ingest::UploadCoordinator>,
 }
 
 impl KernelOpenCoordinator {
@@ -87,7 +91,12 @@ impl KernelOpenCoordinator {
             slot: Mutex::new(None),
             health: health::KernelHealthProjection::new(),
             eligibility_cache: Mutex::new(eligibility::VerdictCache::default()),
+            uploads: Mutex::new(ingest::UploadCoordinator::default()),
         }
+    }
+
+    pub(crate) fn uploads(&self) -> std::sync::MutexGuard<'_, ingest::UploadCoordinator> {
+        self.uploads.lock().expect("upload coordinator mutex")
     }
 
     pub(crate) fn eligibility_cache(&self) -> std::sync::MutexGuard<'_, eligibility::VerdictCache> {
@@ -135,6 +144,7 @@ impl KernelOpenCoordinator {
     /// Slot first, then phase: a reader that sees `Ready` finds the store.
     fn install(&self, store: KernelStore) {
         self.eligibility_cache().clear();
+        self.uploads().clear();
         *self.slot.lock().expect("kernel store slot mutex") = Some(Arc::new(store));
         self.state
             .store(KernelState::Ready as u8, Ordering::Release);
@@ -150,13 +160,15 @@ impl KernelOpenCoordinator {
             | UnavailableReason::StoreStarting
             | UnavailableReason::StoreBusy
             | UnavailableReason::NoRequiredConsumer
-            | UnavailableReason::SnapshotDiverged => UNAVAILABLE_STORE,
+            | UnavailableReason::SnapshotDiverged
+            | UnavailableReason::QueueFull => UNAVAILABLE_STORE,
         };
         self.unavailable_kind.store(kind, Ordering::Release);
         self.state
             .store(KernelState::Unavailable as u8, Ordering::Release);
         *self.slot.lock().expect("kernel store slot mutex") = None;
         self.eligibility_cache().clear();
+        self.uploads().clear();
         self.publish_phase();
     }
 
