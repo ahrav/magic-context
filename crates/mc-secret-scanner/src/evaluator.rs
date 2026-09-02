@@ -61,6 +61,10 @@ pub(crate) fn evaluate(
             limits_hit = Some(LimitExhausted::Work);
             break 'rules;
         }
+        if rule.declaration.name == "hashicorp-tf-password" && memchr::memchr(b'"', bytes).is_none()
+        {
+            continue;
+        }
         if rule.declaration.name == "magic-keyed-assignment" && input.is_ascii() {
             let mut cursor = 0;
             while let Some(equals) =
@@ -95,6 +99,85 @@ pub(crate) fn evaluate(
                 }
             }
             continue;
+        }
+        if input.is_ascii() {
+            if let Some(value_quote) = ascii_assignment_quoted_rule(rule.declaration.name.as_str())
+            {
+                let mut cursor = 0;
+                while let Some(equals) =
+                    memchr::memchr(b'=', &bytes[cursor..]).map(|offset| cursor + offset)
+                {
+                    let spans = match ascii_assignment_quoted_at(input, equals, value_quote) {
+                        Ok(spans) => spans,
+                        Err(Abort::Work) => {
+                            limits_hit = Some(LimitExhausted::Work);
+                            break 'rules;
+                        }
+                        Err(Abort::Invalid(error)) => return Err(error),
+                    };
+                    if let Some(spans) = spans {
+                        cursor = spans.full.end();
+                        if candidates >= limits.max_candidates {
+                            limits_hit = Some(LimitExhausted::Candidates);
+                            break 'rules;
+                        }
+                        candidates += 1;
+                        match evaluate_candidate_spans(rules, rule, spans, input, &mut work, limits)
+                        {
+                            Ok(Some(finding)) => findings.push(finding),
+                            Ok(None) => {}
+                            Err(Abort::Work) => {
+                                limits_hit = Some(LimitExhausted::Work);
+                                break 'rules;
+                            }
+                            Err(Abort::Invalid(error)) => return Err(error),
+                        }
+                    } else {
+                        cursor = equals + 1;
+                    }
+                }
+                continue;
+            }
+        }
+        if input.is_ascii() {
+            if let Some((key_quote, value_quote)) =
+                ascii_quoted_keyed_rule(rule.declaration.name.as_str())
+            {
+                let mut cursor = 0;
+                while let Some(start) =
+                    memchr::memchr(key_quote, &bytes[cursor..]).map(|offset| cursor + offset)
+                {
+                    let spans = match ascii_quoted_keyed_at(input, start, key_quote, value_quote) {
+                        Ok(spans) => spans,
+                        Err(Abort::Work) => {
+                            limits_hit = Some(LimitExhausted::Work);
+                            break 'rules;
+                        }
+                        Err(Abort::Invalid(error)) => return Err(error),
+                    };
+                    if let Some(spans) = spans {
+                        cursor = spans.full.end();
+                        if candidates >= limits.max_candidates {
+                            limits_hit = Some(LimitExhausted::Candidates);
+                            break 'rules;
+                        }
+                        candidates += 1;
+                        match evaluate_candidate_spans(rules, rule, spans, input, &mut work, limits)
+                        {
+                            Ok(Some(finding)) => findings.push(finding),
+                            Ok(None) => {}
+                            Err(Abort::Work) => {
+                                limits_hit = Some(LimitExhausted::Work);
+                                break 'rules;
+                            }
+                            Err(Abort::Invalid(error)) => return Err(error),
+                        }
+                    } else {
+                        cursor = start + 1;
+                    }
+                }
+                continue;
+            }
         }
         for captures in rule.regex.captures_iter(bytes) {
             if candidates >= limits.max_candidates {
@@ -457,6 +540,128 @@ fn contains_keyed_keyword(key: &[u8]) -> bool {
             .get(..keyword.len())
             .is_some_and(|window| window.eq_ignore_ascii_case(keyword))
     })
+}
+
+fn ascii_quoted_keyed_rule(name: &str) -> Option<(u8, u8)> {
+    match name {
+        "magic-keyed-double-quoted" => Some((b'"', b'"')),
+        "magic-keyed-single-quoted" => Some((b'\'', b'\'')),
+        "magic-keyed-double-single" => Some((b'"', b'\'')),
+        "magic-keyed-single-double" => Some((b'\'', b'"')),
+        _ => None,
+    }
+}
+
+fn ascii_assignment_quoted_rule(name: &str) -> Option<u8> {
+    match name {
+        "magic-keyed-assignment-double-quoted" => Some(b'"'),
+        "magic-keyed-assignment-single-quoted" => Some(b'\''),
+        _ => None,
+    }
+}
+
+fn ascii_assignment_quoted_at(
+    input: &str,
+    equals: usize,
+    value_quote: u8,
+) -> Result<Option<CandidateSpans>, Abort> {
+    let bytes = input.as_bytes();
+    if bytes.get(equals) != Some(&b'=') {
+        return Ok(None);
+    }
+    let mut key_end = equals;
+    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+        key_end -= 1;
+    }
+    let mut run_start = key_end;
+    while run_start > 0 && is_key_byte(bytes[run_start - 1]) {
+        run_start -= 1;
+    }
+    let Some(key_start) = (run_start..key_end).find(|&index| {
+        is_word_byte(bytes[index]) && (index == 0 || !is_word_byte(bytes[index - 1]))
+    }) else {
+        return Ok(None);
+    };
+    if !contains_keyed_keyword(&bytes[key_start..key_end]) {
+        return Ok(None);
+    }
+    let mut value_quote_start = equals + 1;
+    while bytes
+        .get(value_quote_start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        value_quote_start += 1;
+    }
+    if bytes.get(value_quote_start) != Some(&value_quote) {
+        return Ok(None);
+    }
+    let value_start = value_quote_start + 1;
+    let Some(value_end) = quoted_end(bytes, value_start, value_quote) else {
+        return Ok(None);
+    };
+    Ok(Some(CandidateSpans {
+        full: TextSpan::snapped(input, key_start, value_end + 1)?,
+        value: TextSpan::snapped(input, value_start, value_end)?,
+        key: Some(TextSpan::snapped(input, key_start, key_end)?),
+    }))
+}
+
+fn ascii_quoted_keyed_at(
+    input: &str,
+    start: usize,
+    key_quote: u8,
+    value_quote: u8,
+) -> Result<Option<CandidateSpans>, Abort> {
+    let bytes = input.as_bytes();
+    if bytes.get(start) != Some(&key_quote) {
+        return Ok(None);
+    }
+    let key_start = start + 1;
+    let Some(key_end) = quoted_end(bytes, key_start, key_quote) else {
+        return Ok(None);
+    };
+    if !contains_keyed_keyword(&bytes[key_start..key_end]) {
+        return Ok(None);
+    }
+    let mut separator = key_end + 1;
+    while bytes.get(separator).is_some_and(u8::is_ascii_whitespace) {
+        separator += 1;
+    }
+    if bytes.get(separator) != Some(&b':') {
+        return Ok(None);
+    }
+    let mut value_quote_start = separator + 1;
+    while bytes
+        .get(value_quote_start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        value_quote_start += 1;
+    }
+    if bytes.get(value_quote_start) != Some(&value_quote) {
+        return Ok(None);
+    }
+    let value_start = value_quote_start + 1;
+    let Some(value_end) = quoted_end(bytes, value_start, value_quote) else {
+        return Ok(None);
+    };
+    Ok(Some(CandidateSpans {
+        full: TextSpan::snapped(input, start, value_end + 1)?,
+        value: TextSpan::snapped(input, value_start, value_end)?,
+        key: Some(TextSpan::snapped(input, key_start, key_end)?),
+    }))
+}
+
+fn quoted_end(bytes: &[u8], mut cursor: usize, quote: u8) -> Option<usize> {
+    while let Some(byte) = bytes.get(cursor) {
+        if *byte == b'\\' {
+            cursor = cursor.checked_add(2)?;
+        } else if *byte == quote {
+            return Some(cursor);
+        } else {
+            cursor += 1;
+        }
+    }
+    None
 }
 
 // Unnamed captures hold secrets; named captures mark header fields. Ignore named captures so header-only rules return their whole match.
@@ -1409,6 +1614,121 @@ mod tests {
                 }
             }
             assert_eq!(actual, expected, "{input:?}");
+        }
+    }
+
+    fn ascii_quoted_keyed_rule(name: &str, key_quote: u8, value_quote: u8) -> Rule {
+        let key_quote = char::from(key_quote);
+        let value_quote = char::from(value_quote);
+        let regex = format!(
+            r#"(?i){key_quote}(?P<key>(?:[^{key_quote}\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^{key_quote}\\]|\\.)*){key_quote}[ \t\n\r]*:[ \t\n\r]*{value_quote}(?P<value>(?:[^{value_quote}\\]|\\.)*){value_quote}"#
+        );
+        alternation_rule(
+            &serde_json::json!({
+                "name": name,
+                "regex": regex,
+                "anchors": ["key"],
+                "radius": 16,
+                "key_group": "key",
+                "value_group": "value",
+                "reject_scalars": true,
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn ascii_quoted_keyed_replays_regex_spans() {
+        for (name, key_quote, value_quote) in [
+            ("magic-keyed-double-quoted", b'"', b'"'),
+            ("magic-keyed-single-quoted", b'\'', b'\''),
+            ("magic-keyed-double-single", b'"', b'\''),
+            ("magic-keyed-single-double", b'\'', b'"'),
+        ] {
+            let rule = ascii_quoted_keyed_rule(name, key_quote, value_quote);
+            let input = match (key_quote, value_quote) {
+                (b'"', b'"') => r#""api\"key": "secret\"value" "token":"next""#,
+                (b'\'', b'\'') => r#"'api\'key': 'secret\'value' 'token':'next'"#,
+                (b'"', b'\'') => r#""api\"key": 'secret\'value' "token":'next'"#,
+                (b'\'', b'"') => r#"'api\'key': "secret\"value" 'token':"next""#,
+                _ => unreachable!(),
+            };
+            let expected: Vec<_> = rule
+                .regex
+                .captures_iter(input.as_bytes())
+                .map(|captures| candidate_spans(&rule, &captures, input).unwrap().unwrap())
+                .collect();
+            let mut actual = Vec::new();
+            let mut cursor = 0;
+            while let Some(start) =
+                memchr::memchr(key_quote, &input.as_bytes()[cursor..]).map(|offset| cursor + offset)
+            {
+                if let Some(spans) =
+                    ascii_quoted_keyed_at(input, start, key_quote, value_quote).unwrap()
+                {
+                    cursor = spans.full.end();
+                    actual.push(spans);
+                } else {
+                    cursor = start + 1;
+                }
+            }
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    fn ascii_assignment_quoted_rule(name: &str, value_quote: u8) -> Rule {
+        let value_quote = char::from(value_quote);
+        let regex = format!(
+            r#"(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[ \t\n\r]*=[ \t\n\r]*{value_quote}(?P<value>(?:[^{value_quote}\\]|\\.)*){value_quote}"#
+        );
+        alternation_rule(
+            &serde_json::json!({
+                "name": name,
+                "regex": regex,
+                "anchors": ["key"],
+                "radius": 16,
+                "key_group": "key",
+                "value_group": "value",
+                "reject_scalars": true,
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn ascii_assignment_quoted_replays_regex_spans() {
+        for (name, value_quote, input) in [
+            (
+                "magic-keyed-assignment-double-quoted",
+                b'"',
+                r#"api_key = "secret\"value" token="next""#,
+            ),
+            (
+                "magic-keyed-assignment-single-quoted",
+                b'\'',
+                r#"api_key = 'secret\'value' token='next'"#,
+            ),
+        ] {
+            let rule = ascii_assignment_quoted_rule(name, value_quote);
+            let expected: Vec<_> = rule
+                .regex
+                .captures_iter(input.as_bytes())
+                .map(|captures| candidate_spans(&rule, &captures, input).unwrap().unwrap())
+                .collect();
+            let mut actual = Vec::new();
+            let mut cursor = 0;
+            while let Some(equals) =
+                memchr::memchr(b'=', &input.as_bytes()[cursor..]).map(|offset| cursor + offset)
+            {
+                if let Some(spans) = ascii_assignment_quoted_at(input, equals, value_quote).unwrap()
+                {
+                    cursor = spans.full.end();
+                    actual.push(spans);
+                } else {
+                    cursor = equals + 1;
+                }
+            }
+            assert_eq!(actual, expected, "{name}");
         }
     }
 
