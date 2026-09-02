@@ -12,6 +12,15 @@ const SYSTEM_VERSION_TUPLE_KEYS = [
 ] as const satisfies readonly (keyof SystemVersionTuple)[];
 
 /**
+ * `_keysComplete` fails to compile when `SystemVersionTuple` adds a key absent from `SYSTEM_VERSION_TUPLE_KEYS`.
+ *
+ * The `satisfies` clause above only proves each listed key exists, not that the list covers the type.
+ */
+type MissingKey = Exclude<keyof SystemVersionTuple, (typeof SYSTEM_VERSION_TUPLE_KEYS)[number]>;
+const _keysComplete: MissingKey extends never ? true : never = true;
+void _keysComplete;
+
+/**
  * Parses a `SystemVersionTuple` with the caller's primitives so every lane report raises its own error class.
  *
  * One implementation keeps the historian, metamorphic, and scorecard consumers accepting the same bytes.

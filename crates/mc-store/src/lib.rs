@@ -14,8 +14,6 @@
 #![forbid(unsafe_code)]
 
 pub mod claim_mirror;
-pub mod kernel;
-pub mod sqlite_runtime;
 
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};

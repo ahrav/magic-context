@@ -204,6 +204,34 @@ jobs:
           rm -f packages/mc-shm-native/mc_shm_native.node
           test ! -e packages/mc-shm-native/mc_shm_native.node
 
+  # mc-kernel runs in its own job because it has no cortexkit-store dependency:
+  # an mc-store compilation failure against this commons revision cannot mask the
+  # kernel's durability, admission, CAS, and replay proofs.
+  mc-kernel-proofs:
+    name: mc-kernel proofs against real commons (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: magic-context
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: magic-context
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ahrav/commons
+          ref: 89abb409b8c71b03146eedb5bf64cd964f2a92c0
+          path: commons
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Kernel tests against real commons
+        run: cargo test -p mc-kernel
+
   mc-host-lifecycle:
     name: mc-host lifecycle integration (Linux)
     runs-on: ubuntu-latest
@@ -220,16 +248,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ahrav/commons
-          ref: 77cd36b9cb8bde762d2b39d4807bb1c0338ed927
+          ref: 89abb409b8c71b03146eedb5bf64cd964f2a92c0
           path: commons
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@nextest
-
-      - name: Store tests against real commons
-        run: cargo test -p mc-store --features test-support
 
       - name: Host lifecycle and closure proofs
         run: |
@@ -310,6 +335,11 @@ jobs:
 
       - name: Warm mc-host dependency graph
         run: cargo tree -p mc-host -e normal >/dev/null
+
+      # Node resolves `@cortexkit/mc-shm-native` to a gitignored artifact that
+      # root `build` does not produce, so this step builds it before tests.
+      - name: Build shared-memory addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
 
       - name: Test
         run: bun run test
@@ -599,6 +629,29 @@ jobs:
 
       - name: Paired-delta unit contracts
         run: bun run test:paired-delta-unit
+
+  # test:e2e uses `--mode ts`, so no other job reaches scorecardUnitFiles().
+  # Credential-free; no live model calls.
+  scorecard-contracts:
+    name: Scorecard lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Scorecard unit contracts
+        run: bun run test:scorecard-unit
 
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)

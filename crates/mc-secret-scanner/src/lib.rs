@@ -16,9 +16,23 @@ pub use rules::{CONSERVATIVE_OVERLAY_SHA256, UPSTREAM_CORPUS_SHA256};
 
 use evaluator::evaluate;
 use rules::RuleSet;
+use std::sync::{Arc, LazyLock};
+
+static EMBEDDED_RULES: LazyLock<Result<Arc<RuleSet>, ConstructionError>> =
+    LazyLock::new(|| RuleSet::from_embedded().map(Arc::new));
+// Each profile owns its own cell, so constructing one profile never initializes the other profile's digest.
+static CONSERVATIVE_DIGEST: LazyLock<Result<[u8; 32], ConstructionError>> =
+    LazyLock::new(|| default_limits_digest(ScanProfile::Conservative));
+static COMPREHENSIVE_DIGEST: LazyLock<Result<[u8; 32], ConstructionError>> =
+    LazyLock::new(|| default_limits_digest(ScanProfile::Comprehensive));
+
+fn default_limits_digest(profile: ScanProfile) -> Result<[u8; 32], ConstructionError> {
+    let rules = EMBEDDED_RULES.as_ref().map_err(|error| *error)?;
+    rules.semantic_digest(profile, ScanLimits::default())
+}
 
 pub struct Scanner {
-    rules: RuleSet,
+    rules: Arc<RuleSet>,
     profile: ScanProfile,
     limits: ScanLimits,
     semantic_digest: [u8; 32],
@@ -34,8 +48,19 @@ impl Scanner {
         limits: ScanLimits,
     ) -> Result<Self, ConstructionError> {
         limits.validate()?;
-        let rules = RuleSet::from_embedded()?;
-        let semantic_digest = rules.semantic_digest(profile, limits)?;
+        let rules = EMBEDDED_RULES
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|error| *error)?;
+        let semantic_digest = if limits == ScanLimits::default() {
+            let cached = match profile {
+                ScanProfile::Conservative => &CONSERVATIVE_DIGEST,
+                ScanProfile::Comprehensive => &COMPREHENSIVE_DIGEST,
+            };
+            cached.as_ref().copied().map_err(|error| *error)?
+        } else {
+            rules.semantic_digest(profile, limits)?
+        };
         Ok(Self {
             rules,
             profile,
@@ -67,5 +92,17 @@ impl Scanner {
     #[must_use]
     pub const fn revision(&self) -> ScannerRevision {
         api::REVISION
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanners_share_compiled_embedded_rules() {
+        let first = Scanner::new(ScanProfile::Conservative).unwrap();
+        let second = Scanner::new(ScanProfile::Comprehensive).unwrap();
+        assert!(Arc::ptr_eq(&first.rules, &second.rules));
     }
 }
