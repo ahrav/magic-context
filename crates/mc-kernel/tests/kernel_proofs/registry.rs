@@ -56,7 +56,6 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.10",
     "magic-context-3q5.9",
     "magic-context-3q5.15",
-    "magic-context-kh8.18",
     "magic-context-kh8.21",
     "magic-context-kh8.22",
     "magic-context-kh8.24",
@@ -65,6 +64,7 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.27",
     "magic-context-kh8.28",
     "magic-context-kh8.30",
+    "magic-context-kh8.31",
 ];
 
 const KERNEL_ADMISSION: &str = "tests/kernel_admission.rs";
@@ -330,6 +330,7 @@ registry_enum! {
         R8ArtifactBudget,
         R8CapConfigurable,
         R9PayloadCap,
+        R9DaemonPayloadCap,
         R10SensitivityAtIngestion,
         R10RedactionMetadata,
         R11EgressEligibility,
@@ -466,7 +467,7 @@ impl PolicyRow {
                 id: "kh8.1 R8/configurable",
                 claim: "the artifact cap is configurable through a production constructor",
                 status: Status::Pending {
-                    owner_bead: "magic-context-kh8.18",
+                    owner_bead: "magic-context-kh8.31",
                     expected_tests: &[Test { path: KERNEL_CAS, function: "a_production_open_accepts_a_configured_artifact_cap" }],
                 },
             },
@@ -476,6 +477,14 @@ impl PolicyRow {
                 status: Status::Contradiction {
                     bead: "magic-context-kh8.21",
                     policy_text: "One artifact payload is capped at 64 MiB. Ingestion accepts 64 MiB and rejects 64 MiB plus one byte with a typed error. Production rejects every payload above the 512 KiB redaction ceiling.",
+                },
+            },
+            PolicyRow::R9DaemonPayloadCap => Row {
+                id: "kh8.1 R9/daemon",
+                claim: "the daemon route accepts an artifact payload at the cap end to end",
+                status: Status::Pending {
+                    owner_bead: "magic-context-kh8.8",
+                    expected_tests: &[Test { path: HOST_KERNEL_ROUTES, function: "ingest_route_accepts_a_payload_at_the_artifact_cap" }],
                 },
             },
             PolicyRow::R10SensitivityAtIngestion => Row {
