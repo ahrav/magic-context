@@ -1,5 +1,8 @@
-//! (R3, R28).
+//! Hosts Broca LLM runs behind session-scoped management routes.
 //!
+//! Route bindings select a project, harness, and session. Requests cannot change that scope.
+//! Runs may outlive routes, while shutdown waits for supervisor teardown and reports any
+//! process group whose termination cannot be confirmed.
 
 pub mod backend;
 pub mod config;
@@ -24,8 +27,13 @@ use protocol::{Request, RequestError};
 use subprocess::EnvSnapshot;
 use supervisor::{SessionKey, Supervisor};
 
+/// Manifest identity used by hosts to bind the Broca management surface.
 pub const BROCA_MODULE_ID: &str = "broca";
 
+/// Session-scoped Broca component shared by concurrent host requests.
+///
+/// Route maps use poison-recovering mutexes. Binding and route removal serialize map updates,
+/// but supervisor operations run after map locks are released.
 pub struct BrocaComponent {
     supervisor: Arc<Supervisor>,
     /// Each route handle maps to the session key validated at bind time.
@@ -70,6 +78,7 @@ impl CredentialVerifier {
 }
 
 impl BrocaComponent {
+    /// Creates a component whose sends skip credential snapshot comparison.
     pub fn new(backend: Arc<dyn LlmExecutionBackend>) -> Self {
         Self {
             supervisor: Arc::new(Supervisor::new(backend)),
@@ -79,6 +88,9 @@ impl BrocaComponent {
         }
     }
 
+    /// Creates a component that compares provider credentials against `env`.
+    ///
+    /// Verification returns `credential_snapshot_mismatch` until the connection key is installed.
     pub fn new_with_credentials(backend: Arc<dyn LlmExecutionBackend>, env: EnvSnapshot) -> Self {
         Self {
             supervisor: Arc::new(Supervisor::new(backend)),
@@ -336,8 +348,8 @@ impl SecondaryComponent for BrocaComponent {
                     .to_owned(),
             ));
         }
-        //
-        //
+        // Sweep process groups before run directories so live ownership records remain
+        // available while orphaned processes are identified.
         subprocess::group_registry::sweep_orphaned_groups().map_err(|err| {
             InitError(format!(
                 "broca could not sweep crash-orphaned process groups: {err}"
