@@ -11,4 +11,7 @@
 mod canonical_state;
 
 mod fixtures;
+mod harness;
+mod model;
+mod obligations;
 mod oracle;
