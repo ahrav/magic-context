@@ -74,17 +74,18 @@ STAGED
     fi
   fi
 
-  if ! out=$(COMMENT_CHECK_IDS="$ids" sh "$gate" "$@" 2>&1); then
-    printf '%s\n' "$out" | sed "s|$work/||g" >&2
-    exit 1
-  fi
-
-  # A grown export can make an unchanged comment a finding, so the whole tree is
-  # checked against it whenever it is staged, not only when it is staged alone.
-  if [ "$ids_staged" -eq 1 ] && [ "$#" -gt 0 ]; then
-    if ! out=$(COMMENT_CHECK_IDS="$ids" sh "$gate" 2>&1); then
-      printf '%s\n' "$out" >&2
+  if [ "$ids_staged" -eq 1 ]; then
+    # A grown export can make an unchanged comment a finding, so the whole index is
+    # materialized and scanned against it; the working tree may differ from the commit.
+    mkdir -p "$work/tree" || exit 1
+    git checkout-index -a -f --prefix="$work/tree/" || exit 1
+    find "$work/tree" -type f > "$work/list" || exit 1
+    if ! out=$(COMMENT_CHECK_IDS="$ids" COMMENT_CHECK_LIST="$work/list" sh "$gate" 2>&1); then
+      printf '%s\n' "$out" | sed "s|$work/tree/||g; s|$work/||g" >&2
       exit 1
     fi
+  elif ! out=$(COMMENT_CHECK_IDS="$ids" sh "$gate" "$@" 2>&1); then
+    printf '%s\n' "$out" | sed "s|$work/||g" >&2
+    exit 1
   fi
 fi

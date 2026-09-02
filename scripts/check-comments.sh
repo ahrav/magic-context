@@ -32,7 +32,9 @@ fi
 list=$(mktemp) || exit 2
 trap 'rm -f "$list"' EXIT HUP INT TERM
 
-if [ "$#" -gt 0 ]; then
+if [ -n "${COMMENT_CHECK_LIST:-}" ]; then
+  cat "$COMMENT_CHECK_LIST" > "$list" || exit 2
+elif [ "$#" -gt 0 ]; then
   printf '%s\n' "$@" > "$list"
 else
   # -z keeps a non-ASCII path unquoted, so its extension is still recognized.
@@ -67,7 +69,10 @@ function shebang_kind(p,   first, rc, w) {
   if (rc <= 0 || first !~ /^#!/) return ""
   w = first
   sub(/^#![ \t]*/, "", w)
-  if (w ~ /^\/usr\/bin\/env[ \t]+/) sub(/^\/usr\/bin\/env[ \t]+/, "", w)
+  if (w ~ /^\/usr\/bin\/env[ \t]+/) {
+    sub(/^\/usr\/bin\/env[ \t]+/, "", w)
+    while (w ~ /^-/) sub(/^[^ \t]+[ \t]+/, "", w)
+  }
   sub(/[ \t].*$/, "", w)
   sub(/^.*\//, "", w)
   if (w ~ /^(sh|bash|zsh|dash|ksh)$/) return "sh"
@@ -118,7 +123,7 @@ function powershell_literals(p) {
 
 # A shell command substitution inside a double-quoted body holds code, not data.
 function cmdsub_literals(p) {
-  return (p ~ /\.sh$/ || shebang_lang == "sh") ? 1 : 0
+  return (p ~ /\.(sh|ps1)$/ || shebang_lang == "sh") ? 1 : 0
 }
 
 # PowerShell uses a backtick where the other languages use a backslash.
@@ -142,7 +147,8 @@ function template_quotes(p) {
 }
 
 function hash_boundary(p) {
-  if (p ~ /\.(sh|ps1)$/ || shebang_lang == "sh") return 2
+  if (p ~ /\.ps1$/) return 3
+  if (p ~ /\.sh$/ || shebang_lang == "sh") return 2
   if (p ~ /\.(yml|yaml)$/) return 1
   return 0
 }
@@ -309,6 +315,8 @@ function url_scheme(line, i,   j, w, c) {
     if (c !~ /^[A-Za-z]$/) break
     w = tolower(c) w
   }
+  # A scheme word with nothing before it on the line is a label, so only an embedded one is a locator.
+  if (substr(line, 1, j) ~ /^[ \t]*$/) return 0
   return (w == "http" || w == "https" || w == "ftp" || w == "file" || w == "ws" ||
           w == "wss" || w == "git" || w == "ssh" || w == "mailto" || w == "data")
 }
@@ -363,7 +371,7 @@ function heredoc_word(line, i,   j, c, w, e) {
   w = ""
   while (j <= length(line)) {
     c = substr(line, j, 1)
-    if (c !~ /^[A-Za-z0-9_]$/) break
+    if (c == " " || c == "\t" || index(";|&<>()", c) > 0) break
     w = w c
     j++
   }
@@ -377,7 +385,8 @@ function hash_opens(line, i,   prev) {
   if (hash_bound == 0 || i == 1) return 1
   prev = substr(line, i - 1, 1)
   if (prev == " " || prev == "\t") return 1
-  if (hash_bound == 2 && index(";&|()", prev) > 0) return 1
+  if (hash_bound >= 2 && index(";&|()", prev) > 0) return 1
+  if (hash_bound == 3 && (prev == DQ || prev == SQ)) return 1
   return 0
 }
 
