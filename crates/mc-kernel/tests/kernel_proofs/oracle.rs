@@ -16,8 +16,11 @@ use crate::canonical_state::{digest, digested_tables, Profile};
 use crate::fixtures::{deletion, domain, ingest, intent, now_ms, root_domain, staging};
 
 /// Seeds a domain, a registered consumer, two ingested artifacts, and two
-/// deletions so every identity domain except capture pins has rows, and
-/// barrier ids appear in relational columns and JSON payloads alike.
+/// deletions, so barrier ids appear in relational columns and JSON payloads alike.
+///
+/// A successful ingest releases its reservation row, and no consumer is abandoned here, so
+/// `artifact_ingestion_reservations` and `consumer_abandonments` end empty. Fixtures that
+/// populate those two domains are tracked in `magic-context-s9k5`.
 fn seed(root: &Path) -> KernelStore {
     let store = KernelStore::open(root).unwrap();
     store
@@ -422,6 +425,7 @@ fn digested_table_set_equals_schema_inventory() {
     let mut keys = digested.tables.keys().cloned().collect::<BTreeSet<_>>();
     assert!(keys.remove("cas_objects"));
     assert!(keys.remove("cas_temps"));
+    assert!(keys.remove("cas_unexpected"));
     assert!(keys.remove("sqlite_sequence"));
     assert_eq!(keys, declared);
 }

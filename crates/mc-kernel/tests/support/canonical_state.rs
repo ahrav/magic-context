@@ -86,6 +86,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
+use mc_kernel::schema::KERNEL_APPLICATION_ID;
+use mc_kernel::sqlite_runtime::compute_marker_digest_for_application_id;
+
 /// Comparison the digest is normalized for; see the module documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -162,6 +165,12 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
         .collect::<Vec<_>>();
     tables.insert("cas_temps".to_string(), hash_rows(&temp_rows));
+    let unexpected_rows = normalized
+        .unexpected
+        .into_iter()
+        .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
+        .collect::<Vec<_>>();
+    tables.insert("cas_unexpected".to_string(), hash_rows(&unexpected_rows));
     let sequence_rows = normalized
         .sequences
         .into_iter()
@@ -224,6 +233,7 @@ struct State {
     tables: BTreeMap<String, Table>,
     sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
+    unexpected: Vec<(String, u64)>,
     temps: Vec<(String, u64)>,
 }
 
@@ -231,6 +241,7 @@ struct Normalized {
     tables: BTreeMap<String, Vec<Vec<Cell>>>,
     sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
+    unexpected: Vec<(String, u64)>,
     temps: Vec<(String, u64)>,
 }
 
@@ -272,10 +283,12 @@ impl State {
                 .unwrap();
             tables.insert(name, Table { columns, rows });
         }
+        verify_format_marker(&tables);
         Self {
             tables,
             sequences: read_sequences(&connection),
             objects: scan_objects(root),
+            unexpected: scan_unexpected_objects(root),
             temps: scan_temps(root),
         }
     }
@@ -321,6 +334,7 @@ impl State {
             tables,
             sequences: self.sequences,
             objects: self.objects,
+            unexpected: self.unexpected,
             temps: self.temps,
         }
     }
@@ -539,6 +553,56 @@ fn assert_no_unresolved_identity(table: &str, cell: &Cell) {
     }
 }
 
+/// Verify the marker digest here, since a normalized comparison no longer covers it.
+///
+/// `read_valid_marker` recomputes it on open, so a corrupted value must not compare equal.
+fn verify_format_marker(tables: &BTreeMap<String, Table>) {
+    let Some(table) = tables.get("mc_kernel_format_marker") else {
+        return;
+    };
+    let column = |name: &str| {
+        table
+            .columns
+            .iter()
+            .position(|column| column == name)
+            .unwrap_or_else(|| panic!("mc_kernel_format_marker.{name} missing"))
+    };
+    let epoch = column("format_epoch");
+    let incarnation = column("database_incarnation_id");
+    let schema = column("schema_digest");
+    let created = column("created_at");
+    let marker = column("marker_digest");
+    for row in &table.rows {
+        let (
+            Cell::Integer(format_epoch),
+            Cell::Text(incarnation_id),
+            Cell::Text(schema_digest),
+            Cell::Integer(created_at),
+            Cell::Text(marker_digest),
+        ) = (
+            &row[epoch],
+            &row[incarnation],
+            &row[schema],
+            &row[created],
+            &row[marker],
+        )
+        else {
+            panic!("mc_kernel_format_marker holds an unexpected column type");
+        };
+        let expected = compute_marker_digest_for_application_id(
+            KERNEL_APPLICATION_ID,
+            *format_epoch,
+            incarnation_id,
+            schema_digest,
+            *created_at,
+        );
+        assert_eq!(
+            marker_digest, &expected,
+            "mc_kernel_format_marker.marker_digest does not match its own row"
+        );
+    }
+}
+
 fn hash_rows(rows: &[Vec<Cell>]) -> String {
     let mut hasher = Sha256::new();
     hasher.update((rows.len() as u64).to_le_bytes());
@@ -666,9 +730,52 @@ pub fn scan_temps(root: &Path) -> Vec<(String, u64)> {
 ///
 /// Treating an unreadable CAS directory as empty would make its digest equal an empty store's.
 fn read_dir_or_absent(path: &Path) -> Option<fs::ReadDir> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            panic!("{} is a symlink", path.display())
+        }
+        Ok(metadata) if !metadata.is_dir() => panic!("{} is not a directory", path.display()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("cannot stat {}: {error}", path.display()),
+    }
     match fs::read_dir(path) {
         Ok(entries) => Some(entries),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => panic!("cannot read {}: {error}", path.display()),
+    }
+}
+
+/// Hash regular files outside valid shards so digest comparison detects unexpected CAS state.
+///
+/// Content digests are recorded instead of names, as `scan_temps` does.
+pub fn scan_unexpected_objects(root: &Path) -> Vec<(String, u64)> {
+    let Some(entries) = read_dir_or_absent(&root.join("artifacts/objects")) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let is_shard = entry.file_type().unwrap().is_dir()
+            && name.len() == 2
+            && name.bytes().all(is_lower_hex);
+        if !is_shard {
+            collect_file_digests(&entry.path(), &mut result);
+        }
+    }
+    result.sort();
+    result
+}
+
+/// Symlinks are excluded rather than followed.
+fn collect_file_digests(path: &Path, out: &mut Vec<(String, u64)>) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            collect_file_digests(&entry.unwrap().path(), out);
+        }
+    } else if metadata.is_file() {
+        let bytes = fs::read(path).unwrap();
+        out.push((format!("{:x}", Sha256::digest(&bytes)), bytes.len() as u64));
     }
 }
