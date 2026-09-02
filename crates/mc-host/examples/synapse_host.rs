@@ -1,8 +1,3 @@
-//!
-//! Usage:
-//!
-//! (degraded-lane smoke).
-
 use std::time::Duration;
 
 use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits};
