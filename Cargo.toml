@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mc-core", "crates/mc-secret-scanner", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
+members = ["crates/mc-core", "crates/mc-secret-scanner", "crates/mc-kernel", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
 # Exclude docs/evidence/subc-surface-probe because it uses published subc crates from crates.io rather than sibling sources.
 # Exclude crates/mc-shm-transport/fuzz because it declares its own [workspace].
 exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]

@@ -2006,6 +2006,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mc-kernel"
+version = "0.1.0"
+dependencies = [
+ "cortexkit-lease",
+ "criterion",
+ "gix",
+ "mc-core",
+ "mc-kernel",
+ "proptest",
+ "rusqlite",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "mc-module"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,44 @@
+[package]
+name = "mc-kernel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Magic Context semantic kernel: a lease-fenced SQLite store owning commit envelopes, admission, CAS artifacts, scope algebra, and backup."
+
+[lib]
+name = "mc_kernel"
+path = "src/lib.rs"
+
+[dependencies]
+mc-core = { workspace = true }
+cortexkit-lease = { workspace = true }
+rusqlite = { workspace = true, features = ["backup", "functions", "hooks"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+gix = { workspace = true }
+semver = { workspace = true }
+
+[features]
+# Fault-injection and inspection helpers the kernel proofs drive. Gated so the
+# writers never ship in production builds.
+test-support = []
+
+[dev-dependencies]
+# Self dev-dependency so integration tests see the `test-support` helpers.
+mc-kernel = { path = ".", features = ["test-support"] }
+# Fixture repositories are written with gix object APIs; no git CLI, even in tests.
+gix = { workspace = true }
+semver = { workspace = true }
+proptest = "1"
+tempfile = "3"
+criterion = "=0.8.2"
+
+[[bench]]
+name = "anchor_resolution"
+harness = false
+
+[[bench]]
+name = "scope_algebra"
+harness = false
