@@ -391,6 +391,9 @@ function parseEndpointEstimates(
                 minimumAnalyzableFamilyCount,
                 rawFamilies.length,
             ));
+        // `estimateEndpoint` groups observations by family, so it emits one row per distinct family. A repeat
+        // would also inflate the count the resolution rule reads.
+        p.unique(families.map(({ familyId }) => familyId), `${itemLabel}.families`);
         const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
         const pointEstimate = finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
@@ -436,11 +439,8 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     p.unique(endpoints.map(({ endpoint }) => endpoint), `${label}.endpoints`);
     if (endpoints.length > 0) {
         if (endpoints.length !== PRIMARY_ENDPOINTS.length) p.fail(`${label}.endpoints: paired-endpoints-required`);
-        const familyKeys = endpoints.map(({ families }) => {
-            const familyIds = families.map(({ familyId }) => familyId);
-            p.unique(familyIds, `${label}.endpoints`);
-            return [...familyIds].sort(compareCodeUnits).join("\u0000");
-        });
+        const familyKeys = endpoints.map(({ families }) =>
+            families.map(({ familyId }) => familyId).sort(compareCodeUnits).join("\u0000"));
         if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
     }
     // Endpoint-less floors with the same `familyId` must have matching fingerprints across primary
@@ -454,6 +454,17 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
             const seen = unscopedFloors.get(floor.familyId);
             if (seen === undefined) unscopedFloors.set(floor.familyId, shape);
             else if (seen !== shape) {
+                p.fail(`${label}.endpoints[${index}].families[${familyIndex}].noise.floor: floor-conflict`);
+            }
+        }
+    }
+    // An unscoped floor is the fallback for every endpoint of its family, so an endpoint lacking a floor of
+    // its own resolves to it and cannot read as having none.
+    for (const [index, endpointEstimate] of endpoints.entries()) {
+        for (const [familyIndex, family] of endpointEstimate.families.entries()) {
+            if (!unscopedFloors.has(family.familyId)) continue;
+            const floor = family.noise.floor;
+            if (floor === undefined || floor === null) {
                 p.fail(`${label}.endpoints[${index}].families[${familyIndex}].noise.floor: floor-conflict`);
             }
         }

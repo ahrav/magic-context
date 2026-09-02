@@ -1035,6 +1035,15 @@ describe("parsePairedDeltaReport", () => {
             }
             for (const endpoint of body.analysis.endpoints) endpoint.resolution = "unresolved";
         }))).toThrow(/report\.body\.analysis\.endpoints\[1\]\.families\[0\]\.noise\.floor: floor-conflict/);
+        // An unscoped floor is the fallback for both endpoints, so the other one cannot read as having none.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.noise.floor = { familyId: family.familyId, value: 10, interval: { lower: 0, upper: 20 } };
+            family.noise.label = "inside-floor";
+            family.resolution = "unresolved";
+            body.analysis.endpoints[0]!.resolution = "unresolved";
+            expect(body.analysis.endpoints[1]!.families[0]!.noise.floor).toBeNull();
+        }))).toThrow(/report\.body\.analysis\.endpoints\[1\]\.families\[0\]\.noise\.floor: floor-conflict/);
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;
             expect(body.analysis.endpoints[0]!.endpoint).toBe("mc-on-vs-compaction");
