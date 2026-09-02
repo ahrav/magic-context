@@ -68,6 +68,7 @@ fn clock_bracket_ns() -> u64 {
     samples[samples.len() / 2]
 }
 
+/// Returns one mean full round-trip time per measured batch, in nanoseconds.
 ///
 /// The release/acquire handoffs publish each exchange between the initiator and responder.
 /// The finite matching counts let every exchange terminate without a stop flag or timeout.
@@ -184,8 +185,10 @@ pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
     })
 }
 
-/// The benchmark times `exchanges` full round trips in one warmup-free, uninstrumented `iter_custom` window.
-/// instrumentation.
+/// The benchmark times `exchanges` full round trips in one warmup-free batch.
+/// The benchmark promotes a zero count to one exchange.
+///
+/// Returns an error when `exchanges` exceeds `u32::MAX`, CPU pinning fails, or either worker panics.
 pub fn timed_exchanges(
     initiator_cpu: u32,
     responder_cpu: u32,
