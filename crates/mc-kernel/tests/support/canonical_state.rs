@@ -50,13 +50,27 @@
 //! | `abandonment` | `consumer_abandonments.abandonment_id` | `next_unique_id()` |
 //! | `capture_pin` | `capture_pins.capture_pin_id` | `randomblob(16)` |
 //!
-//! Identities are numbered in the order of their defining rows once the
-//! identity column and the volatile columns are removed, with the identity
-//! itself breaking ties; `next_unique_id()` counters are monotone within one
-//! process, so tied rows number in creation order in both roots. A barrier-
-//! or reservation-shaped token that survives renaming is
-//! a reference to an identity no defining row declares; the digest panics
-//! rather than compare two roots through an unresolved reference.
+//! Identities are numbered in the order of their defining rows.
+//! The ordering key drops the identity column and normalizes the rest.
+//! The identity itself breaks ties between equal keys.
+//! `next_unique_id()` counters are monotone within one process.
+//! Tied rows therefore number in creation order.
+//! A defining row may reference an earlier domain's identity.
+//! `capture_pins.purge_barrier_id` is one such column.
+//! Earlier domains are renamed before a later ordering key is taken.
+//! `IDENTITY_DOMAINS` orders referenced domains before their dependents.
+//! No defining row names a later domain's identity.
+//!
+//! A barrier- or reservation-shaped token can survive renaming.
+//! Such a token references an identity no defining row declares.
+//! The digest panics rather than compare two roots through it.
+//! Capture-pin and abandonment identities have no shape distinct enough to scan.
+//! An unresolved one of those surfaces as a digest inequality instead.
+//!
+//! `expires_at` is compared by presence, not by instant.
+//! Two roots handed different explicit values therefore compare equal.
+//! The default expiry derives from each root's own clock.
+//! Comparing the instant exactly would fail an identical history.
 
 #![allow(dead_code)]
 
@@ -91,9 +105,26 @@ impl CanonicalDigest {
     }
 
     /// Equality assertion that names the differing tables instead of
-    /// printing two maps of hashes.
+    /// printing two maps of hashes. The key-set check runs first because equal
+    /// shared-table digests would otherwise mask a table only one state covers.
     #[track_caller]
     pub fn assert_same(&self, other: &Self, context: &str) {
+        let missing_here = other
+            .tables
+            .keys()
+            .filter(|table| !self.tables.contains_key(*table));
+        let missing_there = self
+            .tables
+            .keys()
+            .filter(|table| !other.tables.contains_key(*table));
+        let uncovered = missing_here
+            .chain(missing_there)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            uncovered.is_empty(),
+            "{context}: only one digest covers {uncovered:?}"
+        );
         let differing = self
             .tables
             .iter()
@@ -198,7 +229,7 @@ impl State {
         for name in table_names(&connection) {
             let columns = columns_of(&connection, &name);
             let sql = format!(
-                "SELECT {} FROM {name}",
+                "SELECT {} FROM \"{name}\"",
                 columns
                     .iter()
                     .map(|column| format!("\"{column}\""))
@@ -285,15 +316,15 @@ impl State {
     fn identity_renames(&self) -> Vec<(String, String)> {
         let mut renames = Vec::new();
         for domain in IDENTITY_DOMAINS {
+            // Earlier renames normalize cross-root identity text in ordering keys.
+            let resolved = longest_token_first(&renames);
             let table = &self.tables[domain.table];
             let column = table
                 .columns
                 .iter()
                 .position(|column| column == domain.column)
                 .unwrap_or_else(|| panic!("{}.{} missing", domain.table, domain.column));
-            // Identities are numbered by the stable columns of their defining
-            // row, then by the identity itself, so two roots that minted
-            // different identifiers for the same rows number them alike.
+            // Identity ordinals sort by normalized non-identity columns, then identity text.
             let mut ordered = table
                 .rows
                 .iter()
@@ -305,11 +336,12 @@ impl State {
                         .iter()
                         .zip(&table.columns)
                         .enumerate()
-                        .filter(|(index, (_, name))| {
-                            *index != column
-                                && column_rule(Profile::CrossRoot, domain.table, name) == Rule::Keep
+                        .filter(|(index, _)| *index != column)
+                        .filter_map(|(_, (cell, name))| {
+                            let rule = column_rule(Profile::CrossRoot, domain.table, name);
+                            (rule != Rule::Drop)
+                                .then(|| rename_cell(apply_rule(cell.clone(), rule), &resolved))
                         })
-                        .map(|(_, (cell, _))| cell.clone())
                         .collect::<Vec<_>>();
                     (key, id.clone())
                 })
@@ -319,9 +351,15 @@ impl State {
                 renames.push((id, format!("<{}:{ordinal}>", domain.name)));
             }
         }
-        renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
-        renames
+        longest_token_first(&renames)
     }
+}
+
+/// Orders longer tokens first so `replace_tokens` rewrites embedded identities whole.
+fn longest_token_first(renames: &[(String, String)]) -> Vec<(String, String)> {
+    let mut ordered = renames.to_vec();
+    ordered.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    ordered
 }
 
 struct IdentityDomain {
@@ -453,6 +491,10 @@ fn replace_tokens(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
 /// Panics when a cell still carries a barrier- or reservation-shaped token
 /// (`[artifact-deletion-]<64 hex>-<digits>`) after renaming: that token names
 /// an identity no defining row declares, so the two roots cannot be compared.
@@ -462,12 +504,11 @@ fn assert_no_unresolved_identity(table: &str, cell: &Cell) {
         Cell::Blob(bytes) => bytes,
         _ => return,
     };
-    let is_hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
     for index in 0..bytes.len().saturating_sub(65) {
         let window = &bytes[index..index + 64];
-        let preceded_by_hex = index > 0 && is_hex(bytes[index - 1]);
+        let preceded_by_hex = index > 0 && is_lower_hex(bytes[index - 1]);
         if !preceded_by_hex
-            && window.iter().all(|&byte| is_hex(byte))
+            && window.iter().copied().all(is_lower_hex)
             && bytes[index + 64] == b'-'
             && bytes[index + 65].is_ascii_digit()
         {
@@ -521,9 +562,10 @@ fn columns_of(connection: &Connection, table: &str) -> Vec<String> {
 
 /// Every published CAS object as `(digest, byte_length)`, verifying each
 /// object's bytes hash to its path. Missing `artifacts/objects` reads as empty.
+/// Only two-character lowercase-hex shards hold objects.
 pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
     let objects = root.join("artifacts/objects");
-    let Ok(shards) = fs::read_dir(&objects) else {
+    let Some(shards) = read_dir_or_absent(&objects) else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -533,6 +575,9 @@ pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
             continue;
         }
         let prefix = shard.file_name().into_string().unwrap();
+        if prefix.len() != 2 || !prefix.bytes().all(is_lower_hex) {
+            continue;
+        }
         for entry in fs::read_dir(shard.path()).unwrap() {
             let entry = entry.unwrap();
             if !entry.file_type().unwrap().is_file() {
@@ -557,7 +602,7 @@ pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
 /// the content digest is what a leaked plaintext copy of a purged artifact
 /// shares across roots. Missing `artifacts/tmp` reads as empty.
 pub fn scan_temps(root: &Path) -> Vec<(String, u64)> {
-    let Ok(entries) = fs::read_dir(root.join("artifacts/tmp")) else {
+    let Some(entries) = read_dir_or_absent(&root.join("artifacts/tmp")) else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -571,4 +616,15 @@ pub fn scan_temps(root: &Path) -> Vec<(String, u64)> {
     }
     result.sort();
     result
+}
+
+/// `None` for an absent directory, panicking on every other error.
+///
+/// Treating an unreadable CAS directory as empty would make its digest equal an empty store's.
+fn read_dir_or_absent(path: &Path) -> Option<fs::ReadDir> {
+    match fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot read {}: {error}", path.display()),
+    }
 }

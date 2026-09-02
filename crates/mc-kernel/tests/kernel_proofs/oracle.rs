@@ -112,6 +112,19 @@ fn last_recorded_at(root: &Path) -> i64 {
         .unwrap()
 }
 
+/// A fixed sleep can leave two stamps equal when timer granularity exceeds the sleep duration.
+/// The positive controls below require two distinct instants, so they would fail intermittently.
+fn wait_past(stamp: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while now_ms() <= stamp {
+        assert!(
+            Instant::now() < deadline,
+            "clock did not advance past {stamp}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn backup(store: &KernelStore, expires_at: Option<i64>) -> BackupManifest {
     let destination = tempfile::tempdir().unwrap();
     std::fs::set_permissions(destination.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -158,7 +171,7 @@ fn cross_root_capture_pins_compare_by_expiry_presence_not_instant() {
             })
             .unwrap();
         backup(&store, Some(i64::MAX / 2));
-        thread::sleep(Duration::from_millis(3));
+        wait_past(now_ms());
         stores.push(store);
     }
     let expected = digest(first.path(), Profile::CrossRoot);
@@ -174,7 +187,11 @@ fn cross_root_capture_pins_compare_by_expiry_presence_not_instant() {
     // never compared.
     writable(second.path())
         .execute(
-            "UPDATE capture_pins SET expires_at=NULL WHERE expires_at IS NOT NULL",
+            "UPDATE capture_pins SET expires_at=NULL
+             WHERE capture_pin_id=(
+                 SELECT capture_pin_id FROM capture_pins
+                 WHERE expires_at IS NOT NULL ORDER BY capture_pin_id LIMIT 1
+             )",
             [],
         )
         .unwrap();
@@ -200,7 +217,7 @@ fn cross_root_capture_pins_compare_by_release_presence_not_instant() {
     first_store
         .release_capture_pin(&first_pin, now_ms())
         .unwrap();
-    thread::sleep(Duration::from_millis(3));
+    wait_past(now_ms());
     second_store
         .release_capture_pin(&second_pin, now_ms())
         .unwrap();
@@ -233,7 +250,7 @@ fn cross_root_reopen_abandonment_compares_by_terminal_presence_not_instant() {
     digest(second.path(), Profile::CrossRoot).assert_same(&live, "both runs live");
 
     KernelStore::open(first.path()).unwrap();
-    thread::sleep(Duration::from_millis(3));
+    wait_past(now_ms());
     KernelStore::open(second.path()).unwrap();
     assert_ne!(
         digest(first.path(), Profile::SameRoot).table("extraction_runs"),
@@ -301,7 +318,7 @@ fn identical_histories_in_two_roots_agree_cross_root_and_differ_same_root() {
     let _first_store = seed(first.path());
     // Distinct wall-clock stamps make every volatile column actually differ,
     // so an omission from the drop list cannot pass by timestamp coincidence.
-    thread::sleep(Duration::from_millis(3));
+    wait_past(last_recorded_at(first.path()));
     let _second_store = seed(second.path());
     assert_ne!(
         last_recorded_at(first.path()),
