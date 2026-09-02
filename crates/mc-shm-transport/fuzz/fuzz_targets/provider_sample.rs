@@ -1,3 +1,5 @@
+//! Provider-sample harness must accept every byte slice without panicking.
+//!
 //! libFuzzer requires nightly Rust.
 #![no_main]
 
