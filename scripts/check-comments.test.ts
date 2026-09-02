@@ -321,6 +321,52 @@ describe("comment hygiene gate", () => {
         expect(result.out).not.toContain("url.css:1:");
     });
 
+    test("a regex literal holding a block delimiter does not open a comment", () => {
+        const result = scan({
+            "re.ts": [
+                "const P = /(?:^|[^\\w./*-])((?:\\/[^/\\r\\n]+)+)/g;",
+                'const id = "magic-context-om3y";',
+                "// tracked in magic-context-om3y",
+            ].join("\n"),
+            "div.ts": "const r = (a + b) / 2; // tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("re.ts:2:");
+        expect(result.out).toContain("re.ts:3:");
+        expect(result.out).toContain("div.ts:1:");
+    });
+
+    test("an apostrophe in markup text does not hide a trailing comment", () => {
+        const result = scan({
+            "jsx.tsx": "return <p>Don't ship this</p>; // tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("jsx.tsx:1:");
+    });
+
+    test("the suppression ban ignores casing", () => {
+        const result = scan({ "case.rs": "// CommentLint: Allow(JUDGE)" });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("suppression on disk: ");
+    });
+
+    test("multi-line literal bodies in hash-comment languages are out of scope", () => {
+        const result = scan({
+            "tq.py": 'S = """\n# see magic-context-om3y in runtime data\n"""\n# tracked in magic-context-om3y',
+            "tq.toml": 's = """\n# see magic-context-om3y in runtime data\n"""\n# tracked in magic-context-om3y',
+            "hd.sh": "cat <<EOF\n# see magic-context-om3y in runtime data\nEOF\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        for (const name of ["tq.py", "tq.toml", "hd.sh"]) {
+            expect(result.out).not.toContain(`${name}:2:`);
+            expect(result.out).toContain(`${name}:4:`);
+        }
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

@@ -35,7 +35,8 @@ trap 'rm -f "$list"' EXIT HUP INT TERM
 if [ "$#" -gt 0 ]; then
   printf '%s\n' "$@" > "$list"
 else
-  git ls-files > "$list" || exit 2
+  # -z keeps a non-ASCII path unquoted, so its extension is still recognized.
+  git ls-files -z | tr '\0' '\n' > "$list" || exit 2
 fi
 
 status=0
@@ -79,6 +80,20 @@ function rust_literals(p) {
   return (p ~ /\.rs$/) ? 1 : 0
 }
 
+# A slash can open a regular expression, whose body may contain a comment delimiter.
+function regex_literals(p) {
+  return (p ~ /\.(ts|tsx|js|mjs|cjs)$/) ? 1 : 0
+}
+
+# Python and TOML share the triple-quote form.
+function triple_literals(p) {
+  return (p ~ /\.(py|toml)$/) ? 1 : 0
+}
+
+function heredoc_literals(p) {
+  return (p ~ /\.sh$/) ? 1 : 0
+}
+
 # JavaScript template literals permit unescaped line breaks; quoted strings do not.
 function template_quotes(p) {
   return (p ~ /\.(ts|tsx|js|mjs|cjs)$/) ? 1 : 0
@@ -92,16 +107,17 @@ function hash_boundary(p) {
 
 # Quote tracking keeps a delimiter inside a string literal from opening a comment.
 # Only block-comment state survives across lines, so an unbalanced quote cannot desync the next line.
-function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, e, prev) {
+function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hashes, e, prev) {
   out = ""
+  unterm = 0
   n = length(line)
   i = 1
-  # Continue scanning after a raw literal opened on an earlier line.
-  if (rawend != "") {
-    e = index(line, rawend)
+  # `litend` holds the delimiter of a literal opened on a prior line.
+  if (litend != "") {
+    e = index(line, litend)
     if (e == 0) return ""
-    i = e + length(rawend)
-    rawend = ""
+    i = e + length(litend)
+    litend = ""
   }
   q = (tq && tsub == 0) ? BT : ""
   while (i <= n) {
@@ -136,12 +152,12 @@ function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, e, prev) 
         hashes = 0
         while (substr(line, k, 1) == "#") { hashes++; k++ }
         if (substr(line, k, 1) == DQ) {
-          rawend = DQ
-          for (m = 0; m < hashes; m++) rawend = rawend "#"
-          e = index(substr(line, k + 1), rawend)
+          litend = DQ
+          for (m = 0; m < hashes; m++) litend = litend "#"
+          e = index(substr(line, k + 1), litend)
           if (e == 0) return out
-          i = k + e + length(rawend)
-          rawend = ""
+          i = k + e + length(litend)
+          litend = ""
           continue
         }
       }
@@ -157,9 +173,28 @@ function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, e, prev) 
       i++
       continue
     }
-    if (c == DQ || (c == SQ && sq_quotes)) { q = c; i++; continue }
+    if (triple_lit && (c == DQ || c == SQ)) {
+      three = substr(line, i, 3)
+      if (three == DQ DQ DQ || three == SQ SQ SQ) {
+        litend = three
+        e = index(substr(line, i + 3), three)
+        if (e == 0) return out
+        i = i + 3 + e + 2
+        litend = ""
+        continue
+      }
+    }
+    if (regex_lit && c == "/" && substr(line, i + 1, 1) != "/" && substr(line, i + 1, 1) != "*") {
+      e = regex_end(line, i, n)
+      if (e > 0) { i = e; continue }
+    }
+    if (c == DQ || (c == SQ && sq_quotes && !nosq)) { q = c; i++; continue }
     if (c == BT && tmpl_quotes) { q = BT; tq = 1; i++; continue }
     if (st == "hash") {
+      if (heredoc_lit && substr(line, i, 2) == "<<") {
+        e = heredoc_word(line, i)
+        if (e > 0) { i = e; continue }
+      }
       if (c == "#" && hash_opens(line, i)) return out " " substr(line, i + 1)
       i++
       continue
@@ -169,7 +204,57 @@ function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, e, prev) 
     if (two == "/*") { depth = 1; out = out " "; i += 2; continue }
     i++
   }
+  if (q != "" && q != BT) unterm = 1
   return out
+}
+
+# Only scan a slash-delimited body where an expression can begin; elsewhere a slash is division or a path.
+function regex_end(line, i, n,   j, c, prev, in_class) {
+  prev = prev_code_char(line, i)
+  if (prev != "" && index("(,=:[!&|?{};+-*%~^", prev) == 0) return 0
+  in_class = 0
+  j = i + 1
+  while (j <= n) {
+    c = substr(line, j, 1)
+    if (c == BS) { j += 2; continue }
+    if (c == "[") in_class = 1
+    else if (c == "]") in_class = 0
+    else if (c == "/" && !in_class) {
+      j++
+      while (substr(line, j, 1) ~ /^[a-z]$/) j++
+      return j
+    }
+    j++
+  }
+  return 0
+}
+
+function prev_code_char(line, i,   j, c) {
+  for (j = i - 1; j > 0; j--) {
+    c = substr(line, j, 1)
+    if (c != " " && c != "\t") return c
+  }
+  return ""
+}
+
+# A heredoc body ends at a line holding only its delimiter, so the word is retained rather than matched as a substring.
+function heredoc_word(line, i,   j, c, w) {
+  j = i + 2
+  if (substr(line, j, 1) == "-") j++
+  while (substr(line, j, 1) == " ") j++
+  c = substr(line, j, 1)
+  if (c == DQ || c == SQ) j++
+  w = ""
+  while (j <= length(line)) {
+    c = substr(line, j, 1)
+    if (c !~ /^[A-Za-z0-9_]$/) break
+    w = w c
+    j++
+  }
+  if (w == "") return 0
+  heredoc = w
+  if (substr(line, j, 1) == DQ || substr(line, j, 1) == SQ) j++
+  return j
 }
 
 # Boundary 0 accepts any position, 1 also requires whitespace or line start, and 2 additionally accepts a control operator.
@@ -182,12 +267,12 @@ function hash_opens(line, i,   prev) {
 }
 
 function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, tok) {
-  if (txt ~ /commentlint:[ \t]*allow[ \t]*\(/) {
+  lt = tolower(txt) " "
+  if (lt ~ /commentlint:[ \t]*allow[ \t]*\(/) {
     printf "comment-lint suppression on disk: %s:%d:%s\n", p, lno, raw
     status = 1
   }
 
-  lt = tolower(txt) " "
   hit = 0
   # The prefix disambiguates, so a base lookup suffices here. A product name carrying an unknown base does not trigger.
   rest = lt
@@ -246,21 +331,33 @@ BEGIN {
     rust_lit = rust_literals(path)
     tmpl_quotes = template_quotes(path)
     hash_bound = hash_boundary(path)
+    regex_lit = regex_literals(path)
+    triple_lit = triple_literals(path)
+    heredoc_lit = heredoc_literals(path)
     depth = 0
     tq = 0
     tsub = 0
-    rawend = ""
+    litend = ""
+    heredoc = ""
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
-      if (depth == 0 && !tq && rawend == "") {
+      if (heredoc != "") {
+        if (line ~ ("^[ \t]*" heredoc "[ \t]*$")) heredoc = ""
+        continue
+      }
+      if (depth == 0 && !tq && litend == "") {
         if (style == "hash") {
-          if (index(line, "#") == 0) continue
+          if (index(line, "#") == 0 &&
+              !(triple_lit && (index(line, DQ DQ DQ) > 0 || index(line, SQ SQ SQ) > 0)) &&
+              !(heredoc_lit && index(line, "<<") > 0)) continue
         } else if (index(line, "/") == 0 &&
                    !(tmpl_quotes && index(line, BT) > 0) &&
                    !(rust_lit && index(line, DQ) > 0)) continue
       }
-      text = comment_of(line, style)
+      text = comment_of(line, style, 0)
+      # An apostrophe left open is prose rather than a string, so retry without it.
+      if (text == "" && unterm) text = comment_of(line, style, 1)
       if (text != "") check(path, lno, line, text)
     }
     close(path)
