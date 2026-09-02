@@ -9,9 +9,17 @@ use crate::{
     Finding, LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport, TextSpan,
 };
 
+#[derive(Debug)]
 enum Abort {
     Work,
     Invalid(ScanError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CandidateSpans {
+    full: TextSpan,
+    value: TextSpan,
+    key: Option<TextSpan>,
 }
 
 impl From<ScanError> for Abort {
@@ -52,6 +60,41 @@ pub(crate) fn evaluate(
         if add_work(&mut work, bytes.len(), limits.max_work_bytes).is_err() {
             limits_hit = Some(LimitExhausted::Work);
             break 'rules;
+        }
+        if rule.declaration.name == "magic-keyed-assignment" && input.is_ascii() {
+            let mut cursor = 0;
+            while let Some(equals) =
+                memchr::memchr(b'=', &bytes[cursor..]).map(|equals| cursor + equals)
+            {
+                let spans = match ascii_assignment_at(input, equals) {
+                    Ok(spans) => spans,
+                    Err(Abort::Work) => {
+                        limits_hit = Some(LimitExhausted::Work);
+                        break 'rules;
+                    }
+                    Err(Abort::Invalid(error)) => return Err(error),
+                };
+                if let Some(spans) = spans {
+                    cursor = spans.full.end();
+                    if candidates >= limits.max_candidates {
+                        limits_hit = Some(LimitExhausted::Candidates);
+                        break 'rules;
+                    }
+                    candidates += 1;
+                    match evaluate_candidate_spans(rules, rule, spans, input, &mut work, limits) {
+                        Ok(Some(finding)) => findings.push(finding),
+                        Ok(None) => {}
+                        Err(Abort::Work) => {
+                            limits_hit = Some(LimitExhausted::Work);
+                            break 'rules;
+                        }
+                        Err(Abort::Invalid(error)) => return Err(error),
+                    }
+                } else {
+                    cursor = equals + 1;
+                }
+            }
+            continue;
         }
         for captures in rule.regex.captures_iter(bytes) {
             if candidates >= limits.max_candidates {
@@ -107,6 +150,17 @@ fn evaluate_candidate(
     work: &mut usize,
     limits: ScanLimits,
 ) -> Result<Option<Finding>, Abort> {
+    let Some(spans) = candidate_spans(rule, captures, input)? else {
+        return Ok(None);
+    };
+    evaluate_candidate_spans(rules, rule, spans, input, work, limits)
+}
+
+fn candidate_spans(
+    rule: &Rule,
+    captures: &Captures<'_>,
+    input: &str,
+) -> Result<Option<CandidateSpans>, Abort> {
     let full_match = captures.get(0).ok_or(ScanError::InvalidSpan)?;
     // A nonparticipating declared value, secret, or key group skips the candidate, rather than aborting the whole scan, reporting the whole match, or silently skipping the gate keyed on that group.
     let value_match = if let Some(name) = rule.declaration.value_group.as_deref() {
@@ -144,6 +198,26 @@ fn evaluate_candidate(
     if !full_span.contains(value_span) || key_span.is_some_and(|span| !full_span.contains(span)) {
         return Err(ScanError::InvalidSpan.into());
     }
+    Ok(Some(CandidateSpans {
+        full: full_span,
+        value: value_span,
+        key: key_span,
+    }))
+}
+
+fn evaluate_candidate_spans(
+    rules: &RuleSet,
+    rule: &Rule,
+    spans: CandidateSpans,
+    input: &str,
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<Option<Finding>, Abort> {
+    let CandidateSpans {
+        full: full_span,
+        value: value_span,
+        key: key_span,
+    } = spans;
     let value = input
         .as_bytes()
         .get(value_span.start()..value_span.end())
@@ -304,6 +378,85 @@ fn evaluate_candidate(
         value_span,
         key_span,
     }))
+}
+
+fn ascii_assignment_at(input: &str, equals: usize) -> Result<Option<CandidateSpans>, Abort> {
+    let bytes = input.as_bytes();
+    if bytes.get(equals) != Some(&b'=') {
+        return Ok(None);
+    }
+    let mut key_end = equals;
+    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+        key_end -= 1;
+    }
+    let mut run_start = key_end;
+    while run_start > 0 && is_key_byte(bytes[run_start - 1]) {
+        run_start -= 1;
+    }
+    let Some(key_start) = (run_start..key_end).find(|&index| {
+        is_word_byte(bytes[index]) && (index == 0 || !is_word_byte(bytes[index - 1]))
+    }) else {
+        return Ok(None);
+    };
+    if !contains_keyed_keyword(&bytes[key_start..key_end]) {
+        return Ok(None);
+    }
+    let mut value_start = equals + 1;
+    while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+        value_start += 1;
+    }
+    let mut value_end = value_start;
+    while let Some(byte) = bytes.get(value_end) {
+        if *byte == b'\\' {
+            if bytes.get(value_end + 1).is_none() {
+                break;
+            }
+            value_end += 2;
+        } else if byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'\'' | b'"' | b'`' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'$'
+            )
+        {
+            break;
+        } else {
+            value_end += 1;
+        }
+    }
+    if value_start == value_end {
+        return Ok(None);
+    }
+    Ok(Some(CandidateSpans {
+        full: TextSpan::snapped(input, key_start, value_end)?,
+        value: TextSpan::snapped(input, value_start, value_end)?,
+        key: Some(TextSpan::snapped(input, key_start, key_end)?),
+    }))
+}
+
+fn is_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn contains_keyed_keyword(key: &[u8]) -> bool {
+    key.iter().enumerate().any(|(index, byte)| {
+        let keyword: &[u8] = match byte.to_ascii_lowercase() {
+            b'a' => b"auth",
+            b'b' => b"bearer",
+            b'c' => b"credential",
+            b'k' => b"key",
+            b'p' => b"password",
+            b's' => b"secret",
+            b't' => b"token",
+            _ => return false,
+        };
+        key[index..]
+            .get(..keyword.len())
+            .is_some_and(|window| window.eq_ignore_ascii_case(keyword))
+    })
 }
 
 // Unnamed captures hold secrets; named captures mark header fields. Ignore named captures so header-only rules return their whole match.
@@ -1211,6 +1364,51 @@ mod tests {
             regex,
             keyword_matcher: None,
             suppressor_matcher: None,
+        }
+    }
+
+    fn ascii_keyed_assignment_rule() -> Rule {
+        alternation_rule(
+            r##"{"name":"magic-keyed-assignment","regex":"(?i)(?-u:\\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[ \\t\\n\\r]*=[ \\t\\n\\r]*(?P<value>(?:[^ \\t\\n\\r'\"`;&|<>()$\\\\]|\\\\.)+)","anchors":["key"],"radius":16,"key_group":"key","value_group":"value","reject_scalars":true}"##,
+        )
+    }
+
+    #[test]
+    fn ascii_keyed_assignment_replays_regex_spans() {
+        let rule = ascii_keyed_assignment_rule();
+        for input in [
+            "password=hunter2",
+            "API_TOKEN = Ab3fGh1jKlMnOpQrStUv",
+            "prefix password=abc\\ def next",
+            "password=first token=second",
+            "monkey=value",
+            "xpassword=value",
+            ".token=value",
+            "token=one;password=two",
+            "token=\"quoted\"",
+            "token=single'quoted",
+            "token=",
+            "token=one\\",
+            "token=one\\ two key=three",
+        ] {
+            let expected: Vec<_> = rule
+                .regex
+                .captures_iter(input.as_bytes())
+                .map(|captures| candidate_spans(&rule, &captures, input).unwrap().unwrap())
+                .collect();
+            let mut actual = Vec::new();
+            let mut cursor = 0;
+            while let Some(equals) =
+                memchr::memchr(b'=', &input.as_bytes()[cursor..]).map(|offset| cursor + offset)
+            {
+                if let Some(spans) = ascii_assignment_at(input, equals).unwrap() {
+                    cursor = spans.full.end();
+                    actual.push(spans);
+                } else {
+                    cursor = equals + 1;
+                }
+            }
+            assert_eq!(actual, expected, "{input:?}");
         }
     }
 
