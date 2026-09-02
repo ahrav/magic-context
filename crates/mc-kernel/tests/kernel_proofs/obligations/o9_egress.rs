@@ -81,6 +81,26 @@ fn reference_sets() -> Vec<Vec<usize>> {
     sets
 }
 
+/// Every distinct ordering of `references`, deduplicated for repeated classes.
+fn distinct_orderings(references: &[usize]) -> Vec<Vec<usize>> {
+    fn permute(items: &mut Vec<usize>, start: usize, out: &mut Vec<Vec<usize>>) {
+        if start == items.len() {
+            out.push(items.clone());
+            return;
+        }
+        for index in start..items.len() {
+            items.swap(start, index);
+            permute(items, start + 1, out);
+            items.swap(start, index);
+        }
+    }
+    let mut out = Vec::new();
+    permute(&mut references.to_vec(), 0, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Ingests `references.len()` evidence rows over identical bytes so they
 /// merge onto one digest, returning that digest's handle.
 fn ingest_merged(proof: &Proof, point: usize, references: &[usize]) -> ArtifactHandle {
@@ -138,6 +158,43 @@ fn eligibility_matrix_is_exhaustive() {
     }
     // Positive control: the matrix is not uniformly denied.
     assert!(allowed > 0);
+}
+
+/// The merged-reference fold reads rows in query order, and `expected` reads commentlint: allow(JUDGE)
+/// the set with `any`, so every ordering owes the same decision. commentlint: allow(JUDGE)
+#[test]
+fn eligibility_ignores_the_order_references_were_ingested_in() {
+    let mut proof = Proof::open();
+    proof.commit(intent("seed"), |envelope| {
+        envelope.insert_domain(root_domain())?;
+        Ok(String::new())
+    });
+    let mut point = 0;
+    let mut reordered = 0;
+    for references in reference_sets() {
+        let orderings = distinct_orderings(&references);
+        if orderings.len() == 1 {
+            continue;
+        }
+        reordered += 1;
+        for ordering in orderings {
+            let handle = ingest_merged(&proof, point, &ordering);
+            point += 1;
+            for destination in DESTINATIONS {
+                assert_eq!(
+                    proof
+                        .store()
+                        .artifact_eligibility(&handle, destination)
+                        .unwrap(),
+                    expected(&references, destination),
+                    "{ordering:?} to {destination:?}"
+                );
+            }
+        }
+    }
+    // These assertions require sets whose classes differ, the only ones with commentlint: allow(JUDGE)
+    // more than one ordering. commentlint: allow(JUDGE)
+    assert!(reordered > 0);
 }
 
 /// A property of the written policy itself: adding a reference to any set
