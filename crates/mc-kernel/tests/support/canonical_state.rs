@@ -80,6 +80,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use rusqlite::types::ValueRef;
@@ -189,6 +190,11 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         .map(|(name, seq)| vec![Cell::Text(name), Cell::Integer(seq)])
         .collect::<Vec<_>>();
     tables.insert("sqlite_sequence".to_string(), hash_rows(&sequence_rows));
+    tables.insert(
+        "schema_identity".to_string(),
+        hash_rows(&schema_identity_rows(root)),
+    );
+    tables.insert("cas_layout".to_string(), hash_rows(&layout_rows(root)));
     CanonicalDigest { tables }
 }
 
@@ -308,7 +314,10 @@ impl State {
     fn normalize(mut self, profile: Profile) -> Normalized {
         let renames = match profile {
             Profile::SameRoot => Vec::new(),
-            Profile::CrossRoot => self.identity_renames(),
+            Profile::CrossRoot => {
+                assert_no_placeholder_syntax(&self.tables);
+                self.identity_renames()
+            }
         };
         let mut tables = BTreeMap::new();
         for (name, table) in self.tables {
@@ -615,6 +624,87 @@ fn verify_format_marker(tables: &BTreeMap<String, Table>) {
     }
 }
 
+/// A stored cell that already reads as a placeholder collides with a renamed identity.
+///
+/// The healthy root normalizes a minted id to the same literal, so the two would compare equal.
+fn assert_no_placeholder_syntax(tables: &BTreeMap<String, Table>) {
+    for (name, table) in tables {
+        for row in &table.rows {
+            for cell in row {
+                let bytes: &[u8] = match cell {
+                    Cell::Text(text) => text.as_bytes(),
+                    Cell::Blob(bytes) => bytes,
+                    _ => continue,
+                };
+                for domain in IDENTITY_DOMAINS {
+                    let needle = format!("<{}:", domain.name);
+                    if bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_bytes())
+                    {
+                        panic!(
+                            "{name} already holds the {} placeholder syntax",
+                            domain.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The live schema and the header values `KernelStore` checks when it opens a database.
+///
+/// A dropped trigger or a rewritten `user_version` leaves every table row intact.
+fn schema_identity_rows(root: &Path) -> Vec<Vec<Cell>> {
+    let connection = open_read_only(root);
+    let mut rows = connection
+        .prepare(
+            "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(vec![
+                Cell::Text(row.get::<_, String>(0)?),
+                Cell::Text(row.get::<_, String>(1)?),
+                Cell::Text(row.get::<_, String>(2)?),
+            ])
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for pragma in ["application_id", "user_version"] {
+        let value: i64 = connection
+            .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+            .unwrap();
+        rows.push(vec![
+            Cell::Text(pragma.to_string()),
+            Cell::Integer(value),
+            Cell::Null,
+        ]);
+    }
+    rows
+}
+
+/// Owner and permission bits of the CAS directory chain.
+///
+/// `open_secure_directory` refuses a directory that is not owner-only, so the mode is state.
+fn layout_rows(root: &Path) -> Vec<Vec<Cell>> {
+    let mut rows = Vec::new();
+    for relative in ["artifacts", "artifacts/objects", "artifacts/tmp"] {
+        let Ok(metadata) = fs::symlink_metadata(root.join(relative)) else {
+            continue;
+        };
+        rows.push(vec![
+            Cell::Text(relative.to_string()),
+            Cell::Integer(i64::from(metadata.uid())),
+            Cell::Integer(i64::from(metadata.permissions().mode() & 0o7777)),
+        ]);
+    }
+    rows
+}
+
 fn hash_rows(rows: &[Vec<Cell>]) -> String {
     let mut hasher = Sha256::new();
     hasher.update((rows.len() as u64).to_le_bytes());
@@ -770,6 +860,14 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
             && name.bytes().all(is_lower_hex);
         if !is_shard {
             collect_file_digests(&entry.path(), 0, &mut result);
+            continue;
+        }
+        // Only a regular file inside a shard is an object, so anything else is stray state.
+        for inner in fs::read_dir(entry.path()).unwrap() {
+            let inner = inner.unwrap().path();
+            if !fs::symlink_metadata(&inner).unwrap().is_file() {
+                collect_file_digests(&inner, 1, &mut result);
+            }
         }
     }
     result.sort();
