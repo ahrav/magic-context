@@ -142,6 +142,7 @@ fn assert_successor_content(proof: &Proof, kind: Kind, object_id: &str, index: u
         Kind::Domain => {
             let spec = domain(index);
             (
+                spec.domain_id,
                 spec.source_kind,
                 spec.source_id,
                 spec.source_revision,
@@ -151,6 +152,7 @@ fn assert_successor_content(proof: &Proof, kind: Kind, object_id: &str, index: u
         Kind::Decision => {
             let spec = decision(index);
             (
+                spec.domain_id,
                 spec.source_kind,
                 spec.source_id,
                 spec.source_revision,
@@ -168,6 +170,7 @@ fn assert_successor_content(proof: &Proof, kind: Kind, object_id: &str, index: u
         .unwrap_or_else(|| panic!("{object_id} is not live at the tip"));
     assert_eq!(
         (
+            object.domain_id,
             object.source_kind,
             object.source_id,
             object.source_revision,
