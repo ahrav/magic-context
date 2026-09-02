@@ -12,6 +12,11 @@ use mc_kernel::{
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
+#[path = "support/canonical_state.rs"]
+mod canonical_state;
+
+use canonical_state::{digest, Profile};
+
 const PRODUCER: &str = "session-cache-fixture";
 const ACTOR: &str = "hand-authored-test";
 const MAIN_SCOPE: &str = "scope-main";
@@ -278,6 +283,13 @@ fn build_fixture(root: &std::path::Path) -> Fixture {
         })
         .unwrap()
         .commit_seq;
+    let staged_at = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
     store
         .stage_candidate(StagingCandidateSpec {
             extraction_run_id: "fixture-extraction-run".to_string(),
@@ -292,8 +304,10 @@ fn build_fixture(root: &std::path::Path) -> Fixture {
                 repository_id: "fixture-repository".to_string(),
                 revision: "abc123".to_string(),
             }),
-            recorded_at: 1,
-            lease_expires_at: 2,
+            // A live lease keeps reopen from abandoning the run, so the
+            // restart-identity digest covers staging tables too.
+            recorded_at: staged_at,
+            lease_expires_at: staged_at + 3_600_000,
         })
         .unwrap();
     Fixture {
@@ -363,48 +377,6 @@ fn encode_hex(bytes: &[u8]) -> String {
             encoded
         },
     )
-}
-
-fn canonical_slice_rows(root: &std::path::Path) -> Vec<(&'static str, Vec<Vec<String>>)> {
-    [
-        ("decisions", "SELECT * FROM decisions ORDER BY decision_id"),
-        (
-            "decision_events",
-            "SELECT * FROM decision_events ORDER BY decision_id,event_ordinal",
-        ),
-        (
-            "observations",
-            "SELECT * FROM observations ORDER BY observation_id",
-        ),
-        (
-            "observation_dependencies",
-            "SELECT * FROM observation_dependencies
-             ORDER BY observation_id,dependency_object_id,dependency_kind",
-        ),
-        (
-            "alignment_projection",
-            "SELECT * FROM alignment_projection ORDER BY decision_id,observation_id",
-        ),
-    ]
-    .into_iter()
-    .map(|(table, sql)| (table, read_rows(root, sql)))
-    .collect()
-}
-
-fn canonical_slice_digests(root: &std::path::Path) -> Vec<(&'static str, String)> {
-    canonical_slice_rows(root)
-        .into_iter()
-        .map(|(table, rows)| {
-            let mut digest = Sha256::new();
-            for row in rows {
-                for value in row {
-                    digest.update(value.len().to_le_bytes());
-                    digest.update(value);
-                }
-            }
-            (table, format!("{:x}", digest.finalize()))
-        })
-        .collect()
 }
 
 fn projection_evidence(root: &std::path::Path) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
@@ -645,7 +617,7 @@ fn canonical_slice_and_projection_are_restart_identical() {
     let known = fixture.store.known_as_of(fixture.accepted).unwrap();
     let slice = fixture.store.slice_as_of(fixture.accepted).unwrap();
     let alignment = fixture.store.alignment_as_of(fixture.accepted).unwrap();
-    let digests = canonical_slice_digests(root.path());
+    let digests = digest(root.path(), Profile::SameRoot);
     let first = projection_evidence(root.path());
     // Require the redacted classification and one decision event so the
     // restart-equality assertions cannot pass vacuously.
@@ -672,7 +644,7 @@ fn canonical_slice_and_projection_are_restart_identical() {
         reopened.alignment_as_of(fixture.accepted).unwrap(),
         alignment
     );
-    assert_eq!(canonical_slice_digests(root.path()), digests);
+    digest(root.path(), Profile::SameRoot).assert_same(&digests, "reopen");
     assert_eq!(projection_evidence(root.path()), first);
     reopened.rebuild_alignment().unwrap();
     assert_eq!(projection_evidence(root.path()), first);

@@ -17,6 +17,11 @@ use mc_kernel::{
 };
 use rusqlite::{params, Connection};
 
+#[path = "support/canonical_state.rs"]
+mod canonical_state;
+
+use canonical_state::{digest, Profile};
+
 fn intent(key: &str) -> CommitIntent {
     CommitIntent {
         producer: "kernel-backup-test".to_string(),
@@ -123,103 +128,6 @@ fn destination_entries(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct RestoreOracle {
-    domains: String,
-    registry: String,
-    changes: String,
-    outbox: String,
-    receipts: String,
-    consumers: String,
-    commit_tip: i64,
-}
-
-fn restore_oracle(root: &Path) -> RestoreOracle {
-    let connection = inspect(root);
-    RestoreOracle {
-        domains: connection
-            .query_row(
-                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
-                     SELECT domain_id || ':' || object_id || ':' || name || ':' ||
-                            created_commit_seq || ':' || IFNULL(invalidated_commit_seq,'null') || ':' ||
-                            IFNULL(superseded_by,'null') || ':' || sensitivity_class AS row_value
-                     FROM domains ORDER BY domain_id
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        registry: connection
-            .query_row(
-                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
-                     SELECT object_id || ':' || object_kind || ':' || domain_id || ':' ||
-                            source_kind || ':' || source_id || ':' || source_revision || ':' ||
-                            created_commit_seq || ':' || IFNULL(invalidated_commit_seq,'null') || ':' ||
-                            IFNULL(superseded_by,'null') || ':' || sensitivity_class AS row_value
-                     FROM object_registry ORDER BY object_id
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        changes: connection
-            .query_row(
-                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
-                     SELECT commit_seq || ':' || ordinal || ':' || object_id || ':' ||
-                            change_kind || ':' || IFNULL(source_span_id,'null') || ':' ||
-                            idempotency_key || ':' || IFNULL(hex(payload),'null') AS row_value
-                     FROM change_event ORDER BY commit_seq,ordinal
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        outbox: connection
-            .query_row(
-                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
-                     SELECT outbox_position || ':' || commit_seq || ':' || ordinal || ':' ||
-                            object_id || ':' || object_kind || ':' || source_kind || ':' ||
-                            source_id || ':' || source_revision || ':' || sensitivity_class || ':' ||
-                            hex(payload) || ':' || created_at || ':' ||
-                            IFNULL(published_at,'null') AS row_value
-                     FROM outbox ORDER BY outbox_position
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        receipts: connection
-            .query_row(
-                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
-                     SELECT receipt_id || ':' || producer || ':' || operation_key || ':' ||
-                            request_digest || ':' || IFNULL(commit_seq,'null') || ':' ||
-                            result_payload || ':' || created_at AS row_value
-                     FROM operation_receipts ORDER BY receipt_id
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        consumers: connection
-            .query_row(
-                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
-                     SELECT consumer_id || ':' || checkpoint_commit_seq || ':' || updated_at AS row_value
-                     FROM outbox_consumers ORDER BY consumer_id
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        commit_tip: connection
-            .query_row(
-                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-    }
-}
-
 fn unix_time_ms() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -256,7 +164,7 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
         .unwrap();
     let expected = store.known_as_of(2).unwrap();
     let backup = store.backup(request(destination.path())).unwrap();
-    let expected_oracle = restore_oracle(root.path());
+    let expected_oracle = digest(root.path(), Profile::SameRoot);
     assert_eq!(backup.captured_commit_seq, 2);
     assert!(backup
         .destination_path
@@ -295,7 +203,7 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
         2
     );
     assert_eq!(store.known_as_of(2).unwrap(), expected);
-    assert_eq!(restore_oracle(root.path()), expected_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&expected_oracle, "restored state");
     assert_eq!(
         store.known_as_of(3).unwrap_err(),
         KernelError::FutureSnapshot
@@ -726,7 +634,7 @@ fn restore_rejects_lost_fence_before_displacement() {
         store.restore(&backup.destination_path).unwrap_err(),
         KernelError::FenceLost
     );
-    assert_eq!(restore_oracle(root.path()).commit_tip, 2);
+    assert_eq!(store.facts(0).unwrap().commit_seq, 2);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
     assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry
         .unwrap()
@@ -781,7 +689,7 @@ fn unrecoverable_restore_poisons_the_handle_then_reopen_rolls_the_family_back() 
     insert_domain(&store, 1, Sensitivity::Normal);
     let backup = store.backup(request(destination.path())).unwrap();
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     assert_eq!(
         store
@@ -819,7 +727,7 @@ fn unrecoverable_restore_poisons_the_handle_then_reopen_rolls_the_family_back() 
             .contains(".mc-restore-")
     }));
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
 }
 
@@ -950,7 +858,7 @@ fn restore_interrupted_before_the_swap_rolls_back_on_the_next_open() {
     insert_domain(&store, 1, Sensitivity::Normal);
     let backup = store.backup(request(destination.path())).unwrap();
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // `AfterDisplace` abandons the family in the recovery directory with the
     // marker still published, matching a process killed mid-replacement.
@@ -963,7 +871,7 @@ fn restore_interrupted_before_the_swap_rolls_back_on_the_next_open() {
     drop(store);
 
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
     assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
@@ -1036,7 +944,7 @@ fn restore_interrupted_before_displacement_keeps_the_live_family() {
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // A process killed here leaves the marker published, the recovery directory
     // empty, and the live family as the only copy of the data.
@@ -1047,7 +955,7 @@ fn restore_interrupted_before_displacement_keeps_the_live_family() {
     drop(store);
 
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
     assert!(!recovery_dir.exists());
@@ -1060,7 +968,7 @@ fn restore_interrupted_after_sidecars_move_keeps_the_live_main_file() {
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // `displace_family` moves sidecars before the main file, so a kill mid-way
     // leaves the main file live and its sidecars in the recovery directory.
@@ -1078,7 +986,7 @@ fn restore_interrupted_after_sidecars_move_keeps_the_live_main_file() {
     assert!(root.path().join("core.sqlite").exists());
 
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!recovery_dir.exists());
     assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
@@ -1090,7 +998,7 @@ fn a_partially_completed_rollback_keeps_the_members_already_restored() {
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
     drop(store);
@@ -1104,7 +1012,7 @@ fn a_partially_completed_rollback_keeps_the_members_already_restored() {
 
     let reopened = KernelStore::open(root.path()).unwrap();
     assert_eq!(fs::read(&main).unwrap(), live_bytes);
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!recovery_dir.exists());
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
@@ -1175,7 +1083,7 @@ fn an_orphaned_recovery_directory_is_reclaimed_on_the_next_open() {
     let root = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // A crash after the marker is removed but before cleanup leaves the prior
     // family, which may hold sensitive rows, with nothing to reclaim it.
@@ -1190,7 +1098,7 @@ fn an_orphaned_recovery_directory_is_reclaimed_on_the_next_open() {
         !recovery_dir.exists(),
         "recovery directory was not reclaimed"
     );
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(insert_domain(&reopened, 2, Sensitivity::Normal), 2);
 }
 
@@ -1262,7 +1170,7 @@ fn restore_verifies_the_staged_copy_so_a_mutated_source_cannot_install() {
     insert_domain(&store, 1, Sensitivity::Normal);
     let backup = store.backup(request(destination.path())).unwrap();
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // Rewriting the artifact in place keeps its device and inode, so only verifying
     // the staged copy can reject it.
@@ -1275,7 +1183,7 @@ fn restore_verifies_the_staged_copy_so_a_mutated_source_cannot_install() {
         store.restore(&backup.destination_path).unwrap_err(),
         KernelError::InvalidRestore
     );
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(store.facts(1).unwrap().commit_seq, 2);
     assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry
         .unwrap()
@@ -1342,7 +1250,7 @@ fn a_dangling_reference_is_refused_even_when_integrity_check_passes() {
     insert_domain(&store, 1, Sensitivity::Normal);
     let backup = store.backup(request(destination.path())).unwrap();
     insert_domain(&store, 2, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // `foreign_keys=OFF` lets a dangling row be written that `integrity_check`
     // still reports as ok, so only a referential check can reject it.
@@ -1371,7 +1279,7 @@ fn a_dangling_reference_is_refused_even_when_integrity_check_passes() {
         store.restore(&backup.destination_path).unwrap_err(),
         KernelError::InvalidRestore
     );
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
 }
 
@@ -1381,7 +1289,7 @@ fn a_lone_wal_mode_main_file_is_refused_as_a_restore_source() {
     let source_root = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
-    let live_oracle = restore_oracle(root.path());
+    let live_oracle = digest(root.path(), Profile::SameRoot);
 
     // A byte-copy of a live main file keeps the WAL header while its committed pages
     // may live only in a `-wal` that was not copied.
@@ -1396,7 +1304,7 @@ fn a_lone_wal_mode_main_file_is_refused_as_a_restore_source() {
         store.restore(&bare).unwrap_err(),
         KernelError::InvalidRestore
     );
-    assert_eq!(restore_oracle(root.path()), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
 
     // A sealed artifact from `backup` is accepted, so the check is not rejecting
     // every source.

@@ -1,11 +1,11 @@
-//! Criterion benches for the mc-store anchor-resolution kernel. commentlint: allow(JUDGE)
+//! Criterion benches for the mc-kernel anchor-resolution path. commentlint: allow(JUDGE)
 //!
 //! See `docs/perf/mc-store-anchor-resolution.md` for the estimand, corpus,
 //! cell table, and comparison protocol. commentlint: allow(JUDGE)
 //! Each cell asserts its intended resolution rung before timing. Fixture
 //! drift fails the benchmark instead of timing a cheaper resolution rung.
 //!
-//! Run with `cargo bench -p mc-store --bench anchor_resolution`.
+//! Run with `cargo bench -p mc-kernel --bench anchor_resolution`.
 
 #[path = "../tests/support/git_fixtures.rs"]
 mod git_fixtures;

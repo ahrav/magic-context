@@ -773,7 +773,10 @@ fn quarantine(path: &Path, incarnation: &str, lease_epoch: u64) -> Result<(), Ke
     move_family(path, &marker)
 }
 
-fn resume_quarantine(path: &Path) -> Result<(), KernelError> {
+/// Reads the reset marker and applies every check `resume_quarantine` requires
+/// before it moves anything. `Inconclusive` means the next open would refuse
+/// this root.
+fn read_valid_reset_marker(path: &Path) -> Result<ResetMarker, KernelError> {
     let marker_path = reset_marker_path(path);
     let metadata = fs::symlink_metadata(&marker_path).map_err(|_| KernelError::Inconclusive)?;
     if !metadata.is_file() || metadata.len() > RESET_MARKER_MAX_BYTES {
@@ -790,6 +793,19 @@ fn resume_quarantine(path: &Path) -> Result<(), KernelError> {
     {
         return Err(KernelError::Inconclusive);
     }
+    Ok(marker)
+}
+
+/// Whether a present reset marker would let the next open resume the quarantine.
+/// Only tests need to ask without opening; the oracle uses it to treat a
+/// corrupted marker as different state from a valid one.
+#[cfg(feature = "test-support")]
+pub fn reset_marker_is_valid_for_test(database_path: &Path) -> bool {
+    read_valid_reset_marker(database_path).is_ok()
+}
+
+fn resume_quarantine(path: &Path) -> Result<(), KernelError> {
+    let marker = read_valid_reset_marker(path)?;
     move_family(path, &marker)
 }
 

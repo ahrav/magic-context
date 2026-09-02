@@ -21,6 +21,11 @@ use mc_kernel::{
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
+#[path = "support/canonical_state.rs"]
+mod canonical_state;
+
+use canonical_state::{scan_objects, scan_unexpected_objects};
+
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const CHILD_MODE: &str = "MC_CAS_FAULT_CHILD_MODE";
 const CHILD_ROOT: &str = "MC_CAS_FAULT_CHILD_ROOT";
@@ -145,6 +150,11 @@ struct SemanticState {
     barriers: Vec<(String, String, i64, bool)>,
     barrier_consumers: Vec<(String, String, i64, Option<i64>, bool)>,
     objects: Vec<(String, u64)>,
+    /// Anything under `artifacts/objects` that no valid shard holds.
+    ///
+    /// `scan_objects` skips a non-canonical shard, so a fault that misplaces a file would
+    /// otherwise leave `objects` and `usage_bytes` unchanged.
+    unexpected_objects: Vec<(u64, String, String, u64)>,
     usage_bytes: u64,
 }
 
@@ -168,6 +178,7 @@ impl SemanticState {
         let barriers = rows(&connection, "SELECT barrier_id,artifact_digest,delete_commit_seq,completed_at IS NOT NULL FROM deletion_backfill_barriers ORDER BY barrier_id", |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)));
         let barrier_consumers = rows(&connection, "SELECT bc.barrier_id,bc.consumer_id,bc.required_checkpoint_commit_seq,c.checkpoint_commit_seq,EXISTS(SELECT 1 FROM consumer_abandonments a WHERE a.barrier_id=bc.barrier_id AND a.consumer_id=bc.consumer_id) FROM deletion_backfill_barrier_consumers bc LEFT JOIN outbox_consumers c USING(consumer_id) ORDER BY bc.barrier_id,bc.consumer_id", |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)));
         let objects = scan_objects(root);
+        let unexpected_objects = scan_unexpected_objects(root);
         let usage_bytes = objects.iter().map(|(_, bytes)| bytes).sum();
         Self {
             canonical_refs,
@@ -177,6 +188,7 @@ impl SemanticState {
             barriers,
             barrier_consumers,
             objects,
+            unexpected_objects,
             usage_bytes,
         }
     }
@@ -279,33 +291,6 @@ fn object_path(root: &Path, digest: &str) -> PathBuf {
         .join(&digest[2..])
 }
 
-fn scan_objects(root: &Path) -> Vec<(String, u64)> {
-    let mut result = Vec::new();
-    for shard in fs::read_dir(root.join("artifacts/objects")).unwrap() {
-        let shard = shard.unwrap();
-        if !shard.file_type().unwrap().is_dir() {
-            continue;
-        }
-        let prefix = shard.file_name().into_string().unwrap();
-        for entry in fs::read_dir(shard.path()).unwrap() {
-            let entry = entry.unwrap();
-            if !entry.file_type().unwrap().is_file() {
-                continue;
-            }
-            let digest = format!("{prefix}{}", entry.file_name().to_string_lossy());
-            let bytes = fs::read(entry.path()).unwrap();
-            assert_eq!(
-                format!("{:x}", Sha256::digest(&bytes)),
-                digest,
-                "object hash mismatch"
-            );
-            result.push((digest, bytes.len() as u64));
-        }
-    }
-    result.sort();
-    result
-}
-
 fn scan_temp_names(root: &Path) -> Vec<String> {
     let mut names = fs::read_dir(root.join("artifacts/tmp"))
         .unwrap()
@@ -337,6 +322,13 @@ fn assert_semantic_oracle(root: &Path) -> SemanticState {
     let reconciled_usage = store.artifact_budget_facts().unwrap().usage_bytes;
     drop(store);
     let state = SemanticState::read(root);
+    // The shared scanner routes a non-shard entry here instead of failing on a hash mismatch,
+    // so the anomaly is only caught if the oracle looks.
+    assert!(
+        state.unexpected_objects.is_empty(),
+        "stray entries under artifacts/objects: {:?}",
+        state.unexpected_objects
+    );
     for (_, digest, reference, _, invalidated) in &state.canonical_refs {
         if invalidated.is_none() {
             assert_eq!(

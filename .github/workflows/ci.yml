@@ -336,6 +336,11 @@ jobs:
       - name: Warm mc-host dependency graph
         run: cargo tree -p mc-host -e normal >/dev/null
 
+      # Node resolves `@cortexkit/mc-shm-native` to a gitignored artifact that
+      # root `build` does not produce, so this step builds it before tests.
+      - name: Build shared-memory addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
+
       - name: Test
         run: bun run test
 
