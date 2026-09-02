@@ -226,6 +226,12 @@ describe("deterministic metamorphic runner", () => {
         expect(metamorphicExitCode(swapped)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(swapped))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.derivativeScore\\.scenarioId: pair-scenario-mismatch`));
+
+        // `normalizedSeed` rejects a seed past 32 bits, so the runner records such a coordinate as an error.
+        const wideSeed = structuredClone(report);
+        wideSeed.entries[scoredIndex]!.seed = 0x1_0000_0000;
+        expect(() => parseMetamorphicReport(wideSeed))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.seed: integer-invalid`));
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {

@@ -1003,6 +1003,14 @@ describe("parsePairedDeltaReport", () => {
             expect(family.noise).toEqual({ label: "no-noise-floor", floor: null });
             family.noise.label = "outside-floor";
         }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.label: derived-mismatch/);
+        // A primary estimate needs coordinates present at both endpoints, so one endpoint alone or two
+        // endpoints over different family sets is a topology the estimator cannot produce.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints = [body.analysis.endpoints[0]!];
+        }))).toThrow(/report\.body\.analysis\.endpoints: paired-endpoints-required/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
+        }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
     });
 
     it("preserves an endpoint-scoped noise floor through the round trip", () => {

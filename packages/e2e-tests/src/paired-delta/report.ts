@@ -413,6 +413,15 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     if (evidenceSufficient !== analyzableFamilyCount >= minimumAnalyzableFamilyCount) p.fail(`${label}.evidenceSufficient: derived-mismatch`);
     const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, minimumAnalyzableFamilyCount);
     p.unique(endpoints.map(({ endpoint }) => endpoint), `${label}.endpoints`);
+    if (endpoints.length > 0) {
+        if (endpoints.length !== PRIMARY_ENDPOINTS.length) p.fail(`${label}.endpoints: paired-endpoints-required`);
+        const familyKeys = endpoints.map(({ families }) => {
+            const familyIds = families.map(({ familyId }) => familyId);
+            p.unique(familyIds, `${label}.endpoints`);
+            return [...familyIds].sort(compareCodeUnits).join("\u0000");
+        });
+        if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
+    }
     // `estimateFamilyDeltas` counts the distinct families observed on paired coordinates at the primary
     // endpoints, and every such family appears under at least one of them, so the union reproduces it.
     const observedFamilies = new Set(endpoints.flatMap(({ families }) => families.map(({ familyId }) => familyId)));

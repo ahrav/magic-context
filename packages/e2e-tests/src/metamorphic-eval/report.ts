@@ -4,6 +4,7 @@ import type { SystemVersionTuple } from "../historian-eval/runner";
 import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
 import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
 import { invariantHolds, type InvariantEvidence, type InvariantVerdict } from "./invariants";
+import { MAX_TRANSFORM_SEED } from "./transforms";
 
 export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
@@ -175,12 +176,18 @@ function textArray(value: unknown, label: string): string[] {
     return p.array(value, label).map((entry, index) => p.text(entry, `${label}[${index}]`));
 }
 
+function boundedInteger(value: unknown, label: string, maximum: number): number {
+    const result = p.integer(value, label);
+    if (result > maximum) p.fail(`${label}: integer-invalid`);
+    return result;
+}
+
 function parsePairKey(value: Record<string, unknown>, label: string): PairKey {
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
         transformId: p.string(value.transformId, `${label}.transformId`),
         transformVersion: p.integer(value.transformVersion, `${label}.transformVersion`),
-        seed: p.integer(value.seed, `${label}.seed`),
+        seed: boundedInteger(value.seed, `${label}.seed`, MAX_TRANSFORM_SEED),
     };
 }
 

@@ -52,8 +52,11 @@ interface EligibleMessage {
     text: string;
 }
 
+/** Transform seeds drive a 32-bit PRNG state, so the archive and the runner share this bound. */
+export const MAX_TRANSFORM_SEED = 0xffff_ffff;
+
 function normalizedSeed(seed: number): number {
-    if (!Number.isSafeInteger(seed) || seed < 0 || seed > 0xffff_ffff) {
+    if (!Number.isSafeInteger(seed) || seed < 0 || seed > MAX_TRANSFORM_SEED) {
         throw new Error("transform seed must be an unsigned 32-bit integer");
     }
     return seed >>> 0;
