@@ -20,6 +20,13 @@ A real freeze is blocked until all conditions hold:
 
 U9 cannot run until a real cohort closes, comparison reaches a terminal report, and every admitted case passes second privacy review over exact incident bytes. Do not add placeholder incident rows or scenarios.
 
+### What the ready scorecard policy does not yet pin
+
+Two inputs the policy names are identified by name rather than by content, so the policy fingerprint does not change when they change. Both must be closed before a real freeze binds this document.
+
+- **Canary scenario bytes.** `injectionCanaryScenarioIds` names `hse-webhook-docs-injection`, which exists only in `historian-eval/dev`, the split `historian-eval/README.md` describes as tunable. Every lane identity in the document is `identityless`, and the metamorphic report records canary hits by `scenarioId` with no scenario fingerprint, so editing that scenario's transcript, gold, or probes produces evidence that still matches the pre-registered id under an unchanged policy fingerprint. Binding the bytes needs a frozen `historian-eval/releases/vN` manifest to fingerprint against, which does not exist yet, and then either a projection identity on the historian and metamorphic lanes or a canary fingerprint field in the policy.
+- **Regression baseline.** `baselineScorecardReportFingerprint` is `null` because no promoted scorecard report exists to compare against. The evidence loader treats a null value as `absent` and emits a `no-baseline` limitation, and a non-null value is verified against the supplied report's own fingerprint, so nothing here is chosen after outcomes are visible. The consequence is narrower: the first release classifies no regressions, so `maxToleratedRegressions` is satisfied without observing any.
+
 ## Roles and custody
 
 | Actor | May access | Must not access before close |
