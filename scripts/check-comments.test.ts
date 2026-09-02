@@ -139,6 +139,33 @@ describe("comment hygiene gate", () => {
         expect(result.out).toContain("tick.rs:1:");
     });
 
+    test("a lowercase external tracker reference matches", () => {
+        const result = scan({ "lower.rs": "// see jira-4821, pr-42 fixed this" });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("lower.rs:1:");
+    });
+
+    test("a name appearing only in issue prose is not an ID", () => {
+        const result = scan({ "prose.rs": "// the magic-context-native ring is separate" });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
+    });
+
+    test("a bare all-letter ID is exempt but its prefixed spelling is not", () => {
+        const result = scan({
+            "word.rs": [
+                "// `inherit_fds` retains descriptors referenced by child path arguments",
+                "// tracked in magic-context-fds",
+            ].join("\n"),
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("word.rs:1:");
+        expect(result.out).toContain("word.rs:2:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

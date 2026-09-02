@@ -17,10 +17,9 @@ if [ ! -f "$IDS_FILE" ]; then
   exit 2
 fi
 
-# Splitting on characters an ID cannot contain tolerates any record layout.
-BEAD_IDS=$(tr -c 'a-z0-9.-' '\n' < "$IDS_FILE" |
-  grep -E '^magic-context-[a-z0-9]+(\.[0-9]+)*$' |
-  sed 's/^magic-context-//' |
+# The id-field filter prevents issue prose from contributing IDs.
+BEAD_IDS=$(grep -o '"id":"magic-context-[a-z0-9.]*"' "$IDS_FILE" |
+  sed 's/^"id":"magic-context-//; s/"$//' |
   sort -u |
   tr '\n' ' ')
 
@@ -130,7 +129,7 @@ function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, 
     if (base in bead_base) { hit = 1; break }
     rest = substr(rest, RSTART + RLENGTH)
   }
-  if (!hit && txt ~ /(^|[^A-Za-z0-9])(CR|PR|MR|SIM|TT|JIRA)-[0-9]/) hit = 1
+  if (!hit && lt ~ /(^|[^a-z0-9])(cr|pr|mr|sim|tt|jira)-[0-9]/) hit = 1
   if (!hit) {
     count = split(lt, toks, /[^a-z0-9.]+/)
     for (i = 1; i <= count; i++) {
@@ -141,7 +140,7 @@ function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, 
       dot = index(t, ".")
       base = (dot > 0) ? substr(t, 1, dot - 1) : t
       if (!(t in bead_id)) continue
-      # A bare all-letter ID reads as prose, while a dotted or digit-bearing one reads as a citation.
+      # Some all-letter IDs are also ordinary words, so a bare one is exempt while the prefixed spelling still reports.
       if (dot > 0 || base ~ /[0-9]/) { hit = 1; break }
     }
   }
