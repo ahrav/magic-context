@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use mc_kernel::schema::KERNEL_SCHEMA_COMPONENT_NAMES;
 use mc_kernel::{BackupManifest, BackupRequest, KernelStore, Sensitivity};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 use crate::canonical_state::{cross_root_compared_clock_columns, digest, digested_tables, Profile};
 use crate::fixtures::{deletion, domain, ingest, intent, now_ms, root_domain, staging};
@@ -267,6 +268,106 @@ fn cross_root_reopen_abandonment_compares_by_terminal_presence_not_instant() {
         live.table("extraction_runs")
     );
     assert_ne!(abandoned.table("candidates"), live.table("candidates"));
+}
+
+/// Writes the reset marker `KernelStore::open` would resume from: the fields the kernel
+/// validates, with the digest it recomputes. `corrupt` then edits one field so the
+/// marker no longer verifies, without changing that a file is present.
+fn write_reset_marker(root: &Path, corrupt: bool) {
+    let db_path = root.join("core.sqlite");
+    let quarantine = root.join("core.sqlite.mc-quarantine-7");
+    let incarnation = "0123456789abcdef0123456789abcdef";
+    let canonical = format!(
+        "mc-kernel-reset-marker-v1\ndb_path={}\ndatabase_incarnation_id={incarnation}\nquarantine_dir={}",
+        db_path.display(),
+        quarantine.display()
+    );
+    let mut digest = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    if corrupt {
+        digest.replace_range(0..1, if digest.starts_with('0') { "1" } else { "0" });
+    }
+    let marker = serde_json::json!({
+        "protocol": "mc-kernel-reset-marker-v1",
+        "db_path": db_path,
+        "database_incarnation_id": incarnation,
+        "quarantine_dir": quarantine,
+        "marker_digest": digest,
+    });
+    std::fs::write(
+        root.join("core.sqlite.mc-reset"),
+        serde_json::to_vec(&marker).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn cross_root_recovery_markers_compare_by_validity_not_presence() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let _first_store = seed(first.path());
+    let _second_store = seed(second.path());
+    let clean = digest(first.path(), Profile::CrossRoot);
+
+    // Two roots whose markers each verify against their own paths agree, even though
+    // the marker bytes differ in every path-bearing field.
+    write_reset_marker(first.path(), false);
+    write_reset_marker(second.path(), false);
+    let valid = digest(first.path(), Profile::CrossRoot);
+    digest(second.path(), Profile::CrossRoot).assert_same(&valid, "both markers valid");
+    assert_ne!(
+        valid.table("recovery_markers"),
+        clean.table("recovery_markers")
+    );
+
+    // A marker whose digest no longer verifies makes the next open refuse the root.
+    // It is still a present regular file, so a presence-only reduction would call
+    // it equal to the valid one.
+    write_reset_marker(second.path(), true);
+    let corrupted = digest(second.path(), Profile::CrossRoot);
+    assert_ne!(
+        corrupted.table("recovery_markers"),
+        valid.table("recovery_markers")
+    );
+    assert_ne!(
+        corrupted.table("recovery_markers"),
+        clean.table("recovery_markers")
+    );
+}
+
+#[test]
+fn a_lease_entry_the_store_would_reject_changes_the_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let store = seed(root.path());
+    drop(store);
+    let healthy = digest(root.path(), Profile::CrossRoot);
+    let lease = std::fs::read_dir(root.path().join("leases"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with(".lease"))
+        .expect("the seeded store persisted one lease");
+    let bytes = std::fs::read(&lease).unwrap();
+
+    // A directory wearing the lease's name still counts as one entry by suffix, but
+    // `FileLeaseStore::acquire` cannot open it as a file and fails before the
+    // database opens.
+    std::fs::remove_file(&lease).unwrap();
+    std::fs::create_dir(&lease).unwrap();
+    assert_ne!(
+        digest(root.path(), Profile::CrossRoot).table("leases"),
+        healthy.table("leases")
+    );
+
+    // A body the lease store cannot parse as an epoch is likewise not a healthy lease.
+    std::fs::remove_dir(&lease).unwrap();
+    std::fs::write(&lease, b"not-an-epoch").unwrap();
+    assert_ne!(
+        digest(root.path(), Profile::CrossRoot).table("leases"),
+        healthy.table("leases")
+    );
+
+    // Positive control: restoring the original bytes restores the digest.
+    std::fs::write(&lease, &bytes).unwrap();
+    digest(root.path(), Profile::CrossRoot).assert_same(&healthy, "lease restored");
 }
 
 #[test]

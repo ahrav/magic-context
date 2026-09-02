@@ -982,10 +982,10 @@ fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
         })
 }
 
-// Rolls back rather than rolling forward. A surviving marker pairs with a
-// `restore` that never returned to its caller, so the displaced family is the
-// authoritative copy and a half-installed replacement is discarded.
-pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
+/// Reads the restore marker and applies every check `resume_restore` requires
+/// before it acts, without touching anything else. `Inconclusive` means the next
+/// open would refuse this root.
+fn read_valid_restore_marker(path: &Path) -> Result<RestoreMarker, KernelError> {
     let marker_path = restore_marker_path(path);
     // Validating a pathname and then reopening it leaves a window for a swap, so the
     // checks and the read share one descriptor. `NONBLOCK` keeps a FIFO from
@@ -1018,6 +1018,23 @@ pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
     {
         return Err(KernelError::Inconclusive);
     }
+    Ok(marker)
+}
+
+/// Whether a present restore marker would let the next open resume. Only tests
+/// need to ask without opening; the oracle uses it to treat a corrupted marker as
+/// different state from a valid one.
+#[cfg(feature = "test-support")]
+pub fn restore_marker_is_valid_for_test(database_path: &Path) -> bool {
+    read_valid_restore_marker(database_path).is_ok()
+}
+
+// Rolls back rather than rolling forward. A surviving marker pairs with a
+// `restore` that never returned to its caller, so the displaced family is the
+// authoritative copy and a half-installed replacement is discarded.
+pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
+    let marker = read_valid_restore_marker(path)?;
+    let recovery_directory = path_from_bytes(&marker.recovery_directory);
     remove_restore_scratch(path)?;
     // Only remove the live family after a displaced main file exists; otherwise it
     // remains the sole copy.

@@ -20,6 +20,11 @@ requirement() {
     printf '%s\n' "$version"
 }
 
+is_legacy_stub() {
+  grep -q '^version = "0.0.0"$' "$1/Cargo.toml" \
+    && [ "$(cat "$1/src/lib.rs" 2>/dev/null)" = '#![allow(dead_code)]' ]
+}
+
 create_stub() {
   path=$1
   name=$2
@@ -28,7 +33,9 @@ create_stub() {
   if [ -f "$file" ]; then
     # A real sibling checkout is left alone; only a stub this script wrote is refreshed,
     # so a stale version from an earlier run cannot outlive a bump to the manifest.
-    if ! grep -qF "$marker" "$file"; then
+    # Stubs written before the marker existed are recognised by their shape instead:
+    # a 0.0.0 version and the one-line library body, which no real sibling has.
+    if ! grep -qF "$marker" "$file" && ! is_legacy_stub "$path"; then
       return
     fi
     if grep -q "^version = \"$version\"\$" "$file"; then

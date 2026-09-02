@@ -42,8 +42,8 @@ pub use backup::filesystem_is_unsafe_for_test;
 pub use backup::filesystem_name_is_unsafe_for_test;
 #[cfg(feature = "test-support")]
 pub use backup::{
-    owner_is_current_for_test, sensitivity_bearing_tables_for_test,
-    verify_backup_with_deadline_for_test, RestoreFault,
+    owner_is_current_for_test, restore_marker_is_valid_for_test,
+    sensitivity_bearing_tables_for_test, verify_backup_with_deadline_for_test, RestoreFault,
 };
 pub use backup::{BackupManifest, BackupRequest};
 #[cfg(feature = "test-support")]
@@ -63,6 +63,8 @@ pub use envelope::{
     StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
 };
 pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
+#[cfg(feature = "test-support")]
+pub use open::reset_marker_is_valid_for_test;
 pub use open::{KernelError, KernelStore};
 pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};

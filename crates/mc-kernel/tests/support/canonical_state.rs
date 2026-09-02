@@ -108,6 +108,7 @@ use sha2::{Digest, Sha256};
 
 use mc_kernel::schema::KERNEL_APPLICATION_ID;
 use mc_kernel::sqlite_runtime::compute_marker_digest_for_application_id;
+use mc_kernel::{reset_marker_is_valid_for_test, restore_marker_is_valid_for_test};
 
 /// Comparison the digest is normalized for; see the module documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -841,22 +842,59 @@ fn layout_rows(root: &Path) -> Vec<Vec<Cell>> {
     rows
 }
 
-/// The number of persisted leases, which is state whether or not their epochs are.
+/// The persisted leases: how many are well-formed, plus one row per entry that is not.
 ///
 /// A lease file name is an FNV hash of the key identity and its body is an epoch, so neither
-/// travels across roots; the count still separates a present lease store from a deleted one.
+/// travels across roots. `FileLeaseStore::acquire` opens the entry as a regular file and reads
+/// its epoch before the database opens, so an entry it would reject is state distinct from a
+/// healthy lease, and a count alone would let a directory or an unparseable body pass as one.
 fn lease_rows(root: &Path) -> Vec<Vec<Cell>> {
     let Ok(entries) = fs::read_dir(root.join("leases")) else {
         return Vec::new();
     };
-    let leases = entries
-        .filter(|entry| {
-            entry
-                .as_ref()
-                .is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(".lease"))
-        })
-        .count();
-    vec![vec![Cell::Integer(leases as i64)]]
+    let mut valid = 0i64;
+    let mut invalid = Vec::new();
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if !path.to_string_lossy().ends_with(".lease") {
+            continue;
+        }
+        match lease_epoch(&path) {
+            Ok(_) => valid += 1,
+            Err(kind) => invalid.push(kind),
+        }
+    }
+    invalid.sort();
+    let mut rows = vec![vec![Cell::Text("valid".to_string()), Cell::Integer(valid)]];
+    rows.extend(invalid.into_iter().map(|kind| vec![Cell::Text(kind)]));
+    rows
+}
+
+/// Reads a lease entry the way the lease store does, or names why it cannot.
+///
+/// `persist_epoch` pads a short file with `x` before overwriting from offset 0, so a surviving
+/// `x` marks a torn write rather than a digit to strip. Only a complete zero-padded epoch is a
+/// healthy lease; anything else is invalid content, not a lower epoch.
+fn lease_epoch(path: &Path) -> Result<i64, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| format!("<unreadable:{error}>"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(SYMLINK_MARKER.to_string());
+    }
+    if metadata.is_dir() {
+        return Err(DIRECTORY_MARKER.to_string());
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "<other:{:o}>",
+            metadata.permissions().mode() & 0o170000
+        ));
+    }
+    let text = fs::read_to_string(path).map_err(|error| format!("<unreadable:{error}>"))?;
+    if text.len() != LEASE_EPOCH_WIDTH || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("<invalid-epoch>".to_string());
+    }
+    text.parse::<i64>()
+        .map_err(|_| "<invalid-epoch>".to_string())
 }
 
 /// The persisted lease epoch cannot trail the fence the database was stamped with.
@@ -876,14 +914,9 @@ fn verify_lease_epoch(root: &Path, tables: &BTreeMap<String, Table>) {
         if !path.to_string_lossy().ends_with(".lease") {
             continue;
         }
-        let text = fs::read_to_string(&path).unwrap_or_default();
-        // `persist_epoch` pads a short file with `x` before overwriting from offset 0, so a
-        // surviving `x` marks a torn write rather than a digit to strip. Only a complete
-        // zero-padded epoch is read; anything else is invalid content, not a lower epoch.
-        if text.len() != LEASE_EPOCH_WIDTH || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(epoch) = text.parse::<i64>() {
+        // An entry the lease store would reject is recorded by `lease_rows`; only a
+        // well-formed epoch can be compared against the fence.
+        if let Ok(epoch) = lease_epoch(&path) {
             persisted = Some(persisted.unwrap_or(epoch).max(epoch));
         }
     }
@@ -899,6 +932,7 @@ fn verify_lease_epoch(root: &Path, tables: &BTreeMap<String, Table>) {
 ///
 /// An invalid marker makes the next open fail, so its presence and contents are state.
 fn recovery_marker_rows(root: &Path, profile: Profile) -> Vec<Vec<Cell>> {
+    let database = root.join("core.sqlite");
     let mut rows = Vec::new();
     for suffix in [".mc-restore", ".mc-reset", ".mc-reset.staging"] {
         let path = root.join(format!("core.sqlite{suffix}"));
@@ -906,10 +940,22 @@ fn recovery_marker_rows(root: &Path, profile: Profile) -> Vec<Vec<Cell>> {
             continue;
         };
         let content = if metadata.is_file() {
-            // A marker records the absolute database and quarantine paths, which are per-root,
-            // so only one root's own history can compare their bytes.
             if profile == Profile::CrossRoot {
-                Cell::Integer(1)
+                // A marker's fields are all per-root: the absolute database and recovery
+                // paths, a random incarnation, and a digest over those. Only one root's own
+                // history can compare its bytes. What travels is whether the next open would
+                // accept it, so the kernel's own validation decides the cell. The staging
+                // file is a torn publish the kernel never reads, so only its presence is state.
+                let valid = match suffix {
+                    ".mc-restore" => Some(restore_marker_is_valid_for_test(&database)),
+                    ".mc-reset" => Some(reset_marker_is_valid_for_test(&database)),
+                    _ => None,
+                };
+                match valid {
+                    Some(true) => Cell::Text("<valid>".to_string()),
+                    Some(false) => Cell::Text("<invalid>".to_string()),
+                    None => Cell::Integer(1),
+                }
             } else {
                 let bytes = fs::read(&path).unwrap();
                 Cell::Text(format!("{:x}", Sha256::digest(&bytes)))
