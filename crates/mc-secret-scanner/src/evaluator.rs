@@ -469,7 +469,7 @@ fn ascii_assignment_at(input: &str, equals: usize) -> Result<Option<CandidateSpa
         return Ok(None);
     }
     let mut key_end = equals;
-    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+    while key_end > 0 && is_rule_space_byte(bytes[key_end - 1]) {
         key_end -= 1;
     }
     let mut run_start = key_end;
@@ -485,7 +485,11 @@ fn ascii_assignment_at(input: &str, equals: usize) -> Result<Option<CandidateSpa
         return Ok(None);
     }
     let mut value_start = equals + 1;
-    while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+    while bytes
+        .get(value_start)
+        .copied()
+        .is_some_and(is_rule_space_byte)
+    {
         value_start += 1;
     }
     let mut value_end = value_start;
@@ -495,7 +499,7 @@ fn ascii_assignment_at(input: &str, equals: usize) -> Result<Option<CandidateSpa
                 break;
             }
             value_end += 2;
-        } else if byte.is_ascii_whitespace()
+        } else if is_rule_space_byte(*byte)
             || matches!(
                 byte,
                 b'\'' | b'"' | b'`' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'$'
@@ -514,6 +518,12 @@ fn ascii_assignment_at(input: &str, equals: usize) -> Result<Option<CandidateSpa
         value: TextSpan::snapped(input, value_start, value_end)?,
         key: Some(TextSpan::snapped(input, key_start, key_end)?),
     }))
+}
+
+// The keyed overlay rules spell their separator and value-terminator class as `[\t\n\x0B\f\r ...]`, and `u8::is_ascii_whitespace` omits `\x0B`.
+// These helpers run only for ASCII input, so the non-ASCII spellings in that class are unreachable here.
+fn is_rule_space_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | 0x0B | b'\x0C' | b'\r' | b' ')
 }
 
 fn is_key_byte(byte: u8) -> bool {
@@ -570,7 +580,7 @@ fn ascii_assignment_quoted_at(
         return Ok(None);
     }
     let mut key_end = equals;
-    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+    while key_end > 0 && is_rule_space_byte(bytes[key_end - 1]) {
         key_end -= 1;
     }
     let mut run_start = key_end;
@@ -588,7 +598,8 @@ fn ascii_assignment_quoted_at(
     let mut value_quote_start = equals + 1;
     while bytes
         .get(value_quote_start)
-        .is_some_and(u8::is_ascii_whitespace)
+        .copied()
+        .is_some_and(is_rule_space_byte)
     {
         value_quote_start += 1;
     }
@@ -624,7 +635,11 @@ fn ascii_quoted_keyed_at(
         return Ok(None);
     }
     let mut separator = key_end + 1;
-    while bytes.get(separator).is_some_and(u8::is_ascii_whitespace) {
+    while bytes
+        .get(separator)
+        .copied()
+        .is_some_and(is_rule_space_byte)
+    {
         separator += 1;
     }
     if bytes.get(separator) != Some(&b':') {
@@ -633,7 +648,8 @@ fn ascii_quoted_keyed_at(
     let mut value_quote_start = separator + 1;
     while bytes
         .get(value_quote_start)
-        .is_some_and(u8::is_ascii_whitespace)
+        .copied()
+        .is_some_and(is_rule_space_byte)
     {
         value_quote_start += 1;
     }
@@ -1549,6 +1565,55 @@ mod tests {
             "\\x",
         ] {
             assert!(!is_scalar(secret.as_bytes()), "{secret:?}");
+        }
+    }
+
+    // The keyed overlay rules accept `\x0B` wherever they accept a space, and the ASCII fast paths replace those regexes outright, so a separator class that omits `\x0B` drops findings the rule still matches.
+    // The embedded rule regex is the oracle, so the test detects separator-class mismatches in the ASCII fast path.
+    #[test]
+    fn ascii_fast_paths_accept_every_separator_byte_the_rules_accept() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let secret = "hunter2AbCdEf123456";
+        for separator in [b'\t', b'\n', 0x0B, b'\x0C', b'\r', b' '] {
+            let gap = char::from(separator);
+            for input in [
+                format!("password{gap}=x{secret}"),
+                format!("password={gap}x{secret}"),
+                format!("password={gap}\"x{secret}\""),
+                format!("password={gap}'x{secret}'"),
+                format!("\"password\"{gap}:\"x{secret}\""),
+                format!("'password'{gap}:'x{secret}'"),
+            ] {
+                let matched: Vec<_> = rules
+                    .active(ScanProfile::Conservative)
+                    .filter(|rule| rule.declaration.name.starts_with("magic-keyed"))
+                    .filter(|rule| rule.regex.is_match(input.as_bytes()))
+                    .map(|rule| rule.declaration.name.as_str())
+                    .collect();
+                assert!(
+                    !matched.is_empty(),
+                    "no keyed rule matches {input:?}, so the fixture cannot detect a class mismatch"
+                );
+                let report = evaluate(
+                    &rules,
+                    ScanProfile::Conservative,
+                    ScanLimits::default(),
+                    [0u8; 32],
+                    &input,
+                )
+                .unwrap();
+                assert!(
+                    !report.findings.is_empty(),
+                    "separator {separator:#04x} in {input:?} matches {matched:?} but the ASCII fast path reported nothing"
+                );
+                for finding in &report.findings {
+                    let value = &input[finding.value_span.start()..finding.value_span.end()];
+                    assert!(
+                        !value.starts_with(char::from(separator)),
+                        "separator {separator:#04x} in {input:?} leaked into the reported value {value:?}"
+                    );
+                }
+            }
         }
     }
 
