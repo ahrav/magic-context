@@ -29,7 +29,8 @@ import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { POLICY_OWNER_SCHEMA, type PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import { cellResultFixture, freezeManifest, readyPolicies } from "../prospective-holdout/test-fixtures";
-import type { EvidenceSources } from "./evidence";
+import type { EvidenceSources, LaneEvidence, ScorecardEvidenceBundle } from "./evidence";
+import type { LaneStatus, ScorecardReport } from "./report-contract";
 import {
     LANE_IDS,
     LANE_REPORT_SCHEMAS,
@@ -506,5 +507,46 @@ export function writeReleaseTree(root: string, options: ReleaseTreeOptions = {})
         pairedDeltaPolicyPath: paths.pairedDeltaPolicy,
         artifactsDir: paths.artifactsDir,
         baselinePath: options.baseline === undefined ? null : paths.baseline,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// An in-memory evidence bundle, for the pure stages after the loader.
+// ---------------------------------------------------------------------------
+
+export interface BundleFixtureOptions {
+    policy?: ScorecardPolicy;
+    lanes?: Partial<LaneFixtureSet>;
+    statuses?: Partial<Record<LaneId, LaneStatus>>;
+    baseline?: ScorecardReport | null;
+    freezeManifestFingerprint?: string;
+}
+
+export function bundleFixture(options: BundleFixtureOptions = {}): ScorecardEvidenceBundle {
+    const policy = options.policy ?? policyFixture();
+    const fixtures = laneFixtures(options.lanes);
+    const lanes = LANE_IDS.map((lane): LaneEvidence => {
+        const status = options.statuses?.[lane] ?? "present";
+        const report = fixtures[lane];
+        const retained = status === "present" || status === "incomplete";
+        return {
+            lane,
+            status,
+            reportFingerprint: status === "missing" ? null : canonicalFingerprint(report),
+            identity: null,
+            diagnostics: status === "present" ? [] : [`fixture-${status}`],
+            report: retained ? report : null,
+        } as LaneEvidence;
+    });
+    const baseline = options.baseline ?? null;
+    return {
+        freezeManifestFingerprint: options.freezeManifestFingerprint ?? H1,
+        policy,
+        policyFingerprint: canonicalFingerprint(policy),
+        lanes,
+        baseline: baseline === null
+            ? { status: "absent", reportFingerprint: null, report: null, diagnostics: [] }
+            : { status: "present", reportFingerprint: baseline.reportFingerprint, report: baseline, diagnostics: [] },
+        limitations: policy.requiredLanes.filter((row) => row.identity.kind === "identityless").map((row) => `identity-unverified-${row.lane}`),
     };
 }
