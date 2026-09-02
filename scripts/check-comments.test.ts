@@ -295,6 +295,32 @@ describe("comment hygiene gate", () => {
         }
     });
 
+    test("a shell comment may follow a control operator", () => {
+        const result = scan({
+            "op.sh": "true;# tracked in magic-context-om3y",
+            "op.ps1": 'Write-Host "x";# tracked in magic-context-om3y',
+            "scalar.yml": "key: foo#magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("op.sh:1:");
+        expect(result.out).toContain("op.ps1:1:");
+        expect(result.out).not.toContain("scalar.yml:1:");
+    });
+
+    test("JSONC and CSS comments are in scope, and a CSS url is not one", () => {
+        const result = scan({
+            "w.jsonc": '{\n  // tracked in magic-context-om3y\n  "a": 1\n}',
+            "s.css": "/* tracked in magic-context-om3y */",
+            "url.css": ".a { background: url(https://example.com/x/magic-context-om3y) }",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("w.jsonc:2:");
+        expect(result.out).toContain("s.css:1:");
+        expect(result.out).not.toContain("url.css:1:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

@@ -33,7 +33,7 @@ fi
 # --- END BEADS INTEGRATION v1.2.2 ---
 
 # Comment hygiene on staged source files.
-staged=$(git diff --cached --name-only --diff-filter=ACMR -- "*.rs" "*.ts" "*.tsx" "*.js" "*.mjs" "*.cjs" "*.py" "*.sh" "*.yml" "*.yaml" "*.toml")
+staged=$(git diff --cached --name-only --diff-filter=ACMR -- "*.rs" "*.ts" "*.tsx" "*.js" "*.mjs" "*.cjs" "*.py" "*.sh" "*.ps1" "*.yml" "*.yaml" "*.toml" "*.jsonc" "*.css")
 if [ -n "$staged" ] && [ -x scripts/check-comments.sh ]; then
   root=$(git rev-parse --show-toplevel) || exit 1
   work=$(mktemp -d) || exit 1

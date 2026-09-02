@@ -9,7 +9,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-EXTS='rs ts tsx js mjs cjs py sh yml yaml toml'
+EXTS='rs ts tsx js mjs cjs py sh ps1 yml yaml toml jsonc css'
 # A caller validating staged content supplies the matching staged export.
 IDS_FILE=${COMMENT_CHECK_IDS:-.beads/issues.jsonl}
 
@@ -57,9 +57,10 @@ function wanted(p,   i, c, ext) {
   return (ext in ok_ext)
 }
 
-# A hash-style file has line comments only; a c-style file has both forms.
 function style_of(p) {
-  if (p ~ /\.(py|sh|yml|yaml|toml)$/) return "hash"
+  if (p ~ /\.(py|sh|ps1|yml|yaml|toml)$/) return "hash"
+  # CSS supports block comments but not line comments.
+  if (p ~ /\.css$/) return "block"
   return "c"
 }
 
@@ -83,9 +84,10 @@ function template_quotes(p) {
   return (p ~ /\.(ts|tsx|js|mjs|cjs)$/) ? 1 : 0
 }
 
-# Shell and YAML require whitespace before an inline comment delimiter; Python and TOML do not.
-function hash_needs_space(p) {
-  return (p ~ /\.(sh|yml|yaml)$/) ? 1 : 0
+function hash_boundary(p) {
+  if (p ~ /\.(sh|ps1)$/) return 2
+  if (p ~ /\.(yml|yaml)$/) return 1
+  return 0
 }
 
 # Quote tracking keeps a delimiter inside a string literal from opening a comment.
@@ -158,18 +160,25 @@ function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, e, prev) 
     if (c == DQ || (c == SQ && sq_quotes)) { q = c; i++; continue }
     if (c == BT && tmpl_quotes) { q = BT; tq = 1; i++; continue }
     if (st == "hash") {
-      if (c == "#" && (!hash_space || i == 1 || substr(line, i - 1, 1) == " " || substr(line, i - 1, 1) == "\t")) {
-        return out " " substr(line, i + 1)
-      }
+      if (c == "#" && hash_opens(line, i)) return out " " substr(line, i + 1)
       i++
       continue
     }
     two = substr(line, i, 2)
-    if (two == "//") return out " " substr(line, i + 2)
+    if (st != "block" && two == "//") return out " " substr(line, i + 2)
     if (two == "/*") { depth = 1; out = out " "; i += 2; continue }
     i++
   }
   return out
+}
+
+# Boundary 0 accepts any position, 1 also requires whitespace or line start, and 2 additionally accepts a control operator.
+function hash_opens(line, i,   prev) {
+  if (hash_bound == 0 || i == 1) return 1
+  prev = substr(line, i - 1, 1)
+  if (prev == " " || prev == "\t") return 1
+  if (hash_bound == 2 && index(";&|()", prev) > 0) return 1
+  return 0
 }
 
 function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, tok) {
@@ -236,7 +245,7 @@ BEGIN {
     blk_nest = block_nests(path)
     rust_lit = rust_literals(path)
     tmpl_quotes = template_quotes(path)
-    hash_space = hash_needs_space(path)
+    hash_bound = hash_boundary(path)
     depth = 0
     tq = 0
     tsub = 0
