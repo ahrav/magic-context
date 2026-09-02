@@ -836,7 +836,8 @@ fn declarations_reach(manifest: &Path, path: &str) -> Result<(), String> {
 /// declaration behind `#[cfg(any())]` omits the module and every oracle in it from the harness, so
 /// its attributes decide reachability just as the declaration text does.
 fn declares_module(source: &str, name: &str) -> Result<(), String> {
-    let lines = strip_block_comments(source);
+    let lines = strip_comments(source, true);
+    let text = strip_comments(source, false);
     for (index, line) in lines.iter().enumerate() {
         let Some(inline) = line_declares_module(line, name) else {
             continue;
@@ -846,16 +847,18 @@ fn declares_module(source: &str, name: &str) -> Result<(), String> {
                 "`mod {name}` is declared inline, so its conventional file is not compiled"
             ));
         }
+        // Attribute values live in strings (`#[cfg(feature = "..")]`, `#[path = ".."]`), so read the
+        // attributes from the view that preserves them.
         let mut attributes = Vec::new();
-        let inline = line
+        let same_line = text[index]
             .split_once("mod ")
             .map_or("", |(before, _)| before)
             .trim();
-        if !inline.is_empty() {
-            attributes.push(inline.to_string());
+        if !same_line.is_empty() {
+            attributes.push(same_line.to_string());
         }
         let mut depth = 0i32;
-        for above in lines[..index].iter().rev() {
+        for above in text[..index].iter().rev() {
             let trimmed = above.trim();
             if depth > 0 {
                 depth += bracket_delta(trimmed);
@@ -876,6 +879,11 @@ fn declares_module(source: &str, name: &str) -> Result<(), String> {
             if attribute.starts_with("#[cfg_attr(") {
                 return Err(format!(
                     "`mod {name}` is behind #[cfg_attr(..)], which can expand to a disabling cfg"
+                ));
+            }
+            if attribute.starts_with("#[path") {
+                return Err(format!(
+                    "`mod {name}` overrides its file with #[path], so the conventional file is not compiled"
                 ));
             }
             if let Some(condition) = attribute
@@ -1061,15 +1069,17 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
             // and test target that own its file; `cargo test` runs no ignored
             // test otherwise, and a selector naming another target errors
             // before Cargo evaluates this test.
-            let selects_target = target
-                .as_ref()
-                .is_none_or(|target| line.contains(target.as_str()));
             let runnable = line.starts_with("#[ignore = \"")
-                && line.contains("run with: cargo test")
-                && line.contains(&package)
-                && selects_target
-                && selects_function_exactly(line, test.function)
-                && line.contains("--ignored");
+                && parse_rerun_command(line).is_some_and(|command| {
+                    command.package == Some(owning_package(test.path))
+                        && owning_test_target(test.path)
+                            .is_none_or(|target| command.target == Some(target))
+                        && command.selector.is_some_and(|selector| {
+                            selector == test.function
+                                || selector.ends_with(&format!("::{}", test.function))
+                        })
+                        && command.ignored
+                });
             if !runnable {
                 let selector = match &target {
                     Some(target) => format!("{package}{target}"),
@@ -1119,7 +1129,9 @@ impl std::fmt::Display for LocateError {
 /// satisfy the definition or attribute scans and an `#[ignore = ".."]` rerun command survives for
 /// inspection. Block comments nest, and comment markers inside a string are skipped rather than
 /// honored, so a byte string containing a comment opener does not blank the rest of the file.
-fn strip_block_comments(source: &str) -> Vec<String> {
+/// Blanks comment interiors, and string interiors too when `blank_strings`, so an item search never
+/// matches text that Rust compiles as data. Line structure is preserved so indices agree.
+fn strip_comments(source: &str, blank_strings: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let mut depth = 0usize;
     let mut raw_hashes: Option<usize> = None;
@@ -1139,20 +1151,27 @@ fn strip_block_comments(source: &str) -> Vec<String> {
                     kept.push_str(&line[index..index + terminator.len()]);
                     index += terminator.len();
                 } else {
-                    kept.push_str(&line[index..index + 1]);
+                    if !blank_strings {
+                        kept.push_str(&line[index..index + 1]);
+                    }
                     index += 1;
                 }
                 continue;
             }
             if in_string {
                 if rest.starts_with(b"\\") && rest.len() > 1 {
-                    kept.push_str(&line[index..index + 2]);
+                    if !blank_strings {
+                        kept.push_str(&line[index..index + 2]);
+                    }
                     index += 2;
                 } else {
-                    if rest[0] == b'"' {
+                    let closing = rest[0] == b'"';
+                    if closing {
                         in_string = false;
                     }
-                    kept.push_str(&line[index..index + 1]);
+                    if !blank_strings || closing {
+                        kept.push_str(&line[index..index + 1]);
+                    }
                     index += 1;
                 }
                 continue;
@@ -1238,6 +1257,32 @@ fn raw_prefix_len(rest: &[u8], hashes: usize) -> usize {
     prefix + hashes + 1
 }
 
+/// Splits leading outer attributes from the item on one line, so an attribute written beside its
+/// item is inspected rather than hiding the item from a prefix test.
+fn split_leading_attributes(line: &str) -> (&str, &str) {
+    let mut rest = line;
+    while rest.starts_with("#[") {
+        let mut depth = 0i32;
+        let mut end = None;
+        for (offset, character) in rest.char_indices() {
+            match character {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        rest = rest[end..].trim_start();
+    }
+    (line[..line.len() - rest.len()].trim(), rest)
+}
+
 /// Reports whether `index` falls inside a `macro_rules!` body, whose contents become items only
 /// where the macro is invoked. A function that exists only in an unexpanded macro is compiled into
 /// no harness, so it cannot stand as a registered oracle. `proptest!` and other invocations are
@@ -1277,11 +1322,13 @@ fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
     // rather than silently contributing no condition.
     let mut conditions = Vec::new();
     for (start, line) in lines.iter().enumerate().take(index) {
-        let trimmed = line.trim_start();
-        let is_module = trimmed.starts_with("mod ")
-            || trimmed.starts_with("pub mod ")
-            || trimmed.starts_with("pub(crate) mod ")
-            || trimmed.starts_with("pub(super) mod ");
+        // Strip any outer attributes written on the same line before classifying the item, so
+        // `#[cfg(any())] mod disabled {` is still recognized as an enclosing module.
+        let (inline_attributes, item) = split_leading_attributes(line.trim());
+        let is_module = item.starts_with("mod ")
+            || item.starts_with("pub mod ")
+            || item.starts_with("pub(crate) mod ")
+            || item.starts_with("pub(super) mod ");
         if !is_module || !line.contains('{') {
             continue;
         }
@@ -1299,6 +1346,9 @@ fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
             continue;
         }
         let mut raw = Vec::new();
+        if !inline_attributes.is_empty() {
+            raw.push(inline_attributes.to_string());
+        }
         let mut bracket = 0i32;
         for above in lines[..start].iter().rev() {
             let attribute = above.trim();
@@ -1340,41 +1390,71 @@ fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
     conditions
 }
 
-/// Reports whether the rerun command in `attribute` selects `function` as a whole harness filter.
-/// `cargo test <selector>` runs the tests whose path contains `selector`, so a substring match here
-/// would accept `not_epic_close`, which selects nothing while containing the function name.
-fn selects_function_exactly(attribute: &str, function: &str) -> bool {
-    let Some((_, command)) = attribute.split_once("run with: ") else {
-        return false;
+/// The parts of a `cargo test` rerun command that decide whether it selects one ignored test.
+struct RerunCommand<'a> {
+    package: Option<&'a str>,
+    target: Option<&'a str>,
+    selector: Option<&'a str>,
+    ignored: bool,
+}
+
+/// Parses the command after `run with: `. Only the command decides what Cargo runs, so prose
+/// elsewhere in the reason string cannot supply the package, target, or selector.
+fn parse_rerun_command<'a>(attribute: &'a str) -> Option<RerunCommand<'a>> {
+    let (_, command) = attribute.split_once("run with: ")?;
+    let command = command.trim_end_matches(['"', ']', '#']);
+    let (invocation, arguments) = match command.split_once(" -- ") {
+        Some((invocation, arguments)) => (invocation, Some(arguments)),
+        None => (command, None),
     };
-    // `cargo test [OPTIONS] [TESTNAME] [-- [ARGS]..]`: only the positional selector filters tests,
-    // so prose elsewhere in the reason string must not stand in for it.
-    let command = command.split(" -- ").next().unwrap_or(command);
-    let mut tokens = command
+    let ignored =
+        arguments.is_some_and(|arguments| arguments.split_whitespace().any(|a| a == "--ignored"));
+    let mut tokens = invocation
         .split_whitespace()
         .skip_while(|token| *token != "test")
-        .skip(1)
-        .peekable();
-    let mut selector = None;
+        .skip(1);
+    let mut parsed = RerunCommand {
+        package: None,
+        target: None,
+        selector: None,
+        ignored,
+    };
     while let Some(token) = tokens.next() {
         if let Some(flag) = token.strip_prefix("--") {
-            if !flag.contains('=') && FLAGS_TAKING_A_VALUE.contains(&flag) {
-                tokens.next();
+            let (flag, inline) = match flag.split_once('=') {
+                Some((flag, value)) => (flag, Some(value)),
+                None => (flag, None),
+            };
+            let value = match inline {
+                Some(value) => Some(value),
+                None if FLAGS_TAKING_A_VALUE.contains(&flag) => tokens.next(),
+                None => None,
+            };
+            match flag {
+                "package" => parsed.package = value,
+                "test" => parsed.target = value,
+                _ => {}
             }
             continue;
         }
-        if token.starts_with('-') {
-            if token.len() == 2 && SHORT_FLAGS_TAKING_A_VALUE.contains(&token) {
-                tokens.next();
+        if let Some(short) = token.strip_prefix('-') {
+            let value = if short.len() > 1 {
+                Some(&token[2..])
+            } else if SHORT_FLAGS_TAKING_A_VALUE.contains(&token) {
+                tokens.next()
+            } else {
+                None
+            };
+            if short.starts_with('p') {
+                parsed.package = value;
             }
             continue;
         }
-        selector = Some(token.trim_end_matches('"'));
-        break;
+        if parsed.selector.is_none() {
+            parsed.selector = Some(token);
+        }
     }
-    selector.is_some_and(|selector| {
-        selector == function || selector.ends_with(&format!("::{function}"))
-    })
+    Some(parsed)
 }
 
 const FLAGS_TAKING_A_VALUE: &[&str] = &[
@@ -1430,7 +1510,8 @@ fn locate_with_module_cfgs(
     function: &str,
 ) -> Result<(Vec<String>, Vec<String>), LocateError> {
     let signature = format!("fn {function}(");
-    let lines = strip_block_comments(source);
+    let lines = strip_comments(source, true);
+    let text = strip_comments(source, false);
     let matches = lines
         .iter()
         .enumerate()
@@ -1463,8 +1544,10 @@ fn locate_with_module_cfgs(
             break;
         }
     }
-    raw.reverse();
-    let attributes = join_attributes(&raw);
+    // Attribute values live in strings, so re-read the collected span from the preserved view;
+    // that slice is already top-down, unlike the reverse scan that measured it.
+    let first = index - raw.len();
+    let attributes = join_attributes(&text[first..index]);
     let module_cfgs = enclosing_module_cfgs(&lines, index);
     Ok((attributes, module_cfgs))
 }
@@ -1568,6 +1651,11 @@ const IGNORED_PROSE_SELECTOR: &str =
     "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const QUOTE_CHAR_THEN_COMMENT: &str =
     "let quote = b'\\\"';\n/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
+const STRING_ONLY: &str = "const SAMPLE: &str = \"\n#[test]\nfn proven() {}\n\";\nfn other() {}\n";
+const MODULE_ATTR_SAME_LINE: &str =
+    "#[cfg(any())] mod disabled {\n    #[test]\n    fn proven() {}\n}\n";
+const IGNORED_PROSE_FLAGS: &str =
+    "#[test]\n#[ignore = \"see -p mc-kernel --test x ; run with: cargo test -p wrong --test wrong proven -- --ignored\"]\nfn proven() {}\n";
 const MACRO_PAREN_BODY: &str =
     "macro_rules! never_used (\n    () => (\n        #[test]\n        fn proven() {}\n    );\n);\n";
 const MODULE_CFG_ATTR: &str =
@@ -1740,6 +1828,27 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     .unwrap_err();
     assert!(errors[0].contains("function not found"), "{errors:?}");
 
+    // Lines that Rust compiles as string data are not definitions.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(STRING_ONLY))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // An attribute beside its module must not hide the module.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MODULE_ATTR_SAME_LINE))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("inside a module behind #[cfg(any())]"),
+        "{errors:?}"
+    );
+
     // A macro body delimited by parentheses hides a definition just as braces do.
     let errors = validate(
         &[landed(PROVEN)],
@@ -1811,6 +1920,18 @@ fn an_ignored_test_needs_a_runnable_rerun_command() {
         &[],
     )
     .unwrap();
+
+    // Prose before `run with:` must not supply the package or target either.
+    let errors = validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_PROSE_FLAGS))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("without a rerun command for"),
+        "{errors:?}"
+    );
 
     // Prose before `run with:` must not stand in for the positional selector.
     let errors = validate(
