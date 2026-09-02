@@ -260,6 +260,17 @@ describe("deterministic metamorphic runner", () => {
         forgedEntry.derivativeScore.scenarioId = forgedEntry.scenarioId;
         expect(() => parseMetamorphicReport(forgedControl))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: control-pair-coordinates-invalid`));
+        // Only the live runner emits the control pair, so a raw-output pair cannot claim the exemption.
+        const relabelled = structuredClone(report);
+        const relabelledEntry = relabelled.entries[scoredIndex]!;
+        relabelledEntry.transformId = "baseline-control";
+        relabelledEntry.transformVersion = 1;
+        relabelledEntry.seed = 0;
+        if (relabelledEntry.kind !== "scored") throw new Error("unreachable");
+        relabelledEntry.derivativeScore.scenarioId = relabelledEntry.scenarioId;
+        expect(relabelledEntry.baselineScore.source).toBe("raw-output");
+        expect(() => parseMetamorphicReport(relabelled))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: control-pair-source-invalid`));
 
         // Each producer scores both roles through one path, so a mixed-source pair is unreachable.
         const mixedSource = structuredClone(report);

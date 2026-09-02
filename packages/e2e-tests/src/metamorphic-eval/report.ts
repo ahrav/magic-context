@@ -331,6 +331,10 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             if (isControlPair && (pair.transformVersion !== 1 || pair.seed !== 0)) {
                 p.fail(`${label}: control-pair-coordinates-invalid`);
             }
+            // The control pair requires a run-record baseline score.
+            if (isControlPair && baselineScore.source !== "run-record") {
+                p.fail(`${label}: control-pair-source-invalid`);
+            }
             const derivativeScenarioId = isControlPair
                 ? pair.scenarioId
                 : `${pair.scenarioId}-d-${pair.transformId}-v${pair.transformVersion}-s${pair.seed}`;

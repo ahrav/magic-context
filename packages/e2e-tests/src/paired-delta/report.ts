@@ -377,7 +377,7 @@ function parseEndpointEstimates(
     allowed: readonly DeltaEndpoint[],
     minimumAnalyzableFamilyCount: number,
 ): EndpointEstimate[] {
-    return p.array(raw, label).map((entry, index) => {
+    const estimates = p.array(raw, label).map((entry, index) => {
         const itemLabel = `${label}[${index}]`;
         const value = p.record(entry, itemLabel);
         p.exact(value, ["endpoint", "pointEstimate", "interval", "familyCount", "resolution", "families"], itemLabel);
@@ -422,6 +422,10 @@ function parseEndpointEstimates(
             families,
         };
     });
+    // `estimateFamilyDeltas` builds one estimate per endpoint name, so a repeat also makes a later lookup
+    // depend on row order.
+    p.unique(estimates.map(({ endpoint }) => endpoint), label);
+    return estimates;
 }
 
 function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
@@ -436,7 +440,6 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     const evidenceSufficient = p.boolean(value.evidenceSufficient, `${label}.evidenceSufficient`);
     if (evidenceSufficient !== analyzableFamilyCount >= minimumAnalyzableFamilyCount) p.fail(`${label}.evidenceSufficient: derived-mismatch`);
     const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, minimumAnalyzableFamilyCount);
-    p.unique(endpoints.map(({ endpoint }) => endpoint), `${label}.endpoints`);
     if (endpoints.length > 0) {
         if (endpoints.length !== PRIMARY_ENDPOINTS.length) p.fail(`${label}.endpoints: paired-endpoints-required`);
         const familyKeys = endpoints.map(({ families }) =>
