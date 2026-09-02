@@ -367,3 +367,875 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     assert_eq!(value["kernel"]["required_consumer_count"], 1);
     daemon.handler.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// `kernel.read`, `kernel.commit`, `kernel.eligibility.batch`
+// ---------------------------------------------------------------------------
+
+use mc_kernel::{
+    AdmissionEvent, AdmissionRequest, ArtifactDeletionIdentity, ArtifactDeletionKind,
+    ArtifactDeletionRequest, ArtifactIngestRequest, DecisionPayload, DecisionSpec, EventKind,
+    ObservationPayload, ObservationSpec, ProviderEgress, RepositoryProvenance, ScopeSpec,
+    ScopeTermSpec, Sensitivity, SourceClass, TaintClass,
+};
+use mc_module::dispatch::PreparedOutcome;
+use serde_json::{json, Value};
+
+const SESSION: &str = "session-a";
+const DOMAIN: &str = "domain";
+const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+
+fn seed_domain(store: &mc_kernel::KernelStore) {
+    store
+        .commit(intent("seed-domain"), |envelope| {
+            envelope.insert_domain(mc_kernel::DomainSpec {
+                domain_id: DOMAIN.to_string(),
+                object_id: "domain-object".to_string(),
+                name: "fixture".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: DOMAIN.to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+}
+
+fn digest(seed: &str) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(seed.as_bytes()))
+}
+
+fn wire_intent(key: &str, digest_seed: &str) -> Value {
+    json!({
+        "producer": "plugin",
+        "operation_key": key,
+        "request_digest": digest(digest_seed),
+        "actor": "assistant",
+        "cause": "ctx_memory",
+    })
+}
+
+fn decision_spec(index: i64) -> Value {
+    json!({
+        "decision_id": format!("decision-{index}"),
+        "object_id": format!("decision-object-{index}"),
+        "domain_id": DOMAIN,
+        "decision_kind": "memory",
+        "payload": {"summary": format!("decision {index}"), "rationale": format!("because {index}")},
+        "source_id": "memory-lineage",
+        "source_revision": index,
+    })
+}
+
+fn insert_decision(index: i64) -> Value {
+    json!({"op": "insert_decision", "spec": decision_spec(index)})
+}
+
+fn commit_request(project: &Path, key: &str, operations: Vec<Value>, tokens: Vec<Value>) -> Value {
+    json!({
+        "method": "kernel.commit",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "intent": wire_intent(key, key),
+        "tokens": tokens,
+        "operations": operations,
+        "source_kind": "assistant",
+    })
+}
+
+fn read_request(project: &Path, surface: &str, as_of: Option<i64>) -> Value {
+    json!({
+        "method": "kernel.read",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "surface": surface,
+        "as_of": as_of,
+        "gated": false,
+    })
+}
+
+fn token(object_id: &str, known_as_of: i64) -> Value {
+    json!({"object_id": object_id, "known_as_of": known_as_of})
+}
+
+fn state_of(value: &Value) -> (String, Option<String>) {
+    (
+        value["state"]["kind"].as_str().unwrap().to_string(),
+        value["state"]["reason"].as_str().map(str::to_string),
+    )
+}
+
+fn assert_state(value: &Value, kind: &str, reason: Option<&str>) {
+    assert_eq!(
+        state_of(value),
+        (kind.to_string(), reason.map(str::to_string)),
+        "{value}"
+    );
+}
+
+fn object_ids(read: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = read["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["object"]["object_id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+impl Daemon {
+    async fn call(&self, route: RouteHandle, request: Value) -> Value {
+        match self.handler.dispatch_value_for_test(route, request).await {
+            PreparedOutcome::Response(output) => response_json(&output),
+            PreparedOutcome::Error { code, message } => {
+                panic!("kernel route answered {code}: {message}")
+            }
+            PreparedOutcome::Streamed => panic!("kernel route streamed"),
+        }
+    }
+
+    async fn commit(&self, key: &str, operations: Vec<Value>, tokens: Vec<Value>) -> Value {
+        self.call(
+            self.route,
+            commit_request(&self.project, key, operations, tokens),
+        )
+        .await
+    }
+
+    async fn read(&self, surface: &str, as_of: Option<i64>) -> Value {
+        self.call(self.route, read_request(&self.project, surface, as_of))
+            .await
+    }
+
+    fn store(&self) -> std::sync::Arc<mc_kernel::KernelStore> {
+        self.handler.kernel_store_for_test().unwrap()
+    }
+
+    fn tip(&self) -> i64 {
+        self.store().tip().unwrap()
+    }
+
+    /// Binds a second route, on a second session, to a second project root.
+    async fn bind_project(&self, name: &str) -> (RouteHandle, PathBuf) {
+        let root = self._data.path().join(name);
+        fs::create_dir_all(&root).unwrap();
+        let route = RouteHandle {
+            channel: 11,
+            epoch: 1,
+        };
+        assert!(matches!(
+            self.handler.bind(route, identity(&root, "session-b")).await,
+            BindOutcome::Accept
+        ));
+        (route, root)
+    }
+
+    /// The project scope id the route materialized, read back off a row.
+    async fn project_scope_id(&self) -> String {
+        let read = self.read("explicit_search", None).await;
+        read["rows"][0]["scope_id"].as_str().unwrap().to_string()
+    }
+}
+
+/// Deterministic-lineage decision written straight into the store under `scope_id`.
+fn store_decision(index: i64, scope_id: &str, source_id: &str) -> DecisionSpec {
+    DecisionSpec {
+        decision_id: format!("store-decision-{index}"),
+        object_id: format!("store-decision-object-{index}"),
+        domain_id: DOMAIN.to_string(),
+        proposition_id: None,
+        scope_id: Some(scope_id.to_string()),
+        anchor_id: None,
+        evidence_id: None,
+        decision_kind: "architecture".to_string(),
+        payload: DecisionPayload {
+            summary: format!("decision {index}"),
+            rationale: format!("because {index}"),
+        },
+        source_kind: "repo".to_string(),
+        source_id: source_id.to_string(),
+        source_revision: 1,
+        sensitivity: Sensitivity::Normal,
+    }
+}
+
+fn code_observation(index: i64, source_id: &str) -> ObservationSpec {
+    ObservationSpec {
+        observation_id: format!("observation-{index}"),
+        object_id: format!("observation-object-{index}"),
+        domain_id: DOMAIN.to_string(),
+        proposition_id: None,
+        scope_id: None,
+        anchor_id: None,
+        evidence_id: None,
+        observation_kind: "code_present".to_string(),
+        payload: ObservationPayload {
+            summary: "code present".to_string(),
+            classification: "code_present".to_string(),
+            detail: None,
+        },
+        observed_at: 1,
+        dependencies: Vec::new(),
+        source_kind: "repo".to_string(),
+        source_id: source_id.to_string(),
+        source_revision: 1,
+        sensitivity: Sensitivity::Normal,
+    }
+}
+
+fn admission(
+    subject: &str,
+    kind: EventKind,
+    trigger: Option<&str>,
+    classes: (SourceClass, TaintClass),
+) -> AdmissionRequest {
+    AdmissionRequest {
+        candidate_id: None,
+        subject_object_id: Some(subject.to_string()),
+        source_class: Some(classes.0),
+        taint_class: Some(classes.1),
+        event: AdmissionEvent {
+            kind,
+            trigger_object_id: trigger.map(str::to_string),
+            approval_object_id: None,
+            evidence_id: None,
+            reason: format!("{kind:?}"),
+        },
+    }
+}
+
+fn ingest(key: &str, payload: &[u8], sensitivity: Sensitivity) -> ArtifactIngestRequest {
+    ArtifactIngestRequest {
+        intent: intent(key),
+        payload: payload.to_vec(),
+        evidence_id: format!("evidence-{key}"),
+        object_id: format!("evidence-object-{key}"),
+        object_kind: "evidence".to_string(),
+        domain_id: DOMAIN.to_string(),
+        source_kind: "repository".to_string(),
+        source_id: format!("src/{key}"),
+        source_revision: 1,
+        media_type: "text/plain".to_string(),
+        retention_class: "canonical".to_string(),
+        retain_until: None,
+        asserted_sensitivity: sensitivity,
+        provider_egress: ProviderEgress::RemoteAllowed,
+        provenance: Some(RepositoryProvenance {
+            repository_id: "repo".to_string(),
+            revision: "abc123".to_string(),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn replayed_intents_return_one_receipt_and_projects_never_collide() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let first = daemon
+        .commit("create-1", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&first, "available", None);
+    let commit_seq = first["receipt"]["commit_seq"].as_i64().unwrap();
+    assert_eq!(first["receipt"]["replayed"], false);
+    assert_eq!(first["known_as_of"], commit_seq);
+    assert_eq!(
+        first["tokens"],
+        json!([{"object_id": "decision-object-1", "known_as_of": commit_seq}])
+    );
+    let tip = daemon.tip();
+
+    let again = daemon
+        .commit("create-1", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&again, "available", None);
+    assert_eq!(again["receipt"]["commit_seq"], commit_seq);
+    assert_eq!(again["receipt"]["replayed"], true);
+    assert_eq!(again["tokens"], first["tokens"]);
+    assert_eq!(daemon.tip(), tip, "a replay writes nothing");
+
+    // The same request bytes on a route bound to another project are another
+    // operation: a receipt of their own, neither replayed.
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut request = commit_request(&project_b, "create-1", vec![insert_decision(2)], vec![]);
+    request["session_id"] = json!("session-b");
+    let other = daemon.call(route_b, request).await;
+    assert_state(&other, "available", None);
+    assert_eq!(other["receipt"]["replayed"], false);
+    assert_ne!(other["receipt"]["commit_seq"], commit_seq);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_operation_key_reused_with_another_digest_is_invalid() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    assert_state(
+        &daemon.commit("key", vec![insert_decision(1)], vec![]).await,
+        "available",
+        None,
+    );
+    let tip = daemon.tip();
+    let mut reused = commit_request(&daemon.project, "key", vec![insert_decision(2)], vec![]);
+    reused["intent"] = wire_intent("key", "other-bytes");
+    let response = daemon.call(daemon.route, reused).await;
+    assert_state(&response, "invalid", Some("operation_key_reused"));
+    assert_eq!(daemon.tip(), tip);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_token_conflicts_when_its_object_advanced_was_retracted_or_was_superseded() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let created = daemon
+        .commit(
+            "create",
+            vec![insert_decision(1), insert_decision(2), insert_decision(3)],
+            vec![],
+        )
+        .await;
+    let n = created["known_as_of"].as_i64().unwrap();
+
+    // Object 1 changes at N+1 (a supersession into 4); object 2 is retired.
+    let changed = daemon
+        .commit(
+            "change",
+            vec![
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(4)}),
+                json!({"op": "retire_decision", "object_id": "decision-object-2"}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&changed, "available", None);
+    assert_eq!(changed["known_as_of"].as_i64().unwrap(), n + 1);
+    let tip = daemon.tip();
+
+    // Object 4 is live but changed after N: known_as_of advanced.
+    let advanced = daemon
+        .commit(
+            "mutate-advanced",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-4"})],
+            vec![token("decision-object-4", n)],
+        )
+        .await;
+    assert_state(&advanced, "conflict", Some("known_as_of_advanced"));
+    let retracted = daemon
+        .commit(
+            "mutate-retracted",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-3"})],
+            vec![token("decision-object-2", n)],
+        )
+        .await;
+    assert_state(&retracted, "conflict", Some("retracted"));
+    let superseded = daemon
+        .commit(
+            "mutate-superseded",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-3"})],
+            vec![token("decision-object-1", n)],
+        )
+        .await;
+    assert_state(&superseded, "conflict", Some("superseded"));
+    let missing = daemon
+        .commit(
+            "mutate-missing",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-3"})],
+            vec![token("never-written", n)],
+        )
+        .await;
+    assert_state(&missing, "conflict", Some("retracted"));
+    assert_eq!(daemon.tip(), tip, "a conflicting commit writes nothing");
+
+    // A token at the current tip on an untouched object lets the mutation land.
+    let landed = daemon
+        .commit(
+            "mutate-fresh",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-3"})],
+            vec![token("decision-object-3", tip)],
+        )
+        .await;
+    assert_state(&landed, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_merge_folds_every_predecessor_into_one_survivor_in_one_commit() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    daemon
+        .commit(
+            "create",
+            vec![insert_decision(1), insert_decision(2), insert_decision(3)],
+            vec![],
+        )
+        .await;
+    let before = daemon.read("explicit_search", None).await;
+    assert_eq!(
+        object_ids(&before),
+        [
+            "decision-object-1",
+            "decision-object-2",
+            "decision-object-3"
+        ]
+    );
+
+    let merged = daemon
+        .commit(
+            "merge",
+            vec![
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(3)}),
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": decision_spec(3)}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&merged, "available", None);
+    let touched: Vec<&str> = merged["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|token| token["object_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        touched,
+        [
+            "decision-object-1",
+            "decision-object-2",
+            "decision-object-3"
+        ]
+    );
+    let after = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&after), ["decision-object-3"]);
+    let history = daemon
+        .store()
+        .object_history_as_of(daemon.tip())
+        .unwrap()
+        .objects;
+    for predecessor in ["decision-object-1", "decision-object-2"] {
+        let row = history
+            .iter()
+            .find(|object| object.object_id == predecessor)
+            .unwrap();
+        assert_eq!(row.superseded_by.as_deref(), Some("decision-object-3"));
+        assert!(row.invalidated_commit_seq.is_some());
+    }
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_plugin_route_cannot_declare_a_class_above_the_derived_one() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let tip = daemon.tip();
+    let mut over = commit_request(&daemon.project, "over", vec![insert_decision(1)], vec![]);
+    over["asserted_source_class"] = json!("explicit_user");
+    let response = daemon.call(daemon.route, over).await;
+    assert_state(&response, "invalid", Some("class_over_declared"));
+    assert_eq!(daemon.tip(), tip);
+
+    let mut over_taint = commit_request(&daemon.project, "taint", vec![insert_decision(1)], vec![]);
+    over_taint["asserted_taint_class"] = json!("current_code");
+    assert_state(
+        &daemon.call(daemon.route, over_taint).await,
+        "invalid",
+        Some("class_over_declared"),
+    );
+
+    let mut unknown = commit_request(&daemon.project, "unknown", vec![insert_decision(1)], vec![]);
+    unknown["source_kind"] = json!("oracle");
+    assert_state(
+        &daemon.call(daemon.route, unknown).await,
+        "invalid",
+        Some("invalid_input"),
+    );
+
+    let mut derived = commit_request(&daemon.project, "derived", vec![insert_decision(1)], vec![]);
+    derived["asserted_source_class"] = json!("model_inference");
+    derived["asserted_taint_class"] = json!("assistant_inference");
+    let response = daemon.call(daemon.route, derived).await;
+    assert_state(&response, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+    // Inference-class writes serve labeled on explicit search and never on
+    // the automatic surfaces.
+    assert_eq!(read["rows"][0]["labeled"], true);
+    assert!(object_ids(&daemon.read("auto_inject", None).await).is_empty());
+    assert!(object_ids(&daemon.read("auto_search", None).await).is_empty());
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_request_naming_another_project_root_is_refused_before_any_work() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let tip = daemon.tip();
+    let elsewhere = daemon._data.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let response = daemon
+        .call(
+            daemon.route,
+            commit_request(&elsewhere, "foreign", vec![insert_decision(1)], vec![]),
+        )
+        .await;
+    assert_state(&response, "invalid", Some("project_mismatch"));
+    assert_eq!(daemon.tip(), tip);
+    let read = daemon
+        .call(
+            daemon.route,
+            read_request(&elsewhere, "explicit_search", None),
+        )
+        .await;
+    assert_state(&read, "invalid", Some("project_mismatch"));
+    // A missing project_root is a malformed request, not a kernel state.
+    let mut missing = read_request(&daemon.project, "explicit_search", None);
+    missing.as_object_mut().unwrap().remove("project_root");
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, missing).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rows_serve_only_to_the_project_their_scope_names() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    assert_state(
+        &daemon.commit("a", vec![insert_decision(1)], vec![]).await,
+        "available",
+        None,
+    );
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut write_b = commit_request(&project_b, "b", vec![insert_decision(2)], vec![]);
+    write_b["session_id"] = json!("session-b");
+    assert_state(&daemon.call(route_b, write_b).await, "available", None);
+
+    // A row whose project term was redacted names no resolvable project.
+    store
+        .commit(intent("redacted-scope"), |envelope| {
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-redacted".to_string(),
+                object_id: "scope-redacted".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-redacted".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "exact".to_string(),
+                    exact_value: Some(format!("/projects/{SECRET}")),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            envelope.insert_decision(store_decision(9, "scope-redacted", "redacted-lineage"))?;
+            envelope.record_admission(admission(
+                "store-decision-object-9",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let terms = store.scope_terms("scope-redacted").unwrap();
+    assert!(!terms[0].exact_value.as_deref().unwrap().contains(SECRET));
+
+    let read_a = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read_a), ["decision-object-1"]);
+    let mut request_b = read_request(&project_b, "explicit_search", None);
+    request_b["session_id"] = json!("session-b");
+    let read_b = daemon.call(route_b, request_b).await;
+    assert_eq!(object_ids(&read_b), ["decision-object-2"]);
+    // The unfiltered kernel view still holds all three, so the filter is what
+    // hid them.
+    let all = store
+        .visible_as_of(mc_kernel::Surface::ExplicitSearch, daemon.tip())
+        .unwrap();
+    assert_eq!(all.rows.len(), 3);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reads_at_a_snapshot_return_what_was_visible_then() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    // The first route write materializes the project scope used below.
+    daemon
+        .commit("seed", vec![insert_decision(1)], vec![])
+        .await;
+    let scope_id = daemon.project_scope_id().await;
+
+    // A verified decision, the maturity `auto_inject` serves, admitted at N.
+    let n = store
+        .commit(intent("verified"), |envelope| {
+            envelope.insert_observation(code_observation(1, "verified-lineage"))?;
+            envelope.insert_decision(store_decision(1, &scope_id, "verified-lineage"))?;
+            envelope.record_admission(admission(
+                "store-decision-object-1",
+                EventKind::CodeObserved,
+                Some("observation-object-1"),
+                (SourceClass::TrustedLocalCode, TaintClass::CurrentCode),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    let at_n = daemon.read("auto_inject", Some(n)).await;
+    assert_eq!(object_ids(&at_n), ["store-decision-object-1"]);
+    assert_eq!(at_n["rows"][0]["visibility"], "visible");
+    assert_eq!(
+        at_n["rows"][0]["token"],
+        token("store-decision-object-1", n)
+    );
+
+    // N+1: the verified decision is marked stale and a second row appears.
+    store
+        .commit(intent("retract"), |envelope| {
+            envelope.record_admission(admission(
+                "store-decision-object-1",
+                EventKind::MarkStale,
+                None,
+                (SourceClass::TrustedLocalCode, TaintClass::CurrentCode),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    daemon
+        .commit("later", vec![insert_decision(2)], vec![])
+        .await;
+
+    let at_tip = daemon.read("auto_inject", None).await;
+    assert_state(&at_tip, "available", None);
+    assert!(object_ids(&at_tip).is_empty(), "{at_tip}");
+    assert_eq!(at_tip["known_as_of"], at_tip["tip"]);
+    let still_n = daemon.read("auto_inject", Some(n)).await;
+    assert_eq!(object_ids(&still_n), ["store-decision-object-1"]);
+    assert_eq!(still_n["known_as_of"], n);
+    let explicit_at_n = daemon.read("explicit_search", Some(n)).await;
+    assert_eq!(
+        object_ids(&explicit_at_n),
+        ["decision-object-1", "store-decision-object-1"]
+    );
+    let explicit_at_tip = daemon.read("explicit_search", None).await;
+    assert_eq!(
+        object_ids(&explicit_at_tip),
+        [
+            "decision-object-1",
+            "decision-object-2",
+            "store-decision-object-1"
+        ]
+    );
+
+    let future = daemon.read("auto_inject", Some(daemon.tip() + 1)).await;
+    assert_state(&future, "unavailable", Some("snapshot_diverged"));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn eligibility_request(project: &Path, destination: &str, candidates: Vec<Value>) -> Value {
+    json!({
+        "method": "kernel.eligibility.batch",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "destination": destination,
+        "candidates": candidates,
+    })
+}
+
+fn verdicts(response: &Value) -> Vec<(String, String)> {
+    response["verdicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["object_id"].as_str().unwrap().to_string(),
+                entry["verdict"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_tip() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit(
+            "create",
+            vec![
+                insert_decision(1),
+                insert_decision(2),
+                insert_decision(3),
+                insert_decision(4),
+                insert_decision(6),
+            ],
+            vec![],
+        )
+        .await;
+    daemon
+        .commit(
+            "change",
+            vec![
+                json!({"op": "retire_decision", "object_id": "decision-object-2"}),
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-3", "spec": decision_spec(5)}),
+            ],
+            vec![],
+        )
+        .await;
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut write_b = commit_request(&project_b, "b", vec![insert_decision(7)], vec![]);
+    write_b["session_id"] = json!("session-b");
+    daemon.call(route_b, write_b).await;
+    let sensitive = store
+        .ingest_artifact(ingest(
+            "sensitive",
+            b"sensitive bytes",
+            Sensitivity::Sensitive,
+        ))
+        .unwrap();
+
+    let candidates = vec![
+        json!({"object_id": "decision-object-1", "source_revision": 1}),
+        json!({"object_id": "decision-object-2", "source_revision": 2}),
+        json!({"object_id": "decision-object-3", "source_revision": 3}),
+        json!({"object_id": "decision-object-4", "source_revision": 40}),
+        json!({"object_id": "decision-object-7", "source_revision": 7}),
+        json!({"object_id": "decision-object-6", "source_revision": 6, "artifact_digest": sensitive.digest}),
+        json!({"object_id": "never-written", "source_revision": 1}),
+    ];
+    let request = eligibility_request(&daemon.project, "remote", candidates.clone());
+    let first = daemon.call(daemon.route, request.clone()).await;
+    assert_state(&first, "available", None);
+    assert_eq!(first["known_as_of"], daemon.tip());
+    assert_eq!(first["cache_hits"], 0);
+    assert_eq!(
+        verdicts(&first),
+        [
+            ("decision-object-1", "ok"),
+            ("decision-object-2", "retracted"),
+            ("decision-object-3", "superseded"),
+            ("decision-object-4", "stale"),
+            ("decision-object-7", "wrong_scope"),
+            ("decision-object-6", "provider_sensitive"),
+            ("never-written", "retracted"),
+        ]
+        .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
+    );
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 7);
+
+    // Same tip, same candidates: every verdict comes from the cache.
+    let second = daemon.call(daemon.route, request.clone()).await;
+    assert_eq!(second["cache_hits"], 7);
+    assert_eq!(verdicts(&second), verdicts(&first));
+    // A different declared revision is a different key and a different verdict.
+    let revised = daemon
+        .call(
+            daemon.route,
+            eligibility_request(
+                &daemon.project,
+                "remote",
+                vec![json!({"object_id": "decision-object-1", "source_revision": 2})],
+            ),
+        )
+        .await;
+    assert_eq!(revised["cache_hits"], 0);
+    assert_eq!(verdicts(&revised)[0].1, "stale");
+    // Locally the sensitive artifact is eligible; destination is part of the key.
+    let local = daemon
+        .call(
+            daemon.route,
+            eligibility_request(&daemon.project, "local", candidates.clone()),
+        )
+        .await;
+    assert_eq!(local["cache_hits"], 0);
+    assert_eq!(verdicts(&local)[5].1, "ok");
+
+    // Retiring the `ok` candidate moves the tip, so the old entries stop matching.
+    daemon
+        .commit(
+            "retire-1",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-1"})],
+            vec![],
+        )
+        .await;
+    let third = daemon.call(daemon.route, request.clone()).await;
+    assert_eq!(third["cache_hits"], 0);
+    assert_eq!(verdicts(&third)[0].1, "retracted");
+
+    // Dropping the store slot empties the map with it.
+    assert!(daemon.handler.eligibility_cache_len_for_test() > 0);
+    daemon.handler.shutdown().await.unwrap();
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 0);
+}
+
+#[tokio::test]
+async fn an_artifact_purge_advances_the_commit_sequence() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(ingest("purged", b"purge me", Sensitivity::Normal))
+        .unwrap();
+    let before = daemon.tip();
+    let result = store
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("purge"),
+            identity: ArtifactDeletionIdentity::Digest(handle.digest.clone()),
+            kind: ArtifactDeletionKind::Purge,
+            operator_id: Some("operator-1".to_string()),
+            target_locator: Some("incident://secret-1".to_string()),
+            reason: Some("secret".to_string()),
+            deleted_at: 42,
+        })
+        .unwrap();
+    let after = daemon.tip();
+    assert!(after > before, "purge left the tip at {before}");
+    assert_eq!(result.commit_seq, after);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_commit_that_cannot_take_the_writer_by_its_deadline_is_store_busy() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    let held = store.clone();
+    let holder = std::thread::spawn(move || {
+        held.commit(intent("hold"), |_| {
+            std::thread::sleep(Duration::from_millis(1_500));
+            Ok(String::new())
+        })
+        .unwrap()
+    });
+    // Let the holder take the writer before the bounded commit asks for it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut bounded = commit_request(&daemon.project, "bounded", vec![insert_decision(1)], vec![]);
+    bounded["deadline_ms"] = json!(100);
+    let started = Instant::now();
+    let busy = daemon.call(daemon.route, bounded).await;
+    assert_state(&busy, "unavailable", Some("store_busy"));
+    assert!(
+        started.elapsed() < Duration::from_millis(1_200),
+        "{:?}",
+        started.elapsed()
+    );
+    holder.join().unwrap();
+
+    let landed = daemon
+        .commit("after", vec![insert_decision(2)], vec![])
+        .await;
+    assert_state(&landed, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-2"]);
+    daemon.handler.shutdown().await.unwrap();
+}

@@ -231,13 +231,31 @@ impl Envelope<'_> {
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "decision")?;
         let granted_before = self.subject_grants_authority(Some(&replaced_object_id.text))?;
         let replacement = RedactedDecision::new(replacement)?;
-        validate_successor(
-            &old,
-            &replacement.domain_id,
-            &replacement.source_kind,
-            &replacement.source_id,
-            replacement.source_revision,
-        )?;
+        // A replacement naming a decision that is already live folds the
+        // predecessor into that survivor: the survivor's stored row, not the
+        // spec, is what the predecessor's lineage is checked against, and no
+        // row is written for it.
+        let survivor = load_live_decision_by_object(self.tx, &replacement.object_id.text)?;
+        if let Some((survivor, _)) = &survivor {
+            if survivor.object_id == old.object_id {
+                return Err(KernelError::InvalidInput);
+            }
+            validate_successor(
+                &old,
+                &survivor.domain_id,
+                &survivor.source_kind,
+                &survivor.source_id,
+                survivor.source_revision,
+            )?;
+        } else {
+            validate_successor(
+                &old,
+                &replacement.domain_id.text,
+                &replacement.source_kind.text,
+                &replacement.source_id.text,
+                replacement.source_revision,
+            )?;
+        }
         invalidate(
             self.tx,
             self.commit_seq,
@@ -245,18 +263,33 @@ impl Envelope<'_> {
             "object_id",
             &replaced_object_id.text,
         )?;
-        insert_decision(self.tx, self.commit_seq, &replacement)?;
+        let (object, outcome, mut redactions) = match survivor {
+            Some((survivor, decision_id)) => (
+                survivor,
+                DecisionWriteOutcome {
+                    decision_id,
+                    object_id: replacement.object_id.text.clone(),
+                },
+                Vec::new(),
+            ),
+            None => {
+                insert_decision(self.tx, self.commit_seq, &replacement)?;
+                (
+                    replacement.object_row(self.commit_seq),
+                    replacement.outcome(),
+                    replacement.text_fields(),
+                )
+            }
+        };
         set_successor(
             self.tx,
             "decisions",
             &replaced_object_id.text,
             &replacement.object_id.text,
         )?;
-        let outcome = replacement.outcome();
-        let mut redactions = replacement.text_fields();
         redactions.push(("replaced_object_id".to_string(), replaced_object_id.clone()));
         self.changes.push(PendingChange {
-            object: replacement.object_row(self.commit_seq),
+            object,
             kind: "decision_correct",
             replaced_object_id: Some(replaced_object_id.text.clone()),
             redactions,
@@ -285,9 +318,9 @@ impl Envelope<'_> {
         let replacement = RedactedObservation::new(replacement)?;
         validate_successor(
             &old,
-            &replacement.domain_id,
-            &replacement.source_kind,
-            &replacement.source_id,
+            &replacement.domain_id.text,
+            &replacement.source_kind.text,
+            &replacement.source_id.text,
             replacement.source_revision,
         )?;
         invalidate(
@@ -813,6 +846,24 @@ fn load_live_decision_object(
     .ok_or(KernelError::NotFound)
 }
 
+/// The live decision whose object id is `object_id`, with its `decision_id`.
+fn load_live_decision_by_object(
+    tx: &Transaction<'_>,
+    object_id: &str,
+) -> Result<Option<(ObjectRow, String)>, KernelError> {
+    tx.query_row(
+        "SELECT r.object_id,r.object_kind,r.domain_id,r.source_kind,r.source_id,
+                r.source_revision,r.created_commit_seq,r.sensitivity_class,d.decision_id
+         FROM decisions d JOIN object_registry r ON r.object_id=d.object_id
+         WHERE d.object_id=?1 AND d.invalidated_commit_seq IS NULL
+           AND r.invalidated_commit_seq IS NULL",
+        [object_id],
+        |row| Ok((row_to_object(row)?, row.get::<_, String>(8)?)),
+    )
+    .optional()
+    .map_err(|_| KernelError::Io)
+}
+
 fn load_live_typed_object(
     tx: &Transaction<'_>,
     object_id: &str,
@@ -849,15 +900,12 @@ fn row_to_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
 
 fn validate_successor(
     old: &ObjectRow,
-    domain_id: &RedactedField,
-    source_kind: &RedactedField,
-    source_id: &RedactedField,
+    domain_id: &str,
+    source_kind: &str,
+    source_id: &str,
     source_revision: i64,
 ) -> Result<(), KernelError> {
-    if old.domain_id != domain_id.text
-        || old.source_kind != source_kind.text
-        || old.source_id != source_id.text
-    {
+    if old.domain_id != domain_id || old.source_kind != source_kind || old.source_id != source_id {
         return Err(KernelError::InvalidInput);
     }
     if source_revision <= old.source_revision {

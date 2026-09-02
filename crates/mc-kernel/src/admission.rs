@@ -3,6 +3,7 @@ use super::envelope::{
 };
 use super::object_write;
 use super::redaction::{identity, record, redact};
+use super::slice::{DecisionSpec, DecisionWriteOutcome};
 use super::{map_sqlite, KernelError, KernelStore, Sensitivity};
 use crate::current_time_ms;
 use rusqlite::{params, OptionalExtension};
@@ -176,6 +177,9 @@ pub struct VisibleRow {
     pub object: ObjectRow,
     pub visibility: SurfaceVisibility,
     pub labeled: bool,
+    /// The scope the decision or observation row names; `None` for object
+    /// kinds that carry none.
+    pub scope_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1054,6 +1058,41 @@ impl Envelope<'_> {
         self.with_authority_cascade(Some(&replaced_object_id), None, &reason, |envelope| {
             envelope.write_admission(prepared, None)
         })
+    }
+
+    /// Decision counterpart of [`Self::supersede_domain`]: the same
+    /// predecessor-disposition guard, then the slice writer's correction, which
+    /// carries the authority cascade. When `replacement` names a decision that
+    /// is already live, the predecessor is folded into it instead of a new row
+    /// being written, so one envelope can merge several predecessors into one
+    /// survivor.
+    pub fn supersede_decision(
+        &mut self,
+        replaced_object_id: &str,
+        replacement: DecisionSpec,
+    ) -> Result<DecisionWriteOutcome, KernelError> {
+        if let Some(error) = self.already_poisoned() {
+            return Err(error);
+        }
+        let result = self.supersede_decision_inner(replaced_object_id, replacement);
+        self.poison(result)
+    }
+
+    fn supersede_decision_inner(
+        &mut self,
+        replaced_object_id: &str,
+        replacement: DecisionSpec,
+    ) -> Result<DecisionWriteOutcome, KernelError> {
+        let facts = load_subject_facts(self, replaced_object_id)?;
+        if load_prior_decision(self, &facts)?.is_some_and(|stored| {
+            matches!(
+                stored.decision.disposition,
+                Disposition::Quarantined | Disposition::Rejected | Disposition::Contradicted
+            )
+        }) {
+            return Err(KernelError::AdmissionPolicy);
+        }
+        self.correct_decision(replaced_object_id, replacement)
     }
 
     pub fn revoke_approval(
@@ -2138,12 +2177,15 @@ impl KernelStore {
                                        OR :governing_as_of<ad.invalidated_commit_seq)
                             ) AS accepted_decision,
                             {history} AS history_sensitivity_class,
-                            {own_history_inconsistent} AS own_history_inconsistent
+                            {own_history_inconsistent} AS own_history_inconsistent,
+                            COALESCE(dec.scope_id,obs.scope_id) AS scope_id
                      FROM object_registry o
                      JOIN admission_decisions d
                        ON d.admission_decision_id={own}
                      LEFT JOIN admission_decisions s
                        ON s.admission_decision_id={lineage}
+                     LEFT JOIN decisions dec ON dec.object_id=o.object_id
+                     LEFT JOIN observations obs ON obs.object_id=o.object_id
                      WHERE o.created_commit_seq<=:governing_as_of
                        AND (o.invalidated_commit_seq IS NULL
                             OR :governing_as_of<o.invalidated_commit_seq)
@@ -2184,16 +2226,18 @@ impl KernelStore {
                         object.sensitivity = object.sensitivity.restrictive(sensitivity);
                         let visibility =
                             surface_visibility(visibility_row_value, surface, object.sensitivity);
-                        Ok((object, visibility))
+                        let scope_id = row.get::<_, Option<String>>("scope_id")?;
+                        Ok((object, visibility, scope_id))
                     },
                 )
                 .map_err(map_sqlite)?
                 .filter_map(|row| match row {
-                    Ok((_object, SurfaceVisibility::Hidden)) => None,
-                    Ok((object, visibility)) => Some(Ok(VisibleRow {
+                    Ok((_object, SurfaceVisibility::Hidden, _)) => None,
+                    Ok((object, visibility, scope_id)) => Some(Ok(VisibleRow {
                         object,
                         visibility,
                         labeled: visibility == SurfaceVisibility::Labeled,
+                        scope_id,
                     })),
                     Err(error) => Some(Err(error)),
                 })

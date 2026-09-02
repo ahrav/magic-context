@@ -85,6 +85,13 @@ struct RedactedTerm {
 }
 
 impl Envelope<'_> {
+    /// Stored terms of `scope_id` in ordinal order, or `None` when no scope
+    /// row exists. Reads inside the envelope's transaction, so a caller that
+    /// inserts the scope when this answers `None` cannot race another writer.
+    pub fn scope_terms(&self, scope_id: &str) -> Result<Option<Vec<ScopeTermSpec>>, KernelError> {
+        load_scope_terms(self.tx, scope_id)
+    }
+
     /// Inserts one scope, its object-registry row, and its ordered terms in this transaction.
     ///
     /// The referenced domain must exist and remain valid. Success appends a `scope_insert`
@@ -301,6 +308,79 @@ impl RedactedTerm {
 
 fn text(field: &Option<RedactedField>) -> Option<&str> {
     field.as_ref().map(|value| value.text.as_str())
+}
+
+impl super::KernelStore {
+    /// Stored terms of `scope_id` in ordinal order, as the write path left them:
+    /// a value the redactor rewrote reads back as its placeholder.
+    pub fn scope_terms(&self, scope_id: &str) -> Result<Vec<ScopeTermSpec>, KernelError> {
+        let (_, terms) = self.read_snapshot(0, |tx| load_scope_terms(tx, scope_id))?;
+        terms.ok_or(KernelError::NotFound)
+    }
+}
+
+/// `set_values` is stored as a JSON array of strings, mirroring `insert_scope_terms`.
+fn load_scope_terms(
+    tx: &rusqlite::Transaction<'_>,
+    scope_id: &str,
+) -> Result<Option<Vec<ScopeTermSpec>>, KernelError> {
+    let exists = tx
+        .query_row("SELECT 1 FROM scopes WHERE scope_id=?1", [scope_id], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(super::map_sqlite)?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT dimension,operator,exact_value,set_values,range_start,range_end,
+                    version_range,git_oid,git_start_oid,git_end_oid,payload
+             FROM scope_term WHERE scope_id=?1 ORDER BY ordinal",
+        )
+        .map_err(super::map_sqlite)?;
+    let terms = statement
+        .query_map([scope_id], |row| {
+            let set_values: Option<Vec<u8>> = row.get(3)?;
+            let payload: Option<Vec<u8>> = row.get(10)?;
+            Ok((
+                ScopeTermSpec {
+                    dimension: row.get(0)?,
+                    operator: row.get(1)?,
+                    exact_value: row.get(2)?,
+                    set_values: None,
+                    range_start: row.get(4)?,
+                    range_end: row.get(5)?,
+                    version_range: row.get(6)?,
+                    git_oid: row.get(7)?,
+                    git_start_oid: row.get(8)?,
+                    git_end_oid: row.get(9)?,
+                    payload: None,
+                },
+                set_values,
+                payload,
+            ))
+        })
+        .map_err(super::map_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(super::map_sqlite)?;
+    terms
+        .into_iter()
+        .map(|(mut term, set_values, payload)| {
+            term.set_values = set_values
+                .map(|bytes| serde_json::from_slice::<Vec<String>>(&bytes))
+                .transpose()
+                .map_err(|_| KernelError::CorruptCanonicalRow)?;
+            term.payload = payload
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|_| KernelError::CorruptCanonicalRow)?;
+            Ok(term)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn insert_scope_terms(

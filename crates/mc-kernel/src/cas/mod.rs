@@ -140,7 +140,7 @@ pub struct ArtifactHandle {
 }
 
 /// Destination considered by artifact egress eligibility checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactDestination {
     Local,
     Remote,

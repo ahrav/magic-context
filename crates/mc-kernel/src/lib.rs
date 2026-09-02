@@ -62,8 +62,9 @@ pub use cas::{
 };
 pub use envelope::{
     AlignmentProjectionSpec, CommitIntent, CommitReceipt, DomainSpec, Envelope, KnownAsOf,
-    ObjectRow, RemediationTarget, RepositoryProvenance, Sensitivity, StagingCandidateRow,
-    StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
+    ObjectRow, ObjectState, RemediationTarget, RepositoryProvenance, Sensitivity,
+    StagingCandidateRow, StagingCandidateSpec, TokenCheck, TokenConflict,
+    OPERATOR_REDACTION_PLACEHOLDER,
 };
 pub use facts::{ArtifactBudgetFacts, KernelFacts, OutboxLag, MAIN_FILE_WARN_BYTES};
 #[cfg(feature = "test-support")]

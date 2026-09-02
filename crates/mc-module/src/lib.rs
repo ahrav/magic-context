@@ -12016,6 +12016,11 @@ impl McHandler {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn eligibility_cache_len_for_test(&self) -> usize {
+        self.kernel.eligibility_cache().len()
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn kernel_unavailable_reason_for_test(&self) -> Option<kernel_routes::UnavailableReason> {
         (self.kernel.state() == kernel_routes::KernelState::Unavailable)
             .then(|| self.kernel.unavailable_reason())
@@ -12094,6 +12099,12 @@ impl McHandler {
                 "session.status" => self.handle_session_status_value(channel, &request),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
+                "kernel.read" => self.handle_kernel_read(channel, &request).await,
+                "kernel.commit" => self.handle_kernel_commit(channel, &request).await,
+                "kernel.eligibility.batch" => {
+                    self.handle_kernel_eligibility_batch(channel, &request)
+                        .await
+                }
                 // The handler echoes only explicit wire-debugging requests.
                 // Unknown request bodies must fail so misrouted callers cannot mistake an echo for success.
                 // An unconditional echo lets a misrouted caller mistake an echo for success.

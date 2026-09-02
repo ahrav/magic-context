@@ -3,9 +3,10 @@
 use std::{cell::Cell, fs};
 
 use mc_kernel::{
-    ArtifactIngestRequest, CommitIntent, DecisionEventPayload, DecisionEventSpec, DecisionPayload,
-    DecisionSpec, DomainSpec, KernelError, KernelStore, ObservationDependencySpec,
-    ObservationPayload, ObservationSpec, ProviderEgress, RepositoryProvenance, Sensitivity,
+    AdmissionEvent, AdmissionRequest, ArtifactIngestRequest, CommitIntent, DecisionEventPayload,
+    DecisionEventSpec, DecisionPayload, DecisionSpec, DomainSpec, EventKind, KernelError,
+    KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec, ProviderEgress,
+    RepositoryProvenance, Sensitivity, SourceClass, TaintClass,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -643,4 +644,167 @@ fn corrections_reject_cross_domain_replacements() {
         ),
         0
     );
+}
+
+fn subject_request(object_id: &str, kind: EventKind) -> AdmissionRequest {
+    AdmissionRequest {
+        candidate_id: None,
+        subject_object_id: Some(object_id.to_string()),
+        source_class: Some(SourceClass::TrustedLocalCode),
+        taint_class: Some(TaintClass::CurrentCode),
+        event: AdmissionEvent {
+            kind,
+            trigger_object_id: None,
+            approval_object_id: None,
+            evidence_id: None,
+            reason: format!("{kind:?}"),
+        },
+    }
+}
+
+fn live_decision_objects(store: &KernelStore) -> Vec<(String, Option<String>)> {
+    let tip = store.tip().unwrap();
+    store
+        .object_history_as_of(tip)
+        .unwrap()
+        .objects
+        .into_iter()
+        .filter(|object| object.object_kind == "decision")
+        .map(|object| {
+            (
+                object.object_id,
+                object
+                    .invalidated_commit_seq
+                    .map(|_| object.superseded_by.unwrap_or_default()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn supersede_decision_replaces_a_live_predecessor_and_folds_merges_into_a_survivor() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    store
+        .commit(intent("seed", '1'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope.insert_decision(decision(2))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // Revision: the replacement is a new row, the predecessor names it.
+    let revised = store
+        .commit(intent("revise", '2'), |envelope| {
+            let outcome = envelope.supersede_decision("decision-object-1", decision(3))?;
+            assert_eq!(outcome.object_id, "decision-object-3");
+            Ok(String::new())
+        })
+        .unwrap();
+    let live = store.known_as_of(revised.commit_seq).unwrap();
+    let live_ids: Vec<_> = live
+        .objects
+        .iter()
+        .filter(|object| object.object_kind == "decision")
+        .map(|object| object.object_id.as_str())
+        .collect();
+    assert_eq!(live_ids, ["decision-object-2", "decision-object-3"]);
+    assert!(live_decision_objects(&store).contains(&(
+        "decision-object-1".to_string(),
+        Some("decision-object-3".to_string())
+    )));
+
+    // Merge: two predecessors name one already-live survivor in one envelope;
+    // no row is written for the survivor.
+    store
+        .commit(intent("survivor", '3'), |envelope| {
+            envelope.insert_decision(decision(4))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let merged = store
+        .commit(intent("merge", '4'), |envelope| {
+            let first = envelope.supersede_decision("decision-object-2", decision(4))?;
+            let second = envelope.supersede_decision("decision-object-3", decision(4))?;
+            assert_eq!(first.decision_id, "decision-4");
+            assert_eq!(second.object_id, "decision-object-4");
+            Ok(String::new())
+        })
+        .unwrap();
+    let live = store.known_as_of(merged.commit_seq).unwrap();
+    let live_ids: Vec<_> = live
+        .objects
+        .iter()
+        .filter(|object| object.object_kind == "decision")
+        .map(|object| object.object_id.as_str())
+        .collect();
+    assert_eq!(live_ids, ["decision-object-4"]);
+    let history = live_decision_objects(&store);
+    for predecessor in ["decision-object-2", "decision-object-3"] {
+        assert!(history.contains(&(
+            predecessor.to_string(),
+            Some("decision-object-4".to_string())
+        )));
+    }
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM decisions WHERE object_id='decision-object-4'"
+        ),
+        1
+    );
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM change_event WHERE commit_seq=(SELECT MAX(commit_seq) FROM commit_log)"
+        ),
+        2
+    );
+
+    // A survivor cannot supersede itself.
+    let self_reference = store
+        .commit(intent("self", '5'), |envelope| {
+            envelope.supersede_decision("decision-object-4", decision(4))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(self_reference, KernelError::InvalidInput);
+}
+
+#[test]
+fn supersede_decision_refuses_a_quarantined_predecessor() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    store
+        .commit(intent("seed", '1'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope
+                .record_admission(subject_request("decision-object-1", EventKind::Quarantine))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let refused = store
+        .commit(intent("supersede", '2'), |envelope| {
+            envelope.supersede_decision("decision-object-1", decision(2))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(refused, KernelError::AdmissionPolicy);
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE invalidated_commit_seq IS NOT NULL"
+        ),
+        0
+    );
+    let missing = store
+        .commit(intent("missing", '3'), |envelope| {
+            envelope.supersede_decision("decision-object-9", decision(2))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(missing, KernelError::NotFound);
 }

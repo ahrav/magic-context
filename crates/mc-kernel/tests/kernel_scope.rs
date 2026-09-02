@@ -144,3 +144,43 @@ fn insert_scope_reports_missing_domain_and_duplicate_identity_as_typed_errors() 
         .unwrap_err();
     assert_eq!(missing, KernelError::NotFound);
 }
+
+#[test]
+fn scope_terms_read_back_in_ordinal_order_with_redacted_values_as_placeholders() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    store
+        .commit(intent("scope", '5'), |envelope| {
+            assert_eq!(envelope.scope_terms("scope").unwrap(), None);
+            let mut spec = scope(1);
+            spec.terms.push(ScopeTermSpec {
+                dimension: "environment".to_string(),
+                operator: "set".to_string(),
+                set_values: Some(vec!["prod".to_string(), "staging".to_string()]),
+                ..ScopeTermSpec::default()
+            });
+            envelope.insert_scope(spec)?;
+            assert_eq!(envelope.scope_terms("scope").unwrap().unwrap().len(), 3);
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let terms = store.scope_terms("scope").unwrap();
+    assert_eq!(terms.len(), 3);
+    assert_eq!(terms[0].dimension, "branch");
+    assert_eq!(terms[0].operator, "exact");
+    let branch = terms[0].exact_value.as_deref().unwrap();
+    assert!(!branch.contains(SECRET), "stored term leaks the secret");
+    assert!(branch.starts_with("feature/"), "{branch}");
+    assert_eq!(terms[1].dimension, "repository");
+    assert_eq!(terms[1].exact_value.as_deref(), Some("magic-context"));
+    assert_eq!(
+        terms[2].set_values.as_deref(),
+        Some(&["prod".to_string(), "staging".to_string()][..])
+    );
+    assert_eq!(
+        store.scope_terms("missing").unwrap_err(),
+        KernelError::NotFound
+    );
+}
