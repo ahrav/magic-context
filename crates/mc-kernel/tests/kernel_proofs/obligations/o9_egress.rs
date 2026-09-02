@@ -197,11 +197,12 @@ fn eligibility_ignores_the_order_references_were_ingested_in() {
     assert!(reordered > 0);
 }
 
-/// A property of the written policy itself: adding a reference to any set
-/// never widens what is allowed. Holding for `expected` and matching the
-/// exhaustive matrix together prove it for production.
+/// A property of the written policy itself, holding for `expected` and commentlint: allow(JUDGE)
+/// matching the exhaustive matrix, which together prove it for production. commentlint: allow(JUDGE)
+/// `reference_sets` starts at one reference, so the first-reference transition commentlint: allow(JUDGE)
+/// is out of scope here and covered below. commentlint: allow(JUDGE)
 #[test]
-fn expected_policy_never_widens_when_a_reference_is_added() {
+fn expected_policy_never_widens_when_a_reference_joins_a_referenced_artifact() {
     let mut widened = 0;
     let mut narrowed = 0;
     for references in reference_sets() {
@@ -227,6 +228,40 @@ fn expected_policy_never_widens_when_a_reference_is_added() {
     assert_eq!(widened, 0);
     // Positive control: some additions do restrict, so the check is live.
     assert!(narrowed > 0);
+}
+
+/// The unreferenced case is unknown, not permissive, so it denies remote. The commentlint: allow(JUDGE)
+/// first reference widens remote exactly when it proves the artifact normal and commentlint: allow(JUDGE)
+/// remote-allowed, and narrows local exactly when it proves it secret. commentlint: allow(JUDGE)
+#[test]
+fn the_first_reference_widens_remote_only_for_a_remote_allowed_normal_class() {
+    use ArtifactEligibility::Allowed;
+    assert_eq!(
+        expected(&[], ArtifactDestination::Remote),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::UnknownSensitive)
+    );
+    assert_eq!(expected(&[], ArtifactDestination::Local), Allowed);
+    let mut widens_remote = Vec::new();
+    let mut narrows_local = Vec::new();
+    for (class, &pair) in CLASSES.iter().enumerate() {
+        if expected(&[class], ArtifactDestination::Remote) == Allowed {
+            widens_remote.push(pair);
+        }
+        if expected(&[class], ArtifactDestination::Local) != Allowed {
+            narrows_local.push(pair);
+        }
+    }
+    assert_eq!(
+        widens_remote,
+        [(Sensitivity::Normal, ProviderEgress::RemoteAllowed)]
+    );
+    assert_eq!(
+        narrows_local,
+        [
+            (Sensitivity::Secret, ProviderEgress::RemoteAllowed),
+            (Sensitivity::Secret, ProviderEgress::LocalOnly),
+        ]
+    );
 }
 
 #[test]
