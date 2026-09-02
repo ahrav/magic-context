@@ -1,6 +1,6 @@
-//! These tests compare protocol literals against independent wire vectors.
-//! These tests use vectors from `docs/mc-host-wire-protocol.md` and verify live-connection framing.
-//! The host must apply the specified framing dispositions to each live connection.
+//! Protocol conformance tests against independent wire vectors.
+//!
+//! Vectors come from `docs/mc-host-wire-protocol.md`. Live-connection cases verify framing dispositions at connection boundaries.
 //!
 //! The test oracle in `support::raw_client` decodes committed expected literals.
 //! These tests do not ask the host to generate expected bytes (protocol §14.1).
@@ -19,7 +19,7 @@ use support::{TestHost, LINKED_MODULE_ID};
 const BUDGET: Duration = Duration::from_secs(5);
 const VECTOR_DAEMON_VER: &str = "mc-host/0.1.0";
 
-/// `vector_inputs` uses the protocol's canonical proof inputs.
+/// Returns canonical proof inputs as key, client nonce, server nonce, and daemon ID bytes.
 fn vector_inputs() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     (
         (0x00u8..=0x1f).collect(),
@@ -158,8 +158,7 @@ fn proof_folds_every_input() {
 
 #[test]
 fn committed_header_vectors_decode_to_their_documented_fields() {
-    // `route.open` uses control header values: length 173, Interactive/Normal, channel 0, and epoch 0.
-    // correlation 1.
+    // `route.open`: 173 body bytes, Interactive/Normal, control channel and epoch, correlation 1.
     let control = hex_to_bytes("ad0000000200020000000000000100000000000000");
     assert_eq!(control.len(), HEADER_LEN);
     let decoded = raw_client::decode_header(&control);
@@ -176,8 +175,7 @@ fn committed_header_vectors_decode_to_their_documented_fields() {
         "encoding must reproduce the committed control header"
     );
 
-    // The routed request uses header values: length 44, Background/Normal, channel 7, and epoch 77.
-    // correlation 2.
+    // Routed request: 44 body bytes, Background/Normal, channel 7, epoch 77, correlation 2.
     let routed = hex_to_bytes("2c00000002000407004d0000000200000000000000");
     let decoded = raw_client::decode_header(&routed);
     assert_eq!(decoded.len, 44);
@@ -278,7 +276,7 @@ async fn auth_message_at_the_cap_is_valid_and_over_it_closes() {
     assert!(reply["server_proof"].is_array());
     drop(stream);
 
-    // 4,096-byte limit.
+    // One byte over the 4,096-byte limit closes without a reply.
     let mut stream = raw_client::connect_unauthenticated(&host.info)
         .await
         .expect("connect");

@@ -1,3 +1,4 @@
+//! Public handler boundary between host transport and module implementations.
 //!
 //! The boundary excludes private `subc-*` SDK types.
 //! Handlers do not receive socket frames, credentials, correlations, or route allocation.
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::HostInit;
 
+/// Immutable module catalog data returned by a handler.
 ///
 /// The host retains `provides` as raw JSON so `catalog.list` returns it without lossy rewriting.
 /// The host reads each entry's top-level `role` for admission.
@@ -32,6 +34,7 @@ pub struct RouteHandle {
     pub epoch: u32,
 }
 
+/// Route target category accepted by host admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetKind {
     ToolProvider,
@@ -39,6 +42,7 @@ pub enum TargetKind {
 }
 
 impl TargetKind {
+    /// Accepts protocol spellings and rejects unknown target categories.
     pub fn parse(kind: &str) -> Option<Self> {
         match kind {
             "tool_provider" => Some(Self::ToolProvider),
@@ -182,6 +186,7 @@ impl HealthReport {
     }
 }
 
+/// Terminal result returned by one handler request.
 ///
 /// `RequestCtx::reserve_output` must reserve output storage before allocation; preallocated `Vec`s cannot bypass host limits.
 /// resident-byte budget:
@@ -194,8 +199,7 @@ impl HealthReport {
 /// };
 /// ```
 pub enum RequestOutcome {
-    /// The `binary` flag has the same semantics as `RequestCtx::stream`.
-    /// items.
+    /// Unary response whose `binary` flag has the same semantics as `RequestCtx::stream`.
     Response { body: OutputBuffer, binary: bool },
     /// An application failure causes the host to emit one canonical `Error` terminal.
     Error {
@@ -234,7 +238,6 @@ impl RequestOutcome {
 impl std::fmt::Debug for RequestOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Handler-controlled error codes and messages can contain request or identity data; diagnostics expose only their lengths.
-        // Handler-controlled error codes and messages can contain request or identity data; diagnostics expose only their lengths.
         // Protocol V24 diagnostics expose only error-code and message lengths, matching `OutputBuffer` and `RequestCtx`.
         match self {
             Self::Response { body, binary } => f
@@ -257,9 +260,9 @@ impl std::fmt::Debug for RequestOutcome {
     }
 }
 
-/// The semantic request body owns its resident-byte charge.
+/// Semantic request body paired with its resident-byte charge.
+///
 /// The host decodes or copies transport bytes before construction, so asynchronous handler work never retains a receive lease.
-/// Asynchronous handler work never retains a receive lease.
 pub struct InputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) _charge: crate::wire::ByteCharge,
@@ -296,10 +299,9 @@ impl std::fmt::Debug for InputBuffer {
     }
 }
 
+/// Bounded response storage paired with its resident-byte charge.
 ///
-/// The host acquires the resident-byte charge before allocating this buffer.
-/// The buffer's fixed maximum prevents writes from exceeding its reservation.
-/// the charge moves with the body into the connection writer.
+/// The host acquires the charge before allocating this buffer. The fixed maximum prevents writes from exceeding its reservation. The charge moves with the body into the connection writer.
 pub struct OutputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) direct: Option<DirectOutput>,
@@ -319,9 +321,7 @@ pub(crate) enum OutputParts {
 
 impl std::fmt::Debug for OutputBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Diagnostics expose only the reserved output length, not application data.
-        // Diagnostics mirror `RequestCtx` by exposing only the body length.
-        // policy.
+        // Diagnostics expose only reservation metadata, not application data.
         f.debug_struct("OutputBuffer")
             .field("len", &self.len())
             .field("max_len", &self.max_len)
@@ -388,7 +388,8 @@ impl io::Write for OutputBuffer {
     }
 }
 
-/// Dropping `RequestCtx` without returning an outcome leaves settlement to the host through cancellation or teardown.
+/// Per-request body, route, cancellation, output, and scratch-budget access.
+///
 /// Dropping `RequestCtx` without returning an outcome leaves settlement to the host through cancellation or teardown.
 ///
 /// `RequestCtx` hides transport correlations and sockets.
@@ -447,13 +448,12 @@ impl RequestCtx {
     }
 
     /// The reservation covers request-derived allocations, including parse scratch and owned trees decoded from `body`.
-    /// The reservation covers state whose lifetime is the request rather than the response.
+    /// It covers state whose lifetime is the request rather than the response.
     ///
     /// `None` means the pool cannot cover the request now; reserve before allocating.
     /// Reserving after allocation lets the allocation escape the resident envelope.
     /// Concurrent requests can each exceed the envelope by their full allocation.
     /// The returned charge releases on drop; retain it while the charged bytes are resident.
-    /// are live.
     pub fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {
         self.scratch.try_charge(bytes)
     }
@@ -508,8 +508,9 @@ impl std::fmt::Display for InitError {
 
 impl std::error::Error for InitError {}
 
+/// Module lifecycle and request interface invoked by the host.
 ///
-///
+/// Implementations may run concurrently across routes and must synchronize shared state.
 pub trait McHostHandler: Send + Sync + 'static {
     fn manifests(&self) -> Vec<ManifestSnapshot>;
 

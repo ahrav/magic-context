@@ -1,3 +1,5 @@
+//! Qualification fixture provides tooling evidence.
+
 mod common;
 
 use std::collections::BTreeSet;
