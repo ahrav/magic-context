@@ -55,7 +55,7 @@ Rules:
 - Every memory in the pool below MUST appear exactly once.
 - importance is an integer 1-100; scope is one of project|ecosystem|universe; shareable is true|false."#;
 
-/// `classify-prompt.ts`.
+/// Scope values accepted by the TypeScript manifest parser.
 const CLASSIFY_SCOPES: [&str; 3] = ["project", "ecosystem", "universe"];
 
 fn memory_entry_pattern() -> &'static Regex {
@@ -100,9 +100,9 @@ fn classify_root_pattern() -> &'static Regex {
     })
 }
 
-/// Returns the classify root body, or `None` when the envelope is absent or unterminated.
+/// Returns the first complete classify root body.
 ///
-/// parses fine.
+/// Matching is case-insensitive and permits root attributes and surrounding text.
 fn classify_body(text: &str) -> Option<&str> {
     classify_root_pattern()
         .captures(text)
@@ -110,14 +110,14 @@ fn classify_body(text: &str) -> Option<&str> {
         .map(|body| body.as_str())
 }
 
+/// Validates manifest shape, field vocabulary, and exact claim coverage.
 ///
+/// Identity is the opaque public claim ID in each `claim` attribute. Claim IDs
+/// are validated before other entry fields, so diagnostics never echo arbitrary
+/// model-controlled attribute text.
 ///
-/// Identity is the opaque public claim ID in the `claim` attribute.
-/// `CLASSIFY_SYSTEM_PROMPT` demands.
-///
-/// Diagnostics include claim IDs only after `is_valid_public_claim_id` accepts them.
-/// The validator validates claim IDs before other per-entry rules so diagnostics cannot echo model-controlled text.
-/// model-controlled string.
+/// Returns an error for a missing envelope, malformed entry, duplicate or
+/// malformed claim ID, unknown scope, empty classification, or coverage mismatch.
 pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Result<(), String> {
     let body = classify_body(text).ok_or("no complete classify envelope")?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -168,6 +168,7 @@ pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Re
     Ok(())
 }
 
+/// Reports whether trimmed text contains exact lowercase opening and closing tags.
 pub fn has_manifest_envelope(text: &str) -> bool {
     let text = text.trim();
     text.contains("<classify>") && text.contains("</classify>")
@@ -184,9 +185,12 @@ pub fn child_session_id(project: &str, command_id: &str) -> String {
     format!("mc-dreamer:classify:{}", hex_prefix(&digest, 16))
 }
 
-/// The durable ledger scopes commands to `(ledger_session, command_id)`.
-/// `command_id` can repeat across module sessions in the same authority project.
-/// `ledger_session` prevents module sessions that reuse `command_id` from attaching to or purging each other's runs.
+/// Derives an opaque child ID from full attempt identity.
+///
+/// Durable ledger commands are scoped to `(ledger_session, command_id)`.
+/// Including attempt index and model separates fallback attempts, while
+/// `ledger_session` prevents module sessions that reuse `command_id` from
+/// attaching to or purging each other's runs.
 pub fn attempt_child_session_id(
     project: &str,
     ledger_session: &str,

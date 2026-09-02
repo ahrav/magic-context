@@ -1,3 +1,8 @@
+//! Durable outbox publication, consumer checkpoints, and retention barriers.
+//!
+//! Writer transactions serialize checkpoint and pruning changes. Consumer
+//! checkpoints advance monotonically and bound pruning by commit sequence.
+
 use rusqlite::{params, OptionalExtension, Transaction};
 
 use super::envelope::{Envelope, ObjectRow, PendingChange, Sensitivity};
@@ -5,6 +10,7 @@ use super::redaction::{identity, redact, RedactedField};
 use super::retention::begin_fenced_write;
 use super::{map_sqlite, KernelError, KernelStore};
 
+/// Result of pruning rows through the minimum consumer checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxPruneResult {
     /// Rows at or below this `commit_seq` were deleted; the bound is inclusive.
@@ -12,11 +18,16 @@ pub struct OutboxPruneResult {
     pub deleted: usize,
 }
 
+/// Auditable operator authorization to remove a consumer checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerAbandonment {
+    /// Operator identity, redacted before durable storage.
     pub operator_id: String,
+    /// Human-readable reason, redacted before durable storage.
     pub reason: String,
+    /// Nonnegative abandonment timestamp in caller-defined durable time units.
     pub abandoned_at: i64,
+    /// Optional barrier that must already record this consumer.
     pub barrier_id: Option<String>,
 }
 
@@ -436,11 +447,16 @@ impl KernelStore {
         tx.commit().map_err(map_sqlite)
     }
 
+    /// Advances a registered consumer checkpoint monotonically.
+    ///
+    /// Repeating current checkpoint is idempotent. Barrier completion is checked
+    /// in same writer transaction.
+    ///
     /// # Errors
     ///
     /// - Returns [`KernelError::InvalidInput`] when `consumer_id` is empty or a timestamp is negative.
-    /// - Returns [`KernelError::NotFound`] when the consumer is not registered.
-    /// - Returns [`KernelError::InvalidCheckpoint`] when the checkpoint moves backwards or names no committed sequence.
+    /// - Returns [`KernelError::NotFound`] when consumer is not registered.
+    /// - Returns [`KernelError::InvalidCheckpoint`] when checkpoint moves backwards or names no committed sequence.
     pub fn acknowledge_outbox(
         &self,
         consumer_id: &str,
