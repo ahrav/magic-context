@@ -25,30 +25,43 @@ fn snapshots(proof: &Proof) -> BTreeMap<i64, Vec<ObjectRow>> {
         .collect()
 }
 
-/// `invalidated_commit_seq` and `superseded_by` are excluded: a correction
-/// legally stamps both on its predecessor.
+/// `invalidated_commit_seq` and `superseded_by` are excluded because
+/// corrections update predecessor rows.
 fn content(proof: &Proof, kind: Kind) -> BTreeMap<String, String> {
-    let sql = match kind {
-        Kind::Domain => {
-            "SELECT object_id,
-                    domain_id||'|'||name||'|'||created_commit_seq||'|'||sensitivity_class
-             FROM domains ORDER BY object_id"
-        }
-        Kind::Decision => {
-            "SELECT object_id,
-                    decision_id||'|'||decision_kind||'|'||CAST(decision_payload AS TEXT)
-                    ||'|'||created_commit_seq||'|'||sensitivity_class
-             FROM decisions ORDER BY object_id"
-        }
+    let table = match kind {
+        Kind::Domain => "domains",
+        Kind::Decision => "decisions",
     };
-    proof
-        .db()
-        .prepare(sql)
+    let db = proof.db();
+    // Reading the column list from the live schema covers columns added later.
+    let columns = db
+        .prepare(&format!("PRAGMA table_info({table})"))
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| row.get::<_, String>(1))
         .unwrap()
-        .collect::<rusqlite::Result<_>>()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
+        .into_iter()
+        .filter(|name| !matches!(name.as_str(), "invalidated_commit_seq" | "superseded_by"))
+        .collect::<Vec<_>>();
+    assert!(
+        columns.len() >= 5,
+        "{table} projection collapsed to {columns:?}"
+    );
+    // `quote` distinguishes NULL from an empty string.
+    let projection = columns
+        .iter()
+        .map(|name| format!("quote({name})"))
+        .collect::<Vec<_>>()
+        .join("||'|'||");
+    db.prepare(&format!(
+        "SELECT object_id,{projection} FROM {table} ORDER BY object_id"
+    ))
+    .unwrap()
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
 }
 
 fn correct(proof: &mut Proof, kind: Kind, old: &str, index: usize) -> String {
