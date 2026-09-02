@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc aaf07c11a44d4a50acf6324f9c2afc5bdfd0a454537005da4164b3bb1f4d4648 # shrinks to [Step { op: InsertDomain, duplicate_after: false, restart_after: false, fault_then_retry: false }, Step { op: InsertDomain, duplicate_after: false, restart_after: false, fault_then_retry: false }, Step { op: Admit(6), duplicate_after: true, restart_after: true, fault_then_retry: true }, Step { op: Ingest { sensitive: true }, duplicate_after: false, restart_after: true, fault_then_retry: true }, Step { op: RebuildAlignment, duplicate_after: false, restart_after: false, fault_then_retry: false }, Step { op: InsertDecision, duplicate_after: false, restart_after: true, fault_then_retry: true }, Step { op: Acknowledge(136), duplicate_after: true, restart_after: true, fault_then_retry: true }, Step { op: InsertDecision, duplicate_after: true, restart_after: true, fault_then_retry: true }]

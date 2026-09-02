@@ -67,3 +67,73 @@ fn delete_after_ingest_propagates_identically_under_duplicates_and_restart() {
     assert_eq!(outcome.duplicates_replayed, 1);
     assert_eq!(outcome.faults_injected, 2);
 }
+
+/// A generated history may legally contain only operations that never commit an
+/// envelope. Such a history still proves the cross-root and duplicate contracts,
+/// so it must not be reported as a counterexample.
+#[test]
+fn history_without_envelope_operations_still_proves_equivalence() {
+    use crate::model::Op;
+    let steps = [
+        Step {
+            op: Op::Stage,
+            duplicate_after: true,
+            restart_after: false,
+            fault_then_retry: true,
+        },
+        Step {
+            op: Op::Ingest { sensitive: false },
+            duplicate_after: true,
+            restart_after: true,
+            fault_then_retry: true,
+        },
+        Step {
+            op: Op::RebuildAlignment,
+            duplicate_after: true,
+            restart_after: false,
+            fault_then_retry: true,
+        },
+    ];
+    let outcome = run(&steps);
+    // None of these operations is fault-capable, so the run exercises only the
+    // duplicate and restart perturbations. The counts pin that nothing faulted.
+    assert_eq!(outcome.faults_injected, 0);
+    assert_eq!(outcome.duplicates_replayed, 0);
+}
+
+/// A supersession replacement is itself supersedable, so the model must keep it in
+/// the live target set. This pins the chain the randomized history could not reach
+/// while the replacement was dropped from `admitted`.
+#[test]
+fn chained_supersession_replays_and_restarts_identically() {
+    use crate::model::Op;
+    let steps = [
+        Step {
+            op: Op::Stage,
+            duplicate_after: false,
+            restart_after: false,
+            fault_then_retry: false,
+        },
+        Step {
+            op: Op::Admit(0),
+            duplicate_after: true,
+            restart_after: false,
+            fault_then_retry: true,
+        },
+        Step {
+            op: Op::Supersede(0),
+            duplicate_after: true,
+            restart_after: true,
+            fault_then_retry: true,
+        },
+        Step {
+            op: Op::Supersede(0),
+            duplicate_after: true,
+            restart_after: false,
+            fault_then_retry: true,
+        },
+    ];
+    let outcome = run(&steps);
+    assert_eq!(outcome.duplicates_replayed, 3);
+    assert_eq!(outcome.faults_injected, 3);
+}

@@ -240,11 +240,20 @@ fn seed(proof: &mut Proof, model: &mut Model) {
         Ok(String::new())
     });
     model.add(root_domain().object_id, "domain", receipt.commit_seq);
+    // The seed is an envelope commit whose object set the model knows, so record it
+    // like any other. A history of only CAS and control operations then still has a
+    // snapshot to compare, and `known_as_of` is checked at the seed `commit_seq` too.
+    model
+        .expected
+        .insert(receipt.commit_seq, model.objects.clone());
 }
 
-/// Envelope operations fault through the rollback hook; a deletion with a
-/// live artifact faults before its reference commit. Everything else has no
-/// fault window the kernel exposes.
+/// Envelope operations fault through the rollback hook; a deletion with a live
+/// artifact faults before its reference commit. Staging and alignment rebuild have
+/// no fault window the kernel exposes. Ingest has one (`AfterEvents`), but its
+/// rollback unlinks the object and leaves the shard directory it created, which the
+/// `cas_layout` digest records, so it cannot yet meet the rollback contract `fault`
+/// enforces.
 fn supports_fault(op: &Op, model: &Model) -> bool {
     match op {
         Op::Stage | Op::Ingest { .. } | Op::RebuildAlignment => false,
@@ -364,6 +373,10 @@ fn apply(proof: &mut Proof, model: &mut Model, op: &Op, attempt: Attempt) -> Opt
             record_envelope(model, applied, |model, seq| {
                 model.admitted.retain(|id| id != &old);
                 model.objects.remove(&old);
+                // The replacement is itself an admitted domain, so it must re-enter the
+                // live target set. Without it the set only shrinks and a later generated
+                // `Op::Supersede` falls back to `insert_domain` instead of chaining.
+                model.admitted.push(replacement.object_id.clone());
                 model.add(replacement.object_id, "domain", seq);
             })
         }
