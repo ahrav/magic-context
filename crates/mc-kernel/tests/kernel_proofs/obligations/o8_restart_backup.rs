@@ -284,11 +284,7 @@ fn outbox_position_never_regresses_or_reuses_across_prune_and_reopen() {
 
 #[test]
 fn each_restore_fault_rolls_back_to_the_pre_restore_state() {
-    for fault in [
-        RestoreFault::BeforeDisplace,
-        RestoreFault::AfterDisplace,
-        RestoreFault::RecoveryFailure,
-    ] {
+    for &fault in RestoreFault::ALL {
         let Seeded { mut proof, .. } = seeded();
         let destination = private_dir();
         let backup = proof

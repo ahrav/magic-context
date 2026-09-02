@@ -36,8 +36,6 @@ const fn classes() -> [(Sensitivity, ProviderEgress); CLASS_COUNT] {
     }
     out
 }
-const DESTINATIONS: [ArtifactDestination; 2] =
-    [ArtifactDestination::Local, ArtifactDestination::Remote];
 
 /// Expected decision, stated as the policy: the strictest reference governs;
 /// secret never leaves; sensitive and unknown never go remote; a local-only
@@ -141,7 +139,7 @@ fn eligibility_matrix_is_exhaustive() {
     let mut allowed = 0;
     for (point, references) in sets.iter().enumerate() {
         let handle = ingest_merged(&proof, point, references);
-        for destination in DESTINATIONS {
+        for &destination in ArtifactDestination::ALL {
             let actual = proof
                 .store()
                 .artifact_eligibility(&handle, destination)
@@ -180,7 +178,7 @@ fn eligibility_ignores_the_order_references_were_ingested_in() {
         for ordering in orderings {
             let handle = ingest_merged(&proof, point, &ordering);
             point += 1;
-            for destination in DESTINATIONS {
+            for &destination in ArtifactDestination::ALL {
                 assert_eq!(
                     proof
                         .store()
@@ -195,6 +193,117 @@ fn eligibility_ignores_the_order_references_were_ingested_in() {
     // These assertions require sets whose classes differ, the only ones with commentlint: allow(JUDGE)
     // more than one ordering. commentlint: allow(JUDGE)
     assert!(reordered > 0);
+}
+
+/// The stored class each live row carries, as the policy states it: the commentlint: allow(JUDGE)
+/// strictest sensitivity present, and local-only if any reference is. The commentlint: allow(JUDGE)
+/// matches force a new variant in either vocabulary through here. commentlint: allow(JUDGE)
+fn stored_class(references: &[usize]) -> (&'static str, &'static str) {
+    let classes = references
+        .iter()
+        .map(|&index| CLASSES[index])
+        .collect::<Vec<_>>();
+    let sensitivity = classes
+        .iter()
+        .map(|&(sensitivity, _)| sensitivity)
+        .max()
+        .unwrap();
+    let local_only = classes
+        .iter()
+        .any(|&(_, egress)| egress == ProviderEgress::LocalOnly);
+    let sensitivity = match sensitivity {
+        Sensitivity::Normal => "normal",
+        Sensitivity::Sensitive => "sensitive",
+        Sensitivity::Secret => "secret",
+    };
+    let egress = match local_only {
+        true => "local_only",
+        false => "remote_allowed",
+    };
+    (sensitivity, egress)
+}
+
+/// Ingest rewrites every live row for the digest to the merged class, so they commentlint: allow(JUDGE)
+/// all carry the strictest one. That invariant, not the read-side fold, is what commentlint: allow(JUDGE)
+/// makes a decision independent of which rows a query returns or in what commentlint: allow(JUDGE)
+/// order. commentlint: allow(JUDGE)
+#[test]
+fn merging_a_reference_rewrites_every_live_row_to_the_restrictive_class() {
+    let mut proof = Proof::open();
+    proof.commit(intent("seed"), |envelope| {
+        envelope.insert_domain(root_domain())?;
+        Ok(String::new())
+    });
+    for (point, references) in [
+        vec![0, 0, 0, 0, 0, 1],
+        vec![0, 0, 0, 0, 0, 2],
+        vec![0, 1, 0, 4, 0, 0],
+        vec![3, 0, 0, 0, 0, 0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let handle = ingest_merged(&proof, point, &references);
+        let rows = proof
+            .db()
+            .prepare(
+                "SELECT sensitivity_class,provider_egress_class FROM evidence_meta
+                 WHERE artifact_digest=?1 AND invalidated_commit_seq IS NULL",
+            )
+            .unwrap()
+            .query_map([&handle.digest], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), references.len(), "{references:?}");
+        let (sensitivity, egress) = stored_class(&references);
+        for row in &rows {
+            assert_eq!(
+                (row.0.as_str(), row.1.as_str()),
+                (sensitivity, egress),
+                "{references:?} left a row on a laxer class"
+            );
+        }
+    }
+}
+
+/// The matrix stops at three references, but production merges and folds every commentlint: allow(JUDGE)
+/// live row and permits arbitrarily many. Each case puts the restrictive class commentlint: allow(JUDGE)
+/// past that edge, and the control asserts the answer differs from the one the commentlint: allow(JUDGE)
+/// leading permissive references alone would give. commentlint: allow(JUDGE)
+#[test]
+fn a_restrictive_reference_past_the_matrix_edge_still_governs() {
+    let mut proof = Proof::open();
+    proof.commit(intent("seed"), |envelope| {
+        envelope.insert_domain(root_domain())?;
+        Ok(String::new())
+    });
+    // Class 0 is (Normal, RemoteAllowed), the only fully permissive class; the
+    // restrictive classes are one of each denial kind. commentlint: allow(JUDGE)
+    let permissive = 0;
+    let cases = [(3usize, 1usize), (3, 2), (3, 4), (5, 1), (5, 2), (5, 4)];
+    for (point, (leading, restrictive)) in cases.into_iter().enumerate() {
+        let mut references = vec![permissive; leading];
+        references.push(restrictive);
+        assert_ne!(
+            expected(&references, ArtifactDestination::Remote),
+            expected(&references[..leading], ArtifactDestination::Remote),
+            "control: {references:?} must differ from its permissive prefix"
+        );
+        let handle = ingest_merged(&proof, point, &references);
+        for &destination in ArtifactDestination::ALL {
+            assert_eq!(
+                proof
+                    .store()
+                    .artifact_eligibility(&handle, destination)
+                    .unwrap(),
+                expected(&references, destination),
+                "{references:?} to {destination:?}"
+            );
+        }
+    }
 }
 
 /// A property of the written policy itself, holding for `expected` and commentlint: allow(JUDGE)
@@ -213,7 +322,7 @@ fn expected_policy_never_widens_when_a_reference_joins_a_referenced_artifact() {
             let mut wider = references.clone();
             wider.push(class);
             wider.sort_unstable();
-            for destination in DESTINATIONS {
+            for &destination in ArtifactDestination::ALL {
                 let before = expected(&references, destination);
                 let after = expected(&wider, destination);
                 if after == ArtifactEligibility::Allowed && before != ArtifactEligibility::Allowed {
@@ -275,7 +384,7 @@ fn unknown_and_dereferenced_digests_allow_local_and_deny_remote() {
         digest: "a".repeat(64),
         evidence_id: "absent".to_string(),
     };
-    for destination in DESTINATIONS {
+    for &destination in ArtifactDestination::ALL {
         assert_eq!(
             proof
                 .store()
@@ -297,7 +406,7 @@ fn unknown_and_dereferenced_digests_allow_local_and_deny_remote() {
         .store()
         .delete_artifact(deletion("dereference", &handle.digest))
         .unwrap();
-    for destination in DESTINATIONS {
+    for &destination in ArtifactDestination::ALL {
         assert_eq!(
             proof
                 .store()
@@ -322,7 +431,7 @@ fn tombstone_denies_before_any_reference_is_consulted() {
     purge.target_locator = Some("incident://proof".to_string());
     purge.reason = Some("proof".to_string());
     proof.store().delete_artifact(purge).unwrap();
-    for destination in DESTINATIONS {
+    for &destination in ArtifactDestination::ALL {
         assert_eq!(
             proof
                 .store()

@@ -127,6 +127,11 @@ pub enum ArtifactDestination {
     Remote,
 }
 
+impl ArtifactDestination {
+    /// Egress proofs derive destinations from this list.
+    pub const ALL: &'static [Self] = &[Self::Local, Self::Remote];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EligibilityDeniedReason {
     UnknownSensitive,
