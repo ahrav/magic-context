@@ -1,5 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA } from "../../../plugin/scripts/retrieval-benchmark/report";
+import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
 import { REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { SCENARIO_ID_RE } from "../historian-eval/contract";
@@ -168,12 +168,18 @@ type MissingSystemProjectionKey = Exclude<keyof SystemProjection, (typeof SYSTEM
 const _systemProjectionKeysComplete: MissingSystemProjectionKey extends never ? true : never = true;
 void _systemProjectionKeysComplete;
 
-export interface ReleaseFingerprintsProjection {
-    corpus: string;
-    judgments: string;
-    syntheticProfiles: string;
-    manifest: string;
-}
+export type ReleaseFingerprintsProjection = BenchmarkReport["semantic"]["releaseFingerprints"];
+
+/** `_releaseFingerprintsKeysComplete` fails to compile when a `ReleaseFingerprintsProjection` field is missing from this tuple. */
+const RELEASE_FINGERPRINTS_KEYS = [
+    "corpus",
+    "judgments",
+    "syntheticProfiles",
+    "manifest",
+] as const satisfies readonly (keyof ReleaseFingerprintsProjection)[];
+type MissingReleaseFingerprintsKey = Exclude<keyof ReleaseFingerprintsProjection, (typeof RELEASE_FINGERPRINTS_KEYS)[number]>;
+const _releaseFingerprintsKeysComplete: MissingReleaseFingerprintsKey extends never ? true : never = true;
+void _releaseFingerprintsKeysComplete;
 
 export type LaneIdentity =
     | { kind: "identityless" }
@@ -273,7 +279,7 @@ function parseIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity 
         case "retrieval": {
             exact(value, ["kind", "releaseFingerprints"], label);
             const fingerprints = record(value.releaseFingerprints, `${label}.releaseFingerprints`);
-            exact(fingerprints, ["corpus", "judgments", "syntheticProfiles", "manifest"], `${label}.releaseFingerprints`);
+            exact(fingerprints, RELEASE_FINGERPRINTS_KEYS, `${label}.releaseFingerprints`);
             return {
                 kind,
                 releaseFingerprints: {
@@ -315,6 +321,8 @@ function parseModelMatrix(raw: unknown, label: string): PolicyModel[] {
         };
     });
     if (models.length === 0) fail(`${label}: empty`);
+    // A repeated provider/model identity runs that model more times than `replicateCount` states.
+    unique(models.map((model) => `${model.providerId}\u0000${model.modelId}`), label);
     return models;
 }
 

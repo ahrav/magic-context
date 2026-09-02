@@ -107,6 +107,18 @@ describe("parseScorecardPolicy", () => {
         }
     });
 
+    it("requires a non-empty model matrix with distinct provider/model identities", () => {
+        const [model] = policyFixture().modelMatrix;
+        expectRejects(policyFixture({ modelMatrix: [] }), "policy.modelMatrix: empty");
+        expectRejects(policyFixture({ modelMatrix: [model!, model!] }), "policy.modelMatrix: duplicate");
+        expectRejects(
+            policyFixture({ modelMatrix: [model!, { ...model!, contextLimit: model!.contextLimit * 2 }] }),
+            "policy.modelMatrix: duplicate",
+        );
+        expect(parseScorecardPolicy(policyFixture({ modelMatrix: [model!, { ...model!, modelId: "other-model" }] })).modelMatrix)
+            .toHaveLength(2);
+    });
+
     it("requires a hex64 paired-delta binding and allows a null baseline", () => {
         expectRejects(policyFixture({ pairedDeltaPolicyFingerprint: "abc" }), "policy.pairedDeltaPolicyFingerprint: fingerprint-invalid");
         expect(parseScorecardPolicy(policyFixture({ baselineScorecardReportFingerprint: null })).baselineScorecardReportFingerprint).toBeNull();
