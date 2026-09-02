@@ -223,6 +223,7 @@ export async function verifyDualMockResolution(input: {
         { providerId: input.liveProviderId, modelId: input.liveModelId },
     ];
     /** The callback receives a copy: handed the same object, a `sendPrompt` that normalizes its argument in place would rewrite the expectation too, and the comparison below could then agree after both identities had been changed — certifying a live route that resolved through the fixture provider. commentlint: allow(JUDGE) */
+    /** One prompt at a time, fixture first, rather than concurrently: a `sendPrompt` that throws means the harness cannot serve a route at all, and the live route is a real provider call, so the free route's failure must not have already spent it. The comparison below is index-based, so the order this preserves is the order it reads. commentlint: allow(JUDGE) */
     const resolved = [];
     for (const route of routes) resolved.push(await input.sendPrompt({ ...route }));
     for (let index = 0; index < routes.length; index++) {
