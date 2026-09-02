@@ -10,7 +10,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 EXTS='rs ts tsx js mjs cjs py sh yml yaml toml'
-IDS_FILE=.beads/issues.jsonl
+# A caller validating staged content supplies the matching staged export.
+IDS_FILE=${COMMENT_CHECK_IDS:-.beads/issues.jsonl}
 
 if [ ! -f "$IDS_FILE" ]; then
   echo >&2 "comment check: $IDS_FILE is missing, so short tracker IDs cannot be recognized"
@@ -18,8 +19,8 @@ if [ ! -f "$IDS_FILE" ]; then
 fi
 
 # The id-field filter prevents issue prose from contributing IDs.
-BEAD_IDS=$(grep -o '"id":"magic-context-[a-z0-9.]*"' "$IDS_FILE" |
-  sed 's/^"id":"magic-context-//; s/"$//' |
+BEAD_IDS=$(grep -oE '"id" *: *"magic-context-[a-z0-9.]*"' "$IDS_FILE" |
+  sed -E 's/.*"magic-context-//; s/"$//' |
   sort -u |
   tr '\n' ' ')
 
@@ -89,12 +90,18 @@ function hash_needs_space(p) {
 
 # Quote tracking keeps a delimiter inside a string literal from opening a comment.
 # Only block-comment state survives across lines, so an unbalanced quote cannot desync the next line.
-function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, endmark, e, prev) {
+function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, e, prev) {
   out = ""
   n = length(line)
   i = 1
-  # A template literal left open by the previous line is still open here.
-  q = tq ? BT : ""
+  # Continue scanning after a raw literal opened on an earlier line.
+  if (rawend != "") {
+    e = index(line, rawend)
+    if (e == 0) return ""
+    i = e + length(rawend)
+    rawend = ""
+  }
+  q = (tq && tsub == 0) ? BT : ""
   while (i <= n) {
     if (depth > 0) {
       two = substr(line, i, 2)
@@ -107,12 +114,18 @@ function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, endmark, 
     c = substr(line, i, 1)
     if (q != "") {
       if (c == BS) { i += 2; continue }
-      if (c == q) { q = ""; tq = 0 }
+      if (q == BT && substr(line, i, 2) == "${") { tsub = 1; q = ""; i += 2; continue }
+      if (c == q) { q = ""; if (c == BT) tq = 0 }
       i++
       continue
     }
     # An escape outside a string covers the shell form that embeds an apostrophe.
     if (c == BS) { i += 2; continue }
+    # Substitution contents are code, so its braces decide where the template resumes.
+    if (tq && tsub > 0) {
+      if (c == "{") { tsub++; i++; continue }
+      if (c == "}") { tsub--; if (tsub == 0) q = BT; i++; continue }
+    }
     if (rust_lit && (c == "r" || c == "b")) {
       j = (c == "b") ? i + 1 : i
       prev = (i > 1) ? substr(line, i - 1, 1) : ""
@@ -121,11 +134,12 @@ function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, endmark, 
         hashes = 0
         while (substr(line, k, 1) == "#") { hashes++; k++ }
         if (substr(line, k, 1) == DQ) {
-          endmark = DQ
-          for (m = 0; m < hashes; m++) endmark = endmark "#"
-          e = index(substr(line, k + 1), endmark)
+          rawend = DQ
+          for (m = 0; m < hashes; m++) rawend = rawend "#"
+          e = index(substr(line, k + 1), rawend)
           if (e == 0) return out
-          i = k + e + length(endmark)
+          i = k + e + length(rawend)
+          rawend = ""
           continue
         }
       }
@@ -225,13 +239,17 @@ BEGIN {
     hash_space = hash_needs_space(path)
     depth = 0
     tq = 0
+    tsub = 0
+    rawend = ""
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
-      if (depth == 0 && !tq) {
+      if (depth == 0 && !tq && rawend == "") {
         if (style == "hash") {
           if (index(line, "#") == 0) continue
-        } else if (index(line, "/") == 0 && !(tmpl_quotes && index(line, BT) > 0)) continue
+        } else if (index(line, "/") == 0 &&
+                   !(tmpl_quotes && index(line, BT) > 0) &&
+                   !(rust_lit && index(line, DQ) > 0)) continue
       }
       text = comment_of(line, style)
       if (text != "") check(path, lno, line, text)

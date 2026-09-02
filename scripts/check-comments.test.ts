@@ -17,7 +17,10 @@ function exportedDottedId(): string {
     throw new Error("the ID export holds no dotted short form");
 }
 
-function scan(files: Record<string, string>): { code: number; out: string } {
+function scan(
+    files: Record<string, string>,
+    env?: Record<string, string>,
+): { code: number; out: string } {
     const dir = mkdtempSync(join(tmpdir(), "comment-gate-"));
     try {
         const paths = Object.entries(files).map(([name, body]) => {
@@ -28,6 +31,7 @@ function scan(files: Record<string, string>): { code: number; out: string } {
         const run = spawnSync("sh", [gate, ...paths], {
             cwd: repoRoot,
             encoding: "utf8",
+            env: { ...process.env, ...env },
         });
         return { code: run.status ?? -1, out: `${run.stdout}${run.stderr}` };
     } finally {
@@ -244,6 +248,51 @@ describe("comment hygiene gate", () => {
 
         expect(result.code).toBe(1);
         expect(result.out).toContain("probe.cjs:1:");
+    });
+
+    test("a multi-line Rust raw string keeps its contents out of scope", () => {
+        const result = scan({
+            "rawmulti.rs": [
+                'let json = r#"{',
+                "// see magic-context-om3y inside runtime data",
+                '}"#;',
+                "// tracked in magic-context-om3y",
+            ].join("\n"),
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("rawmulti.rs:2:");
+        expect(result.out).toContain("rawmulti.rs:4:");
+    });
+
+    test("a comment inside a template substitution is in scope", () => {
+        const result = scan({
+            "subst.ts": [
+                "const s = `a${",
+                "// tracked in magic-context-om3y",
+                "x}b`;",
+            ].join("\n"),
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("subst.ts:2:");
+    });
+
+    test("the caller can supply the ID export", () => {
+        const dir = mkdtempSync(join(tmpdir(), "comment-gate-ids-"));
+        try {
+            const ids = join(dir, "issues.jsonl");
+            writeFileSync(ids, '{"id":"magic-context-zz9.7","title":"probe"}\n');
+            const cite = { "ids.rs": "// see zz9.7 for the plan" };
+
+            expect(scan(cite).code).toBe(0);
+
+            const supplied = scan(cite, { COMMENT_CHECK_IDS: ids });
+            expect(supplied.code).toBe(1);
+            expect(supplied.out).toContain("ids.rs:1:");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     test("prose, product names, and string literals stay clean", () => {
