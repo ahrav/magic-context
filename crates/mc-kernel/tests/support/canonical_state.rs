@@ -78,6 +78,9 @@
 
 #![allow(dead_code)]
 
+/// Stands in for a content digest, which is 64 hex characters and cannot collide with it.
+const DIRECTORY_MARKER: &str = "<directory>";
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -774,8 +777,7 @@ fn read_sequences(connection: &Connection) -> Vec<(String, i64)> {
 /// object's bytes hash to its path. Missing `artifacts/objects` reads as empty.
 /// Only two-character lowercase-hex shards hold objects.
 pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
-    let objects = root.join("artifacts/objects");
-    let Some(shards) = read_dir_or_absent(&objects) else {
+    let Some(shards) = read_dir_or_absent(root, "artifacts/objects") else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -814,7 +816,7 @@ pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
 /// shares across roots. Missing `artifacts/tmp` reads as empty.
 /// `prepare_layout` unlinks only files and symlinks, so a directory here survives a restart.
 pub fn scan_temps(root: &Path) -> Vec<(u64, String, u64)> {
-    let Some(entries) = read_dir_or_absent(&root.join("artifacts/tmp")) else {
+    let Some(entries) = read_dir_or_absent(root, "artifacts/tmp") else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -828,17 +830,22 @@ pub fn scan_temps(root: &Path) -> Vec<(u64, String, u64)> {
 /// `None` for an absent directory, panicking on every other error.
 ///
 /// Treating an unreadable CAS directory as empty would make its digest equal an empty store's.
-fn read_dir_or_absent(path: &Path) -> Option<fs::ReadDir> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            panic!("{} is a symlink", path.display())
+fn read_dir_or_absent(root: &Path, relative: &str) -> Option<fs::ReadDir> {
+    let mut path = root.to_path_buf();
+    // Every component is checked, since an intermediate symlink also invalidates the layout.
+    for component in relative.split('/') {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                panic!("{} is a symlink", path.display())
+            }
+            Ok(metadata) if !metadata.is_dir() => panic!("{} is not a directory", path.display()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("cannot stat {}: {error}", path.display()),
         }
-        Ok(metadata) if !metadata.is_dir() => panic!("{} is not a directory", path.display()),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => panic!("cannot stat {}: {error}", path.display()),
     }
-    match fs::read_dir(path) {
+    match fs::read_dir(&path) {
         Ok(entries) => Some(entries),
         Err(error) => panic!("cannot read {}: {error}", path.display()),
     }
@@ -848,7 +855,7 @@ fn read_dir_or_absent(path: &Path) -> Option<fs::ReadDir> {
 ///
 /// Content digests are recorded instead of names, as `scan_temps` does.
 pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
-    let Some(entries) = read_dir_or_absent(&root.join("artifacts/objects")) else {
+    let Some(entries) = read_dir_or_absent(root, "artifacts/objects") else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -881,6 +888,8 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
 fn collect_file_digests(path: &Path, depth: u64, out: &mut Vec<(u64, String, u64)>) {
     let metadata = fs::symlink_metadata(path).unwrap();
     if metadata.is_dir() {
+        // A directory holding no regular file would otherwise read the same as its absence.
+        out.push((depth, DIRECTORY_MARKER.to_string(), 0));
         for entry in fs::read_dir(path).unwrap() {
             collect_file_digests(&entry.unwrap().path(), depth + 1, out);
         }
