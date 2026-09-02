@@ -1,0 +1,538 @@
+//! `digest(root, profile)` reads every non-`sqlite_%` table in `core.sqlite`
+//! plus the CAS object listing under `artifacts/objects`, normalizes the rows
+//! for the requested comparison, and hashes each table separately so an
+//! unequal comparison names the table that differs.
+//!
+//! Two normalization profiles answer two different questions about one store:
+//!
+//! * [`Profile::SameRoot`] compares one root with itself after a reopen or a
+//!   backup-and-restore. Every reopen advances the lease epoch, so the current
+//!   `writer_fence` row is the only column dropped. Everything else, including
+//!   the format marker, minted identities, and wall-clock timestamps, must
+//!   match exactly.
+//! * [`Profile::CrossRoot`] compares two roots that ran the same history (a
+//!   clean run against a perturbed run). It additionally drops the per-root
+//!   incarnation, every persisted epoch, and every wall-clock timestamp the
+//!   kernel stamps itself, then renames minted identities bijectively so two
+//!   roots that minted different identifiers for the same objects compare
+//!   equal while merged, swapped, or missing identities still differ.
+//!
+//! Volatile columns dropped by `CrossRoot` (all wall-clock or per-process).
+//! A nullable expiry is reduced to its nullness instead of dropped, because
+//! whether a pin expires at all is a contract the caller chose, while the
+//! instant it expires derives from the wall clock:
+//!
+//! | table | columns |
+//! |---|---|
+//! | `mc_kernel_format_marker` | `database_incarnation_id`, `marker_digest`, `created_at` |
+//! | `commit_log` | `writer_epoch`, `recorded_at` |
+//! | `outbox` | `created_at` |
+//! | `operation_receipts` | `created_at` |
+//! | `admission_decisions` | `decided_at` |
+//! | `capture_pins` | `lease_epoch`, `writer_epoch`, `created_at`, `released_at`; `expires_at` reduced to null-or-set |
+//! | `capture_pin_refs` | `released_at`; `expires_at` reduced to null-or-set |
+//! | `artifact_ingestion_reservations` | `writer_epoch`, `created_at`, `heartbeat_at`, `lease_expires_at`, `reclaim_started_at` |
+//!
+//! Identity domains renamed by `CrossRoot`. Each is defined by one table
+//! column; the rename applies to every text and blob cell in every table, so
+//! relational references and JSON payload references (`$.audit.barrier_id`
+//! in `change_event.payload` and `outbox.payload`, `barrier_id` in
+//! `operation_receipts.result_payload`, consumer-abandonment payloads) rewrite
+//! together with the defining row.
+//!
+//! | domain | defining column | minted by |
+//! |---|---|---|
+//! | `barrier` | `deletion_backfill_barriers.barrier_id` | `next_unique_id()` |
+//! | `reservation` | `artifact_ingestion_reservations.reservation_id` | `next_unique_id()` |
+//! | `abandonment` | `consumer_abandonments.abandonment_id` | `next_unique_id()` |
+//! | `capture_pin` | `capture_pins.capture_pin_id` | `randomblob(16)` |
+//!
+//! Identities are numbered in the order of their defining rows once the
+//! identity column and the volatile columns are removed, with the identity
+//! itself breaking ties; `next_unique_id()` counters are monotone within one
+//! process, so tied rows number in creation order in both roots. A barrier-
+//! or reservation-shaped token that survives renaming is
+//! a reference to an identity no defining row declares; the digest panics
+//! rather than compare two roots through an unresolved reference.
+
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
+
+/// Comparison the digest is normalized for; see the module documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    SameRoot,
+    CrossRoot,
+}
+
+/// One SHA-256 hex digest per table, plus the CAS object listing under the
+/// `cas_objects` key. Equality is table-wise so a failing assertion reports
+/// exactly which table diverged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalDigest {
+    pub tables: BTreeMap<String, String>,
+}
+
+impl CanonicalDigest {
+    pub fn table(&self, name: &str) -> &str {
+        self.tables
+            .get(name)
+            .unwrap_or_else(|| panic!("digest has no table {name}"))
+    }
+
+    /// Equality assertion that names the differing tables instead of
+    /// printing two maps of hashes.
+    #[track_caller]
+    pub fn assert_same(&self, other: &Self, context: &str) {
+        let differing = self
+            .tables
+            .iter()
+            .filter(|(table, digest)| other.tables.get(*table) != Some(digest))
+            .map(|(table, _)| table.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            differing.is_empty(),
+            "{context}: canonical state differs in {differing:?}"
+        );
+    }
+}
+
+/// Digest the canonical state at `root` under `profile`.
+pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
+    let state = State::read(root);
+    let normalized = state.normalize(profile);
+    let mut tables = BTreeMap::new();
+    for (table, rows) in normalized.tables {
+        tables.insert(table, hash_rows(&rows));
+    }
+    let object_rows = normalized
+        .objects
+        .into_iter()
+        .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
+        .collect::<Vec<_>>();
+    tables.insert("cas_objects".to_string(), hash_rows(&object_rows));
+    CanonicalDigest { tables }
+}
+
+/// Names of every table the digest covers at `root`, in sorted order. The
+/// oracle reads the live schema so a new kernel table is digested without an
+/// edit here; the inventory test in `kernel_proofs` pins that set against the
+/// schema module's declared component list.
+pub fn digested_tables(root: &Path) -> BTreeSet<String> {
+    let connection = open_read_only(root);
+    table_names(&connection).into_iter().collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Cell {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl Cell {
+    fn feed(&self, hasher: &mut Sha256) {
+        match self {
+            Cell::Null => hasher.update([0u8]),
+            Cell::Integer(value) => {
+                hasher.update([1u8]);
+                hasher.update(value.to_le_bytes());
+            }
+            Cell::Real(bits) => {
+                hasher.update([2u8]);
+                hasher.update(bits.to_le_bytes());
+            }
+            Cell::Text(value) => {
+                hasher.update([3u8]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            Cell::Blob(value) => {
+                hasher.update([4u8]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+        }
+    }
+}
+
+struct Table {
+    columns: Vec<String>,
+    rows: Vec<Vec<Cell>>,
+}
+
+struct State {
+    tables: BTreeMap<String, Table>,
+    objects: Vec<(String, u64)>,
+}
+
+struct Normalized {
+    tables: BTreeMap<String, Vec<Vec<Cell>>>,
+    objects: Vec<(String, u64)>,
+}
+
+impl State {
+    fn read(root: &Path) -> Self {
+        let connection = open_read_only(root);
+        let mut tables = BTreeMap::new();
+        for name in table_names(&connection) {
+            let columns = columns_of(&connection, &name);
+            let sql = format!(
+                "SELECT {} FROM {name}",
+                columns
+                    .iter()
+                    .map(|column| format!("\"{column}\""))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let mut statement = connection.prepare(&sql).unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns.len())
+                        .map(|index| {
+                            Ok(match row.get_ref(index)? {
+                                ValueRef::Null => Cell::Null,
+                                ValueRef::Integer(value) => Cell::Integer(value),
+                                ValueRef::Real(value) => Cell::Real(value.to_bits()),
+                                ValueRef::Text(value) => {
+                                    Cell::Text(String::from_utf8(value.to_vec()).unwrap_or_else(
+                                        |_| panic!("{name}.{} is not UTF-8", columns[index]),
+                                    ))
+                                }
+                                ValueRef::Blob(value) => Cell::Blob(value.to_vec()),
+                            })
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            tables.insert(name, Table { columns, rows });
+        }
+        Self {
+            tables,
+            objects: scan_objects(root),
+        }
+    }
+
+    fn normalize(mut self, profile: Profile) -> Normalized {
+        let renames = match profile {
+            Profile::SameRoot => Vec::new(),
+            Profile::CrossRoot => self.identity_renames(),
+        };
+        let mut tables = BTreeMap::new();
+        for (name, table) in self.tables {
+            let kept = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| (index, column_rule(profile, &name, column)))
+                .filter(|(_, rule)| *rule != Rule::Drop)
+                .collect::<Vec<_>>();
+            let mut rows = table
+                .rows
+                .into_iter()
+                .map(|row| {
+                    kept.iter()
+                        .map(|&(index, rule)| {
+                            rename_cell(apply_rule(row[index].clone(), rule), &renames)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if profile == Profile::CrossRoot {
+                for row in &rows {
+                    for cell in row {
+                        assert_no_unresolved_identity(&name, cell);
+                    }
+                }
+            }
+            rows.sort();
+            tables.insert(name, rows);
+        }
+        self.objects.sort();
+        Normalized {
+            tables,
+            objects: self.objects,
+        }
+    }
+
+    /// Bijective rename map over every identity domain, longest tokens first
+    /// so a token that embeds another domain's shape is rewritten whole.
+    fn identity_renames(&self) -> Vec<(String, String)> {
+        let mut renames = Vec::new();
+        for domain in IDENTITY_DOMAINS {
+            let table = &self.tables[domain.table];
+            let column = table
+                .columns
+                .iter()
+                .position(|column| column == domain.column)
+                .unwrap_or_else(|| panic!("{}.{} missing", domain.table, domain.column));
+            // Identities are numbered by the stable columns of their defining
+            // row, then by the identity itself, so two roots that minted
+            // different identifiers for the same rows number them alike.
+            let mut ordered = table
+                .rows
+                .iter()
+                .map(|row| {
+                    let Cell::Text(id) = &row[column] else {
+                        panic!("{}.{} is not text", domain.table, domain.column);
+                    };
+                    let key = row
+                        .iter()
+                        .zip(&table.columns)
+                        .enumerate()
+                        .filter(|(index, (_, name))| {
+                            *index != column
+                                && column_rule(Profile::CrossRoot, domain.table, name) == Rule::Keep
+                        })
+                        .map(|(_, (cell, _))| cell.clone())
+                        .collect::<Vec<_>>();
+                    (key, id.clone())
+                })
+                .collect::<Vec<_>>();
+            ordered.sort();
+            for (ordinal, (_, id)) in ordered.into_iter().enumerate() {
+                renames.push((id, format!("<{}:{ordinal}>", domain.name)));
+            }
+        }
+        renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        renames
+    }
+}
+
+struct IdentityDomain {
+    name: &'static str,
+    table: &'static str,
+    column: &'static str,
+}
+
+const IDENTITY_DOMAINS: &[IdentityDomain] = &[
+    IdentityDomain {
+        name: "barrier",
+        table: "deletion_backfill_barriers",
+        column: "barrier_id",
+    },
+    IdentityDomain {
+        name: "reservation",
+        table: "artifact_ingestion_reservations",
+        column: "reservation_id",
+    },
+    IdentityDomain {
+        name: "abandonment",
+        table: "consumer_abandonments",
+        column: "abandonment_id",
+    },
+    IdentityDomain {
+        name: "capture_pin",
+        table: "capture_pins",
+        column: "capture_pin_id",
+    },
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    Keep,
+    Drop,
+    /// Reduce to `Null` or `Integer(1)`: the value is wall-clock but its
+    /// presence is caller-chosen contract.
+    Presence,
+}
+
+fn column_rule(profile: Profile, table: &str, column: &str) -> Rule {
+    let dropped: &[&str] = match (profile, table) {
+        (_, "writer_fence") => &["writer_epoch"],
+        (Profile::SameRoot, _) => &[],
+        (Profile::CrossRoot, "mc_kernel_format_marker") => {
+            &["database_incarnation_id", "marker_digest", "created_at"]
+        }
+        (Profile::CrossRoot, "commit_log") => &["writer_epoch", "recorded_at"],
+        (Profile::CrossRoot, "outbox") => &["created_at"],
+        (Profile::CrossRoot, "operation_receipts") => &["created_at"],
+        (Profile::CrossRoot, "admission_decisions") => &["decided_at"],
+        (Profile::CrossRoot, "capture_pins") => {
+            &["lease_epoch", "writer_epoch", "created_at", "released_at"]
+        }
+        (Profile::CrossRoot, "capture_pin_refs") => &["released_at"],
+        (Profile::CrossRoot, "artifact_ingestion_reservations") => &[
+            "writer_epoch",
+            "created_at",
+            "heartbeat_at",
+            "lease_expires_at",
+            "reclaim_started_at",
+        ],
+        (Profile::CrossRoot, _) => &[],
+    };
+    if dropped.contains(&column) {
+        Rule::Drop
+    } else if profile == Profile::CrossRoot
+        && matches!(table, "capture_pins" | "capture_pin_refs")
+        && column == "expires_at"
+    {
+        Rule::Presence
+    } else {
+        Rule::Keep
+    }
+}
+
+fn apply_rule(cell: Cell, rule: Rule) -> Cell {
+    match (rule, cell) {
+        (Rule::Presence, Cell::Null) => Cell::Null,
+        (Rule::Presence, _) => Cell::Integer(1),
+        (_, cell) => cell,
+    }
+}
+
+fn rename_cell(cell: Cell, renames: &[(String, String)]) -> Cell {
+    if renames.is_empty() {
+        return cell;
+    }
+    match cell {
+        Cell::Text(text) => {
+            let mut bytes = text.into_bytes();
+            for (from, to) in renames {
+                bytes = replace_tokens(&bytes, from.as_bytes(), to.as_bytes());
+            }
+            Cell::Text(String::from_utf8(bytes).unwrap())
+        }
+        Cell::Blob(mut bytes) => {
+            for (from, to) in renames {
+                bytes = replace_tokens(&bytes, from.as_bytes(), to.as_bytes());
+            }
+            Cell::Blob(bytes)
+        }
+        other => other,
+    }
+}
+
+/// Replaces whole tokens only: a match adjoined by another identity
+/// character on either side is a longer identity that merely contains
+/// `from`, so it stays untouched and is later reported as unresolved.
+fn replace_tokens(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let is_identity_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-';
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        let rest = &haystack[index..];
+        let continues = rest
+            .get(from.len())
+            .is_some_and(|&byte| is_identity_byte(byte));
+        let preceded = index > 0 && is_identity_byte(haystack[index - 1]);
+        if rest.starts_with(from) && !continues && !preceded {
+            out.extend_from_slice(to);
+            index += from.len();
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Panics when a cell still carries a barrier- or reservation-shaped token
+/// (`[artifact-deletion-]<64 hex>-<digits>`) after renaming: that token names
+/// an identity no defining row declares, so the two roots cannot be compared.
+fn assert_no_unresolved_identity(table: &str, cell: &Cell) {
+    let bytes: &[u8] = match cell {
+        Cell::Text(text) => text.as_bytes(),
+        Cell::Blob(bytes) => bytes,
+        _ => return,
+    };
+    let is_hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+    for index in 0..bytes.len().saturating_sub(65) {
+        let window = &bytes[index..index + 64];
+        let preceded_by_hex = index > 0 && is_hex(bytes[index - 1]);
+        if !preceded_by_hex
+            && window.iter().all(|&byte| is_hex(byte))
+            && bytes[index + 64] == b'-'
+            && bytes[index + 65].is_ascii_digit()
+        {
+            let token = String::from_utf8_lossy(&bytes[index.saturating_sub(18)..]);
+            panic!(
+                "{table} references an identity no defining row declares: {}",
+                token.chars().take(96).collect::<String>()
+            );
+        }
+    }
+}
+
+fn hash_rows(rows: &[Vec<Cell>]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((rows.len() as u64).to_le_bytes());
+    for row in rows {
+        hasher.update((row.len() as u64).to_le_bytes());
+        for cell in row {
+            cell.feed(&mut hasher);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn open_read_only(root: &Path) -> Connection {
+    Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+}
+
+fn table_names(connection: &Connection) -> Vec<String> {
+    connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn columns_of(connection: &Connection, table: &str) -> Vec<String> {
+    connection
+        .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// Every published CAS object as `(digest, byte_length)`, verifying each
+/// object's bytes hash to its path. Missing `artifacts/objects` reads as empty.
+pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
+    let objects = root.join("artifacts/objects");
+    let Ok(shards) = fs::read_dir(&objects) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for shard in shards {
+        let shard = shard.unwrap();
+        if !shard.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let prefix = shard.file_name().into_string().unwrap();
+        for entry in fs::read_dir(shard.path()).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let digest = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            let bytes = fs::read(entry.path()).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                digest,
+                "object bytes do not hash to their path"
+            );
+            result.push((digest, bytes.len() as u64));
+        }
+    }
+    result.sort();
+    result
+}
