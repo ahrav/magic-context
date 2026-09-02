@@ -426,10 +426,10 @@ impl InjectionBlock {
     /// Repair generation for an append of `kind`: the commit sequence of the
     /// newest recorded observation whose kind differs from `kind`.
     ///
-    /// Repeating one repair keeps its generation, so the dedup key repeats and commentlint: allow(JUDGE)
-    /// the receipt replays. Failing again after a clearing observation crosses commentlint: allow(JUDGE)
-    /// a kind change, which advances the generation, so the dedup key differs commentlint: allow(JUDGE)
-    /// from the pre-clear repair rather than replaying it. commentlint: allow(JUDGE)
+    /// Repeating one repair keeps its generation, so the dedup key repeats and
+    /// the receipt replays. Failing again after a clearing observation crosses
+    /// a kind change, which advances the generation, so the dedup key differs
+    /// from the pre-clear repair rather than replaying it.
     /// A reduction whose records were all invalidated: nothing blocks, but the
     /// generation has moved past the identity those records carried.
     fn invalidated(invalidated_commit_seq: i64) -> Self {

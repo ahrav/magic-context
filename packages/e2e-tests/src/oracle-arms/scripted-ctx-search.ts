@@ -31,7 +31,7 @@ function locatorQuery(claims: readonly GoldMemoryId[]): string {
 /**
  *
  */
-/** The invariant text this turn adds to the model-visible transcript, independent of the query. Exposed so a gold contract can reject an answer the prompt itself would reveal. commentlint: allow(JUDGE) */
+/** The invariant text this turn adds to the model-visible transcript, independent of the query. Exposed so a gold contract can reject an answer the prompt itself would reveal. */
 export const SCRIPTED_SEARCH_PROMPT_PREFIX = "Search project memory for oracle evidence: ";
 export const SCRIPTED_SEARCH_FOLLOW_UP = "oracle search complete";
 

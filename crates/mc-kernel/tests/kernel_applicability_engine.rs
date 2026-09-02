@@ -2590,10 +2590,10 @@ fn a_check_path_under_a_missing_ancestor_is_definitely_absent() {
 /// confirms nothing, while a live budget still classifies and caches a payload
 /// carrying many checks.
 ///
-/// The early exit itself is reachable only when cancellation arrives during commentlint: allow(JUDGE)
-/// evaluation, since an already-expired budget is caught before the payload is commentlint: allow(JUDGE)
-/// decoded. That ordering has no deterministic single-threaded seam, so this commentlint: allow(JUDGE)
-/// covers the surrounding contract rather than the read it avoids. commentlint: allow(JUDGE)
+/// The early exit itself is reachable only when cancellation arrives during
+/// evaluation, since an already-expired budget is caught before the payload is
+/// decoded. That ordering has no deterministic single-threaded seam, so this
+/// covers the surrounding contract rather than the read it avoids.
 #[test]
 fn a_payload_with_many_checks_keeps_its_cache_contract_across_budgets() {
     let dir = tempfile::tempdir().unwrap();

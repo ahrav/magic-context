@@ -18,26 +18,26 @@ use sha2::{Digest, Sha256};
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// A path re-resolved after containment validation can escape if an ancestor
-/// is replaced with a symlink before open, because `NOFOLLOW` only ever commentlint: allow(JUDGE)
-/// guards the final component. Walking one component at a time with commentlint: allow(JUDGE)
-/// `NOFOLLOW` refuses a symlink at every level, and each descriptor pins its commentlint: allow(JUDGE)
-/// directory's inode, so the returned parent cannot be moved out from under commentlint: allow(JUDGE)
-/// the caller. commentlint: allow(JUDGE)
+/// is replaced with a symlink before open, because `NOFOLLOW` only ever
+/// guards the final component. Walking one component at a time with
+/// `NOFOLLOW` refuses a symlink at every level, and each descriptor pins its
+/// directory's inode, so the returned parent cannot be moved out from under
+/// the caller.
 ///
 /// `PATH` descriptors allow child resolution with directory search
-/// permission. Requiring read access would refuse a tracked file under an commentlint: allow(JUDGE)
-/// execute-only directory that git reads fine, and the resulting commentlint: allow(JUDGE)
-/// `out-of-worktree` token would then stop moving when its content changed. A commentlint: allow(JUDGE)
-/// `PATH` descriptor still serves as the base for `openat`, `statat`, and commentlint: allow(JUDGE)
-/// `readlinkat`. commentlint: allow(JUDGE)
+/// permission. Requiring read access would refuse a tracked file under an
+/// execute-only directory that git reads fine, and the resulting
+/// `out-of-worktree` token would then stop moving when its content changed. A
+/// `PATH` descriptor still serves as the base for `openat`, `statat`, and
+/// `readlinkat`.
 ///
 /// `workdir` is trusted; its resolved directory is the containment root.
 enum ParentDir {
     Opened(OwnedFd, OsString),
-    /// An ancestor does not exist, so nothing beneath it exists either. Read commentlint: allow(JUDGE)
-    /// repair needs that separated from a walk that failed: absence is a commentlint: allow(JUDGE)
-    /// definite answer about the checked path, whereas a refused or unreadable commentlint: allow(JUDGE)
-    /// ancestor hides whatever is really there. commentlint: allow(JUDGE)
+    /// An ancestor does not exist, so nothing beneath it exists either. Read
+    /// repair needs that separated from a walk that failed: absence is a
+    /// definite answer about the checked path, whereas a refused or unreadable
+    /// ancestor hides whatever is really there.
     AncestorAbsent,
     Unresolvable,
 }
@@ -80,11 +80,11 @@ fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> ParentDir {
             rfs::Mode::empty(),
         ) {
             Ok(next) => dir = next,
-            // Only absence is definite. `O_PATH` with `NOFOLLOW` opens a commentlint: allow(JUDGE)
-            // symlinked ancestor rather than refusing it, so `O_DIRECTORY` commentlint: allow(JUDGE)
-            // rejects that link as `ENOTDIR` — indistinguishable here from a commentlint: allow(JUDGE)
-            // plain non-directory, and the link hides whatever it points at. commentlint: allow(JUDGE)
-            // Both stay unresolvable. commentlint: allow(JUDGE)
+            // Only absence is definite. `O_PATH` with `NOFOLLOW` opens a
+            // symlinked ancestor rather than refusing it, so `O_DIRECTORY`
+            // rejects that link as `ENOTDIR` — indistinguishable here from a
+            // plain non-directory, and the link hides whatever it points at.
+            // Both stay unresolvable.
             Err(rustix::io::Errno::NOENT) => return ParentDir::AncestorAbsent,
             Err(_) => return ParentDir::Unresolvable,
         }
@@ -93,15 +93,15 @@ fn open_parent_beneath(workdir: &Path, rela_path: &Path) -> ParentDir {
 }
 
 /// A path can be replaced after a stat; validate the opened descriptor
-/// instead. A swapped-in symlink would move the read outside the checkout, commentlint: allow(JUDGE)
-/// and a FIFO would block the request without reaching another budget poll, commentlint: allow(JUDGE)
-/// so `NOFOLLOW` and `NONBLOCK` refuse both at open time and the commentlint: allow(JUDGE)
-/// descriptor's own mode settles what was reached. commentlint: allow(JUDGE)
+/// instead. A swapped-in symlink would move the read outside the checkout,
+/// and a FIFO would block the request without reaching another budget poll,
+/// so `NOFOLLOW` and `NONBLOCK` refuse both at open time and the
+/// descriptor's own mode settles what was reached.
 ///
 /// `Ok(None)` means no regular file is there — it vanished, or it is a
-/// symlink, FIFO, directory, or device. `Err` keeps genuine failures commentlint: allow(JUDGE)
-/// distinguishable, since those hide content that still governs the commentlint: allow(JUDGE)
-/// checkout. commentlint: allow(JUDGE)
+/// symlink, FIFO, directory, or device. `Err` keeps genuine failures
+/// distinguishable, since those hide content that still governs the
+/// checkout.
 fn open_regular_no_follow_at<Fd: std::os::fd::AsFd>(
     dir: Fd,
     name: &OsStr,
@@ -113,10 +113,10 @@ fn open_regular_no_follow_at<Fd: std::os::fd::AsFd>(
         rfs::Mode::empty(),
     ) {
         Ok(file) => std::fs::File::from(file),
-        // NOENT is a vanished path; LOOP answers NOFOLLOW on a symlink, commentlint: allow(JUDGE)
-        // NXIO answers NONBLOCK on a reader-less FIFO, and ISDIR answers a commentlint: allow(JUDGE)
-        // directory. All four report the absence of a regular file here commentlint: allow(JUDGE)
-        // rather than a failure to scan one. commentlint: allow(JUDGE)
+        // NOENT is a vanished path; LOOP answers NOFOLLOW on a symlink,
+        // NXIO answers NONBLOCK on a reader-less FIFO, and ISDIR answers a
+        // directory. All four report the absence of a regular file here
+        // rather than a failure to scan one.
         Err(
             rustix::io::Errno::NOENT
             | rustix::io::Errno::LOOP
@@ -132,10 +132,10 @@ fn open_regular_no_follow_at<Fd: std::os::fd::AsFd>(
     Ok(Some(file))
 }
 
-/// Worker-thread ceiling for the status scan. Spawn and coordination cost commentlint: allow(JUDGE)
-/// grows with core count while the stat-bound scan does not, so an uncapped commentlint: allow(JUDGE)
-/// scan on a many-core host spends more on threads than on the walk. gix commentlint: allow(JUDGE)
-/// clamps the value to available parallelism on smaller hosts. commentlint: allow(JUDGE)
+/// Worker-thread ceiling for the status scan. Spawn and coordination cost
+/// grows with core count while the stat-bound scan does not, so an uncapped
+/// scan on a many-core host spends more on threads than on the walk. gix
+/// clamps the value to available parallelism on smaller hosts.
 const STATUS_SCAN_THREAD_CAP: usize = 4;
 
 /// Deadline plus cooperative interrupt flag threaded through every walk the
@@ -202,12 +202,12 @@ impl EvalBudget {
     }
 }
 
-/// `DeadlineWatchdog` raises `budget`'s interrupt when its deadline passes, so commentlint: allow(JUDGE)
-/// an in-flight gix walk stops at its next poll. commentlint: allow(JUDGE)
+/// `DeadlineWatchdog` raises `budget`'s interrupt when its deadline passes, so
+/// an in-flight gix walk stops at its next poll.
 ///
-/// The wait is a condvar rather than a sleep: `drop` has to stop this thread commentlint: allow(JUDGE)
-/// promptly, and a sleeping thread cannot be woken, which would add the commentlint: allow(JUDGE)
-/// remainder of its nap to every snapshot that finishes early. commentlint: allow(JUDGE)
+/// The wait is a condvar rather than a sleep: `drop` has to stop this thread
+/// promptly, and a sleeping thread cannot be woken, which would add the
+/// remainder of its nap to every snapshot that finishes early.
 struct DeadlineWatchdog {
     stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -221,8 +221,8 @@ impl DeadlineWatchdog {
         let signal = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             let (lock, woken) = &*signal;
-            // A poisoned lock still carries the flag, and its only writer sets commentlint: allow(JUDGE)
-            // it to `true`, so an unwind mid-update cannot invent a stop. commentlint: allow(JUDGE)
+            // A poisoned lock still carries the flag, and its only writer sets
+            // it to `true`, so an unwind mid-update cannot invent a stop.
             let mut stop = lock.lock().unwrap_or_else(|error| error.into_inner());
             while !*stop {
                 let now = Instant::now();
@@ -230,8 +230,8 @@ impl DeadlineWatchdog {
                     interrupt.store(true, Ordering::Relaxed);
                     return;
                 }
-                // The guard is held across the deadline test, so a `drop` commentlint: allow(JUDGE)
-                // racing this wait cannot signal into the gap and be missed. commentlint: allow(JUDGE)
+                // The guard is held across the deadline test, so a `drop`
+                // racing this wait cannot signal into the gap and be missed.
                 stop = woken
                     .wait_timeout(stop, deadline - now)
                     .unwrap_or_else(|error| error.into_inner())
@@ -286,9 +286,9 @@ impl std::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
-/// One scan's budget together with its submodule nesting depth. Recursing commentlint: allow(JUDGE)
-/// into a dirty gitlink re-enters the scan, so the depth travels with the commentlint: allow(JUDGE)
-/// budget rather than widening four private signatures. commentlint: allow(JUDGE)
+/// One scan's budget together with its submodule nesting depth. Recursing
+/// into a dirty gitlink re-enters the scan, so the depth travels with the
+/// budget rather than widening four private signatures.
 #[derive(Clone, Copy)]
 struct ScanCtx<'a> {
     budget: &'a EvalBudget,
@@ -296,8 +296,8 @@ struct ScanCtx<'a> {
 }
 
 impl<'a> ScanCtx<'a> {
-    /// Nesting beyond this depth ends the scan rather than keying a gitlink commentlint: allow(JUDGE)
-    /// whose contents went unread. commentlint: allow(JUDGE)
+    /// Nesting beyond this depth ends the scan rather than keying a gitlink
+    /// whose contents went unread.
     const MAX_SUBMODULE_DEPTH: u32 = 3;
 
     fn root(budget: &'a EvalBudget) -> Self {
@@ -308,7 +308,7 @@ impl<'a> ScanCtx<'a> {
         self.budget.check()
     }
 
-    /// The context one submodule deeper, or `None` at the depth limit. commentlint: allow(JUDGE)
+    /// The context one submodule deeper, or `None` at the depth limit.
     fn nested(&self) -> Option<Self> {
         (self.depth < Self::MAX_SUBMODULE_DEPTH).then_some(Self {
             budget: self.budget,
@@ -320,29 +320,29 @@ impl<'a> ScanCtx<'a> {
 /// One uncommitted entry: repo-relative path, status label, and a content
 /// address (blob/content hash, or a fixed token for deletions).
 ///
-/// `path_encoding` distinguishes valid UTF-8 paths from lossy renderings of commentlint: allow(JUDGE)
-/// non-UTF-8 paths. Without it, a file named exactly like some byte path's commentlint: allow(JUDGE)
-/// lossy rendering yields an identical tuple, so the set keeps one entry commentlint: allow(JUDGE)
-/// while the two checkouts it stands for hold different bytes. commentlint: allow(JUDGE)
+/// `path_encoding` distinguishes valid UTF-8 paths from lossy renderings of
+/// non-UTF-8 paths. Without it, a file named exactly like some byte path's
+/// lossy rendering yields an identical tuple, so the set keeps one entry
+/// while the two checkouts it stands for hold different bytes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DirtyEntry {
     pub path: String,
     pub path_encoding: PathEncoding,
-    /// The path exactly as the repository holds it. `path` is a rendering for commentlint: allow(JUDGE)
-    /// display and fingerprinting and is lossy for bytes that are not valid commentlint: allow(JUDGE)
-    /// UTF-8, so only these bytes identify the file; a rendering cannot say commentlint: allow(JUDGE)
-    /// where loss occurred, which leaves even its prefixes ambiguous. commentlint: allow(JUDGE)
+    /// The path exactly as the repository holds it. `path` is a rendering for
+    /// display and fingerprinting and is lossy for bytes that are not valid
+    /// UTF-8, so only these bytes identify the file; a rendering cannot say
+    /// where loss occurred, which leaves even its prefixes ambiguous.
     pub raw_path: Vec<u8>,
     pub status: &'static str,
     pub content_hash: String,
 }
 
-/// Whether `DirtyEntry::path` is the path itself or a lossy rendering of commentlint: allow(JUDGE)
-/// bytes that are not valid UTF-8. commentlint: allow(JUDGE)
+/// Whether `DirtyEntry::path` is the path itself or a lossy rendering of
+/// bytes that are not valid UTF-8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PathEncoding {
     Utf8,
-    /// Lossy rendering with a digest of the raw bytes appended. commentlint: allow(JUDGE)
+    /// Lossy rendering with a digest of the raw bytes appended.
     LossyWithDigest,
 }
 
@@ -350,11 +350,11 @@ impl DirtyEntry {
     /// Whether this entry records an uncommitted change, as opposed to an index
     /// bookkeeping flag the status walk does not inspect.
     ///
-    /// `skip_worktree` and `assume_valid` entries are keyed straight from the commentlint: allow(JUDGE)
-    /// index so a fingerprint covers state the walk skips. Git reports both commentlint: allow(JUDGE)
-    /// clean, and a sparse checkout marks every unmaterialized path commentlint: allow(JUDGE)
-    /// `skip_worktree`, so treating them as dirty would gate every object commentlint: allow(JUDGE)
-    /// declaring such a path forever. commentlint: allow(JUDGE)
+    /// `skip_worktree` and `assume_valid` entries are keyed straight from the
+    /// index so a fingerprint covers state the walk skips. Git reports both
+    /// clean, and a sparse checkout marks every unmaterialized path
+    /// `skip_worktree`, so treating them as dirty would gate every object
+    /// declaring such a path forever.
     pub fn is_uncommitted_change(&self) -> bool {
         !matches!(self.status, "skip_worktree" | "assume_valid")
     }
@@ -398,39 +398,39 @@ impl CheckoutSnapshot {
         &self.head
     }
 
-    /// `repository_state` digests sparse-checkout configuration and shallow boundary. commentlint: allow(JUDGE)
+    /// `repository_state` digests sparse-checkout configuration and shallow boundary.
     ///
-    /// Unshallowing or a sparse-pattern edit moves neither HEAD nor the commentlint: allow(JUDGE)
-    /// worktree, so a cache key for a verdict that read history reach or path commentlint: allow(JUDGE)
-    /// materialization has to carry this generation. commentlint: allow(JUDGE)
+    /// Unshallowing or a sparse-pattern edit moves neither HEAD nor the
+    /// worktree, so a cache key for a verdict that read history reach or path
+    /// materialization has to carry this generation.
     ///
-    /// Object availability is deliberately outside it: a fetch can supply a commentlint: allow(JUDGE)
-    /// missing object without moving HEAD, the worktree, sparse configuration, commentlint: allow(JUDGE)
-    /// or the shallow file, so a verdict that rested on an absent object must commentlint: allow(JUDGE)
-    /// not be retained against this generation at all. commentlint: allow(JUDGE)
+    /// Object availability is deliberately outside it: a fetch can supply a
+    /// missing object without moving HEAD, the worktree, sparse configuration,
+    /// or the shallow file, so a verdict that rested on an absent object must
+    /// not be retained against this generation at all.
     pub fn repository_state(&self) -> &str {
         &self.repository_state
     }
 
     /// Whether the repository was shallow when this snapshot was taken.
     ///
-    /// A shallow boundary truncates every graph walk, so a negative ancestry commentlint: allow(JUDGE)
-    /// result cannot be trusted. Readers take it from here rather than from commentlint: allow(JUDGE)
-    /// the live repository, which can be deepened or re-truncated after the commentlint: allow(JUDGE)
-    /// fingerprint was fixed. commentlint: allow(JUDGE)
+    /// A shallow boundary truncates every graph walk, so a negative ancestry
+    /// result cannot be trusted. Readers take it from here rather than from
+    /// the live repository, which can be deepened or re-truncated after the
+    /// fingerprint was fixed.
     pub fn is_shallow(&self) -> bool {
         self.shallow
     }
 
-    /// Whether sparse configuration and the shallow boundary still match the commentlint: allow(JUDGE)
-    /// state this snapshot's cache keys record. commentlint: allow(JUDGE)
+    /// Whether sparse configuration and the shallow boundary still match the
+    /// state this snapshot's cache keys record.
     ///
-    /// The keys record that state once, while a graph walk reads the live commentlint: allow(JUDGE)
-    /// repository later. A concurrent fetch between the two makes a walk commentlint: allow(JUDGE)
-    /// answer for a boundary the key does not name, and a boundary that moves commentlint: allow(JUDGE)
-    /// away and back leaves that answer reachable under the original key. commentlint: allow(JUDGE)
-    /// State that cannot be re-read counts as moved: an unverifiable boundary commentlint: allow(JUDGE)
-    /// is no basis for retaining a verdict derived from one. commentlint: allow(JUDGE)
+    /// The keys record that state once, while a graph walk reads the live
+    /// repository later. A concurrent fetch between the two makes a walk
+    /// answer for a boundary the key does not name, and a boundary that moves
+    /// away and back leaves that answer reachable under the original key.
+    /// State that cannot be re-read counts as moved: an unverifiable boundary
+    /// is no basis for retaining a verdict derived from one.
     pub(super) fn repository_state_still_current(&self, budget: &EvalBudget) -> bool {
         let ctx = ScanCtx::root(budget);
         match repository_state(&self.repo, &ctx) {
@@ -475,11 +475,11 @@ impl CheckoutSnapshot {
     /// leave it: absolute paths, `..` components, and symlinked parent
     /// directories.
     ///
-    /// The final component stays unresolved, so a returned path may itself be commentlint: allow(JUDGE)
-    /// a symlink pointing outside the worktree — `worktree_content_hash` needs commentlint: allow(JUDGE)
-    /// that in order to hash the link rather than its target. A caller that commentlint: allow(JUDGE)
-    /// opens the path with following enabled therefore has to resolve and commentlint: allow(JUDGE)
-    /// re-check it, or use no-follow access such as `symlink_metadata`. commentlint: allow(JUDGE)
+    /// The final component stays unresolved, so a returned path may itself be
+    /// a symlink pointing outside the worktree — `worktree_content_hash` needs
+    /// that in order to hash the link rather than its target. A caller that
+    /// opens the path with following enabled therefore has to resolve and
+    /// re-check it, or use no-follow access such as `symlink_metadata`.
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
         contained_path(self.repo.workdir()?, Path::new(rela_path))
     }
@@ -503,11 +503,11 @@ pub(super) enum WorktreeEntry {
 impl CheckoutSnapshot {
     /// Inspects `rela_path` beneath the worktree without traversing a symlink.
     ///
-    /// `worktree_path` validates containment against a pathname, which a commentlint: allow(JUDGE)
-    /// concurrent checkout can invalidate by replacing an ancestor directory commentlint: allow(JUDGE)
-    /// with a symlink before the caller looks. Resolving through commentlint: allow(JUDGE)
-    /// `open_parent_beneath` pins every ancestor's inode instead, so no rung of commentlint: allow(JUDGE)
-    /// the path can be swapped out from under this stat. commentlint: allow(JUDGE)
+    /// `worktree_path` validates containment against a pathname, which a
+    /// concurrent checkout can invalidate by replacing an ancestor directory
+    /// with a symlink before the caller looks. Resolving through
+    /// `open_parent_beneath` pins every ancestor's inode instead, so no rung of
+    /// the path can be swapped out from under this stat.
     pub(super) fn worktree_entry(&self, rela_path: &str) -> WorktreeEntry {
         let Some(workdir) = self.repo.workdir() else {
             return WorktreeEntry::Unresolvable(format!(
@@ -627,9 +627,9 @@ pub fn snapshot_checkout(
     }
     let (repository_state, shallow) = repository_state(&repo, &ctx)?;
     let dirty_fingerprint = fingerprint_entries(&dirty_entries, &repository_state);
-    // Stop the watchdog before the last check, so neither the fingerprint nor commentlint: allow(JUDGE)
-    // the watchdog's own teardown can carry a cacheable snapshot past the commentlint: allow(JUDGE)
-    // deadline that the scan's final poll still satisfied. commentlint: allow(JUDGE)
+    // Stop the watchdog before the last check, so neither the fingerprint nor
+    // the watchdog's own teardown can carry a cacheable snapshot past the
+    // deadline that the scan's final poll still satisfied.
     drop(watchdog);
     budget.check()?;
     Ok(CheckoutSnapshot {
@@ -650,9 +650,9 @@ fn checkout_identity(repo: &gix::Repository) -> Result<String, SnapshotError> {
         .canonicalize()
         .map_err(|error| SnapshotError::Open(error.to_string()))?;
     // The digest suffix distinguishes non-UTF-8 git-dir paths that share a
-    // lossy string, and the tag keeps the two encodings disjoint: a checkout commentlint: allow(JUDGE)
-    // whose valid path reads exactly like some lossy rendering would commentlint: allow(JUDGE)
-    // otherwise share an identity with the bytes it stands for. commentlint: allow(JUDGE)
+    // lossy string, and the tag keeps the two encodings disjoint: a checkout
+    // whose valid path reads exactly like some lossy rendering would
+    // otherwise share an identity with the bytes it stands for.
     match git_dir.to_str() {
         Some(utf8) => Ok(format!("utf8:{utf8}")),
         None => {
@@ -701,18 +701,18 @@ fn scan_dirty_entries(
         }
     }
     ctx.check()?;
-    // The status walk skips stats for assume-valid entries and reports commentlint: allow(JUDGE)
-    // skip-worktree entries clean whether or not a file is materialized, so commentlint: allow(JUDGE)
-    // both classes are keyed straight from the index instead. commentlint: allow(JUDGE)
+    // The status walk skips stats for assume-valid entries and reports
+    // skip-worktree entries clean whether or not a file is materialized, so
+    // both classes are keyed straight from the index instead.
     let index = repo
         .index_or_empty()
         .map_err(|error| SnapshotError::Scan(error.to_string()))?;
     for entry in index.entries() {
         use gix::index::entry::Flags;
         // `ctx.check()` precedes classification so every entry observes
-        // cancellation during large scans. Ordinary entries reach `continue` commentlint: allow(JUDGE)
-        // without per-entry work, so polling only on the rare classes would commentlint: allow(JUDGE)
-        // walk a whole index past an armed deadline. commentlint: allow(JUDGE)
+        // cancellation during large scans. Ordinary entries reach `continue`
+        // without per-entry work, so polling only on the rare classes would
+        // walk a whole index past an armed deadline.
         ctx.check()?;
         let status = if entry.flags.contains(Flags::SKIP_WORKTREE) {
             "skip_worktree"
@@ -724,9 +724,9 @@ fn scan_dirty_entries(
         let rela_path = entry.path(&index);
         let (path, path_encoding, raw_path) = encode_path(rela_path);
         // A chmod moves the git entry mode while the bytes stay equal, so
-        // the mode tag participates alongside the content hash. The index commentlint: allow(JUDGE)
-        // blob id separates two absent-file states whose staged content commentlint: allow(JUDGE)
-        // differs. commentlint: allow(JUDGE)
+        // the mode tag participates alongside the content hash. The index
+        // blob id separates two absent-file states whose staged content
+        // differs.
         entries.insert(DirtyEntry {
             content_hash: format!(
                 "{}:{}:{}",
@@ -772,10 +772,10 @@ fn index_worktree_entry(
                     content_hash: "absent".to_string(),
                 }),
                 // The mode tag joins the content hash for the same reason it
-                // does on assume-valid and skip-worktree entries: a chmod commentlint: allow(JUDGE)
-                // moves git's worktree mode between 100644 and 100755 while commentlint: allow(JUDGE)
-                // the bytes stay equal, and a file that is already dirty by commentlint: allow(JUDGE)
-                // content would otherwise absorb that move unrecorded. commentlint: allow(JUDGE)
+                // does on assume-valid and skip-worktree entries: a chmod
+                // moves git's worktree mode between 100644 and 100755 while
+                // the bytes stay equal, and a file that is already dirty by
+                // content would otherwise absorb that move unrecorded.
                 EntryStatus::Change(_) => Some(DirtyEntry {
                     content_hash: format!(
                         "{}:{}",
@@ -932,8 +932,8 @@ fn worktree_content_hash(
     }
     if !file_type.is_file() {
         if file_type.is_dir() {
-            // A dirty tracked gitlink resolves to a directory; its HEAD and commentlint: allow(JUDGE)
-            // its own uncommitted state are the content that moved. commentlint: allow(JUDGE)
+            // A dirty tracked gitlink resolves to a directory; its HEAD and
+            // its own uncommitted state are the content that moved.
             return submodule_hash_at(&dir, name.as_os_str(), ctx);
         }
         return Ok("not-a-regular-file".to_string());
@@ -942,9 +942,9 @@ fn worktree_content_hash(
         Ok(Some(file)) => file,
         // The path changed kind under the classification above.
         Ok(None) => return Ok("unreadable".to_string()),
-        // A failure to read hides content that still governs the checkout, so commentlint: allow(JUDGE)
-        // it must not collapse onto a fixed token that two different dirty commentlint: allow(JUDGE)
-        // states would share. commentlint: allow(JUDGE)
+        // A failure to read hides content that still governs the checkout, so
+        // it must not collapse onto a fixed token that two different dirty
+        // states would share.
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     let mut hash = Sha256::new();
@@ -982,8 +982,8 @@ fn conflict_content_hash(
     let worktree = worktree_content_hash(repo, rela_path, ctx)?;
     hash.update(worktree.as_bytes());
     // A conflicted path stays conflicted through a chmod, so without the mode
-    // tag a 100644 and a 100755 worktree share this hash — the same aliasing commentlint: allow(JUDGE)
-    // the modified and index-keyed entries already record. commentlint: allow(JUDGE)
+    // tag a 100644 and a 100755 worktree share this hash — the same aliasing
+    // the modified and index-keyed entries already record.
     hash.update(b"mode\0");
     hash.update(worktree_mode_tag(repo, rela_path).as_bytes());
     Ok(format!("conflict:{:x}", hash.finalize()))
@@ -1047,17 +1047,17 @@ fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> S
     format!("{:x}", hash.finalize())
 }
 
-/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone commentlint: allow(JUDGE)
-/// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
-/// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
-/// read them. commentlint: allow(JUDGE)
+/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone
+/// holds still while files under the submodule path are edited, and those
+/// files sit inside the superproject worktree where applicability checks
+/// read them.
 /// The pinned parent descriptor prevents ancestor-path replacement from
 /// redirecting the nested scan.
 ///
 /// `gix` opens a repository by path, so the pinned directory is named through
-/// `/proc/self/fd`, which resolves to the descriptor's inode however the commentlint: allow(JUDGE)
-/// original pathname is rewritten. The descriptor stays open for the whole commentlint: allow(JUDGE)
-/// nested scan, which is what keeps that name valid. commentlint: allow(JUDGE)
+/// `/proc/self/fd`, which resolves to the descriptor's inode however the
+/// original pathname is rewritten. The descriptor stays open for the whole
+/// nested scan, which is what keeps that name valid.
 #[cfg(target_os = "linux")]
 fn submodule_hash_at(
     dir: &OwnedFd,
@@ -1092,10 +1092,10 @@ fn submodule_hash_at(
     Ok("unreadable-gitlink".to_string())
 }
 
-/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone commentlint: allow(JUDGE)
-/// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
-/// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
-/// read them. commentlint: allow(JUDGE)
+/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone
+/// holds still while files under the submodule path are edited, and those
+/// files sit inside the superproject worktree where applicability checks
+/// read them.
 fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotError> {
     let Some(nested) = ctx.nested() else {
         return Err(SnapshotError::Scan(format!(
@@ -1117,8 +1117,8 @@ fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotErro
     let entries = scan_dirty_entries(&submodule, &nested)?;
     let (state, _) = repository_state(&submodule, &nested)?;
     // The nested scan needs the same HEAD-stability check the top-level one
-    // makes: a submodule that switches commits mid-scan would otherwise pair commentlint: allow(JUDGE)
-    // an old HEAD with a new worktree and key that tuple as a clean state. commentlint: allow(JUDGE)
+    // makes: a submodule that switches commits mid-scan would otherwise pair
+    // an old HEAD with a new worktree and key that tuple as a clean state.
     let head_after = match submodule.head_id() {
         Ok(head) => head.detach().to_string(),
         Err(_) => "unborn".to_string(),
@@ -1165,23 +1165,23 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     "file"
 }
 
-/// Folds `path`'s bytes into `hash` chunk by chunk, so a large file bounds commentlint: allow(JUDGE)
-/// neither the working set nor the digest. Anything other than a regular file commentlint: allow(JUDGE)
-/// counts as absent, since opening a FIFO can block indefinitely. commentlint: allow(JUDGE)
+/// Folds `path`'s bytes into `hash` chunk by chunk, so a large file bounds
+/// neither the working set nor the digest. Anything other than a regular file
+/// counts as absent, since opening a FIFO can block indefinitely.
 fn fold_file(
     hash: &mut Sha256,
     path: &Path,
     ctx: &ScanCtx<'_>,
 ) -> Result<Option<u64>, SnapshotError> {
-    // The open is the sole authority on what is there: a stat first would commentlint: allow(JUDGE)
-    // leave a window for the path to be swapped before the read. commentlint: allow(JUDGE)
+    // The open is the sole authority on what is there: a stat first would
+    // leave a window for the path to be swapped before the read.
     let mut file = match open_regular_no_follow_at(rfs::CWD, path.as_os_str()) {
         Ok(Some(file)) => file,
         Ok(None) => {
             hash.update(b"absent\0");
             return Ok(None);
         }
-        // Any other failure hides content that still governs the checkout. commentlint: allow(JUDGE)
+        // Any other failure hides content that still governs the checkout.
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
     hash.update(b"present\0");
@@ -1189,7 +1189,7 @@ fn fold_file(
 }
 
 /// A read error propagates rather than truncating: a prefix would key as a
-/// genuinely shorter file. commentlint: allow(JUDGE)
+/// genuinely shorter file.
 fn fold_open_file(
     hash: &mut Sha256,
     file: &mut std::fs::File,
@@ -1211,19 +1211,19 @@ fn fold_open_file(
     }
 }
 
-/// Repository state beyond HEAD and the dirty set that changes what the engine commentlint: allow(JUDGE)
-/// can see: which paths materialize, and how far history reaches. commentlint: allow(JUDGE)
+/// Repository state beyond HEAD and the dirty set that changes what the engine
+/// can see: which paths materialize, and how far history reaches.
 ///
-/// Sparse configuration and patterns decide materialization. The shallow commentlint: allow(JUDGE)
-/// boundary decides whether an ancestry walk can reach a conclusion at all, so commentlint: allow(JUDGE)
-/// unshallowing has to move the generation. commentlint: allow(JUDGE)
+/// Sparse configuration and patterns decide materialization. The shallow
+/// boundary decides whether an ancestry walk can reach a conclusion at all, so
+/// unshallowing has to move the generation.
 ///
 /// Object availability stays out of this digest: in a partial clone a fetch
-/// materializes a missing blob without touching HEAD, the worktree, sparse commentlint: allow(JUDGE)
-/// configuration, or the shallow file, and no cheap repository read separates commentlint: allow(JUDGE)
-/// "absent" from "absent so far". A cache keyed by this generation therefore commentlint: allow(JUDGE)
-/// must not retain an outcome that an unreadable object produced; such an commentlint: allow(JUDGE)
-/// outcome is transient exactly as a budget-driven one is. commentlint: allow(JUDGE)
+/// materializes a missing blob without touching HEAD, the worktree, sparse
+/// configuration, or the shallow file, and no cheap repository read separates
+/// "absent" from "absent so far". A cache keyed by this generation therefore
+/// must not retain an outcome that an unreadable object produced; such an
+/// outcome is transient exactly as a budget-driven one is.
 fn repository_state(
     repo: &gix::Repository,
     ctx: &ScanCtx<'_>,
@@ -1239,9 +1239,9 @@ fn repository_state(
     fold_file(&mut hash, &repo.git_dir().join("info/sparse-checkout"), ctx)?;
     hash.update(b"shallow\0");
     // The digest and the shallow verdict come from one read, so a shallow file
-    // removed between them cannot pair a shallow fingerprint with commentlint: allow(JUDGE)
-    // `shallow == false`. A present-but-empty file is not shallow, which is commentlint: allow(JUDGE)
-    // what gix reports too. commentlint: allow(JUDGE)
+    // removed between them cannot pair a shallow fingerprint with
+    // `shallow == false`. A present-but-empty file is not shallow, which is
+    // what gix reports too.
     let shallow = fold_file(&mut hash, &repo.shallow_file(), ctx)?;
     Ok((
         hash.finalize().into(),
@@ -1305,9 +1305,9 @@ mod tests {
     /// to survive an ancestor being replaced after the path was validated.
     ///
     /// The swap here is the race made deterministic: resolve first, substitute
-    /// the ancestor, then read. A descriptor pins the directory it opened, so commentlint: allow(JUDGE)
-    /// the later read still lands on the originally contained file; a path commentlint: allow(JUDGE)
-    /// re-walked at open time would traverse the substituted link instead. commentlint: allow(JUDGE)
+    /// the ancestor, then read. A descriptor pins the directory it opened, so
+    /// the later read still lands on the originally contained file; a path
+    /// re-walked at open time would traverse the substituted link instead.
     #[test]
     fn a_swapped_ancestor_cannot_redirect_a_pinned_parent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1365,8 +1365,8 @@ mod tests {
     }
 
     /// Resolving a known child needs search permission, not read permission,
-    /// so a traversal that demanded read access would lose track of a tracked commentlint: allow(JUDGE)
-    /// file that git still reads — and its content edits with it. commentlint: allow(JUDGE)
+    /// so a traversal that demanded read access would lose track of a tracked
+    /// file that git still reads — and its content edits with it.
     #[test]
     fn an_execute_only_ancestor_still_resolves() {
         use std::os::unix::fs::PermissionsExt;

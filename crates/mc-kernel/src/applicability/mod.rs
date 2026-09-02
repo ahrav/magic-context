@@ -106,16 +106,16 @@ const BLOCK_FENCE_ATTEMPTS: usize = 2;
 impl ApplicabilityEngine {
     /// The one entry point retrieval consumers use: snapshot the checkout
     /// once, classify the batch, and perform read repair for stale and
-    /// clearing classifications. kh8.6 composes the result as an input
-    /// predicate; no visibility policy lives here.
+    /// clearing classifications. Admission uses the classifications as an
+    /// input predicate; no visibility policy lives here.
     ///
     /// A checkout that cannot be snapshotted (unreadable, unborn HEAD,
     /// budget exhausted) classifies every candidate uncertain — that is a
     /// domain outcome, not a store failure.
     ///
-    /// An object whose durable block this request could not clear reports commentlint: allow(JUDGE)
-    /// uncertain rather than current: the block still stands for every other commentlint: allow(JUDGE)
-    /// reader, so a current label here would auto-inject a blocked object. commentlint: allow(JUDGE)
+    /// An object whose durable block this request could not clear reports
+    /// uncertain rather than current: the block still stands for every other
+    /// reader, so a current label here would auto-inject a blocked object.
     pub fn evaluate(
         &self,
         store: &KernelStore,

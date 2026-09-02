@@ -22,10 +22,10 @@ use crate::fixtures::{
 };
 use crate::harness::Proof;
 
-/// Declared tables `assert_seeded` skips: the seed leaves them empty. commentlint: allow(JUDGE)
-/// The first eight have no public writer. commentlint: allow(JUDGE)
-/// Ingest removes its own `artifact_ingestion_reservations` row before returning. commentlint: allow(JUDGE)
-/// A purge removes its own `artifact_pending_unlinks` row once the object is unlinked. commentlint: allow(JUDGE)
+/// Declared tables `assert_seeded` skips: the seed leaves them empty.
+/// The first eight have no public writer.
+/// Ingest removes its own `artifact_ingestion_reservations` row before returning.
+/// A purge removes its own `artifact_pending_unlinks` row once the object is unlinked.
 const UNSEEDED_TABLES: &[&str] = &[
     "entities",
     "entity_aliases",
@@ -39,7 +39,7 @@ const UNSEEDED_TABLES: &[&str] = &[
     "artifact_pending_unlinks",
 ];
 
-/// Declared tables `backup` fills; `assert_seeded` skips them until a backup has run. commentlint: allow(JUDGE)
+/// Declared tables `backup` fills; `assert_seeded` skips them until a backup has run.
 const BACKUP_TABLES: &[&str] = &["capture_pins", "capture_pin_refs"];
 
 /// A detector-recognizable secret that causes redacted text to create a `durable_text_redactions` row.
@@ -224,9 +224,9 @@ fn backup_and_restore_reproduce_every_table_and_the_commit_seq() {
         .unwrap();
     let captured = proof.tip();
     assert_eq!(backup.captured_commit_seq, captured);
-    // The fixture leaves `evidence-kept` live and invalidates `evidence-deleted` commentlint: allow(JUDGE)
-    // and `evidence-purged`, so capture owes exactly the live one. Comparing commentlint: allow(JUDGE)
-    // identities catches a capture that pins a stale row or misses the live one. commentlint: allow(JUDGE)
+    // The fixture leaves `evidence-kept` live and invalidates `evidence-deleted`
+    // and `evidence-purged`, so capture owes exactly the live one. Comparing
+    // identities catches a capture that pins a stale row or misses the live one.
     assert_eq!(backup.evidence_refs, ["evidence-kept"]);
     let capture_pin_id = backup.capture_pin_id.clone().unwrap();
     let pinned = proof
