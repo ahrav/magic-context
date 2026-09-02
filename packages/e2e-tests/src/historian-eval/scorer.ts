@@ -428,6 +428,26 @@ export function compareProbeAnswer(args: {
     return { probeId: probe.id, outcome: "fail", expected, actual: exchange.answerRaw };
 }
 
+/**
+ * The fail reasons a score's own published evidence implies.
+ *
+ * `invalid-output` is absent because it comes from the run's status rather than anything the score records,
+ * so a consumer can check these four in both directions and that one in neither.
+ */
+export function evidenceFailReasons(score: {
+    recall: number | null;
+    falseAuthoritativeMatches: readonly string[];
+    structuralFindings: readonly string[];
+    probeVerdicts: readonly { outcome: ProbeVerdict["outcome"] }[];
+}): FailReason[] {
+    const reasons = new Set<FailReason>();
+    if (score.falseAuthoritativeMatches.length > 0) reasons.add("false-authoritative");
+    if (score.recall !== null && score.recall < 1) reasons.add("recall");
+    if (score.structuralFindings.length > 0) reasons.add("structural");
+    if (score.probeVerdicts.some((verdict) => verdict.outcome === "fail")) reasons.add("probe");
+    return FAIL_REASONS.filter((reason) => reasons.has(reason));
+}
+
 function assembleScore(args: {
     scenarioId: string;
     facts: FactsScore;
@@ -441,12 +461,13 @@ function assembleScore(args: {
     source: ScenarioScore["source"];
 }): ScenarioScore {
     const { scenarioId, facts, structuralFindings, probeVerdicts, anyRunInvalid, system, source } = args;
-    const failReasons = new Set<FailReason>();
+    const failReasons = new Set<FailReason>(evidenceFailReasons({
+        recall: facts.recall,
+        falseAuthoritativeMatches: facts.falseAuthoritativeMatches,
+        structuralFindings,
+        probeVerdicts,
+    }));
     if (anyRunInvalid) failReasons.add("invalid-output");
-    if (facts.falseAuthoritativeMatches.length > 0) failReasons.add("false-authoritative");
-    if (facts.recall !== null && facts.recall < 1) failReasons.add("recall");
-    if (structuralFindings.length > 0) failReasons.add("structural");
-    if (probeVerdicts.some((verdict) => verdict.outcome === "fail")) failReasons.add("probe");
 
     //
     const trimmed = probeVerdicts.find((verdict) => verdict.outcome === "error-trimmed");
@@ -1828,6 +1849,20 @@ function parseNullableText(value: unknown, label: string): string | null {
 }
 
 
+function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
+    return p.array(raw, label).map((entry, index) => {
+        const probeLabel = `${label}[${index}]`;
+        const probe = p.record(entry, probeLabel);
+        p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
+        return {
+            probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
+            outcome: p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`),
+            expected: p.text(probe.expected, `${probeLabel}.expected`),
+            actual: parseNullableText(probe.actual, `${probeLabel}.actual`),
+        };
+    });
+}
+
 export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const value = p.record(raw, label);
     p.exact(value, [
@@ -1854,11 +1889,34 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     if (recall !== null && (expectedClaimsTotal === 0 || recall !== expectedClaimsMatched / expectedClaimsTotal)) {
         p.fail(`${label}.recall: derived-mismatch`);
     }
+    const verdict = p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`);
+    const failReasons = p.array(value.failReasons, `${label}.failReasons`)
+        .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`));
+    p.unique(failReasons, `${label}.failReasons`);
+    const structuralFindings = stringArray("structuralFindings");
+    const falseAuthoritativeMatches = stringArray("falseAuthoritativeMatches");
+    const probeVerdicts = parseProbeVerdicts(value.probeVerdicts, `${label}.probeVerdicts`);
+    // `assembleScore` turns each of these into its reason, and `buildLaneReport` aggregates the declared
+    // reasons rather than re-deriving them, so a contradictory score would rebuild unchanged.
+    const derivedReasons = new Set(evidenceFailReasons({
+        recall, falseAuthoritativeMatches, structuralFindings, probeVerdicts,
+    }));
+    for (const reason of derivedReasons) {
+        if (!failReasons.includes(reason)) p.fail(`${label}.failReasons: derived-mismatch`);
+    }
+    // `invalid-output` comes from the run's status, which the score does not publish.
+    for (const reason of failReasons) {
+        if (reason !== "invalid-output" && !derivedReasons.has(reason)) p.fail(`${label}.failReasons: derived-mismatch`);
+    }
+    if (verdict === "ERROR") {
+        if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
+    } else if ((verdict === "PASS") !== (failReasons.length === 0)) {
+        p.fail(`${label}.verdict: derived-mismatch`);
+    }
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
-        verdict: p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`),
-        failReasons: p.array(value.failReasons, `${label}.failReasons`)
-            .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`)),
+        verdict,
+        failReasons,
         errorReason: parseNullableText(value.errorReason, `${label}.errorReason`),
         errorDetail: parseNullableText(value.errorDetail, `${label}.errorDetail`),
         precision,
@@ -1867,19 +1925,9 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         expectedClaimsTotal,
         visibleClaimsMatched,
         visibleClaimsTotal,
-        falseAuthoritativeMatches: stringArray("falseAuthoritativeMatches"),
-        structuralFindings: stringArray("structuralFindings"),
-        probeVerdicts: p.array(value.probeVerdicts, `${label}.probeVerdicts`).map((entry, index) => {
-            const probeLabel = `${label}.probeVerdicts[${index}]`;
-            const probe = p.record(entry, probeLabel);
-            p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
-            return {
-                probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
-                outcome: p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`),
-                expected: p.text(probe.expected, `${probeLabel}.expected`),
-                actual: parseNullableText(probe.actual, `${probeLabel}.actual`),
-            };
-        }),
+        falseAuthoritativeMatches,
+        structuralFindings,
+        probeVerdicts,
         system: parseSystemVersionTuple(p, value.system, `${label}.system`),
         source: p.enumeration(value.source, SCORE_SOURCES, `${label}.source`),
     };

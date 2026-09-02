@@ -2472,7 +2472,8 @@ describe("buildLaneReport", () => {
         const fa: ScenarioScore = {
             ...passScore("hse-b"),
             verdict: "FAIL",
-            failReasons: ["false-authoritative"],
+            // A failing probe is its own reason, so `assembleScore` would list both.
+            failReasons: ["false-authoritative", "probe"],
             falseAuthoritativeMatches: ["abs-x"],
             probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "" }],
         };
@@ -2547,6 +2548,23 @@ describe("buildLaneReport", () => {
         const nullRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         nullRecall.scenarios[0]!.recall = null;
         expect(() => parseLaneReport(nullRecall)).not.toThrow();
+        // `assembleScore` turns each published condition into its reason, and the rebuild trusts the declared
+        // ones, so a green scenario over failing evidence would otherwise survive both checks.
+        const greenOverEvidence = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        greenOverEvidence.scenarios[1]!.verdict = "PASS";
+        greenOverEvidence.scenarios[1]!.failReasons = [];
+        expect(() => parseLaneReport(greenOverEvidence))
+            .toThrow(/report\.scenarios\[1\]\.failReasons: derived-mismatch/);
+        const reasonWithoutEvidence = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        reasonWithoutEvidence.scenarios[0]!.verdict = "FAIL";
+        reasonWithoutEvidence.scenarios[0]!.failReasons = ["structural"];
+        expect(() => parseLaneReport(reasonWithoutEvidence))
+            .toThrow(/report\.scenarios\[0\]\.failReasons: derived-mismatch/);
+        // `invalid-output` comes from the run status, so it is admissible without published evidence.
+        const invalidOutput = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        invalidOutput.scenarios[0]!.verdict = "FAIL";
+        invalidOutput.scenarios[0]!.failReasons = ["invalid-output"];
+        expect(() => parseLaneReport(invalidOutput)).toThrow(/^report: derived-mismatch/);
         // A reason key is only ever written by incrementing, so a zero count fails on its own field.
         const zeroCount = structuredClone(report);
         zeroCount.aggregate.failCountsByReason = { "false-authoritative": 0 };

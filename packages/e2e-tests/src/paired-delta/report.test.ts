@@ -1011,6 +1011,11 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        // Every analyzable family needs a coordinate whose primary arms all completed.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.healthyCoordinates = 0;
+            body.runSummary.evidenceComplete = false;
+        }))).toThrow(/report\.body\.analysis\.analyzableFamilyCount: healthy-coordinate-shortfall/);
         // Joining ids with a separator would let an embedded separator forge a matching family set.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const [first, second] = body.analysis.endpoints;

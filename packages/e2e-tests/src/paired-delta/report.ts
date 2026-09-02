@@ -626,6 +626,11 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.runSummary.healthyCoordinates > body.runSummary.plannedCoordinates) {
         p.fail("report.body.runSummary.healthyCoordinates: integer-invalid");
     }
+    // A primary observation is recorded only for a coordinate whose every primary arm completed, which is the
+    // predicate `healthyCoordinates` counts, and each coordinate carries one family.
+    if (body.analysis.analyzableFamilyCount > body.runSummary.healthyCoordinates) {
+        p.fail("report.body.analysis.analyzableFamilyCount: healthy-coordinate-shortfall");
+    }
     if (canonicalFingerprint(body.regret.live) !== canonicalFingerprint(body.analysis.liveRegret)) {
         p.fail("report.body.regret.live: analysis-mismatch");
     }
