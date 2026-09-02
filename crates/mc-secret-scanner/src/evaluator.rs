@@ -63,119 +63,45 @@ pub(crate) fn evaluate(
             limits_hit = Some(LimitExhausted::Work);
             break 'rules;
         }
+        // The value group `("[a-z0-9=_\-]{8,20}")` makes a double quote a necessary byte of every match.
         if rule.declaration.name == "hashicorp-tf-password" && memchr::memchr(b'"', bytes).is_none()
         {
             continue;
         }
-        if rule.declaration.name == "magic-keyed-assignment" && input_is_ascii {
-            let mut cursor = 0;
-            while let Some(equals) =
-                memchr::memchr(b'=', &bytes[cursor..]).map(|equals| cursor + equals)
-            {
-                let spans = match ascii_assignment_at(input, equals) {
-                    Ok(spans) => spans,
-                    Err(Abort::Work) => {
-                        limits_hit = Some(LimitExhausted::Work);
-                        break 'rules;
-                    }
-                    Err(Abort::Invalid(error)) => return Err(error),
-                };
-                if let Some(spans) = spans {
-                    cursor = spans.full.end();
-                    if candidates >= limits.max_candidates {
-                        limits_hit = Some(LimitExhausted::Candidates);
-                        break 'rules;
-                    }
-                    candidates += 1;
-                    match evaluate_candidate_spans(rules, rule, spans, input, &mut work, limits) {
-                        Ok(Some(finding)) => findings.push(finding),
-                        Ok(None) => {}
-                        Err(Abort::Work) => {
-                            limits_hit = Some(LimitExhausted::Work);
-                            break 'rules;
-                        }
-                        Err(Abort::Invalid(error)) => return Err(error),
-                    }
-                } else {
-                    cursor = equals + 1;
-                }
-            }
-            continue;
-        }
         if input_is_ascii {
-            if let Some(value_quote) = ascii_assignment_quoted_rule(rule.declaration.name.as_str())
-            {
+            if let Some(form) = KeyedForm::for_rule(&rule.declaration.name) {
                 let mut cursor = 0;
-                while let Some(equals) =
-                    memchr::memchr(b'=', &bytes[cursor..]).map(|offset| cursor + offset)
+                while let Some(at) =
+                    memchr::memchr(form.anchor(), &bytes[cursor..]).map(|offset| cursor + offset)
                 {
-                    let spans = match ascii_assignment_quoted_at(input, equals, value_quote) {
-                        Ok(spans) => spans,
-                        Err(Abort::Work) => {
-                            limits_hit = Some(LimitExhausted::Work);
-                            break 'rules;
-                        }
-                        Err(Abort::Invalid(error)) => return Err(error),
-                    };
-                    if let Some(spans) = spans {
-                        cursor = spans.full.end();
-                        if candidates >= limits.max_candidates {
-                            limits_hit = Some(LimitExhausted::Candidates);
-                            break 'rules;
-                        }
-                        candidates += 1;
-                        match evaluate_candidate_spans(rules, rule, spans, input, &mut work, limits)
-                        {
-                            Ok(Some(finding)) => findings.push(finding),
-                            Ok(None) => {}
-                            Err(Abort::Work) => {
-                                limits_hit = Some(LimitExhausted::Work);
+                    match form.probe(input, at, cursor)? {
+                        Probe::Candidate(spans) => {
+                            cursor = spans.full.end();
+                            if candidates >= limits.max_candidates {
+                                limits_hit = Some(LimitExhausted::Candidates);
                                 break 'rules;
                             }
-                            Err(Abort::Invalid(error)) => return Err(error),
-                        }
-                    } else {
-                        cursor = equals + 1;
-                    }
-                }
-                continue;
-            }
-        }
-        if input_is_ascii {
-            if let Some((key_quote, value_quote)) =
-                ascii_quoted_keyed_rule(rule.declaration.name.as_str())
-            {
-                let mut cursor = 0;
-                while let Some(start) =
-                    memchr::memchr(key_quote, &bytes[cursor..]).map(|offset| cursor + offset)
-                {
-                    let spans = match ascii_quoted_keyed_at(input, start, key_quote, value_quote) {
-                        Ok(spans) => spans,
-                        Err(Abort::Work) => {
-                            limits_hit = Some(LimitExhausted::Work);
-                            break 'rules;
-                        }
-                        Err(Abort::Invalid(error)) => return Err(error),
-                    };
-                    if let Some(spans) = spans {
-                        cursor = spans.full.end();
-                        if candidates >= limits.max_candidates {
-                            limits_hit = Some(LimitExhausted::Candidates);
-                            break 'rules;
-                        }
-                        candidates += 1;
-                        match evaluate_candidate_spans(rules, rule, spans, input, &mut work, limits)
-                        {
-                            Ok(Some(finding)) => findings.push(finding),
-                            Ok(None) => {}
-                            Err(Abort::Work) => {
-                                limits_hit = Some(LimitExhausted::Work);
-                                break 'rules;
+                            candidates += 1;
+                            // `candidate_spans` counts an empty value as a candidate and skips it; the fast path must charge the same candidate budget.
+                            if spans.value.is_empty() {
+                                continue;
                             }
-                            Err(Abort::Invalid(error)) => return Err(error),
+                            match evaluate_candidate_spans(
+                                rules, rule, spans, input, &mut work, limits,
+                            ) {
+                                Ok(Some(finding)) => findings.push(finding),
+                                Ok(None) => {}
+                                Err(Abort::Work) => {
+                                    limits_hit = Some(LimitExhausted::Work);
+                                    break 'rules;
+                                }
+                                Err(Abort::Invalid(error)) => return Err(error),
+                            }
                         }
-                    } else {
-                        cursor = start + 1;
+                        Probe::Skip(next) => {
+                            debug_assert!(next > at, "a probe must advance past its anchor");
+                            cursor = next;
+                        }
                     }
                 }
                 continue;
@@ -465,61 +391,226 @@ fn evaluate_candidate_spans(
     }))
 }
 
-fn ascii_assignment_at(input: &str, equals: usize) -> Result<Option<CandidateSpans>, Abort> {
-    let bytes = input.as_bytes();
-    if bytes.get(equals) != Some(&b'=') {
-        return Ok(None);
-    }
-    let mut key_end = equals;
-    while key_end > 0 && is_rule_space_byte(bytes[key_end - 1]) {
-        key_end -= 1;
-    }
-    let mut run_start = key_end;
-    while run_start > 0 && is_key_byte(bytes[run_start - 1]) {
-        run_start -= 1;
-    }
-    let Some(key_start) = (run_start..key_end).find(|&index| {
-        is_word_byte(bytes[index]) && (index == 0 || !is_word_byte(bytes[index - 1]))
-    }) else {
-        return Ok(None);
-    };
-    if !contains_keyed_keyword(&bytes[key_start..key_end]) {
-        return Ok(None);
-    }
-    let mut value_start = equals + 1;
-    while bytes
-        .get(value_start)
-        .copied()
-        .is_some_and(is_rule_space_byte)
-    {
-        value_start += 1;
-    }
-    let mut value_end = value_start;
-    while let Some(byte) = bytes.get(value_end) {
-        if *byte == b'\\' {
-            if bytes.get(value_end + 1).is_none() {
-                break;
+/// Parses the ASCII subset of one keyed overlay rule without regex matching.
+///
+/// Each variant mirrors one embedded `magic-keyed-*` regex. For ASCII input
+/// `probe` must report exactly the candidates `Regex::captures_iter` reports
+/// for that regex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyedForm {
+    /// `key = value`, the value ending at a separator or shell delimiter.
+    Assignment,
+    /// `key = "value"`.
+    AssignmentQuoted { value_quote: u8 },
+    /// `"key": "value"`.
+    QuotedKeyed { key_quote: u8, value_quote: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    Candidate(CandidateSpans),
+    /// No candidate is anchored in `at..next`; the next probe starts at `next`.
+    Skip(usize),
+}
+
+impl KeyedForm {
+    fn for_rule(name: &str) -> Option<Self> {
+        match name {
+            "magic-keyed-assignment" => Some(Self::Assignment),
+            "magic-keyed-assignment-double-quoted" => {
+                Some(Self::AssignmentQuoted { value_quote: b'"' })
             }
-            value_end += 2;
-        } else if is_rule_space_byte(*byte)
-            || matches!(
-                byte,
-                b'\'' | b'"' | b'`' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'$'
-            )
-        {
-            break;
-        } else {
-            value_end += 1;
+            "magic-keyed-assignment-single-quoted" => {
+                Some(Self::AssignmentQuoted { value_quote: b'\'' })
+            }
+            "magic-keyed-double-quoted" => Some(Self::QuotedKeyed {
+                key_quote: b'"',
+                value_quote: b'"',
+            }),
+            "magic-keyed-single-quoted" => Some(Self::QuotedKeyed {
+                key_quote: b'\'',
+                value_quote: b'\'',
+            }),
+            "magic-keyed-double-single" => Some(Self::QuotedKeyed {
+                key_quote: b'"',
+                value_quote: b'\'',
+            }),
+            "magic-keyed-single-double" => Some(Self::QuotedKeyed {
+                key_quote: b'\'',
+                value_quote: b'"',
+            }),
+            _ => None,
         }
     }
-    if value_start == value_end {
-        return Ok(None);
+
+    /// The byte every candidate of this form contains.
+    fn anchor(self) -> u8 {
+        match self {
+            Self::Assignment | Self::AssignmentQuoted { .. } => b'=',
+            Self::QuotedKeyed { key_quote, .. } => key_quote,
+        }
     }
-    Ok(Some(CandidateSpans {
-        full: TextSpan::snapped(input, key_start, value_end)?,
+
+    /// Probes for the candidate anchored at `at`.
+    ///
+    /// `floor` is where `captures_iter` would resume after the previous
+    /// candidate, so no reported span starts before it.
+    fn probe(self, input: &str, at: usize, floor: usize) -> Result<Probe, ScanError> {
+        let bytes = input.as_bytes();
+        match self {
+            Self::Assignment => {
+                let Some((key_start, key_end)) = assignment_key(bytes, at, floor) else {
+                    return Ok(Probe::Skip(at + 1));
+                };
+                let value_start = skip_rule_spaces(bytes, at + 1);
+                let value_end = unquoted_value_end(bytes, value_start);
+                if value_start == value_end {
+                    return Ok(Probe::Skip(at + 1));
+                }
+                candidate(
+                    input,
+                    (key_start, value_end),
+                    (value_start, value_end),
+                    (key_start, key_end),
+                )
+            }
+            Self::AssignmentQuoted { value_quote } => {
+                let Some((key_start, key_end)) = assignment_key(bytes, at, floor) else {
+                    return Ok(Probe::Skip(at + 1));
+                };
+                let value_quote_start = skip_rule_spaces(bytes, at + 1);
+                if bytes.get(value_quote_start) != Some(&value_quote) {
+                    return Ok(Probe::Skip(at + 1));
+                }
+                let value_start = value_quote_start + 1;
+                match quoted_end(bytes, value_start, value_quote) {
+                    Ok(value_end) => candidate(
+                        input,
+                        (key_start, value_end + 1),
+                        (value_start, value_end),
+                        (key_start, key_end),
+                    ),
+                    // An `=` inside this unclosed value opens its own value at a quote this walk consumed as escaped, so that value cannot close before `resume` either.
+                    Err(resume) => Ok(Probe::Skip(resume)),
+                }
+            }
+            Self::QuotedKeyed {
+                key_quote,
+                value_quote,
+            } => {
+                let key_start = at + 1;
+                let key_end = match quoted_end(bytes, key_start, key_quote) {
+                    Ok(end) => end,
+                    // A key opening at an escaped quote inside this one is parsed in step with it, so it cannot close before `resume` either.
+                    Err(resume) => return Ok(Probe::Skip(resume)),
+                };
+                // A key opening at an escaped quote inside this one is a suffix of this key that shares its closing quote, so it fails the same checks; the closing quote itself may open the next key.
+                let skip = Probe::Skip(key_end);
+                if !quoted_key_contains_keyword(&bytes[key_start..key_end]) {
+                    return Ok(skip);
+                }
+                let separator = skip_rule_spaces(bytes, key_end + 1);
+                if bytes.get(separator) != Some(&b':') {
+                    return Ok(skip);
+                }
+                let value_quote_start = skip_rule_spaces(bytes, separator + 1);
+                if bytes.get(value_quote_start) != Some(&value_quote) {
+                    return Ok(skip);
+                }
+                let value_start = value_quote_start + 1;
+                let Ok(value_end) = quoted_end(bytes, value_start, value_quote) else {
+                    return Ok(skip);
+                };
+                candidate(
+                    input,
+                    (at, value_end + 1),
+                    (value_start, value_end),
+                    (key_start, key_end),
+                )
+            }
+        }
+    }
+}
+
+fn candidate(
+    input: &str,
+    (full_start, full_end): (usize, usize),
+    (value_start, value_end): (usize, usize),
+    (key_start, key_end): (usize, usize),
+) -> Result<Probe, ScanError> {
+    Ok(Probe::Candidate(CandidateSpans {
+        full: TextSpan::snapped(input, full_start, full_end)?,
         value: TextSpan::snapped(input, value_start, value_end)?,
         key: Some(TextSpan::snapped(input, key_start, key_end)?),
     }))
+}
+
+/// Finds the key that `(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:keyword)[A-Za-z0-9_.-]*)[sep]*=`
+/// reports before the `=` at `equals` when the search starts at `floor`.
+fn assignment_key(bytes: &[u8], equals: usize, floor: usize) -> Option<(usize, usize)> {
+    let mut key_end = equals;
+    while key_end > floor && is_rule_space_byte(bytes[key_end - 1]) {
+        key_end -= 1;
+    }
+    let mut run_start = key_end;
+    while run_start > floor && is_key_byte(bytes[run_start - 1]) {
+        run_start -= 1;
+    }
+    // `\b` holds at a word byte only when the byte before it is not one; the byte before `floor` counts even though the search does not start there.
+    let key_start = (run_start..key_end).find(|&index| {
+        is_word_byte(bytes[index]) && (index == 0 || !is_word_byte(bytes[index - 1]))
+    })?;
+    contains_keyed_keyword(&bytes[key_start..key_end]).then_some((key_start, key_end))
+}
+
+fn skip_rule_spaces(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).copied().is_some_and(is_rule_space_byte) {
+        index += 1;
+    }
+    index
+}
+
+/// Extends `(?:[^SEP'"`;&|<>()$\\]|\\.)+` from `start` and returns where it stops.
+fn unquoted_value_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while let Some(&byte) = bytes.get(end) {
+        match byte {
+            // `.` never matches a newline, so a backslash before one, or at the end of input, escapes nothing and ends the value.
+            b'\\' => match bytes.get(end + 1) {
+                None | Some(b'\n') => break,
+                Some(_) => end += 2,
+            },
+            b'\'' | b'"' | b'`' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'$' => break,
+            _ if is_rule_space_byte(byte) => break,
+            _ => end += 1,
+        }
+    }
+    end
+}
+
+/// Finds the unescaped `quote` that closes `(?:[^QUOTE\\]|\\.)*` starting at `start`.
+///
+/// `Err(resume)` means no closing quote exists, and no section opening at a
+/// quote inside `start..resume` closes either: those quotes are escaped, so a
+/// section opening there is parsed in step with this one and stops where it
+/// stopped. `.` never matches a newline, so a backslash before one, or at the
+/// end of input, ends the section without closing it.
+fn quoted_end(bytes: &[u8], start: usize, quote: u8) -> Result<usize, usize> {
+    let mut cursor = start;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte == b'\\' {
+            match bytes.get(cursor + 1) {
+                None => return Err(bytes.len()),
+                Some(b'\n') => return Err(cursor + 2),
+                Some(_) => cursor += 2,
+            }
+        } else if byte == quote {
+            return Ok(cursor);
+        } else {
+            cursor += 1;
+        }
+    }
+    Err(bytes.len())
 }
 
 // The keyed overlay rules spell their separator and value-terminator class as `[\t\n\x0B\f\r ...]`, and `u8::is_ascii_whitespace` omits `\x0B`.
@@ -537,149 +628,39 @@ fn is_word_byte(byte: u8) -> bool {
 }
 
 fn contains_keyed_keyword(key: &[u8]) -> bool {
-    key.iter().enumerate().any(|(index, byte)| {
-        let keyword: &[u8] = match byte.to_ascii_lowercase() {
-            b'a' => b"auth",
-            b'b' => b"bearer",
-            b'c' => b"credential",
-            b'k' => b"key",
-            b'p' => b"password",
-            b's' => b"secret",
-            b't' => b"token",
-            _ => return false,
-        };
-        key[index..]
-            .get(..keyword.len())
-            .is_some_and(|window| window.eq_ignore_ascii_case(keyword))
-    })
+    (0..key.len()).any(|index| keyed_keyword_at(key, index))
 }
 
-fn ascii_quoted_keyed_rule(name: &str) -> Option<(u8, u8)> {
-    match name {
-        "magic-keyed-double-quoted" => Some((b'"', b'"')),
-        "magic-keyed-single-quoted" => Some((b'\'', b'\'')),
-        "magic-keyed-double-single" => Some((b'"', b'\'')),
-        "magic-keyed-single-double" => Some((b'\'', b'"')),
-        _ => None,
-    }
-}
-
-fn ascii_assignment_quoted_rule(name: &str) -> Option<u8> {
-    match name {
-        "magic-keyed-assignment-double-quoted" => Some(b'"'),
-        "magic-keyed-assignment-single-quoted" => Some(b'\''),
-        _ => None,
-    }
-}
-
-fn ascii_assignment_quoted_at(
-    input: &str,
-    equals: usize,
-    value_quote: u8,
-) -> Result<Option<CandidateSpans>, Abort> {
-    let bytes = input.as_bytes();
-    if bytes.get(equals) != Some(&b'=') {
-        return Ok(None);
-    }
-    let mut key_end = equals;
-    while key_end > 0 && is_rule_space_byte(bytes[key_end - 1]) {
-        key_end -= 1;
-    }
-    let mut run_start = key_end;
-    while run_start > 0 && is_key_byte(bytes[run_start - 1]) {
-        run_start -= 1;
-    }
-    let Some(key_start) = (run_start..key_end).find(|&index| {
-        is_word_byte(bytes[index]) && (index == 0 || !is_word_byte(bytes[index - 1]))
-    }) else {
-        return Ok(None);
-    };
-    if !contains_keyed_keyword(&bytes[key_start..key_end]) {
-        return Ok(None);
-    }
-    let mut value_quote_start = equals + 1;
-    while bytes
-        .get(value_quote_start)
-        .copied()
-        .is_some_and(is_rule_space_byte)
-    {
-        value_quote_start += 1;
-    }
-    if bytes.get(value_quote_start) != Some(&value_quote) {
-        return Ok(None);
-    }
-    let value_start = value_quote_start + 1;
-    let Some(value_end) = quoted_end(bytes, value_start, value_quote) else {
-        return Ok(None);
-    };
-    Ok(Some(CandidateSpans {
-        full: TextSpan::snapped(input, key_start, value_end + 1)?,
-        value: TextSpan::snapped(input, value_start, value_end)?,
-        key: Some(TextSpan::snapped(input, key_start, key_end)?),
-    }))
-}
-
-fn ascii_quoted_keyed_at(
-    input: &str,
-    start: usize,
-    key_quote: u8,
-    value_quote: u8,
-) -> Result<Option<CandidateSpans>, Abort> {
-    let bytes = input.as_bytes();
-    if bytes.get(start) != Some(&key_quote) {
-        return Ok(None);
-    }
-    let key_start = start + 1;
-    let Some(key_end) = quoted_end(bytes, key_start, key_quote) else {
-        return Ok(None);
-    };
-    if !contains_keyed_keyword(&bytes[key_start..key_end]) {
-        return Ok(None);
-    }
-    let mut separator = key_end + 1;
-    while bytes
-        .get(separator)
-        .copied()
-        .is_some_and(is_rule_space_byte)
-    {
-        separator += 1;
-    }
-    if bytes.get(separator) != Some(&b':') {
-        return Ok(None);
-    }
-    let mut value_quote_start = separator + 1;
-    while bytes
-        .get(value_quote_start)
-        .copied()
-        .is_some_and(is_rule_space_byte)
-    {
-        value_quote_start += 1;
-    }
-    if bytes.get(value_quote_start) != Some(&value_quote) {
-        return Ok(None);
-    }
-    let value_start = value_quote_start + 1;
-    let Some(value_end) = quoted_end(bytes, value_start, value_quote) else {
-        return Ok(None);
-    };
-    Ok(Some(CandidateSpans {
-        full: TextSpan::snapped(input, start, value_end + 1)?,
-        value: TextSpan::snapped(input, value_start, value_end)?,
-        key: Some(TextSpan::snapped(input, key_start, key_end)?),
-    }))
-}
-
-fn quoted_end(bytes: &[u8], mut cursor: usize, quote: u8) -> Option<usize> {
-    while let Some(byte) = bytes.get(cursor) {
-        if *byte == b'\\' {
-            cursor = cursor.checked_add(2)?;
-        } else if *byte == quote {
-            return Some(cursor);
-        } else {
-            cursor += 1;
+// `(?:[^QUOTE\\]|\\.)*` parses left to right into single bytes and `\x` pairs, so the keyword alternation can only start on one of those unit boundaries.
+fn quoted_key_contains_keyword(key: &[u8]) -> bool {
+    let mut index = 0;
+    while index < key.len() {
+        if key[index] == b'\\' {
+            index += 2;
+            continue;
         }
+        if keyed_keyword_at(key, index) {
+            return true;
+        }
+        index += 1;
     }
-    None
+    false
+}
+
+fn keyed_keyword_at(key: &[u8], index: usize) -> bool {
+    let keyword: &[u8] = match key[index].to_ascii_lowercase() {
+        b'a' => b"auth",
+        b'b' => b"bearer",
+        b'c' => b"credential",
+        b'k' => b"key",
+        b'p' => b"password",
+        b's' => b"secret",
+        b't' => b"token",
+        _ => return false,
+    };
+    key[index..]
+        .get(..keyword.len())
+        .is_some_and(|window| window.eq_ignore_ascii_case(keyword))
 }
 
 // Unnamed captures hold secrets; named captures mark header fields. Ignore named captures so header-only rules return their whole match.
@@ -1577,55 +1558,6 @@ mod tests {
         }
     }
 
-    // The keyed overlay rules accept `\x0B` wherever they accept a space, and the ASCII fast paths replace those regexes outright, so a separator class that omits `\x0B` drops findings the rule still matches.
-    // The embedded rule regex is the oracle, so the test detects separator-class mismatches in the ASCII fast path.
-    #[test]
-    fn ascii_fast_paths_accept_every_separator_byte_the_rules_accept() {
-        let rules = RuleSet::from_embedded().unwrap();
-        let secret = "hunter2AbCdEf123456";
-        for separator in [b'\t', b'\n', 0x0B, b'\x0C', b'\r', b' '] {
-            let gap = char::from(separator);
-            for input in [
-                format!("password{gap}=x{secret}"),
-                format!("password={gap}x{secret}"),
-                format!("password={gap}\"x{secret}\""),
-                format!("password={gap}'x{secret}'"),
-                format!("\"password\"{gap}:\"x{secret}\""),
-                format!("'password'{gap}:'x{secret}'"),
-            ] {
-                let matched: Vec<_> = rules
-                    .active(ScanProfile::Conservative)
-                    .filter(|rule| rule.declaration.name.starts_with("magic-keyed"))
-                    .filter(|rule| rule.regex.is_match(input.as_bytes()))
-                    .map(|rule| rule.declaration.name.as_str())
-                    .collect();
-                assert!(
-                    !matched.is_empty(),
-                    "no keyed rule matches {input:?}, so the fixture cannot detect a class mismatch"
-                );
-                let report = evaluate(
-                    &rules,
-                    ScanProfile::Conservative,
-                    ScanLimits::default(),
-                    [0u8; 32],
-                    &input,
-                )
-                .unwrap();
-                assert!(
-                    !report.findings.is_empty(),
-                    "separator {separator:#04x} in {input:?} matches {matched:?} but the ASCII fast path reported nothing"
-                );
-                for finding in &report.findings {
-                    let value = &input[finding.value_span.start()..finding.value_span.end()];
-                    assert!(
-                        !value.starts_with(char::from(separator)),
-                        "separator {separator:#04x} in {input:?} leaked into the reported value {value:?}"
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn crc32_matches_standard_vector() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
@@ -1646,15 +1578,158 @@ mod tests {
         }
     }
 
-    fn ascii_keyed_assignment_rule() -> Rule {
-        alternation_rule(
-            r##"{"name":"magic-keyed-assignment","regex":"(?i)(?-u:\\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[ \\t\\n\\r]*=[ \\t\\n\\r]*(?P<value>(?:[^ \\t\\n\\r'\"`;&|<>()$\\\\]|\\\\.)+)","anchors":["key"],"radius":16,"key_group":"key","value_group":"value","reject_scalars":true}"##,
-        )
+    const KEYED_RULE_NAMES: [&str; 7] = [
+        "magic-keyed-assignment",
+        "magic-keyed-assignment-double-quoted",
+        "magic-keyed-assignment-single-quoted",
+        "magic-keyed-double-quoted",
+        "magic-keyed-single-quoted",
+        "magic-keyed-double-single",
+        "magic-keyed-single-double",
+    ];
+
+    const KEYED_KEYWORDS: [&str; 7] = [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "auth",
+        "bearer",
+        "credential",
+    ];
+
+    const RULE_SPACE_BYTES: [u8; 6] = [b'\t', b'\n', 0x0B, b'\x0C', b'\r', b' '];
+
+    const UNQUOTED_VALUE_TERMINATORS: [u8; 11] = *b"'\"`;&|<>()$";
+
+    fn embedded_rule<'a>(rules: &'a RuleSet, name: &str) -> &'a Rule {
+        rules
+            .active(ScanProfile::Comprehensive)
+            .find(|rule| rule.declaration.name == name)
+            .unwrap_or_else(|| panic!("no embedded rule named {name}"))
+    }
+
+    /// Every regex match, including the empty-value ones `candidate_spans` counts but does not evaluate.
+    fn regex_candidates(rule: &Rule, input: &str) -> Vec<CandidateSpans> {
+        rule.regex
+            .captures_iter(input.as_bytes())
+            .map(|captures| {
+                let group = |name: &str| {
+                    let found = captures.name(name).unwrap();
+                    TextSpan::snapped(input, found.start(), found.end()).unwrap()
+                };
+                let full = captures.get(0).unwrap();
+                let spans = CandidateSpans {
+                    full: TextSpan::snapped(input, full.start(), full.end()).unwrap(),
+                    value: group("value"),
+                    key: Some(group("key")),
+                };
+                let evaluated = candidate_spans(rule, &captures, input).unwrap();
+                assert_eq!(evaluated, (!spans.value.is_empty()).then_some(spans));
+                spans
+            })
+            .collect()
+    }
+
+    /// Replays the probe loop in `evaluate` and reports the candidates with the number of probes it took.
+    fn fast_path_candidates(form: KeyedForm, input: &str) -> (Vec<CandidateSpans>, usize) {
+        let bytes = input.as_bytes();
+        let mut candidates = Vec::new();
+        let mut probes = 0;
+        let mut cursor = 0;
+        while let Some(at) =
+            memchr::memchr(form.anchor(), &bytes[cursor..]).map(|offset| cursor + offset)
+        {
+            probes += 1;
+            match form.probe(input, at, cursor).unwrap() {
+                Probe::Candidate(spans) => {
+                    cursor = spans.full.end();
+                    candidates.push(spans);
+                }
+                Probe::Skip(next) => {
+                    assert!(next > at, "{form:?} did not advance past {at} in {input:?}");
+                    cursor = next;
+                }
+            }
+        }
+        (candidates, probes)
+    }
+
+    fn assert_fast_path_replays_embedded_regex(rules: &RuleSet, input: &str) {
+        for name in KEYED_RULE_NAMES {
+            let rule = embedded_rule(rules, name);
+            let form = KeyedForm::for_rule(name).unwrap();
+            let (actual, _) = fast_path_candidates(form, input);
+            assert_eq!(actual, regex_candidates(rule, input), "{name} on {input:?}");
+        }
+    }
+
+    /// Every `magic-keyed-*` rule in the overlay has a fast path, and every fast path names an overlay rule.
+    #[test]
+    fn keyed_forms_and_embedded_keyed_rules_correspond() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let mut embedded: Vec<_> = rules
+            .active(ScanProfile::Comprehensive)
+            .map(|rule| rule.declaration.name.as_str())
+            .filter(|name| name.starts_with("magic-keyed"))
+            .collect();
+        embedded.sort_unstable();
+        let mut forms = KEYED_RULE_NAMES.to_vec();
+        forms.sort_unstable();
+        assert_eq!(embedded, forms);
+        for name in KEYED_RULE_NAMES {
+            assert!(
+                KeyedForm::for_rule(name).is_some(),
+                "{name} has no fast path"
+            );
+        }
+    }
+
+    // `KeyedForm::probe` hand-codes each regex below, so a change to one of them must be paired with a change to the fast path.
+    #[test]
+    fn keyed_rule_regexes_are_pinned_to_the_fast_path() {
+        let rules = RuleSet::from_embedded().unwrap();
+        for (name, regex) in [
+            (
+                "magic-keyed-assignment",
+                r#"(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*=[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*(?P<value>(?:[^\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}'"`;&|<>()$\\]|\\.)+)"#,
+            ),
+            (
+                "magic-keyed-assignment-double-quoted",
+                r#"(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*=[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*"(?P<value>(?:[^"\\]|\\.)*)""#,
+            ),
+            (
+                "magic-keyed-assignment-single-quoted",
+                r#"(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*=[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*'(?P<value>(?:[^'\\]|\\.)*)'"#,
+            ),
+            (
+                "magic-keyed-double-quoted",
+                r#"(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*"(?P<value>(?:[^"\\]|\\.)*)""#,
+            ),
+            (
+                "magic-keyed-single-quoted",
+                r#"(?i)'(?P<key>(?:[^'\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^'\\]|\\.)*)'[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*'(?P<value>(?:[^'\\]|\\.)*)'"#,
+            ),
+            (
+                "magic-keyed-double-single",
+                r#"(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*'(?P<value>(?:[^'\\]|\\.)*)'"#,
+            ),
+            (
+                "magic-keyed-single-double",
+                r#"(?i)'(?P<key>(?:[^'\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^'\\]|\\.)*)'[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*:[\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]*"(?P<value>(?:[^"\\]|\\.)*)""#,
+            ),
+        ] {
+            assert_eq!(
+                embedded_rule(&rules, name).declaration.regex,
+                regex,
+                "{name} changed; update `KeyedForm::probe` and its differential tests"
+            );
+        }
     }
 
     #[test]
-    fn ascii_keyed_assignment_replays_regex_spans() {
-        let rule = ascii_keyed_assignment_rule();
+    fn keyed_fast_paths_replay_embedded_regex_spans() {
+        let rules = RuleSet::from_embedded().unwrap();
         for input in [
             "password=hunter2",
             "API_TOKEN = Ab3fGh1jKlMnOpQrStUv",
@@ -1663,147 +1738,246 @@ mod tests {
             "monkey=value",
             "xpassword=value",
             ".token=value",
+            "-token=value",
+            "a.password=value",
+            "a-.password=value",
+            "1.2.token=value",
             "token=one;password=two",
             "token=\"quoted\"",
             "token=single'quoted",
             "token=",
+            "key=\"\"",
+            "token=''",
+            "\"key\":\"\"",
             "token=one\\",
+            "token=\\",
             "token=one\\ two key=three",
+            "token=abcdefghij12345\\\nplaceholder",
+            "token=abcdefghij12345\\\nmore",
+            "token=abcdefghij12345\\\rmore",
+            "password = token = abcdefghij12345",
+            "k=key = key = v",
+            "password\x0B=secret",
+            "password=\x0Bsecret",
+            "api_key = \"secret\\\"value\" token=\"next\"",
+            "api_key = 'secret\\'value' token='next'",
+            "api_key = \"abcdefghij12345\\\nmore\"",
+            "api_key = 'abcdefghij12345\\\nmore'",
+            "api_key = \"abc\\",
+            "api_key = \"abc",
+            "password=\"\\\"password=\\\"password=\\\"",
+            "\"api\\\"key\": \"secret\\\"value\" \"token\":\"next\"",
+            "'api\\'key': 'secret\\'value' 'token':'next'",
+            "\"api\\\"key\": 'secret\\'value' \"token\":'next'",
+            "'api\\'key': \"secret\\\"value\" 'token':\"next\"",
+            "\"a\\key\": \"Ab3fGh1jKlMnOpQrStUv\"",
+            "\"\\\\key\": \"Ab3fGh1jKlMnOpQrStUv\"",
+            "\"key\": \"AAAA\\\nBBBB\"password\": \"AbCdEf1234567890x\"",
+            "\"a\\\n\"key\":\"v\"",
+            "\"x\" \"password\":\"v\"",
+            "\"x\\\" \"key\":\"v\"",
+            "\"key\": x \"key\": x \"key\": \"v\"",
+            "\"key\"\x0B:\"v\"",
+            "\"key\": \"\\\"\\\"\\\"",
+            "\"\\\"\\\"\\\"key\": x",
+            "'password':\"v\" \"password\":'v'",
         ] {
-            let expected: Vec<_> = rule
-                .regex
-                .captures_iter(input.as_bytes())
-                .map(|captures| candidate_spans(&rule, &captures, input).unwrap().unwrap())
-                .collect();
-            let mut actual = Vec::new();
-            let mut cursor = 0;
-            while let Some(equals) =
-                memchr::memchr(b'=', &input.as_bytes()[cursor..]).map(|offset| cursor + offset)
-            {
-                if let Some(spans) = ascii_assignment_at(input, equals).unwrap() {
-                    cursor = spans.full.end();
-                    actual.push(spans);
-                } else {
-                    cursor = equals + 1;
-                }
-            }
-            assert_eq!(actual, expected, "{input:?}");
+            assert_fast_path_replays_embedded_regex(&rules, input);
         }
     }
 
-    fn ascii_quoted_keyed_rule(name: &str, key_quote: u8, value_quote: u8) -> Rule {
-        let key_quote = char::from(key_quote);
-        let value_quote = char::from(value_quote);
-        let regex = format!(
-            r#"(?i){key_quote}(?P<key>(?:[^{key_quote}\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^{key_quote}\\]|\\.)*){key_quote}[ \t\n\r]*:[ \t\n\r]*{value_quote}(?P<value>(?:[^{value_quote}\\]|\\.)*){value_quote}"#
-        );
-        alternation_rule(
-            &serde_json::json!({
-                "name": name,
-                "regex": regex,
-                "anchors": ["key"],
-                "radius": 16,
-                "key_group": "key",
-                "value_group": "value",
-                "reject_scalars": true,
-            })
-            .to_string(),
-        )
-    }
-
+    // Each rule's separators, keywords, and terminators are hand-coded in the fast path; the embedded regex is the oracle.
     #[test]
-    fn ascii_quoted_keyed_replays_regex_spans() {
-        for (name, key_quote, value_quote) in [
-            ("magic-keyed-double-quoted", b'"', b'"'),
-            ("magic-keyed-single-quoted", b'\'', b'\''),
-            ("magic-keyed-double-single", b'"', b'\''),
-            ("magic-keyed-single-double", b'\'', b'"'),
-        ] {
-            let rule = ascii_quoted_keyed_rule(name, key_quote, value_quote);
-            let input = match (key_quote, value_quote) {
-                (b'"', b'"') => r#""api\"key": "secret\"value" "token":"next""#,
-                (b'\'', b'\'') => r#"'api\'key': 'secret\'value' 'token':'next'"#,
-                (b'"', b'\'') => r#""api\"key": 'secret\'value' "token":'next'"#,
-                (b'\'', b'"') => r#"'api\'key': "secret\"value" 'token':"next""#,
-                _ => unreachable!(),
-            };
-            let expected: Vec<_> = rule
-                .regex
-                .captures_iter(input.as_bytes())
-                .map(|captures| candidate_spans(&rule, &captures, input).unwrap().unwrap())
-                .collect();
-            let mut actual = Vec::new();
-            let mut cursor = 0;
-            while let Some(start) =
-                memchr::memchr(key_quote, &input.as_bytes()[cursor..]).map(|offset| cursor + offset)
-            {
-                if let Some(spans) =
-                    ascii_quoted_keyed_at(input, start, key_quote, value_quote).unwrap()
-                {
-                    cursor = spans.full.end();
-                    actual.push(spans);
-                } else {
-                    cursor = start + 1;
+    fn keyed_fast_paths_accept_every_keyword_and_separator_the_rules_accept() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let secret = "hunter2AbCdEf123456";
+        for keyword in KEYED_KEYWORDS {
+            for separator in RULE_SPACE_BYTES {
+                let gap = char::from(separator);
+                for (form, input) in [
+                    (
+                        "magic-keyed-assignment",
+                        format!("x_{keyword}{gap}=x{secret}"),
+                    ),
+                    (
+                        "magic-keyed-assignment",
+                        format!("{keyword}={gap}x{secret}"),
+                    ),
+                    (
+                        "magic-keyed-assignment-double-quoted",
+                        format!("{keyword}={gap}\"x{secret}\""),
+                    ),
+                    (
+                        "magic-keyed-assignment-single-quoted",
+                        format!("{keyword}={gap}'x{secret}'"),
+                    ),
+                    (
+                        "magic-keyed-double-quoted",
+                        format!("\"{keyword}\"{gap}:\"x{secret}\""),
+                    ),
+                    (
+                        "magic-keyed-single-quoted",
+                        format!("'{keyword}'{gap}:'x{secret}'"),
+                    ),
+                    (
+                        "magic-keyed-double-single",
+                        format!("\"{keyword}\":{gap}'x{secret}'"),
+                    ),
+                    (
+                        "magic-keyed-single-double",
+                        format!("'{keyword}':{gap}\"x{secret}\""),
+                    ),
+                ] {
+                    let rule = embedded_rule(&rules, form);
+                    let expected = regex_candidates(rule, &input);
+                    assert_eq!(expected.len(), 1, "{form} does not match {input:?}");
+                    assert_fast_path_replays_embedded_regex(&rules, &input);
+                    let report = evaluate(
+                        &rules,
+                        ScanProfile::Conservative,
+                        ScanLimits::default(),
+                        [0u8; 32],
+                        &input,
+                    )
+                    .unwrap();
+                    let reported: Vec<_> = report
+                        .findings
+                        .iter()
+                        .filter(|finding| finding.rule_id == form)
+                        .map(|finding| finding.value_span)
+                        .collect();
+                    assert_eq!(reported, [expected[0].value], "{form} on {input:?}");
                 }
             }
-            assert_eq!(actual, expected, "{name}");
         }
     }
 
-    fn ascii_assignment_quoted_rule(name: &str, value_quote: u8) -> Rule {
-        let value_quote = char::from(value_quote);
-        let regex = format!(
-            r#"(?i)(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)[ \t\n\r]*=[ \t\n\r]*{value_quote}(?P<value>(?:[^{value_quote}\\]|\\.)*){value_quote}"#
-        );
-        alternation_rule(
-            &serde_json::json!({
-                "name": name,
-                "regex": regex,
-                "anchors": ["key"],
-                "radius": 16,
-                "key_group": "key",
-                "value_group": "value",
-                "reject_scalars": true,
-            })
-            .to_string(),
-        )
+    #[test]
+    fn keyed_fast_path_stops_unquoted_values_at_every_terminator_the_rule_stops_at() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let rule = embedded_rule(&rules, "magic-keyed-assignment");
+        for terminator in UNQUOTED_VALUE_TERMINATORS
+            .into_iter()
+            .chain(RULE_SPACE_BYTES)
+        {
+            let input = format!("password=hunter2AbCdEf{}tail", char::from(terminator));
+            let expected = regex_candidates(rule, &input);
+            assert_eq!(expected.len(), 1, "{input:?}");
+            assert_eq!(
+                &input[expected[0].value.start()..expected[0].value.end()],
+                "hunter2AbCdEf",
+                "{input:?}"
+            );
+            assert_fast_path_replays_embedded_regex(&rules, &input);
+        }
+        for content in *b"#,./:=@\\" {
+            let input = format!("password=hunter2{}AbCdEf", char::from(content));
+            let expected = regex_candidates(rule, &input);
+            assert_eq!(expected.len(), 1, "{input:?}");
+            assert_fast_path_replays_embedded_regex(&rules, &input);
+        }
     }
 
+    // A probe that restarts one byte after a rejected anchor rescans every escaped quote in the rejected region, which is quadratic in the input.
     #[test]
-    fn ascii_assignment_quoted_replays_regex_spans() {
-        for (name, value_quote, input) in [
+    fn keyed_fast_paths_probe_each_rejected_region_once() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let escaped_quotes = "\\\"".repeat(2_000);
+        for (name, input, max_probes) in [
+            (
+                "magic-keyed-double-quoted",
+                format!("\"key\"{escaped_quotes}"),
+                3,
+            ),
+            (
+                "magic-keyed-double-quoted",
+                format!("\"key\": \"{escaped_quotes}"),
+                4,
+            ),
+            (
+                "magic-keyed-double-quoted",
+                format!("\"{escaped_quotes}key\": x"),
+                3,
+            ),
             (
                 "magic-keyed-assignment-double-quoted",
-                b'"',
-                r#"api_key = "secret\"value" token="next""#,
+                format!("password=\"{}", "\\\"password=".repeat(2_000)),
+                1,
             ),
             (
-                "magic-keyed-assignment-single-quoted",
-                b'\'',
-                r#"api_key = 'secret\'value' token='next'"#,
+                "magic-keyed-double-quoted",
+                format!("\"a\\\n{}", "\"key\": x".repeat(2_000)),
+                4_001,
             ),
         ] {
-            let rule = ascii_assignment_quoted_rule(name, value_quote);
-            let expected: Vec<_> = rule
-                .regex
-                .captures_iter(input.as_bytes())
-                .map(|captures| candidate_spans(&rule, &captures, input).unwrap().unwrap())
-                .collect();
-            let mut actual = Vec::new();
-            let mut cursor = 0;
-            while let Some(equals) =
-                memchr::memchr(b'=', &input.as_bytes()[cursor..]).map(|offset| cursor + offset)
-            {
-                if let Some(spans) = ascii_assignment_quoted_at(input, equals, value_quote).unwrap()
-                {
-                    cursor = spans.full.end();
-                    actual.push(spans);
-                } else {
-                    cursor = equals + 1;
-                }
-            }
-            assert_eq!(actual, expected, "{name}");
+            let form = KeyedForm::for_rule(name).unwrap();
+            let (actual, probes) = fast_path_candidates(form, &input);
+            assert!(
+                probes <= max_probes,
+                "{name} took {probes} probes on {input:.40?}"
+            );
+            assert_eq!(
+                actual,
+                regex_candidates(embedded_rule(&rules, name), &input)
+            );
         }
+    }
+
+    // Pieces that exercise every keyword, separator, quote, escape, and terminator the keyed rules distinguish.
+    const KEYED_INPUT_PIECES: [&str; 18] = [
+        "key", "TOKEN", "Password", "=", ":", "\"", "'", "\\", "\n", "\x0B", " ", ";", "$", ".",
+        "-", "_", "a", "Z9",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2_000))]
+        #[test]
+        fn keyed_fast_paths_replay_embedded_regex_spans_on_generated_input(
+            pieces in proptest::collection::vec(0..KEYED_INPUT_PIECES.len(), 0..24)
+        ) {
+            let input: String = pieces.iter().map(|&piece| KEYED_INPUT_PIECES[piece]).collect();
+            assert_fast_path_replays_embedded_regex(&EMBEDDED_RULES_FOR_TESTS, &input);
+        }
+    }
+
+    static EMBEDDED_RULES_FOR_TESTS: std::sync::LazyLock<RuleSet> =
+        std::sync::LazyLock::new(|| RuleSet::from_embedded().unwrap());
+
+    // `evaluate` skips `hashicorp-tf-password` when the input holds no double quote; the rule's value group requires one.
+    #[test]
+    fn hashicorp_password_skip_requires_a_double_quote_in_every_match() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let rule = embedded_rule(&rules, "hashicorp-tf-password");
+        assert_eq!(
+            rule.declaration.regex,
+            r#"(?i)[\w.-]{0,50}?(?:administrator_login_password|password)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}("[a-z0-9=_\-]{8,20}")(?:[\x60'"\s;]|\\[nr]|$)"#,
+            "hashicorp-tf-password changed; recheck the double-quote skip in `evaluate`"
+        );
+        let quoted = r#"password = "kq7v2m9xw4zt""#;
+        assert_eq!(rule.regex.captures_iter(quoted.as_bytes()).count(), 1);
+        for unquoted in [
+            "password = 'kq7v2m9xw4zt'",
+            "password = `kq7v2m9xw4zt`",
+            "password = kq7v2m9xw4zt",
+        ] {
+            assert!(!rule.regex.is_match(unquoted.as_bytes()), "{unquoted:?}");
+        }
+        let report = evaluate(
+            &rules,
+            ScanProfile::Comprehensive,
+            ScanLimits::default(),
+            [0u8; 32],
+            quoted,
+        )
+        .unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "hashicorp-tf-password"),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]

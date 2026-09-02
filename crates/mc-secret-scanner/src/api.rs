@@ -221,7 +221,7 @@ impl std::error::Error for ScanError {}
 
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),
-    semantic_digest_version: 4,
+    semantic_digest_version: 5,
     upstream_commit: "3d2869011138cd7812a12f893dc93635a961b0d7",
 };
 

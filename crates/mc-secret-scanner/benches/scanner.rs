@@ -61,7 +61,7 @@ fn construction(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(400));
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(10);
-    group.bench_function("scanner_with_limits_cached", |b| {
+    group.bench_function("scanner_with_limits", |b| {
         b.iter(|| {
             Scanner::with_limits(
                 black_box(ScanProfile::Comprehensive),
