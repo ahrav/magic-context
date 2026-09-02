@@ -1,3 +1,4 @@
+//! CK wire-message projection into stable cache block identities.
 //!
 //! The cache machinery uses stable block identities instead of full CK messages.
 //! This module bridges full CK messages and stable block identities.
@@ -22,6 +23,7 @@ pub use mc_store::{
     MediaKind, MessageOrigin, OpaqueBlock, ProviderExtras, ResultBlock, ResultBlockKind,
 };
 
+/// One ingress message with transport identity and ordering metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CkIngressMessage {
     pub mid: String,
@@ -98,6 +100,10 @@ struct ProjectionMessageMeta {
     meta: HarnessMeta,
 }
 
+/// Flattened message projection plus metadata needed to rebuild cached prefixes.
+///
+/// Block order follows message order and then content order. Each
+/// `message_block_ends` entry is the exclusive block frontier for one message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlatProjection {
     pub blocks: Vec<FlatBlock>,
@@ -320,6 +326,7 @@ impl FlatProjection {
     }
 }
 
+/// Projection failure caused by invalid identity syntax or tool-arc structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CkWireError {
     MidContainsReservedHash(String),
@@ -360,13 +367,18 @@ impl std::fmt::Display for CkWireError {
 
 impl std::error::Error for CkWireError {}
 
+/// Projects messages into stable blocks in input order.
+///
+/// Message IDs containing `#`, unserializable blocks, and tool results without
+/// a pending call return [`CkWireError`].
 pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection, CkWireError> {
     project_messages_from_state(messages, FlatProjectionBuilder::default())
 }
 
+/// Projects a suffix while reusing a validated cached prefix.
 ///
-/// Malformed or out-of-range local metadata triggers a full projection.
-/// result.
+/// Zero, out-of-range, or incomplete local prefix metadata falls back to a full
+/// projection. Projection errors have the same meaning as [`project_messages`].
 pub(crate) fn project_messages_incremental(
     messages: &[CkIngressMessage],
     cached: &FlatProjection,
@@ -514,6 +526,7 @@ pub fn split_block_id(id: &str) -> Option<(&str, usize)> {
     Some((mid, index))
 }
 
+/// Preserves tool identity and provider extras while replacing reducible content.
 pub fn reduced_block(block: &CkWireBlock, reduced: &str, file_path: Option<&str>) -> CkWireBlock {
     let kind = match &block.kind {
         CkKind::ToolResult {
@@ -703,12 +716,12 @@ pub(crate) fn fingerprint(bytes: &str) -> String {
     fingerprint_digest(&content_hash)
 }
 
-/// The function returns the projected fingerprint and serialized length only when `served` matches the projected wire.
+/// Returns the projected SHA-256 fingerprint and serialized byte length when
+/// `served` equals the projected wire block.
 ///
-/// Projection stores the SHA-256 digest of `serde_json::to_string(CkWireBlock)`.
-/// Divergence attribution uses the same serialized `CkWireBlock` digest.
-/// The helper reuses the digest only when `served == flat.wire`.
-/// re-hash.
+/// Projection and divergence attribution both hash
+/// `serde_json::to_string(CkWireBlock)`. A missing or unequal projected block
+/// returns `None` rather than reusing an unrelated digest.
 pub(crate) fn fingerprint_from_projected_wire(
     served: &CkWireBlock,
     projected: Option<&FlatBlock>,
