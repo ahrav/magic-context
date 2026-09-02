@@ -1,6 +1,6 @@
 use std::fs;
 
-use rusqlite::TransactionBehavior;
+use rusqlite::{Transaction, TransactionBehavior};
 
 use super::open::family_sidecars;
 use super::{KernelError, KernelStore};
@@ -23,7 +23,11 @@ pub struct KernelFacts {
     pub family_bytes: u64,
     pub minimum_required_checkpoint: Option<i64>,
     pub commit_lag: Option<i64>,
+    /// Published outbox rows the slowest required consumer has not acknowledged.
+    /// `None` when no consumer is registered, matching `commit_lag`.
+    pub outbox_position_lag: Option<i64>,
     pub oldest_unconsumed_age_ms: Option<i64>,
+    pub retained_outbox_rows: u64,
     pub artifact_budget: ArtifactBudgetFacts,
 }
 
@@ -34,6 +38,13 @@ pub struct ArtifactBudgetFacts {
     pub usage_bytes: u64,
     pub cap_bytes: u64,
     pub warn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxLag {
+    pub position_lag: Option<i64>,
+    pub oldest_unconsumed_age_ms: Option<i64>,
+    pub consumer_count: u64,
 }
 
 impl KernelStore {
@@ -56,26 +67,19 @@ impl KernelStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|_| KernelError::Io)?;
-        let minimum_required_checkpoint = tx
-            .query_row(
-                "SELECT MIN(checkpoint_commit_seq) FROM outbox_consumers",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .map_err(|_| KernelError::Io)?;
+        let consumers = consumer_horizon(&tx)?;
         // `None` distinguishes no registered consumer from a caught-up consumer.
-        let commit_lag =
-            minimum_required_checkpoint.map(|checkpoint| commit_seq.saturating_sub(checkpoint));
-        let oldest_unconsumed_created_at = match minimum_required_checkpoint {
-            Some(checkpoint) if checkpoint < commit_seq => tx
-                .query_row(
-                    "SELECT MIN(created_at) FROM outbox WHERE commit_seq>?1",
-                    [checkpoint],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .map_err(|_| KernelError::Io)?,
-            _ => None,
-        };
+        let commit_lag = consumers
+            .minimum_checkpoint
+            .map(|checkpoint| commit_seq.saturating_sub(checkpoint));
+        let lag = outbox_lag_in(&tx, &consumers, now_ms)?;
+        let retained_outbox_rows = tx
+            .query_row("SELECT COUNT(*) FROM outbox", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|_| KernelError::Io)?
+            .try_into()
+            .unwrap_or(0);
         tx.commit().map_err(|_| KernelError::Io)?;
         let main_file_bytes = file_len(&self.db_path)?;
         let family_bytes = family_sidecars(&self.db_path)
@@ -88,12 +92,31 @@ impl KernelStore {
             commit_seq,
             main_file_bytes,
             family_bytes,
-            minimum_required_checkpoint,
+            minimum_required_checkpoint: consumers.minimum_checkpoint,
             commit_lag,
-            oldest_unconsumed_age_ms: oldest_unconsumed_created_at
-                .map(|created_at| now_ms.saturating_sub(created_at).max(0)),
+            outbox_position_lag: lag.position_lag,
+            oldest_unconsumed_age_ms: lag.oldest_unconsumed_age_ms,
+            retained_outbox_rows,
             artifact_budget,
         })
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidInput`] if `now_ms` is negative or
+    /// [`KernelError::Io`] if a database operation fails.
+    pub fn outbox_lag(&self, now_ms: i64) -> Result<OutboxLag, KernelError> {
+        if now_ms < 0 {
+            return Err(KernelError::InvalidInput);
+        }
+        let mut reader = self.lock_reader()?;
+        let tx = reader
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| KernelError::Io)?;
+        let consumers = consumer_horizon(&tx)?;
+        let lag = outbox_lag_in(&tx, &consumers, now_ms)?;
+        tx.commit().map_err(|_| KernelError::Io)?;
+        Ok(lag)
     }
 
     /// Artifact traversal failures propagate as [`KernelError`].
@@ -106,6 +129,67 @@ impl KernelStore {
             warn: usage_bytes >= warn_at,
         })
     }
+}
+
+struct ConsumerHorizon {
+    minimum_checkpoint: Option<i64>,
+    count: u64,
+}
+
+fn consumer_horizon(tx: &Transaction<'_>) -> Result<ConsumerHorizon, KernelError> {
+    tx.query_row(
+        "SELECT MIN(checkpoint_commit_seq), COUNT(*) FROM outbox_consumers",
+        [],
+        |row| {
+            Ok(ConsumerHorizon {
+                minimum_checkpoint: row.get::<_, Option<i64>>(0)?,
+                count: row.get::<_, i64>(1)?.try_into().unwrap_or(0),
+            })
+        },
+    )
+    .map_err(|_| KernelError::Io)
+}
+
+/// Position lag counts published rows past the slowest checkpoint rather than
+/// subtracting positions, so pruned rows below the horizon cannot skew it and a
+/// publication watermark behind the newest commit is respected. Age covers
+/// every unconsumed row, published or not, because an unpublished row is still
+/// waiting on the consumer.
+fn outbox_lag_in(
+    tx: &Transaction<'_>,
+    consumers: &ConsumerHorizon,
+    now_ms: i64,
+) -> Result<OutboxLag, KernelError> {
+    let Some(checkpoint) = consumers.minimum_checkpoint else {
+        return Ok(OutboxLag {
+            position_lag: None,
+            oldest_unconsumed_age_ms: None,
+            consumer_count: consumers.count,
+        });
+    };
+    let position_lag = tx
+        .query_row(
+            "SELECT COUNT(*) FROM outbox
+             WHERE commit_seq>?1
+               AND outbox_position<=COALESCE(
+                   (SELECT published_through_position FROM outbox_publication WHERE id=0),0)",
+            [checkpoint],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| KernelError::Io)?;
+    let oldest_unconsumed_created_at = tx
+        .query_row(
+            "SELECT MIN(created_at) FROM outbox WHERE commit_seq>?1",
+            [checkpoint],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|_| KernelError::Io)?;
+    Ok(OutboxLag {
+        position_lag: Some(position_lag),
+        oldest_unconsumed_age_ms: oldest_unconsumed_created_at
+            .map(|created_at| now_ms.saturating_sub(created_at).max(0)),
+        consumer_count: consumers.count,
+    })
 }
 
 fn file_len(path: &std::path::Path) -> Result<u64, KernelError> {

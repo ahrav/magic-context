@@ -64,7 +64,7 @@ pub use envelope::{
     ObjectRow, RemediationTarget, RepositoryProvenance, Sensitivity, StagingCandidateRow,
     StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
 };
-pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
+pub use facts::{ArtifactBudgetFacts, KernelFacts, OutboxLag, MAIN_FILE_WARN_BYTES};
 #[cfg(feature = "test-support")]
 pub use open::reset_marker_is_valid_for_test;
 pub use open::{KernelError, KernelStore};

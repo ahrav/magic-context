@@ -142,3 +142,99 @@ fn lag_uses_slowest_consumer_and_oldest_age_grows_exactly() {
     assert_eq!(caught_up.commit_lag, Some(0));
     assert_eq!(caught_up.oldest_unconsumed_age_ms, None);
 }
+
+/// One commit inserting `count` domains emits `count` outbox rows.
+fn insert_domains(store: &KernelStore, first_index: i64, count: i64) -> i64 {
+    store
+        .commit(
+            intent(&format!("domains-{first_index}-{count}")),
+            |envelope| {
+                for index in first_index..first_index + count {
+                    envelope.insert_domain(domain(index))?;
+                }
+                Ok("stored".to_string())
+            },
+        )
+        .unwrap()
+        .commit_seq
+}
+
+fn register(store: &KernelStore, consumer: &str) -> i64 {
+    store
+        .commit(intent(&format!("register-{consumer}")), |envelope| {
+            envelope.register_outbox_consumer(consumer, 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap()
+        .commit_seq
+}
+
+#[test]
+fn lag_uses_outbox_positions_and_the_required_consumer_minimum() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    // Commits 1..=3 emit 2, 5, and 1 outbox rows at positions 1-2, 3-7, and 8.
+    assert_eq!(insert_domains(&store, 1, 2), 1);
+    assert_eq!(insert_domains(&store, 3, 5), 2);
+    assert_eq!(insert_domains(&store, 8, 1), 3);
+    assert_eq!(store.facts(1).unwrap().retained_outbox_rows, 8);
+
+    // Registration checkpoints at the commit before the oldest retained row and
+    // emits one control row per consumer at positions 9 and 10.
+    assert_eq!(register(&store, "a"), 4);
+    assert_eq!(register(&store, "b"), 5);
+    assert_eq!(store.facts(1).unwrap().retained_outbox_rows, 10);
+    store.acknowledge_outbox("a", 1, 1).unwrap();
+    store.acknowledge_outbox("b", 2, 1).unwrap();
+
+    // Nothing published yet: rows past the slowest checkpoint are unconsumed but
+    // count as zero positions of lag, while their age still accrues.
+    let unpublished = store.outbox_lag(1).unwrap();
+    assert_eq!(unpublished.position_lag, Some(0));
+    assert_eq!(unpublished.consumer_count, 2);
+    assert!(unpublished.oldest_unconsumed_age_ms.is_some());
+
+    store.mark_outbox_published_through(7, 1).unwrap();
+    let facts = store.facts(1).unwrap();
+    assert_eq!(facts.minimum_required_checkpoint, Some(1));
+    assert_eq!(facts.commit_lag, Some(4));
+    assert_eq!(facts.outbox_position_lag, Some(5));
+    assert_eq!(facts.retained_outbox_rows, 10);
+    let lag = store.outbox_lag(1).unwrap();
+    assert_eq!(lag.position_lag, Some(5));
+    assert_eq!(lag.consumer_count, 2);
+    assert_eq!(lag.oldest_unconsumed_age_ms, facts.oldest_unconsumed_age_ms);
+
+    store.mark_outbox_published_through(8, 1).unwrap();
+    assert_eq!(store.facts(1).unwrap().outbox_position_lag, Some(6));
+
+    // The minimum governs: `a` catching up leaves `b` at commit 2, so position 8
+    // (commit 3) is still unacknowledged.
+    store.acknowledge_outbox("a", 5, 1).unwrap();
+    assert_eq!(store.outbox_lag(1).unwrap().position_lag, Some(1));
+    store.acknowledge_outbox("b", 5, 1).unwrap();
+    let caught_up = store.facts(1).unwrap();
+    assert_eq!(caught_up.outbox_position_lag, Some(0));
+    assert_eq!(caught_up.oldest_unconsumed_age_ms, None);
+    assert_eq!(caught_up.retained_outbox_rows, 10);
+}
+
+#[test]
+fn no_consumers_report_absent_position_lag_and_count_retained_rows() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domains(&store, 1, 8);
+    store.mark_outbox_published_through(8, 1).unwrap();
+    let facts = store.facts(1).unwrap();
+    assert_eq!(facts.outbox_position_lag, None);
+    assert_eq!(facts.commit_lag, None);
+    assert_eq!(facts.retained_outbox_rows, 8);
+    let lag = store.outbox_lag(1).unwrap();
+    assert_eq!(lag.position_lag, None);
+    assert_eq!(lag.oldest_unconsumed_age_ms, None);
+    assert_eq!(lag.consumer_count, 0);
+    assert_eq!(
+        store.outbox_lag(-1),
+        Err(mc_kernel::KernelError::InvalidInput)
+    );
+}
