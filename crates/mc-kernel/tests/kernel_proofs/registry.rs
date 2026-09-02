@@ -135,6 +135,7 @@ registry_enum! {
     /// daemon or projector owner proves the other.
     Obligation {
         O1StagingInvisibility,
+        O1ProjectorStagingInvisibility,
         O2AtomicRepair,
         O3BranchApplicability,
         O4ScopeAlgebra,
@@ -142,6 +143,7 @@ registry_enum! {
         O6DeletionPropagationKernel,
         O6DeletionWithdrawsSubject,
         O6DeletionReachesSearch,
+        O6DeletionReachesVectors,
         O7StaleExclusionKernel,
         O7StaleServing,
         O7DeletedEvidenceExcluded,
@@ -149,6 +151,8 @@ registry_enum! {
         O9EgressKernel,
         O9EgressGate,
         O10Idempotency,
+        O10SearchProjectorRedelivery,
+        O10VectorProjectorRedelivery,
     }
 }
 
@@ -164,6 +168,14 @@ impl Obligation {
                         Test { path: PROOFS_O1, function: "canonical_object_without_an_admission_decision_stays_off_automatic_surfaces" },
                         Test { path: KERNEL_SLICE_FIXTURES, function: "staged_candidate_never_enters_canonical_state" },
                     ],
+                },
+            },
+            Obligation::O1ProjectorStagingInvisibility => Row {
+                id: "O1/projector",
+                claim: "the search projector never reads or indexes staging candidates",
+                status: Status::Pending {
+                    owner_bead: "magic-context-3q5.9",
+                    expected_tests: &[Test { path: HOST_SEARCH_PROJECTOR, function: "the_projector_never_indexes_a_staging_candidate" }],
                 },
             },
             Obligation::O2AtomicRepair => Row {
@@ -245,6 +257,14 @@ impl Obligation {
                     expected_tests: &[Test { path: HOST_SEARCH_PROJECTOR, function: "deletion_barrier_removes_search_documents_before_acknowledgement" }],
                 },
             },
+            Obligation::O6DeletionReachesVectors => Row {
+                id: "O6/vectors",
+                claim: "a purge tombstone removes vector state before the deletion barrier is acknowledged",
+                status: Status::Pending {
+                    owner_bead: "magic-context-3q5.15",
+                    expected_tests: &[Test { path: HOST_VECTOR_PROJECTOR, function: "a_purge_tombstone_removes_embeddings_before_the_barrier_is_acknowledged" }],
+                },
+            },
             Obligation::O7StaleExclusionKernel => Row {
                 id: "O7/kernel",
                 claim: "a retracted or superseded subject is excluded at the tip while its admission snapshot still serves it; lag facts are exact",
@@ -322,6 +342,22 @@ impl Obligation {
                         Test { path: KERNEL_DELETION, function: "a_replayed_deletion_reports_the_generation_it_committed" },
                         Test { path: KERNEL_OUTBOX, function: "publication_stays_idempotent_after_the_rows_are_pruned" },
                     ],
+                },
+            },
+            Obligation::O10SearchProjectorRedelivery => Row {
+                id: "O10/search",
+                claim: "redelivering an outbox event to the search projector produces one logical document",
+                status: Status::Pending {
+                    owner_bead: "magic-context-3q5.9",
+                    expected_tests: &[Test { path: HOST_SEARCH_PROJECTOR, function: "redelivery_produces_one_logical_document" }],
+                },
+            },
+            Obligation::O10VectorProjectorRedelivery => Row {
+                id: "O10/vectors",
+                claim: "redelivering an outbox event to the vector projector produces one embedding",
+                status: Status::Pending {
+                    owner_bead: "magic-context-3q5.15",
+                    expected_tests: &[Test { path: HOST_VECTOR_PROJECTOR, function: "redelivery_produces_one_embedding" }],
                 },
             },
         }
@@ -852,6 +888,9 @@ fn declares_module(source: &str, name: &str) -> Result<(), String> {
         let Some(inline) = line_declares_module(line, name) else {
             continue;
         };
+        if inside_macro_definition(&lines, index) {
+            continue;
+        }
         if inline {
             return Err(format!(
                 "`mod {name}` is declared inline, so its conventional file is not compiled"
@@ -1221,8 +1260,11 @@ fn strip_comments(source: &str, blank_strings: bool) -> Vec<String> {
                 index += 1;
             } else if let Some(width) = char_literal_len(rest) {
                 // `'"'` and `b'"'` are literals; consuming them whole keeps a quote inside one from
-                // toggling string state and inverting the scan for the rest of the file.
-                kept.push_str(&line[index..index + width]);
+                // toggling string state, and dropping them from the item view keeps `'}'` from
+                // closing a block that is still open.
+                if !blank_strings {
+                    kept.push_str(&line[index..index + width]);
+                }
                 index += width;
             } else {
                 let width = line[index..].chars().next().map_or(1, char::len_utf8);
@@ -1473,10 +1515,13 @@ fn parse_rerun_command<'a>(attribute: &'a str) -> Option<RerunCommand<'a>> {
     };
     let ignored =
         arguments.is_some_and(|arguments| arguments.split_whitespace().any(|a| a == "--ignored"));
-    let mut tokens = invocation
-        .split_whitespace()
-        .skip_while(|token| *token != "test")
-        .skip(1);
+    // Require an actual `cargo test`; a token merely equal to `test` could belong to any program.
+    let words = invocation.split_whitespace().collect::<Vec<_>>();
+    let start = words
+        .windows(2)
+        .position(|pair| (pair[0] == "cargo" || pair[0].ends_with("/cargo")) && pair[1] == "test")
+        .map(|position| position + 2)?;
+    let mut tokens = words.into_iter().skip(start);
     let mut parsed = RerunCommand {
         package: None,
         target: None,
@@ -1718,6 +1763,10 @@ const IGNORED_PROSE_SELECTOR: &str =
     "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const QUOTE_CHAR_THEN_COMMENT: &str =
     "let quote = b'\\\"';\n/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
+const NESTED_WITH_BRACE_LITERAL: &str =
+    "fn outer() { let _ = '}';\n    #[test]\n    fn proven() {}\n}\n";
+const IGNORED_NOT_CARGO: &str =
+    "#[test]\n#[ignore = \"run with: echo test -p mc-kernel --test x proven -- --ignored\"]\nfn proven() {}\n";
 const NESTED_IN_FN: &str = "fn outer() {\n    #[test]\n    fn proven() {}\n}\n";
 const MACRO_DELIM_NEXT_LINE: &str =
     "macro_rules! never_used\n{\n    () => {\n        #[test]\n        fn proven() {}\n    };\n}\n";
@@ -1907,6 +1956,15 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     .unwrap_err();
     assert!(errors[0].contains("function not found"), "{errors:?}");
 
+    // A brace inside a char literal must not close the enclosing function early.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(NESTED_WITH_BRACE_LITERAL))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+
     // A macro body whose delimiter opens on the next line still hides a definition.
     let errors = validate(
         &[landed(PROVEN)],
@@ -2008,6 +2066,18 @@ fn an_ignored_test_needs_a_runnable_rerun_command() {
         &[],
     )
     .unwrap();
+
+    // A command that is not `cargo test` runs no oracle, whatever its arguments look like.
+    let errors = validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_NOT_CARGO))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("without a rerun command for"),
+        "{errors:?}"
+    );
 
     // Prose before `run with:` must not supply the package or target either.
     let errors = validate(
