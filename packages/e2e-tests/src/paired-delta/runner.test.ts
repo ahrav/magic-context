@@ -85,6 +85,7 @@ function storedRecord(armId: ArmId): RolloutRecord {
         armId,
         replicateIndex: 0,
         repoCommit: "commit-a",
+        openCodeVersion: "1.18.25",
         pinnedProviderId: "mock-live",
         pinnedSnapshotId: "snapshot-2026-08-01",
         echoedProviderId: null,
@@ -129,6 +130,7 @@ function options(store: RolloutStore = new MemoryStore()): RunPairedDeltaOptions
         scenarios: [scenario],
         poolManifestFingerprint: "a".repeat(64),
         repoCommit: "commit-a",
+        openCodeVersion: "1.18.25",
         pinnedProviderId: "mock-live",
         pinnedSnapshotId: "snapshot-2026-08-01",
         replicateCount: 1,
@@ -208,6 +210,7 @@ describe("paired-delta runner", () => {
         expect(result.records.every(({ harnessDisposed }) => harnessDisposed)).toBe(true);
         expect(result.observedCostRollouts).toBe(3);
         expect(result.estimatedCostRollouts).toBe(0);
+        expect(result.records[0]?.costUsd).toBe(148 / 1_000_000);
         expect(events.filter((event) => event.startsWith("dispose:"))).toHaveLength(3);
     });
 
@@ -2723,6 +2726,26 @@ describe("paired-delta runner", () => {
         expect(result.coordinates[0]?.cells["mc-on"]?.checks).toEqual([]);
     });
 
+    it("persists malformed verifier output instead of aborting the lane", async () => {
+        const result = await runPairedDelta(
+            options(),
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-on") {
+                    value.checks = [{ id: "check-undeclared", passed: true }];
+                }
+                return value;
+            }),
+        );
+
+        expect(result.records).toHaveLength(3);
+        expect(result.coordinates[0]?.cells["mc-on"]?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
+        expect(result.exclusionCounts["mc-on"]?.["invalid-result"]).toBe(1);
+    });
+
     it("fires oracle arms only for completed critical failure and prepares R2 before run", async () => {
         const events: string[] = [];
         const result = await runPairedDelta(
@@ -2934,8 +2957,11 @@ describe("regret decomposition", () => {
         const records = result.coordinates[0]?.cells ?? {};
         const rungs = computeRegretRungs(scenario, records);
 
-        expect((rungs.retrieval ?? 0) + (rungs.formation ?? 0) + (rungs.representation ?? 0))
-            .toBe(1);
+        expect(rungs).toEqual({
+            retrieval: 0,
+            formation: 1,
+            representation: 0,
+        });
     });
 });
 

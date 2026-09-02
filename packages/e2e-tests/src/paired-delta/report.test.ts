@@ -350,6 +350,7 @@ function rolloutRecord(
         armId,
         replicateIndex,
         repoCommit: "abc123",
+        openCodeVersion: "1.18.25",
         pinnedProviderId: "anthropic",
         pinnedSnapshotId: "claude-sonnet-4-5-20250929",
         echoedProviderId: "anthropic",

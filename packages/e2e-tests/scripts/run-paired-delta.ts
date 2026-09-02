@@ -453,6 +453,32 @@ function gitAt(cwd: string): (args: string[]) => string {
     };
 }
 
+/** The harness drives the installed OpenCode binary, so the same checkout can produce different rollouts under a different release. `bindingMatches` compares this alongside `repoCommit`, which pins the repository but says nothing about the binary under it, so a resume across an OpenCode upgrade reuses coordinates the new release may no longer reproduce. commentlint: allow(JUDGE) */
+function openCodeVersion(): string {
+    /** `Bun.spawnSync` throws on an unresolvable executable rather than returning an `ENOENT` result, so a bare `opencode` on a runner that has not installed it yet escapes as a raw spawn failure and the exit-code branch below never runs. Resolving first turns that into this lane's own error. commentlint: allow(JUDGE) */
+    const entry = Bun.which("opencode");
+    if (entry === null) {
+        throw new Error("cannot resolve OpenCode version: opencode is not on PATH");
+    }
+    const result = Bun.spawnSync([entry, "--version"], {
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+    if (result.exitCode !== 0) {
+        /** The binary resolved but would not report a version, and the reason is only in the captured stderr: without it the operator sees a bare refusal and cannot tell a broken install from a permission error. commentlint: allow(JUDGE) */
+        throw new Error(
+            `cannot resolve OpenCode version: ${entry} --version exited ${result.exitCode}` +
+            `${stderrDetail(result.stderr)}`,
+        );
+    }
+    return result.stdout.toString().trim();
+}
+
+function stderrDetail(stderr: Uint8Array | null): string {
+    const text = stderr === null ? "" : Buffer.from(stderr).toString().trim();
+    return text === "" ? "" : `: ${text.slice(-2000)}`;
+}
+
 function recordsRepoCommit(ownedPaths: readonly string[]): string {
     /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. commentlint: allow(JUDGE) */
     const root = worktreeRoot();
@@ -653,6 +679,8 @@ async function runSmoke(args: CliArgs): Promise<void> {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
             repoCommit: recordsRepoCommit([args.recordsPath, args.reportPath, args.calibrationRecordPath]),
+            /** The smoke lane answers prompts from an in-process mock and never launches the installed binary, so it pins a literal beside its other mock identities rather than binding to whatever release happens to be on PATH. commentlint: allow(JUDGE) */
+            openCodeVersion: "mock-opencode",
             pinnedProviderId: "mock-live",
             pinnedSnapshotId: "mock-snapshot-2026-08-31",
             replicateCount: 1,
@@ -2191,6 +2219,7 @@ async function runLive(args: CliArgs): Promise<void> {
                     args.reportPath,
                     args.calibrationRecordPath,
                 ])}${calibrationFingerprint === null ? "" : `-cal-${calibrationFingerprint}`}`,
+                openCodeVersion: openCodeVersion(),
                 pinnedProviderId: model.providerId,
                 pinnedSnapshotId: model.modelId,
                 replicateCount: policy.replicateCount,

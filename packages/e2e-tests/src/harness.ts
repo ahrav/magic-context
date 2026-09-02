@@ -235,10 +235,13 @@ export class TestHarness {
                 ...(options.agent ? { agent: options.agent } : {}),
             },
         });
-        const timeout = new Promise<null>((r) =>
-            setTimeout(() => r(null), timeoutMs),
-        );
-        const result = await Promise.race([promptPromise, timeout]);
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<null>((resolve) => {
+            timeoutHandle = setTimeout(() => resolve(null), timeoutMs);
+        });
+        const result = await Promise.race([promptPromise, timeout]).finally(() => {
+            if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+        });
         if (result === null) {
             /** The SDK request is still running when the race is lost, and the provider still bills it. The promise rides on the error so a caller that accounts for spend can wait for or observe the request instead of losing it with the wrapper. Its own rejection is observed here so an abandoned request cannot surface as an unhandled rejection. commentlint: allow(JUDGE) */
             promptPromise.catch(() => {});

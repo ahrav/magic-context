@@ -66,6 +66,7 @@ export interface RolloutObservation {
 export interface RolloutRecord extends RolloutCoordinate {
     schema: typeof ROLLOUT_RECORD_SCHEMA;
     repoCommit: string;
+    openCodeVersion: string;
     pinnedProviderId: string;
     pinnedSnapshotId: string;
     echoedProviderId: string | null;
@@ -133,6 +134,7 @@ export interface RunPairedDeltaOptions {
     scenarios: readonly ScenarioDeclaration[];
     poolManifestFingerprint: string;
     repoCommit: string;
+    openCodeVersion: string;
     pinnedProviderId: string;
     pinnedSnapshotId: string;
     replicateCount: number;
@@ -221,7 +223,9 @@ export async function verifyDualMockResolution(input: {
         { providerId: input.liveProviderId, modelId: input.liveModelId },
     ];
     /** The callback receives a copy: handed the same object, a `sendPrompt` that normalizes its argument in place would rewrite the expectation too, and the comparison below could then agree after both identities had been changed — certifying a live route that resolved through the fixture provider. commentlint: allow(JUDGE) */
-    const resolved = await Promise.all(routes.map((route) => input.sendPrompt({ ...route })));
+    /** One prompt at a time, fixture first, rather than concurrently: a `sendPrompt` that throws means the harness cannot serve a route at all, and the live route is a real provider call, so the free route's failure must not have already spent it. The comparison below is index-based, so the order this preserves is the order it reads. commentlint: allow(JUDGE) */
+    const resolved = [];
+    for (const route of routes) resolved.push(await input.sendPrompt({ ...route }));
     for (let index = 0; index < routes.length; index++) {
         const expected = routes[index];
         const actual = resolved[index];
@@ -575,6 +579,7 @@ export function interventionFor(
 /** A stored record binds to the run's commit and pinned model, and a completed one also echoes them back; anything else is re-run rather than rehydrated. Pre-scan accounting and rehydration share this test so a record cannot be charged as resumed and then executed again. commentlint: allow(JUDGE) */
 function bindingMatches(record: RolloutRecord, options: RunPairedDeltaOptions): boolean {
     return record.repoCommit === options.repoCommit &&
+        record.openCodeVersion === options.openCodeVersion &&
         record.pinnedProviderId === options.pinnedProviderId &&
         record.pinnedSnapshotId === options.pinnedSnapshotId;
 }
@@ -1374,6 +1379,7 @@ function completedRecord(
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
         repoCommit: options.repoCommit,
+        openCodeVersion: options.openCodeVersion,
         pinnedProviderId: options.pinnedProviderId,
         pinnedSnapshotId: options.pinnedSnapshotId,
         echoedProviderId: echoesAreStrings ? observed.echoedProviderId : null,
@@ -1450,6 +1456,7 @@ function failedRecord(
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
         repoCommit: options.repoCommit,
+        openCodeVersion: options.openCodeVersion,
         pinnedProviderId: options.pinnedProviderId,
         pinnedSnapshotId: options.pinnedSnapshotId,
         echoedProviderId: null,
