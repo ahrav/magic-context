@@ -224,7 +224,22 @@ fn backup_and_restore_reproduce_every_table_and_the_commit_seq() {
         .unwrap();
     let captured = proof.tip();
     assert_eq!(backup.captured_commit_seq, captured);
-    assert!(backup.capture_pin_id.is_some());
+    // The fixture leaves `evidence-kept` live and invalidates `evidence-deleted` commentlint: allow(JUDGE)
+    // and `evidence-purged`, so capture owes exactly the live one. Comparing commentlint: allow(JUDGE)
+    // identities catches a capture that pins a stale row or misses the live one. commentlint: allow(JUDGE)
+    assert_eq!(backup.evidence_refs, ["evidence-kept"]);
+    let capture_pin_id = backup.capture_pin_id.clone().unwrap();
+    let pinned = proof
+        .db()
+        .prepare(
+            "SELECT evidence_id FROM capture_pin_refs WHERE capture_pin_id=?1 ORDER BY evidence_id",
+        )
+        .unwrap()
+        .query_map([&capture_pin_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(pinned, ["evidence-kept"]);
     // `backup` commits its capture pins before copying, so the digest to
     // restore to is the one observed after it returns.
     let expected = proof.digest();

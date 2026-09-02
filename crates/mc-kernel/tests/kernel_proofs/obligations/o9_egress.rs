@@ -442,6 +442,26 @@ fn tombstone_denies_before_any_reference_is_consulted() {
     }
 }
 
+/// Expected admission visibility, stated as the policy rather than read from commentlint: allow(JUDGE)
+/// `surface_visibility`: secret is hidden everywhere, sensitive only reaches commentlint: allow(JUDGE)
+/// explicit user search, normal reaches every surface. Both matches are commentlint: allow(JUDGE)
+/// exhaustive, so a new variant in either vocabulary must be classified here. commentlint: allow(JUDGE)
+fn expected_visibility(sensitivity: Sensitivity, surface: Surface) -> Option<SurfaceVisibility> {
+    let reaches_automatic_surfaces = match sensitivity {
+        Sensitivity::Normal => true,
+        Sensitivity::Sensitive | Sensitivity::Secret => false,
+    };
+    let reaches_explicit_search = match sensitivity {
+        Sensitivity::Normal | Sensitivity::Sensitive => true,
+        Sensitivity::Secret => false,
+    };
+    let reaches = match surface {
+        Surface::AutoInject | Surface::AutoSearch => reaches_automatic_surfaces,
+        Surface::ExplicitSearch => reaches_explicit_search,
+    };
+    reaches.then_some(SurfaceVisibility::Visible)
+}
+
 #[test]
 fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
     let mut proof = Proof::open();
@@ -449,13 +469,14 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
         envelope.insert_domain(root_domain())?;
         Ok(String::new())
     });
-    // Three subjects admitted by the same observed-code event differ only in
-    // stored sensitivity, so any surface difference is the sensitivity gate. commentlint: allow(JUDGE)
-    for (index, sensitivity) in [
-        (1, Sensitivity::Normal),
-        (2, Sensitivity::Sensitive),
-        (3, Sensitivity::Secret),
-    ] {
+    // One subject per sensitivity, admitted by the same observed-code event, so commentlint: allow(JUDGE)
+    // any surface difference is the sensitivity gate. commentlint: allow(JUDGE)
+    let subjects = Sensitivity::ALL
+        .iter()
+        .enumerate()
+        .map(|(offset, &sensitivity)| (offset + 1, sensitivity))
+        .collect::<Vec<_>>();
+    for &(index, sensitivity) in &subjects {
         let mut spec = domain(index);
         spec.sensitivity = sensitivity;
         let object_id = spec.object_id.clone();
@@ -474,10 +495,11 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
     }
     proof.restart();
     let tip = proof.tip();
-    // An absent row is also what a never-admitted object yields, so the
-    // hidden subjects must be known at the tip for `None` to mean hidden.
+    // An absent row is also what a never-admitted object yields, so every commentlint: allow(JUDGE)
+    // subject must be known at the tip for `None` to mean hidden. commentlint: allow(JUDGE)
     let known = proof.store().known_as_of(tip).unwrap();
-    for object_id in ["object-2", "object-3"] {
+    for &(index, _) in &subjects {
+        let object_id = format!("object-{index}");
         assert!(
             known.objects.iter().any(|row| row.object_id == object_id),
             "positive control: {object_id} is known at the tip"
@@ -493,33 +515,23 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
             .find(|row| row.object.object_id == object_id)
             .map(|row| row.visibility)
     };
-    // The match forces every `Surface` variant to declare whether sensitive
-    // subjects are visible. commentlint: allow(JUDGE)
-    fn sensitive_is_visible(surface: Surface) -> bool {
-        match surface {
-            Surface::AutoInject | Surface::AutoSearch => false,
-            Surface::ExplicitSearch => true,
-        }
-    }
-    // These assertions require at least one visible and one hidden sensitive
-    // surface. commentlint: allow(JUDGE)
-    assert!(Surface::ALL.iter().copied().any(sensitive_is_visible));
-    assert!(!Surface::ALL.iter().copied().all(sensitive_is_visible));
-    for &surface in Surface::ALL {
+    // These assertions require the matrix to contain both a visible and a commentlint: allow(JUDGE)
+    // hidden cell, so the comparison below discriminates. commentlint: allow(JUDGE)
+    let cells = || {
+        subjects.iter().flat_map(|&(index, sensitivity)| {
+            Surface::ALL
+                .iter()
+                .map(move |&surface| (index, sensitivity, surface))
+        })
+    };
+    assert!(cells().any(|(_, s, f)| expected_visibility(s, f).is_some()));
+    assert!(cells().any(|(_, s, f)| expected_visibility(s, f).is_none()));
+    for (index, sensitivity, surface) in cells() {
+        let object_id = format!("object-{index}");
         assert_eq!(
-            visibility(surface, "object-1"),
-            Some(SurfaceVisibility::Visible),
-            "normal subject on {surface:?}"
-        );
-        assert_eq!(
-            visibility(surface, "object-3"),
-            None,
-            "secret subject on {surface:?}"
-        );
-        assert_eq!(
-            visibility(surface, "object-2"),
-            sensitive_is_visible(surface).then_some(SurfaceVisibility::Visible),
-            "sensitive subject on {surface:?}"
+            visibility(surface, &object_id),
+            expected_visibility(sensitivity, surface),
+            "{sensitivity:?} subject on {surface:?}"
         );
     }
 }
