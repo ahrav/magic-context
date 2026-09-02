@@ -1,17 +1,17 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { HEX64_RE, makeContractPrimitives } from "../contract-primitives";
+import { GATE_ID_RE, HEX64_RE, REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
 
 export const FREEZE_SCHEMA = "prospective-release-freeze/v1";
 export const CLOSE_SCHEMA = "prospective-cohort-close/v1";
 export const POLICY_OWNER_SCHEMA = "prospective-policy-owner/v1";
 export const TRUST_ENTRY_SCHEMA = "prospective-trust-entry/v1";
 
-export { HEX64_RE };
+export { GATE_ID_RE, HEX64_RE, REASON_CODE_RE };
 export const EPOCH_ID_RE = /^epoch-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const CASE_ID_RE = /^case-[0-9a-f]{32}$/;
 export const INTAKE_ID_RE = /^intake-[0-9a-f]{32}$/;
 export const FAMILY_ID_RE = /^fam-[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const STATIC_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const STATIC_ID_RE = REASON_CODE_RE;
 const RELEASE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/;
 /**
  * The `Z` designator makes every accepted instant UTC.
@@ -41,6 +41,7 @@ export const hex64 = primitives.hex64;
 export const enumeration = primitives.enumeration;
 export const array = primitives.array;
 export const integer = primitives.integer;
+export const idArray = primitives.idArray;
 const unique = primitives.unique;
 
 export function staticId(value: unknown, label: string, pattern: RegExp = STATIC_ID_RE): string {

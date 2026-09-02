@@ -77,6 +77,22 @@ const FINGERPRINT_FIELDS = new Set([
     "incident_bytes_fingerprint",
     "subject_fingerprint",
     "releaseFingerprint",
+    "pairedDeltaPolicyFingerprint",
+    "baselineScorecardReportFingerprint",
+    "scorecardReportFingerprint",
+    "poolManifestFingerprint",
+    "calibrationFingerprint",
+    "implementationDigest",
+    "ledger_fingerprint",
+    "selected_set_digest",
+    "semantic_fingerprint",
+    "implementation_digest",
+    "revisionLocator",
+    "runtimeDigest",
+    "corpus",
+    "judgments",
+    "syntheticProfiles",
+    "manifest",
 ]);
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control-character rejection is the point
