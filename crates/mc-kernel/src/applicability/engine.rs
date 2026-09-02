@@ -102,8 +102,8 @@ impl ApplicabilityState {
 }
 
 /// One retrieval candidate: identity plus the frozen rows the engine
-/// classifies. The caller (retrieval, kh8.6) loads rows; the engine never
-/// reads the store.
+/// classifies. The retrieval caller loads the rows; the engine never reads
+/// the store.
 #[derive(Debug, Clone, Default)]
 pub struct ApplicabilityCandidate {
     pub object_id: String,

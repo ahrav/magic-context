@@ -37,11 +37,11 @@ pub const DEPENDENCY_KIND_TARGET: &str = "applicability_target";
 /// Object-side applicability inputs, decoded from the owning row's frozen
 /// `payload` BLOB.
 ///
-/// `deny_unknown_fields` because `affected_paths` and `checks` both default to commentlint: allow(JUDGE)
-/// empty: a producer that misspells one, or writes a field this schema commentlint: allow(JUDGE)
-/// version does not define, would otherwise decode as an object declaring commentlint: allow(JUDGE)
-/// nothing and classify `Current`. A shape change takes a new schema tag, commentlint: allow(JUDGE)
-/// which [`Self::decode`] already rejects. commentlint: allow(JUDGE)
+/// `deny_unknown_fields` because `affected_paths` and `checks` both default to
+/// empty: a producer that misspells one, or writes a field this schema
+/// version does not define, would otherwise decode as an object declaring
+/// nothing and classify `Current`. A shape change takes a new schema tag,
+/// which [`Self::decode`] already rejects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectApplicabilitySpec {
@@ -109,10 +109,10 @@ impl ObjectApplicabilitySpec {
 /// unknown tag, so one unknown check kind degrades to unsupported instead of
 /// voiding the payload.
 ///
-/// `deny_unknown_fields` still applies inside a *recognized* variant: an extra commentlint: allow(JUDGE)
-/// field there is a constraint this build would silently drop, so the payload commentlint: allow(JUDGE)
-/// fails closed rather than enforcing weaker semantics than its producer commentlint: allow(JUDGE)
-/// wrote. The two compose — an unknown `kind` still reaches `Unrecognized`. commentlint: allow(JUDGE)
+/// `deny_unknown_fields` still applies inside a *recognized* variant: an extra
+/// field there is a constraint this build would silently drop, so the payload
+/// fails closed rather than enforcing weaker semantics than its producer
+/// wrote. The two compose — an unknown `kind` still reaches `Unrecognized`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckSpec {
@@ -134,13 +134,13 @@ pub enum CheckSpec {
 /// Durable payload of one applicability observation: enough to identify the
 /// checkout, the evidence, and the algorithm versions that produced it.
 ///
-/// The repair commit revalidates `head` and the object revision, both single commentlint: allow(JUDGE)
-/// indexed reads. It leaves `dirty_fingerprint` unchecked: revalidating that commentlint: allow(JUDGE)
-/// would put a whole worktree walk inside the single-writer window and still commentlint: allow(JUDGE)
-/// leave the worktree free to change immediately afterwards. A worktree that commentlint: allow(JUDGE)
-/// does change yields a different fingerprint on the next evaluation, which is commentlint: allow(JUDGE)
-/// both a classification-cache miss and a different repair generation, so that commentlint: allow(JUDGE)
-/// evaluation appends a superseding record. commentlint: allow(JUDGE)
+/// The repair commit revalidates `head` and the object revision, both single
+/// indexed reads. It leaves `dirty_fingerprint` unchecked: revalidating that
+/// would put a whole worktree walk inside the single-writer window and still
+/// leave the worktree free to change immediately afterwards. A worktree that
+/// does change yields a different fingerprint on the next evaluation, which is
+/// both a classification-cache miss and a different repair generation, so that
+/// evaluation appends a superseding record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicabilityObservationPayload {
     pub schema: String,

@@ -9,7 +9,7 @@ import { r1QueryLeaksAnswer, r1WireDelivered } from "./support";
 import { packSearchResults } from "../../../../plugin/src/tools/ctx-search/render";
 import type { MemorySearchResult } from "../../../../plugin/src/features/magic-context/search";
 
-/** Renders through the real `ctx_search` packer rather than a hand-written string, so a change to the memory-row format breaks this test instead of silently making `r1WireDelivered` reject every genuine retrieval. commentlint: allow(JUDGE) */
+/** Renders through the real `ctx_search` packer rather than a hand-written string, so a change to the memory-row format breaks this test instead of silently making `r1WireDelivered` reject every genuine retrieval. */
 function realWireText(resolvedIds: readonly string[]): string {
     const results: MemorySearchResult[] = resolvedIds.map((publicClaimId, index) => ({
         source: "memory",
@@ -60,7 +60,7 @@ describe("paired-delta authored scenarios", () => {
             const swapped = answer.toUpperCase() === answer
                 ? answer.toLowerCase()
                 : answer.toUpperCase();
-            /** An all-digit answer cannot be case-swapped, so asserting a policy against it would pass under either mode. Assert the vacuity instead, so this branch is taken only for genuinely caseless answers and a future answer that gains letters lands in the real check below. commentlint: allow(JUDGE) */
+            /** An all-digit answer cannot be case-swapped, so asserting a policy against it would pass under either mode. Assert the vacuity instead, so this branch is taken only for genuinely caseless answers and a future answer that gains letters lands in the real check below. */
             if (swapped === answer) {
                 expect(answer).not.toMatch(/\p{L}/u);
                 return;
@@ -98,7 +98,7 @@ describe("paired-delta authored scenarios", () => {
                 expect(
                     scenario.absencePrecondition.minimumBallastBytes / CHARS_PER_TOKEN,
                 ).toBeGreaterThan(scenario.modelContextLimit);
-                /** Stand in for the runner's handle-to-publicClaimId mapping: the search turn is served resolved ids, so the declared `mem-*` handles never reach the wire text. commentlint: allow(JUDGE) */
+                /** Stand in for the runner's handle-to-publicClaimId mapping: the search turn is served resolved ids, so the declared `mem-*` handles never reach the wire text. */
                 const resolvedLocatorIds = scenario.interventions.r1.locatorIds.map(
                     (_handle, index) => `mcm_${String(index).padStart(32, "0")}`,
                 );
@@ -119,14 +119,14 @@ describe("paired-delta authored scenarios", () => {
                     scriptedTurnText: deliveredWire,
                     resolvedLocatorIds,
                 })).toBe(true);
-                /** A runner that resolves only some handles would otherwise pass while R1 held less gold than R2. commentlint: allow(JUDGE) */
+                /** A runner that resolves only some handles would otherwise pass while R1 held less gold than R2. */
                 expect(r1WireDelivered(scenario, {
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: deliveredWire,
                     resolvedLocatorIds: resolvedLocatorIds.slice(0, -1),
                 })).toBe(false);
-                /** The empty-results renderer echoes the query, and a locator query is the resolved ids, so a bare substring test would treat zero retrieval as delivery. commentlint: allow(JUDGE) */
+                /** The empty-results renderer echoes the query, and a locator query is the resolved ids, so a bare substring test would treat zero retrieval as delivery. */
                 expect(r1WireDelivered(scenario, {
                     armId: "r1",
                     workspacePath: root,
@@ -140,7 +140,7 @@ describe("paired-delta authored scenarios", () => {
                     workspacePath: root,
                     scriptedTurnText: scenario.interventions.r1.locatorIds.join(" "),
                 })).toBe(false);
-                /** An empty id degenerates the marker to `id=`, which every rendered memory row contains. commentlint: allow(JUDGE) */
+                /** An empty id degenerates the marker to `id=`, which every rendered memory row contains. */
                 expect(r1WireDelivered(scenario, {
                     armId: "r1",
                     workspacePath: root,
