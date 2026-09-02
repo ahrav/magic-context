@@ -119,6 +119,13 @@ describe("parseScorecardPolicy", () => {
             .toHaveLength(2);
     });
 
+    it("requires a positive release cost budget", () => {
+        for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "100"]) {
+            expectRejects(policyFixture({ releaseCostBudgetUsd: value as never }), "policy.releaseCostBudgetUsd: positive-number-required");
+        }
+        expect(parseScorecardPolicy(policyFixture({ releaseCostBudgetUsd: 0.5 })).releaseCostBudgetUsd).toBe(0.5);
+    });
+
     it("requires a hex64 paired-delta binding and allows a null baseline", () => {
         expectRejects(policyFixture({ pairedDeltaPolicyFingerprint: "abc" }), "policy.pairedDeltaPolicyFingerprint: fingerprint-invalid");
         expect(parseScorecardPolicy(policyFixture({ baselineScorecardReportFingerprint: null })).baselineScorecardReportFingerprint).toBeNull();

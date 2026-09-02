@@ -227,8 +227,8 @@ export const SCORECARD_POLICY_KEYS = [
     "baselineScorecardReportFingerprint",
 ] as const;
 
-function nonNegativeNumber(value: unknown, label: string): number {
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) fail(`${label}: number-invalid`);
+function positiveNumber(value: unknown, label: string): number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) fail(`${label}: positive-number-required`);
     return value as number;
 }
 
@@ -357,7 +357,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
         },
         modelMatrix: parseModelMatrix(root.modelMatrix, "policy.modelMatrix"),
         replicateCount: integer(root.replicateCount, "policy.replicateCount", 1),
-        releaseCostBudgetUsd: nonNegativeNumber(root.releaseCostBudgetUsd, "policy.releaseCostBudgetUsd"),
+        releaseCostBudgetUsd: positiveNumber(root.releaseCostBudgetUsd, "policy.releaseCostBudgetUsd"),
         requiredLanes: parseRequiredLanes(root.requiredLanes, "policy.requiredLanes"),
         requiredMetricSlots,
         pairedDeltaPolicyFingerprint: hex64(root.pairedDeltaPolicyFingerprint, "policy.pairedDeltaPolicyFingerprint"),
