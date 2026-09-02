@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+//! Deterministic secret scanning backed by an embedded, shared rule set.
+//!
+//! Construction validates resource limits and binds a semantic digest to rules,
+//! profile, and limits. Embedded rules and default-profile digests initialize
+//! once and are shared across threads.
+
 #[cfg(test)]
 mod anchor_proof;
 mod api;
@@ -39,10 +45,19 @@ pub struct Scanner {
 }
 
 impl Scanner {
+    /// Uses default resource limits and the profile-specific cached semantic digest.
+    ///
+    /// Returns [`ConstructionError`] when embedded rules or their semantic digest
+    /// cannot be constructed.
     pub fn new(profile: ScanProfile) -> Result<Self, ConstructionError> {
         Self::with_limits(profile, ScanLimits::default())
     }
 
+    /// Validates resource limits before binding them into scanner semantics.
+    ///
+    /// Default limits reuse a lazily cached digest per profile. Custom limits
+    /// compute their digest during construction. Invalid limits or rules return
+    /// [`ConstructionError`].
     pub fn with_limits(
         profile: ScanProfile,
         limits: ScanLimits,
@@ -69,6 +84,9 @@ impl Scanner {
         })
     }
 
+    /// Scans UTF-8 input under the configured profile and limits.
+    ///
+    /// Returns [`ScanError`] when input or evaluation exceeds configured limits.
     pub fn scan(&self, input: &str) -> Result<ScanReport, ScanError> {
         evaluate(
             &self.rules,
@@ -79,16 +97,19 @@ impl Scanner {
         )
     }
 
+    /// Identifies the rule semantics, profile, and limits used for findings.
     #[must_use]
     pub fn semantic_digest(&self) -> [u8; 32] {
         self.semantic_digest
     }
 
+    /// Reports which rule profile controls evaluation.
     #[must_use]
     pub fn profile(&self) -> ScanProfile {
         self.profile
     }
 
+    /// Reports the scanner API and rule-semantics revision.
     #[must_use]
     pub const fn revision(&self) -> ScannerRevision {
         api::REVISION

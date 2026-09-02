@@ -1,5 +1,4 @@
-//! The module defines a private complete-frame channel boundary between the connection engine and a transport.
-//! a transport.
+//! Private complete-frame channel boundary between the connection engine and transport.
 //!
 //! The contract is directional: a cloneable [`FrameSender`] admits complete
 //! outbound frames in FIFO order against one logical writer, and the
@@ -45,8 +44,9 @@ pub enum ReadClose {
     RejectedDrainFailed,
 }
 
-/// one place.
+/// Validates body length, pure-header flags, and peer-legal frame types in one place.
 ///
+/// Returns [`ReadClose::Corrupt`] with a static protocol reason on rejection.
 pub(crate) fn validate_inbound_header(header: EnvelopeHeader) -> Result<(), ReadClose> {
     if header.len > MAX_BODY_LEN {
         return Err(ReadClose::Corrupt("body over interoperability cap"));
@@ -67,8 +67,9 @@ pub(crate) fn validate_inbound_header(header: EnvelopeHeader) -> Result<(), Read
     Ok(())
 }
 
+/// Counts explicit receive-body flattening copies.
 ///
-/// Direct/leased paths leave this at zero. Flattening adapters add exactly one
+/// Direct and leased paths leave this at zero. Flattening adapters add exactly one
 /// for each body they copy into owned semantic storage.
 #[derive(Clone, Default)]
 pub struct CopyCounter(Arc<AtomicU64>);
@@ -182,8 +183,10 @@ impl<'storage, C> ProducerReservation<'storage, C> {
         Ok(())
     }
 
-    /// `commit` drops the charge guard when `body_len > bound` or `cursor != body_len`.
-    /// consuming transition.
+    /// Commits exactly `body_len` initialized bytes and transfers the charge guard.
+    ///
+    /// The method drops the charge guard and returns an error when `body_len`
+    /// exceeds the bound or differs from the cursor.
     pub fn commit(mut self, body_len: usize) -> Result<ProducedBody<'storage, C>, ProducerError> {
         if self.aborted {
             return Err(ProducerError::Aborted);
@@ -390,8 +393,10 @@ impl LeaseTracker {
         ReceiveLease::tracked(first, second, self.clone())
     }
 
-    /// Close never reports reusable storage while any lexical lease is live.
-    /// bounded-quarantine branch.
+    /// Reports reusable storage only when no lexical lease is live.
+    ///
+    /// Once close observes an active lease, the tracker remains quarantined even
+    /// after all leases drop.
     pub fn close(&self) -> LeaseClose {
         let mut state = self.0.lock().expect("lease tracker lock");
         if state.active == 0 && !state.quarantined {
@@ -575,6 +580,10 @@ pub struct FrameSendTicket {
 }
 
 impl FrameSendTicket {
+    /// Cancels a frame only while it remains queued.
+    ///
+    /// [`SendOutcome::PossibleSend`] means publication already started, completed,
+    /// or another caller cancelled the shared ticket.
     pub fn cancel(&self) -> SendOutcome {
         match self
             .state
@@ -625,6 +634,10 @@ impl FrameSender {
             .map(drop)
     }
 
+    /// Queues a frame before `deadline` and returns a cancellation ticket.
+    ///
+    /// Retirement, channel closure, or admission timeout returns [`WriterGone`].
+    /// Timeout also retires this sender and cancels its connection generation.
     pub async fn send_ticket_before(
         &self,
         frame: OutboundFrame,
