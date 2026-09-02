@@ -10,7 +10,7 @@
 //! a new decision. This module proves that work row is emitted; the registry
 //! tracks the withdrawal itself as a separate row.
 
-use mc_kernel::{ArtifactHandle, Sensitivity, Surface, SurfaceVisibility};
+use mc_kernel::{ArtifactDeletionKind, ArtifactHandle, Sensitivity, Surface, SurfaceVisibility};
 
 use crate::fixtures::{
     admit_request, admitted_domain, code_observation, deletion, ingest, intent, root_domain,
@@ -72,6 +72,20 @@ fn admitted_subject() -> Subject {
         envelope.admit_domain_candidate(request, admitted)?;
         Ok(String::new())
     });
+    // The test reads `evidence_id` back because `validate_trigger` accepts NULL
+    // evidence IDs.
+    let stored_evidence: Option<String> = proof
+        .db()
+        .query_row(
+            "SELECT evidence_id FROM observations WHERE observation_id=?1",
+            [format!("observation-{CANDIDATE}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_evidence.as_deref(),
+        Some(handle.evidence_id.as_str())
+    );
     Subject {
         proof,
         handle,
@@ -141,6 +155,8 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         .delete_artifact(deletion("delete", &handle.digest))
         .unwrap();
     assert!(!result.already_applied);
+    assert_eq!(result.kind, ArtifactDeletionKind::Delete);
+    assert_eq!(result.digest, handle.digest);
     assert_eq!(result.commit_seq, proof.tip());
     assert_eq!(count_sql(&proof, live_refs), 0);
     assert_eq!(
@@ -193,6 +209,7 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         }
         let barrier = proof.store().deletion_barrier(&result.barrier_id).unwrap();
         assert_eq!(barrier.deletion_commit_seq, result.commit_seq);
+        assert_eq!(barrier.digest, handle.digest);
         assert_eq!(barrier.consumers.len(), 1);
         let consumer = &barrier.consumers[0];
         assert_eq!(consumer.consumer_id, "search");
@@ -226,6 +243,8 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         .delete_artifact(deletion("delete", &handle.digest))
         .unwrap();
     assert!(replayed.already_applied);
+    assert_eq!(replayed.kind, ArtifactDeletionKind::Delete);
+    assert_eq!(replayed.digest, handle.digest);
     assert_eq!(replayed.commit_seq, result.commit_seq);
     assert_eq!(replayed.barrier_id, result.barrier_id);
     assert_eq!(replayed.affected_object_ids, result.affected_object_ids);

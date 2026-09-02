@@ -93,6 +93,35 @@ fn content(proof: &Proof, kind: Kind) -> BTreeMap<String, String> {
     .unwrap()
 }
 
+fn assert_successor_content(proof: &Proof, kind: Kind, object_id: &str, index: usize) {
+    let (sql, expected) = match kind {
+        Kind::Domain => (
+            "SELECT domain_id||'|'||name FROM domains WHERE object_id=?1",
+            vec![format!("domain-{index}"), format!("name-{index}")],
+        ),
+        Kind::Decision => (
+            "SELECT decision_id||'|'||decision_kind||'|'||CAST(decision_payload AS TEXT)
+             FROM decisions WHERE object_id=?1",
+            vec![
+                format!("decision-{index}"),
+                "architecture".to_string(),
+                format!("decision {index}"),
+                format!("rationale {index}"),
+            ],
+        ),
+    };
+    let stored: String = proof
+        .db()
+        .query_row(sql, [object_id], |row| row.get(0))
+        .unwrap();
+    for value in expected {
+        assert!(
+            stored.contains(&value),
+            "{object_id} lost {value:?} from its correction: {stored}"
+        );
+    }
+}
+
 fn correct(proof: &mut Proof, kind: Kind, old: &str, index: usize) -> String {
     let key = format!("correct-{old}-{index}");
     let (new_id, receipt) = match kind {
@@ -186,6 +215,7 @@ fn run_chain(kind: Kind, length: usize) {
         // Positive control.
         assert!(after.contains_key(&new), "{new} has no typed row");
         assert_eq!(after.len(), frozen_content.len() + 1);
+        assert_successor_content(&proof, kind, &new, step + 2);
     }
     let tip = proof.tip();
     let history = proof.store().object_history_as_of(tip).unwrap();
