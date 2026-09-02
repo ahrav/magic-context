@@ -1341,23 +1341,34 @@ fn split_leading_attributes(line: &str) -> (&str, &str) {
     (line[..line.len() - rest.len()].trim(), rest)
 }
 
+/// Returns the line index closing the block that opens at or after `start`, allowing the opening
+/// delimiter to sit on a later line than the item's declaration.
+fn block_end(lines: &[String], start: usize, open: char, close: char) -> Option<usize> {
+    let body_start = lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(offset, line)| line.contains(open).then_some(offset))?;
+    let mut depth = 0i32;
+    for (offset, body) in lines.iter().enumerate().skip(body_start) {
+        depth += i32::try_from(body.matches(open).count()).unwrap_or(i32::MAX);
+        depth -= i32::try_from(body.matches(close).count()).unwrap_or(i32::MAX);
+        if depth <= 0 {
+            return Some(offset);
+        }
+    }
+    None
+}
+
 /// Reports whether `index` falls inside another function's body. Rust permits an inner `#[test]`
 /// item but never collects it into the harness, so such a definition cannot serve as an oracle.
 fn inside_function_body(lines: &[String], index: usize) -> bool {
     for (start, line) in lines.iter().enumerate().take(index) {
-        if !defines_any_function(line) || !line.contains('{') {
+        if !defines_any_function(line) {
             continue;
         }
-        let mut depth = 0i32;
-        for (offset, body) in lines.iter().enumerate().skip(start) {
-            depth += i32::try_from(body.matches('{').count()).unwrap_or(i32::MAX);
-            depth -= i32::try_from(body.matches('}').count()).unwrap_or(i32::MAX);
-            if depth <= 0 {
-                if offset > index {
-                    return true;
-                }
-                break;
-            }
+        if block_end(lines, start, '{', '}').is_some_and(|end| end > index) {
+            return true;
         }
     }
     false
@@ -1435,20 +1446,10 @@ fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
             || item.starts_with("pub mod ")
             || item.starts_with("pub(crate) mod ")
             || item.starts_with("pub(super) mod ");
-        if !is_module || !line.contains('{') {
+        if !is_module {
             continue;
         }
-        let mut depth = 0i32;
-        let mut end = None;
-        for (offset, body) in lines.iter().enumerate().skip(start) {
-            depth += body.matches('{').count() as i32;
-            depth -= body.matches('}').count() as i32;
-            if depth <= 0 {
-                end = Some(offset);
-                break;
-            }
-        }
-        if end.is_none_or(|end| end < index) {
+        if block_end(lines, start, '{', '}').is_none_or(|end| end < index) {
             continue;
         }
         let mut raw = Vec::new();
@@ -1515,13 +1516,16 @@ fn parse_rerun_command<'a>(attribute: &'a str) -> Option<RerunCommand<'a>> {
     };
     let ignored =
         arguments.is_some_and(|arguments| arguments.split_whitespace().any(|a| a == "--ignored"));
-    // Require an actual `cargo test`; a token merely equal to `test` could belong to any program.
+    // `cargo test` has to be the command itself; a shell prefix such as `echo` would consume these
+    // words as arguments and run no oracle.
     let words = invocation.split_whitespace().collect::<Vec<_>>();
-    let start = words
-        .windows(2)
-        .position(|pair| (pair[0] == "cargo" || pair[0].ends_with("/cargo")) && pair[1] == "test")
-        .map(|position| position + 2)?;
-    let mut tokens = words.into_iter().skip(start);
+    let [program, subcommand, arguments @ ..] = words.as_slice() else {
+        return None;
+    };
+    if !(*program == "cargo" || program.ends_with("/cargo")) || *subcommand != "test" {
+        return None;
+    }
+    let mut tokens = arguments.iter().copied();
     let mut parsed = RerunCommand {
         package: None,
         target: None,
@@ -1763,6 +1767,11 @@ const IGNORED_PROSE_SELECTOR: &str =
     "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const QUOTE_CHAR_THEN_COMMENT: &str =
     "let quote = b'\\\"';\n/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
+const NESTED_BRACE_NEXT_LINE: &str = "fn outer()\n{\n    #[test]\n    fn proven() {}\n}\n";
+const MODULE_BRACE_NEXT_LINE: &str =
+    "#[cfg(any())] mod disabled\n{\n    #[test]\n    fn proven() {}\n}\n";
+const IGNORED_SHELL_PREFIX: &str =
+    "#[test]\n#[ignore = \"run with: echo cargo test -p mc-kernel --test x proven -- --ignored\"]\nfn proven() {}\n";
 const NESTED_WITH_BRACE_LITERAL: &str =
     "fn outer() { let _ = '}';\n    #[test]\n    fn proven() {}\n}\n";
 const IGNORED_NOT_CARGO: &str =
@@ -1956,6 +1965,25 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     .unwrap_err();
     assert!(errors[0].contains("function not found"), "{errors:?}");
 
+    // A function or module body whose brace opens on the next line still encloses the definition.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(NESTED_BRACE_NEXT_LINE))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MODULE_BRACE_NEXT_LINE))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("inside a module behind #[cfg(any())]"),
+        "{errors:?}"
+    );
+
     // A brace inside a char literal must not close the enclosing function early.
     let errors = validate(
         &[landed(PROVEN)],
@@ -2066,6 +2094,18 @@ fn an_ignored_test_needs_a_runnable_rerun_command() {
         &[],
     )
     .unwrap();
+
+    // A shell prefix consumes the words as arguments, so `cargo test` must be the command itself.
+    let errors = validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_SHELL_PREFIX))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("without a rerun command for"),
+        "{errors:?}"
+    );
 
     // A command that is not `cargo test` runs no oracle, whatever its arguments look like.
     let errors = validate(
