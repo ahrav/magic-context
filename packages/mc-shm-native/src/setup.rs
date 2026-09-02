@@ -1,3 +1,8 @@
+//! Authenticated setup-socket client for shared-memory ring activation.
+//!
+//! Messages use a four-byte little-endian length prefix. One absolute deadline bounds the full
+//! handshake, including partial reads and writes.
+
 use std::io::{self, IoSliceMut, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -79,6 +84,10 @@ enum ServerMessage {
     Committed,
 }
 
+/// Authenticated grant awaiting descriptor transfer and activation.
+///
+/// Call [`PendingSetup::take_descriptors`] at most once, then call [`PendingSetup::activate`]
+/// before the handshake deadline.
 pub struct PendingSetup {
     stream: UnixStream,
     descriptors: Option<[OwnedFd; SETUP_DESCRIPTOR_COUNT]>,
@@ -90,6 +99,11 @@ pub struct PendingSetup {
     deadline: Instant,
 }
 
+/// Connects, authenticates both peers, receives one grant, and validates its ring identities.
+///
+/// Returns `InvalidData` for malformed input or grants, `PermissionDenied` for daemon identity or
+/// proof mismatch, and `TimedOut` after the shared handshake deadline. Other socket errors pass
+/// through unchanged.
 pub fn begin_connect(
     path: &Path,
     key: &[u8],
@@ -147,10 +161,16 @@ pub fn peer_closed(stream: &UnixStream) -> bool {
 }
 
 impl PendingSetup {
+    /// Takes the fixed descriptor array received with the grant.
+    ///
+    /// Returns `InvalidData` if descriptors were already taken.
     pub fn take_descriptors(&mut self) -> io::Result<[OwnedFd; SETUP_DESCRIPTOR_COUNT]> {
         self.descriptors.take().ok_or_else(invalid)
     }
 
+    /// Activates and commits the grant, returning the setup socket as a liveness sentinel.
+    ///
+    /// Returns `InvalidData` for an unexpected response and propagates deadline or socket errors.
     pub fn activate(mut self) -> io::Result<UnixStream> {
         write_message(
             &mut self.stream,
@@ -184,6 +204,9 @@ impl PendingSetup {
     }
 }
 
+/// Best-effort sends `Goodbye`, then shuts down both socket directions.
+///
+/// The send uses a 100 millisecond budget. This function ignores send and shutdown errors.
 pub fn goodbye(stream: &mut UnixStream) {
     let deadline = Instant::now() + Duration::from_millis(100);
     let _ = write_message(
