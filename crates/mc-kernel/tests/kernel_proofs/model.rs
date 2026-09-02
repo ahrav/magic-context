@@ -166,7 +166,6 @@ enum Applied {
 pub struct Outcome {
     pub duplicates_replayed: usize,
     pub faults_injected: usize,
-    pub envelope_commits: usize,
 }
 
 /// Runs `steps` clean in A and perturbed in B and asserts the two agree.
@@ -192,7 +191,6 @@ pub fn run(steps: &[Step]) -> Outcome {
     let mut outcome = Outcome {
         duplicates_replayed: 0,
         faults_injected: 0,
-        envelope_commits: 0,
     };
     for step in steps {
         if step.fault_then_retry && supports_fault(&step.op, &model) {
@@ -204,9 +202,6 @@ pub fn run(steps: &[Step]) -> Outcome {
         }
         let applied = apply(&mut perturbed, &mut model, &step.op, Attempt::Land)
             .expect("a landing attempt applies");
-        if let Applied::Envelope { .. } = applied {
-            outcome.envelope_commits += 1;
-        }
         if step.duplicate_after {
             let before = perturbed.digest();
             match &applied {

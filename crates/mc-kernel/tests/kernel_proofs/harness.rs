@@ -156,19 +156,9 @@ impl Proof {
 #[cfg(test)]
 mod tests {
     use mc_kernel::{KernelError, KernelStore};
-    use rusqlite::Connection;
 
     use super::Proof;
     use crate::fixtures::{domain, intent, root_domain};
-
-    fn count(proof: &Proof, table: &str) -> i64 {
-        Connection::open(proof.path().join("core.sqlite"))
-            .unwrap()
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap()
-    }
 
     #[test]
     fn fault_on_domain_insert_leaves_no_trace_before_or_after_restart() {
