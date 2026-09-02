@@ -78,6 +78,7 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.31",
     "magic-context-kh8.35",
     "magic-context-kh8.36",
+    "magic-context-kh8.37",
 ];
 
 const KERNEL_ADMISSION: &str = "tests/kernel_admission.rs";
@@ -364,6 +365,7 @@ registry_enum! {
         R12dProjector,
         R12dVectorLag,
         R12eBackupPermissions,
+        R12eBackupRotation,
         K2FullLogReplay,
         K7MatrixCompleteness,
     }
@@ -689,6 +691,14 @@ impl PolicyRow {
                         Test { path: KERNEL_BACKUP, function: "backup_restores_exact_snapshot_and_reclaims_writer_fence" },
                         Test { path: DURABLE_FS, function: "created_directories_and_files_are_owner_only" },
                     ],
+                },
+            },
+            PolicyRow::R12eBackupRotation => Row {
+                id: "kh8.1 R12e/rotation",
+                claim: "backup rotation rejects unsafe destinations and keeps retained backups owner-only",
+                status: Status::Pending {
+                    owner_bead: "magic-context-kh8.37",
+                    expected_tests: &[Test { path: KERNEL_BACKUP, function: "rotation_rejects_unsafe_destinations_and_preserves_owner_only_modes" }],
                 },
             },
             PolicyRow::K2FullLogReplay => Row {
@@ -1129,8 +1139,12 @@ impl std::fmt::Display for LocateError {
 /// satisfy the definition or attribute scans and an `#[ignore = ".."]` rerun command survives for
 /// inspection. Block comments nest, and comment markers inside a string are skipped rather than
 /// honored, so a byte string containing a comment opener does not blank the rest of the file.
-/// Blanks comment interiors, and string interiors too when `blank_strings`, so an item search never
-/// matches text that Rust compiles as data. Line structure is preserved so indices agree.
+/// Blanks comment interiors, and string and line-comment interiors too when `blank_strings`, so an
+/// item search never matches text Rust compiles as data or ignores as a comment, while the
+/// preserving view keeps an `#[ignore = ".."]` rerun command inspectable. Block comments nest, and
+/// comment markers inside a string are skipped rather than honored, so a byte string containing a
+/// comment opener does not blank the rest of the file. Line structure is preserved in both views so
+/// their indices agree.
 fn strip_comments(source: &str, blank_strings: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let mut depth = 0usize;
@@ -1192,7 +1206,9 @@ fn strip_comments(source: &str, blank_strings: bool) -> Vec<String> {
                 depth = 1;
                 index += 2;
             } else if rest.starts_with(b"//") {
-                kept.push_str(&line[index..]);
+                if !blank_strings {
+                    kept.push_str(&line[index..]);
+                }
                 break;
             } else if let Some(hashes) = raw_string_opener(rest) {
                 let opener = raw_prefix_len(rest, hashes);
@@ -1283,6 +1299,39 @@ fn split_leading_attributes(line: &str) -> (&str, &str) {
     (line[..line.len() - rest.len()].trim(), rest)
 }
 
+/// Reports whether `index` falls inside another function's body. Rust permits an inner `#[test]`
+/// item but never collects it into the harness, so such a definition cannot serve as an oracle.
+fn inside_function_body(lines: &[String], index: usize) -> bool {
+    for (start, line) in lines.iter().enumerate().take(index) {
+        if !defines_any_function(line) || !line.contains('{') {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (offset, body) in lines.iter().enumerate().skip(start) {
+            depth += i32::try_from(body.matches('{').count()).unwrap_or(i32::MAX);
+            depth -= i32::try_from(body.matches('}').count()).unwrap_or(i32::MAX);
+            if depth <= 0 {
+                if offset > index {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Reports whether `line` defines some function, using the same prefix rule as `defines_function`.
+fn defines_any_function(line: &str) -> bool {
+    let (_, item) = split_leading_attributes(line.trim());
+    let Some(offset) = item.find("fn ") else {
+        return false;
+    };
+    item[..offset]
+        .split_whitespace()
+        .all(|token| LEADING.contains(&token))
+}
+
 /// Reports whether `index` falls inside a `macro_rules!` body, whose contents become items only
 /// where the macro is invoked. A function that exists only in an unexpanded macro is compiled into
 /// no harness, so it cannot stand as a registered oracle. `proptest!` and other invocations are
@@ -1292,16 +1341,31 @@ fn inside_macro_definition(lines: &[String], index: usize) -> bool {
         if !line.contains("macro_rules!") {
             continue;
         }
-        // A macro body may be delimited by braces, parentheses, or brackets.
-        let Some((open, close)) = [('{', '}'), ('(', ')'), ('[', ']')]
-            .into_iter()
-            .filter(|(open, _)| line.contains(*open))
-            .min_by_key(|(open, _)| line.find(*open).unwrap_or(usize::MAX))
-        else {
+        // A macro body may be delimited by braces, parentheses, or brackets, and the opener may sit
+        // on a later line than `macro_rules!`.
+        let after = line.split_once("macro_rules!").map_or("", |(_, rest)| rest);
+        let mut opener = None;
+        for (offset, candidate) in std::iter::once(after)
+            .chain(lines[start + 1..].iter().map(String::as_str))
+            .enumerate()
+        {
+            if let Some(found) = [('{', '}'), ('(', ')'), ('[', ']')]
+                .into_iter()
+                .filter(|(open, _)| candidate.contains(*open))
+                .min_by_key(|(open, _)| candidate.find(*open).unwrap_or(usize::MAX))
+            {
+                opener = Some((start + offset, found));
+                break;
+            }
+            if !candidate.trim().is_empty() && offset > 0 {
+                break;
+            }
+        }
+        let Some((body_start, (open, close))) = opener else {
             continue;
         };
         let mut depth = 0i32;
-        for (offset, body) in lines.iter().enumerate().skip(start) {
+        for (offset, body) in lines.iter().enumerate().skip(body_start) {
             depth += i32::try_from(body.matches(open).count()).unwrap_or(i32::MAX);
             depth -= i32::try_from(body.matches(close).count()).unwrap_or(i32::MAX);
             if depth <= 0 {
@@ -1475,20 +1539,22 @@ const SHORT_FLAGS_TAKING_A_VALUE: &[&str] = &["-p", "-j", "-F"];
 /// Restricting the prefix to `LEADING` prevents comments and strings that
 /// mention `signature` from matching, so a named function that no longer exists
 /// cannot resolve to a line that only refers to it.
+/// The tokens Rust permits between the start of an item and its `fn` keyword.
+const LEADING: &[&str] = &[
+    "pub",
+    "pub(crate)",
+    "pub(super)",
+    "pub(self)",
+    "const",
+    "async",
+    "unsafe",
+    "extern",
+    "\"C\"",
+    "\"C-unwind\"",
+    "default",
+];
+
 fn defines_function(line: &str, signature: &str) -> bool {
-    const LEADING: &[&str] = &[
-        "pub",
-        "pub(crate)",
-        "pub(super)",
-        "pub(self)",
-        "const",
-        "async",
-        "unsafe",
-        "extern",
-        "\"C\"",
-        "\"C-unwind\"",
-        "default",
-    ];
     let Some(offset) = line.find(signature) else {
         return false;
     };
@@ -1518,6 +1584,7 @@ fn locate_with_module_cfgs(
         .filter(|(_, line)| defines_function(line, &signature))
         .map(|(index, _)| index)
         .filter(|index| !inside_macro_definition(&lines, *index))
+        .filter(|index| !inside_function_body(&lines, *index))
         .collect::<Vec<_>>();
     let index = match matches.as_slice() {
         [index] => *index,
@@ -1651,6 +1718,9 @@ const IGNORED_PROSE_SELECTOR: &str =
     "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const QUOTE_CHAR_THEN_COMMENT: &str =
     "let quote = b'\\\"';\n/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
+const NESTED_IN_FN: &str = "fn outer() {\n    #[test]\n    fn proven() {}\n}\n";
+const MACRO_DELIM_NEXT_LINE: &str =
+    "macro_rules! never_used\n{\n    () => {\n        #[test]\n        fn proven() {}\n    };\n}\n";
 const STRING_ONLY: &str = "const SAMPLE: &str = \"\n#[test]\nfn proven() {}\n\";\nfn other() {}\n";
 const MODULE_ATTR_SAME_LINE: &str =
     "#[cfg(any())] mod disabled {\n    #[test]\n    fn proven() {}\n}\n";
@@ -1823,6 +1893,24 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     let errors = validate(
         &[landed(PROVEN)],
         &catalog(&[("a.rs", Some(QUOTE_CHAR_THEN_COMMENT))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // Rust permits an inner `#[test]` item but never collects it into the harness.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(NESTED_IN_FN))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // A macro body whose delimiter opens on the next line still hides a definition.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MACRO_DELIM_NEXT_LINE))]),
         &[],
     )
     .unwrap_err();
