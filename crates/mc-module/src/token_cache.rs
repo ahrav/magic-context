@@ -12,9 +12,7 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
-/// Per-generation entry cap; two full generations hold ~9.7 MB
-/// (hashbrown rounds each 65,536-entry map to 131,072 x 37-byte buckets).
-///
+/// Maximum entries in each current or previous generation.
 const GENERATION_CAP: usize = 65_536;
 
 /// Contents shorter than this tokenize directly: hashing plus the lock
@@ -29,12 +27,18 @@ struct Generations {
 
 static CACHE: Mutex<Option<Generations>> = Mutex::new(None);
 
+/// Calling-thread cache counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TokenCacheStats {
+    /// Lookups served from either generation.
     pub hits: u64,
+    /// Lookups that required tokenization before insertion.
     pub misses: u64,
+    /// Short inputs tokenized without hashing or locking.
     pub bypassed: u64,
+    /// Total lookup calls.
     pub calls: u64,
+    /// UTF-8 bytes passed to the tokenizer on misses or bypasses.
     pub tokenized_bytes: u64,
 }
 
@@ -89,6 +93,8 @@ fn insert_current(generations: &mut Generations, digest: [u8; 32], count: u32) {
 /// Tail hygiene hashes `kind_name ‖ NUL ‖ content`; this module's raw path
 /// hashes `NUL ‖ content`, which no kind name can prefix.
 ///
+/// Concurrent misses may tokenize the same content more than once. Insertion
+/// remains bounded and later lookups return the stored count.
 pub(crate) fn count_with_digest(digest: [u8; 32], content: &str) -> usize {
     bump_local(|stats| stats.calls += 1);
     // ponytail: one global lock; shard per digest byte if concurrent sessions
@@ -123,6 +129,7 @@ pub(crate) fn count_with_digest(digest: [u8; 32], content: &str) -> usize {
     count
 }
 
+/// Clears both shared generations.
 #[cfg(any(test, feature = "bench-internals"))]
 pub fn clear() {
     let mut guard = lock_cache();

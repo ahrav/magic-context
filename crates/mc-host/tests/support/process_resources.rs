@@ -1,4 +1,4 @@
-//! R13).
+//! Cross-platform process-resource observations for host envelope tests.
 //!
 //! Counts open file descriptors, mapped memory regions, threads, and RSS for
 //! one pid through one interface. Linux reads `/proc/<pid>/fd`,
@@ -14,11 +14,16 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+/// One complete process-resource observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceCounts {
+    /// Open file descriptor count.
     pub fds: u64,
+    /// Mapped virtual-memory region count.
     pub mapped_regions: u64,
+    /// Thread count.
     pub threads: u64,
+    /// Resident set size in bytes.
     pub rss_bytes: u64,
 }
 
@@ -34,6 +39,7 @@ impl ResourceCounts {
     }
 }
 
+/// Bounded failure identifying only the counter that could not be observed.
 #[derive(Clone, Copy)]
 pub struct ObserveError {
     counter: &'static str,
@@ -79,6 +85,11 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 /// polls.
 ///
 /// Uses Tokio sleep to avoid blocking a runtime worker thread while polling.
+///
+/// # Panics
+///
+/// Panics if observation fails or three equal samples do not arrive within
+/// `within`.
 pub async fn stabilize(pid: u32, within: std::time::Duration) -> ResourceCounts {
     let deadline = std::time::Instant::now() + within;
     let mut previous = None;
@@ -105,11 +116,15 @@ pub async fn stabilize(pid: u32, within: std::time::Duration) -> ResourceCounts 
 /// Descriptors, regions, and threads must equal `baseline`; RSS may exceed
 /// `baseline.rss_bytes` by at most `rss_tolerance` bytes.
 ///
-///
 /// `context` names the caller's iteration so a ratcheting leak reports which
 /// cycle exceeded the envelope rather than only that one did.
 ///
 /// Uses Tokio sleep to avoid blocking a runtime worker thread while polling.
+///
+/// # Panics
+///
+/// Panics if observation fails or counters do not enter the envelope within
+/// `within`.
 pub async fn await_envelope(
     pid: u32,
     baseline: ResourceCounts,
@@ -149,6 +164,10 @@ pub struct TaskCounters {
     pub nonvoluntary_context_switches: u64,
 }
 
+/// Per-task counter deltas between two Linux observations.
+///
+/// Counters use saturating subtraction. Tasks absent from the first sample
+/// are measured from zero.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct TaskDelta {
     pub tid: u32,
@@ -223,6 +242,7 @@ fn status_counter(status: &str, key: &str) -> Option<u64> {
     })
 }
 
+/// Computes deltas for tasks present in `after`, ordered by ascending task ID.
 pub fn task_deltas(
     before: &BTreeMap<u32, TaskCounters>,
     after: &BTreeMap<u32, TaskCounters>,
@@ -256,7 +276,6 @@ pub fn task_deltas(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -301,7 +320,6 @@ fn resident_bytes(pid: u32) -> Result<u64, ObserveError> {
     kib.checked_mul(1024).ok_or_else(|| fail("rss_bytes"))
 }
 
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -384,8 +402,7 @@ mod libproc {
     }
 }
 
-/// `LIST_ENTRY_HINT` sets the fallback initial capacity; the growth loop establishes completeness.
-/// `LIST_ENTRY_HINT` sets the fallback initial capacity; the growth loop establishes completeness.
+/// Fallback initial capacity; the growth loop establishes completeness.
 #[cfg(target_os = "macos")]
 const LIST_ENTRY_HINT: usize = 64;
 
@@ -403,6 +420,8 @@ fn count_list_entries(
     // A NULL buffer is a size query only for `PROC_PIDLISTFDS`.
     // `PROC_PIDLISTTHREADS` returns `ENOMEM` when `buffersize < size`.
     // A nonpositive probe uses the fallback hint; the subsequent sized call determines whether the observation succeeds.
+    // SAFETY: The null-buffer query uses size zero. `pid`, selector, and
+    // scalar argument contain no borrowed memory.
     let probed = unsafe { proc_pidinfo(pid, flavor, 0, std::ptr::null_mut(), 0) };
     let hint = if probed > 0 {
         probed as usize
@@ -413,6 +432,8 @@ fn count_list_entries(
     for _ in 0..8 {
         let buffer_size = std::os::raw::c_int::try_from(capacity).map_err(|_| fail(counter))?;
         let mut buffer = vec![0u8; capacity];
+        // SAFETY: `buffer` owns `capacity` writable bytes and `buffer_size`
+        // is the checked `c_int` representation of that capacity.
         let returned =
             unsafe { proc_pidinfo(pid, flavor, 0, buffer.as_mut_ptr().cast(), buffer_size) };
         if returned <= 0 {
@@ -462,7 +483,11 @@ fn count_mapped_regions(pid: u32) -> Result<u64, ObserveError> {
     let mut address = 0u64;
     let mut count = 0u64;
     for _ in 0..1_000_000u32 {
+        // SAFETY: `ProcRegionInfo` is a C integer-only record for which the
+        // all-zero bit pattern is valid.
         let mut info: ProcRegionInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` provides `buffer_size == size_of::<ProcRegionInfo>()`
+        // writable bytes for the duration of the call.
         let returned = unsafe {
             proc_pidinfo(
                 pid,
@@ -503,6 +528,8 @@ fn resident_bytes(pid: u32) -> Result<u64, ObserveError> {
     let pid = i32::try_from(pid).map_err(|_| fail(counter))?;
     let size = std::mem::size_of::<ProcTaskInfo>();
     let mut info = std::mem::MaybeUninit::<ProcTaskInfo>::uninit();
+    // SAFETY: `info` points to `size_of::<ProcTaskInfo>()` writable bytes and
+    // is initialized by `proc_pidinfo` only when that exact size is returned.
     let returned = unsafe {
         proc_pidinfo(
             pid,
@@ -515,6 +542,8 @@ fn resident_bytes(pid: u32) -> Result<u64, ObserveError> {
     if returned as usize != size {
         return Err(fail(counter));
     }
+    // SAFETY: Exact-size return above proves the C function initialized the
+    // complete `ProcTaskInfo` record.
     Ok(unsafe { info.assume_init() }.resident_size)
 }
 

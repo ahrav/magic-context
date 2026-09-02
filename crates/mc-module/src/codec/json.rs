@@ -8,6 +8,8 @@ use crate::ck_wire::{CkKind, CkWireBlock, MediaKind, OpaqueBlock};
 
 use super::sidecar::stable_hash_prefix;
 
+/// Classifies recognized media prefixes, treats PDF as a document, and
+/// falls back to a generic file.
 pub(crate) fn media_kind(media_type: &str) -> MediaKind {
     if media_type.starts_with("image/") {
         MediaKind::Image
@@ -22,6 +24,10 @@ pub(crate) fn media_kind(media_type: &str) -> MediaKind {
     }
 }
 
+/// Builds an approval arc when `part.approvalId` is a string.
+///
+/// Types containing `response` use the `Response` role; all other or missing
+/// types use `Request`.
 pub(crate) fn opaque_arc(part: &Value) -> Option<Value> {
     let approval_id = string_field(part, "approvalId")?;
     let part_type = string_field(part, "type").unwrap_or_default();
@@ -33,6 +39,7 @@ pub(crate) fn opaque_arc(part: &Value) -> Option<Value> {
     Some(json!({ "kind": "Approval", "id": approval_id, "role": role }))
 }
 
+/// Preserves harness-specific JSON in an opaque CK wire block.
 pub(crate) fn opaque_block(
     harness: &str,
     kind: &str,
@@ -47,6 +54,7 @@ pub(crate) fn opaque_block(
     }))
 }
 
+/// Replaces a non-object input with an empty object before insertion.
 pub(crate) fn set_value(value: &mut Value, key: &str, next: Value) {
     if !value.is_object() {
         *value = Value::Object(Map::new());
@@ -64,6 +72,8 @@ pub(crate) fn string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// Includes location, tool name, and a 12-character stable input-hash prefix
+/// in a deterministic synthetic tool ID.
 pub(crate) fn synth_tool_id(
     ordinal: u64,
     part_index: usize,
