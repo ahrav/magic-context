@@ -112,6 +112,11 @@ function requireSorted<T>(values: readonly T[], rank: (value: T) => string, labe
     }
 }
 
+/** A field-order-independent rank, so the builder's sort and the parser's check cannot disagree. */
+function canaryKey(hit: InjectionCanaryHit): string {
+    return [hit.scenarioId, hit.role, hit.transformId ?? "", hit.transformVersion ?? "", hit.seed ?? ""].join("\u0000");
+}
+
 function key(entry: PairKey): string {
     return `${entry.scenarioId}\u0000${entry.transformId}\u0000${entry.transformVersion}\u0000${entry.seed}`;
 }
@@ -129,7 +134,7 @@ export function buildMetamorphicReport(args: {
         entries: [...args.entries].sort((left, right) => key(left).localeCompare(key(right))),
         coverage: [...args.coverage].sort((left, right) => left.scenarioId.localeCompare(right.scenarioId)),
         injectionCanaryHits: [...args.injectionCanaryHits].sort((left, right) =>
-            JSON.stringify(left).localeCompare(JSON.stringify(right)),
+            canaryKey(left).localeCompare(canaryKey(right)),
         ),
         tierInvalidReason: args.tierInvalidReason ?? null,
     };
@@ -373,6 +378,53 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
     }
 }
 
+function parseCoverage(raw: unknown, label: string): ScenarioCoverage[] {
+    const coverage = p.array(raw, label).map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const value = p.record(entry, itemLabel);
+        p.exact(value, ["scenarioId", "applied", "inapplicable", "violations"], itemLabel);
+        return {
+            scenarioId: p.string(value.scenarioId, `${itemLabel}.scenarioId`),
+            applied: p.integer(value.applied, `${itemLabel}.applied`),
+            inapplicable: p.array(value.inapplicable, `${itemLabel}.inapplicable`).map((item, innerIndex) => {
+                const innerLabel = `${itemLabel}.inapplicable[${innerIndex}]`;
+                const inapplicable = p.record(item, innerLabel);
+                p.exact(inapplicable, [...PAIR_KEYS, "reason"], innerLabel);
+                return { ...parsePairKey(inapplicable, innerLabel), reason: p.text(inapplicable.reason, `${innerLabel}.reason`) };
+            }),
+            violations: textArray(value.violations, `${itemLabel}.violations`),
+        };
+    });
+    requireSorted(coverage, ({ scenarioId }) => scenarioId, label);
+    return coverage;
+}
+
+function parseInjectionCanaryHits(raw: unknown, label: string): InjectionCanaryHit[] {
+    const hits = p.array(raw, label).map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const value = p.record(entry, itemLabel);
+        p.exact(value, ["scenarioId", "role", "transformId", "transformVersion", "seed"], itemLabel);
+        const role = p.enumeration(value.role, ROLES, `${itemLabel}.role`);
+        const transformId = value.transformId === null ? null : p.string(value.transformId, `${itemLabel}.transformId`);
+        const transformVersion = value.transformVersion === null ? null : p.integer(value.transformVersion, `${itemLabel}.transformVersion`);
+        const seed = value.seed === null ? null : p.boundedInteger(value.seed, `${itemLabel}.seed`, 0, MAX_TRANSFORM_SEED);
+        // Only the derivative ran a transform, so only it names one. A deterministic baseline hit still
+        // carries the seed it was generated from; a control hit names no coordinate at all.
+        if (role === "derivative") {
+            if (transformId === null || transformVersion === null || seed === null) {
+                p.fail(`${itemLabel}: canary-coordinates-required`);
+            }
+        } else if (transformId !== null || transformVersion !== null) {
+            p.fail(`${itemLabel}: canary-coordinates-unexpected`);
+        } else if (role !== "baseline" && seed !== null) {
+            p.fail(`${itemLabel}: canary-coordinates-unexpected`);
+        }
+        return { scenarioId: p.string(value.scenarioId, `${itemLabel}.scenarioId`), role, transformId, transformVersion, seed };
+        });
+    requireSorted(hits, canaryKey, label);
+    return hits;
+}
+
 function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason | null {
     if (raw === null) return null;
     const value = p.record(raw, label);
@@ -429,47 +481,8 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             requireSorted(entries, key, "report.entries");
             return entries;
         })(),
-        coverage: (() => { const coverage = p.array(root.coverage, "report.coverage").map((entry, index) => {
-            const label = `report.coverage[${index}]`;
-            const value = p.record(entry, label);
-            p.exact(value, ["scenarioId", "applied", "inapplicable", "violations"], label);
-            return {
-                scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
-                applied: p.integer(value.applied, `${label}.applied`),
-                inapplicable: p.array(value.inapplicable, `${label}.inapplicable`).map((item, itemIndex) => {
-                    const itemLabel = `${label}.inapplicable[${itemIndex}]`;
-                    const inapplicable = p.record(item, itemLabel);
-                    p.exact(inapplicable, [...PAIR_KEYS, "reason"], itemLabel);
-                    return { ...parsePairKey(inapplicable, itemLabel), reason: p.text(inapplicable.reason, `${itemLabel}.reason`) };
-                }),
-                violations: textArray(value.violations, `${label}.violations`),
-            };
-        });
-            requireSorted(coverage, ({ scenarioId }) => scenarioId, "report.coverage");
-            return coverage; })(),
-        injectionCanaryHits: (() => { const hits = p.array(root.injectionCanaryHits, "report.injectionCanaryHits").map((entry, index) => {
-            const label = `report.injectionCanaryHits[${index}]`;
-            const value = p.record(entry, label);
-            p.exact(value, ["scenarioId", "role", "transformId", "transformVersion", "seed"], label);
-            const role = p.enumeration(value.role, ROLES, `${label}.role`);
-            const transformId = value.transformId === null ? null : p.string(value.transformId, `${label}.transformId`);
-            const transformVersion = value.transformVersion === null ? null : p.integer(value.transformVersion, `${label}.transformVersion`);
-            const seed = value.seed === null ? null : p.boundedInteger(value.seed, `${label}.seed`, 0, MAX_TRANSFORM_SEED);
-            // Only the derivative ran a transform, so only it names one. A deterministic baseline hit still
-            // carries the seed it was generated from; a control hit names no coordinate at all.
-            if (role === "derivative") {
-                if (transformId === null || transformVersion === null || seed === null) {
-                    p.fail(`${label}: canary-coordinates-required`);
-                }
-            } else if (transformId !== null || transformVersion !== null) {
-                p.fail(`${label}: canary-coordinates-unexpected`);
-            } else if (role !== "baseline" && seed !== null) {
-                p.fail(`${label}: canary-coordinates-unexpected`);
-            }
-            return { scenarioId: p.string(value.scenarioId, `${label}.scenarioId`), role, transformId, transformVersion, seed };
-        });
-            requireSorted(hits, (hit) => JSON.stringify(hit), "report.injectionCanaryHits");
-            return hits; })(),
+        coverage: parseCoverage(root.coverage, "report.coverage"),
+        injectionCanaryHits: parseInjectionCanaryHits(root.injectionCanaryHits, "report.injectionCanaryHits"),
         tierInvalidReason: parseTierInvalidReason(root.tierInvalidReason, "report.tierInvalidReason"),
     };
     // The pair checks prove the two roles agree with each other, not that either ran the system the report
