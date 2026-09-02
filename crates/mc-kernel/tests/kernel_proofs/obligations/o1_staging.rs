@@ -71,12 +71,12 @@ fn populated() -> Proof {
     proof
 }
 
-fn staged_payload(proof: &Proof) -> String {
+fn staged_payload(proof: &Proof, candidate: &str) -> String {
     proof
         .db()
         .query_row(
             "SELECT CAST(payload AS TEXT) FROM candidates WHERE candidate_id=?1",
-            [CANDIDATE],
+            [candidate],
             |row| row.get(0),
         )
         .unwrap()
@@ -90,10 +90,10 @@ fn staged_candidate_is_invisible_on_every_surface_until_admitted_across_restart(
         .stage_candidate(staging("run-1", CANDIDATE, TEXT))
         .unwrap();
     // Positive control: the candidate text is durably staged.
-    assert_eq!(staged_payload(&proof), TEXT);
+    assert_eq!(staged_payload(&proof, CANDIDATE), TEXT);
     assert_absent_everywhere(&proof, CANDIDATE);
     proof.restart();
-    assert_eq!(staged_payload(&proof), TEXT);
+    assert_eq!(staged_payload(&proof, CANDIDATE), TEXT);
     assert_absent_everywhere(&proof, CANDIDATE);
 
     let admitted = admitted_domain(CANDIDATE, TEXT);
