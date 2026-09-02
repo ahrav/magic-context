@@ -2783,7 +2783,7 @@ fn apply_additive_only(
             core.frozen_units.clear();
             core.pending_changes.clear();
             core.step(PassInput {
-                proposed: Some(mc_core::Action::Hard),
+                proposed: mc_core::Action::Hard,
                 boundary_present: "-".to_string(),
                 rendered_units,
                 new_boundary_id: Some(String::new()),
@@ -2850,7 +2850,7 @@ fn apply_additive_only(
             note_deliveries = m1.note_deliveries.clone();
             let profile_rendered = m1.profile_rendered;
             core.step(PassInput {
-                proposed: Some(mc_core::Action::Soft),
+                proposed: mc_core::Action::Soft,
                 boundary_present: "-".to_string(),
                 rendered_units: vec![render_m1_body(&m1.body)],
                 new_boundary_id: None,
@@ -4234,7 +4234,7 @@ fn apply_once(
     if req.is_subagent {
         if !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer) {
             core.step(PassInput {
-                proposed: Some(mc_core::Action::Soft),
+                proposed: mc_core::Action::Soft,
                 boundary_present: boundary_token,
                 rendered_units: new_reduction_units(
                     &core,
@@ -4451,7 +4451,7 @@ fn apply_once(
                 rendered.extend(caveman_survivors);
 
                 core.step(PassInput {
-                    proposed: Some(mc_core::Action::Hard),
+                    proposed: mc_core::Action::Hard,
                     boundary_present: boundary_token,
                     rendered_units: rendered,
                     new_boundary_id: Some(comp.boundary_id.clone()),
@@ -4647,7 +4647,7 @@ fn apply_once(
                     rendered.extend(strip_survivors);
                     rendered.extend(caveman_survivors);
                     core.step(PassInput {
-                        proposed: Some(mc_core::Action::Hard),
+                        proposed: mc_core::Action::Hard,
                         boundary_present: boundary_token,
                         rendered_units: rendered,
                         new_boundary_id: Some(comp.boundary_id.clone()),
@@ -4735,7 +4735,7 @@ fn apply_once(
                         }
                     }
                     core.step(PassInput {
-                        proposed: Some(mc_core::Action::Soft),
+                        proposed: mc_core::Action::Soft,
                         boundary_present: boundary_token,
                         rendered_units: rendered,
                         new_boundary_id,
@@ -4779,11 +4779,7 @@ fn apply_once(
                         loaded.meta.m1_pending_since_ms,
                     );
                 }
-                core.step(PassInput {
-                    proposed: Some(mc_core::Action::SoftPlus),
-                    boundary_present: boundary_token,
-                    ..Default::default()
-                });
+                core.step(PassInput::new(mc_core::Action::SoftPlus, boundary_token));
                 if compartment_seq_changed_since_meta
                     && current_m1_digest == loaded.meta.m1_revision
                 {
@@ -9173,7 +9169,7 @@ mod nudge_formula_tests {
     #[test]
     fn channel2_claimed_lease_reaps_and_delivered_echo_keeps_cycle_consumed() {
         let projection = project_messages(&[]).unwrap();
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let tags = Vec::new();
         let due_baseline = baseline(75_000, 100_000);
         let mut stale = nudge_meta(75_000, 100_000);
@@ -13933,7 +13929,7 @@ pub(crate) mod tests {
         );
 
         let mut memo = TagMintFrontierMemo::default();
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let pass1 = project_messages(&[
             wire_item("user", "t0", 0, &["first"]),
             wire_item("assistant", "t1", 1, &["second"]),
@@ -14687,7 +14683,7 @@ pub(crate) mod tests {
                 synth_region("m1", M1_PLACEHOLDER.into()),
                 red_unit("live#1", "drop", "[dropped 1]"),
             ],
-            ..Default::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta {
             initialized: true,
@@ -14721,7 +14717,7 @@ pub(crate) mod tests {
         };
         let anchor_core = CoreState {
             boundary_id: "anchor#0".to_string(),
-            ..Default::default()
+            ..CoreState::empty()
         };
         s.commit("identity-anchor", None, &anchor_core, &meta)
             .unwrap();
@@ -14746,7 +14742,7 @@ pub(crate) mod tests {
             let core = CoreState {
                 boundary_id: "anchor#0".to_string(),
                 frozen_units: vec![frozen_unit],
-                ..Default::default()
+                ..CoreState::empty()
             };
             s.commit(&session, None, &core, &meta).unwrap();
             let error = transform(
@@ -16781,7 +16777,7 @@ pub(crate) mod tests {
             content
         }
 
-        let mut strip_core = CoreState::default();
+        let mut strip_core = CoreState::empty();
         strip_core
             .frozen_units
             .push(strip_unit("trailing_blank_strip", "target", ""));
@@ -16815,7 +16811,7 @@ pub(crate) mod tests {
             first_without_trailing_bytes
         );
 
-        let mut keep_core = CoreState::default();
+        let mut keep_core = CoreState::empty();
         keep_core
             .frozen_units
             .push(strip_unit("trailing_blank_keep", "target", ""));
@@ -17736,7 +17732,7 @@ pub(crate) mod tests {
         let projection = project_messages(&request.messages).unwrap();
         let mut overlay = TagOverlayState::default();
         overlay.tag_by_block_id.insert("latest#1".to_string(), 7);
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let meta = ModuleMeta::default();
         let unprotected = build_output(
             &core,
@@ -18157,7 +18153,7 @@ pub(crate) mod tests {
         let projection = project_messages(&request.messages).unwrap();
         let tag_numbers = BTreeMap::from([("latest".to_string(), 1)]);
         let output = build_output_with_tags(
-            &CoreState::default(),
+            &CoreState::empty(),
             &ModuleMeta::default(),
             &projection,
             &request,
@@ -19839,7 +19835,7 @@ pub(crate) mod tests {
     fn boundary_divergence_bust_reset_requires_structural_progress_or_convergence() {
         let before_core = CoreState {
             boundary_id: "old#0".to_string(),
-            ..Default::default()
+            ..CoreState::empty()
         };
         let before_meta = ModuleMeta {
             coverage_ordinal: Some(10),
@@ -20663,7 +20659,7 @@ pub(crate) mod tests {
                 synth_region("m0", "m0".to_string()),
                 synth_region("m1", "m1".to_string()),
             ],
-            ..Default::default()
+            ..CoreState::empty()
         };
         let pair = crate::injection::build_synthetic_todo_pair(
             r#"[{"content":"once","status":"pending","priority":"high"}]"#,
@@ -21521,7 +21517,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let request = req("mature-tag-mints", "cfg0", messages);
         let projection = project_messages(&request.messages).unwrap();
-        let core = CoreState::default();
+        let core = CoreState::empty();
         let all_work = legacy_tag_mint_inputs(&projection, &core, None, &HashSet::new());
         assert_eq!(all_work.inputs.len(), MESSAGE_COUNT);
 
@@ -22025,7 +22021,7 @@ pub(crate) mod tests {
             );
             // The bootstrap tagger skips the already-frozen placeholder so it does not consume a tag position or advance the temporal boundary.
             // Skipping the placeholder preserves its tag position and temporal boundary if the block is restored.
-            let mut core = CoreState::default();
+            let mut core = CoreState::empty();
             core.frozen_units
                 .push(red_unit("m1#0", "drop", "[dropped]"));
             s.commit("temporal-frontier", None, &core, &ModuleMeta::default())
@@ -24610,18 +24606,11 @@ pub(crate) mod tests {
             created_at_ms: 0,
             source_bytes: source.as_bytes().to_vec(),
         }];
-        let no_units = new_caveman_units(
-            &CoreState::default(),
-            &request,
-            &tags,
-            &live,
-            None,
-            false,
-            1,
-        );
+        let no_units =
+            new_caveman_units(&CoreState::empty(), &request, &tags, &live, None, false, 1);
         assert!(no_units.is_empty(), "defer must not mint a cav unit");
 
-        let units = new_caveman_units(&CoreState::default(), &request, &tags, &live, None, true, 1);
+        let units = new_caveman_units(&CoreState::empty(), &request, &tags, &live, None, true, 1);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].key, "cav:m1#0");
         assert_eq!(units[0].reset_rule, "3");
@@ -24635,7 +24624,7 @@ pub(crate) mod tests {
                 synth_region("m0", "m0".to_string()),
                 render_m1_placeholder(),
             ],
-            ..CoreState::default()
+            ..CoreState::empty()
         };
         core.frozen_units.extend(units);
         let output = build_output(
@@ -24673,7 +24662,7 @@ pub(crate) mod tests {
                     synth_region("m0", "m0".to_string()),
                     render_m1_placeholder(),
                 ],
-                ..CoreState::default()
+                ..CoreState::empty()
             };
             core.frozen_units.extend(units);
             let output = build_output(
@@ -24805,7 +24794,7 @@ pub(crate) mod tests {
         let old = caveman_unit("m1#0", 1, &lite);
         let core = CoreState {
             frozen_units: vec![old],
-            ..CoreState::default()
+            ..CoreState::empty()
         };
         let tags = vec![McTagRow {
             tag_number: 1,
@@ -24847,7 +24836,7 @@ pub(crate) mod tests {
             source_bytes: source.as_bytes().to_vec(),
         };
         assert!(new_caveman_units(
-            &CoreState::default(),
+            &CoreState::empty(),
             &subagent,
             std::slice::from_ref(&tag),
             &live,
@@ -24871,7 +24860,7 @@ pub(crate) mod tests {
             .filter(|block| !block.synthetic)
             .collect::<Vec<_>>();
         assert!(new_caveman_units(
-            &CoreState::default(),
+            &CoreState::empty(),
             &reasoning,
             std::slice::from_ref(&tag),
             &live,
@@ -24892,7 +24881,7 @@ pub(crate) mod tests {
             .filter(|block| !block.synthetic)
             .collect::<Vec<_>>();
         assert!(new_caveman_units(
-            &CoreState::default(),
+            &CoreState::empty(),
             &protected,
             &[tag],
             &live,
@@ -26136,7 +26125,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
                 .collect(),
-            ..Default::default()
+            ..CoreState::empty()
         };
         let served = build_output(
             &core,
@@ -26285,7 +26274,7 @@ pub(crate) mod tests {
                 red_unit("reasoning-adjacency-left#2", "drop", "[dropped]"),
                 red_unit("reasoning-adjacency-result#0", "drop", "[dropped]"),
             ],
-            ..Default::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta::default();
         let first = build_output_with_tags(
@@ -26420,7 +26409,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
                 .collect(),
-            ..Default::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta::default();
         let first = build_output_with_tags(
@@ -26734,7 +26723,7 @@ pub(crate) mod tests {
     #[test]
     fn legacy_transition_consumed_units_parse_as_the_v1_class_set() {
         for key in [LEGACY_TRANSITION_CONSUMED_KEY, TRANSITION_CONSUMED_KEY] {
-            let mut core = CoreState::default();
+            let mut core = CoreState::empty();
             let mut unit = boolean_v1_transition_consumed_unit();
             unit.key = key.to_string();
             core.frozen_units.push(unit);
@@ -27333,7 +27322,7 @@ pub(crate) mod tests {
                 synth_region("m0", m0.to_string()),
                 synth_region("m1", m1.to_string()),
             ],
-            ..Default::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta::default();
         let request = req(
@@ -27583,7 +27572,7 @@ pub(crate) mod tests {
         assert_eq!(frozen_units.len(), FROZEN_UNIT_COUNT);
         let core = CoreState {
             frozen_units,
-            ..Default::default()
+            ..CoreState::empty()
         };
         let meta = ModuleMeta::default();
 

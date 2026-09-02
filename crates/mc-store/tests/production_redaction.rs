@@ -337,7 +337,7 @@ fn lineage_copy_links_source_scans_without_rescanning_and_survives_source_deleti
             None,
             &CoreState {
                 boundary_id: "password=lineage-secret".to_string(),
-                ..CoreState::default()
+                ..CoreState::empty()
             },
             &ModuleMeta {
                 initialized: true,
@@ -614,7 +614,7 @@ fn cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity() {
             durability_class: DurabilityClass::Episode,
             reset_rule: "run_started".to_string(),
         }],
-        ..CoreState::default()
+        ..CoreState::empty()
     };
     store
         .commit("session", None, &core, &ModuleMeta::default())
@@ -659,7 +659,7 @@ fn cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity() {
         .commit(
             "password=new-session",
             None,
-            &CoreState::default(),
+            &CoreState::empty(),
             &ModuleMeta::default(),
         )
         .unwrap_err();
@@ -674,7 +674,7 @@ fn cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity() {
              VALUES (?1, 0, ?2, ?3)",
             rusqlite::params![
                 "password=legacy-session",
-                serde_json::to_string(&CoreState::default()).unwrap(),
+                serde_json::to_string(&CoreState::empty()).unwrap(),
                 serde_json::to_string(&ModuleMeta::default()).unwrap()
             ],
         )
@@ -684,7 +684,7 @@ fn cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity() {
         .commit(
             "password=legacy-session",
             Some(0),
-            &CoreState::default(),
+            &CoreState::empty(),
             &ModuleMeta::default(),
         )
         .unwrap();
@@ -697,7 +697,7 @@ fn cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity() {
         ..ModuleMeta::default()
     };
     let error = store
-        .commit("rejected", None, &CoreState::default(), &meta)
+        .commit("rejected", None, &CoreState::empty(), &meta)
         .unwrap_err();
     assert!(matches!(error, mc_store::McStoreError::Redaction(_)));
     assert!(!error.to_string().contains("signature-secret"));

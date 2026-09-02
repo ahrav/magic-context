@@ -23833,7 +23833,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .commit("ses", None, &CoreState::default(), &meta)
+            .commit("ses", None, &CoreState::empty(), &meta)
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
@@ -26838,7 +26838,7 @@ mod tests {
             .commit(
                 session_id,
                 None,
-                &CoreState::default(),
+                &CoreState::empty(),
                 &ModuleMeta {
                     pending_channel2_directive: Some(mc_store::PendingChannel2Directive {
                         text: "frozen reminder".to_string(),

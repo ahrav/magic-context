@@ -16,6 +16,15 @@ byte-identical to `76cd6f41` across that span, so every source line below holds
 at all three commits. CI references are at `76cd6f41` with the `HEAD` line
 noted.
 
+Three rows are re-pinned past that span, because the cache-state evidence records
+they index were rewritten against the U6 cache-core consumer migration:
+`exactly-one-core-step-executes-per-pass`,
+`core-fields-mutated-outside-the-step-machine`, and
+`defer-commit-carries-no-compartment-fence`. Their `transform.rs` and `mc-store`
+citations, and item 4's T1 list below, resolve at `eae8f72b`; cache-core citations
+resolve at `commons@cb5a5c01`. Every other row still resolves at the three commits
+named above.
+
 Three framing points specific to this part.
 
 First, **the dominant obstacle is not a missing fault.** No CI job executes any
@@ -108,14 +117,14 @@ two caveman records need the opt-in described above.
 | lineage-descent-write-precedes-the-array-validity-guards | A lineage-switch request (`lineage_switched: true`, `is_subagent: false`, well-formed `descent_edge_id`, `prior_conversation_key`, `constituents`) whose CK array also carries a duplicate flat block id, a live `mc_`-prefixed id, or non-increasing non-synthetic ordinals (T8). **No fault injection needed:** the guards at `:3355`-`:3372` are downstream of the `:3312` commit in straight-line code | **Yes** |
 | revert-truncate-commits-outside-the-terminal-cas | `loaded.core.reconcile_pending == true` plus a minted anchor absent from the live array (`:4636-4645`), which is the post-revert shape, then the `CoverageGap` at `:4704` (T8). That error sits inside the `:4650`-`:5565` window, so the split state is observable with no seam. A process kill anywhere else in the ~900-line window needs T2 | **Yes** — for the `:4704` form only |
 | revert-epoch-bumps-at-most-once-per-logical-recut | The reconcile-rematerialize arm plus a `CasConflict` on the terminal commit so attempt 2 re-enters the truncate (T1). Idempotence rests on the `dropped_count == 0` no-op arm (`mc-store/src/lib.rs:9053-9059`) returning the current epoch, and that on the recomputed `keep_through_seq` never being smaller than the surviving max sequence. Nothing covers the no-op arm today; `:18267` covers the bump path | **Yes** |
-| exactly-one-core-step-executes-per-pass | **None.** Structural: instrument `CoreState::step` with a per-pass counter. The five call sites (`:4541`, `:4794`, `:5002`, `:5098`, `:5151`) are mutually exclusive by control-flow shape plus the *move* of `boundary_token: String` (`:3540-3544`) into whichever `PassInput` runs | **Yes** |
-| core-fields-mutated-outside-the-step-machine | For the frozen-set half, a coverage-extending SOFT (`m1.new_coverage.is_some()`, `:5108`) with at least one frozen `red:` unit whose target the advance folds below coverage, so `prune_covered_red_units` (`:5117`) runs after the step bumped `core.version` (T8). For the latch half, a `validate_lineage_anchor` failure (`:2484-2547`, detected `:3452-3459`, handled `:4429-4433` and `:5191-5196`) on a pass whose boundary is still present. The `cav:` half additionally needs the caveman opt-in | **Yes** |
+| exactly-one-core-step-executes-per-pass | **None.** Structural: instrument `CoreState::step` with a per-pass counter. The seven call sites (`:2785`, `:2852`, `:4236`, `:4453`, `:4649`, `:4737`, `:4782`) are mutually exclusive by control-flow shape plus the *move* of `boundary_token: String` (`:3334-3338`) into whichever `PassInput` runs. The bound is at-most-one, not exactly-one: an accepted Defer path can execute no step | **Yes** |
+| core-fields-mutated-outside-the-step-machine | For the frozen-set half, a coverage-extending SOFT (`m1.new_coverage.is_some()`, `:4720`) with at least one frozen `red:` unit whose target the advance folds below coverage, so `prune_covered_red_units` (`:4748`) runs after the step bumped `core.version` (T8). For the latch half, a `validate_lineage_anchor` failure (`:2316-2377`, detected `:3261-3263`, handled `:4128-4132` and `:4813-4815`) on a pass whose boundary is still present. The `cav:` half additionally needs the caveman opt-in | **Yes** |
 
 ### Engine: fences, races, and cache validity
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
-| defer-commit-carries-no-compartment-fence | A Defer pass with `compartment_seq_changed_since_meta` true and `current_m1_digest == loaded.meta.m1_revision` (`:5156-5158`), plus a compartment append committing between the m1 revision read (`:5029`/`:5119`) and `:5565`. The hook at `:5563-5564` fires inside that window, so the append lands there (T1). The `row_version` CAS does not help: `append_compartments` (`mc-store/src/lib.rs:9167`) does not touch `mc_cache_state`, and `compartment_max_seq` is `None` on a Defer because `is_bust_pass` (`:4439`) excludes it | **Yes** |
+| defer-commit-carries-no-compartment-fence | **None constructible.** The fence really is absent on Defer — `compartment_max_seq` is `None` because `is_bust_pass` (`:4138`) excludes Defer, and `:4783-4786` writes the watermark from a read taken outside any predicate. But no production caller can land a compartment append inside that window: production historian publication does not use the standalone `append_compartments` wrapper (`mc-store/src/lib.rs:8615`), and the paths it does use bump the cache-state row version, which turns the interval into an ordinary stale-CAS retry. The earlier T1-hook recipe reached "constructible" only by treating production publication as the standalone wrapper | **No** — vacuous against current callers. A future production caller of standalone `append_compartments` would reopen it |
 | speculative-tag-numbering-has-two-authorities | `tagging_active` (`:3503-3504`, requires `ClaudeCodeAnthropic` or `OpencodeAiSdk` plus `tool_present`) and a mint batch containing a `block_id` already present in `mc_tags`, so the store's skip branch (`mc-store/src/lib.rs:7488-7495`) desynchronises every later number in the batch. Whether `compute_active_overlay_decisions` (`transform.rs:8574-8761`, 4e scope) can ever emit such a `block_id` is unresolved | **Partial** — the coverage form over the two numbering authorities is writable today; the mismatch needs a 4e answer first |
 | pass-firing-work-bounded-by-max-cas-retries | For the retry bound, the hook at `:5563-5564` committing a conflicting row on the first three attempts, then stopping, and asserting the firing returns within `MAX_CAS_RETRIES + 1 = 9` attempts (T1). For the tag-loop half, a writer changing the tag summary on every iteration (T6) | **Partial** — the attempt bound is constructible and unasserted today; the tag-loop half is blocked on T6 |
 | synthetic-strip-precedes-every-coverage-read | An OpenCode array carrying a replayed synthetic todo pair whose CK metadata lacks the `synthetic` marker, so recognition must come from the reserved call-id namespace (`is_synthetic_todo_id`, `injection.rs`), plus a harness block whose flat id starts with `mc_` for the backstop (T8). The mechanism under test is a shadow, not a copy: `let req = rebased_req.as_ref().unwrap_or(ingress_req)` at `:3342` | **Yes** |
@@ -149,7 +158,7 @@ two caveman records need the opt-in described above.
 | sel-caveman-deeper-tier-growth-panics-in-production | Caveman enabled, a primary session, a block inside the eligible tag window, and a text block for which the deeper tier's compression is longer than the frozen payload. Whether such a block exists is a property of `caveman.rs`'s level ladder (4e scope) and is unresolved, because compression is always applied to the persisted original (`:6338-6340`) rather than to the intermediate | **Partial** — the tie arm at `:6370-6374` is constructible and is the safe coverage form; the growth case that fires the `assert!` is unresolved |
 | sel-caveman-eligibility-ladder-deterministic-over-frozen-basis | Caveman enabled, a primary session, a bust pass, and at least one new tag minted in that same pass so the hydrated and final tag sets differ. `age_basis_tag` is the max *hydrated* tag number (`:4492-4497`), captured before the mint suffix is appended and persisted in the same commit; a non-bust pass reuses the prior durable value (`:4499-4501`) | **Yes** |
 
-**Totals: 19 non-vacuous today, 5 partial, 0 no.**
+**Totals: 18 non-vacuous today, 5 partial, 1 no.**
 
 The distribution differs from both neighbours, and the reason is worth naming.
 Part 3 had cheap capabilities missing and records blocked on infrastructure.
@@ -178,9 +187,9 @@ never constructed dynamically.
 | `transform_revert_truncate_returned_the_no_op_arm` | The `dropped_count == 0` arm (`mc-store/src/lib.rs:9053-9059`) taken on a later attempt | Legal, and it is the mechanism the documented idempotency claim names. Untested today |
 | `transform_firing_performed_more_than_one_apply_once_attempt` | The retry loop at `:2274` iterated | Legal; `MAX_CAS_RETRIES` exists for it |
 | `transform_core_step_executed_once_for_this_pass` | Exactly one `CoreState::step` call completed | The positive form of the one-step invariant, legal by construction |
-| `transform_soft_step_was_followed_by_a_coverage_prune` | `prune_covered_red_units` (`:5117`) or `prune_covered_caveman_units` (`:5118`) ran after the step bumped `core.version` | Legal and is the documented ordering; recording it is what makes the "`version` is not a witness for the frozen set" finding checkable |
-| `transform_defer_commit_wrote_a_compartment_watermark` | A committing Defer wrote `meta.coverage_compartment_seq` at `:5156-5159` | Legal; that is the ordinary Defer path |
-| `transform_commit_withheld_the_compartment_fence` | `compartment_max_seq` was `None` at `:5574` | Legal: `is_bust_pass` excludes Defer by design, so observing `None` is a fact about the code, not an outcome |
+| `transform_soft_step_was_followed_by_a_coverage_prune` | `prune_covered_red_units` (`:4748`) or `prune_covered_caveman_units` (`:4749`) ran after the step bumped `core.version` | Legal and is the documented ordering; recording it is what makes the "`version` is not a witness for the frozen set" finding checkable |
+| `transform_defer_commit_wrote_a_compartment_watermark` | A committing Defer wrote `meta.coverage_compartment_seq` at `:4783-4786` | Legal; that is the ordinary Defer path |
+| `transform_commit_withheld_the_compartment_fence` | `compartment_max_seq` was `None` at `:5173` | Legal: `is_bust_pass` excludes Defer by design, so observing `None` is a fact about the code, not an outcome |
 | `transform_commit_carried_a_nonempty_tag_mint_span` | `tag_mint_count > 0`, so the commit sliced `tag_rows` at `:5591-5592` | Legal on any tagging pass |
 | `transform_store_skipped_an_existing_tag_block_id_at_commit` | The store's skip branch (`mc-store/src/lib.rs:7488-7495`) was taken for at least one input | The independent precondition of the numbering desync, stated without asserting a desync |
 | `transform_ingress_carried_a_replayed_synthetic_todo_pair` | An ingress array carried a synthetic pair recognised by its reserved call id rather than its CK marker | Legal OpenCode replay shape; the normalization exists for it |
@@ -325,15 +334,17 @@ infrastructure, a new dependency, a subprocess harness, or a new seam.
 
 4. **T1, the CAS-conflict hook that already exists.** `run_transform_attempt_hook`
    is installed (`:2303-2322`) and fired (`:5563-5564`) today, and existing
-   tests already use it. Repurposing it costs nothing new and makes four records
+   tests already use it. Repurposing it costs nothing new and makes three records
    valid: `revert-epoch-bumps-at-most-once-per-logical-recut`,
-   `defer-commit-carries-no-compartment-fence`,
    `recut-intent-survives-the-mandatory-cas-reload`, and
-   `output-cache-replace-trails-the-accepted-commit`. It sits below item 3 only
-   because it is a seam rather than a value. Two specific gaps it closes cheaply:
-   `MAX_CAS_RETRIES = 8` has no dedicated test at all, and the truncate's no-op
-   arm (`mc-store/src/lib.rs:9053-9059`), on which the whole revert-idempotency
-   argument rests, has none either.
+   `output-cache-replace-trails-the-accepted-commit`. It no longer buys
+   `defer-commit-carries-no-compartment-fence`: that record's row above now reads
+   **No**, because the interleaving the hook would create is unreachable from
+   production callers, so the hook cannot make it non-vacuous. It sits below item 3
+   only because it is a seam rather than a value. Two specific gaps it closes
+   cheaply: `MAX_CAS_RETRIES = 8` has no dedicated test at all, and the truncate's
+   no-op arm (`mc-store/src/lib.rs:9053-9059`), on which the whole
+   revert-idempotency argument rests, has none either.
 
 5. **T8, crafted CK ingress arrays.** More test-authoring work than items 1
    through 4, which is the only reason it sits here: the guards are all

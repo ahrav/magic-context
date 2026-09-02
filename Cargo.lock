@@ -321,19 +321,22 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-cache-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
- "serde_json",
 ]
 
 [[package]]
 name = "cortexkit-lease"
-version = "0.1.1"
+version = "0.2.1"
+dependencies = [
+ "libc",
+ "tempfile",
+]
 
 [[package]]
 name = "cortexkit-store"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cortexkit-lease",
  "cortexkit-store-types",
@@ -342,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-store-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
