@@ -341,8 +341,13 @@ function installedDependencyParts(): Uint8Array[] {
             /** Resolved from this file so the digest names the installation this run will import, not a hoisted copy elsewhere. */
             const entry = Bun.resolveSync(specifier, import.meta.dir);
             parts.push(Buffer.from(`${entry}\0`, "utf8"));
-            /** The bytes, not the declared version: a locally patched install keeps its version string. */
-            parts.push(readFileSync(entry));
+            /** The whole installed package, not the entry: the SDK entry is a re-export of sibling modules, so a patched client module leaves the entry bytes unchanged. */
+            const root = installedPackageRoot(entry, specifier);
+            for (const file of bundleFiles(root)) {
+                parts.push(Buffer.from(`${relative(root, file)}\0`, "utf8"));
+                /** The bytes, not the declared version: a locally patched install keeps its version string. */
+                parts.push(readFileSync(file));
+            }
         } catch (error) {
             parts.push(Buffer.from(
                 `<unresolved>${error instanceof Error ? error.message : "unknown"}`,
@@ -355,6 +360,15 @@ function installedDependencyParts(): Uint8Array[] {
 
 /** The modules whose behaviour the measurement is made of, rather than every installed dependency. */
 const MEASUREMENT_RUNTIME_MODULES = ["@opencode-ai/sdk"] as const;
+
+/** Walks up from the resolved entry to the directory named `node_modules/<specifier>`, which is the installed package's root regardless of the entry's depth within it. */
+function installedPackageRoot(entry: string, specifier: string): string {
+    const suffix = join("node_modules", ...specifier.split("/"));
+    for (let directory = dirname(entry); directory !== dirname(directory); directory = dirname(directory)) {
+        if (directory.endsWith(sep + suffix)) return directory;
+    }
+    throw new Error(`installed package root for ${specifier} not found above ${entry}`);
+}
 
 /**
  * The bytes of the plugin bundle the harness will load.
