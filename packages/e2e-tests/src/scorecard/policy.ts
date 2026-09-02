@@ -7,7 +7,7 @@ import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
 import { PRIMARY_ARM_IDS } from "../paired-delta/contract";
 import { PRIMARY_ENDPOINTS, type PrimaryEndpoint } from "../paired-delta/estimator";
-import { PAIRED_DELTA_REPORT_SCHEMA } from "../paired-delta/report";
+import { PAIRED_DELTA_REPORT_SCHEMA, type SecondaryMetrics } from "../paired-delta/report";
 
 export const SCORECARD_POLICY_SCHEMA = "scorecard-policy/v1";
 export const SCORECARD_POLICY_OWNER = "magic-context-x4l.15";
@@ -145,6 +145,25 @@ export const PRIMARY_ENDPOINT_SLOTS: Readonly<Record<PrimaryEndpoint, UtilitySlo
     "mc-on-vs-compaction": "valid-success-delta-mc-on-vs-compaction",
 };
 
+export type PrimaryArmId = (typeof PRIMARY_ARM_IDS)[number];
+export type SecondaryMetricKey = keyof SecondaryMetrics;
+
+/** Which paired-delta arm metric each per-arm utility slot reads. */
+export const SECONDARY_SLOT_SOURCES: Readonly<Partial<Record<UtilitySlotId, { metric: SecondaryMetricKey; arm: PrimaryArmId }>>> = {
+    "invalid-success-rate-mc-on": { metric: "invalidSuccessRateByArm", arm: "mc-on" },
+    "invalid-success-rate-mc-off": { metric: "invalidSuccessRateByArm", arm: "mc-off" },
+    "invalid-success-rate-compaction": { metric: "invalidSuccessRateByArm", arm: "compaction" },
+    "final-attempt-tokens-mc-on": { metric: "finalAttemptTokensByArm", arm: "mc-on" },
+    "final-attempt-tokens-mc-off": { metric: "finalAttemptTokensByArm", arm: "mc-off" },
+    "final-attempt-tokens-compaction": { metric: "finalAttemptTokensByArm", arm: "compaction" },
+    "final-attempt-wall-clock-ms-mc-on": { metric: "finalAttemptWallClockMsByArm", arm: "mc-on" },
+    "final-attempt-wall-clock-ms-mc-off": { metric: "finalAttemptWallClockMsByArm", arm: "mc-off" },
+    "final-attempt-wall-clock-ms-compaction": { metric: "finalAttemptWallClockMsByArm", arm: "compaction" },
+    "final-attempt-turns-mc-on": { metric: "finalAttemptTurnsByArm", arm: "mc-on" },
+    "final-attempt-turns-mc-off": { metric: "finalAttemptTurnsByArm", arm: "mc-off" },
+    "final-attempt-turns-compaction": { metric: "finalAttemptTurnsByArm", arm: "compaction" },
+};
+
 export const NOISE_FLOOR_SOURCES = ["calibration", "none"] as const;
 export type NoiseFloorSource = (typeof NOISE_FLOOR_SOURCES)[number];
 
@@ -249,7 +268,7 @@ function parseSystemProjection(raw: unknown, label: string): SystemProjection {
     };
 }
 
-function parseIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {
+export function parseLaneIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {
     const value = record(raw, label);
     const kind = enumeration(value.kind, ["identityless", "projection"] as const, `${label}.kind`);
     if (kind === "identityless") {
@@ -295,7 +314,7 @@ function parseRequiredLanes(raw: unknown, label: string): RequiredLane[] {
         exact(value, ["lane", "schema", "identity"], rowLabel);
         const lane = enumeration(value.lane, LANE_IDS, `${rowLabel}.lane`);
         if (value.schema !== LANE_REPORT_SCHEMAS[lane]) fail(`${rowLabel}.schema: version-invalid`);
-        return { lane, schema: LANE_REPORT_SCHEMAS[lane], identity: parseIdentity(value.identity, lane, `${rowLabel}.identity`) };
+        return { lane, schema: LANE_REPORT_SCHEMAS[lane], identity: parseLaneIdentity(value.identity, lane, `${rowLabel}.identity`) };
     });
     if (rows.length !== LANE_IDS.length || rows.some((row, index) => row.lane !== LANE_IDS[index])) fail(`${label}: exact-lane-set-required`);
     return rows;
@@ -326,6 +345,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
     if (canaryIds.length === 0) fail("policy.injectionCanaryScenarioIds: empty");
     const secondaryMetricSlots = idArray(root.secondaryMetricSlots, "policy.secondaryMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, UTILITY_SLOT_IDS, `policy.secondaryMetricSlots[${index}]`));
+    if (secondaryMetricSlots.some((slot) => SECONDARY_SLOT_SOURCES[slot] === undefined)) fail("policy.secondaryMetricSlots: not-secondary");
     const requiredMetricSlots = idArray(root.requiredMetricSlots, "policy.requiredMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `policy.requiredMetricSlots[${index}]`));
     return {
