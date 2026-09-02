@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import { compareCodeUnits } from "../code-unit-order";
 import { makeContractPrimitives, vocabulary } from "../contract-primitives";
@@ -469,8 +469,10 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, minimumAnalyzableFamilyCount);
     if (endpoints.length > 0) {
         if (endpoints.length !== PRIMARY_ENDPOINTS.length) p.fail(`${label}.endpoints: paired-endpoints-required`);
+        // Family ids are free-form here, so a separator-joined key could be forged by embedding the
+        // separator. Canonical JSON of the sorted ids escapes instead of concatenating.
         const familyKeys = endpoints.map(({ families }) =>
-            families.map(({ familyId }) => familyId).sort(compareCodeUnits).join("\u0000"));
+            canonicalJson(families.map(({ familyId }) => familyId).sort(compareCodeUnits)));
         if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
     }
     const rawRegret = parseRawRegretRecords(value.rawRegretRecords, `${label}.rawRegretRecords`);

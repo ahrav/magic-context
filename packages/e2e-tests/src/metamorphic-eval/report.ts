@@ -418,7 +418,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     const root = p.record(raw, "report");
     p.exact(root, ["schema", "system", "entries", "coverage", "injectionCanaryHits", "tierInvalidReason"], "report");
     if (root.schema !== METAMORPHIC_REPORT_SCHEMA) p.fail("report.schema: version-invalid");
-    return {
+    const report: MetamorphicReport = {
         schema: METAMORPHIC_REPORT_SCHEMA,
         system: parseSystemVersionTuple(p, root.system, "report.system"),
         entries: (() => {
@@ -472,6 +472,18 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             return hits; })(),
         tierInvalidReason: parseTierInvalidReason(root.tierInvalidReason, "report.tierInvalidReason"),
     };
+    // The pair checks prove the two roles agree with each other, not that either ran the system the report
+    // names. Where both tuples are stated they have to be the same run.
+    if (report.system !== null) {
+        const rootSystem = canonicalJson(report.system);
+        for (const [index, entry] of report.entries.entries()) {
+            if (entry.kind !== "scored" || entry.baselineScore.system === null) continue;
+            if (canonicalJson(entry.baselineScore.system) !== rootSystem) {
+                p.fail(`report.entries[${index}]: report-system-mismatch`);
+            }
+        }
+    }
+    return report;
 }
 
 export function metamorphicExitCode(report: MetamorphicReport): 0 | 1 | 2 {

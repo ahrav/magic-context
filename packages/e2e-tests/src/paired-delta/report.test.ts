@@ -1011,6 +1011,14 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        // Joining ids with a separator would let an embedded separator forge a matching family set.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const [first, second] = body.analysis.endpoints;
+            first!.families[0]!.familyId = "a";
+            first!.families[1]!.familyId = "b\u0000c";
+            second!.families[0]!.familyId = "a\u0000b";
+            second!.families[1]!.familyId = "c";
+        }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
         // A family cannot be `resolved` over an interval that includes zero.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;

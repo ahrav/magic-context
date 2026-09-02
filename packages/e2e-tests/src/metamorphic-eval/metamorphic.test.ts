@@ -300,6 +300,17 @@ describe("deterministic metamorphic runner", () => {
         expect(() => parseMetamorphicReport(relabelled))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: control-pair-source-invalid`));
 
+        // The pair checks only prove the roles agree with each other, not that they ran the named system.
+        const rootMismatch = structuredClone(report);
+        rootMismatch.system = systemTuple();
+        const rootEntry = rootMismatch.entries[scoredIndex]!;
+        if (rootEntry.kind !== "scored") throw new Error("unreachable");
+        const otherSystem = { ...systemTuple(), historianModelId: "another-model" };
+        rootEntry.baselineScore.system = otherSystem;
+        rootEntry.derivativeScore.system = otherSystem;
+        expect(() => parseMetamorphicReport(rootMismatch))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: report-system-mismatch`));
+
         // Each producer scores both roles through one path, so a mixed-source pair is unreachable.
         const mixedSource = structuredClone(report);
         const mixedEntry = mixedSource.entries[scoredIndex]!;
