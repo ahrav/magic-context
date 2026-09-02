@@ -623,6 +623,7 @@ impl PolicyRow {
                     tests: &[
                         Test { path: KERNEL_BACKUP, function: "staging_sensitivity_marks_backup_sensitive" },
                         Test { path: KERNEL_BACKUP, function: "a_secret_row_classifies_the_backup_secret_not_merely_sensitive" },
+                        Test { path: KERNEL_BACKUP, function: "sensitivity_classification_scans_every_table_carrying_the_column" },
                         Test { path: KERNEL_BACKUP, function: "unsafe_destinations_and_restore_sources_are_rejected_before_live_touch" },
                         Test { path: KERNEL_BACKUP, function: "backup_restores_exact_snapshot_and_reclaims_writer_fence" },
                         Test { path: DURABLE_FS, function: "created_directories_and_files_are_owner_only" },
@@ -778,7 +779,7 @@ pub fn validate(rows: &[Row], catalog: &Catalog, known_beads: &[&str]) -> Result
 }
 
 /// The `cfg` conditions CI satisfies for every kernel test target, so a named oracle behind one still reaches the harness.
-const CI_ENABLED_CFG: &[&str] = &["unix", "feature = \"test-support\""];
+const CI_ENABLED_CFG: &[&str] = &["test", "unix", "feature = \"test-support\""];
 
 fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
     let source = match catalog.get(test.path) {
@@ -786,8 +787,16 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
         Some(None) => return Err(format!("{} does not exist", test.path)),
         None => return Err(format!("{} is not in the catalog", test.path)),
     };
-    let attributes = locate(source, test.function)
+    let (attributes, module_cfgs) = locate_with_module_cfgs(source, test.function)
         .map_err(|error| format!("{}::{}: {error}", test.path, test.function))?;
+    for condition in &module_cfgs {
+        if !CI_ENABLED_CFG.contains(&condition.as_str()) {
+            return Err(format!(
+                "{}::{} is inside a module behind #[cfg({condition})], which is not known to be enabled",
+                test.path, test.function
+            ));
+        }
+    }
     if !attributes.iter().any(|line| line.trim() == "#[test]") {
         return Err(format!(
             "{}::{} is not a #[test] function",
@@ -815,6 +824,12 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
                 test.path, test.function
             ));
         }
+        if line.starts_with("#[should_panic") {
+            return Err(format!(
+                "{}::{} is #[should_panic]; a panic in setup would pass without reaching the policy assertions",
+                test.path, test.function
+            ));
+        }
         if line.starts_with("#[ignore") {
             // The rerun command has to select this ignored test in the package
             // and test target that own its file; `cargo test` runs no ignored
@@ -827,7 +842,7 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
                 && line.contains("run with: cargo test")
                 && line.contains(&package)
                 && selects_target
-                && line.contains(test.function)
+                && selects_function_exactly(line, test.function)
                 && line.contains("--ignored");
             if !runnable {
                 let selector = match &target {
@@ -874,6 +889,161 @@ impl std::fmt::Display for LocateError {
     }
 }
 
+/// Blanks comment interiors while preserving string literals, so a commented-out item cannot
+/// satisfy the definition or attribute scans and an `#[ignore = ".."]` rerun command survives for
+/// inspection. Block comments nest, and comment markers inside a string are skipped rather than
+/// honored, so a byte string containing a comment opener does not blank the rest of the file.
+fn strip_block_comments(source: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut depth = 0usize;
+    let mut raw_hashes: Option<usize> = None;
+    let mut in_string = false;
+    for line in source.lines() {
+        let bytes = line.as_bytes();
+        let mut kept = String::with_capacity(line.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            let rest = &bytes[index..];
+            if let Some(hashes) = raw_hashes {
+                let mut terminator = Vec::with_capacity(hashes + 1);
+                terminator.push(b'"');
+                terminator.extend(std::iter::repeat_n(b'#', hashes));
+                if rest.starts_with(&terminator) {
+                    raw_hashes = None;
+                    kept.push_str(&line[index..index + terminator.len()]);
+                    index += terminator.len();
+                } else {
+                    kept.push_str(&line[index..index + 1]);
+                    index += 1;
+                }
+                continue;
+            }
+            if in_string {
+                if rest.starts_with(b"\\") && rest.len() > 1 {
+                    kept.push_str(&line[index..index + 2]);
+                    index += 2;
+                } else {
+                    if rest[0] == b'"' {
+                        in_string = false;
+                    }
+                    kept.push_str(&line[index..index + 1]);
+                    index += 1;
+                }
+                continue;
+            }
+            if depth > 0 {
+                if rest.starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if rest.starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if rest.starts_with(b"/*") {
+                depth = 1;
+                index += 2;
+            } else if rest.starts_with(b"//") {
+                kept.push_str(&line[index..]);
+                break;
+            } else if let Some(hashes) = raw_string_opener(rest) {
+                let opener = raw_prefix_len(rest, hashes);
+                raw_hashes = Some(hashes);
+                kept.push_str(&line[index..index + opener]);
+                index += opener;
+            } else if rest[0] == b'"' {
+                in_string = true;
+                kept.push_str(&line[index..index + 1]);
+                index += 1;
+            } else {
+                let width = line[index..].chars().next().map_or(1, char::len_utf8);
+                kept.push_str(&line[index..index + width]);
+                index += width;
+            }
+        }
+        lines.push(kept);
+    }
+    lines
+}
+
+/// Returns the hash count of a raw-string opener at the start of `rest`, covering `r`, `br`, and
+/// `cr` prefixes, so its body is skipped whole rather than scanned for comment markers.
+fn raw_string_opener(rest: &[u8]) -> Option<usize> {
+    let after_prefix = if rest.starts_with(b"br") || rest.starts_with(b"cr") {
+        2
+    } else if rest.starts_with(b"r") {
+        1
+    } else {
+        return None;
+    };
+    let hashes = rest[after_prefix..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    (rest.get(after_prefix + hashes) == Some(&b'"')).then_some(hashes)
+}
+
+fn raw_prefix_len(rest: &[u8], hashes: usize) -> usize {
+    let prefix = usize::from(rest.starts_with(b"br") || rest.starts_with(b"cr")) + 1;
+    prefix + hashes + 1
+}
+
+/// Returns the `cfg` conditions on every `mod` block enclosing `index`, so an oracle inside
+/// `#[cfg(any())] mod disabled { .. }` is rejected even though its own attributes look enabled.
+fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
+    let mut conditions = Vec::new();
+    for (start, line) in lines.iter().enumerate().take(index) {
+        let trimmed = line.trim_start();
+        let is_module = trimmed.starts_with("mod ")
+            || trimmed.starts_with("pub mod ")
+            || trimmed.starts_with("pub(crate) mod ")
+            || trimmed.starts_with("pub(super) mod ");
+        if !is_module || !line.contains('{') {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut end = None;
+        for (offset, body) in lines.iter().enumerate().skip(start) {
+            depth += body.matches('{').count() as i32;
+            depth -= body.matches('}').count() as i32;
+            if depth <= 0 {
+                end = Some(offset);
+                break;
+            }
+        }
+        if end.is_none_or(|end| end < index) {
+            continue;
+        }
+        for above in lines[..start].iter().rev() {
+            let attribute = above.trim();
+            if attribute.starts_with("#[") {
+                if let Some(condition) = attribute
+                    .strip_prefix("#[cfg(")
+                    .and_then(|rest| rest.strip_suffix(")]"))
+                {
+                    conditions.push(condition.to_string());
+                }
+            } else if !attribute.starts_with("//") && !attribute.is_empty() {
+                break;
+            }
+        }
+    }
+    conditions
+}
+
+/// Reports whether the rerun command in `attribute` selects `function` as a whole harness filter.
+/// `cargo test <selector>` runs the tests whose path contains `selector`, so a substring match here
+/// would accept `not_epic_close`, which selects nothing while containing the function name.
+fn selects_function_exactly(attribute: &str, function: &str) -> bool {
+    let suffix = format!("::{function}");
+    attribute
+        .split(|character: char| character.is_whitespace() || character == '"')
+        .any(|token| token == function || token.ends_with(&suffix))
+}
+
 /// Reports whether `line` defines `signature` rather than merely mentioning it.
 /// Restricting the prefix to `LEADING` prevents comments and strings that
 /// mention `signature` from matching, so a named function that no longer exists
@@ -905,8 +1075,15 @@ fn defines_function(line: &str, signature: &str) -> bool {
 /// neither, so an attribute on the previous item is never attributed to this
 /// one.
 fn locate(source: &str, function: &str) -> Result<Vec<String>, LocateError> {
+    locate_with_module_cfgs(source, function).map(|(attributes, _)| attributes)
+}
+
+fn locate_with_module_cfgs(
+    source: &str,
+    function: &str,
+) -> Result<(Vec<String>, Vec<String>), LocateError> {
     let signature = format!("fn {function}(");
-    let lines = source.lines().collect::<Vec<_>>();
+    let lines = strip_block_comments(source);
     let matches = lines
         .iter()
         .enumerate()
@@ -928,7 +1105,8 @@ fn locate(source: &str, function: &str) -> Result<Vec<String>, LocateError> {
         }
     }
     attributes.reverse();
-    Ok(attributes)
+    let module_cfgs = enclosing_module_cfgs(&lines, index);
+    Ok((attributes, module_cfgs))
 }
 
 fn catalog(entries: &[(&str, Option<&str>)]) -> Catalog {
@@ -981,6 +1159,12 @@ const IGNORED_WRONG_PACKAGE: &str =
 const IGNORED_WRONG_TARGET: &str =
     "#[test]\n#[ignore = \"run with: cargo test -p mc-kernel --test other proven -- --ignored\"]\nfn proven() {}\n";
 const RENAMED_TO_COMMENT: &str = "#[test]\n// formerly fn proven()\nfn renamed() {}\n";
+const BLOCK_COMMENTED: &str = "/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
+const MODULE_DISABLED: &str = "#[cfg(any())]\nmod disabled {\n    #[test]\n    fn proven() {}\n}\n";
+const MODULE_ENABLED: &str = "#[cfg(test)]\nmod enabled {\n    #[test]\n    fn proven() {}\n}\n";
+const SHOULD_PANIC: &str = "#[test]\n#[should_panic]\nfn proven() {}\n";
+const IGNORED_SUBSTRING_SELECTOR: &str =
+    "#[test]\n#[ignore = \"run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const CFG_DISABLED: &str = "#[test]\n#[cfg(any())]\nfn proven() {}\n";
 const CFG_ENABLED: &str = "#[test]\n#[cfg(unix)]\nfn proven() {}\n";
 const DUPLICATED: &str = "#[test]\nfn proven() {}\nmod inner { #[test]\nfn proven() {} }\n";
@@ -1084,6 +1268,42 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
         &[],
     )
     .unwrap();
+
+    // An oracle deleted by commenting it out must not resolve.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(BLOCK_COMMENTED))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // A `cfg` on an enclosing module keeps the oracle out of the harness too.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MODULE_DISABLED))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("inside a module behind #[cfg(any())]"),
+        "{errors:?}"
+    );
+    validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MODULE_ENABLED))]),
+        &[],
+    )
+    .unwrap();
+
+    // `should_panic` can pass on a setup panic without reaching the assertions.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(SHOULD_PANIC))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("#[should_panic]"), "{errors:?}");
 }
 
 #[test]
@@ -1120,6 +1340,18 @@ fn an_ignored_test_needs_a_runnable_rerun_command() {
         &[],
     )
     .unwrap();
+
+    // `cargo test not_proven` selects nothing, yet the string contains `proven`.
+    let errors = validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_SUBSTRING_SELECTOR))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("without a rerun command for"),
+        "{errors:?}"
+    );
 }
 
 #[test]
