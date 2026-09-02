@@ -86,6 +86,11 @@ export interface RolloutRecord extends RolloutCoordinate {
     harnessDisposed: boolean;
 }
 
+export interface FailureUsage {
+    usage: TokenUsage;
+    settled: boolean;
+}
+
 export interface RolloutHandle {
     /**
      * Usage the rollout already billed, read after `run` threw.
@@ -94,8 +99,13 @@ export interface RolloutHandle {
      * the handle can still account for. The fallback charge is a bound, and a bound over a nested
      * retry tree in another package cannot be derived from constants here, so an implementation that
      * can measure what it spent reports it and the charge takes whichever is larger.
+     *
+     * `settled` is whether the reported usage is final. A handle that knows a call is still in flight
+     * — a historian the plugin abandoned — reports what has landed so far as `settled: false`; the
+     * runner charges it and then stops admitting arms, because neither the partial measurement nor
+     * the bound can be trusted to cover the rest.
      */
-    usageOnFailure?(): Promise<TokenUsage>;
+    usageOnFailure?(): Promise<FailureUsage>;
     /** Oracle setup runs before the handle creates or uses a session in `run`. */
     prepare?(): Promise<void>;
     run(): Promise<RolloutObservation>;
@@ -1032,10 +1042,15 @@ export async function runPairedDelta(
                          * a little wall clock after the deadline to avoid losing accounting.
                          */
                         try {
-                            billedOnFailure = await withRolloutDeadline(
+                            const reported = await withRolloutDeadline(
                                 billed,
                                 LATE_DISPOSAL_GRACE_MS,
                             );
+                            /** Validated here, not only in `failedRecord`: that sanitizer nulls a malformed counter and prices the estimate, which is the fallback this status exists to refuse. commentlint: allow(JUDGE) */
+                            billedOnFailure = finiteUsage(reported?.usage);
+                            if (billedOnFailure === null || reported.settled !== true) {
+                                usageUnmeasured = true;
+                            }
                         } catch {
                             billedOnFailure = null;
                             usageUnmeasured = true;
@@ -1502,8 +1517,9 @@ function zeroUsage(): TokenUsage {
 }
 
 /** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. commentlint: allow(JUDGE) */
-function finiteUsage(usage: TokenUsage): TokenUsage | null {
-    const counters = [usage?.input, usage?.output, usage?.cacheCreation, usage?.cacheRead];
+function finiteUsage(usage: TokenUsage | null | undefined): TokenUsage | null {
+    if (usage === null || usage === undefined || typeof usage !== "object") return null;
+    const counters = [usage.input, usage.output, usage.cacheCreation, usage.cacheRead];
     /** Safe integers rather than merely finite ones: a counter near `Number.MAX_VALUE` prices to `Infinity`, which JSON writes as `null` and the next resume rejects as `cost-invalid`. commentlint: allow(JUDGE) */
     if (counters.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) {
         return null;

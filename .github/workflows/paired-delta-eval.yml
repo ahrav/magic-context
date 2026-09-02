@@ -112,7 +112,11 @@ jobs:
           restore-keys: |
             paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-
 
+      # The exit code is captured as a step output because the save step below has to read it after
+      # this step has failed: `usage-unmeasured` (5) means a failed rollout's spend could not be read
+      # and its record carries only an estimate, so a checkpoint holding it must not be resumed.
       - name: Run live paired-delta lane
+        id: lane
         timeout-minutes: 300
         env:
           NODE_ENV: ""
@@ -124,11 +128,17 @@ jobs:
           ARGS=("--${PAIRED_DELTA_MODE}" "--records" "$RECORDS" "--report" "$REPORT")
           ARGS+=("--calibration-record" "$CALIBRATION" "--deadline-minutes" "290")
           if [[ -f "$RECORDS" ]]; then ARGS+=("--resume"); fi
+          set +e
           bun packages/e2e-tests/scripts/run-paired-delta.ts "${ARGS[@]}"
+          CODE=$?
+          set -e
+          echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+          exit "$CODE"
 
       # Cache entries are immutable, so the attempt is part of the key: a rerun writes its own accumulated progress instead of failing to replace the first attempt's checkpoint.
+      # Not saved after `usage-unmeasured`: the next attempt would find the file, add `--resume`, and admit arms against the estimate the run just refused to continue from. The records still reach the artifact below for inspection.
       - name: Save rollout records for the next attempt
-        if: always() && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE)) != ''
+        if: always() && steps.lane.outputs.exit-code != '5' && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE)) != ''
         uses: actions/cache/save@v4
         with:
           path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json

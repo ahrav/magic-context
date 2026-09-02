@@ -696,6 +696,36 @@ describe("paired-delta runner", () => {
         expect(result.records[0]?.costUsd).toBeGreaterThan(0);
     });
 
+    it("stops the run when a failed rollout's usage is reported unsettled or malformed", async () => {
+        for (const reported of [
+            { usage: { input: 10, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: false },
+            { usage: { input: -1, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: true },
+            { usage: { input: Number.NaN, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: true },
+            { usage: { input: 1.5, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: true },
+        ]) {
+            const result = await runPairedDelta(
+                options(new MemoryStore()),
+                {
+                    now: () => 100,
+                    async createRollout(): Promise<RolloutHandle> {
+                        return {
+                            async run() {
+                                throw new Error("provider closed the stream");
+                            },
+                            async usageOnFailure() {
+                                return reported;
+                            },
+                            async dispose() {},
+                        };
+                    },
+                },
+            );
+
+            expect(result.status, JSON.stringify(reported)).toBe("usage-unmeasured");
+            expect(result.records).toHaveLength(1);
+        }
+    });
+
     it("charges a failed rollout's measured usage when it exceeds the estimate", async () => {
         const store = new MemoryStore();
         const measured = { input: 50_000_000, output: 0, cacheCreation: 0, cacheRead: 0 };
@@ -709,7 +739,7 @@ describe("paired-delta runner", () => {
                             throw new Error("provider closed the stream");
                         },
                         async usageOnFailure() {
-                            return measured;
+                            return { usage: measured, settled: true };
                         },
                         async dispose() {},
                     };

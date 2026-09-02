@@ -337,11 +337,11 @@ function resolvedRuntimeParts(): Uint8Array[] {
  */
 function installedDependencyParts(): Uint8Array[] {
     const parts: Uint8Array[] = [];
-    for (const specifier of MEASUREMENT_RUNTIME_MODULES) {
+    for (const { specifier, importedFrom } of MEASUREMENT_RUNTIME_MODULES) {
         parts.push(Buffer.from(`${specifier}\0`, "utf8"));
         try {
-            /** Resolved from this file so the digest names the installation this run will import, not a hoisted copy elsewhere. */
-            const entry = Bun.resolveSync(specifier, import.meta.dir);
+            /** Resolved from the importing directory so the digest names the installation that run will load, not a hoisted copy elsewhere. */
+            const entry = Bun.resolveSync(specifier, importedFrom());
             parts.push(Buffer.from(`${entry}\0`, "utf8"));
             /** The whole installed package, not the entry: the SDK entry is a re-export of sibling modules, so a patched client module leaves the entry bytes unchanged. */
             const root = installedPackageRoot(entry, specifier);
@@ -360,8 +360,18 @@ function installedDependencyParts(): Uint8Array[] {
     return parts;
 }
 
-/** The modules whose behaviour the measurement is made of, rather than every installed dependency. */
-const MEASUREMENT_RUNTIME_MODULES = ["@opencode-ai/sdk"] as const;
+/**
+ * The modules whose behaviour the measurement is made of, rather than every installed dependency.
+ *
+ * Each is resolved from the directory that imports it at runtime. The SDK is imported by this
+ * script. `@opencode-ai/plugin` is imported by the plugin bundle, which the build leaves `--external`,
+ * so the bundle bytes do not change when that installed package does even though it supplies the
+ * `tool` implementation that registers `ctx_search`. commentlint: allow(JUDGE)
+ */
+const MEASUREMENT_RUNTIME_MODULES: readonly { specifier: string; importedFrom: () => string }[] = [
+    { specifier: "@opencode-ai/sdk", importedFrom: () => import.meta.dir },
+    { specifier: "@opencode-ai/plugin", importedFrom: () => dirname(pluginEntryPath()) },
+];
 
 /** Walks up from the resolved entry to the directory named `node_modules/<specifier>`, which is the installed package's root regardless of the entry's depth within it. */
 function installedPackageRoot(entry: string, specifier: string): string {
@@ -993,7 +1003,7 @@ async function settledSessionUsage(
         attempts: number;
         incomplete: "reject" | "charge";
     } = { attempts: LEDGER_SETTLE_ATTEMPTS, incomplete: "reject" },
-): Promise<SessionUsage> {
+): Promise<SessionUsage & { settled: boolean }> {
     let previous: string | null = null;
     let last: SessionUsage | null = null;
     let state: ReturnType<typeof historianState> = "unobservable";
@@ -1009,12 +1019,13 @@ async function settledSessionUsage(
         const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
         const signature = JSON.stringify(reading);
         /** Two agreeing reads settle only a ledger whose historian is known clear: a running historian can append rows after them, and an unobservable log cannot say one is not running. Charged incomplete ledgers wait for all attempts. commentlint: allow(JUDGE) */
-        if (signature === previous && state === "clear") return reading;
+        if (signature === previous && state === "clear") return { ...reading, settled: true };
         previous = signature;
         last = reading;
         await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
     }
-    if (settle.incomplete === "charge" && last !== null) return last;
+    /** What landed is charged, and the caller is told it is not the whole bill: an abandoned or unobservable historian may still be running, and a clear ledger that never repeated itself was still moving. commentlint: allow(JUDGE) */
+    if (settle.incomplete === "charge" && last !== null) return { ...last, settled: false };
     if (state === "unobservable") {
         throw new Error(
             "live paired-delta cannot price this rollout: the plugin wrote no diagnostics for the " +
@@ -1445,7 +1456,7 @@ export function createLiveDependencies(input: {
                  */
                 async usageOnFailure() {
                     /** The same settle path as a scored rollout, charging rather than rejecting an incomplete ledger: a single snapshot misses an abandoned historian's retries, and a rejection falls back to the four-call bound those retries exceed. */
-                    return (await settledSessionUsage(
+                    const { usage, settled } = await settledSessionUsage(
                         harness,
                         activeSessionId ?? "",
                         { providerId: input.providerId, modelId: input.modelId },
@@ -1453,7 +1464,8 @@ export function createLiveDependencies(input: {
                         logPath,
                         PLUGIN_BACKED_ARMS.includes(coordinate.armId),
                         { attempts: LEDGER_SETTLE_ATTEMPTS_ON_FAILURE, incomplete: "charge" },
-                    )).usage;
+                    );
+                    return { usage, settled };
                 },
                 async dispose() {
                     await harness.dispose();
