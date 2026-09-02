@@ -30,7 +30,7 @@ struct Subject {
     proof: Proof,
     handle: ArtifactHandle,
     object_id: String,
-    evidence_object_id: String,
+    evidence_object_ids: Vec<String>,
 }
 
 /// Ingests an artifact and admits a candidate whose trigger observation
@@ -48,6 +48,15 @@ fn admitted_subject() -> Subject {
     let request = ingest("evidence", b"evidence bytes", Sensitivity::Normal);
     let evidence_object_id = request.object_id.clone();
     let handle = proof.store().ingest_artifact(request).unwrap();
+    // A second reference to the same bytes, so a deletion that stopped after
+    // the first row matching the digest fails the propagation assertions.
+    let shared = ingest("evidence-second", b"evidence bytes", Sensitivity::Normal);
+    let shared_object_id = shared.object_id.clone();
+    let shared_handle = proof.store().ingest_artifact(shared).unwrap();
+    assert_eq!(shared_handle.digest, handle.digest);
+    let mut evidence_object_ids = vec![evidence_object_id, shared_object_id];
+    // `delete_artifact` reports the affected ids ordered by object id.
+    evidence_object_ids.sort();
     proof
         .store()
         .stage_candidate(staging("run-1", CANDIDATE, "name"))
@@ -67,7 +76,7 @@ fn admitted_subject() -> Subject {
         proof,
         handle,
         object_id,
-        evidence_object_id,
+        evidence_object_ids,
     }
 }
 
@@ -109,12 +118,12 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         mut proof,
         handle,
         object_id,
-        evidence_object_id,
+        evidence_object_ids,
     } = admitted_subject();
     // Positive control: the dependent subject is served before deletion.
     assert!(auto_inject_ids(&proof).contains(&object_id));
     let live_refs = "SELECT COUNT(*) FROM evidence_meta WHERE invalidated_commit_seq IS NULL";
-    assert_eq!(count_sql(&proof, live_refs), 1);
+    assert_eq!(count_sql(&proof, live_refs), 2);
 
     let result = proof
         .store()
@@ -135,9 +144,8 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     );
 
     assert_eq!(
-        result.affected_object_ids,
-        vec![evidence_object_id],
-        "deletion invalidates the evidence object, not the admitted subject"
+        result.affected_object_ids, evidence_object_ids,
+        "deletion invalidates every evidence reference, not the admitted subject"
     );
     let check_state = |proof: &Proof| {
         let rows = propagation_rows(proof, result.commit_seq);
@@ -195,15 +203,14 @@ fn deletion_fault_before_commit_leaves_references_live_and_no_barrier_across_res
     } = admitted_subject();
     assert!(auto_inject_ids(&proof).contains(&object_id));
     proof.fault_deletion(deletion("delete", &handle.digest));
-    // `fault_deletion` restarted; the reference is still live and no barrier
-    // or propagation row exists.
+    // Both references remain live; no barrier or propagation row exists.
     assert!(auto_inject_ids(&proof).contains(&object_id));
     assert_eq!(
         count_sql(
             &proof,
             "SELECT COUNT(*) FROM evidence_meta WHERE invalidated_commit_seq IS NULL"
         ),
-        1
+        2
     );
     assert_eq!(
         count_sql(&proof, "SELECT COUNT(*) FROM deletion_backfill_barriers"),
