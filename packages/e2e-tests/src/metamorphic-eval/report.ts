@@ -3,7 +3,7 @@ import { makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { SystemVersionTuple } from "../historian-eval/runner";
 import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
 import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
-import { invariantHolds, type InvariantEvidence, type InvariantVerdict } from "./invariants";
+import { falseAuthoritativeMatchSet, introducedFailReasons, invariantHolds, type InvariantEvidence, type InvariantVerdict } from "./invariants";
 import { MAX_TRANSFORM_SEED } from "./transforms";
 
 export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
@@ -176,18 +176,12 @@ function textArray(value: unknown, label: string): string[] {
     return p.array(value, label).map((entry, index) => p.text(entry, `${label}[${index}]`));
 }
 
-function boundedInteger(value: unknown, label: string, maximum: number): number {
-    const result = p.integer(value, label);
-    if (result > maximum) p.fail(`${label}: integer-invalid`);
-    return result;
-}
-
 function parsePairKey(value: Record<string, unknown>, label: string): PairKey {
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
         transformId: p.string(value.transformId, `${label}.transformId`),
         transformVersion: p.integer(value.transformVersion, `${label}.transformVersion`),
-        seed: boundedInteger(value.seed, `${label}.seed`, MAX_TRANSFORM_SEED),
+        seed: p.boundedInteger(value.seed, `${label}.seed`, 0, MAX_TRANSFORM_SEED),
     };
 }
 
@@ -238,12 +232,62 @@ function parseInvariantEvidence(value: Record<string, unknown>, invariant: Metam
 }
 
 // `metamorphicExitCode` reads `holds` alone, so a recorded value that disagrees with its evidence is rejected rather than trusted.
-function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdict {
+/**
+ * Rejects evidence that contradicts the pair's own scores.
+ *
+ * `injection-set-equality` and `expectation-predicate-equality` are omitted: they derive from injected
+ * claims and expectation predicates, which the report does not publish.
+ */
+function checkScoreDerivedEvidence(
+    evidence: InvariantEvidence,
+    baselineScore: ScenarioScore,
+    derivativeScore: ScenarioScore,
+    label: string,
+): void {
+    const mismatch = (field: string): never => p.fail(`${label}.${field}: score-evidence-mismatch`);
+    switch (evidence.invariant) {
+        case "scenario-verdict-equality":
+        case "verdict-monotonicity": {
+            if (evidence.baselineVerdict !== baselineScore.verdict) mismatch("baselineVerdict");
+            if (evidence.derivativeVerdict !== derivativeScore.verdict) mismatch("derivativeVerdict");
+            if (evidence.invariant === "verdict-monotonicity") {
+                const derived = introducedFailReasons(baselineScore, derivativeScore);
+                if (canonicalJson(evidence.introducedFailReasons) !== canonicalJson(derived)) {
+                    mismatch("introducedFailReasons");
+                }
+            }
+            return;
+        }
+        case "expected-absent-empty":
+        case "false-authoritative-set-equality": {
+            if (canonicalJson(evidence.baselineMatches) !== canonicalJson(falseAuthoritativeMatchSet(baselineScore))) {
+                mismatch("baselineMatches");
+            }
+            if (canonicalJson(evidence.derivativeMatches) !== canonicalJson(falseAuthoritativeMatchSet(derivativeScore))) {
+                mismatch("derivativeMatches");
+            }
+            return;
+        }
+        case "injection-set-equality":
+        case "expectation-predicate-equality":
+            return;
+    }
+}
+
+function parseInvariant(
+    raw: unknown,
+    label: string,
+    scores?: { baselineScore: ScenarioScore; derivativeScore: ScenarioScore },
+): MetamorphicInvariantVerdict {
     const value = p.record(raw, label);
     const invariant = p.enumeration(value.invariant, INVARIANT_IDS, `${label}.invariant`);
     const holds = p.boolean(value.holds, `${label}.holds`);
     const evidence = parseInvariantEvidence(value, invariant, label);
     if (invariantHolds(evidence) !== holds) p.fail(`${label}.holds: derived-mismatch`);
+    // Editing both sides of one invariant keeps `holds` self-consistent, so the scores are the outside oracle.
+    if (scores !== undefined) {
+        checkScoreDerivedEvidence(evidence, scores.baselineScore, scores.derivativeScore, label);
+    }
     return { ...evidence, holds } as MetamorphicInvariantVerdict;
 }
 
@@ -291,7 +335,7 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
                 baselineScore,
                 derivativeScore,
                 invariants: p.array(value.invariants, `${label}.invariants`)
-                    .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`)),
+                    .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`, { baselineScore, derivativeScore })),
             };
         }
         case "error":
@@ -340,7 +384,13 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     return {
         schema: METAMORPHIC_REPORT_SCHEMA,
         system: parseSystemVersionTuple(p, root.system, "report.system"),
-        entries: p.array(root.entries, "report.entries").map((entry, index) => parseEntry(entry, `report.entries[${index}]`)),
+        entries: (() => {
+            const entries = p.array(root.entries, "report.entries")
+                .map((entry, index) => parseEntry(entry, `report.entries[${index}]`));
+            // One pair is observed once, so a repeated key means a duplicated observation.
+            p.unique(entries.map(key), "report.entries");
+            return entries;
+        })(),
         coverage: p.array(root.coverage, "report.coverage").map((entry, index) => {
             const label = `report.coverage[${index}]`;
             const value = p.record(entry, label);

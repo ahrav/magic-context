@@ -79,6 +79,22 @@ function canonicalizeInjectionSet(
         .map(([, claim]) => claim);
 }
 
+/** Sorted unique false-authoritative matches, the form both comparison sets publish. */
+export function falseAuthoritativeMatchSet(score: { falseAuthoritativeMatches: readonly string[] }): string[] {
+    return [...new Set(score.falseAuthoritativeMatches)].sort();
+}
+
+/** Fail reasons present on the derivative and absent from the baseline, in `FAIL_REASONS` order. */
+export function introducedFailReasons(
+    baselineScore: { failReasons: readonly FailReason[] },
+    derivativeScore: { failReasons: readonly FailReason[] },
+): FailReason[] {
+    const baselineReasons = new Set(baselineScore.failReasons);
+    return FAIL_REASONS.filter(
+        (reason) => derivativeScore.failReasons.includes(reason) && !baselineReasons.has(reason),
+    );
+}
+
 export function compareInvariants(
     baselineClaims: readonly InjectedClaimRecord[],
     derivativeClaims: readonly InjectedClaimRecord[],
@@ -97,13 +113,8 @@ export function compareInvariants(
             .filter((claim) => !baselineKeys.has(claimKey(claim)))
             .map((claim): InjectionSetChange => ({ direction: "added-in-derivative", claim })),
     ];
-    const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
-    const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
-
-    const baselineReasons = new Set(baselineScore.failReasons);
-    const introducedFailReasons = FAIL_REASONS.filter(
-        (reason) => derivativeScore.failReasons.includes(reason) && !baselineReasons.has(reason),
-    );
+    const baselineMatches = falseAuthoritativeMatchSet(baselineScore);
+    const derivativeMatches = falseAuthoritativeMatchSet(derivativeScore);
 
     return [
         withHolds({ invariant: "injection-set-equality", changes }),
@@ -112,7 +123,7 @@ export function compareInvariants(
             invariant: "verdict-monotonicity",
             baselineVerdict: baselineScore.verdict,
             derivativeVerdict: derivativeScore.verdict,
-            introducedFailReasons,
+            introducedFailReasons: introducedFailReasons(baselineScore, derivativeScore),
         }),
     ];
 }
@@ -130,8 +141,8 @@ export function compareScoreInvariants(
     const changedExpectationIds = expectationIds.filter(
         (id) => baselineExpectations[id] !== derivativeExpectations[id],
     );
-    const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
-    const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
+    const baselineMatches = falseAuthoritativeMatchSet(baselineScore);
+    const derivativeMatches = falseAuthoritativeMatchSet(derivativeScore);
     return [
         withHolds({ invariant: "expectation-predicate-equality", changedExpectationIds }),
         withHolds({ invariant: "false-authoritative-set-equality", baselineMatches, derivativeMatches }),

@@ -34,6 +34,10 @@ export interface ContractPrimitives {
     enumeration<T extends string>(value: unknown, allowed: readonly T[], label: string): T;
     array(value: unknown, label: string): unknown[];
     integer(value: unknown, label: string, minimum?: number): number;
+    /** An integer constrained on both sides, for a field whose producer has a published upper bound. */
+    boundedInteger(value: unknown, label: string, minimum: number, maximum: number): number;
+    /** A `reason -> count` record. Counts are only ever reached by incrementing, so zero means corruption. */
+    countRecord(raw: unknown, label: string): Record<string, number>;
     unique(values: readonly string[], label: string): void;
     idArray(value: unknown, label: string, pattern: RegExp): string[];
 }
@@ -100,6 +104,17 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return value as number;
     }
 
+    function boundedInteger(value: unknown, label: string, minimum: number, maximum: number): number {
+        const result = integer(value, label, minimum);
+        if (result > maximum) fail(`${label}: integer-invalid`);
+        return result;
+    }
+
+    function countRecord(raw: unknown, label: string): Record<string, number> {
+        const value = record(raw, label);
+        return Object.fromEntries(Object.entries(value).map(([key, count]) => [key, integer(count, `${label}.${key}`, 1)]));
+    }
+
     function unique(values: readonly string[], label: string): void {
         if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
     }
@@ -110,5 +125,5 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return values;
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, integer, unique, idArray };
+    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, integer, boundedInteger, countRecord, unique, idArray };
 }

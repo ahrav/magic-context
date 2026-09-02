@@ -1827,11 +1827,6 @@ function parseNullableText(value: unknown, label: string): string | null {
     return value === null ? null : p.text(value, label);
 }
 
-function parseCountRecord(raw: unknown, label: string): Record<string, number> {
-    const value = p.record(raw, label);
-    // `buildLaneReport` only ever increments these, so a key present with a zero count is corruption.
-    return Object.fromEntries(Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`, 1)]));
-}
 
 export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const value = p.record(raw, label);
@@ -1889,8 +1884,8 @@ export function parseLaneReport(raw: unknown): LaneReport {
             total: p.integer(aggregate.total, "report.aggregate.total"),
             scored: p.integer(aggregate.scored, "report.aggregate.scored"),
             errors: p.integer(aggregate.errors, "report.aggregate.errors"),
-            errorCountsByReason: parseCountRecord(aggregate.errorCountsByReason, "report.aggregate.errorCountsByReason"),
-            failCountsByReason: parseCountRecord(aggregate.failCountsByReason, "report.aggregate.failCountsByReason"),
+            errorCountsByReason: p.countRecord(aggregate.errorCountsByReason, "report.aggregate.errorCountsByReason"),
+            failCountsByReason: p.countRecord(aggregate.failCountsByReason, "report.aggregate.failCountsByReason"),
             precision: parseRatio(aggregate.precision, "report.aggregate.precision"),
             recall: parseRatio(aggregate.recall, "report.aggregate.recall"),
             falseAuthoritativeRate: parseRatio(aggregate.falseAuthoritativeRate, "report.aggregate.falseAuthoritativeRate"),

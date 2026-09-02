@@ -302,12 +302,6 @@ function nonNegativeNumber(value: unknown, label: string): number {
     return result;
 }
 
-function boundedInteger(value: unknown, label: string, minimum: number, maximum: number): number {
-    const result = p.integer(value, label, minimum);
-    if (result > maximum) p.fail(`${label}: integer-invalid`);
-    return result;
-}
-
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
     p.exact(value, ["lower", "upper"], label);
@@ -319,7 +313,7 @@ function parseInterval(raw: unknown, label: string): Interval {
     return { lower, upper };
 }
 
-function parseNoiseFloor(raw: unknown, label: string): FamilyNoiseFloor {
+function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string; endpoint: DeltaEndpoint }): FamilyNoiseFloor {
     const value = p.record(raw, label);
     const hasEndpoint = Object.hasOwn(value, "endpoint");
     p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
@@ -328,33 +322,52 @@ function parseNoiseFloor(raw: unknown, label: string): FamilyNoiseFloor {
     if (interval.lower < 0 || interval.lower > floorValue || floorValue > interval.upper) {
         p.fail(`${label}.interval: interval-invalid`);
     }
+    const familyId = p.string(value.familyId, `${label}.familyId`);
+    // `familyId` and `endpoint` must identify the series this floor applies to.
+    if (familyId !== owner.familyId) p.fail(`${label}.familyId: floor-owner-mismatch`);
+    const endpoint = hasEndpoint ? p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`) : null;
+    if (endpoint !== null && endpoint !== owner.endpoint) p.fail(`${label}.endpoint: floor-owner-mismatch`);
     return {
-        ...(hasEndpoint ? { endpoint: p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`) } : {}),
-        familyId: p.string(value.familyId, `${label}.familyId`),
+        ...(endpoint === null ? {} : { endpoint }),
+        familyId,
         value: floorValue,
         interval,
     };
 }
 
-function parseFamilyEstimate(raw: unknown, label: string): FamilyEstimate {
+function parseFamilyEstimate(
+    raw: unknown,
+    label: string,
+    endpoint: DeltaEndpoint,
+    minimumAnalyzableFamilyCount: number,
+    endpointFamilyCount: number,
+): FamilyEstimate {
     const value = p.record(raw, label);
     p.exact(value, ["familyId", "pointEstimate", "interval", "resolution", "noise"], label);
     const noise = p.record(value.noise, `${label}.noise`);
     p.exact(noise, ["label", "floor"], `${label}.noise`);
+    const familyId = p.string(value.familyId, `${label}.familyId`);
     const pointEstimate = finiteNumber(value.pointEstimate, `${label}.pointEstimate`);
-    const floor = noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`);
+    const isPrimary = (PRIMARY_ENDPOINTS as readonly DeltaEndpoint[]).includes(endpoint);
+    // `noise.floor` is allowed only for primary endpoints.
+    if (!isPrimary && noise.floor !== null) p.fail(`${label}.noise.floor: floor-owner-mismatch`);
+    const floor = noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`, { familyId, endpoint });
     const noiseLabel = p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`);
     const derivedLabel = floor === null
         ? "no-noise-floor"
         : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
     if (noiseLabel !== derivedLabel) p.fail(`${label}.noise.label: derived-mismatch`);
-    return {
-        familyId: p.string(value.familyId, `${label}.familyId`),
-        pointEstimate,
-        interval: parseInterval(value.interval, `${label}.interval`),
-        resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`),
-        noise: { label: noiseLabel, floor },
-    };
+    const interval = parseInterval(value.interval, `${label}.interval`);
+    const resolution = p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`);
+    // Zero-crossing intervals, inside-floor noise, and insufficient endpoint families each require
+    // `unresolved`. The unpublished per-family observation count only blocks proving the converse.
+    if (
+        resolution === "resolved" &&
+        (includesZero(interval) || noiseLabel === "inside-floor" || endpointFamilyCount < minimumAnalyzableFamilyCount)
+    ) {
+        p.fail(`${label}.resolution: derived-mismatch`);
+    }
+    return { familyId, pointEstimate, interval, resolution, noise: { label: noiseLabel, floor } };
 }
 
 // `allowed` is the estimator's bucket for this array: primary, live-regret, or provider-mixed-regret endpoints only.
@@ -368,8 +381,16 @@ function parseEndpointEstimates(
         const itemLabel = `${label}[${index}]`;
         const value = p.record(entry, itemLabel);
         p.exact(value, ["endpoint", "pointEstimate", "interval", "familyCount", "resolution", "families"], itemLabel);
-        const families = p.array(value.families, `${itemLabel}.families`)
-            .map((family, familyIndex) => parseFamilyEstimate(family, `${itemLabel}.families[${familyIndex}]`));
+        const endpoint = p.enumeration(value.endpoint, allowed, `${itemLabel}.endpoint`);
+        const rawFamilies = p.array(value.families, `${itemLabel}.families`);
+        const families = rawFamilies.map((family, familyIndex) =>
+            parseFamilyEstimate(
+                family,
+                `${itemLabel}.families[${familyIndex}]`,
+                endpoint,
+                minimumAnalyzableFamilyCount,
+                rawFamilies.length,
+            ));
         const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
         const pointEstimate = finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
@@ -390,7 +411,7 @@ function parseEndpointEstimates(
             : "unresolved";
         if (resolution !== derivedResolution) p.fail(`${itemLabel}.resolution: derived-mismatch`);
         return {
-            endpoint: p.enumeration(value.endpoint, allowed, `${itemLabel}.endpoint`),
+            endpoint,
             pointEstimate,
             interval,
             familyCount,
@@ -431,7 +452,7 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, `${label}.pinnedSnapshotId`),
         policyFingerprint: p.hex64(value.policyFingerprint, `${label}.policyFingerprint`),
         pairedFactsFingerprint: p.hex64(value.pairedFactsFingerprint, `${label}.pairedFactsFingerprint`),
-        bootstrapSeed: boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
+        bootstrapSeed: p.boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
         bootstrapResamples: p.integer(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES),
         minimumAnalyzableFamilyCount,
         analyzableFamilyCount,
@@ -467,12 +488,6 @@ function parseArmMetrics(raw: unknown, label: string, maximum = Number.POSITIVE_
     return metrics;
 }
 
-function parseCountRecord(raw: unknown, label: string): Record<string, number> {
-    const value = p.record(raw, label);
-    return Object.fromEntries(
-        Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`, 1)]),
-    );
-}
 
 /** Strict consumer parser: rejects unknown fields at every level and a `reportFingerprint` that does not match the body. */
 export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
@@ -543,7 +558,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             spentUsd: nonNegativeNumber(summary.spentUsd, "report.body.runSummary.spentUsd"),
             observedCostRollouts: p.integer(summary.observedCostRollouts, "report.body.runSummary.observedCostRollouts"),
             estimatedCostRollouts: p.integer(summary.estimatedCostRollouts, "report.body.runSummary.estimatedCostRollouts"),
-            refusedRegretLadders: parseCountRecord(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
+            refusedRegretLadders: p.countRecord(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
             plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates"),
             healthyCoordinates: p.integer(summary.healthyCoordinates, "report.body.runSummary.healthyCoordinates"),
             evidenceComplete: p.boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),

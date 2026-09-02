@@ -1011,6 +1011,30 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        // A family cannot be `resolved` over an interval that includes zero.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.interval = { lower: -1, upper: 1 };
+            family.resolution = "resolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.resolution: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[0]!.families[0]!.noise.floor = {
+                endpoint: "mc-on-vs-mc-off",
+                familyId: "fam-somebody-else",
+                value: 0.5,
+                interval: { lower: 0, upper: 1 },
+            };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.familyId: floor-owner-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            expect(body.analysis.endpoints[0]!.endpoint).toBe("mc-on-vs-compaction");
+            family.noise.floor = {
+                endpoint: "mc-on-vs-mc-off",
+                familyId: family.familyId,
+                value: 0.5,
+                interval: { lower: 0, upper: 1 },
+            };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.endpoint: floor-owner-mismatch/);
     });
 
     it("preserves an endpoint-scoped noise floor through the round trip", () => {

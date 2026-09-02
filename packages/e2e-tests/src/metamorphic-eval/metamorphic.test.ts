@@ -232,6 +232,24 @@ describe("deterministic metamorphic runner", () => {
         wideSeed.entries[scoredIndex]!.seed = 0x1_0000_0000;
         expect(() => parseMetamorphicReport(wideSeed))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.seed: integer-invalid`));
+
+        // Changing both verdicts preserves `holds`; score evidence must still match.
+        const bothSides = structuredClone(report);
+        const bothSidesEntry = bothSides.entries[scoredIndex]!;
+        if (bothSidesEntry.kind !== "scored") throw new Error("unreachable");
+        const equality = bothSidesEntry.invariants.findIndex((entry) => entry.invariant === "scenario-verdict-equality");
+        const both = bothSidesEntry.invariants[equality]!;
+        if (both.invariant !== "scenario-verdict-equality") throw new Error("unreachable");
+        both.baselineVerdict = "ERROR";
+        both.derivativeVerdict = "ERROR";
+        expect(both.holds).toBe(true);
+        expect(metamorphicExitCode(bothSides)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(bothSides))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants\\[${equality}\\]\\.baselineVerdict: score-evidence-mismatch`));
+
+        const duplicated = structuredClone(report);
+        duplicated.entries.push(structuredClone(duplicated.entries[scoredIndex]!));
+        expect(() => parseMetamorphicReport(duplicated)).toThrow(/report\.entries: duplicate/);
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {
