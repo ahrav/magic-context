@@ -12,6 +12,17 @@
 //! row's expected file may not exist yet and the validator has to observe
 //! that absence. The validator itself is a pure function over rows and a
 //! path catalog so its negative controls run on hand-built catalogs.
+//!
+//! What the registry proves is declaration fidelity, not execution. It checks
+//! that each named oracle is compiled into a harness and would run: the
+//! function is defined rather than mentioned, carries `#[test]`, is not
+//! `#[should_panic]`, sits under no unsatisfied `cfg`, is reachable through
+//! the `mod` declarations of its target, and, when ignored, names a rerun
+//! command that selects it. It never observes an oracle pass, because a test
+//! cannot execute the other test binaries. Closing the epic therefore takes
+//! two steps: a green run of every test target the rows name, then the
+//! `epic_close` gate. `magic-context-kh8.33` tracks deriving the oracle list
+//! from each harness rather than from source text.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -688,6 +699,110 @@ pub fn read_catalog(rows: &[Row]) -> Catalog {
         .collect()
 }
 
+/// Checks that every declared multi-file test target still declares the modules leading to each
+/// named path. A nested file reaches the harness only through `mod` declarations, so a deleted
+/// declaration would leave its functions resolvable in source while Cargo compiled none of them.
+pub fn check_module_reachability(rows: &[Row]) -> Result<(), Vec<String>> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut errors = Vec::new();
+    let mut checked = BTreeSet::new();
+    for row in rows {
+        let tests = match row.status {
+            Status::Landed { tests }
+            | Status::Pending {
+                expected_tests: tests,
+                ..
+            } => tests,
+            Status::Contradiction { .. } => &[][..],
+        };
+        for test in tests {
+            if !checked.insert(test.path) {
+                continue;
+            }
+            if let Err(error) = declarations_reach(manifest, test.path) {
+                errors.push(format!("{} ({}): {error}", row.id, row.claim));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Walks the module chain from a test target's root to `path`, requiring each step to be declared.
+fn declarations_reach(manifest: &Path, path: &str) -> Result<(), String> {
+    let Some(target) = owning_test_target(path) else {
+        return Ok(());
+    };
+    let crate_root = match path.strip_prefix("../") {
+        Some(rest) => match rest.split_once('/') {
+            Some((crate_name, _)) => manifest.join("..").join(crate_name),
+            None => return Ok(()),
+        },
+        None => manifest.to_path_buf(),
+    };
+    let relative = path
+        .strip_prefix("../")
+        .and_then(|rest| rest.split_once('/').map(|(_, rest)| rest))
+        .unwrap_or(path);
+    let Some(inside) = relative.strip_prefix(&format!("tests/{target}/")) else {
+        // A single-file target is its own root and needs no declaration.
+        return Ok(());
+    };
+    let mut parent = crate_root.join("tests").join(target).join("main.rs");
+    let components = inside.split('/').collect::<Vec<_>>();
+    for (position, component) in components.iter().enumerate() {
+        let name = component.strip_suffix(".rs").unwrap_or(component);
+        if name == "mod" || name == "main" {
+            continue;
+        }
+        let source = fs::read_to_string(&parent)
+            .map_err(|_| format!("{path} is unreachable: {} does not exist", parent.display()))?;
+        if !declares_module(&source, name) {
+            return Err(format!(
+                "{path} is unreachable: {} does not declare `mod {name}`",
+                parent.display()
+            ));
+        }
+        let is_last = position + 1 == components.len();
+        parent = if is_last {
+            break;
+        } else {
+            let directory = crate_root
+                .join("tests")
+                .join(target)
+                .join(components[..=position].join("/"));
+            let module_file = directory.join("mod.rs");
+            if module_file.exists() {
+                module_file
+            } else {
+                directory.with_extension("rs")
+            }
+        };
+    }
+    Ok(())
+}
+
+fn declares_module(source: &str, name: &str) -> bool {
+    strip_block_comments(source).iter().any(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("pub ")
+            .or_else(|| trimmed.strip_prefix("pub(crate) "))
+            .or_else(|| trimmed.strip_prefix("pub(super) "))
+            .unwrap_or(trimmed);
+        rest.strip_prefix("mod ")
+            .map(str::trim)
+            .and_then(|rest| rest.strip_prefix(name))
+            .is_some_and(|tail| {
+                let tail = tail.trim_start();
+                tail.starts_with(';') || tail.starts_with('{')
+            })
+    })
+}
+
 /// Validates `rows` against `catalog` and `known_beads`; every failure is
 /// reported so one run names every broken row.
 pub fn validate(rows: &[Row], catalog: &Catalog, known_beads: &[&str]) -> Result<(), Vec<String>> {
@@ -790,7 +905,10 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
     let (attributes, module_cfgs) = locate_with_module_cfgs(source, test.function)
         .map_err(|error| format!("{}::{}: {error}", test.path, test.function))?;
     for condition in &module_cfgs {
-        if !CI_ENABLED_CFG.contains(&condition.as_str()) {
+        if !CI_ENABLED_CFG
+            .iter()
+            .any(|allowed| normalize_condition(allowed) == normalize_condition(condition))
+        {
             return Err(format!(
                 "{}::{} is inside a module behind #[cfg({condition})], which is not known to be enabled",
                 test.path, test.function
@@ -812,7 +930,11 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
             .strip_prefix("#[cfg(")
             .and_then(|rest| rest.strip_suffix(")]"))
         {
-            if !CI_ENABLED_CFG.contains(&condition) {
+            let condition = normalize_condition(condition);
+            if !CI_ENABLED_CFG
+                .iter()
+                .any(|allowed| normalize_condition(allowed) == condition)
+            {
                 return Err(format!(
                     "{}::{} is behind #[cfg({condition})], which is not known to be enabled",
                     test.path, test.function
@@ -1095,18 +1217,70 @@ fn locate_with_module_cfgs(
         [] => return Err(LocateError::NotFound),
         _ => return Err(LocateError::Ambiguous),
     };
-    let mut attributes = Vec::new();
+    let mut raw = Vec::new();
+    let mut depth = 0i32;
     for line in lines[..index].iter().rev() {
         let trimmed = line.trim();
+        let closes = bracket_delta(trimmed);
+        if depth > 0 {
+            // A continuation line of a multiline attribute; keep climbing to its `#[`.
+            depth += closes;
+            raw.push(line.to_string());
+            continue;
+        }
         if trimmed.starts_with("#[") || trimmed.starts_with("//") {
-            attributes.push(line.to_string());
+            raw.push(line.to_string());
+        } else if trimmed.ends_with(']') {
+            depth += closes;
+            raw.push(line.to_string());
         } else {
             break;
         }
     }
-    attributes.reverse();
+    raw.reverse();
+    let attributes = join_attributes(&raw);
     let module_cfgs = enclosing_module_cfgs(&lines, index);
     Ok((attributes, module_cfgs))
+}
+
+/// Unclosed `]` minus unopened `[` on one line, so a reverse scan can climb a multiline attribute.
+fn bracket_delta(line: &str) -> i32 {
+    i32::try_from(line.matches(']').count()).unwrap_or(i32::MAX)
+        - i32::try_from(line.matches('[').count()).unwrap_or(i32::MAX)
+}
+
+/// Joins the lines of each multiline attribute into one logical attribute, so a `cfg` split across
+/// lines is inspected as a whole rather than skipped for not fitting the single-line shape.
+fn join_attributes(raw: &[String]) -> Vec<String> {
+    let mut logical = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    for line in raw {
+        let trimmed = line.trim();
+        if depth == 0 && !trimmed.starts_with("#[") {
+            logical.push(trimmed.to_string());
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(trimmed);
+        depth = -bracket_delta(&current);
+        if depth <= 0 {
+            logical.push(std::mem::take(&mut current));
+            depth = 0;
+        }
+    }
+    if !current.is_empty() {
+        logical.push(current);
+    }
+    logical
+}
+
+/// Removes every whitespace character so a condition split across lines compares equal to its
+/// single-line spelling in `CI_ENABLED_CFG`.
+fn normalize_condition(condition: &str) -> String {
+    condition.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn catalog(entries: &[(&str, Option<&str>)]) -> Catalog {
@@ -1162,6 +1336,8 @@ const RENAMED_TO_COMMENT: &str = "#[test]\n// formerly fn proven()\nfn renamed()
 const BLOCK_COMMENTED: &str = "/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
 const MODULE_DISABLED: &str = "#[cfg(any())]\nmod disabled {\n    #[test]\n    fn proven() {}\n}\n";
 const MODULE_ENABLED: &str = "#[cfg(test)]\nmod enabled {\n    #[test]\n    fn proven() {}\n}\n";
+const MULTILINE_CFG_DISABLED: &str = "#[cfg(\n    any()\n)]\n#[test]\nfn proven() {}\n";
+const MULTILINE_CFG_ENABLED: &str = "#[cfg(\n    unix\n)]\n#[test]\nfn proven() {}\n";
 const SHOULD_PANIC: &str = "#[test]\n#[should_panic]\nfn proven() {}\n";
 const IGNORED_SUBSTRING_SELECTOR: &str =
     "#[test]\n#[ignore = \"run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
@@ -1176,6 +1352,9 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
     let catalog = read_catalog(&rows);
     if let Err(errors) = validate(&rows, &catalog, KNOWN_BEADS) {
         panic!("registry violations:\n{}", errors.join("\n"));
+    }
+    if let Err(errors) = check_module_reachability(&rows) {
+        panic!("unreachable oracle modules:\n{}", errors.join("\n"));
     }
     // Positive control: the registry is not vacuously green.
     let landed = rows
@@ -1195,13 +1374,16 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
 }
 
 #[test]
-#[ignore = "epic-close gate; run with: cargo test -p mc-kernel --test kernel_proofs registry::epic_close -- --ignored"]
+#[ignore = "epic-close gate; presupposes a green run of every named target; run with: cargo test -p mc-kernel --test kernel_proofs registry::epic_close -- --ignored"]
 fn epic_close() {
     // `every_row_resolves_to_a_checked_test_or_a_known_bead` does not run under an `epic_close` name filter.
     // Revalidating here, and deriving closure from the row statuses, stops an emptied KNOWN_BEADS from authorizing closure alone.
     let rows = all_rows();
     if let Err(errors) = validate(&rows, &read_catalog(&rows), KNOWN_BEADS) {
         panic!("registry violations:\n{}", errors.join("\n"));
+    }
+    if let Err(errors) = check_module_reachability(&rows) {
+        panic!("unreachable oracle modules:\n{}", errors.join("\n"));
     }
     let unresolved = rows
         .iter()
@@ -1292,6 +1474,21 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     validate(
         &[landed(PROVEN)],
         &catalog(&[("a.rs", Some(MODULE_ENABLED))]),
+        &[],
+    )
+    .unwrap();
+
+    // A `cfg` split across lines is still a `cfg`.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MULTILINE_CFG_DISABLED))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("#[cfg(any())]"), "{errors:?}");
+    validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MULTILINE_CFG_ENABLED))]),
         &[],
     )
     .unwrap();
