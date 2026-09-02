@@ -9,12 +9,14 @@ This directory stores public control artifacts for prospective Magic Context rel
 A real freeze is blocked until all conditions hold:
 
 - `magic-context-x4l.14` publishes the versioned estimator, pairing, clustering, and missingness policy in `policies/analysis-policy.json`.
-- `magic-context-x4l.15` publishes the versioned scorecard, hard gates, weights, tolerated regressions, and minimum-evidence policy in `policies/scorecard-policy.json`.
+- `magic-context-x4l.15` publishes the versioned scorecard, hard gates, tolerated regressions, and minimum-evidence policy in `policies/scorecard-policy.json`.
 - Release N and the previous promoted N-1 exist as promoted, immutable release-root manifests for the same channel and platform matrix.
 - Required OpenCode, Pi, Rust, database-template, harness, evaluator, prompt, model, decoding, lockfile, and runtime bytes are available by digest.
 - Independent protected review can append freeze and lifecycle fingerprints to the trust registry.
 
-Current policy documents have `status: "pending"`. This is intentional. Do not replace them with placeholder values. U7 cannot run until both sibling owners publish real policies and real promoted release roots exist.
+`policies/analysis-policy.json` has `status: "pending"`. This is intentional. Do not replace it with placeholder values. U7 cannot run until x4l.14 publishes a real analysis policy and real promoted release roots exist.
+
+`policies/scorecard-policy.json` has `status: "ready"`. Its body is the `scorecard-policy/v1` pre-registration: the primary endpoint, the five hard gates, the injection canary scenarios, the tolerated-regression count, the statistical comparison, the model matrix, the replicate count, the cost budget, the required lane and metric-slot sets, and the paired-delta policy fingerprint it binds. The contract carries no metric weighting and no composite weighted score, and the parser rejects a `weighting` field, so promotion rests on the hard gates, the primary endpoint, and the tolerated-regression count. A weighted aggregate cannot be introduced once outcomes are visible without republishing the policy under a new fingerprint.
 
 U9 cannot run until a real cohort closes, comparison reaches a terminal report, and every admitted case passes second privacy review over exact incident bytes. Do not add placeholder incident rows or scenarios.
 

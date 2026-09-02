@@ -37,7 +37,7 @@ describe("parseScorecardPolicy", () => {
         const { replicateCount: _dropped, ...missing } = policyFixture();
         expectRejects(missing, "policy: fields-invalid");
         expectRejects({ ...policyFixture(), weighting: 1 }, "policy: fields-invalid");
-        expect(() => canonicalJson({ ...policyFixture(), replicateCount: undefined })).toThrow();
+        expectRejects({ ...policyFixture(), replicateCount: undefined }, "policy.replicateCount: integer-invalid");
     });
 
     it("requires the exact five gate ids in order", () => {
@@ -98,6 +98,7 @@ describe("parseScorecardPolicy", () => {
     it("requires at least one unique canary scenario id", () => {
         expectRejects(policyFixture({ injectionCanaryScenarioIds: [] }), "policy.injectionCanaryScenarioIds: empty");
         expectRejects(policyFixture({ injectionCanaryScenarioIds: ["a-b", "a-b"] }), "policy.injectionCanaryScenarioIds: duplicate");
+        expectRejects(policyFixture({ injectionCanaryScenarioIds: ["hse_webhook_docs_injection"] }), "policy.injectionCanaryScenarioIds[0]: id-invalid");
     });
 });
 

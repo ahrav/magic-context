@@ -1,11 +1,10 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { GATE_ID_RE, REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
+import { REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval/scorer";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
-import { PRIMARY_ARM_IDS } from "../paired-delta/contract";
 import { PRIMARY_ENDPOINTS, type PrimaryEndpoint } from "../paired-delta/estimator";
 import { PAIRED_DELTA_REPORT_SCHEMA } from "../paired-delta/report";
 
@@ -217,8 +216,6 @@ export const SCORECARD_POLICY_KEYS = [
     "baselineScorecardReportFingerprint",
 ] as const;
 
-const SCENARIO_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
-
 function nonNegativeNumber(value: unknown, label: string): number {
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0) fail(`${label}: number-invalid`);
     return value as number;
@@ -322,7 +319,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
     if (root.schema !== SCORECARD_POLICY_SCHEMA) fail("policy.schema: version-invalid");
     const comparison = record(root.statisticalComparison, "policy.statisticalComparison");
     exact(comparison, ["bootstrapResamples", "noiseFloorSource"], "policy.statisticalComparison");
-    const canaryIds = idArray(root.injectionCanaryScenarioIds, "policy.injectionCanaryScenarioIds", SCENARIO_ID_RE);
+    const canaryIds = idArray(root.injectionCanaryScenarioIds, "policy.injectionCanaryScenarioIds", REASON_CODE_RE);
     if (canaryIds.length === 0) fail("policy.injectionCanaryScenarioIds: empty");
     const secondaryMetricSlots = idArray(root.secondaryMetricSlots, "policy.secondaryMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, UTILITY_SLOT_IDS, `policy.secondaryMetricSlots[${index}]`));
@@ -353,4 +350,4 @@ export function scorecardPolicyFingerprint(policy: ScorecardPolicy): string {
     return canonicalFingerprint(policy);
 }
 
-export { GATE_ID_RE, PRIMARY_ARM_IDS, REASON_CODE_RE };
+export { REASON_CODE_RE };

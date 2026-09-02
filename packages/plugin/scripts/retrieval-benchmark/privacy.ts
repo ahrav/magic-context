@@ -89,11 +89,12 @@ const FINGERPRINT_FIELDS = new Set([
     "implementation_digest",
     "revisionLocator",
     "runtimeDigest",
-    "corpus",
-    "judgments",
-    "syntheticProfiles",
-    "manifest",
 ]);
+
+/** Keys whose hex64 values are named by a generic noun, so the `HASH_LIKE` exception is scoped to the container that holds them rather than to the key name at any depth. */
+const CONTAINER_SCOPED_FINGERPRINT_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+    releaseFingerprints: new Set(["corpus", "judgments", "syntheticProfiles", "manifest"]),
+};
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control-character rejection is the point
 const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
@@ -186,16 +187,19 @@ function scanValue(
     path: string,
     forbidden: ForbiddenMatchers,
     violations: PrivacyViolation[],
+    containerKey = "",
 ): void {
     if (typeof value === "string") {
         scanString(value, path, forbidden, violations);
         return;
     }
     if (Array.isArray(value)) {
+        // An array is not a fingerprint container, so its elements start over with no container-scoped exception.
         value.forEach((item, i) => scanValue(item, `${path}[${i}]`, forbidden, violations));
         return;
     }
     if (value !== null && typeof value === "object") {
+        const scoped = CONTAINER_SCOPED_FINGERPRINT_FIELDS[containerKey];
         for (const [key, child] of Object.entries(value)) {
             // A key that matches `forbidden` uses `<redacted-key>` in its violation path because paths are an output channel.
             // Every descendant path of a key that matches `forbidden` uses `<redacted-key>`.
@@ -203,11 +207,11 @@ function scanValue(
             scanString(key, `${path}.<redacted-key>`, forbidden, keyProbe);
             violations.push(...keyProbe);
             const segment = keyProbe.length > 0 ? "<redacted-key>" : key;
-            if (typeof child === "string" && FINGERPRINT_FIELDS.has(key)) {
+            if (typeof child === "string" && (FINGERPRINT_FIELDS.has(key) || scoped?.has(key) === true)) {
                 scanString(child, `${path}.${segment}`, forbidden, violations, true);
                 continue;
             }
-            scanValue(child, `${path}.${segment}`, forbidden, violations);
+            scanValue(child, `${path}.${segment}`, forbidden, violations, key);
         }
     }
 }
