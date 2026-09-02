@@ -251,6 +251,16 @@ describe("deterministic metamorphic runner", () => {
         duplicated.entries.push(structuredClone(duplicated.entries[scoredIndex]!));
         expect(() => parseMetamorphicReport(duplicated)).toThrow(/report\.entries: duplicate/);
 
+        // The control exemption is claimable only at the reserved coordinate.
+        const forgedControl = structuredClone(report);
+        const forgedEntry = forgedControl.entries[scoredIndex]!;
+        forgedEntry.transformId = "baseline-control";
+        forgedEntry.transformVersion = 7;
+        if (forgedEntry.kind !== "scored") throw new Error("unreachable");
+        forgedEntry.derivativeScore.scenarioId = forgedEntry.scenarioId;
+        expect(() => parseMetamorphicReport(forgedControl))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: control-pair-coordinates-invalid`));
+
         // Each producer scores both roles through one path, so a mixed-source pair is unreachable.
         const mixedSource = structuredClone(report);
         const mixedEntry = mixedSource.entries[scoredIndex]!;

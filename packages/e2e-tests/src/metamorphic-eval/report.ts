@@ -326,7 +326,12 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             }
             // `applyTransform` names the derivative scenario after its pair, so the id is derivable. The
             // control pair scores two runs of the base scenario and keeps that id on both roles.
-            const derivativeScenarioId = pair.transformId === CONTROL_TRANSFORM_ID
+            // The reserved control pair has fixed coordinates: transformVersion 1 and seed 0.
+            const isControlPair = pair.transformId === CONTROL_TRANSFORM_ID;
+            if (isControlPair && (pair.transformVersion !== 1 || pair.seed !== 0)) {
+                p.fail(`${label}: control-pair-coordinates-invalid`);
+            }
+            const derivativeScenarioId = isControlPair
                 ? pair.scenarioId
                 : `${pair.scenarioId}-d-${pair.transformId}-v${pair.transformVersion}-s${pair.seed}`;
             if (derivativeScore.scenarioId !== derivativeScenarioId) {
