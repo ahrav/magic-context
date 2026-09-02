@@ -10,6 +10,7 @@ pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
 /// `M1_PLACEHOLDER` keeps the m1 delta block non-empty when it has no new content.
 /// The m1 block remains non-empty to preserve the provider prompt-cache breakpoint.
 pub const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
+/// Default pre-pressure token budget for rendered session history.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
 fn escape_xml_attr(s: &str) -> String {
@@ -170,6 +171,8 @@ fn claim_render_order(left: &MirroredClaimMemory, right: &MirroredClaimMemory) -
     }
 }
 
+/// Renders one claim line, escaping XML content and truncating content to at
+/// most 64 KiB without splitting a UTF-8 code point.
 pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     let source = claim
         .provenance_label
@@ -186,7 +189,12 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     format!("{}{source}: {content}", claim.public_claim_id)
 }
 
-/// Native surfaces filter non-positive categories because callers can construct `MirroredClaimMemory` directly and native surfaces lack a warning renderer.
+/// Renders positive claims grouped in deterministic category and claim-ID order.
+///
+/// Native surfaces filter non-positive categories because callers can construct
+/// [`MirroredClaimMemory`] directly and native surfaces lack a warning renderer.
+/// Category and wrapper names are escaped for XML attributes. Claim content is
+/// escaped by [`render_claim_memory_line`].
 pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
     let mut ordered = claims
         .iter()
@@ -293,6 +301,9 @@ pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> 
     sections.join("\n\n").trim().to_string()
 }
 
+/// Wraps non-empty delta blocks in `<session-history-since>` in argument order.
+///
+/// Returns `placeholder` unchanged when every delta block is empty.
 pub fn assemble_m1(
     memory_updates: &str,
     new_compartments: &str,
@@ -320,7 +331,9 @@ pub fn assemble_m1(
     )
 }
 
-/// block.
+/// Renders non-empty compartment input at tier 1 inside `<new-compartments>`.
+///
+/// Returns an empty string when `compartments` is empty and preserves input order.
 pub fn render_new_compartments(
     compartments: &[&crate::decay_render::DecayRenderCompartment],
 ) -> String {

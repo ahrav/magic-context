@@ -3,9 +3,9 @@
 //! `estimateTokens(text)` in the TS harness returns `Tokenizer(claudeEncoding).encode(text, "all").length`.
 //! In TS `"all"` mode, special-token substrings are encoded as literal byte-BPE text.
 //! In TS `"all"` mode, `<EOT>` encodes as four byte tokens rather than its special-token rank.
-//! `encode_ordinary` and `count_ordinary` perform byte-BPE without special-token handling.
-//!
-//!
+//! [`encode_ordinary`] and [`estimate_tokens`] perform byte-BPE without
+//! special-token handling. Tokenizer construction is cached for process lifetime
+//! and panics only if the build-embedded vocabulary or regex is invalid.
 
 use std::sync::OnceLock;
 
@@ -44,6 +44,11 @@ fn tokenizer() -> &'static CoreBPE {
     })
 }
 
+/// Counts ordinary Claude byte-BPE tokens in `text`.
+///
+/// Empty input returns zero without initializing the tokenizer. First non-empty
+/// use initializes a process-wide tokenizer and may panic if the embedded
+/// vocabulary or pre-tokenization pattern is invalid.
 pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
@@ -51,6 +56,10 @@ pub fn estimate_tokens(text: &str) -> usize {
     tokenizer().count_ordinary(text)
 }
 
+/// Encodes `text` as ordinary Claude byte-BPE ranks without special-token handling.
+///
+/// First use initializes a process-wide tokenizer and may panic if the embedded
+/// vocabulary or pre-tokenization pattern is invalid.
 pub fn encode_ordinary(text: &str) -> Vec<Rank> {
     tokenizer().encode_ordinary(text)
 }
