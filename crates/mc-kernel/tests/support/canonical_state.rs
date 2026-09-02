@@ -213,9 +213,10 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         hash_rows(&normalized.identity),
     );
     tables.insert("cas_layout".to_string(), hash_rows(&layout_rows(root)));
+    tables.insert("leases".to_string(), hash_rows(&lease_rows(root)));
     tables.insert(
         "recovery_markers".to_string(),
-        hash_rows(&recovery_marker_rows(root)),
+        hash_rows(&recovery_marker_rows(root, profile)),
     );
     let metadata_rows = scan_object_metadata(root)
         .into_iter()
@@ -301,6 +302,13 @@ struct Normalized {
 
 impl State {
     fn read(root: &Path) -> Self {
+        // `prepare_private_dir` stats the root without following, and requires a directory.
+        let root_metadata = fs::symlink_metadata(root).unwrap();
+        assert!(
+            root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+            "{} is not a directory",
+            root.display()
+        );
         let connection = open_read_only(root);
         let mut tables = BTreeMap::new();
         for name in table_names(&connection) {
@@ -338,6 +346,7 @@ impl State {
             tables.insert(name, Table { columns, rows });
         }
         verify_format_marker(&tables);
+        verify_lease_epoch(root, &tables);
         Self {
             identity: schema_identity_rows(&connection),
             tables,
@@ -791,10 +800,59 @@ fn layout_rows(root: &Path) -> Vec<Vec<Cell>> {
     rows
 }
 
+/// The number of persisted leases, which is state whether or not their epochs are.
+///
+/// A lease file name is an FNV hash of the key identity and its body is an epoch, so neither
+/// travels across roots; the count still separates a present lease store from a deleted one.
+fn lease_rows(root: &Path) -> Vec<Vec<Cell>> {
+    let Ok(entries) = fs::read_dir(root.join("leases")) else {
+        return Vec::new();
+    };
+    let leases = entries
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(".lease"))
+        })
+        .count();
+    vec![vec![Cell::Integer(leases as i64)]]
+}
+
+/// The persisted lease epoch cannot trail the fence the database was stamped with.
+///
+/// `writer_fence` takes its epoch from the lease store at open, so a lease store that was
+/// deleted or rolled back hands the next writer an epoch a committed row already used.
+fn verify_lease_epoch(root: &Path, tables: &BTreeMap<String, Table>) {
+    let Some(fence) = current_writer_epoch(tables) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root.join("leases")) else {
+        return;
+    };
+    let mut persisted = None;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if !path.to_string_lossy().ends_with(".lease") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let digits = text.trim_matches('x');
+        if let Ok(epoch) = digits.trim().parse::<i64>() {
+            persisted = Some(persisted.unwrap_or(epoch).max(epoch));
+        }
+    }
+    if let Some(epoch) = persisted {
+        assert!(
+            epoch >= fence,
+            "lease epoch {epoch} trails the writer_fence epoch {fence}"
+        );
+    }
+}
+
 /// The recovery markers `KernelStore::open` inspects before it opens the live family.
 ///
 /// An invalid marker makes the next open fail, so its presence and contents are state.
-fn recovery_marker_rows(root: &Path) -> Vec<Vec<Cell>> {
+fn recovery_marker_rows(root: &Path, profile: Profile) -> Vec<Vec<Cell>> {
     let mut rows = Vec::new();
     for suffix in [".mc-restore", ".mc-reset", ".mc-reset.staging"] {
         let path = root.join(format!("core.sqlite{suffix}"));
@@ -802,8 +860,14 @@ fn recovery_marker_rows(root: &Path) -> Vec<Vec<Cell>> {
             continue;
         };
         let content = if metadata.is_file() {
-            let bytes = fs::read(&path).unwrap();
-            Cell::Text(format!("{:x}", Sha256::digest(&bytes)))
+            // A marker records the absolute database and quarantine paths, which are per-root,
+            // so only one root's own history can compare their bytes.
+            if profile == Profile::CrossRoot {
+                Cell::Integer(1)
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                Cell::Text(format!("{:x}", Sha256::digest(&bytes)))
+            }
         } else if metadata.file_type().is_symlink() {
             Cell::Text(SYMLINK_MARKER.to_string())
         } else {
