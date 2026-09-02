@@ -317,6 +317,9 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             if (canonicalJson(baselineScore.system) !== canonicalJson(derivativeScore.system)) {
                 p.fail(`${label}: pair-system-mismatch`);
             }
+            if (baselineScore.source !== derivativeScore.source) {
+                p.fail(`${label}: pair-source-mismatch`);
+            }
             // Baseline scores must match `pair.scenarioId` to prevent replay under another pair key.
             if (baselineScore.scenarioId !== pair.scenarioId) {
                 p.fail(`${label}.baselineScore.scenarioId: pair-scenario-mismatch`);

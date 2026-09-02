@@ -443,6 +443,21 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         });
         if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
     }
+    // Endpoint-less floors with the same `familyId` must have matching fingerprints across primary
+    // endpoints. Endpoint-keyed floors stay independent per endpoint.
+    const unscopedFloors = new Map<string, string>();
+    for (const [index, endpointEstimate] of endpoints.entries()) {
+        for (const [familyIndex, family] of endpointEstimate.families.entries()) {
+            const floor = family.noise.floor;
+            if (floor === undefined || floor === null || floor.endpoint !== undefined) continue;
+            const shape = canonicalFingerprint(floor);
+            const seen = unscopedFloors.get(floor.familyId);
+            if (seen === undefined) unscopedFloors.set(floor.familyId, shape);
+            else if (seen !== shape) {
+                p.fail(`${label}.endpoints[${index}].families[${familyIndex}].noise.floor: floor-conflict`);
+            }
+        }
+    }
     // `estimateFamilyDeltas` counts the distinct families observed on paired coordinates at the primary
     // endpoints, and every such family appears under at least one of them, so the union reproduces it.
     const observedFamilies = new Set(endpoints.flatMap(({ families }) => families.map(({ familyId }) => familyId)));

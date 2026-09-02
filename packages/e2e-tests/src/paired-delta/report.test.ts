@@ -1025,6 +1025,16 @@ describe("parsePairedDeltaReport", () => {
                 interval: { lower: 0, upper: 1 },
             };
         }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.familyId: floor-owner-mismatch/);
+        // One endpoint-less floor record serves both endpoints, so two shapes for one family is impossible.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            for (const [index, endpoint] of body.analysis.endpoints.entries()) {
+                const family = endpoint.families[0]!;
+                family.noise.floor = { familyId: family.familyId, value: 10 + index, interval: { lower: 0, upper: 20 } };
+                family.noise.label = "inside-floor";
+                family.resolution = "unresolved";
+            }
+            for (const endpoint of body.analysis.endpoints) endpoint.resolution = "unresolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[1\]\.families\[0\]\.noise\.floor: floor-conflict/);
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;
             expect(body.analysis.endpoints[0]!.endpoint).toBe("mc-on-vs-compaction");

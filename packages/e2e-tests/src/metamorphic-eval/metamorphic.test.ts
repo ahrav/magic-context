@@ -250,6 +250,16 @@ describe("deterministic metamorphic runner", () => {
         const duplicated = structuredClone(report);
         duplicated.entries.push(structuredClone(duplicated.entries[scoredIndex]!));
         expect(() => parseMetamorphicReport(duplicated)).toThrow(/report\.entries: duplicate/);
+
+        // Each producer scores both roles through one path, so a mixed-source pair is unreachable.
+        const mixedSource = structuredClone(report);
+        const mixedEntry = mixedSource.entries[scoredIndex]!;
+        if (mixedEntry.kind !== "scored") throw new Error("unreachable");
+        expect(mixedEntry.baselineScore.source).toBe("raw-output");
+        mixedEntry.derivativeScore.source = "run-record";
+        expect(metamorphicExitCode(mixedSource)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(mixedSource))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-source-mismatch`));
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {
