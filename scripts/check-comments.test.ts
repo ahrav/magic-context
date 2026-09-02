@@ -392,6 +392,55 @@ describe("comment hygiene gate", () => {
         expect(result.out).toContain("bs.sh:1:");
     });
 
+    test("an arithmetic shift is not a heredoc operator", () => {
+        const result = scan({
+            "shift.sh": "value=$((1 << 2))\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("shift.sh:2:");
+    });
+
+    test("a regex may follow an expression keyword", () => {
+        const result = scan({
+            "kw.ts": 'function quote() { return /"/; } // tracked in magic-context-om3y',
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("kw.ts:1:");
+    });
+
+    test("closing a nested template leaves the outer one open", () => {
+        const result = scan({
+            "nest.ts": "const v = `outer ${`inner`} rest`; // tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("nest.ts:1:");
+    });
+
+    test("PowerShell block comments and here-strings are handled", () => {
+        const result = scan({
+            "blk.ps1": "<#\n tracked in magic-context-om3y\n#>",
+            "here.ps1": '$f = @"\n# runtime magic-context-om3y\n"@\n# tracked in magic-context-om3y',
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("blk.ps1:2:");
+        expect(result.out).not.toContain("here.ps1:2:");
+        expect(result.out).toContain("here.ps1:4:");
+    });
+
+    test("a raw C-string and an unquoted locator are runtime data", () => {
+        const result = scan({
+            "crs.rs": 'let _ = cr#"runtime " // magic-context-om3y"#;',
+            "url.tsx": "return <p>See https://magic-context-om3y/docs</p>;",
+        });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [
@@ -431,10 +480,11 @@ describe("comment hygiene gate", () => {
         expect(`${run.stdout}${run.stderr}`).toContain("cannot read");
     });
 
+    // A whole-tree scan needs a bound above the per-test default on a slow host.
     test("the repository is clean", () => {
         const run = spawnSync("sh", [gate], { cwd: repoRoot, encoding: "utf8" });
 
         expect(`${run.stdout}${run.stderr}`).toBe("");
         expect(run.status).toBe(0);
-    });
+    }, 120_000);
 });

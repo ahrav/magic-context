@@ -94,6 +94,11 @@ function heredoc_literals(p) {
   return (p ~ /\.sh$/) ? 1 : 0
 }
 
+# PowerShell adds a block-comment form and here-strings whose terminators are distinctive.
+function powershell_literals(p) {
+  return (p ~ /\.ps1$/) ? 1 : 0
+}
+
 # A single-quoted body processes backslash escapes only in these languages.
 function apostrophe_escapes(p) {
   return (p ~ /\.(ts|tsx|js|mjs|cjs|py)$/) ? 1 : 0
@@ -126,6 +131,13 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
   }
   q = (tq && tsub == 0) ? BT : ""
   while (i <= n) {
+    if (hdepth > 0) {
+      two = substr(line, i, 2)
+      if (two == "#>") { hdepth--; i += 2; continue }
+      out = out substr(line, i, 1)
+      i++
+      continue
+    }
     if (depth > 0) {
       two = substr(line, i, 2)
       if (two == "*/") { depth--; i += 2; continue }
@@ -138,7 +150,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     if (q != "") {
       if (c == BS && (q != SQ || sq_escapes)) { i += 2; continue }
       if (q == BT && substr(line, i, 2) == "${") { tsub = 1; q = ""; i += 2; continue }
-      if (c == q) { q = ""; if (c == BT) tq = 0 }
+      if (c == q) { q = ""; if (c == BT) tq-- }
       i++
       continue
     }
@@ -149,8 +161,8 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
       if (c == "{") { tsub++; i++; continue }
       if (c == "}") { tsub--; if (tsub == 0) q = BT; i++; continue }
     }
-    if (rust_lit && (c == "r" || c == "b")) {
-      j = (c == "b") ? i + 1 : i
+    if (rust_lit && (c == "r" || c == "b" || c == "c")) {
+      j = (c == "b" || c == "c") ? i + 1 : i
       prev = (i > 1) ? substr(line, i - 1, 1) : ""
       if (substr(line, j, 1) == "r" && prev !~ /[A-Za-z0-9_]/) {
         k = j + 1
@@ -194,8 +206,17 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
       if (e > 0) { i = e; continue }
     }
     if (c == DQ || (c == SQ && sq_quotes && !nosq)) { q = c; i++; continue }
-    if (c == BT && tmpl_quotes) { q = BT; tq = 1; i++; continue }
+    if (c == BT && tmpl_quotes) { q = BT; tq++; i++; continue }
     if (st == "hash") {
+      if (ps_lit && substr(line, i, 2) == "<#") { hdepth = 1; out = out " "; i += 2; continue }
+      if (ps_lit && (substr(line, i, 2) == "@" DQ || substr(line, i, 2) == "@" SQ)) {
+        litend = substr(line, i + 1, 1) "@"
+        e = index(substr(line, i + 2), litend)
+        if (e == 0) return out
+        i = i + 2 + e + 1
+        litend = ""
+        continue
+      }
       if (heredoc_lit && substr(line, i, 2) == "<<") {
         e = heredoc_word(line, i)
         if (e > 0) { i = e; continue }
@@ -205,7 +226,10 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
       continue
     }
     two = substr(line, i, 2)
-    if (st != "block" && two == "//") return out " " substr(line, i + 2)
+    if (st != "block" && two == "//") {
+      if (url_scheme(line, i)) { i += 2; continue }
+      return out " " substr(line, i + 2)
+    }
     if (two == "/*") { depth = 1; out = out " "; i += 2; continue }
     i++
   }
@@ -216,7 +240,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
 # Only scan a slash-delimited body where an expression can begin; elsewhere a slash is division or a path.
 function regex_end(line, i, n,   j, c, prev, in_class) {
   prev = prev_code_char(line, i)
-  if (prev != "" && index("(,=:[!&|?{};+-*%~^", prev) == 0) return 0
+  if (prev != "" && index("(,=:[!&|?{};+-*%~^", prev) == 0 && !expr_keyword(line, i)) return 0
   in_class = 0
   j = i + 1
   while (j <= n) {
@@ -234,6 +258,33 @@ function regex_end(line, i, n,   j, c, prev, in_class) {
   return 0
 }
 
+# A known scheme immediately before a double slash marks a locator, which JSX text carries unquoted.
+function url_scheme(line, i,   j, w, c) {
+  if (substr(line, i - 1, 1) != ":") return 0
+  w = ""
+  for (j = i - 2; j > 0; j--) {
+    c = substr(line, j, 1)
+    if (c !~ /^[A-Za-z]$/) break
+    w = tolower(c) w
+  }
+  return (w == "http" || w == "https" || w == "ftp" || w == "file" || w == "ws" ||
+          w == "wss" || w == "git" || w == "ssh" || w == "mailto" || w == "data")
+}
+
+# A slash after one of these keywords begins a value rather than a division.
+function expr_keyword(line, i,   j, w, c) {
+  w = ""
+  for (j = i - 1; j > 0; j--) {
+    c = substr(line, j, 1)
+    if (c == " " || c == "\t") { if (w != "") break; else continue }
+    if (c !~ /^[A-Za-z]$/) break
+    w = tolower(c) w
+  }
+  return (w == "return" || w == "typeof" || w == "case" || w == "in" || w == "of" ||
+          w == "delete" || w == "void" || w == "instanceof" || w == "do" || w == "else" ||
+          w == "yield" || w == "await" || w == "throw" || w == "new")
+}
+
 function prev_code_char(line, i,   j, c) {
   for (j = i - 1; j > 0; j--) {
     c = substr(line, j, 1)
@@ -249,6 +300,7 @@ function heredoc_word(line, i,   j, c, w) {
   while (substr(line, j, 1) == " ") j++
   c = substr(line, j, 1)
   if (c == DQ || c == SQ) j++
+  if (substr(line, j, 1) !~ /^[A-Za-z_]$/) return 0
   w = ""
   while (j <= length(line)) {
     c = substr(line, j, 1)
@@ -340,7 +392,9 @@ BEGIN {
     regex_lit = regex_literals(path)
     triple_lit = triple_literals(path)
     heredoc_lit = heredoc_literals(path)
+    ps_lit = powershell_literals(path)
     depth = 0
+    hdepth = 0
     tq = 0
     tsub = 0
     litend = ""
@@ -352,11 +406,12 @@ BEGIN {
         if (line ~ ("^[ \t]*" heredoc "[ \t]*$")) heredoc = ""
         continue
       }
-      if (depth == 0 && !tq && litend == "") {
+      if (depth == 0 && hdepth == 0 && !tq && litend == "") {
         if (style == "hash") {
           if (index(line, "#") == 0 &&
               !(triple_lit && (index(line, DQ DQ DQ) > 0 || index(line, SQ SQ SQ) > 0)) &&
-              !(heredoc_lit && index(line, "<<") > 0)) continue
+              !(heredoc_lit && index(line, "<<") > 0) &&
+              !(ps_lit && index(line, "@") > 0)) continue
         } else if (index(line, "/") == 0 &&
                    !(tmpl_quotes && index(line, BT) > 0) &&
                    !(rust_lit && index(line, DQ) > 0)) continue
