@@ -100,46 +100,43 @@ const HOST_SEARCH_PROJECTOR: &str = "../mc-host/tests/search_projector.rs";
 const HOST_VECTOR_PROJECTOR: &str = "../mc-host/tests/vector_projector.rs";
 const HOST_SHADOW_EXTRACTION: &str = "../mc-host/tests/shadow_extraction.rs";
 
-/// kh8 R8 obligations O1–O10, split where the kernel proves one half and a
-/// daemon or projector owner proves the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Obligation {
-    O1StagingInvisibility,
-    O2AtomicRepair,
-    O3BranchApplicability,
-    O4ScopeAlgebra,
-    O5AppendOnlyCorrection,
-    O6DeletionPropagationKernel,
-    O6DeletionWithdrawsSubject,
-    O6DeletionReachesSearch,
-    O7StaleExclusionKernel,
-    O7StaleServing,
-    O7DeletedEvidenceExcluded,
-    O8RestartBackup,
-    O9EgressKernel,
-    O9EgressGate,
-    O10Idempotency,
+macro_rules! registry_enum {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const ALL: &'static [$name] = &[$($name::$variant),+];
+        }
+    };
+}
+
+registry_enum! {
+    /// kh8 R8 obligations O1–O10, split where the kernel proves one half and a
+    /// daemon or projector owner proves the other.
+    Obligation {
+        O1StagingInvisibility,
+        O2AtomicRepair,
+        O3BranchApplicability,
+        O4ScopeAlgebra,
+        O5AppendOnlyCorrection,
+        O6DeletionPropagationKernel,
+        O6DeletionWithdrawsSubject,
+        O6DeletionReachesSearch,
+        O7StaleExclusionKernel,
+        O7StaleServing,
+        O7DeletedEvidenceExcluded,
+        O8RestartBackup,
+        O9EgressKernel,
+        O9EgressGate,
+        O10Idempotency,
+    }
 }
 
 impl Obligation {
-    pub const ALL: &'static [Obligation] = &[
-        Obligation::O1StagingInvisibility,
-        Obligation::O2AtomicRepair,
-        Obligation::O3BranchApplicability,
-        Obligation::O4ScopeAlgebra,
-        Obligation::O5AppendOnlyCorrection,
-        Obligation::O6DeletionPropagationKernel,
-        Obligation::O6DeletionWithdrawsSubject,
-        Obligation::O6DeletionReachesSearch,
-        Obligation::O7StaleExclusionKernel,
-        Obligation::O7StaleServing,
-        Obligation::O7DeletedEvidenceExcluded,
-        Obligation::O8RestartBackup,
-        Obligation::O9EgressKernel,
-        Obligation::O9EgressGate,
-        Obligation::O10Idempotency,
-    ];
-
     pub fn row(self) -> Row {
         match self {
             Obligation::O1StagingInvisibility => Row {
@@ -312,70 +309,41 @@ impl Obligation {
     }
 }
 
-/// kh8.1 policy rows R1–R12e and the owner-matrix oracles that have no
-/// policy row of their own, split where owners differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyRow {
-    R1AppendOnlyRetention,
-    R2CommitHistoryRetained,
-    R3OutboxPruning,
-    R3VectorConsumer,
-    R4StagingLeases,
-    R5ArtifactRetention,
-    R6SearchRebuild,
-    R6VectorRebuild,
-    R7CoreWarning,
-    R8ArtifactBudget,
-    R9PayloadCap,
-    R10SensitivityAtIngestion,
-    R11EgressEligibility,
-    R11EgressGate,
-    R11ExtractionDelegation,
-    R12aBackupContents,
-    R12bRestoreExact,
-    R12cRestoreRto,
-    R12cArtifactFixture,
-    R12dOutboxPosition,
-    R12dLagFacts,
-    R12dServing,
-    R12dProjector,
-    R12dVectorLag,
-    R12eBackupPermissions,
-    K2FullLogReplay,
-    K7MatrixCompleteness,
+registry_enum! {
+    /// kh8.1 policy rows R1–R12e and the owner-matrix oracles that have no
+    /// policy row of their own, split where owners differ.
+    PolicyRow {
+        R1AppendOnlyRetention,
+        R2CommitHistoryRetained,
+        R3OutboxPruning,
+        R3VectorConsumer,
+        R4StagingLeases,
+        R5ArtifactRetention,
+        R6SearchRebuild,
+        R6VectorRebuild,
+        R7CoreWarning,
+        R8ArtifactBudget,
+        R9PayloadCap,
+        R10SensitivityAtIngestion,
+        R11EgressEligibility,
+        R11EgressGate,
+        R11ExtractionDelegation,
+        R12aBackupContents,
+        R12bRestoreExact,
+        R12cRestoreRto,
+        R12cArtifactFixture,
+        R12dOutboxPosition,
+        R12dLagFacts,
+        R12dServing,
+        R12dProjector,
+        R12dVectorLag,
+        R12eBackupPermissions,
+        K2FullLogReplay,
+        K7MatrixCompleteness,
+    }
 }
 
 impl PolicyRow {
-    pub const ALL: &'static [PolicyRow] = &[
-        PolicyRow::R1AppendOnlyRetention,
-        PolicyRow::R2CommitHistoryRetained,
-        PolicyRow::R3OutboxPruning,
-        PolicyRow::R3VectorConsumer,
-        PolicyRow::R4StagingLeases,
-        PolicyRow::R5ArtifactRetention,
-        PolicyRow::R6SearchRebuild,
-        PolicyRow::R6VectorRebuild,
-        PolicyRow::R7CoreWarning,
-        PolicyRow::R8ArtifactBudget,
-        PolicyRow::R9PayloadCap,
-        PolicyRow::R10SensitivityAtIngestion,
-        PolicyRow::R11EgressEligibility,
-        PolicyRow::R11EgressGate,
-        PolicyRow::R11ExtractionDelegation,
-        PolicyRow::R12aBackupContents,
-        PolicyRow::R12bRestoreExact,
-        PolicyRow::R12cRestoreRto,
-        PolicyRow::R12cArtifactFixture,
-        PolicyRow::R12dOutboxPosition,
-        PolicyRow::R12dLagFacts,
-        PolicyRow::R12dServing,
-        PolicyRow::R12dProjector,
-        PolicyRow::R12dVectorLag,
-        PolicyRow::R12eBackupPermissions,
-        PolicyRow::K2FullLogReplay,
-        PolicyRow::K7MatrixCompleteness,
-    ];
-
     pub fn row(self) -> Row {
         match self {
             PolicyRow::R1AppendOnlyRetention => Row {
@@ -719,11 +687,18 @@ pub fn validate(rows: &[Row], catalog: &Catalog, known_beads: &[&str]) -> Result
                 }
                 for test in expected_tests {
                     if let Some(Some(source)) = catalog.get(test.path) {
-                        if locate(source, test.function).is_ok() {
-                            errors.push(format!(
+                        // Ambiguous matches satisfy the existence check; only
+                        // `LocateError::NotFound` leaves the row pending.
+                        match locate(source, test.function) {
+                            Ok(_) => errors.push(format!(
                                 "{} ({}): expected test {}::{} exists; promote the row to Landed",
                                 row.id, row.claim, test.path, test.function
-                            ));
+                            )),
+                            Err(LocateError::Ambiguous) => errors.push(format!(
+                                "{} ({}): expected test {}::{} exists more than once; promote the row to Landed and disambiguate it",
+                                row.id, row.claim, test.path, test.function
+                            )),
+                            Err(LocateError::NotFound) => {}
                         }
                     } else if !catalog.contains_key(test.path) {
                         errors.push(format!(
@@ -776,18 +751,20 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
             test.path, test.function
         ));
     }
+    let package = format!("-p {} ", owning_package(test.path));
     for line in &attributes {
         let line = line.trim();
         if line.starts_with("#[ignore") {
-            // A rerun command must select this test and pass `--ignored`, or
-            // it reruns nothing.
+            // The rerun command has to select this ignored test in the package
+            // that owns its file; `cargo test` runs no ignored test otherwise.
             let runnable = line.starts_with("#[ignore = \"")
                 && line.contains("run with: cargo test")
+                && line.contains(&package)
                 && line.contains(test.function)
                 && line.contains("--ignored");
             if !runnable {
                 return Err(format!(
-                    "{}::{} is ignored without a rerun command",
+                    "{}::{} is ignored without a rerun command for {package}",
                     test.path, test.function
                 ));
             }
@@ -796,11 +773,32 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
     Ok(())
 }
 
+fn owning_package(path: &str) -> &str {
+    path.strip_prefix("../")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(env!("CARGO_PKG_NAME"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocateError {
+    NotFound,
+    Ambiguous,
+}
+
+impl std::fmt::Display for LocateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            LocateError::NotFound => "function not found",
+            LocateError::Ambiguous => "function name is ambiguous in this file",
+        })
+    }
+}
+
 /// Finds the single definition of `function` and returns the attribute and
 /// comment lines immediately above it, stopping at the first line that is
 /// neither, so an attribute on the previous item is never attributed to this
 /// one.
-fn locate(source: &str, function: &str) -> Result<Vec<String>, String> {
+fn locate(source: &str, function: &str) -> Result<Vec<String>, LocateError> {
     let signature = format!("fn {function}(");
     let lines = source.lines().collect::<Vec<_>>();
     let matches = lines
@@ -811,8 +809,8 @@ fn locate(source: &str, function: &str) -> Result<Vec<String>, String> {
         .collect::<Vec<_>>();
     let index = match matches.as_slice() {
         [index] => *index,
-        [] => return Err("function not found".to_string()),
-        _ => return Err("function name is ambiguous in this file".to_string()),
+        [] => return Err(LocateError::NotFound),
+        _ => return Err(LocateError::Ambiguous),
     };
     let mut attributes = Vec::new();
     for line in lines[..index].iter().rev() {
@@ -868,20 +866,9 @@ const IGNORED_BARE: &str = "#[test]\n#[ignore]\nfn proven() {}\n";
 const IGNORED_RUNNABLE: &str =
     "#[test]\n#[ignore = \"heavy; run with: cargo test -p mc-kernel --test x proven -- --ignored\"]\nfn proven() {}\n";
 const IGNORED_VAGUE: &str = "#[test]\n#[ignore = \"run with: cargo test\"]\nfn proven() {}\n";
-
-/// `row()` is exhaustive over each enum, so a new variant cannot compile
-/// without a row; these counts make it fail to pass without an `ALL` entry.
-#[test]
-fn all_variants_are_listed() {
-    assert_eq!(Obligation::ALL.len(), 15);
-    assert_eq!(PolicyRow::ALL.len(), 27);
-    let mut ids = Obligation::ALL.to_vec();
-    ids.dedup();
-    assert_eq!(ids.len(), Obligation::ALL.len());
-    let mut ids = PolicyRow::ALL.to_vec();
-    ids.dedup();
-    assert_eq!(ids.len(), PolicyRow::ALL.len());
-}
+const IGNORED_WRONG_PACKAGE: &str =
+    "#[test]\n#[ignore = \"run with: cargo test -p mc-store --test x proven -- --ignored\"]\nfn proven() {}\n";
+const DUPLICATED: &str = "#[test]\nfn proven() {}\nmod inner { #[test]\nfn proven() {} }\n";
 
 #[test]
 fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
@@ -936,36 +923,41 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     .unwrap_err();
     assert!(errors[0].contains("not a #[test] function"), "{errors:?}");
 
-    let duplicated = catalog(&[(
-        "a.rs",
-        Some("#[test]\nfn proven() {}\nmod inner { #[test]\nfn proven() {} }\n"),
-    )]);
-    let errors = validate(&[landed(PROVEN)], &duplicated, &[]).unwrap_err();
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(DUPLICATED))]),
+        &[],
+    )
+    .unwrap_err();
     assert!(errors[0].contains("ambiguous"), "{errors:?}");
 }
 
 #[test]
 fn an_ignored_test_needs_a_runnable_rerun_command() {
-    let errors = validate(
-        &[landed(PROVEN)],
-        &catalog(&[("a.rs", Some(IGNORED_BARE))]),
-        &[],
-    )
-    .unwrap_err();
-    assert!(errors[0].contains("without a rerun command"), "{errors:?}");
-    let errors = validate(
-        &[landed(PROVEN)],
-        &catalog(&[("a.rs", Some(IGNORED_VAGUE))]),
-        &[],
-    )
-    .unwrap_err();
-    assert!(errors[0].contains("without a rerun command"), "{errors:?}");
+    for source in [IGNORED_BARE, IGNORED_VAGUE, IGNORED_WRONG_PACKAGE] {
+        let errors =
+            validate(&[landed(PROVEN)], &catalog(&[("a.rs", Some(source))]), &[]).unwrap_err();
+        assert!(
+            errors[0].contains("without a rerun command for -p mc-kernel"),
+            "{errors:?}"
+        );
+    }
     validate(
         &[landed(PROVEN)],
         &catalog(&[("a.rs", Some(IGNORED_RUNNABLE))]),
         &[],
     )
     .unwrap();
+}
+
+#[test]
+fn a_sibling_crate_path_is_owned_by_that_crate() {
+    assert_eq!(
+        owning_package("../mc-host/tests/kernel_routes.rs"),
+        "mc-host"
+    );
+    assert_eq!(owning_package("tests/kernel_backup.rs"), "mc-kernel");
+    assert_eq!(owning_package("src/durable_fs.rs"), "mc-kernel");
 }
 
 #[test]
@@ -993,6 +985,15 @@ fn a_pending_row_needs_a_known_owner_and_fails_once_its_test_exists() {
         errors[0].contains("promote the row to Landed"),
         "{errors:?}"
     );
+
+    let duplicated = catalog(&[("a.rs", Some(DUPLICATED))]);
+    let errors = validate(&[pending(PROVEN, "bead-1")], &duplicated, &["bead-1"]).unwrap_err();
+    assert!(
+        errors[0].contains("exists more than once; promote the row to Landed"),
+        "{errors:?}"
+    );
+
+    validate(&[pending(ABSENT, "bead-1")], &present_other, &["bead-1"]).unwrap();
 }
 
 #[test]

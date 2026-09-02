@@ -741,7 +741,7 @@ fn insert_domain_result(store: &KernelStore, index: i64) -> Result<i64, mc_kerne
 }
 
 #[test]
-#[ignore = "writes about 3 GiB; run with: cargo test -p mc-store --features test-support --test kernel_backup threshold_size_restore_rto -- --ignored --nocapture"]
+#[ignore = "writes about 3 GiB; run with: cargo test -p mc-kernel --test kernel_backup threshold_size_restore_rto -- --ignored --nocapture"]
 fn threshold_size_restore_rto() {
     let root = private_dir();
     let destination = private_dir();
