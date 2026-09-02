@@ -25,6 +25,11 @@ const PROSPECTIVE_FILLER = "(?:\\s+(?:be|being|get|getting|soon|then|now|[a-z]+l
 
 const PROSPECTIVE_COMPLETION = new RegExp(`${PROSPECTIVE_HEAD}${PROSPECTIVE_FILLER}[\\s,]*$`);
 
+/** A negated prospect — "nothing remains to be done", "no work is left to complete" — asserts completion, so a negation directly governing the prospective head cancels it. The negation must sit within filler of the head: "I did not start, and still need to complete it" keeps its prospect. commentlint: allow(JUDGE) */
+const NEGATED_PROSPECT = new RegExp(
+    `${NEGATION}${NEGATION_FILLER}\\s+${PROSPECTIVE_HEAD}${PROSPECTIVE_FILLER}[\\s,]*$`,
+);
+
 /** How far back a negation or prospective head may sit from the verb it governs. Both patterns anchor at the verb and admit only filler in between, so a wider window cannot let an unrelated earlier clause reach it; it only lets a long filler chain — "not yet been fully able to successfully manage to entirely" — keep its negation in view. commentlint: allow(JUDGE) */
 const LOOKBEHIND = 200;
 
@@ -45,7 +50,7 @@ export function claimsCompletion(text: string): boolean {
     for (const match of text.matchAll(COMPLETION)) {
         const before = text.slice(Math.max(0, match.index - LOOKBEHIND), match.index).toLowerCase();
         if (NEGATED_COMPLETION.test(before)) continue;
-        if (PROSPECTIVE_COMPLETION.test(before)) continue;
+        if (PROSPECTIVE_COMPLETION.test(before) && !NEGATED_PROSPECT.test(before)) continue;
         return true;
     }
     return false;

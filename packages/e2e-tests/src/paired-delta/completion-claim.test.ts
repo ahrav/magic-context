@@ -94,6 +94,8 @@ describe("paired-delta completion claims: prospective constructions", () => {
             "It should be done after the next step.",
             "I was trying to complete the request when the context ran out.",
             "There is more work left to complete.",
+            // A negation on an earlier clause does not cancel a later prospect.
+            "I did not start it, and I still need to complete it.",
         ]) {
             expect(reachesTheClassifier(text)).toBe(true);
             expect(claimsCompletion(text)).toBe(false);
@@ -107,6 +109,10 @@ describe("paired-delta completion claims: prospective constructions", () => {
             "I managed to complete the task.",
             "I have completed the task.",
             "I can confirm the task is complete.",
+            // A negated prospect asserts completion.
+            "Nothing remains to be done.",
+            "Nothing remains to be completed.",
+            "No work is left to complete.",
         ]) {
             expect(claimsCompletion(text)).toBe(true);
         }
