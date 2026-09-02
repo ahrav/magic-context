@@ -726,6 +726,42 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("keeps usage-unmeasured over invalid stored records", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(options(store), dependencies());
+        const stored = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stored) throw new Error("missing fixture record");
+        stored.checks = stored.checks.map((check, index) => ({
+            ...check,
+            id: `check-drifted-${index}`,
+        }));
+
+        // Replicate 0 is blocked by the drifted record; replicate 1 runs and cannot read its spend.
+        const result = await runPairedDelta(
+            { ...options(store), replicateCount: 2, resume: true },
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            return {
+                                usage: { input: 1, output: 0, cacheCreation: 0, cacheRead: 0 },
+                                settled: false,
+                            };
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.invalidStoredCoordinates).toHaveLength(1);
+        expect(result.status).toBe("usage-unmeasured");
+    });
+
     it("charges a failed rollout's measured usage when it exceeds the estimate", async () => {
         const store = new MemoryStore();
         const measured = { input: 50_000_000, output: 0, cacheCreation: 0, cacheRead: 0 };

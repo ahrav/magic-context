@@ -1182,8 +1182,13 @@ export async function runPairedDelta(
         if (reclaimed.some((ok) => !ok)) status = "harness-unreclaimed";
     }
 
-    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. commentlint: allow(JUDGE) */
-    if (status !== "harness-unreclaimed" && invalidStoredCoordinates.length > 0) {
+    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. Unmeasured usage also stands: it is the one status whose checkpoint must not be resumed at all, and the workflow keys that refusal on this status alone. commentlint: allow(JUDGE) */
+    /** Read through the declared type: `status` is assigned inside `runArm`, which control-flow narrowing does not see, and a narrowed literal makes the second comparison a type error. commentlint: allow(JUDGE) */
+    const outranksStoredRecords: readonly PairedDeltaRunResult["status"][] = [
+        "harness-unreclaimed",
+        "usage-unmeasured",
+    ];
+    if (!outranksStoredRecords.includes(status) && invalidStoredCoordinates.length > 0) {
         status = "invalid-stored-records";
     }
 

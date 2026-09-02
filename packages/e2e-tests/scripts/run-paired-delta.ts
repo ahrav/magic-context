@@ -1460,10 +1460,12 @@ export function createLiveDependencies(input: {
                  * bound and the measurement is larger.
                  */
                 async usageOnFailure() {
+                    /** No session means no prompt was sent: `prepare` and `createSession` run before the first provider call, so a failure there billed nothing, and reading the ledger for an empty id would report that nothing as unmeasured. commentlint: allow(JUDGE) */
+                    if (activeSessionId === undefined) return { usage: ZERO_USAGE, settled: true };
                     /** The same settle path as a scored rollout, charging rather than rejecting an incomplete ledger: a single snapshot misses an abandoned historian's retries, and a rejection falls back to the four-call bound those retries exceed. */
                     const { usage, settled } = await settledSessionUsage(
                         harness,
-                        activeSessionId ?? "",
+                        activeSessionId,
                         { providerId: input.providerId, modelId: input.modelId },
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                         logPath,
