@@ -483,6 +483,46 @@ describe("comment hygiene gate", () => {
         expect(result.out).toContain("hookish:2:");
     });
 
+    test("a quoted heredoc delimiter keeps its punctuation", () => {
+        const result = scan({
+            "qd.sh": "cat <<'END-MARK'\n# runtime magic-context-om3y\nEND-MARK\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("qd.sh:2:");
+        expect(result.out).toContain("qd.sh:4:");
+    });
+
+    test("a here-string terminator only counts at the start of a line", () => {
+        const result = scan({
+            "hs.ps1": '$f = @"\nprefix "@ still runtime\n# runtime magic-context-om3y\n"@\n# tracked in magic-context-om3y',
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("hs.ps1:3:");
+        expect(result.out).toContain("hs.ps1:5:");
+    });
+
+    test("a regex may follow an arrow, and a comparison is not one", () => {
+        const result = scan({
+            "arrow.ts": 'const f = () => /"/; // tracked in magic-context-om3y',
+            "cmp.ts": "const c = x>y; // tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("arrow.ts:1:");
+        expect(result.out).toContain("cmp.ts:1:");
+    });
+
+    test("a shell command substitution inside a quoted body holds code", () => {
+        const result = scan({
+            "cs.sh": 'x="$(printf hi # tracked in magic-context-om3y\n)"',
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("cs.sh:1:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

@@ -34,7 +34,11 @@ fi
 
 # Comment hygiene on staged source files.
 staged=$(git diff --cached -z --name-only --diff-filter=ACMR -- "*.rs" "*.ts" "*.tsx" "*.js" "*.mjs" "*.cjs" "*.py" "*.sh" "*.ps1" "*.yml" "*.yaml" "*.toml" "*.jsonc" "*.css" ".beads/hooks/*" | tr '\0' '\n')
-if [ -n "$staged" ] && [ -f scripts/check-comments.sh ]; then
+# A staged export can turn a previously harmless token in an unchanged comment into a
+# finding, so it triggers a whole-tree scan of its own.
+ids_staged=0
+if ! git diff --cached --quiet -- .beads/issues.jsonl 2>/dev/null; then ids_staged=1; fi
+if { [ -n "$staged" ] || [ "$ids_staged" -eq 1 ]; } && [ -f scripts/check-comments.sh ]; then
   root=$(git rev-parse --show-toplevel) || exit 1
   work=$(mktemp -d) || exit 1
   trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -56,13 +60,21 @@ STAGED
   # The ID export decides which short forms resolve, so a staged change to it
   # belongs in the same view of the commit as the sources.
   ids="$root/.beads/issues.jsonl"
-  if ! git diff --cached --quiet -- .beads/issues.jsonl 2>/dev/null; then
+  if [ "$ids_staged" -eq 1 ]; then
     if git cat-file blob :.beads/issues.jsonl > "$work/issues.jsonl" 2>/dev/null; then
       ids="$work/issues.jsonl"
     fi
   fi
 
-  if ! out=$(COMMENT_CHECK_IDS="$ids" sh "$root/scripts/check-comments.sh" "$@" 2>&1); then
+  # The scanner itself may be partially staged, so run the version being committed.
+  gate="$root/scripts/check-comments.sh"
+  if ! git diff --cached --quiet -- scripts/check-comments.sh 2>/dev/null; then
+    if git cat-file blob :scripts/check-comments.sh > "$work/gate.sh" 2>/dev/null; then
+      gate="$work/gate.sh"
+    fi
+  fi
+
+  if ! out=$(COMMENT_CHECK_IDS="$ids" sh "$gate" "$@" 2>&1); then
     printf '%s\n' "$out" | sed "s|$work/||g" >&2
     exit 1
   fi

@@ -108,6 +108,11 @@ function powershell_literals(p) {
   return (p ~ /\.ps1$/) ? 1 : 0
 }
 
+# A shell command substitution inside a double-quoted body holds code, not data.
+function cmdsub_literals(p) {
+  return (p ~ /\.sh$/ || p !~ /\.[A-Za-z0-9]+$/) ? 1 : 0
+}
+
 # PowerShell uses a backtick where the other languages use a backslash.
 function escape_char(p) {
   return (p ~ /\.ps1$/) ? BT : BS
@@ -148,7 +153,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     i = e + length(litend)
     litend = ""
   }
-  q = (tq > 0 && subd[tq] == 0) ? BT : ""
+  q = (tq > 0 && subd[tq] == 0) ? BT : (dqsub > 0 ? "" : "")
   while (i <= n) {
     if (hdepth > 0) {
       two = substr(line, i, 2)
@@ -170,6 +175,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     if (q != "") {
       if (c == esc_ch && (q != SQ || sq_escapes)) { i += 2; continue }
       if (q == BT && substr(line, i, 2) == "${") { subd[tq] = 1; q = ""; i += 2; continue }
+      if (q == DQ && cmdsub_lit && substr(line, i, 2) == "$(") { dqsub = 1; q = ""; i += 2; continue }
       if (c == q) {
         q = ""
         if (c == BT) { tq--; if (tq > 0 && subd[tq] == 0) q = BT }
@@ -179,6 +185,10 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     }
     # An escape outside a string covers the shell form that embeds an apostrophe.
     if (c == BS) { i += 2; continue }
+    if (dqsub > 0) {
+      if (c == "(") { dqsub++; i++; continue }
+      if (c == ")") { dqsub--; if (dqsub == 0) q = DQ; i++; continue }
+    }
     # Substitution contents are code, so its braces decide where the template resumes.
     if (tq > 0 && subd[tq] > 0) {
       if (c == "{") { subd[tq]++; i++; continue }
@@ -233,12 +243,8 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     if (st == "hash") {
       if (ps_lit && substr(line, i, 2) == "<#") { hdepth = 1; out = out " "; i += 2; continue }
       if (ps_lit && (substr(line, i, 2) == "@" DQ || substr(line, i, 2) == "@" SQ)) {
-        litend = substr(line, i + 1, 1) "@"
-        e = index(substr(line, i + 2), litend)
-        if (e == 0) return out
-        i = i + 2 + e + 1
-        litend = ""
-        continue
+        hstr = substr(line, i + 1, 1) "@"
+        return out
       }
       if (heredoc_lit && substr(line, i, 2) == "<<") {
         e = heredoc_word(line, i)
@@ -267,6 +273,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
 # Only scan a slash-delimited body where an expression can begin; elsewhere a slash is division or a path.
 function regex_end(line, i, n,   j, c, prev, in_class) {
   prev = prev_code_char(line, i)
+  if (prev == ">" && arrow_before(line, i)) prev = "="
   if (prev != "" && index("(,=:[!&|?{};+-*%~^", prev) == 0 && !expr_keyword(line, i)) return 0
   in_class = 0
   j = i + 1
@@ -312,6 +319,17 @@ function expr_keyword(line, i,   j, w, c) {
           w == "yield" || w == "await" || w == "throw" || w == "new")
 }
 
+# An arrow before a slash is an expression start, unlike a bare comparison.
+function arrow_before(line, i,   j, c) {
+  for (j = i - 1; j > 0; j--) {
+    c = substr(line, j, 1)
+    if (c == " " || c == "\t") continue
+    if (c != ">") return 0
+    return (substr(line, j - 1, 1) == "=")
+  }
+  return 0
+}
+
 function prev_code_char(line, i,   j, c) {
   for (j = i - 1; j > 0; j--) {
     c = substr(line, j, 1)
@@ -321,13 +339,18 @@ function prev_code_char(line, i,   j, c) {
 }
 
 # A heredoc body ends at a line holding only its delimiter, so the word is retained rather than matched as a substring.
-function heredoc_word(line, i,   j, c, w) {
+function heredoc_word(line, i,   j, c, w, e) {
   j = i + 2
   heredoc_dash = 0
   if (substr(line, j, 1) == "-") { heredoc_dash = 1; j++ }
   while (substr(line, j, 1) == " ") j++
   c = substr(line, j, 1)
-  if (c == DQ || c == SQ) j++
+  if (c == DQ || c == SQ) {
+    e = index(substr(line, j + 1), c)
+    if (e < 2) return 0
+    heredoc = substr(line, j + 1, e - 1)
+    return j + e + 1
+  }
   if (substr(line, j, 1) !~ /^[A-Za-z_]$/) return 0
   w = ""
   while (j <= length(line)) {
@@ -338,7 +361,6 @@ function heredoc_word(line, i,   j, c, w) {
   }
   if (w == "") return 0
   heredoc = w
-  if (substr(line, j, 1) == DQ || substr(line, j, 1) == SQ) j++
   return j
 }
 
@@ -423,6 +445,7 @@ BEGIN {
     triple_lit = triple_literals(path)
     heredoc_lit = heredoc_literals(path)
     ps_lit = powershell_literals(path)
+    cmdsub_lit = cmdsub_literals(path)
     depth = 0
     hdepth = 0
     tq = 0
@@ -430,14 +453,21 @@ BEGIN {
     litend = ""
     heredoc = ""
     heredoc_dash = 0
+    hstr = ""
+    dqsub = 0
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
+      if (hstr != "") {
+        if (line ~ ("^[ \t]*" hstr)) {
+          hstr = ""
+        } else continue
+      }
       if (heredoc != "") {
         if (line ~ (heredoc_dash ? ("^[ \t]*" heredoc "[ \t]*$") : ("^" heredoc "[ \t]*$"))) heredoc = ""
         continue
       }
-      if (depth == 0 && hdepth == 0 && !tq && litend == "") {
+      if (depth == 0 && hdepth == 0 && tq == 0 && litend == "" && dqsub == 0) {
         if (style == "hash") {
           if (index(line, "#") == 0 &&
               !(triple_lit && (index(line, DQ DQ DQ) > 0 || index(line, SQ SQ SQ) > 0)) &&
