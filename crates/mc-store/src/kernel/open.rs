@@ -1,6 +1,4 @@
-use cortexkit_lease::{
-    protect_file, FileLeaseStore, LeaseError, LeaseHandle, LeaseKey, LeaseStore,
-};
+use cortexkit_lease::{protect_file, FileLeaseStore, HeldFileLease, LeaseError, LeaseKey};
 use mc_core::claim_operation::is_lower_hex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -120,7 +118,7 @@ pub struct KernelStore {
     pub(super) artifacts_path: PathBuf,
     lease_epoch: u64,
     pub(super) db_path: PathBuf,
-    _lease: Box<dyn LeaseHandle>,
+    _lease: HeldFileLease,
 }
 
 impl fmt::Debug for KernelStore {
