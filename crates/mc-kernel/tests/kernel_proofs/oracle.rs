@@ -9,11 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mc_kernel::schema::KERNEL_SCHEMA_COMPONENT_NAMES;
-use mc_kernel::{BackupRequest, KernelStore, Sensitivity};
+use mc_kernel::{BackupManifest, BackupRequest, KernelStore, Sensitivity};
 use rusqlite::{params, Connection};
 
 use crate::canonical_state::{digest, digested_tables, Profile};
-use crate::fixtures::{deletion, domain, ingest, intent, root_domain};
+use crate::fixtures::{deletion, domain, ingest, intent, now_ms, root_domain, staging};
 
 /// Seeds a domain, a registered consumer, two ingested artifacts, and two
 /// deletions so every identity domain except capture pins has rows, and
@@ -112,7 +112,7 @@ fn last_recorded_at(root: &Path) -> i64 {
         .unwrap()
 }
 
-fn backup(store: &KernelStore, expires_at: Option<i64>) {
+fn backup(store: &KernelStore, expires_at: Option<i64>) -> BackupManifest {
     let destination = tempfile::tempdir().unwrap();
     std::fs::set_permissions(destination.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     store
@@ -121,7 +121,18 @@ fn backup(store: &KernelStore, expires_at: Option<i64>) {
             deadline: Instant::now() + Duration::from_secs(30),
             capture_pin_expires_at: expires_at,
         })
+        .unwrap()
+}
+
+/// Seeds `root` and backs it up once so exactly one active capture pin with
+/// one evidence reference exists; returns the pin id.
+fn seed_with_pin(root: &Path) -> (KernelStore, String) {
+    let store = seed(root);
+    store
+        .ingest_artifact(ingest("kept", b"kept bytes", Sensitivity::Normal))
         .unwrap();
+    let pin_id = backup(&store, None).capture_pin_id.unwrap();
+    (store, pin_id)
 }
 
 #[test]
@@ -136,8 +147,9 @@ fn cross_root_capture_pins_compare_by_expiry_presence_not_instant() {
         store
             .ingest_artifact(ingest("kept", b"kept bytes", Sensitivity::Normal))
             .unwrap();
-        // Two pins per root, minted at different commits, one with an expiry
-        // and one without; the second root's stamps differ by wall clock.
+        // Two pins per root, minted at different commits: one with the
+        // default expiry, which trails the wall clock, and one with an
+        // explicit far-future expiry; the second root's stamps differ.
         backup(&store, None);
         store
             .commit(intent("domain-2"), |envelope| {
@@ -150,16 +162,16 @@ fn cross_root_capture_pins_compare_by_expiry_presence_not_instant() {
         stores.push(store);
     }
     let expected = digest(first.path(), Profile::CrossRoot);
-    assert_eq!(digest(second.path(), Profile::CrossRoot), expected);
+    digest(second.path(), Profile::CrossRoot).assert_same(&expected, "identical pin histories");
     assert_ne!(
         digest(first.path(), Profile::SameRoot).table("capture_pins"),
         digest(second.path(), Profile::SameRoot).table("capture_pins"),
         "positive control: pin ids and stamps differ between roots"
     );
     drop(stores);
-    // Removing the expiry from the pin that had one changes a caller-chosen
-    // contract, so the digests must diverge even though the instant itself
-    // is never compared.
+    // Clearing an expiry turns a pin that reaps itself into one that never
+    // does, so the digests must diverge even though the instant itself is
+    // never compared.
     writable(second.path())
         .execute(
             "UPDATE capture_pins SET expires_at=NULL WHERE expires_at IS NOT NULL",
@@ -175,13 +187,102 @@ fn cross_root_capture_pins_compare_by_expiry_presence_not_instant() {
 }
 
 #[test]
+fn cross_root_capture_pins_compare_by_release_presence_not_instant() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let (first_store, first_pin) = seed_with_pin(first.path());
+    let (second_store, second_pin) = seed_with_pin(second.path());
+    let active = digest(first.path(), Profile::CrossRoot);
+    digest(second.path(), Profile::CrossRoot).assert_same(&active, "both pins active");
+
+    // Releasing at different instants must still agree: only the nullness
+    // of `released_at` is state.
+    first_store
+        .release_capture_pin(&first_pin, now_ms())
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    second_store
+        .release_capture_pin(&second_pin, now_ms())
+        .unwrap();
+    let released = digest(first.path(), Profile::CrossRoot);
+    digest(second.path(), Profile::CrossRoot).assert_same(&released, "both pins released");
+
+    // A released pin no longer blocks purge, so a root that released and a
+    // root that leaked the pin must not digest equal.
+    assert_ne!(released.table("capture_pins"), active.table("capture_pins"));
+    assert_ne!(
+        released.table("capture_pin_refs"),
+        active.table("capture_pin_refs")
+    );
+}
+
+#[test]
+fn cross_root_reopen_abandonment_compares_by_terminal_presence_not_instant() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for root in [first.path(), second.path()] {
+        let store = seed(root);
+        // A lease that expired before it was staged is abandoned by the next
+        // open, which stamps `terminal_at` from its own clock.
+        let mut spec = staging("run-expired", "expired", "expired-name");
+        spec.recorded_at = 1;
+        spec.lease_expires_at = 2;
+        store.stage_candidate(spec).unwrap();
+    }
+    let live = digest(first.path(), Profile::CrossRoot);
+    digest(second.path(), Profile::CrossRoot).assert_same(&live, "both runs live");
+
+    KernelStore::open(first.path()).unwrap();
+    thread::sleep(Duration::from_millis(3));
+    KernelStore::open(second.path()).unwrap();
+    assert_ne!(
+        digest(first.path(), Profile::SameRoot).table("extraction_runs"),
+        digest(second.path(), Profile::SameRoot).table("extraction_runs"),
+        "positive control: abandonment stamps differ between roots"
+    );
+    let abandoned = digest(first.path(), Profile::CrossRoot);
+    digest(second.path(), Profile::CrossRoot).assert_same(&abandoned, "both runs abandoned");
+    assert_ne!(
+        abandoned.table("extraction_runs"),
+        live.table("extraction_runs")
+    );
+    assert_ne!(abandoned.table("candidates"), live.table("candidates"));
+}
+
+#[test]
+fn a_leaked_staging_temp_changes_the_digest_by_content_not_name() {
+    let root = tempfile::tempdir().unwrap();
+    let store = seed(root.path());
+    let clean = digest(root.path(), Profile::CrossRoot);
+    assert_eq!(
+        clean.table("cas_temps"),
+        digest(root.path(), Profile::SameRoot).table("cas_temps")
+    );
+    drop(store);
+
+    // A purge that fails to sweep its temp leaves the artifact's plaintext
+    // under a name that embeds the process-unique counter; two roots leaking
+    // the same bytes under different names must still agree.
+    let tmp = root.path().join("artifacts/tmp");
+    std::fs::write(tmp.join(".artifact-leak-1.tmp"), b"first bytes").unwrap();
+    let leaked = digest(root.path(), Profile::CrossRoot);
+    assert_ne!(leaked.table("cas_temps"), clean.table("cas_temps"));
+    std::fs::rename(
+        tmp.join(".artifact-leak-1.tmp"),
+        tmp.join(".artifact-leak-2.tmp"),
+    )
+    .unwrap();
+    digest(root.path(), Profile::CrossRoot).assert_same(&leaked, "renamed temp");
+}
+
+#[test]
 fn same_root_digest_survives_reopen_and_detects_one_insert() {
     let root = tempfile::tempdir().unwrap();
     let store = seed(root.path());
     let before = digest(root.path(), Profile::SameRoot);
     drop(store);
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(digest(root.path(), Profile::SameRoot), before);
+    digest(root.path(), Profile::SameRoot).assert_same(&before, "reopen");
     reopened
         .commit(intent("domain-2"), |envelope| {
             envelope.insert_domain(domain(2))?;
@@ -207,9 +308,9 @@ fn identical_histories_in_two_roots_agree_cross_root_and_differ_same_root() {
         last_recorded_at(second.path()),
         "positive control: wall-clock stamps differ between roots"
     );
-    assert_eq!(
-        digest(first.path(), Profile::CrossRoot),
-        digest(second.path(), Profile::CrossRoot)
+    digest(second.path(), Profile::CrossRoot).assert_same(
+        &digest(first.path(), Profile::CrossRoot),
+        "identical histories",
     );
     let same_first = digest(first.path(), Profile::SameRoot);
     let same_second = digest(second.path(), Profile::SameRoot);
@@ -303,5 +404,6 @@ fn digested_table_set_equals_schema_inventory() {
     let digested = digest(root.path(), Profile::SameRoot);
     let mut keys = digested.tables.keys().cloned().collect::<BTreeSet<_>>();
     assert!(keys.remove("cas_objects"));
+    assert!(keys.remove("cas_temps"));
     assert_eq!(keys, declared);
 }

@@ -203,7 +203,7 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
         2
     );
     assert_eq!(store.known_as_of(2).unwrap(), expected);
-    assert_eq!(digest(root.path(), Profile::SameRoot), expected_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&expected_oracle, "restored state");
     assert_eq!(
         store.known_as_of(3).unwrap_err(),
         KernelError::FutureSnapshot
@@ -727,7 +727,7 @@ fn unrecoverable_restore_poisons_the_handle_then_reopen_rolls_the_family_back() 
             .contains(".mc-restore-")
     }));
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
 }
 
@@ -871,7 +871,7 @@ fn restore_interrupted_before_the_swap_rolls_back_on_the_next_open() {
     drop(store);
 
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
     assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
@@ -955,7 +955,7 @@ fn restore_interrupted_before_displacement_keeps_the_live_family() {
     drop(store);
 
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
     assert!(!recovery_dir.exists());
@@ -986,7 +986,7 @@ fn restore_interrupted_after_sidecars_move_keeps_the_live_main_file() {
     assert!(root.path().join("core.sqlite").exists());
 
     let reopened = KernelStore::open(root.path()).unwrap();
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!recovery_dir.exists());
     assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
@@ -1012,7 +1012,7 @@ fn a_partially_completed_rollback_keeps_the_members_already_restored() {
 
     let reopened = KernelStore::open(root.path()).unwrap();
     assert_eq!(fs::read(&main).unwrap(), live_bytes);
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!recovery_dir.exists());
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
@@ -1098,7 +1098,7 @@ fn an_orphaned_recovery_directory_is_reclaimed_on_the_next_open() {
         !recovery_dir.exists(),
         "recovery directory was not reclaimed"
     );
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(insert_domain(&reopened, 2, Sensitivity::Normal), 2);
 }
 
@@ -1183,7 +1183,7 @@ fn restore_verifies_the_staged_copy_so_a_mutated_source_cannot_install() {
         store.restore(&backup.destination_path).unwrap_err(),
         KernelError::InvalidRestore
     );
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(store.facts(1).unwrap().commit_seq, 2);
     assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry
         .unwrap()
@@ -1279,7 +1279,7 @@ fn a_dangling_reference_is_refused_even_when_integrity_check_passes() {
         store.restore(&backup.destination_path).unwrap_err(),
         KernelError::InvalidRestore
     );
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
     assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
 }
 
@@ -1304,7 +1304,7 @@ fn a_lone_wal_mode_main_file_is_refused_as_a_restore_source() {
         store.restore(&bare).unwrap_err(),
         KernelError::InvalidRestore
     );
-    assert_eq!(digest(root.path(), Profile::SameRoot), live_oracle);
+    digest(root.path(), Profile::SameRoot).assert_same(&live_oracle, "live state");
 
     // A sealed artifact from `backup` is accepted, so the check is not rejecting
     // every source.

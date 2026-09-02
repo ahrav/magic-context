@@ -21,6 +21,11 @@ use mc_kernel::{
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
+#[path = "support/canonical_state.rs"]
+mod canonical_state;
+
+use canonical_state::scan_objects;
+
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const CHILD_MODE: &str = "MC_CAS_FAULT_CHILD_MODE";
 const CHILD_ROOT: &str = "MC_CAS_FAULT_CHILD_ROOT";
@@ -277,33 +282,6 @@ fn object_path(root: &Path, digest: &str) -> PathBuf {
     root.join("artifacts/objects")
         .join(&digest[..2])
         .join(&digest[2..])
-}
-
-fn scan_objects(root: &Path) -> Vec<(String, u64)> {
-    let mut result = Vec::new();
-    for shard in fs::read_dir(root.join("artifacts/objects")).unwrap() {
-        let shard = shard.unwrap();
-        if !shard.file_type().unwrap().is_dir() {
-            continue;
-        }
-        let prefix = shard.file_name().into_string().unwrap();
-        for entry in fs::read_dir(shard.path()).unwrap() {
-            let entry = entry.unwrap();
-            if !entry.file_type().unwrap().is_file() {
-                continue;
-            }
-            let digest = format!("{prefix}{}", entry.file_name().to_string_lossy());
-            let bytes = fs::read(entry.path()).unwrap();
-            assert_eq!(
-                format!("{:x}", Sha256::digest(&bytes)),
-                digest,
-                "object hash mismatch"
-            );
-            result.push((digest, bytes.len() as u64));
-        }
-    }
-    result.sort();
-    result
 }
 
 fn scan_temp_names(root: &Path) -> Vec<String> {

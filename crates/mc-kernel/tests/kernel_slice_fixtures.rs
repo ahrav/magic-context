@@ -644,7 +644,7 @@ fn canonical_slice_and_projection_are_restart_identical() {
         reopened.alignment_as_of(fixture.accepted).unwrap(),
         alignment
     );
-    assert_eq!(digest(root.path(), Profile::SameRoot), digests);
+    digest(root.path(), Profile::SameRoot).assert_same(&digests, "reopen");
     assert_eq!(projection_evidence(root.path()), first);
     reopened.rebuild_alignment().unwrap();
     assert_eq!(projection_evidence(root.path()), first);

@@ -1,6 +1,9 @@
 //! Spec builders shared by the proofs. Every builder yields values that pass
 //! kernel validation as written, so a proof's body reads as the scenario it
 //! proves rather than as field plumbing.
+//!
+//! The admission, decision, and observation builders have no caller in the
+//! oracle proofs; the per-obligation proofs consume them.
 
 #![allow(dead_code)]
 

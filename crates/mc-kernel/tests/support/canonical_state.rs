@@ -1,7 +1,7 @@
 //! `digest(root, profile)` reads every non-`sqlite_%` table in `core.sqlite`
-//! plus the CAS object listing under `artifacts/objects`, normalizes the rows
-//! for the requested comparison, and hashes each table separately so an
-//! unequal comparison names the table that differs.
+//! plus the CAS listings under `artifacts/objects` and `artifacts/tmp`,
+//! normalizes the rows for the requested comparison, and hashes each table
+//! separately so an unequal comparison names the table that differs.
 //!
 //! Two normalization profiles answer two different questions about one store:
 //!
@@ -18,9 +18,10 @@
 //!   equal while merged, swapped, or missing identities still differ.
 //!
 //! Volatile columns dropped by `CrossRoot` (all wall-clock or per-process).
-//! A nullable expiry is reduced to its nullness instead of dropped, because
-//! whether a pin expires at all is a contract the caller chose, while the
-//! instant it expires derives from the wall clock:
+//! `expires_at`, `released_at`, and `terminal_at` are reduced to null-or-set
+//! instead of dropped: their nullness decides expiry, purge eligibility, and
+//! staging-run visibility, while the instant in each derives from the clock
+//! (`KernelStore::open` stamps `terminal_at` on abandoning an expired lease):
 //!
 //! | table | columns |
 //! |---|---|
@@ -29,9 +30,11 @@
 //! | `outbox` | `created_at` |
 //! | `operation_receipts` | `created_at` |
 //! | `admission_decisions` | `decided_at` |
-//! | `capture_pins` | `lease_epoch`, `writer_epoch`, `created_at`, `released_at`; `expires_at` reduced to null-or-set |
-//! | `capture_pin_refs` | `released_at`; `expires_at` reduced to null-or-set |
+//! | `capture_pins` | `lease_epoch`, `writer_epoch`, `created_at`; `expires_at`, `released_at` reduced to null-or-set |
+//! | `capture_pin_refs` | `expires_at`, `released_at` reduced to null-or-set |
 //! | `artifact_ingestion_reservations` | `writer_epoch`, `created_at`, `heartbeat_at`, `lease_expires_at`, `reclaim_started_at` |
+//! | `extraction_runs` | `terminal_at` reduced to null-or-set |
+//! | `candidates` | `terminal_at` reduced to null-or-set |
 //!
 //! Identity domains renamed by `CrossRoot`. Each is defined by one table
 //! column; the rename applies to every text and blob cell in every table, so
@@ -118,6 +121,12 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
         .collect::<Vec<_>>();
     tables.insert("cas_objects".to_string(), hash_rows(&object_rows));
+    let temp_rows = normalized
+        .temps
+        .into_iter()
+        .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
+        .collect::<Vec<_>>();
+    tables.insert("cas_temps".to_string(), hash_rows(&temp_rows));
     CanonicalDigest { tables }
 }
 
@@ -173,11 +182,13 @@ struct Table {
 struct State {
     tables: BTreeMap<String, Table>,
     objects: Vec<(String, u64)>,
+    temps: Vec<(String, u64)>,
 }
 
 struct Normalized {
     tables: BTreeMap<String, Vec<Vec<Cell>>>,
     objects: Vec<(String, u64)>,
+    temps: Vec<(String, u64)>,
 }
 
 impl State {
@@ -221,6 +232,7 @@ impl State {
         Self {
             tables,
             objects: scan_objects(root),
+            temps: scan_temps(root),
         }
     }
 
@@ -260,9 +272,11 @@ impl State {
             tables.insert(name, rows);
         }
         self.objects.sort();
+        self.temps.sort();
         Normalized {
             tables,
             objects: self.objects,
+            temps: self.temps,
         }
     }
 
@@ -344,7 +358,9 @@ enum Rule {
     Keep,
     Drop,
     /// Reduce to `Null` or `Integer(1)`: the value is wall-clock but its
-    /// presence is caller-chosen contract.
+    /// nullness is state. `expires_at IS NULL` means the caller pinned without
+    /// expiry; `released_at IS NULL` defines an active pin; `terminal_at IS
+    /// NULL` defines a live staging run.
     Presence,
 }
 
@@ -359,10 +375,7 @@ fn column_rule(profile: Profile, table: &str, column: &str) -> Rule {
         (Profile::CrossRoot, "outbox") => &["created_at"],
         (Profile::CrossRoot, "operation_receipts") => &["created_at"],
         (Profile::CrossRoot, "admission_decisions") => &["decided_at"],
-        (Profile::CrossRoot, "capture_pins") => {
-            &["lease_epoch", "writer_epoch", "created_at", "released_at"]
-        }
-        (Profile::CrossRoot, "capture_pin_refs") => &["released_at"],
+        (Profile::CrossRoot, "capture_pins") => &["lease_epoch", "writer_epoch", "created_at"],
         (Profile::CrossRoot, "artifact_ingestion_reservations") => &[
             "writer_epoch",
             "created_at",
@@ -372,12 +385,14 @@ fn column_rule(profile: Profile, table: &str, column: &str) -> Rule {
         ],
         (Profile::CrossRoot, _) => &[],
     };
+    let presence: &[&str] = match table {
+        "capture_pins" | "capture_pin_refs" => &["expires_at", "released_at"],
+        "extraction_runs" | "candidates" => &["terminal_at"],
+        _ => &[],
+    };
     if dropped.contains(&column) {
         Rule::Drop
-    } else if profile == Profile::CrossRoot
-        && matches!(table, "capture_pins" | "capture_pin_refs")
-        && column == "expires_at"
-    {
+    } else if profile == Profile::CrossRoot && presence.contains(&column) {
         Rule::Presence
     } else {
         Rule::Keep
@@ -532,6 +547,27 @@ pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
             );
             result.push((digest, bytes.len() as u64));
         }
+    }
+    result.sort();
+    result
+}
+
+/// Every file left under `artifacts/tmp` as `(sha256(bytes), byte_length)`.
+/// Names are excluded because they embed the per-process `next_unique_id()`;
+/// the content digest is what a leaked plaintext copy of a purged artifact
+/// shares across roots. Missing `artifacts/tmp` reads as empty.
+pub fn scan_temps(root: &Path) -> Vec<(String, u64)> {
+    let Ok(entries) = fs::read_dir(root.join("artifacts/tmp")) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        let bytes = fs::read(entry.path()).unwrap();
+        result.push((format!("{:x}", Sha256::digest(&bytes)), bytes.len() as u64));
     }
     result.sort();
     result
