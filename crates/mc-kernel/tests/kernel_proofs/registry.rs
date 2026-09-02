@@ -724,19 +724,24 @@ pub fn all_rows() -> Vec<Row> {
 /// Source text per declared path, `None` when the file does not exist.
 pub type Catalog = BTreeMap<String, Option<String>>;
 
+/// The tests a row names, if any; a `Contradiction` names none.
+fn row_tests(status: &Status) -> &[Test] {
+    match status {
+        Status::Landed { tests }
+        | Status::Pending {
+            expected_tests: tests,
+            ..
+        } => tests,
+        Status::Contradiction { .. } => &[],
+    }
+}
+
 pub fn read_catalog(rows: &[Row]) -> Catalog {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     // Collect the distinct paths first; many rows name the same file, and
     // reading once per row would re-read it for every reference.
     rows.iter()
-        .flat_map(|row| match row.status {
-            Status::Landed { tests }
-            | Status::Pending {
-                expected_tests: tests,
-                ..
-            } => tests,
-            Status::Contradiction { .. } => &[],
-        })
+        .flat_map(|row| row_tests(&row.status))
         .map(|test| test.path)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -757,15 +762,7 @@ pub fn check_module_reachability(rows: &[Row]) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let mut checked = BTreeSet::new();
     for row in rows {
-        let tests = match row.status {
-            Status::Landed { tests }
-            | Status::Pending {
-                expected_tests: tests,
-                ..
-            } => tests,
-            Status::Contradiction { .. } => &[][..],
-        };
-        for test in tests {
+        for test in row_tests(&row.status) {
             if !checked.insert(test.path) {
                 continue;
             }
