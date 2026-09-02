@@ -762,10 +762,17 @@ fn contains_any_charged_ignore_case(
         return contains_any_charged_ignore_case_scalar(haystack, needles, work, limits);
     }
 
-    let first_match = matcher
-        .find_overlapping_iter(haystack)
-        .map(|found| found.pattern().as_usize())
-        .min();
+    // Pattern 0 is the lowest possible index, so no later overlap can change `first_match`.
+    let mut first_match: Option<usize> = None;
+    for found in matcher.find_overlapping_iter(haystack) {
+        let index = found.pattern().as_usize();
+        if first_match.is_none_or(|lowest| index < lowest) {
+            first_match = Some(index);
+        }
+        if index == 0 {
+            break;
+        }
+    }
     let probes = first_match.map_or(needles.len(), |index| index + 1);
     *work += haystack.len() * probes;
     Ok(first_match.is_some())
