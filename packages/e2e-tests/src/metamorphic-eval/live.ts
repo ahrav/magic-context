@@ -16,6 +16,7 @@ import { containsInjectionCanary } from "./injection-canary";
 import { compareInvariants } from "./invariants";
 import { admitPair } from "./pairs";
 import {
+    CONTROL_TRANSFORM_ID,
     buildMetamorphicReport,
     type InjectionCanaryHit,
     type MetamorphicInvariantVerdict,
@@ -63,7 +64,6 @@ interface ApplicablePair {
     derivative: TurnTransform;
 }
 
-const CONTROL_TRANSFORM_ID = "baseline-control";
 
 function sortedUnique(values: readonly string[]): string[] {
     return [...new Set(values)].sort();

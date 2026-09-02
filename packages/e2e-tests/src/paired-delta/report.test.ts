@@ -994,6 +994,15 @@ describe("parsePairedDeltaReport", () => {
             body.analysis.analyzableFamilyCount += 1;
             body.analysis.evidenceSufficient = body.analysis.analyzableFamilyCount >= body.analysis.minimumAnalyzableFamilyCount;
         }))).toThrow(/report\.body\.analysis\.analyzableFamilyCount: derived-mismatch/);
+        // An inverted interval reads as excluding zero, which would let the resolution check pass.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[0]!.interval = { lower: 1, upper: -1 };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.interval: interval-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            expect(family.noise).toEqual({ label: "no-noise-floor", floor: null });
+            family.noise.label = "outside-floor";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.label: derived-mismatch/);
     });
 
     it("preserves an endpoint-scoped noise floor through the round trip", () => {

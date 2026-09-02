@@ -7,6 +7,9 @@ import { invariantHolds, type InvariantEvidence, type InvariantVerdict } from ".
 
 export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
+/** Transform id of the live stability pair, whose two roles are both runs of the base scenario. */
+export const CONTROL_TRANSFORM_ID = "baseline-control";
+
 export interface PairKey {
     scenarioId: string;
     transformId: string;
@@ -264,9 +267,16 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
                 p.fail(`${label}: pair-system-mismatch`);
             }
             // Baseline scores must match `pair.scenarioId` to prevent replay under another pair key.
-            // The derivative is exempt: it carries the transformed scenario's id.
             if (baselineScore.scenarioId !== pair.scenarioId) {
                 p.fail(`${label}.baselineScore.scenarioId: pair-scenario-mismatch`);
+            }
+            // `applyTransform` names the derivative scenario after its pair, so the id is derivable. The
+            // control pair scores two runs of the base scenario and keeps that id on both roles.
+            const derivativeScenarioId = pair.transformId === CONTROL_TRANSFORM_ID
+                ? pair.scenarioId
+                : `${pair.scenarioId}-d-${pair.transformId}-v${pair.transformVersion}-s${pair.seed}`;
+            if (derivativeScore.scenarioId !== derivativeScenarioId) {
+                p.fail(`${label}.derivativeScore.scenarioId: pair-scenario-mismatch`);
             }
             return {
                 ...pair,

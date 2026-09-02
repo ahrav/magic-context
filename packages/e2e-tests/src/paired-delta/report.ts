@@ -311,18 +311,28 @@ function boundedInteger(value: unknown, label: string, minimum: number, maximum:
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
     p.exact(value, ["lower", "upper"], label);
-    return { lower: finiteNumber(value.lower, `${label}.lower`), upper: finiteNumber(value.upper, `${label}.upper`) };
+    const lower = finiteNumber(value.lower, `${label}.lower`);
+    const upper = finiteNumber(value.upper, `${label}.upper`);
+    // `bootstrapInterval` reads both bounds from one sorted sample, so it cannot invert them. An inverted
+    // interval would also read as excluding zero and let a resolution check pass.
+    if (lower > upper) p.fail(`${label}: interval-invalid`);
+    return { lower, upper };
 }
 
 function parseNoiseFloor(raw: unknown, label: string): FamilyNoiseFloor {
     const value = p.record(raw, label);
     const hasEndpoint = Object.hasOwn(value, "endpoint");
     p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
+    const floorValue = nonNegativeNumber(value.value, `${label}.value`);
+    const interval = parseInterval(value.interval, `${label}.interval`);
+    if (interval.lower < 0 || interval.lower > floorValue || floorValue > interval.upper) {
+        p.fail(`${label}.interval: interval-invalid`);
+    }
     return {
         ...(hasEndpoint ? { endpoint: p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`) } : {}),
         familyId: p.string(value.familyId, `${label}.familyId`),
-        value: finiteNumber(value.value, `${label}.value`),
-        interval: parseInterval(value.interval, `${label}.interval`),
+        value: floorValue,
+        interval,
     };
 }
 
@@ -331,15 +341,19 @@ function parseFamilyEstimate(raw: unknown, label: string): FamilyEstimate {
     p.exact(value, ["familyId", "pointEstimate", "interval", "resolution", "noise"], label);
     const noise = p.record(value.noise, `${label}.noise`);
     p.exact(noise, ["label", "floor"], `${label}.noise`);
+    const pointEstimate = finiteNumber(value.pointEstimate, `${label}.pointEstimate`);
+    const floor = noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`);
+    const noiseLabel = p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`);
+    const derivedLabel = floor === null
+        ? "no-noise-floor"
+        : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
+    if (noiseLabel !== derivedLabel) p.fail(`${label}.noise.label: derived-mismatch`);
     return {
         familyId: p.string(value.familyId, `${label}.familyId`),
-        pointEstimate: finiteNumber(value.pointEstimate, `${label}.pointEstimate`),
+        pointEstimate,
         interval: parseInterval(value.interval, `${label}.interval`),
         resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`),
-        noise: {
-            label: p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`),
-            floor: noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`),
-        },
+        noise: { label: noiseLabel, floor },
     };
 }
 

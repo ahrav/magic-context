@@ -214,6 +214,18 @@ describe("deterministic metamorphic runner", () => {
         expect(metamorphicExitCode(unbound)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(unbound))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.baselineScore\\.scenarioId: pair-scenario-mismatch`));
+
+        // The derivative id is derivable from the pair key, so a score from another pair cannot stand in.
+        const swapped = structuredClone(report);
+        const swappedEntry = swapped.entries[scoredIndex]!;
+        if (swappedEntry.kind !== "scored") throw new Error("unreachable");
+        expect(swappedEntry.derivativeScore.scenarioId).toBe(
+            `${swappedEntry.scenarioId}-d-${swappedEntry.transformId}-v${swappedEntry.transformVersion}-s${swappedEntry.seed}`,
+        );
+        swappedEntry.derivativeScore.scenarioId = `${swappedEntry.derivativeScore.scenarioId}-x`;
+        expect(metamorphicExitCode(swapped)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(swapped))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.derivativeScore\\.scenarioId: pair-scenario-mismatch`));
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {
