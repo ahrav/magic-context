@@ -64,7 +64,6 @@ interface ApplicablePair {
     derivative: TurnTransform;
 }
 
-
 function sortedUnique(values: readonly string[]): string[] {
     return [...new Set(values)].sort();
 }

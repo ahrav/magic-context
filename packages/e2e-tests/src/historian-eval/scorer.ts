@@ -1848,7 +1848,6 @@ function parseNullableText(value: unknown, label: string): string | null {
     return value === null ? null : p.text(value, label);
 }
 
-
 function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
     const verdicts = p.array(raw, label).map((entry, index) => {
         const probeLabel = `${label}[${index}]`;
