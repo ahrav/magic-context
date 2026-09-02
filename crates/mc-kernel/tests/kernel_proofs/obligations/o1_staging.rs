@@ -1,6 +1,10 @@
 //! O1, staging invisibility: a staged candidate reaches no serving surface,
 //! no canonical snapshot, and no slice or alignment view until admission,
 //! and that stays true across a restart.
+//!
+//! No surface row carries a domain name, so a payload-text needle would hold
+//! whether or not staging leaked; the payload is asserted only in
+//! `candidates`, and surfaces are checked for the id admission renders.
 
 use mc_kernel::{Surface, SurfaceVisibility};
 
@@ -87,14 +91,10 @@ fn staged_candidate_is_invisible_on_every_surface_until_admitted_across_restart(
         .unwrap();
     // Positive control: the candidate text is durably staged.
     assert_eq!(staged_payload(&proof), TEXT);
-    for needle in [CANDIDATE, TEXT] {
-        assert_absent_everywhere(&proof, needle);
-    }
+    assert_absent_everywhere(&proof, CANDIDATE);
     proof.restart();
     assert_eq!(staged_payload(&proof), TEXT);
-    for needle in [CANDIDATE, TEXT] {
-        assert_absent_everywhere(&proof, needle);
-    }
+    assert_absent_everywhere(&proof, CANDIDATE);
 
     let admitted = admitted_domain(CANDIDATE, TEXT);
     let object_id = admitted.object_id.clone();
