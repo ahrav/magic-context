@@ -1174,6 +1174,11 @@ fn strip_block_comments(source: &str) -> Vec<String> {
                 in_string = true;
                 kept.push_str(&line[index..index + 1]);
                 index += 1;
+            } else if let Some(width) = char_literal_len(rest) {
+                // `'"'` and `b'"'` are literals; consuming them whole keeps a quote inside one from
+                // toggling string state and inverting the scan for the rest of the file.
+                kept.push_str(&line[index..index + width]);
+                index += width;
             } else {
                 let width = line[index..].chars().next().map_or(1, char::len_utf8);
                 kept.push_str(&line[index..index + width]);
@@ -1200,6 +1205,22 @@ fn raw_string_opener(rest: &[u8]) -> Option<usize> {
         .take_while(|byte| **byte == b'#')
         .count();
     (rest.get(after_prefix + hashes) == Some(&b'"')).then_some(hashes)
+}
+
+/// Returns the byte length of a char or byte-char literal at the start of `rest`, or `None` for a
+/// lifetime, which has no closing quote in that position.
+fn char_literal_len(rest: &[u8]) -> Option<usize> {
+    let start = usize::from(rest.starts_with(b"b'"));
+    if rest.get(start) != Some(&b'\'') {
+        return None;
+    }
+    let body = start + 1;
+    let end = if rest.get(body) == Some(&b'\\') {
+        body + 2
+    } else {
+        body + 1
+    };
+    (rest.get(end) == Some(&b'\'')).then_some(end + 1)
 }
 
 fn raw_prefix_len(rest: &[u8], hashes: usize) -> usize {
@@ -1500,6 +1521,8 @@ const MULTILINE_CFG_DISABLED: &str = "#[cfg(\n    any()\n)]\n#[test]\nfn proven(
 const MULTILINE_CFG_ENABLED: &str = "#[cfg(\n    unix\n)]\n#[test]\nfn proven() {}\n";
 const IGNORED_PROSE_SELECTOR: &str =
     "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
+const QUOTE_CHAR_THEN_COMMENT: &str =
+    "let quote = b'\\\"';\n/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
 const MACRO_ONLY: &str =
     "macro_rules! never_used {\n    () => {\n        #[test]\n        fn proven() {}\n    };\n}\n";
 const SHOULD_PANIC: &str = "#[test]\n#[should_panic]\nfn proven() {}\n";
@@ -1533,7 +1556,9 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
         .iter()
         .filter(|row| matches!(row.status, Status::Contradiction { .. }))
         .count();
-    assert!(landed > pending, "{landed} landed, {pending} pending");
+    // A floor, not a comparison against `pending`: filing a pending row is ordinary and must not
+    // fail this control, while a registry that stopped resolving landed rows would.
+    assert!(landed >= 20, "{landed} landed, {pending} pending");
     assert_eq!(contradicted, 4);
 }
 
@@ -1656,6 +1681,15 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
         &[],
     )
     .unwrap();
+
+    // A quote inside a char literal must not make the scanner read `/*` as string content.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(QUOTE_CHAR_THEN_COMMENT))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
 
     // A definition that exists only inside an unexpanded macro is in no harness.
     let errors = validate(
