@@ -17,3 +17,4 @@ mod harness;
 mod model;
 mod obligations;
 mod oracle;
+mod registry;

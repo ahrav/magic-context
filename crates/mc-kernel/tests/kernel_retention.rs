@@ -116,6 +116,49 @@ fn first_day_31_sweep_abandons_incomplete_run_without_deleting_it() {
 }
 
 #[test]
+fn reaper_abandons_a_run_at_exactly_its_stored_lease_expiry() {
+    // The reaper's comparison is `lease_expires_at <= now`, so one
+    // millisecond earlier keeps the run live and the stored instant itself
+    // abandons it.
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(candidate("run", "candidate", 0))
+        .unwrap();
+    let connection = inspect(directory.path());
+    let lease_expires_at: i64 = connection
+        .query_row(
+            "SELECT lease_expires_at FROM extraction_runs WHERE extraction_run_id='run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lease_expires_at, HOUR_MS, "positive control: stored lease");
+
+    let live = store.run_staging_maintenance(lease_expires_at - 1).unwrap();
+    assert_eq!(live.abandoned_runs, 0);
+    let terminal_state: Option<String> = connection
+        .query_row(
+            "SELECT terminal_state FROM extraction_runs WHERE extraction_run_id='run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(terminal_state, None);
+
+    let expired = store.run_staging_maintenance(lease_expires_at).unwrap();
+    assert_eq!(expired.abandoned_runs, 1);
+    let run: (String, i64) = connection
+        .query_row(
+            "SELECT terminal_state,terminal_at FROM extraction_runs WHERE extraction_run_id='run'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run, ("abandoned".to_string(), lease_expires_at));
+}
+
+#[test]
 fn open_runs_staging_sweep_after_fencing() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
