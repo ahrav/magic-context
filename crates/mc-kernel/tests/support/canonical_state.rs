@@ -54,9 +54,11 @@
 //!
 //! Identities are numbered in the order of their defining rows.
 //! The ordering key drops the identity column and normalizes the rest.
-//! The identity itself breaks ties between equal keys.
-//! `next_unique_id()` counters are monotone within one process.
-//! Tied rows therefore number in creation order.
+//! Columns dropped by the profile then order rows tied on that key.
+//! Those columns are wall-clock, so within one root they follow creation order.
+//! The identity text breaks a tie only when the dropped columns also agree.
+//! Comparison of identity text is lexicographic, which is not numeric order.
+//! A tie resolved that way can pair rows differently in two roots.
 //! A defining row may reference an earlier domain's identity.
 //! `capture_pins.purge_barrier_id` is one such column.
 //! Earlier domains are renamed before a later ordering key is taken.
@@ -336,7 +338,9 @@ impl State {
                 .iter()
                 .position(|column| column == domain.column)
                 .unwrap_or_else(|| panic!("{}.{} missing", domain.table, domain.column));
-            // Identity ordinals sort by normalized non-identity columns, then identity text.
+            // Identity ordinals sort by normalized columns, then dropped columns, then identity.
+            // A dropped wall-clock column orders tied rows by creation within one root.
+            // Its value never reaches the digest, so only the induced order carries over.
             let mut ordered = table
                 .rows
                 .iter()
@@ -344,22 +348,24 @@ impl State {
                     let Cell::Text(id) = &row[column] else {
                         panic!("{}.{} is not text", domain.table, domain.column);
                     };
-                    let key = row
-                        .iter()
-                        .zip(&table.columns)
-                        .enumerate()
-                        .filter(|(index, _)| *index != column)
-                        .filter_map(|(_, (cell, name))| {
-                            let rule = column_rule(Profile::CrossRoot, domain.table, name);
-                            (rule != Rule::Drop)
-                                .then(|| rename_cell(apply_rule(cell.clone(), rule), &resolved))
-                        })
-                        .collect::<Vec<_>>();
-                    (key, id.clone())
+                    let mut key = Vec::new();
+                    let mut creation = Vec::new();
+                    for (index, (cell, name)) in row.iter().zip(&table.columns).enumerate() {
+                        if index == column {
+                            continue;
+                        }
+                        let rule = column_rule(Profile::CrossRoot, domain.table, name);
+                        if rule == Rule::Drop {
+                            creation.push(cell.clone());
+                        } else {
+                            key.push(rename_cell(apply_rule(cell.clone(), rule), &resolved));
+                        }
+                    }
+                    (key, creation, id.clone())
                 })
                 .collect::<Vec<_>>();
             ordered.sort();
-            for (ordinal, (_, id)) in ordered.into_iter().enumerate() {
+            for (ordinal, (_, _, id)) in ordered.into_iter().enumerate() {
                 renames.push((id, format!("<{}:{ordinal}>", domain.name)));
             }
         }
