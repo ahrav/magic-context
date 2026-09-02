@@ -391,8 +391,9 @@ function parseEndpointEstimates(
                 minimumAnalyzableFamilyCount,
                 rawFamilies.length,
             ));
-        // `estimateEndpoint` groups observations by family, so it emits one row per distinct family. A repeat
-        // would also inflate the count the resolution rule reads.
+        // `estimateEndpoint` runs only for an endpoint present in the observations, so a row it emits has at
+        // least one family, and one row per distinct family.
+        if (families.length === 0) p.fail(`${itemLabel}.families: families-required`);
         p.unique(families.map(({ familyId }) => familyId), `${itemLabel}.families`);
         const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
@@ -428,6 +429,32 @@ function parseEndpointEstimates(
     return estimates;
 }
 
+function parseRawRegretRecords(raw: unknown, label: string): FamilyDeltaAnalysis["rawRegretRecords"] {
+    const records = p.array(raw, label).map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const item = p.record(entry, itemLabel);
+        p.exact(item, ["coordinateId", "familyId", "endpoint", "delta", "inferential"], itemLabel);
+        if (item.inferential !== false) p.fail(`${itemLabel}.inferential: literal-invalid`);
+        return {
+            coordinateId: p.string(item.coordinateId, `${itemLabel}.coordinateId`),
+            familyId: p.string(item.familyId, `${itemLabel}.familyId`),
+            endpoint: p.enumeration(item.endpoint, REGRET_ENDPOINTS, `${itemLabel}.endpoint`),
+            delta: finiteNumber(item.delta, `${itemLabel}.delta`),
+            inferential: false as const,
+        };
+    });
+    // The estimator rejects a repeated endpoint-coordinate pair, and one coordinate under two families would
+    // join two bootstrap clusters, so its family assignment is fixed.
+    p.unique(records.map(({ endpoint, coordinateId }) => tupleKey(endpoint, coordinateId)), label);
+    const familyByCoordinate = new Map<string, string>();
+    for (const [index, record] of records.entries()) {
+        const seen = familyByCoordinate.get(record.coordinateId);
+        if (seen === undefined) familyByCoordinate.set(record.coordinateId, record.familyId);
+        else if (seen !== record.familyId) p.fail(`${label}[${index}].familyId: family-conflict`);
+    }
+    return records;
+}
+
 function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     const value = p.record(raw, label);
     p.exact(value, [
@@ -446,6 +473,7 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
             families.map(({ familyId }) => familyId).sort(compareCodeUnits).join("\u0000"));
         if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
     }
+    const rawRegret = parseRawRegretRecords(value.rawRegretRecords, `${label}.rawRegretRecords`);
     // Endpoint-less floors with the same `familyId` must have matching fingerprints across primary
     // endpoints. Endpoint-keyed floors stay independent per endpoint.
     const unscopedFloors = new Map<string, string>();
@@ -489,19 +517,7 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         endpoints,
         liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`, LIVE_REGRET_ENDPOINTS, minimumAnalyzableFamilyCount),
         providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`, PROVIDER_MIXED_REGRET_ENDPOINTS, minimumAnalyzableFamilyCount),
-        rawRegretRecords: p.array(value.rawRegretRecords, `${label}.rawRegretRecords`).map((entry, index) => {
-            const itemLabel = `${label}.rawRegretRecords[${index}]`;
-            const item = p.record(entry, itemLabel);
-            p.exact(item, ["coordinateId", "familyId", "endpoint", "delta", "inferential"], itemLabel);
-            if (item.inferential !== false) p.fail(`${itemLabel}.inferential: literal-invalid`);
-            return {
-                coordinateId: p.string(item.coordinateId, `${itemLabel}.coordinateId`),
-                familyId: p.string(item.familyId, `${itemLabel}.familyId`),
-                endpoint: p.enumeration(item.endpoint, REGRET_ENDPOINTS, `${itemLabel}.endpoint`),
-                delta: finiteNumber(item.delta, `${itemLabel}.delta`),
-                inferential: false,
-            };
-        }),
+        rawRegretRecords: rawRegret,
     };
 }
 

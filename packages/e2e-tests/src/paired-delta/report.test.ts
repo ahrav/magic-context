@@ -1035,6 +1035,12 @@ describe("parsePairedDeltaReport", () => {
             }
             for (const endpoint of body.analysis.endpoints) endpoint.resolution = "unresolved";
         }))).toThrow(/report\.body\.analysis\.endpoints\[1\]\.families\[0\]\.noise\.floor: floor-conflict/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const endpoint = body.analysis.endpoints[0]!;
+            endpoint.families = [];
+            endpoint.familyCount = 0;
+            endpoint.resolution = "unresolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families: families-required/);
         // An unscoped floor is the fallback for both endpoints, so the other one cannot read as having none.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;

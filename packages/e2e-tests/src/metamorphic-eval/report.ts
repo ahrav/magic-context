@@ -162,6 +162,18 @@ const TIER_INVALID_KINDS = vocabulary<TierInvalidReason["kind"]>({
     "deadline-exhausted": true,
 });
 const ROLES = vocabulary<InjectionCanaryHit["role"]>({ baseline: true, derivative: true, "control-a": true, "control-b": true });
+/** The invariants `compareLivePair` emits, which is the only source a control disagreement can name. */
+type ControlInvariantId =
+    | "injection-set-equality"
+    | "expectation-predicate-equality"
+    | "false-authoritative-set-equality"
+    | "scenario-verdict-equality";
+const CONTROL_INVARIANT_IDS = vocabulary<ControlInvariantId>({
+    "injection-set-equality": true,
+    "expectation-predicate-equality": true,
+    "false-authoritative-set-equality": true,
+    "scenario-verdict-equality": true,
+});
 const SCORED_ROLES = vocabulary<Extract<MetamorphicReportEntry, { kind: "stage-not-scored" }>["role"]>({ baseline: true, derivative: true });
 const UNSCORED_STAGES = vocabulary<Extract<MetamorphicReportEntry, { kind: "stage-not-scored" }>["stage"]>({
     "validation-rejected": true,
@@ -364,14 +376,19 @@ function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason 
         case "incomplete":
             p.exact(value, ["kind"], label);
             return { kind };
-        case "control-disagreement":
+        case "control-disagreement": {
             p.exact(value, ["kind", "systemMismatch", "failedInvariants"], label);
-            return {
-                kind,
-                systemMismatch: p.boolean(value.systemMismatch, `${label}.systemMismatch`),
-                failedInvariants: p.array(value.failedInvariants, `${label}.failedInvariants`)
-                    .map((entry, index) => p.enumeration(entry, INVARIANT_IDS, `${label}.failedInvariants[${index}]`)),
-            };
+            const systemMismatch = p.boolean(value.systemMismatch, `${label}.systemMismatch`);
+            const failedInvariants = p.array(value.failedInvariants, `${label}.failedInvariants`)
+                .map((entry, index) => p.enumeration(entry, CONTROL_INVARIANT_IDS, `${label}.failedInvariants[${index}]`));
+            p.unique(failedInvariants, `${label}.failedInvariants`);
+            // This reason is recorded only when the systems differ or an invariant failed, so it always
+            // carries the cause of its own rejection.
+            if (!systemMismatch && failedInvariants.length === 0) {
+                p.fail(`${label}: control-disagreement-cause-required`);
+            }
+            return { kind, systemMismatch, failedInvariants };
+        }
         case "control-error":
             p.exact(value, ["kind", "controlAErrorReason", "controlBErrorReason"], label);
             return {
@@ -423,13 +440,22 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             const label = `report.injectionCanaryHits[${index}]`;
             const value = p.record(entry, label);
             p.exact(value, ["scenarioId", "role", "transformId", "transformVersion", "seed"], label);
-            return {
-                scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
-                role: p.enumeration(value.role, ROLES, `${label}.role`),
-                transformId: value.transformId === null ? null : p.string(value.transformId, `${label}.transformId`),
-                transformVersion: value.transformVersion === null ? null : p.integer(value.transformVersion, `${label}.transformVersion`),
-                seed: value.seed === null ? null : p.integer(value.seed, `${label}.seed`),
-            };
+            const role = p.enumeration(value.role, ROLES, `${label}.role`);
+            const transformId = value.transformId === null ? null : p.string(value.transformId, `${label}.transformId`);
+            const transformVersion = value.transformVersion === null ? null : p.integer(value.transformVersion, `${label}.transformVersion`);
+            const seed = value.seed === null ? null : p.boundedInteger(value.seed, `${label}.seed`, 0, MAX_TRANSFORM_SEED);
+            // Only the derivative ran a transform, so only it names one. A deterministic baseline hit still
+            // carries the seed it was generated from; a control hit names no coordinate at all.
+            if (role === "derivative") {
+                if (transformId === null || transformVersion === null || seed === null) {
+                    p.fail(`${label}: canary-coordinates-required`);
+                }
+            } else if (transformId !== null || transformVersion !== null) {
+                p.fail(`${label}: canary-coordinates-unexpected`);
+            } else if (role !== "baseline" && seed !== null) {
+                p.fail(`${label}: canary-coordinates-unexpected`);
+            }
+            return { scenarioId: p.string(value.scenarioId, `${label}.scenarioId`), role, transformId, transformVersion, seed };
         }),
         tierInvalidReason: parseTierInvalidReason(root.tierInvalidReason, "report.tierInvalidReason"),
     };

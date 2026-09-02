@@ -152,7 +152,7 @@ describe("deterministic metamorphic runner", () => {
             ],
             coverage: [{ scenarioId: "hse-a", applied: 1, inapplicable: [{ scenarioId: "hse-a", transformId: "t", transformVersion: 1, seed: 3, reason: "n/a" }], violations: [] }],
             injectionCanaryHits: [{ scenarioId: "hse-a", role: "control-a", transformId: null, transformVersion: null, seed: null }],
-            tierInvalidReason: { kind: "control-disagreement", systemMismatch: true, failedInvariants: ["expected-absent-empty"] },
+            tierInvalidReason: { kind: "control-disagreement", systemMismatch: true, failedInvariants: ["scenario-verdict-equality"] },
             system: systemTuple(),
         });
         expect(parseMetamorphicReport(JSON.parse(JSON.stringify(invalid)))).toEqual(invalid);
@@ -162,6 +162,25 @@ describe("deterministic metamorphic runner", () => {
         const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         unknownKind.entries[0]!.kind = "skipped";
         expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        // A control disagreement is recorded only with a cause, and only over the live comparator's invariants.
+        const causeless = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        causeless.tierInvalidReason.systemMismatch = false;
+        causeless.tierInvalidReason.failedInvariants = [];
+        expect(() => parseMetamorphicReport(causeless))
+            .toThrow(/report\.tierInvalidReason: control-disagreement-cause-required/);
+        const foreignInvariant = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        foreignInvariant.tierInvalidReason.failedInvariants = ["verdict-monotonicity"];
+        expect(() => parseMetamorphicReport(foreignInvariant))
+            .toThrow(/report\.tierInvalidReason\.failedInvariants\[0\]: enum-invalid/);
+        // Only the derivative ran a transform, so only it names one.
+        const canaryCoords = structuredClone(invalid) as unknown as { injectionCanaryHits: Record<string, unknown>[] };
+        canaryCoords.injectionCanaryHits[0]!.transformId = "reorder-independent-turns";
+        expect(() => parseMetamorphicReport(canaryCoords))
+            .toThrow(/report\.injectionCanaryHits\[0\]: canary-coordinates-unexpected/);
+        const canarySeed = structuredClone(invalid) as unknown as { injectionCanaryHits: Record<string, unknown>[] };
+        canarySeed.injectionCanaryHits[0]!.role = "derivative";
+        expect(() => parseMetamorphicReport(canarySeed))
+            .toThrow(/report\.injectionCanaryHits\[0\]: canary-coordinates-required/);
         const extraNested = structuredClone(report) as unknown as { entries: Record<string, unknown>[] };
         extraNested.entries[0]!.note = "x";
         expect(() => parseMetamorphicReport(extraNested)).toThrow(/report\.entries\[0\]: fields-invalid/);
