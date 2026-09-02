@@ -204,6 +204,34 @@ jobs:
           rm -f packages/mc-shm-native/mc_shm_native.node
           test ! -e packages/mc-shm-native/mc_shm_native.node
 
+  # mc-kernel runs in its own job because it has no cortexkit-store dependency:
+  # an mc-store compilation failure against this commons revision cannot mask the
+  # kernel's durability, admission, CAS, and replay proofs.
+  mc-kernel-proofs:
+    name: mc-kernel proofs against real commons (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: magic-context
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: magic-context
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ahrav/commons
+          ref: 89abb409b8c71b03146eedb5bf64cd964f2a92c0
+          path: commons
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Kernel tests against real commons
+        run: cargo test -p mc-kernel
+
   mc-host-lifecycle:
     name: mc-host lifecycle integration (Linux)
     runs-on: ubuntu-latest
@@ -227,13 +255,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@nextest
-
-      # mc-store's lib does not compile against current commons, so its own tests
-      # cannot run yet; that migration is tracked separately. The kernel is a
-      # separate crate with no cortexkit-store dependency, so its suite does run
-      # here and covers the durability, admission, CAS, and replay proofs.
-      - name: Kernel tests against real commons
-        run: cargo test -p mc-kernel
 
       - name: Host lifecycle and closure proofs
         run: |

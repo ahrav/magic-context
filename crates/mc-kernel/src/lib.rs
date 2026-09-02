@@ -5,6 +5,8 @@
 //! Extracted from `mc-store` so the kernel and its proofs build independently of
 //! that crate's legacy cache-state store.
 
+#![forbid(unsafe_code)]
+
 pub mod sqlite_runtime;
 
 mod admission;
