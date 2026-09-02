@@ -93,17 +93,25 @@ fn concurrent_reader_never_observes_a_partial_three_object_correction() {
             release_tx.send(()).unwrap();
             let deadline = Instant::now() + HANDSHAKE;
             loop {
+                assert!(Instant::now() < deadline, "commit never became visible");
                 let tip = store.facts(0).unwrap().commit_seq;
-                samples.push(live_domains(store, tip));
+                let sample = live_domains(store, tip);
+                // Skipping consecutive identical snapshots bounds `samples`
+                // until `deadline`.
+                if samples.last() != Some(&sample) {
+                    samples.push(sample);
+                }
                 if tip > tip_before {
                     break;
                 }
-                assert!(Instant::now() < deadline, "commit never became visible");
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             samples
         });
-        (writer.join().unwrap(), poller.join().unwrap())
+        // Joining `poller` first reports its assertion failure before the
+        // writer's dropped-channel panic.
+        let polls = poller.join().unwrap();
+        (writer.join().unwrap(), polls)
     });
 
     assert!(!receipt.replayed);

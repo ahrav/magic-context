@@ -5,9 +5,9 @@
 //! ambiguity are proven in the sibling anchor-resolution and acceptance
 //! files, which the registry cites; this module owns the graph property.
 //!
-//! Every commit writes unique content so no two commits share a tree or a
-//! diff, which keeps the fallback rungs out of the oracle's way: the only
-//! question left is ancestry.
+//! With no capture, `resolve_commit` skips the patch-id and tree-hash rungs
+//! (`match_in_window` has nothing to match), so the ancestry test alone
+//! decides each outcome.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
