@@ -1,4 +1,4 @@
-use mc_core::redaction::{redact_durable_text, Detection};
+use mc_core::redaction::{redact_durable_text, redact_windowed_durable_text, Detection};
 use rusqlite::{params, Transaction};
 
 use super::{map_sqlite, KernelError};
@@ -16,6 +16,17 @@ pub(super) struct RedactedField {
 /// does not preserve oversized input.
 pub(super) fn redact_lossy(value: &str) -> RedactedField {
     let redaction = redact_durable_text(value);
+    RedactedField {
+        text: redaction.text,
+        detections: redaction.detections,
+    }
+}
+
+/// Artifact payloads may exceed `MAX_REDACTABLE_BYTES`, so they scan in
+/// overlapping windows instead of failing closed at the scan limit. Every
+/// other durable field keeps [`redact`] or [`redact_lossy`].
+pub(super) fn redact_payload(value: &str) -> RedactedField {
+    let redaction = redact_windowed_durable_text(value);
     RedactedField {
         text: redaction.text,
         detections: redaction.detections,

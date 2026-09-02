@@ -5,7 +5,8 @@
 use std::sync::OnceLock;
 
 use mc_core::redaction::{
-    redact_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID, MAX_REDACTION_LABEL_BYTES,
+    redact_durable_text, redact_windowed_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID,
+    MAX_REDACTION_LABEL_BYTES, WINDOW_OVERLAP_BYTES,
 };
 use proptest::prelude::*;
 
@@ -410,4 +411,103 @@ fn labels_stay_bounded_for_key_names_built_from_many_label_words() {
             );
         }
     }
+}
+
+/// Filler whose lines carry no secret vocabulary, sized so `target_offset`
+/// falls at the start of a line, then `line` inserted there.
+fn text_with_line_at(target_offset: usize, line: &str, total: usize) -> (String, usize) {
+    const FILLER: &str = "plain filler line without any credential words 0123\n";
+    let mut text = String::with_capacity(total + line.len() + FILLER.len());
+    while text.len() + FILLER.len() <= target_offset {
+        text.push_str(FILLER);
+    }
+    let offset = text.len();
+    text.push_str(line);
+    text.push('\n');
+    while text.len() < total {
+        text.push_str(FILLER);
+    }
+    (text, offset)
+}
+
+fn assert_single_windowed_detection(text: &str, secret_line: &str, line_offset: usize) {
+    let redaction = redact_windowed_durable_text(text);
+    assert_eq!(redaction.detections.len(), 1, "{:?}", redaction.detections);
+    let value_start = line_offset + secret_line.find('=').unwrap() + 1;
+    assert_eq!(redaction.detections[0].offset, value_start);
+    assert_eq!(
+        redaction.detections[0].length,
+        secret_line.len() - secret_line.find('=').unwrap() - 1
+    );
+    assert!(!redaction.text.contains(AWS_KEY));
+    assert!(redaction.text.contains("<REDACTED:token>"));
+    // Everything outside the placeholder is unchanged.
+    assert_eq!(
+        redaction.text.len(),
+        text.len() - AWS_KEY.len() + "<REDACTED:token>".len()
+    );
+}
+
+#[test]
+fn windowed_redaction_matches_direct_redaction_below_the_scan_limit() {
+    let input = format!("token={AWS_KEY} and password=hunter-two");
+    assert_eq!(
+        redact_windowed_durable_text(&input),
+        redact_durable_text(&input)
+    );
+}
+
+#[test]
+fn windowed_redaction_reports_a_secret_in_the_overlap_once() {
+    let secret_line = format!("token={AWS_KEY}");
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // The second window starts at a line boundary at or before `window -
+    // overlap`, so a line just past that point is scanned by both windows.
+    let (text, offset) = text_with_line_at(
+        window - WINDOW_OVERLAP_BYTES + 4096,
+        &secret_line,
+        window + window / 2,
+    );
+    assert!(text.len() > window);
+    assert_single_windowed_detection(&text, &secret_line, offset);
+}
+
+#[test]
+fn windowed_redaction_redacts_a_secret_the_first_window_cuts_in_half() {
+    let secret_line = format!("token={AWS_KEY}");
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // The first window ends exactly at `window`, inside the secret value; the
+    // second window begins on an earlier line boundary and sees the whole line.
+    let (text, offset) = text_with_line_at(
+        window - secret_line.len() + AWS_KEY.len() / 2,
+        &secret_line,
+        window + window / 2,
+    );
+    assert!(offset < window && offset + secret_line.len() > window);
+    assert_single_windowed_detection(&text, &secret_line, offset);
+}
+
+#[test]
+fn windowed_redaction_finds_a_secret_deep_in_a_large_payload() {
+    let secret_line = format!("token={AWS_KEY}");
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    let (text, offset) = text_with_line_at(5 * window + 777, &secret_line, 8 * window + 13);
+    assert_single_windowed_detection(&text, &secret_line, offset);
+}
+
+#[test]
+fn windowed_redaction_leaves_a_clean_large_payload_unchanged() {
+    let (text, _) = text_with_line_at(0, "first", 3 * mc_secret_scanner::MAX_INPUT_BYTES);
+    let redaction = redact_windowed_durable_text(&text);
+    assert!(redaction.detections.is_empty());
+    assert_eq!(redaction.text, text);
+}
+
+#[test]
+fn direct_redaction_of_oversized_text_still_fails_closed() {
+    let input = "x".repeat(mc_secret_scanner::MAX_INPUT_BYTES + 1);
+    let redaction = redact_durable_text(&input);
+    assert_eq!(redaction.text, "<REDACTED:secret>");
+    assert_eq!(redaction.detections.len(), 1);
+    assert_eq!(redaction.detections[0].length, input.len());
 }

@@ -27,7 +27,7 @@ use crate::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::redaction::{identity, record, redact_lossy, RedactedField};
+use crate::redaction::{identity, record, redact_lossy, redact_payload, RedactedField};
 use crate::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -127,33 +127,27 @@ impl PreparedArtifact {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
 
-        // Redaction fails closed by replacing text it cannot inspect, so the payload
-        // has to be measured before that happens. Measuring the redacted bytes instead
-        // sees the placeholder's length, which passes any cap and stores the
-        // placeholder in place of the artifact.
-        if request.payload.len() > MAX_PAYLOAD_BYTES
-            || request.payload.len() > mc_core::redaction::MAX_REDACTABLE_BYTES
-        {
+        // The windowed scan fails closed only on scanner construction or budget
+        // failure, replacing the whole payload with one placeholder. Measuring the
+        // raw payload first keeps that placeholder's length from standing in for
+        // the artifact's when the cap is checked.
+        if request.payload.len() > MAX_PAYLOAD_BYTES {
             return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
         }
 
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact_lossy(text);
+                let redaction = redact_payload(text);
                 let bytes = redaction.text.as_bytes().to_vec();
                 (redaction, bytes, true)
             }
             Err(_) => {
                 {
-                    // Each invalid byte widens to a three-byte replacement character, so a
-                    // payload inside the raw limit can still convert to a scan input outside
-                    // it. Measuring the converted text keeps redaction's fail-closed
-                    // placeholder from being read back as proof of a secret.
+                    // Invalid bytes widen to three-byte replacement characters under the
+                    // lossy conversion; the windowed scan has no input limit, so the
+                    // widened text is inspected whole rather than rejected.
                     let inspected_text = String::from_utf8_lossy(&request.payload);
-                    if inspected_text.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
-                        return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-                    }
-                    if !redact_lossy(&inspected_text).detections.is_empty() {
+                    if !redact_payload(&inspected_text).detections.is_empty() {
                         return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
                     }
                 }

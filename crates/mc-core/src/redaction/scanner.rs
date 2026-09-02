@@ -58,7 +58,7 @@ const PROVIDER_PRECEDENCE: u8 = 1;
 const GENERIC_PRECEDENCE: u8 = 2;
 
 #[derive(Debug)]
-struct Replacement {
+pub(super) struct Replacement {
     start: usize,
     end: usize,
     /// Lowest `specificity` supplies the label when findings overlap.
@@ -67,14 +67,19 @@ struct Replacement {
     replacement: String,
 }
 
-/// Replaces all finding spans and reports one detection per overlapping cluster.
+/// Describes each finding in `input` as a replacement positioned at `base +
+/// span`, so findings from one scan window can be rendered against the text
+/// that window was cut from.
 ///
 /// Detection offsets and lengths are UTF-8 byte positions in `input`. Findings
-/// may arrive in any order. Keyed labels win provider labels, which win generic
-/// labels. Returns [`RedactionErrorKind::InvalidSpan`] when any span is not a
-/// valid string range, and [`RedactionErrorKind::UnknownRule`] for an
-/// unclassified conservative-overlay rule.
-pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, RedactionError> {
+/// may arrive in any order. Returns [`RedactionErrorKind::InvalidSpan`] when
+/// any span is not a valid string range, and [`RedactionErrorKind::UnknownRule`]
+/// for an unclassified conservative-overlay rule.
+pub(super) fn describe_findings(
+    input: &str,
+    findings: &[Finding],
+    base: usize,
+) -> Result<Vec<Replacement>, RedactionError> {
     let mut replacements = Vec::with_capacity(findings.len());
     for finding in findings {
         let value = finding.value_span;
@@ -93,12 +98,21 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
             &finding.rule_id,
             finding.rule_source,
             key,
-            value.start(),
-            value.end(),
+            base.checked_add(value.start()).ok_or_else(invalid_span)?,
+            base.checked_add(value.end()).ok_or_else(invalid_span)?,
         )?);
     }
+    Ok(replacements)
+}
+
+/// Replaces all described spans and reports one detection per overlapping
+/// cluster. Keyed labels win provider labels, which win generic labels.
+pub(super) fn render(
+    input: &str,
+    mut replacements: Vec<Replacement>,
+) -> Result<Redaction, RedactionError> {
     // Widest span first so a cluster's union is known from its first member, then
-    // most specific, so `render` can pick a winner without rescanning.
+    // most specific, so the cluster walk can pick a winner without rescanning.
     replacements.sort_by(|left, right| {
         (left.start, Reverse(left.end), left.specificity).cmp(&(
             right.start,
@@ -106,7 +120,7 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
             right.specificity,
         ))
     });
-    render(input, replacements)
+    render_sorted(input, replacements)
 }
 
 fn describe(
@@ -153,7 +167,10 @@ fn describe(
 ///
 /// Touching spans remain separate. Transitively overlapping spans form one
 /// maximal cluster whose full byte union is replaced once.
-fn render(input: &str, mut replacements: Vec<Replacement>) -> Result<Redaction, RedactionError> {
+fn render_sorted(
+    input: &str,
+    mut replacements: Vec<Replacement>,
+) -> Result<Redaction, RedactionError> {
     let mut text = String::with_capacity(input.len());
     let mut detections = Vec::with_capacity(replacements.len());
     let mut cursor = 0;

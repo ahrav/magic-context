@@ -188,6 +188,17 @@ impl Redactor {
 
     /// Returns no partial output when scanning exhausts a limit or yields an invalid span.
     pub fn redact(&self, input: &str) -> Result<Redaction, RedactionError> {
+        let replacements = self.replacements(input, 0)?;
+        scanner::render(input, replacements)
+    }
+
+    /// Scans `input` and returns its replacements shifted by `base`, the byte
+    /// offset of `input` inside the text they will be rendered against.
+    fn replacements(
+        &self,
+        input: &str,
+        base: usize,
+    ) -> Result<Vec<scanner::Replacement>, RedactionError> {
         let report = self.scanner.scan(input)?;
         if let Some(limit) = report.limits_hit {
             return Err(RedactionError {
@@ -197,8 +208,77 @@ impl Redactor {
                 },
             });
         }
-        scanner::redact(input, &report.findings)
+        scanner::describe_findings(input, &report.findings, base)
     }
+
+    /// Redacts text longer than [`MAX_REDACTABLE_BYTES`] by scanning
+    /// line-aligned windows that overlap by [`WINDOW_OVERLAP_BYTES`] and
+    /// rendering every finding against the whole input once. A finding both
+    /// windows see collapses into one placeholder because rendering merges
+    /// overlapping spans; a match one window truncates and the next completes
+    /// merges the same way.
+    pub fn redact_windowed(&self, input: &str) -> Result<Redaction, RedactionError> {
+        if input.len() <= MAX_REDACTABLE_BYTES {
+            return self.redact(input);
+        }
+        let mut replacements = Vec::new();
+        for (start, end) in scan_windows(input) {
+            let window = input.get(start..end).ok_or(RedactionError {
+                kind: RedactionErrorKind::InvalidSpan,
+            })?;
+            replacements.extend(self.replacements(window, start)?);
+        }
+        scanner::render(input, replacements)
+    }
+}
+
+/// Bytes shared by consecutive scan windows. A secret is found only when its
+/// whole match, its anchor radius, and its local-context span sit inside one
+/// window, so the overlap has to exceed the sum of the largest of each. The
+/// widest rule radius is 16 KiB and the widest local-context span is 1 KiB;
+/// the remainder covers the longest match, such as a PEM-encoded private key.
+pub const WINDOW_OVERLAP_BYTES: usize = 64 * 1024;
+
+const _: () = assert!(WINDOW_OVERLAP_BYTES * 2 <= MAX_REDACTABLE_BYTES);
+
+/// Splits `input` into `[start, end)` windows of at most `MAX_REDACTABLE_BYTES`
+/// whose starts fall on line boundaries and whose consecutive members share at
+/// least `WINDOW_OVERLAP_BYTES`. A line longer than the window minus its
+/// overlap is split at a char boundary instead, so the walk always advances.
+fn scan_windows(input: &str) -> Vec<(usize, usize)> {
+    let mut windows = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let end = char_floor(input, start.saturating_add(MAX_REDACTABLE_BYTES));
+        windows.push((start, end));
+        if end >= input.len() {
+            return windows;
+        }
+        let target = char_floor(input, end - WINDOW_OVERLAP_BYTES);
+        // The latest line start at or before `target` keeps the overlap at
+        // least as wide as required. Only line starts past `floor` qualify, so
+        // one long line preceded by a short one cannot shrink the advance to a
+        // few bytes and multiply the window count.
+        let floor = start + MIN_WINDOW_ADVANCE_BYTES;
+        let next = input[..target]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .filter(|&line_start| line_start >= floor)
+            .unwrap_or(target);
+        start = next.max(start + 1);
+    }
+}
+
+/// Smallest distance one window start moves past the previous one.
+const MIN_WINDOW_ADVANCE_BYTES: usize = (MAX_REDACTABLE_BYTES - WINDOW_OVERLAP_BYTES) / 2;
+
+/// Largest char boundary at or below `index`, clamped to the input length.
+fn char_floor(input: &str, index: usize) -> usize {
+    let mut index = index.min(input.len());
+    while !input.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 static REDACTOR: LazyLock<Result<Redactor, RedactionError>> = LazyLock::new(Redactor::new);
@@ -234,15 +314,19 @@ fn redact_with(redactor: &Result<Redactor, RedactionError>, input: &str) -> Reda
         .and_then(|redactor| redactor.redact(input))
     {
         Ok(redaction) => redaction,
-        Err(_) => Redaction {
-            text: "<REDACTED:secret>".to_owned(),
-            detections: vec![Detection {
-                detector_id: DETECTOR_ID,
-                secret_type: "secret".to_owned(),
-                offset: 0,
-                length: input.len(),
-            }],
-        },
+        Err(_) => whole_placeholder(input),
+    }
+}
+
+fn whole_placeholder(input: &str) -> Redaction {
+    Redaction {
+        text: "<REDACTED:secret>".to_owned(),
+        detections: vec![Detection {
+            detector_id: DETECTOR_ID,
+            secret_type: "secret".to_owned(),
+            offset: 0,
+            length: input.len(),
+        }],
     }
 }
 
@@ -250,6 +334,21 @@ fn redact_with(redactor: &Result<Redactor, RedactionError>, input: &str) -> Reda
 /// the same way `redact_durable_text` does.
 pub fn redact_transaction_durable_text(input: &str) -> Redaction {
     redact_with(&TRANSACTION_REDACTOR, input)
+}
+
+/// Redacts text of any length by windowed scanning; fails closed the same way
+/// `redact_durable_text` does. Only artifact ingestion, whose payload cap sits
+/// above the scan limit, calls this; every other durable field keeps the
+/// `InputLimit` behavior of `redact_durable_text`.
+pub fn redact_windowed_durable_text(input: &str) -> Redaction {
+    match REDACTOR
+        .as_ref()
+        .map_err(|error| *error)
+        .and_then(|redactor| redactor.redact_windowed(input))
+    {
+        Ok(redaction) => redaction,
+        Err(_) => whole_placeholder(input),
+    }
 }
 
 /// Identifies the detector build that produced a redaction, for the audit
@@ -509,6 +608,54 @@ fn is_label_segment(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_windows(input: &str) -> Vec<(usize, usize)> {
+        let windows = scan_windows(input);
+        assert_eq!(windows[0].0, 0);
+        assert_eq!(windows.last().unwrap().1, input.len());
+        for pair in windows.windows(2) {
+            let (first, second) = (pair[0], pair[1]);
+            assert!(first.1 - first.0 <= MAX_REDACTABLE_BYTES);
+            assert!(second.0 > first.0, "window start regressed: {pair:?}");
+            assert!(
+                first.1 - second.0 >= WINDOW_OVERLAP_BYTES,
+                "overlap too small: {pair:?}"
+            );
+            assert!(second.0 - first.0 >= MIN_WINDOW_ADVANCE_BYTES.min(1));
+            assert!(input.is_char_boundary(second.0));
+        }
+        windows
+    }
+
+    #[test]
+    fn windows_start_on_line_boundaries_and_overlap_when_lines_are_short() {
+        let input = "0123456789abcdef\n".repeat((3 * MAX_REDACTABLE_BYTES) / 17);
+        let windows = check_windows(&input);
+        assert!(windows.len() >= 3);
+        for &(start, _) in &windows[1..] {
+            assert_eq!(&input[start - 1..start], "\n");
+        }
+    }
+
+    #[test]
+    fn a_single_long_line_still_advances_by_the_minimum() {
+        let mut input = "short\n".to_owned();
+        input.push_str(&"y".repeat(2 * MAX_REDACTABLE_BYTES));
+        let windows = check_windows(&input);
+        assert!(windows.len() <= 2 * MAX_REDACTABLE_BYTES / MIN_WINDOW_ADVANCE_BYTES + 2);
+    }
+
+    #[test]
+    fn windows_never_split_a_multibyte_char() {
+        check_windows(&"π".repeat(MAX_REDACTABLE_BYTES));
+        check_windows(&"\u{fffd}".repeat(MAX_REDACTABLE_BYTES));
+    }
+
+    #[test]
+    fn short_input_uses_a_single_window() {
+        assert_eq!(scan_windows("a\nb"), vec![(0, 3)]);
+        assert_eq!(scan_windows(""), vec![(0, 0)]);
+    }
 
     #[test]
     fn scanner_is_the_only_redaction_path() {

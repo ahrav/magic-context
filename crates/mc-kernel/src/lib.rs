@@ -58,6 +58,7 @@ pub use cas::{
     ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,
     ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
     BarrierConsumerStatus, DeletionBarrierStatus, EligibilityDeniedReason, ProviderEgress,
+    MAX_PAYLOAD_BYTES,
 };
 pub use envelope::{
     AlignmentProjectionSpec, CommitIntent, CommitReceipt, DomainSpec, Envelope, KnownAsOf,

@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use mc_kernel::{
     ArtifactDestination, ArtifactEligibility, ArtifactErrorKind, ArtifactHandle,
     ArtifactIngestFault, ArtifactIngestRequest, CommitIntent, DomainSpec, EligibilityDeniedReason,
-    KernelStore, ProviderEgress, RepositoryProvenance, Sensitivity,
+    KernelStore, ProviderEgress, RepositoryProvenance, Sensitivity, MAX_PAYLOAD_BYTES,
 };
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -167,69 +167,160 @@ fn ingest_publishes_sharded_redacted_bytes_and_commits_live_reference() {
     );
 }
 
-#[test]
-fn payload_limit_is_inclusive() {
-    let root = tempfile::tempdir().unwrap();
-    let store = KernelStore::open(root.path()).unwrap();
-    seed_domain(&store);
+fn live_reservations(root: &std::path::Path) -> i64 {
+    Connection::open(root.join("core.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_ingestion_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
 
-    let limit = mc_core::redaction::MAX_REDACTABLE_BYTES;
-    store
-        .ingest_artifact(request("limit", vec![b'x'; limit]))
-        .unwrap();
-    let error = store
-        .ingest_artifact(request("over-limit", vec![b'x'; limit + 1]))
-        .unwrap_err();
-    assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+fn temp_entries(root: &std::path::Path) -> usize {
+    fs::read_dir(root.join("artifacts/tmp"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// UTF-8 payload of `total` bytes made of neutral lines, with `line` inserted
+/// at the first line boundary at or before `target_offset`.
+fn large_text_payload(total: usize, target_offset: usize, line: &str) -> (Vec<u8>, usize) {
+    const FILLER: &str = "plain filler line without any credential words 0123\n";
+    let mut text = String::with_capacity(total + FILLER.len() + line.len());
+    while text.len() + FILLER.len() <= target_offset {
+        text.push_str(FILLER);
+    }
+    let offset = text.len();
+    text.push_str(line);
+    text.push('\n');
+    while text.len() < total {
+        text.push_str(FILLER);
+    }
+    text.truncate(total);
+    (text.into_bytes(), offset)
 }
 
 #[test]
-fn binary_payload_is_measured_by_what_the_scan_would_inspect() {
+fn payload_limit_is_inclusive_at_the_artifact_cap() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
 
-    // Invalid bytes are scanned through a lossy conversion, and each widens to a
-    // three-byte replacement character. Measuring the raw length would accept this
-    // payload, then the scan would exceed its limit, redaction would fail closed, and
-    // the resulting placeholder detection would report a secret-free payload as one
-    // holding a secret that cannot be redacted.
-    let payload = vec![0xff_u8; 200 * 1024];
-    assert!(payload.len() < mc_core::redaction::MAX_REDACTABLE_BYTES);
-    assert!(
-        String::from_utf8_lossy(&payload).len() > mc_core::redaction::MAX_REDACTABLE_BYTES,
-        "payload no longer expands past the scan limit"
+    assert_eq!(MAX_PAYLOAD_BYTES, 64 * MIB);
+    let (payload, _) = large_text_payload(MAX_PAYLOAD_BYTES, 0, "first");
+    let handle = store.ingest_artifact(request("limit", payload)).unwrap();
+    assert_eq!(
+        store.read_artifact(&handle).unwrap().len(),
+        MAX_PAYLOAD_BYTES
     );
 
+    let (payload, _) = large_text_payload(MAX_PAYLOAD_BYTES + 1, 0, "first");
     let error = store
-        .ingest_artifact(request("wide-binary", payload))
+        .ingest_artifact(request("over-limit", payload))
         .unwrap_err();
     assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+    assert_eq!(live_reservations(root.path()), 0);
+    assert_eq!(temp_entries(root.path()), 0);
 }
 
 #[test]
-fn payload_too_large_to_inspect_is_rejected_rather_than_replaced() {
+fn cap_sized_payload_is_redacted_in_windows_and_the_digest_names_the_redacted_bytes() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
 
-    // Redaction cannot inspect text this long, so it replaces the whole value with one
-    // placeholder. Accepting that would store the placeholder as the artifact and
-    // classify a payload holding no secret as one that does, both without an error.
-    let limit = mc_core::redaction::MAX_REDACTABLE_BYTES;
-    assert!(MIB > limit);
-    let error = store
-        .ingest_artifact(request("unscannable", vec![b'x'; MIB]))
-        .unwrap_err();
-    assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+    let secret_line = format!("key {SECRET} tail");
+    let (payload, offset) = large_text_payload(MAX_PAYLOAD_BYTES, 40 * MIB, &secret_line);
+    assert_eq!(payload.len(), MAX_PAYLOAD_BYTES);
+    let handle = store
+        .ingest_artifact(request("deep-secret", payload.clone()))
+        .unwrap();
 
-    // At the limit the payload is stored whole, so the rejection above is a size
-    // boundary rather than a placeholder standing in for the artifact.
-    let payload = vec![b'x'; limit];
+    let stored = store.read_artifact(&handle).unwrap();
+    assert!(!stored
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert!(stored
+        .windows(b"<ANTHROPIC_API_KEY_REDACTED>".len())
+        .any(|window| window == b"<ANTHROPIC_API_KEY_REDACTED>"));
+    assert_eq!(handle.digest, format!("{:x}", Sha256::digest(&stored)));
+    assert_eq!(
+        stored.len(),
+        payload.len() - SECRET.len() + "<ANTHROPIC_API_KEY_REDACTED>".len()
+    );
+    // Bytes on either side of the placeholder are untouched.
+    assert_eq!(&stored[..offset + 4], &payload[..offset + 4]);
+
+    let (detector, secret_type, redaction_offset): (String, String, i64) =
+        Connection::open(root.path().join("core.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT detector_id,secret_type,source_utf8_offset FROM durable_text_redactions
+                 WHERE owner_kind='evidence' AND owner_id=?1",
+                [handle.evidence_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(detector, "mc-secret-scanner");
+    assert_eq!(secret_type, "anthropic_api_key");
+    assert_eq!(redaction_offset, i64::try_from(offset + 4).unwrap());
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+}
+
+#[test]
+fn cap_sized_binary_payload_is_inspected_whole() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    // Every 0xff widens to a three-byte replacement character, so the inspected
+    // text is three times the payload; the windowed scan still covers it.
+    let mut clean = vec![0xff_u8; 2 * MIB];
+    clean[MIB] = b'\n';
+    let handle = store
+        .ingest_artifact(request("wide-binary", clean.clone()))
+        .unwrap();
+    assert_eq!(store.read_artifact(&handle).unwrap(), clean);
+    assert_eq!(
+        store
+            .artifact_eligibility(&handle, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+
+    let mut leaking = vec![0xff_u8; 2 * MIB];
+    leaking[MIB..MIB + SECRET.len()].copy_from_slice(SECRET.as_bytes());
+    let error = store
+        .ingest_artifact(request("wide-binary-secret", leaking))
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::UnredactableSecret);
+    assert_eq!(live_reservations(root.path()), 0);
+}
+
+#[test]
+fn a_payload_past_the_scan_limit_is_stored_whole_rather_than_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    // Direct redaction would replace text this long with one placeholder; the
+    // windowed payload scan keeps the bytes and finds nothing to redact.
+    let (payload, _) = large_text_payload(MIB, 0, "first");
+    assert!(payload.len() > mc_core::redaction::MAX_REDACTABLE_BYTES);
     let handle = store
         .ingest_artifact(request("scannable", payload.clone()))
         .unwrap();
     assert_eq!(store.read_artifact(&handle).unwrap(), payload);
+    assert_eq!(
+        store
+            .artifact_eligibility(&handle, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Allowed
+    );
 }
 
 #[test]
