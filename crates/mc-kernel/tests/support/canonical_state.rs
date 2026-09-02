@@ -75,6 +75,13 @@
 //! Two roots handed different explicit values therefore compare equal.
 //! The default expiry derives from each root's own clock.
 //! Comparing the instant exactly would fail an identical history.
+//!
+//! A caller-supplied instant stays `Rule::Keep`, because it is part of the history.
+//! `deletion_backfill_barriers.created_at` takes the deletion request's `deleted_at`.
+//! `consumer_abandonments.abandoned_at` arrives on the abandonment request.
+//! `completed_at` and `acknowledged_at` are threaded from that same caller value.
+//! Neither `outbox.rs` nor `cas/deletion.rs` reads the clock at all.
+//! A cross-root proof must therefore pass one fixed instant to both roots.
 
 #![allow(dead_code)]
 
