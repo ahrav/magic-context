@@ -64,7 +64,7 @@ fn concurrent_reader_never_observes_a_partial_three_object_correction() {
 
     let store = proof.store();
     let tip_before = proof.tip();
-    let (receipt, polls) = thread::scope(|scope| {
+    let (receipt, open_envelope_samples, polls) = thread::scope(|scope| {
         let writer = scope.spawn(move || {
             store
                 .commit(intent("correct-three"), move |envelope| {
@@ -90,6 +90,7 @@ fn concurrent_reader_never_observes_a_partial_three_object_correction() {
                 samples.push(live_domains(store, store.facts(0).unwrap().commit_seq));
                 thread::yield_now();
             }
+            let open_envelope_samples = samples.len();
             release_tx.send(()).unwrap();
             let deadline = Instant::now() + HANDSHAKE;
             loop {
@@ -106,15 +107,24 @@ fn concurrent_reader_never_observes_a_partial_three_object_correction() {
                 }
                 thread::sleep(Duration::from_millis(1));
             }
-            samples
+            (open_envelope_samples, samples)
         });
         // Joining `poller` first reports its assertion failure before the
         // writer's dropped-channel panic.
-        let polls = poller.join().unwrap();
-        (writer.join().unwrap(), polls)
+        let (open_envelope_samples, polls) = poller.join().unwrap();
+        (writer.join().unwrap(), open_envelope_samples, polls)
     });
 
     assert!(!receipt.replayed);
+    // The envelope remains open across this prefix, so a post-state sample
+    // violates atomic visibility. The weaker `saw_pre` check below still
+    // passes in that case whenever one later sample is the pre-state.
+    for sample in &polls[..open_envelope_samples] {
+        assert_eq!(
+            sample, &pre,
+            "a correction became visible while the envelope was still open"
+        );
+    }
     let mut saw_pre = false;
     let mut saw_post = false;
     for sample in &polls {
