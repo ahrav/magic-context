@@ -88,6 +88,9 @@
 /// Stands in for a content digest, which is 64 hex characters and cannot collide with it.
 const DIRECTORY_MARKER: &str = "<directory>";
 
+/// `(depth, name, content digest, byte length)`.
+type CasEntry = (u64, String, String, u64);
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -173,9 +176,10 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
     let temp_rows = normalized
         .temps
         .into_iter()
-        .map(|(depth, digest, len)| {
+        .map(|(depth, name, digest, len)| {
             vec![
                 Cell::Integer(depth as i64),
+                Cell::Text(name),
                 Cell::Text(digest),
                 Cell::Integer(len as i64),
             ]
@@ -185,9 +189,10 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
     let unexpected_rows = normalized
         .unexpected
         .into_iter()
-        .map(|(depth, digest, len)| {
+        .map(|(depth, name, digest, len)| {
             vec![
                 Cell::Integer(depth as i64),
+                Cell::Text(name),
                 Cell::Text(digest),
                 Cell::Integer(len as i64),
             ]
@@ -202,9 +207,21 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
     tables.insert("sqlite_sequence".to_string(), hash_rows(&sequence_rows));
     tables.insert(
         "schema_identity".to_string(),
-        hash_rows(&schema_identity_rows(root)),
+        hash_rows(&normalized.identity),
     );
     tables.insert("cas_layout".to_string(), hash_rows(&layout_rows(root)));
+    let metadata_rows = scan_object_metadata(root)
+        .into_iter()
+        .map(|(digest, uid, mode, links)| {
+            vec![
+                Cell::Text(digest),
+                Cell::Integer(i64::from(uid)),
+                Cell::Integer(i64::from(mode)),
+                Cell::Integer(links as i64),
+            ]
+        })
+        .collect::<Vec<_>>();
+    tables.insert("cas_object_metadata".to_string(), hash_rows(&metadata_rows));
     CanonicalDigest { tables }
 }
 
@@ -259,18 +276,20 @@ struct Table {
 
 struct State {
     tables: BTreeMap<String, Table>,
+    identity: Vec<Vec<Cell>>,
     sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
-    unexpected: Vec<(u64, String, u64)>,
-    temps: Vec<(u64, String, u64)>,
+    unexpected: Vec<CasEntry>,
+    temps: Vec<CasEntry>,
 }
 
 struct Normalized {
     tables: BTreeMap<String, Vec<Vec<Cell>>>,
+    identity: Vec<Vec<Cell>>,
     sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
-    unexpected: Vec<(u64, String, u64)>,
-    temps: Vec<(u64, String, u64)>,
+    unexpected: Vec<CasEntry>,
+    temps: Vec<CasEntry>,
 }
 
 impl State {
@@ -313,6 +332,7 @@ impl State {
         }
         verify_format_marker(&tables);
         Self {
+            identity: schema_identity_rows(&connection),
             tables,
             sequences: read_sequences(&connection),
             objects: scan_objects(root),
@@ -322,11 +342,12 @@ impl State {
     }
 
     fn normalize(mut self, profile: Profile) -> Normalized {
+        let current_writer = current_writer_epoch(&self.tables);
         let renames = match profile {
             Profile::SameRoot => Vec::new(),
             Profile::CrossRoot => {
                 assert_no_placeholder_syntax(&self.tables);
-                self.identity_renames()
+                self.identity_renames(current_writer)
             }
         };
         let mut tables = BTreeMap::new();
@@ -344,7 +365,10 @@ impl State {
                 .map(|row| {
                     kept.iter()
                         .map(|&(index, rule)| {
-                            rename_cell(apply_rule(row[index].clone(), rule), &renames)
+                            rename_cell(
+                                apply_rule(row[index].clone(), rule, current_writer),
+                                &renames,
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -363,6 +387,7 @@ impl State {
         self.temps.sort();
         Normalized {
             tables,
+            identity: self.identity,
             sequences: self.sequences,
             objects: self.objects,
             unexpected: self.unexpected,
@@ -372,7 +397,7 @@ impl State {
 
     /// Bijective rename map over every identity domain, longest tokens first
     /// so a token that embeds another domain's shape is rewritten whole.
-    fn identity_renames(&self) -> Vec<(String, String)> {
+    fn identity_renames(&self, current_writer: Option<i64>) -> Vec<(String, String)> {
         let mut renames = Vec::new();
         for domain in IDENTITY_DOMAINS {
             // Earlier renames normalize cross-root identity text in ordering keys.
@@ -403,7 +428,10 @@ impl State {
                         if rule == Rule::Drop {
                             creation.push(cell.clone());
                         } else {
-                            key.push(rename_cell(apply_rule(cell.clone(), rule), &resolved));
+                            key.push(rename_cell(
+                                apply_rule(cell.clone(), rule, current_writer),
+                                &resolved,
+                            ));
                         }
                     }
                     (key, creation, id.clone())
@@ -458,6 +486,11 @@ const IDENTITY_DOMAINS: &[IdentityDomain] = &[
 enum Rule {
     Keep,
     Drop,
+    /// Reduce to whether the value equals the store's current writer epoch.
+    ///
+    /// `prepare_reclaim` treats a live reservation as protective only on an epoch match, so the
+    /// relationship is state even though the epoch itself is per-root.
+    CurrentWriter,
     /// Reduce to `Null` or `Integer(1)`: the value is wall-clock but its
     /// nullness is state. `expires_at IS NULL` means the caller pinned without
     /// expiry; `released_at IS NULL` defines an active pin; `terminal_at IS
@@ -478,7 +511,6 @@ fn column_rule(profile: Profile, table: &str, column: &str) -> Rule {
         (Profile::CrossRoot, "admission_decisions") => &["decided_at"],
         (Profile::CrossRoot, "capture_pins") => &["lease_epoch", "writer_epoch", "created_at"],
         (Profile::CrossRoot, "artifact_ingestion_reservations") => &[
-            "writer_epoch",
             "created_at",
             "heartbeat_at",
             "lease_expires_at",
@@ -486,6 +518,12 @@ fn column_rule(profile: Profile, table: &str, column: &str) -> Rule {
         ],
         (Profile::CrossRoot, _) => &[],
     };
+    if profile == Profile::CrossRoot
+        && table == "artifact_ingestion_reservations"
+        && column == "writer_epoch"
+    {
+        return Rule::CurrentWriter;
+    }
     let presence: &[&str] = match table {
         "capture_pins" | "capture_pin_refs" => &["expires_at", "released_at"],
         "extraction_runs" | "candidates" => &["terminal_at"],
@@ -500,11 +538,27 @@ fn column_rule(profile: Profile, table: &str, column: &str) -> Rule {
     }
 }
 
-fn apply_rule(cell: Cell, rule: Rule) -> Cell {
+fn apply_rule(cell: Cell, rule: Rule, current_writer: Option<i64>) -> Cell {
     match (rule, cell) {
         (Rule::Presence, Cell::Null) => Cell::Null,
         (Rule::Presence, _) => Cell::Integer(1),
+        (Rule::CurrentWriter, Cell::Integer(epoch)) => {
+            Cell::Integer(i64::from(current_writer == Some(epoch)))
+        }
         (_, cell) => cell,
+    }
+}
+
+/// The `writer_fence` epoch, which every other epoch is compared against.
+fn current_writer_epoch(tables: &BTreeMap<String, Table>) -> Option<i64> {
+    let table = tables.get("writer_fence")?;
+    let index = table
+        .columns
+        .iter()
+        .position(|column| column == "writer_epoch")?;
+    match table.rows.first()?.get(index)? {
+        Cell::Integer(epoch) => Some(*epoch),
+        _ => None,
     }
 }
 
@@ -666,8 +720,7 @@ fn assert_no_placeholder_syntax(tables: &BTreeMap<String, Table>) {
 /// The live schema and the header values `KernelStore` checks when it opens a database.
 ///
 /// A dropped trigger or a rewritten `user_version` leaves every table row intact.
-fn schema_identity_rows(root: &Path) -> Vec<Vec<Cell>> {
-    let connection = open_read_only(root);
+fn schema_identity_rows(connection: &Connection) -> Vec<Vec<Cell>> {
     let mut rows = connection
         .prepare(
             "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
@@ -822,14 +875,18 @@ pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
 /// the content digest is what a leaked plaintext copy of a purged artifact
 /// shares across roots. Missing `artifacts/tmp` reads as empty.
 /// `prepare_layout` unlinks only files and symlinks, so a directory here survives a restart.
-pub fn scan_temps(root: &Path) -> Vec<(u64, String, u64)> {
+pub fn scan_temps(root: &Path) -> Vec<CasEntry> {
     let Some(entries) = read_dir_or_absent(root, "artifacts/tmp") else {
         return Vec::new();
     };
-    let mut result = Vec::new();
+    let mut collected = Vec::new();
     for entry in entries {
-        collect_file_digests(&entry.unwrap().path(), 0, &mut result);
+        collect_file_digests(&entry.unwrap().path(), 0, &mut collected);
     }
+    let mut result = collected
+        .into_iter()
+        .map(|(depth, name, digest, len)| (depth, temp_stem(&name), digest, len))
+        .collect::<Vec<_>>();
     result.sort();
     result
 }
@@ -858,14 +915,38 @@ fn read_dir_or_absent(root: &Path, relative: &str) -> Option<fs::ReadDir> {
     }
 }
 
+/// Owner, mode, and link count of every published object.
+///
+/// `open_regular_nofollow` refuses an object whose `nlink` is not 1, whose owner is not the
+/// caller, or whose mode intersects `0o177`, so all three decide whether the artifact reads.
+pub fn scan_object_metadata(root: &Path) -> Vec<(String, u32, u32, u64)> {
+    let mut result = Vec::new();
+    for (digest, _) in scan_objects(root) {
+        let path = root.join(format!(
+            "artifacts/objects/{}/{}",
+            &digest[..2],
+            &digest[2..]
+        ));
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        result.push((
+            digest,
+            metadata.uid(),
+            metadata.permissions().mode() & 0o7777,
+            metadata.nlink(),
+        ));
+    }
+    result.sort();
+    result
+}
+
 /// Hash regular files outside valid shards so digest comparison detects unexpected CAS state.
 ///
 /// Content digests are recorded instead of names, as `scan_temps` does.
-pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
+pub fn scan_unexpected_objects(root: &Path) -> Vec<CasEntry> {
     let Some(entries) = read_dir_or_absent(root, "artifacts/objects") else {
         return Vec::new();
     };
-    let mut result = Vec::new();
+    let mut collected = Vec::new();
     for entry in entries {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
@@ -873,17 +954,22 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
             && name.len() == 2
             && name.bytes().all(is_lower_hex);
         if !is_shard {
-            collect_file_digests(&entry.path(), 0, &mut result);
+            collect_file_digests(&entry.path(), 0, &mut collected);
             continue;
         }
         // Only a regular file inside a shard is an object, so anything else is stray state.
         for inner in fs::read_dir(entry.path()).unwrap() {
             let inner = inner.unwrap().path();
             if !fs::symlink_metadata(&inner).unwrap().is_file() {
-                collect_file_digests(&inner, 1, &mut result);
+                collect_file_digests(&inner, 1, &mut collected);
             }
         }
     }
+    // A stray name carries no meaning production reads, unlike a temp name.
+    let mut result = collected
+        .into_iter()
+        .map(|(depth, _, digest, len)| (depth, String::new(), digest, len))
+        .collect::<Vec<_>>();
     result.sort();
     result
 }
@@ -892,11 +978,15 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
 ///
 /// `depth` accompanies each digest because `regular_file_bytes` charges a root-level file but
 /// descends only one level, so the same bytes cost different usage at different depths.
-fn collect_file_digests(path: &Path, depth: u64, out: &mut Vec<(u64, String, u64)>) {
+fn collect_file_digests(path: &Path, depth: u64, out: &mut Vec<CasEntry>) {
     let metadata = fs::symlink_metadata(path).unwrap();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if metadata.is_dir() {
         // A directory holding no regular file would otherwise read the same as its absence.
-        out.push((depth, DIRECTORY_MARKER.to_string(), 0));
+        out.push((depth, name, DIRECTORY_MARKER.to_string(), 0));
         for entry in fs::read_dir(path).unwrap() {
             collect_file_digests(&entry.unwrap().path(), depth + 1, out);
         }
@@ -904,8 +994,25 @@ fn collect_file_digests(path: &Path, depth: u64, out: &mut Vec<(u64, String, u64
         let bytes = fs::read(path).unwrap();
         out.push((
             depth,
+            name,
             format!("{:x}", Sha256::digest(&bytes)),
             bytes.len() as u64,
         ));
+    }
+}
+
+/// The part of a temp name that is state, with the process-unique counter removed.
+///
+/// `sweep_digest_temps` unlinks only names starting with `.artifact-{digest}-`.
+/// The stem therefore decides whether a purge of that artifact removes the plaintext.
+fn temp_stem(name: &str) -> String {
+    let base = name.strip_suffix(".tmp").unwrap_or(name);
+    match base.rsplit_once('-') {
+        Some((stem, counter))
+            if !counter.is_empty() && counter.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            stem.to_string()
+        }
+        _ => String::new(),
     }
 }

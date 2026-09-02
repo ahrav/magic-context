@@ -429,5 +429,6 @@ fn digested_table_set_equals_schema_inventory() {
     assert!(keys.remove("sqlite_sequence"));
     assert!(keys.remove("schema_identity"));
     assert!(keys.remove("cas_layout"));
+    assert!(keys.remove("cas_object_metadata"));
     assert_eq!(keys, declared);
 }
