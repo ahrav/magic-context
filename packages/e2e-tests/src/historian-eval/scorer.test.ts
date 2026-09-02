@@ -20,6 +20,7 @@ import {
     compareProbeAnswer,
     freshScoringDatabase,
     laneExitCode,
+    parseLaneReport,
     scoreRawOutput,
     scoreRunRecord,
     type ScenarioScore,
@@ -2465,6 +2466,30 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: ["abs-x"],
         };
         expect(laneExitCode(buildLaneReport([fatal, passScore("hse-b")]))).toBe(2);
+    });
+
+    test("parseLaneReport round-trips builder output and rejects malformed reports", () => {
+        const fa: ScenarioScore = {
+            ...passScore("hse-b"),
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: ["abs-x"],
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "" }],
+        };
+        const errored: ScenarioScore = { ...passScore("hse-c"), verdict: "ERROR", errorReason: "script-drift", precision: null, recall: null };
+        const report = buildLaneReport([passScore("hse-a"), fa, errored], { releaseVersion: "v2.0.0" });
+        expect(parseLaneReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
+        expect(() => parseLaneReport({ ...report, schema: "historian-eval-report/v2" })).toThrow(/report\.schema: version-invalid/);
+        expect(() => parseLaneReport({ ...report, notes: "x" })).toThrow(/^report: fields-invalid/);
+        const nested = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        nested.scenarios[0]!.transcript = "leaked";
+        expect(() => parseLaneReport(nested)).toThrow(/report\.scenarios\[0\]: fields-invalid/);
+        const badReason = structuredClone(report) as unknown as { scenarios: { failReasons: string[] }[] };
+        badReason.scenarios[1]!.failReasons = ["vibes"];
+        expect(() => parseLaneReport(badReason)).toThrow(/report\.scenarios\[1\]\.failReasons\[0\]: enum-invalid/);
+        const badVerdict = structuredClone(report) as unknown as { scenarios: { verdict: string }[] };
+        badVerdict.scenarios[0]!.verdict = "GREEN";
+        expect(() => parseLaneReport(badVerdict)).toThrow(/report\.scenarios\[0\]\.verdict: enum-invalid/);
     });
 });
 

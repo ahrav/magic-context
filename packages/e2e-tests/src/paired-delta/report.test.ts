@@ -14,6 +14,7 @@ import {
     calibrationNoiseFloors,
     readCalibrationRecord,
     buildPairedDeltaReport,
+    parsePairedDeltaReport,
     publishPairedDeltaReport,
 } from "./report";
 import { PRIMARY_ARM_IDS } from "./contract";
@@ -913,5 +914,63 @@ describe("paired-delta calibration reader: series integrity", () => {
             scenarioDepth: { "var-a": 4 },
             familyNoise: inflated.familyNoise.map((noise) => ({ ...noise, observationCount: 4 })),
         }))).toThrow(/validity-inconsistent/);
+    });
+});
+
+describe("parsePairedDeltaReport", () => {
+    it("round-trips builder output and rejects the wrong schema literal", () => {
+        const built = report();
+        expect(parsePairedDeltaReport(JSON.parse(JSON.stringify(built)))).toEqual(built);
+        expect(() => parsePairedDeltaReport({ ...built, schema: "paired-delta-report/v0" })).toThrow(/report\.schema: version-invalid/);
+    });
+
+    it("rejects an extra field at any nesting level naming the path", () => {
+        const built = report();
+        expect(() => parsePairedDeltaReport({ ...built, extra: 1 })).toThrow(/^report: fields-invalid/);
+        const nested = structuredClone(built) as unknown as { body: Record<string, unknown> };
+        (nested.body.runSummary as Record<string, unknown>).operator = "x";
+        expect(() => parsePairedDeltaReport(nested)).toThrow(/report\.body\.runSummary: fields-invalid/);
+        const deep = structuredClone(built) as unknown as { body: { analysis: { endpoints: Record<string, unknown>[] } } };
+        deep.body.analysis.endpoints[0]!.weight = 2;
+        expect(() => parsePairedDeltaReport(deep)).toThrow(/report\.body\.analysis\.endpoints\[0\]: fields-invalid/);
+    });
+
+    it("rejects a tampered report fingerprint and unknown enum values", () => {
+        const built = report();
+        const tampered = structuredClone(built);
+        tampered.body.runSummary.spentUsd = 0;
+        expect(() => parsePairedDeltaReport(tampered)).toThrow(/report\.reportFingerprint: fingerprint-mismatch/);
+        const badArm = structuredClone(built) as unknown as { body: { exclusions: Record<string, unknown>[] } };
+        badArm.body.exclusions[0]!.armId = "r9";
+        expect(() => parsePairedDeltaReport(badArm)).toThrow(/report\.body\.exclusions\[0\]\.armId: enum-invalid/);
+        const badStatus = structuredClone(built) as unknown as { body: { runSummary: Record<string, unknown> } };
+        badStatus.body.runSummary.status = "done";
+        expect(() => parsePairedDeltaReport(badStatus)).toThrow(/report\.body\.runSummary\.status: enum-invalid/);
+    });
+
+    it("preserves an endpoint-scoped noise floor through the round trip", () => {
+        const policy = policyDocument();
+        const analysis = estimateFamilyDeltas({
+            observations: [
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.1, runHealth: "completed" },
+                { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.1, runHealth: "completed" },
+            ],
+            minimumAnalyzableFamilyCount: 2,
+            bootstrapSeed: 17,
+            bootstrapResamples: 2000,
+            lane: {
+                poolManifestFingerprint: H1,
+                pinnedSnapshotId: "anthropic-model-20260830",
+                policyFingerprint: policy.policyFingerprint,
+                pairedFactsFingerprint: PAIRED_FACTS,
+            },
+            noiseFloors: [{ familyId: "fam-a", endpoint: "mc-on-vs-mc-off", value: 0.1, interval: { lower: 0, upper: 0.1 } }],
+        });
+        const built = report({ policyDocument: policy, analysis });
+        const endpoint = built.body.analysis.endpoints.find((entry) => entry.endpoint === "mc-on-vs-mc-off")!;
+        expect(endpoint.families.find((family) => family.familyId === "fam-a")!.noise.floor?.endpoint).toBe("mc-on-vs-mc-off");
+        expect(parsePairedDeltaReport(JSON.parse(JSON.stringify(built)))).toEqual(built);
     });
 });

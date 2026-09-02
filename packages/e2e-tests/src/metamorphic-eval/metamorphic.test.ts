@@ -25,7 +25,7 @@ import {
     type LiveObservation,
     type LiveRole,
 } from "./live";
-import { buildMetamorphicReport, metamorphicExitCode, type MetamorphicReport } from "./report";
+import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval, DETERMINISTIC_SEEDS } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
@@ -133,6 +133,41 @@ describe("deterministic metamorphic runner", () => {
         expect(report.entries[0]?.kind).toBe("scored");
         expect(report.coverage[0]?.applied).toBe(1);
         expect(metamorphicExitCode(report)).toBe(0);
+    });
+
+    test("parseMetamorphicReport round-trips the full corpus report and rejects malformed variants", () => {
+        const report = runDeterministicMetamorphicEval(corpus(), {
+            transforms: [reorder()],
+            seeds: [DETERMINISTIC_SEEDS[0]!],
+        });
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
+        const invalid = buildMetamorphicReport({
+            entries: [
+                { scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 0, kind: "error", error: "boom" },
+                {
+                    scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 1,
+                    kind: "stage-not-scored", role: "derivative", stage: "validation-rejected", error: "rejected",
+                },
+                { scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 2, kind: "lint-red", diagnostics: ["d1"] },
+            ],
+            coverage: [{ scenarioId: "hse-a", applied: 1, inapplicable: [{ scenarioId: "hse-a", transformId: "t", transformVersion: 1, seed: 3, reason: "n/a" }], violations: [] }],
+            injectionCanaryHits: [{ scenarioId: "hse-a", role: "control-a", transformId: null, transformVersion: null, seed: null }],
+            tierInvalidReason: { kind: "control-disagreement", systemMismatch: true, failedInvariants: ["expected-absent-empty"] },
+            system: systemTuple(),
+        });
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(invalid)))).toEqual(invalid);
+
+        expect(() => parseMetamorphicReport({ ...report, schema: "metamorphic-eval-report/v1" })).toThrow(/report\.schema: version-invalid/);
+        expect(() => parseMetamorphicReport({ ...report, operator: "x" })).toThrow(/^report: fields-invalid/);
+        const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
+        unknownKind.entries[0]!.kind = "skipped";
+        expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        const extraNested = structuredClone(report) as unknown as { entries: Record<string, unknown>[] };
+        extraNested.entries[0]!.note = "x";
+        expect(() => parseMetamorphicReport(extraNested)).toThrow(/report\.entries\[0\]: fields-invalid/);
+        const badReason = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        badReason.tierInvalidReason.kind = "tired";
+        expect(() => parseMetamorphicReport(badReason)).toThrow(/report\.tierInvalidReason\.kind: enum-invalid/);
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {

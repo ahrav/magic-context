@@ -2,17 +2,27 @@ import { readFileSync } from "node:fs";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import { compareCodeUnits } from "../code-unit-order";
+import { makeContractPrimitives } from "../contract-primitives";
 import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
-import { ARM_IDS, PRIMARY_ARM_IDS, REASON_CODES, type ArmId, type ReasonCode } from "./contract";
+import {
+    ARM_IDS,
+    PRIMARY_ARM_IDS,
+    PairedDeltaContractError,
+    REASON_CODES,
+    type ArmId,
+    type ReasonCode,
+} from "./contract";
 import type {
     EndpointEstimate,
     FamilyDeltaAnalysis,
+    FamilyEstimate,
     FamilyNoiseFloor,
+    Interval,
     RawRegretRecord,
 } from "./estimator";
-import { PRIMARY_ENDPOINTS } from "./estimator";
+import { PRIMARY_ENDPOINTS, REGRET_ENDPOINTS } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -267,6 +277,215 @@ export function buildPairedDeltaReport(input: {
         body,
         reportFingerprint: canonicalFingerprint(body),
     };
+}
+
+const RUN_STATUSES = [
+    "completed",
+    "cost-cap-reached",
+    "deadline-reached",
+    "invalid-stored-records",
+    "harness-unreclaimed",
+    "usage-unmeasured",
+] as const satisfies readonly PairedDeltaRunResult["status"][];
+const DELTA_ENDPOINTS = [...PRIMARY_ENDPOINTS, ...REGRET_ENDPOINTS] as const;
+
+const p = makeContractPrimitives(PairedDeltaContractError);
+
+function finiteNumber(value: unknown, label: string): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) p.fail(`${label}: number-invalid`);
+    return value as number;
+}
+
+function boolean(value: unknown, label: string): boolean {
+    if (typeof value !== "boolean") p.fail(`${label}: boolean-invalid`);
+    return value as boolean;
+}
+
+function parseInterval(raw: unknown, label: string): Interval {
+    const value = p.record(raw, label);
+    p.exact(value, ["lower", "upper"], label);
+    return { lower: finiteNumber(value.lower, `${label}.lower`), upper: finiteNumber(value.upper, `${label}.upper`) };
+}
+
+function parseNoiseFloor(raw: unknown, label: string): FamilyNoiseFloor {
+    const value = p.record(raw, label);
+    const hasEndpoint = Object.hasOwn(value, "endpoint");
+    p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
+    return {
+        ...(hasEndpoint ? { endpoint: p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`) } : {}),
+        familyId: p.string(value.familyId, `${label}.familyId`),
+        value: finiteNumber(value.value, `${label}.value`),
+        interval: parseInterval(value.interval, `${label}.interval`),
+    };
+}
+
+function parseFamilyEstimate(raw: unknown, label: string): FamilyEstimate {
+    const value = p.record(raw, label);
+    p.exact(value, ["familyId", "pointEstimate", "interval", "resolution", "noise"], label);
+    const noise = p.record(value.noise, `${label}.noise`);
+    p.exact(noise, ["label", "floor"], `${label}.noise`);
+    return {
+        familyId: p.string(value.familyId, `${label}.familyId`),
+        pointEstimate: finiteNumber(value.pointEstimate, `${label}.pointEstimate`),
+        interval: parseInterval(value.interval, `${label}.interval`),
+        resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`),
+        noise: {
+            label: p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`),
+            floor: noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`),
+        },
+    };
+}
+
+function parseEndpointEstimates(raw: unknown, label: string): EndpointEstimate[] {
+    return p.array(raw, label).map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const value = p.record(entry, itemLabel);
+        p.exact(value, ["endpoint", "pointEstimate", "interval", "familyCount", "resolution", "families"], itemLabel);
+        return {
+            endpoint: p.enumeration(value.endpoint, DELTA_ENDPOINTS, `${itemLabel}.endpoint`),
+            pointEstimate: finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`),
+            interval: parseInterval(value.interval, `${itemLabel}.interval`),
+            familyCount: p.integer(value.familyCount, `${itemLabel}.familyCount`),
+            resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${itemLabel}.resolution`),
+            families: p.array(value.families, `${itemLabel}.families`)
+                .map((family, familyIndex) => parseFamilyEstimate(family, `${itemLabel}.families[${familyIndex}]`)),
+        };
+    });
+}
+
+function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
+    const value = p.record(raw, label);
+    p.exact(value, [
+        "poolManifestFingerprint", "pinnedSnapshotId", "policyFingerprint", "pairedFactsFingerprint",
+        "bootstrapSeed", "bootstrapResamples", "minimumAnalyzableFamilyCount", "analyzableFamilyCount",
+        "evidenceSufficient", "endpoints", "liveRegret", "providerMixedRegret", "rawRegretRecords",
+    ], label);
+    return {
+        poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, `${label}.poolManifestFingerprint`),
+        pinnedSnapshotId: p.string(value.pinnedSnapshotId, `${label}.pinnedSnapshotId`),
+        policyFingerprint: p.hex64(value.policyFingerprint, `${label}.policyFingerprint`),
+        pairedFactsFingerprint: p.hex64(value.pairedFactsFingerprint, `${label}.pairedFactsFingerprint`),
+        bootstrapSeed: p.integer(value.bootstrapSeed, `${label}.bootstrapSeed`),
+        bootstrapResamples: p.integer(value.bootstrapResamples, `${label}.bootstrapResamples`, 1),
+        minimumAnalyzableFamilyCount: p.integer(value.minimumAnalyzableFamilyCount, `${label}.minimumAnalyzableFamilyCount`, 1),
+        analyzableFamilyCount: p.integer(value.analyzableFamilyCount, `${label}.analyzableFamilyCount`),
+        evidenceSufficient: boolean(value.evidenceSufficient, `${label}.evidenceSufficient`),
+        endpoints: parseEndpointEstimates(value.endpoints, `${label}.endpoints`),
+        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`),
+        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`),
+        rawRegretRecords: p.array(value.rawRegretRecords, `${label}.rawRegretRecords`).map((entry, index) => {
+            const itemLabel = `${label}.rawRegretRecords[${index}]`;
+            const item = p.record(entry, itemLabel);
+            p.exact(item, ["coordinateId", "familyId", "endpoint", "delta", "inferential"], itemLabel);
+            if (item.inferential !== false) p.fail(`${itemLabel}.inferential: literal-invalid`);
+            return {
+                coordinateId: p.string(item.coordinateId, `${itemLabel}.coordinateId`),
+                familyId: p.string(item.familyId, `${itemLabel}.familyId`),
+                endpoint: p.enumeration(item.endpoint, REGRET_ENDPOINTS, `${itemLabel}.endpoint`),
+                delta: finiteNumber(item.delta, `${itemLabel}.delta`),
+                inferential: false,
+            };
+        }),
+    };
+}
+
+function parseArmMetrics(raw: unknown, label: string): ArmMetrics {
+    const value = p.record(raw, label);
+    const metrics: ArmMetrics = {};
+    for (const [armId, metric] of Object.entries(value)) {
+        const arm = p.enumeration(armId, ARM_IDS, `${label}.${armId}`);
+        metrics[arm] = finiteNumber(metric, `${label}.${armId}`);
+    }
+    return metrics;
+}
+
+function parseCountRecord(raw: unknown, label: string): Record<string, number> {
+    const value = p.record(raw, label);
+    return Object.fromEntries(
+        Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`, 1)]),
+    );
+}
+
+/** Strict consumer parser: rejects unknown fields at every level and a `reportFingerprint` that does not match the body. */
+export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
+    const root = p.record(raw, "report");
+    p.exact(root, ["schema", "body", "reportFingerprint"], "report");
+    if (root.schema !== PAIRED_DELTA_REPORT_SCHEMA) p.fail("report.schema: version-invalid");
+    const value = p.record(root.body, "report.body");
+    p.exact(value, [
+        "limitations", "poolManifestFingerprint", "pinnedSnapshotId", "policyFingerprint", "implementationDigest",
+        "analysis", "exclusions", "secondaryMetrics", "regret", "runSummary",
+    ], "report.body");
+    const secondary = p.record(value.secondaryMetrics, "report.body.secondaryMetrics");
+    p.exact(secondary, ["invalidSuccessRateByArm", "finalAttemptTokensByArm", "finalAttemptWallClockMsByArm", "finalAttemptTurnsByArm"], "report.body.secondaryMetrics");
+    const regret = p.record(value.regret, "report.body.regret");
+    p.exact(regret, ["live", "providerMixed", "raw"], "report.body.regret");
+    const summary = p.record(value.runSummary, "report.body.runSummary");
+    p.exact(summary, [
+        "status", "spentUsd", "observedCostRollouts", "estimatedCostRollouts", "refusedRegretLadders",
+        "plannedCoordinates", "healthyCoordinates", "evidenceComplete", "calibrationFingerprint",
+    ], "report.body.runSummary");
+    const body: PairedDeltaReportBody = {
+        limitations: p.array(value.limitations, "report.body.limitations")
+            .map((line, index) => p.string(line, `report.body.limitations[${index}]`)),
+        poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, "report.body.poolManifestFingerprint"),
+        pinnedSnapshotId: p.string(value.pinnedSnapshotId, "report.body.pinnedSnapshotId"),
+        policyFingerprint: p.hex64(value.policyFingerprint, "report.body.policyFingerprint"),
+        implementationDigest: p.string(value.implementationDigest, "report.body.implementationDigest"),
+        analysis: parseAnalysis(value.analysis, "report.body.analysis"),
+        exclusions: p.array(value.exclusions, "report.body.exclusions").map((entry, index) => {
+            const label = `report.body.exclusions[${index}]`;
+            const item = p.record(entry, label);
+            p.exact(item, ["armId", "reasonCode", "count"], label);
+            return {
+                armId: p.enumeration(item.armId, ARM_IDS, `${label}.armId`),
+                reasonCode: p.enumeration(item.reasonCode, REASON_CODES, `${label}.reasonCode`),
+                count: p.integer(item.count, `${label}.count`, 1),
+            };
+        }),
+        secondaryMetrics: {
+            invalidSuccessRateByArm: parseArmMetrics(secondary.invalidSuccessRateByArm, "report.body.secondaryMetrics.invalidSuccessRateByArm"),
+            finalAttemptTokensByArm: parseArmMetrics(secondary.finalAttemptTokensByArm, "report.body.secondaryMetrics.finalAttemptTokensByArm"),
+            finalAttemptWallClockMsByArm: parseArmMetrics(secondary.finalAttemptWallClockMsByArm, "report.body.secondaryMetrics.finalAttemptWallClockMsByArm"),
+            finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm"),
+        },
+        regret: {
+            live: parseEndpointEstimates(regret.live, "report.body.regret.live"),
+            providerMixed: parseEndpointEstimates(regret.providerMixed, "report.body.regret.providerMixed"),
+            raw: p.array(regret.raw, "report.body.regret.raw").map((entry, index) => {
+                const label = `report.body.regret.raw[${index}]`;
+                const item = p.record(entry, label);
+                p.exact(item, ["coordinateId", "familyId", "retrieval", "formation", "representation", "label"], label);
+                if (item.label !== "raw-non-inferential") p.fail(`${label}.label: literal-invalid`);
+                const rung = (field: "retrieval" | "formation" | "representation"): number | null =>
+                    item[field] === null ? null : finiteNumber(item[field], `${label}.${field}`);
+                return {
+                    coordinateId: p.string(item.coordinateId, `${label}.coordinateId`),
+                    familyId: p.string(item.familyId, `${label}.familyId`),
+                    retrieval: rung("retrieval"),
+                    formation: rung("formation"),
+                    representation: rung("representation"),
+                    label: "raw-non-inferential",
+                };
+            }),
+        },
+        runSummary: {
+            status: p.enumeration(summary.status, RUN_STATUSES, "report.body.runSummary.status"),
+            spentUsd: finiteNumber(summary.spentUsd, "report.body.runSummary.spentUsd"),
+            observedCostRollouts: p.integer(summary.observedCostRollouts, "report.body.runSummary.observedCostRollouts"),
+            estimatedCostRollouts: p.integer(summary.estimatedCostRollouts, "report.body.runSummary.estimatedCostRollouts"),
+            refusedRegretLadders: parseCountRecord(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
+            plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates"),
+            healthyCoordinates: p.integer(summary.healthyCoordinates, "report.body.runSummary.healthyCoordinates"),
+            evidenceComplete: boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
+            calibrationFingerprint: summary.calibrationFingerprint === null
+                ? null
+                : p.hex64(summary.calibrationFingerprint, "report.body.runSummary.calibrationFingerprint"),
+        },
+    };
+    const reportFingerprint = p.hex64(root.reportFingerprint, "report.reportFingerprint");
+    if (canonicalFingerprint(body) !== reportFingerprint) p.fail("report.reportFingerprint: fingerprint-mismatch");
+    return { schema: PAIRED_DELTA_REPORT_SCHEMA, body, reportFingerprint };
 }
 
 export function publishPairedDeltaReport(report: PairedDeltaReport, path: string): void {

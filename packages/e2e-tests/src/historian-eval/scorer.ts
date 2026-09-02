@@ -24,6 +24,7 @@ import { resolveProjectIdsForIdentities } from "../../../plugin/src/features/mag
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { makeContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
 import {
     containsCompleteValue,
@@ -1796,6 +1797,127 @@ export function buildLaneReport(
         },
         red: sorted.some((score) => score.verdict !== "PASS"),
         runFatal: scored.some((score) => score.failReasons.includes("false-authoritative")),
+    };
+}
+
+export class HistorianReportError extends Error {
+    readonly diagnostics: readonly string[];
+
+    constructor(diagnostics: readonly string[]) {
+        super(diagnostics.join("; "));
+        this.name = "HistorianReportError";
+        this.diagnostics = diagnostics;
+    }
+}
+
+const p = makeContractPrimitives(HistorianReportError);
+
+function parseRatio(value: unknown, label: string): number | null {
+    if (value === null) return null;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) p.fail(`${label}: ratio-invalid`);
+    return value as number;
+}
+
+function parseText(value: unknown, label: string): string {
+    if (typeof value !== "string") p.fail(`${label}: string-invalid`);
+    return value as string;
+}
+
+function parseNullableText(value: unknown, label: string): string | null {
+    return value === null ? null : parseText(value, label);
+}
+
+function parseBoolean(value: unknown, label: string): boolean {
+    if (typeof value !== "boolean") p.fail(`${label}: boolean-invalid`);
+    return value as boolean;
+}
+
+function parseCountRecord(raw: unknown, label: string): Record<string, number> {
+    const value = p.record(raw, label);
+    return Object.fromEntries(Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`)]));
+}
+
+function parseSystemTuple(raw: unknown, label: string): SystemVersionTuple | null {
+    if (raw === null) return null;
+    const value = p.record(raw, label);
+    p.exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "historianModelId", "probeModelId", "parserImpl", "chunkTokenBudget"], label);
+    if (value.parserImpl !== "ts") p.fail(`${label}.parserImpl: enum-invalid`);
+    return {
+        repoCommitSha: p.string(value.repoCommitSha, `${label}.repoCommitSha`),
+        bunVersion: p.string(value.bunVersion, `${label}.bunVersion`),
+        opencodeVersion: p.string(value.opencodeVersion, `${label}.opencodeVersion`),
+        historianModelId: p.string(value.historianModelId, `${label}.historianModelId`),
+        probeModelId: p.string(value.probeModelId, `${label}.probeModelId`),
+        parserImpl: "ts",
+        chunkTokenBudget: value.chunkTokenBudget === null ? null : p.integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
+    };
+}
+
+export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
+    const value = p.record(raw, label);
+    p.exact(value, [
+        "scenarioId", "verdict", "failReasons", "errorReason", "errorDetail", "precision", "recall",
+        "expectedClaimsMatched", "expectedClaimsTotal", "visibleClaimsMatched", "visibleClaimsTotal",
+        "falseAuthoritativeMatches", "structuralFindings", "probeVerdicts", "system", "source",
+    ], label);
+    const stringArray = (field: "falseAuthoritativeMatches" | "structuralFindings"): string[] =>
+        p.array(value[field], `${label}.${field}`).map((entry, index) => parseText(entry, `${label}.${field}[${index}]`));
+    return {
+        scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
+        verdict: p.enumeration(value.verdict, ["PASS", "FAIL", "ERROR"] as const, `${label}.verdict`),
+        failReasons: p.array(value.failReasons, `${label}.failReasons`)
+            .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`)),
+        errorReason: parseNullableText(value.errorReason, `${label}.errorReason`),
+        errorDetail: parseNullableText(value.errorDetail, `${label}.errorDetail`),
+        precision: parseRatio(value.precision, `${label}.precision`),
+        recall: parseRatio(value.recall, `${label}.recall`),
+        expectedClaimsMatched: p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`),
+        expectedClaimsTotal: p.integer(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`),
+        visibleClaimsMatched: p.integer(value.visibleClaimsMatched, `${label}.visibleClaimsMatched`),
+        visibleClaimsTotal: p.integer(value.visibleClaimsTotal, `${label}.visibleClaimsTotal`),
+        falseAuthoritativeMatches: stringArray("falseAuthoritativeMatches"),
+        structuralFindings: stringArray("structuralFindings"),
+        probeVerdicts: p.array(value.probeVerdicts, `${label}.probeVerdicts`).map((entry, index) => {
+            const probeLabel = `${label}.probeVerdicts[${index}]`;
+            const probe = p.record(entry, probeLabel);
+            p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
+            return {
+                probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
+                outcome: p.enumeration(probe.outcome, ["pass", "fail", "error-trimmed"] as const, `${probeLabel}.outcome`),
+                expected: parseText(probe.expected, `${probeLabel}.expected`),
+                actual: parseNullableText(probe.actual, `${probeLabel}.actual`),
+            };
+        }),
+        system: parseSystemTuple(value.system, `${label}.system`),
+        source: p.enumeration(value.source, ["run-record", "raw-output"] as const, `${label}.source`),
+    };
+}
+
+/** Strict consumer parser for an archived lane report: exact keys at every level and closed verdict and fail-reason vocabularies. */
+export function parseLaneReport(raw: unknown): LaneReport {
+    const root = p.record(raw, "report");
+    p.exact(root, ["schema", "releaseVersion", "system", "scenarios", "aggregate", "red", "runFatal"], "report");
+    if (root.schema !== LANE_REPORT_SCHEMA) p.fail("report.schema: version-invalid");
+    const aggregate = p.record(root.aggregate, "report.aggregate");
+    p.exact(aggregate, ["total", "scored", "errors", "errorCountsByReason", "failCountsByReason", "precision", "recall", "falseAuthoritativeRate"], "report.aggregate");
+    return {
+        schema: LANE_REPORT_SCHEMA,
+        releaseVersion: parseNullableText(root.releaseVersion, "report.releaseVersion"),
+        system: parseSystemTuple(root.system, "report.system"),
+        scenarios: p.array(root.scenarios, "report.scenarios")
+            .map((entry, index) => parseScenarioScore(entry, `report.scenarios[${index}]`)),
+        aggregate: {
+            total: p.integer(aggregate.total, "report.aggregate.total"),
+            scored: p.integer(aggregate.scored, "report.aggregate.scored"),
+            errors: p.integer(aggregate.errors, "report.aggregate.errors"),
+            errorCountsByReason: parseCountRecord(aggregate.errorCountsByReason, "report.aggregate.errorCountsByReason"),
+            failCountsByReason: parseCountRecord(aggregate.failCountsByReason, "report.aggregate.failCountsByReason"),
+            precision: parseRatio(aggregate.precision, "report.aggregate.precision"),
+            recall: parseRatio(aggregate.recall, "report.aggregate.recall"),
+            falseAuthoritativeRate: parseRatio(aggregate.falseAuthoritativeRate, "report.aggregate.falseAuthoritativeRate"),
+        },
+        red: parseBoolean(root.red, "report.red"),
+        runFatal: parseBoolean(root.runFatal, "report.runFatal"),
     };
 }
 
