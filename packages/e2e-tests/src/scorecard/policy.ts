@@ -330,9 +330,15 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
         .map((slot, index) => enumeration(slot, UTILITY_SLOT_IDS, `policy.secondaryMetricSlots[${index}]`));
     const requiredMetricSlots = idArray(root.requiredMetricSlots, "policy.requiredMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `policy.requiredMetricSlots[${index}]`));
+    const primaryEndpoint = enumeration(root.primaryEndpoint, PRIMARY_ENDPOINTS, "policy.primaryEndpoint");
+    // Promotion reads the primary endpoint's delta, so a policy that does not require that slot
+    // pre-registers a decision on a metric the evidence is allowed to omit.
+    if (!requiredMetricSlots.includes(PRIMARY_ENDPOINT_SLOTS[primaryEndpoint])) {
+        fail("policy.requiredMetricSlots: primary-endpoint-slot-required");
+    }
     return {
         schema: SCORECARD_POLICY_SCHEMA,
-        primaryEndpoint: enumeration(root.primaryEndpoint, PRIMARY_ENDPOINTS, "policy.primaryEndpoint"),
+        primaryEndpoint,
         secondaryMetricSlots,
         gates: exactIdSequence(root.gates, SCORECARD_GATE_IDS, "policy.gates", "exact-gate-set-required"),
         injectionCanaryScenarioIds: canaryIds,

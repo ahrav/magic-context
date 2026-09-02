@@ -9,12 +9,15 @@ import { validateFreezePolicies } from "../prospective-holdout/freeze";
 import { freezeManifest, readyPolicies } from "../prospective-holdout/test-fixtures";
 import {
     METRIC_SLOT_IDS,
+    PRIMARY_ENDPOINT_SLOTS,
     SCORECARD_GATE_IDS,
     SCORECARD_POLICY_OWNER,
     SCORECARD_POLICY_SCHEMA,
     ScorecardContractError,
     parseScorecardPolicy,
     scorecardPolicyFingerprint,
+    type MetricSlotId,
+    type ScorecardPolicy,
 } from "./policy";
 import { PAIRED_DELTA_POLICY_FP, policyDocumentFixture, policyFixture, requiredLanesWith } from "./test-fixtures";
 
@@ -89,6 +92,19 @@ describe("parseScorecardPolicy", () => {
         expectRejects(policyFixture({ requiredMetricSlots: ["headline-score" as never] }), "policy.requiredMetricSlots[0]: enum-invalid");
         expectRejects(policyFixture({ secondaryMetricSlots: ["recall-at-10-explicit" as never] }), "policy.secondaryMetricSlots[0]: enum-invalid");
         expect(new Set(METRIC_SLOT_IDS).size).toBe(METRIC_SLOT_IDS.length);
+    });
+
+    it("requires the primary endpoint's own delta slot", () => {
+        const pairs = Object.entries(PRIMARY_ENDPOINT_SLOTS) as [ScorecardPolicy["primaryEndpoint"], MetricSlotId][];
+        for (const [primaryEndpoint, slot] of pairs) {
+            const other = METRIC_SLOT_IDS.find((id) => id !== slot)!;
+            expectRejects(
+                policyFixture({ primaryEndpoint, requiredMetricSlots: [other] }),
+                "policy.requiredMetricSlots: primary-endpoint-slot-required",
+            );
+            expect(parseScorecardPolicy(policyFixture({ primaryEndpoint, requiredMetricSlots: [slot] })).primaryEndpoint)
+                .toBe(primaryEndpoint);
+        }
     });
 
     it("requires a hex64 paired-delta binding and allows a null baseline", () => {
