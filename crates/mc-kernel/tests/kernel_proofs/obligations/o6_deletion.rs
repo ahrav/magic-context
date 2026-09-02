@@ -158,6 +158,12 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
             assert_eq!(payload["audit"]["barrier_id"], result.barrier_id);
             assert_eq!(payload["audit"]["target_class"], *kind);
             assert_eq!(payload["audit"]["digest"], handle.digest);
+            // Without the ids, a consumer cannot tell what to invalidate.
+            assert_eq!(
+                payload["audit"]["affected_object_ids"],
+                serde_json::json!(result.affected_object_ids),
+                "{kind} payload lost the affected object ids"
+            );
         }
         let barrier = proof.store().deletion_barrier(&result.barrier_id).unwrap();
         assert_eq!(barrier.deletion_commit_seq, result.commit_seq);

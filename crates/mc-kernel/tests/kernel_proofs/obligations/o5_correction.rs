@@ -25,6 +25,32 @@ fn snapshots(proof: &Proof) -> BTreeMap<i64, Vec<ObjectRow>> {
         .collect()
 }
 
+/// `invalidated_commit_seq` and `superseded_by` are excluded: a correction
+/// legally stamps both on its predecessor.
+fn content(proof: &Proof, kind: Kind) -> BTreeMap<String, String> {
+    let sql = match kind {
+        Kind::Domain => {
+            "SELECT object_id,
+                    domain_id||'|'||name||'|'||created_commit_seq||'|'||sensitivity_class
+             FROM domains ORDER BY object_id"
+        }
+        Kind::Decision => {
+            "SELECT object_id,
+                    decision_id||'|'||decision_kind||'|'||CAST(decision_payload AS TEXT)
+                    ||'|'||created_commit_seq||'|'||sensitivity_class
+             FROM decisions ORDER BY object_id"
+        }
+    };
+    proof
+        .db()
+        .prepare(sql)
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 fn correct(proof: &mut Proof, kind: Kind, old: &str, index: usize) -> String {
     let key = format!("correct-{old}-{index}");
     let (new_id, receipt) = match kind {
@@ -84,10 +110,11 @@ fn run_chain(kind: Kind, length: usize) {
     let mut invalidated_at: BTreeMap<String, i64> = BTreeMap::new();
     for step in 0..length {
         let frozen = snapshots(&proof);
+        let frozen_content = content(&proof, kind);
         let old = chain.last().unwrap().clone();
         let new = correct(&mut proof, kind, &old, step + 2);
         invalidated_at.insert(old.clone(), proof.tip());
-        chain.push(new);
+        chain.push(new.clone());
         // Every snapshot that existed before the correction is unchanged.
         for (seq, before) in &frozen {
             assert_eq!(
@@ -96,6 +123,17 @@ fn run_chain(kind: Kind, length: usize) {
                 "snapshot {seq}"
             );
         }
+        let after = content(&proof, kind);
+        for (id, before) in &frozen_content {
+            assert_eq!(
+                after.get(id),
+                Some(before),
+                "correction rewrote the typed content of {id}"
+            );
+        }
+        // Positive control.
+        assert!(after.contains_key(&new), "{new} has no typed row");
+        assert_eq!(after.len(), frozen_content.len() + 1);
     }
     let tip = proof.tip();
     let history = proof.store().object_history_as_of(tip).unwrap();
@@ -123,6 +161,7 @@ fn run_chain(kind: Kind, length: usize) {
 
     // A faulted correction changes neither history nor any snapshot.
     let frozen = snapshots(&proof);
+    let frozen_content = content(&proof, kind);
     let head = chain.last().unwrap().clone();
     let fault_index = length + 100;
     match kind {
@@ -136,6 +175,7 @@ fn run_chain(kind: Kind, length: usize) {
         }),
     }
     assert_eq!(snapshots(&proof), frozen);
+    assert_eq!(content(&proof, kind), frozen_content);
     assert_eq!(
         proof.store().object_history_as_of(tip).unwrap().objects,
         history.objects

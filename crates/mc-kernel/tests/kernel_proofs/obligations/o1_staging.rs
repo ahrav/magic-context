@@ -154,19 +154,20 @@ fn canonical_object_without_an_admission_decision_stays_off_automatic_surfaces()
     let known = proof.store().known_as_of(tip).unwrap();
     assert!(known.objects.iter().any(|row| row.object_id == "object-1"));
     for surface in [Surface::AutoInject, Surface::AutoSearch] {
-        let ids = proof
-            .store()
-            .visible_as_of(surface, tip)
-            .unwrap()
-            .rows
-            .into_iter()
-            .filter(|row| row.visibility == SurfaceVisibility::Visible)
-            .map(|row| row.object.object_id)
+        // `visible_as_of` excludes `Hidden` rows.
+        let rows = proof.store().visible_as_of(surface, tip).unwrap().rows;
+        let served = rows
+            .iter()
+            .map(|row| (row.object.object_id.as_str(), row.visibility))
             .collect::<Vec<_>>();
-        assert!(ids.contains(&admitted_id), "{surface:?}: {ids:?}");
         assert!(
-            !ids.contains(&"object-1".to_string()),
-            "{surface:?}: {ids:?}"
+            !rows.iter().any(|row| row.object.object_id == "object-1"),
+            "{surface:?} served the object with no admission decision: {served:?}"
         );
+        let admitted_row = rows
+            .iter()
+            .find(|row| row.object.object_id == admitted_id)
+            .unwrap_or_else(|| panic!("admitted object missing on {surface:?}: {served:?}"));
+        assert_eq!(admitted_row.visibility, SurfaceVisibility::Visible);
     }
 }
