@@ -24,6 +24,8 @@ export interface ScriptedToolCall {
     publishedToolName: string;
     /** `resultText` contains the provider-visible `tool_result` text. */
     resultText: string;
+    /** The final assistant message of the scripted prompt, or null when the response carried no readable id. Its `parentID` in the session ledger names the user message every fixture-served row of this turn descends from. */
+    assistantMessageId: string | null;
 }
 
 interface WireContentBlock {
@@ -113,7 +115,9 @@ export async function runScriptedToolCall(
         text: options.followUpText ?? "scripted tool follow-up",
         usage,
     });
-    await harness.sendPrompt(sessionId, options.prompt);
+    const response = await harness.sendPrompt(sessionId, options.prompt);
+    const assistantMessageId = ((response as { data?: { info?: { id?: unknown } } } | null)
+        ?.data?.info?.id);
     if (published === null) {
         const visible = [
             ...new Set(
@@ -143,5 +147,8 @@ export async function runScriptedToolCall(
     return {
         publishedToolName: published,
         resultText,
+        assistantMessageId: typeof assistantMessageId === "string" && assistantMessageId !== ""
+            ? assistantMessageId
+            : null,
     };
 }

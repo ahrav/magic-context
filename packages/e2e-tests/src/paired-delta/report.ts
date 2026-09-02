@@ -611,6 +611,9 @@ function reachableVariances(n: number, spread: number): number[] {
 /** `{-1, 0, 1}` deltas cannot range wider than 2. */
 const MAX_ENDPOINT_SPREAD = 2;
 
+/** Observations per series a reader will enumerate over. At `replicateCount: 3` a family of five scenarios yields 15; the weekly cost budget cannot reach a small fraction of this. */
+const MAX_CALIBRATION_OBSERVATIONS = 1_024;
+
 /** Relative slack for the writer's floating-point variance — it sums squared deviations from a rounded mean and can land one ulp off the closed form — and far below the gap between any two reachable variances, which is at least `1/(n(n-1))`. commentlint: allow(JUDGE) */
 const VARIANCE_TOLERANCE = 1e-9;
 
@@ -673,6 +676,10 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
     if (measured.some((noise) =>
         !Number.isSafeInteger(noise.observationCount) || noise.observationCount > maxObservations)) {
         throw new Error("paired-delta-calibration: observation-count-exceeds-depth");
+    }
+    /** The depth sum is the record's own claim, so it bounds nothing on its own; a fixed ceiling does. `reachableVariances` visits `n²/2` count pairs, and at the ceiling that is about half a million, well inside a preflight's budget and two orders of magnitude above any pilot this lane can afford. commentlint: allow(JUDGE) */
+    if (measured.some((noise) => noise.observationCount > MAX_CALIBRATION_OBSERVATIONS)) {
+        throw new Error("paired-delta-calibration: observation-count-exceeds-ceiling");
     }
     const families = new Set(measured.map(({ familyId }) => familyId));
     /**

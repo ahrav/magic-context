@@ -40,6 +40,15 @@ export async function scriptedCtxSearchTurn(
     sessionId: string,
     idsOrQuery: readonly GoldMemoryId[] | string,
 ): Promise<string> {
+    return (await scriptedCtxSearchTurnDetailed(harness, sessionId, idsOrQuery)).text;
+}
+
+/** The wire text plus the assistant message that closed the turn, for a caller that reconciles the fixture-served ledger rows against this exact turn rather than counting them. */
+export async function scriptedCtxSearchTurnDetailed(
+    harness: TestHarness,
+    sessionId: string,
+    idsOrQuery: readonly GoldMemoryId[] | string,
+): Promise<{ text: string; assistantMessageId: string | null }> {
     const query =
         typeof idsOrQuery === "string" ? idsOrQuery : locatorQuery(idsOrQuery);
     const call = await runScriptedToolCall(harness, sessionId, {
@@ -48,5 +57,5 @@ export async function scriptedCtxSearchTurn(
         prompt: `${SCRIPTED_SEARCH_PROMPT_PREFIX}${query}`,
         followUpText: SCRIPTED_SEARCH_FOLLOW_UP,
     });
-    return call.resultText;
+    return { text: call.resultText, assistantMessageId: call.assistantMessageId };
 }

@@ -890,6 +890,20 @@ describe("paired-delta calibration reader: series integrity", () => {
         expect(performance.now() - started).toBeLessThan(1_000);
     });
 
+    it("rejects an observation count above the fixed ceiling whatever the record declares", () => {
+        // Depth and counts agree with each other, so only a ceiling the record cannot move stops the enumeration.
+        const n = 1_000_000;
+        const inflated = build3();
+        const started = performance.now();
+
+        expect(() => readCalibrationRecord(rewrite({
+            decisions: { ...inflated.decisions, replicateCount: n },
+            scenarioDepth: { "var-a": n },
+            familyNoise: inflated.familyNoise.map((noise) => ({ ...noise, observationCount: n })),
+        }))).toThrow(/observation-count-exceeds-ceiling/);
+        expect(performance.now() - started).toBeLessThan(1_000);
+    });
+
     it("rejects a scenario depth above the declared replicate count", () => {
         // Inflating depth and series counts together clears the family-sum cross-check.
         const inflated = build3();

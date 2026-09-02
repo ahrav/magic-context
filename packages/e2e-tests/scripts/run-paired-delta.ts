@@ -19,7 +19,7 @@ import {
     mcOffOptions,
     naiveCompactionOptions,
 } from "../src/oracle-arms/presets";
-import { scriptedCtxSearchTurn } from "../src/oracle-arms/scripted-ctx-search";
+import { scriptedCtxSearchTurnDetailed } from "../src/oracle-arms/scripted-ctx-search";
 import {
     seedGoldMemories,
     type GoldMemoryRow,
@@ -355,10 +355,12 @@ function installedDependencyParts(): Uint8Array[] {
                 parts.push(fileDigestParts(file));
             }
         } catch (error) {
-            parts.push(Buffer.from(
-                `<unresolved>${error instanceof Error ? error.message : "unknown"}`,
-                "utf8",
-            ));
+            /** Thrown, not folded into the digest: a stable error string would leave both bindings unchanged while a linked package's bytes moved. A live run that cannot name what it loads cannot bind to it. commentlint: allow(JUDGE) */
+            throw new Error(
+                `paired-delta cannot digest the installed ${specifier}: ` +
+                `${error instanceof Error ? error.message : String(error)}`,
+                { cause: error },
+            );
         }
     }
     return parts;
@@ -377,13 +379,19 @@ const MEASUREMENT_RUNTIME_MODULES: readonly { specifier: string; importedFrom: (
     { specifier: "@opencode-ai/plugin", importedFrom: () => dirname(pluginEntryPath()) },
 ];
 
-/** Walks up from the resolved entry to the directory named `node_modules/<specifier>`, which is the installed package's root regardless of the entry's depth within it. `Bun.resolveSync` returns the real path, so a `bun link`-ed or `file:` package whose realpath is outside any `node_modules` throws here and fails every live mode; the smoke lane never digests, so that failure is install-specific even though it looks mode-specific. commentlint: allow(JUDGE) */
+/** Walks up from the resolved entry to the nearest directory whose `package.json` names the specifier. `Bun.resolveSync` returns the real path, so a `bun link`-ed or `file:` package sits outside any `node_modules`; matching the manifest name rather than the path finds its root too, and the whole tree is then hashed like an ordinary install. commentlint: allow(JUDGE) */
 function installedPackageRoot(entry: string, specifier: string): string {
-    const suffix = join("node_modules", ...specifier.split("/"));
     for (let directory = dirname(entry); directory !== dirname(directory); directory = dirname(directory)) {
-        if (directory.endsWith(sep + suffix)) return directory;
+        const manifest = join(directory, "package.json");
+        if (!existsSync(manifest)) continue;
+        try {
+            const { name } = JSON.parse(readFileSync(manifest, "utf8")) as { name?: unknown };
+            if (name === specifier) return directory;
+        } catch {
+            /** A manifest that does not parse is not this package's; keep walking. */
+        }
     }
-    throw new Error(`installed package root for ${specifier} not found above ${entry}`);
+    throw new Error(`no package.json naming ${specifier} above ${entry}`);
 }
 
 /**
@@ -877,6 +885,8 @@ interface SessionUsage {
     offPinRoute: { providerId: string; modelId: string } | null;
     /** Fixture-served assistant entries seen. R1 schedules exactly `SCRIPTED_ORACLE_MOCK_ENTRIES`; a shortfall is a scripted turn that did not land, and the ledger is not an R1 ledger. */
     mockEntries: number;
+    /** `{ id, parentID }` of every fixture-served assistant entry, so the caller can tie each one to the scripted turn rather than count them: a missing scripted row and a stray live child on the fixture cancel in a count. */
+    mockRows: { id: string; parentId: string | null }[];
     /** Ids of every priced assistant entry, so the caller can check that each response it was handed is in the ledger it is charging from. */
     messageIds: Set<string>;
 }
@@ -885,6 +895,28 @@ const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
 
 /** `scriptedCtxSearchTurn` drives one tool-use response and one follow-up, both served by the fixture provider. */
 const SCRIPTED_ORACLE_MOCK_ENTRIES = 2;
+
+/**
+ * Whether the fixture-served ledger rows are exactly the scripted turn's.
+ *
+ * Both rows of the scripted turn descend from the one user message that turn sent, so they share the
+ * closing assistant message's `parentID`. Requiring every fixture row to carry that parent, and
+ * exactly the scheduled number of them, ties the rows to the turn: a count alone lets a missing
+ * scripted row and a stray live child that routed to the fixture cancel out. An arm without a
+ * scripted turn must have no fixture rows at all. commentlint: allow(JUDGE)
+ */
+function scriptedRowsMatch(
+    mockRows: SessionUsage["mockRows"],
+    scriptedTurnText: string | undefined,
+    scriptedAssistantMessageId: string | null,
+): boolean {
+    if (scriptedTurnText === undefined) return mockRows.length === 0;
+    if (scriptedAssistantMessageId === null) return false;
+    const closing = mockRows.find(({ id }) => id === scriptedAssistantMessageId);
+    if (closing === undefined || closing.parentId === null) return false;
+    return mockRows.length === SCRIPTED_ORACLE_MOCK_ENTRIES &&
+        mockRows.every(({ parentId }) => parentId === closing.parentId);
+}
 
 /** Bounds the quiescence wait. Generous enough for a historian retry to land, short enough that a stuck session fails rather than holding the run. */
 const LEDGER_SETTLE_ATTEMPTS = 12;
@@ -909,16 +941,22 @@ function addUsage(
     left: RolloutObservation["usage"],
     right: RolloutObservation["usage"],
 ): RolloutObservation["usage"] {
-    return {
+    const sum = {
         input: left.input + right.input,
         output: left.output + right.output,
         cacheCreation: left.cacheCreation + right.cacheCreation,
         cacheRead: left.cacheRead + right.cacheRead,
     };
+    /** Each row is a safe integer; their sum need not be. An unsafe aggregate would be nulled downstream and priced from the estimate with the cell still completed, so it is a ledger the rollout cannot be priced from. commentlint: allow(JUDGE) */
+    if (!Object.values(sum).every((count) => Number.isSafeInteger(count))) {
+        throw new Error("live paired-delta session ledger totals exceed the safe integer range");
+    }
+    return sum;
 }
 
 interface LedgerMessage {
     id?: unknown;
+    parentID?: unknown;
     role?: unknown;
     providerID?: unknown;
     modelID?: unknown;
@@ -1111,6 +1149,7 @@ async function sessionUsage(
     let usage = ZERO_USAGE;
     let offPinRoute: SessionUsage["offPinRoute"] = null;
     let mockEntries = 0;
+    const mockRows: SessionUsage["mockRows"] = [];
     const messageIds = new Set<string>();
     let frontier = [sessionId];
     const seen = new Set<string>();
@@ -1165,6 +1204,10 @@ async function sessionUsage(
              */
             if (route.providerId === "mock-anthropic") {
                 mockEntries += 1;
+                mockRows.push({
+                    id: info.id,
+                    parentId: typeof info.parentID === "string" ? info.parentID : null,
+                });
                 /** Counted rather than allowed by arm: an extra fixture-served entry — a historian or compaction call that routed to the mock — is an identity failure even on R1. */
                 if (mockEntries > expectedMockEntries && offPinRoute === null) {
                     offPinRoute = route;
@@ -1196,7 +1239,7 @@ async function sessionUsage(
         }
         }
     }
-    return { usage, offPinRoute, mockEntries, messageIds };
+    return { usage, offPinRoute, mockEntries, mockRows, messageIds };
 }
 
 /**
@@ -1323,6 +1366,8 @@ export function createLiveDependencies(input: {
             let harness = await TestHarness.create(harnessOptions);
             let seeded: ReturnType<typeof seedGoldMemories> = [];
             let scriptedTurnText: string | undefined;
+            /** The assistant message that closed the scripted turn; its ledger `parentID` identifies the fixture-served rows that belong to it. */
+            let scriptedAssistantMessageId: string | null = null;
             /** Captured so the failure path can price the session the rollout was using. */
             let activeSessionId: string | undefined;
             /** Set by the failure read. The runner's deadline rejects a race, not the rollout, so without this the turn loop would keep issuing paid prompts after the failed record was priced. */
@@ -1440,11 +1485,13 @@ export function createLiveDependencies(input: {
                             coordinate.armId === "r1" &&
                             turn.id === scenario.interventions.r1.insertAfterTurnId
                         ) {
-                            scriptedTurnText = await trackedPrompt(() => scriptedCtxSearchTurn(
+                            const scripted = await trackedPrompt(() => scriptedCtxSearchTurnDetailed(
                                 harness,
                                 sessionId,
                                 seeded,
                             ));
+                            scriptedTurnText = scripted.text;
+                            scriptedAssistantMessageId = scripted.assistantMessageId;
                         }
                     }
                     const last = responses.at(-1);
@@ -1520,9 +1567,7 @@ export function createLiveDependencies(input: {
                             scenario.modelContextLimit,
                             input.apiKey,
                         ) &&
-                        /** Exactly the scheduled fixture entries, not at most: the excess case is reported as an off-pin route above, and a shortfall means the scripted turn the arm is defined by did not reach the ledger. commentlint: allow(JUDGE) */
-                        ledger.mockEntries ===
-                            (scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES) &&
+                        scriptedRowsMatch(ledger.mockRows, scriptedTurnText, scriptedAssistantMessageId) &&
                         (
                             coordinate.armId !== "compaction" ||
                             !harness.hasContextDb()
@@ -2089,44 +2134,60 @@ async function runLive(args: CliArgs): Promise<void> {
             );
         }
     }
-    const result = await runOrReportInvalidRecords(() => runPairedDelta(
-        {
-            scenarios,
-            poolManifestFingerprint: manifestFingerprint,
-            repoCommit: `${recordsRepoCommit([
-                args.recordsPath,
-                args.reportPath,
-                args.calibrationRecordPath,
-            ])}${calibrationFingerprint === null ? "" : `-cal-${calibrationFingerprint}`}`,
-            pinnedProviderId: model.providerId,
-            pinnedSnapshotId: model.modelId,
-            replicateCount: policy.replicateCount,
-            deskCostCeilingUsd: deskCostCeilingUsd(
-                scenarios,
-                policy.pricesPerMillionTokens,
-            ),
-            maxCostUsd: args.maxCostUsd ?? policy.costBudgetUsd[mode],
-            deadlineEpochMs: Date.now() + args.deadlineMinutes * 60_000,
-            pricesPerMillionTokens: policy.pricesPerMillionTokens,
-            resume: args.resume,
-            store: new FileRolloutStore(args.recordsPath),
-        },
-        createLiveDependencies({
-            apiKey,
-            providerId: model.providerId,
-            modelId: model.modelId,
-        }),
-    ));
-    if (result === null) return;
-    /** Written before any report or calibration work, which can throw — an unwritable `--report` destination, a malformed record — and would otherwise leave the records file unmarked for the always-on cache save. commentlint: allow(JUDGE) */
-    if (result.usageUnmeasured) {
+    /**
+     * Written whenever the run leaves `runPairedDelta` by any path but a returned result.
+     *
+     * A throw after a provider call — a record publication that lost its disk or lock, a store
+     * conflict, anything the runner does not classify — leaves the records file without the paid
+     * coordinate while the always-on cache save keeps the older file, so a rerun would resume and
+     * repeat or admit calls against spend the checkpoint never restored. The marker makes that path
+     * refuse the same way an unmeasured record does. commentlint: allow(JUDGE)
+     */
+    const writeUnmeasuredMarker = (status: string, spentUsd: number | null): void => {
         writeFileSync(marker, `${JSON.stringify({
-            status: result.status,
+            status,
             recordsPath: args.recordsPath,
-            spentUsd: result.spentUsd,
+            spentUsd,
             writtenAt: new Date().toISOString(),
         }, null, 2)}\n`);
+    };
+    let result: PairedDeltaRunResult | null = null;
+    try {
+        result = await runOrReportInvalidRecords(() => runPairedDelta(
+            {
+                scenarios,
+                poolManifestFingerprint: manifestFingerprint,
+                repoCommit: `${recordsRepoCommit([
+                    args.recordsPath,
+                    args.reportPath,
+                    args.calibrationRecordPath,
+                ])}${calibrationFingerprint === null ? "" : `-cal-${calibrationFingerprint}`}`,
+                pinnedProviderId: model.providerId,
+                pinnedSnapshotId: model.modelId,
+                replicateCount: policy.replicateCount,
+                deskCostCeilingUsd: deskCostCeilingUsd(
+                    scenarios,
+                    policy.pricesPerMillionTokens,
+                ),
+                maxCostUsd: args.maxCostUsd ?? policy.costBudgetUsd[mode],
+                deadlineEpochMs: Date.now() + args.deadlineMinutes * 60_000,
+                pricesPerMillionTokens: policy.pricesPerMillionTokens,
+                resume: args.resume,
+                store: new FileRolloutStore(args.recordsPath),
+            },
+            createLiveDependencies({
+                apiKey,
+                providerId: model.providerId,
+                modelId: model.modelId,
+            }),
+        ));
+    } finally {
+        /** A returned result, even a failed one, has published every record it paid for; only an escape has not. commentlint: allow(JUDGE) */
+        if (result === null) writeUnmeasuredMarker("run-escaped", null);
     }
+    if (result === null) return;
+    /** Written before any report or calibration work, which can throw — an unwritable `--report` destination, a malformed record — and would otherwise leave the records file unmarked for the always-on cache save. commentlint: allow(JUDGE) */
+    if (result.usageUnmeasured) writeUnmeasuredMarker(result.status, result.spentUsd);
     const scenarioFamilies = new Map(
         scenarios.map(({ scenarioId, familyId }) => [scenarioId, familyId]),
     );
