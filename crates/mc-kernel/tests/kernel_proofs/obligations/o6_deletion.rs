@@ -12,6 +12,7 @@
 
 use mc_kernel::{ArtifactDeletionKind, ArtifactHandle, Sensitivity, Surface, SurfaceVisibility};
 
+use crate::canonical_state::CanonicalDigest;
 use crate::fixtures::{
     admit_request, admitted_domain, code_observation, deletion, ingest, intent, root_domain,
     staging,
@@ -131,6 +132,21 @@ fn assert_object_retained(proof: &Proof, digest: &str) {
     assert!(path.exists(), "the CAS object was unlinked: {path:?}");
 }
 
+fn assert_written_tables_unchanged(before: &CanonicalDigest, after: &CanonicalDigest, what: &str) {
+    for (table, hash) in &before.tables {
+        // The alignment projection is derived, not written by the deletion.
+        if table.starts_with("alignment_projection") {
+            continue;
+        }
+        assert_eq!(
+            after.tables.get(table),
+            Some(hash),
+            "{what} wrote to {table}"
+        );
+    }
+    assert_eq!(after.tables.len(), before.tables.len());
+}
+
 fn propagation_rows(proof: &Proof, commit_seq: i64) -> Vec<(String, serde_json::Value)> {
     proof
         .db()
@@ -225,7 +241,14 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         assert_eq!(consumer.consumer_id, "search");
         // A required checkpoint below the deletion commit would let the next checkpoint clear the barrier without consuming this deletion's work.
         assert_eq!(consumer.required_checkpoint_commit_seq, result.commit_seq);
-        assert!(consumer.checkpoint_commit_seq.is_none());
+        // A registered consumer checkpoint below the deletion commit keeps the barrier uncleared.
+        let checkpoint = consumer
+            .checkpoint_commit_seq
+            .expect("a registered consumer has a checkpoint");
+        assert!(
+            checkpoint < consumer.required_checkpoint_commit_seq,
+            "checkpoint {checkpoint} already reached the deletion commit"
+        );
         assert!(!consumer.satisfied);
         assert!(consumer.abandoned_by.is_none());
         assert!(!barrier.cleared);
@@ -240,6 +263,21 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     assert_object_retained(&proof, &handle.digest);
     assert_eq!(proof.store().rebuild_alignment().unwrap(), projection);
     assert_eq!(proof.digest(), before_restart);
+
+    // A plain repeated request takes the no-live-references branch.
+    let before_repeat = proof.digest();
+    let repeated = proof
+        .store()
+        .delete_artifact(deletion("delete", &handle.digest))
+        .unwrap();
+    assert!(repeated.already_applied);
+    assert_eq!(repeated.kind, ArtifactDeletionKind::Delete);
+    assert_eq!(repeated.digest, handle.digest);
+    assert_eq!(repeated.commit_seq, result.commit_seq);
+    assert_eq!(repeated.barrier_id, result.barrier_id);
+    assert_eq!(repeated.affected_object_ids, result.affected_object_ids);
+    assert_written_tables_unchanged(&before_repeat, &proof.digest(), "the repeated request");
+    assert_object_retained(&proof, &handle.digest);
 
     // A reingested live reference makes the repeated deletion return its
     // operation receipt rather than take the no-live-references branch.
@@ -278,20 +316,7 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         1,
         "the replay opened a second barrier"
     );
-    // A replay writes no table. The alignment projection is exempt because a
-    // rebuild may re-derive it for the reference ingested after the deletion.
-    let after_replay = proof.digest();
-    for (table, before) in &before_replay.tables {
-        if table.starts_with("alignment_projection") {
-            continue;
-        }
-        assert_eq!(
-            after_replay.tables.get(table),
-            Some(before),
-            "the replay wrote to {table}"
-        );
-    }
-    assert_eq!(after_replay.tables.len(), before_replay.tables.len());
+    assert_written_tables_unchanged(&before_replay, &proof.digest(), "the replay");
 }
 
 #[test]

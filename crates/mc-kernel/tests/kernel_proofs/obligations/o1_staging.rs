@@ -21,11 +21,7 @@ const TEXT: &str = "staged-only-text";
 /// of an unpopulated view) and none of them may mention `needle` in any
 /// rendered field.
 fn assert_absent_as_of(proof: &Proof, seq: i64, needle: &str) {
-    for surface in [
-        Surface::AutoInject,
-        Surface::AutoSearch,
-        Surface::ExplicitSearch,
-    ] {
+    for surface in Surface::ALL.iter().copied() {
         let visible = proof.store().visible_as_of(surface, seq).unwrap();
         assert!(!visible.rows.is_empty(), "{surface:?} served nothing");
         assert!(
@@ -126,11 +122,7 @@ fn staged_candidate_is_invisible_on_every_surface_until_admitted_across_restart(
     // Admission must not reach backwards into the sequence that predates it.
     assert_absent_as_of(&proof, staged_tip, CANDIDATE);
     let tip = proof.tip();
-    for surface in [
-        Surface::AutoInject,
-        Surface::AutoSearch,
-        Surface::ExplicitSearch,
-    ] {
+    for surface in Surface::ALL.iter().copied() {
         let visible = proof.store().visible_as_of(surface, tip).unwrap();
         let row = visible
             .rows
