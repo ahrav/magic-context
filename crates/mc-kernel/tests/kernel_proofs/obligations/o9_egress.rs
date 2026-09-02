@@ -3,8 +3,9 @@
 //! references) domain against a spec written independently of the code
 //! path, the spec's own monotone restriction when a reference is added, the
 //! unknown and dereferenced cases, and the admission surface hiding
-//! sensitive rows on remote-capable surfaces. A daemon gate that turns these
-//! decisions into refused requests is a separate surface with its own row.
+//! sensitive rows on remote-capable surfaces and secret rows everywhere. commentlint: allow(JUDGE)
+//! A daemon gate that turns these decisions into refused requests is a commentlint: allow(JUDGE)
+//! separate surface with its own row. commentlint: allow(JUDGE)
 
 use mc_kernel::{
     ArtifactDestination, ArtifactEligibility, ArtifactHandle, EligibilityDeniedReason, EventKind,
@@ -232,9 +233,13 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
         envelope.insert_domain(root_domain())?;
         Ok(String::new())
     });
-    // Two subjects admitted by the same observed-code event differ only in
-    // stored sensitivity, so any surface difference is the sensitivity gate.
-    for (index, sensitivity) in [(1, Sensitivity::Normal), (2, Sensitivity::Sensitive)] {
+    // Three subjects admitted by the same observed-code event differ only in
+    // stored sensitivity, so any surface difference is the sensitivity gate. commentlint: allow(JUDGE)
+    for (index, sensitivity) in [
+        (1, Sensitivity::Normal),
+        (2, Sensitivity::Sensitive),
+        (3, Sensitivity::Secret),
+    ] {
         let mut spec = domain(index);
         spec.sensitivity = sensitivity;
         let object_id = spec.object_id.clone();
@@ -253,6 +258,15 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
     }
     proof.restart();
     let tip = proof.tip();
+    // An absent row is also what a never-admitted object yields, so the
+    // hidden subjects must be known at the tip for `None` to mean hidden.
+    let known = proof.store().known_as_of(tip).unwrap();
+    for object_id in ["object-2", "object-3"] {
+        assert!(
+            known.objects.iter().any(|row| row.object_id == object_id),
+            "positive control: {object_id} is known at the tip"
+        );
+    }
     let visibility = |surface: Surface, object_id: &str| {
         proof
             .store()
@@ -272,6 +286,11 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
             visibility(surface, "object-1"),
             Some(SurfaceVisibility::Visible),
             "normal subject on {surface:?}"
+        );
+        assert_eq!(
+            visibility(surface, "object-3"),
+            None,
+            "secret subject on {surface:?}"
         );
     }
     assert_eq!(visibility(Surface::AutoInject, "object-2"), None);

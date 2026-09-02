@@ -10,38 +10,61 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
-use mc_kernel::{BackupRequest, RestoreFault, Sensitivity};
+use mc_kernel::schema::KERNEL_SCHEMA_COMPONENT_NAMES;
+use mc_kernel::{
+    ArtifactDeletionKind, BackupRequest, ConsumerAbandonment, DecisionEventPayload,
+    DecisionEventSpec, RestoreFault, ScopeSpec, ScopeTermSpec, Sensitivity,
+};
 
 use crate::fixtures::{
     admit_request, admitted_domain, code_observation, decision, deletion, domain, ingest, intent,
-    observation, root_domain, staging,
+    observation, root_domain, staging, DOMAIN,
 };
 use crate::harness::Proof;
 
-/// Tables the seed must populate so the digest comparison is not vacuous
-/// over empty tables.
-const SEEDED_TABLES: [&str; 20] = [
-    "commit_log",
-    "change_event",
-    "outbox",
-    "outbox_publication",
-    "operation_receipts",
-    "outbox_consumers",
-    "deletion_backfill_barriers",
-    "deletion_backfill_barrier_consumers",
-    "object_registry",
-    "domains",
-    "evidence_meta",
-    "extraction_runs",
-    "candidates",
-    "admission_decisions",
-    "decisions",
-    "observations",
-    "observation_dependencies",
-    "alignment_projection",
-    "alignment_projection_state",
-    "capture_pins",
+/// Declared tables `assert_seeded` skips: the seed leaves them empty. commentlint: allow(JUDGE)
+/// The first eight have no public writer. commentlint: allow(JUDGE)
+/// Ingest removes its own `artifact_ingestion_reservations` row before returning. commentlint: allow(JUDGE)
+/// A purge removes its own `artifact_pending_unlinks` row once the object is unlinked. commentlint: allow(JUDGE)
+const UNSEEDED_TABLES: &[&str] = &[
+    "entities",
+    "entity_aliases",
+    "propositions",
+    "predicate_schemas",
+    "anchors",
+    "asserted_edges",
+    "relation_registry",
+    "candidate_scores",
+    "artifact_ingestion_reservations",
+    "artifact_pending_unlinks",
 ];
+
+/// Declared tables `backup` fills; `assert_seeded` skips them until a backup has run. commentlint: allow(JUDGE)
+const BACKUP_TABLES: &[&str] = &["capture_pins", "capture_pin_refs"];
+
+/// A detector-recognizable secret that causes redacted text to create a `durable_text_redactions` row.
+const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+
+/// A newly declared table must be seeded or listed as unseeded, so a digest
+/// equality cannot silently become empty-vs-empty for it.
+fn assert_seeded(proof: &Proof, after_backup: bool) {
+    for table in UNSEEDED_TABLES.iter().chain(BACKUP_TABLES) {
+        assert!(
+            KERNEL_SCHEMA_COMPONENT_NAMES.contains(table),
+            "{table} is not a declared table"
+        );
+        assert!(
+            !(UNSEEDED_TABLES.contains(table) && BACKUP_TABLES.contains(table)),
+            "{table} listed as both unseeded and backup-populated"
+        );
+    }
+    for table in KERNEL_SCHEMA_COMPONENT_NAMES {
+        if UNSEEDED_TABLES.contains(table) || (!after_backup && BACKUP_TABLES.contains(table)) {
+            continue;
+        }
+        assert!(proof.count_table(table) > 0, "{table} not seeded");
+    }
+}
 
 fn max_outbox_position(proof: &Proof) -> i64 {
     proof
@@ -60,7 +83,7 @@ struct Seeded {
     replay_index: usize,
 }
 
-/// Seeds every table group the kernel writes through its public API.
+/// Seeds every table `assert_seeded` checks.
 fn seeded() -> Seeded {
     let mut proof = Proof::open();
     proof.commit(intent("seed"), |envelope| {
@@ -70,11 +93,39 @@ fn seeded() -> Seeded {
     });
     proof.commit(intent("consumer"), |envelope| {
         envelope.register_outbox_consumer("search", 10)?;
+        envelope.register_outbox_consumer("retired", 10)?;
         Ok(String::new())
     });
     proof.commit(intent("slice"), |envelope| {
         envelope.insert_decision(decision(1))?;
         envelope.insert_observation(observation(2, "decision-object-1"))?;
+        envelope.append_decision_event(
+            "decision-1",
+            DecisionEventSpec {
+                event_kind: "status".to_string(),
+                payload: DecisionEventPayload {
+                    summary: "seeded".to_string(),
+                },
+                evidence_id: None,
+                recorded_at: 11,
+            },
+        )?;
+        // A secret in a term value populates `durable_text_redactions`.
+        envelope.insert_scope(ScopeSpec {
+            scope_id: "scope-1".to_string(),
+            object_id: "scope-object-1".to_string(),
+            domain_id: DOMAIN.to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "scope".to_string(),
+            source_revision: 1,
+            sensitivity: Sensitivity::Normal,
+            terms: vec![ScopeTermSpec {
+                dimension: "branch".to_string(),
+                operator: "exact".to_string(),
+                exact_value: Some(format!("feature/{SECRET}")),
+                ..ScopeTermSpec::default()
+            }],
+        })?;
         Ok(String::new())
     });
     proof.store().rebuild_alignment().unwrap();
@@ -89,8 +140,7 @@ fn seeded() -> Seeded {
         envelope.admit_domain_candidate(request, admitted_domain("candidate-1", "name"))?;
         Ok(String::new())
     });
-    // One artifact stays referenced so a backup has something to pin and the
-    // digest covers a live evidence row beside the deleted one.
+    // One artifact stays referenced so a backup has something to pin.
     proof
         .store()
         .ingest_artifact(ingest("kept", b"kept", Sensitivity::Normal))
@@ -103,10 +153,34 @@ fn seeded() -> Seeded {
         .store()
         .delete_artifact(deletion("delete", &deleted.digest))
         .unwrap();
+    let purged = proof
+        .store()
+        .ingest_artifact(ingest("purged", b"purged", Sensitivity::Normal))
+        .unwrap();
+    let mut purge = deletion("purge", &purged.digest);
+    purge.kind = ArtifactDeletionKind::Purge;
+    purge.operator_id = Some("operator".to_string());
+    purge.target_locator = Some("incident://seed".to_string());
+    purge.reason = Some("seed".to_string());
+    proof.store().delete_artifact(purge).unwrap();
+    // `search` stays registered for the outbox proofs; `retired` is abandoned.
+    proof.commit(intent("abandon"), |envelope| {
+        envelope.abandon_outbox_consumer(
+            "retired",
+            ConsumerAbandonment {
+                operator_id: "operator".to_string(),
+                reason: "seed".to_string(),
+                abandoned_at: 20,
+                barrier_id: None,
+            },
+        )?;
+        Ok(String::new())
+    });
     proof
         .store()
         .mark_outbox_published_through(max_outbox_position(&proof), 30)
         .unwrap();
+    assert_seeded(&proof, false);
     Seeded {
         proof,
         replay_index,
@@ -130,12 +204,6 @@ fn backup_request(destination: &std::path::Path) -> BackupRequest {
 #[test]
 fn seeded_state_digest_survives_reopen() {
     let Seeded { mut proof, .. } = seeded();
-    for table in SEEDED_TABLES
-        .iter()
-        .filter(|table| **table != "capture_pins")
-    {
-        assert!(proof.count_table(table) > 0, "{table} not seeded");
-    }
     let before = proof.digest();
     let known = proof.store().known_as_of(proof.tip()).unwrap();
     proof.restart();
@@ -160,9 +228,7 @@ fn backup_and_restore_reproduce_every_table_and_the_commit_seq() {
     // `backup` commits its capture pins before copying, so the digest to
     // restore to is the one observed after it returns.
     let expected = proof.digest();
-    for table in SEEDED_TABLES {
-        assert!(proof.count_table(table) > 0, "{table} not seeded");
-    }
+    assert_seeded(&proof, true);
 
     proof.commit(intent("after-backup"), |envelope| {
         envelope.insert_domain(domain(2))?;
@@ -206,6 +272,10 @@ fn outbox_position_never_regresses_or_reuses_across_prune_and_reopen() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    assert!(
+        !positions.is_empty(),
+        "positive control: the after-prune commit emitted outbox rows"
+    );
     assert!(
         positions.iter().all(|position| *position > high_water),
         "{positions:?}"
