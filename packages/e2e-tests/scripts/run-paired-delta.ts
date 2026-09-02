@@ -98,8 +98,8 @@ const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
     "deadline-reached": 1,
     "invalid-stored-records": 2,
     "harness-unreclaimed": 3,
-    /** Distinct from the budget stops because a resume that simply continues would admit arms against a `spentUsd` the failed record understates; the operator has to see the estimate stood in for a measurement. commentlint: allow(JUDGE) */
-    "usage-unmeasured": 5,
+    /** Distinct from the budget stops because a resume that simply continues would admit arms against a `spentUsd` the failed record understates; the operator has to see the estimate stood in for a measurement. Distinct from `INSUFFICIENT_EVIDENCE_EXIT` because the workflow keys its checkpoint save on this code alone. commentlint: allow(JUDGE) */
+    "usage-unmeasured": 6,
 };
 
 /** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. commentlint: allow(JUDGE) */
@@ -857,6 +857,8 @@ function armOptions(
 interface SessionUsage {
     usage: RolloutObservation["usage"];
     offPinRoute: { providerId: string; modelId: string } | null;
+    /** Fixture-served assistant entries seen. R1 schedules exactly `SCRIPTED_ORACLE_MOCK_ENTRIES`; a shortfall is a scripted turn that did not land, and the ledger is not an R1 ledger. */
+    mockEntries: number;
 }
 
 const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
@@ -1123,7 +1125,7 @@ async function sessionUsage(
         }
         }
     }
-    return { usage, offPinRoute };
+    return { usage, offPinRoute, mockEntries };
 }
 
 /**
@@ -1415,6 +1417,9 @@ export function createLiveDependencies(input: {
                             scenario.modelContextLimit,
                             input.apiKey,
                         ) &&
+                        /** Exactly the scheduled fixture entries, not at most: the excess case is reported as an off-pin route above, and a shortfall means the scripted turn the arm is defined by did not reach the ledger. commentlint: allow(JUDGE) */
+                        ledger.mockEntries ===
+                            (scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES) &&
                         (
                             coordinate.armId !== "compaction" ||
                             !harness.hasContextDb()
