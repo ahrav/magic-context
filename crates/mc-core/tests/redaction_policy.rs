@@ -1,3 +1,7 @@
+//! Pins replacement spelling, overlap precedence, UTF-8 byte spans, label
+//! bounds, input limits, and placeholder suppression for durable redaction.
+//! Every reported span must fall on a character boundary in the original text.
+
 use std::sync::OnceLock;
 
 use mc_core::redaction::{

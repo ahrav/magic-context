@@ -20,6 +20,8 @@ use tempfile::TempDir;
 
 use crate::canonical_state::{digest, CanonicalDigest, Profile};
 
+/// Owns a temporary kernel root, its current store handle, and intents available
+/// for replay. Methods panic on fixture setup or proof failure.
 pub struct Proof {
     root: TempDir,
     store: Option<KernelStore>,
@@ -27,6 +29,11 @@ pub struct Proof {
 }
 
 impl Proof {
+    /// Creates a temporary root and opens its kernel store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when temporary-directory creation or store opening fails.
     pub fn open() -> Self {
         let root = tempfile::tempdir().unwrap();
         let store = KernelStore::open(root.path()).unwrap();
@@ -55,6 +62,11 @@ impl Proof {
         Connection::open(self.path().join("core.sqlite")).unwrap()
     }
 
+    /// Counts rows in a fixture-selected table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `table` does not form a valid query or SQLite rejects the query.
     pub fn count_table(&self, table: &str) -> i64 {
         self.db()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
