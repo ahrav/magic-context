@@ -166,6 +166,86 @@ describe("comment hygiene gate", () => {
         expect(result.out).toContain("word.rs:2:");
     });
 
+    test("Python and TOML need no whitespace before the delimiter", () => {
+        const result = scan({
+            "inline.py": "value = 1# tracked in magic-context-om3y",
+            "inline.toml": "key = 1# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("inline.py:1:");
+        expect(result.out).toContain("inline.toml:1:");
+    });
+
+    test("a Rust raw string keeps its contents out of scope", () => {
+        const result = scan({
+            "raw.rs": [
+                'let fixture = r#"runtime " // magic-context-om3y"#;',
+                'let plain = r"also // magic-context-om3y";',
+            ].join("\n"),
+        });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
+    });
+
+    test("a Rust character literal does not hide the comment after it", () => {
+        const result = scan({
+            "char.rs": [
+                `let quote = '"'; // tracked in magic-context-om3y`,
+                `let esc = '\\''; // tracked in magic-context-om3y`,
+            ].join("\n"),
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("char.rs:1:");
+        expect(result.out).toContain("char.rs:2:");
+    });
+
+    test("an escaped shell apostrophe does not hide the comment after it", () => {
+        const result = scan({
+            "esc.sh": "value='can'\\''t' # tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("esc.sh:1:");
+    });
+
+    test("a multi-line template literal keeps its contents out of scope", () => {
+        const result = scan({
+            "multi.ts": [
+                "const s = `line one",
+                "// see magic-context-om3y here",
+                "still string`;",
+                "// tracked in magic-context-om3y",
+            ].join("\n"),
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("multi.ts:2:");
+        expect(result.out).toContain("multi.ts:4:");
+    });
+
+    test("an external tracker reference needs an end boundary", () => {
+        const result = scan({
+            "tok.rs": [
+                "// the sim-2d transform is stable",
+                "// decode jira-2fa as hexadecimal",
+                "// the pr-7zip archive",
+            ].join("\n"),
+        });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
+    });
+
+    test("CommonJS sources are in scope", () => {
+        const result = scan({ "probe.cjs": "// tracked in magic-context-om3y" });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("probe.cjs:1:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

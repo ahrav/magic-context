@@ -9,7 +9,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-EXTS='rs ts tsx js mjs py sh yml yaml toml'
+EXTS='rs ts tsx js mjs cjs py sh yml yaml toml'
 IDS_FILE=.beads/issues.jsonl
 
 if [ ! -f "$IDS_FILE" ]; then
@@ -72,13 +72,29 @@ function block_nests(p) {
   return (p ~ /\.rs$/) ? 1 : 0
 }
 
+# Rust raw strings and character literals need their own delimiters.
+function rust_literals(p) {
+  return (p ~ /\.rs$/) ? 1 : 0
+}
+
+# JavaScript template literals permit unescaped line breaks; quoted strings do not.
+function template_quotes(p) {
+  return (p ~ /\.(ts|tsx|js|mjs|cjs)$/) ? 1 : 0
+}
+
+# Shell and YAML require whitespace before an inline comment delimiter; Python and TOML do not.
+function hash_needs_space(p) {
+  return (p ~ /\.(sh|yml|yaml)$/) ? 1 : 0
+}
+
 # Quote tracking keeps a delimiter inside a string literal from opening a comment.
 # Only block-comment state survives across lines, so an unbalanced quote cannot desync the next line.
-function comment_of(line, st,   i, n, c, two, q, out) {
+function comment_of(line, st,   i, n, c, two, q, out, j, k, m, hashes, endmark, e, prev) {
   out = ""
   n = length(line)
   i = 1
-  q = ""
+  # A template literal left open by the previous line is still open here.
+  q = tq ? BT : ""
   while (i <= n) {
     if (depth > 0) {
       two = substr(line, i, 2)
@@ -91,14 +107,44 @@ function comment_of(line, st,   i, n, c, two, q, out) {
     c = substr(line, i, 1)
     if (q != "") {
       if (c == BS) { i += 2; continue }
-      if (c == q) q = ""
+      if (c == q) { q = ""; tq = 0 }
       i++
       continue
     }
-    if (c == DQ || c == BT || (c == SQ && sq_quotes)) { q = c; i++; continue }
+    # An escape outside a string covers the shell form that embeds an apostrophe.
+    if (c == BS) { i += 2; continue }
+    if (rust_lit && (c == "r" || c == "b")) {
+      j = (c == "b") ? i + 1 : i
+      prev = (i > 1) ? substr(line, i - 1, 1) : ""
+      if (substr(line, j, 1) == "r" && prev !~ /[A-Za-z0-9_]/) {
+        k = j + 1
+        hashes = 0
+        while (substr(line, k, 1) == "#") { hashes++; k++ }
+        if (substr(line, k, 1) == DQ) {
+          endmark = DQ
+          for (m = 0; m < hashes; m++) endmark = endmark "#"
+          e = index(substr(line, k + 1), endmark)
+          if (e == 0) return out
+          i = k + e + length(endmark)
+          continue
+        }
+      }
+    }
+    if (rust_lit && c == SQ) {
+      # An apostrophe closing a one-character or escaped body is a character literal; any other is a lifetime.
+      if (substr(line, i + 1, 1) == BS) {
+        if (substr(line, i + 3, 1) == SQ) { i += 4; continue }
+      } else if (substr(line, i + 2, 1) == SQ && substr(line, i + 1, 1) != "") {
+        i += 3
+        continue
+      }
+      i++
+      continue
+    }
+    if (c == DQ || (c == SQ && sq_quotes)) { q = c; i++; continue }
+    if (c == BT && tmpl_quotes) { q = BT; tq = 1; i++; continue }
     if (st == "hash") {
-      # A hash starts a comment only at line start or after whitespace, so a shell word or YAML scalar containing one stays runtime data.
-      if (c == "#" && (i == 1 || substr(line, i - 1, 1) == " " || substr(line, i - 1, 1) == "\t")) {
+      if (c == "#" && (!hash_space || i == 1 || substr(line, i - 1, 1) == " " || substr(line, i - 1, 1) == "\t")) {
         return out " " substr(line, i + 1)
       }
       i++
@@ -129,7 +175,7 @@ function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, 
     if (base in bead_base) { hit = 1; break }
     rest = substr(rest, RSTART + RLENGTH)
   }
-  if (!hit && lt ~ /(^|[^a-z0-9])(cr|pr|mr|sim|tt|jira)-[0-9]/) hit = 1
+  if (!hit && lt ~ /(^|[^a-z0-9])(cr|pr|mr|sim|tt|jira)-[0-9]+[^a-z0-9]/) hit = 1
   if (!hit) {
     count = split(lt, toks, /[^a-z0-9.]+/)
     for (i = 1; i <= count; i++) {
@@ -174,14 +220,18 @@ BEGIN {
     style = style_of(path)
     sq_quotes = apostrophe_quotes(path)
     blk_nest = block_nests(path)
+    rust_lit = rust_literals(path)
+    tmpl_quotes = template_quotes(path)
+    hash_space = hash_needs_space(path)
     depth = 0
+    tq = 0
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
-      if (depth == 0) {
+      if (depth == 0 && !tq) {
         if (style == "hash") {
           if (index(line, "#") == 0) continue
-        } else if (index(line, "/") == 0) continue
+        } else if (index(line, "/") == 0 && !(tmpl_quotes && index(line, BT) > 0)) continue
       }
       text = comment_of(line, style)
       if (text != "") check(path, lno, line, text)
