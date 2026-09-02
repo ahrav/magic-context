@@ -10,7 +10,10 @@
 //! a new decision. This module proves that work row is emitted; the registry
 //! tracks the withdrawal itself as a separate row.
 
-use mc_kernel::{ArtifactDeletionKind, ArtifactHandle, Sensitivity, Surface, SurfaceVisibility};
+use mc_kernel::{
+    ArtifactDeletionKind, ArtifactErrorKind, ArtifactHandle, Sensitivity, Surface,
+    SurfaceVisibility,
+};
 
 use crate::canonical_state::CanonicalDigest;
 use crate::fixtures::{
@@ -184,35 +187,40 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     assert_eq!(result.kind, ArtifactDeletionKind::Delete);
     assert_eq!(result.digest, handle.digest);
     assert_eq!(result.commit_seq, proof.tip());
-    assert_eq!(count_sql(&proof, live_refs), 0);
     assert_eq!(
         result.affected_object_ids, evidence_object_ids,
         "deletion invalidates every evidence reference, not the admitted subject"
     );
-    // `evidence_meta` and `object_registry` are stamped by separate statements.
-    for table in ["object_registry", "evidence_meta"] {
-        assert_eq!(
-            ids_sql(
-                &proof,
-                &format!(
-                    "SELECT object_id FROM {table} WHERE invalidated_commit_seq={}
-                     ORDER BY object_id",
-                    result.commit_seq
-                )
-            ),
-            result.affected_object_ids,
-            "{table} did not stamp the affected ids at the deletion commit"
-        );
-    }
-    let known = proof.store().known_as_of(proof.tip()).unwrap();
-    for id in &result.affected_object_ids {
-        assert!(
-            !known.objects.iter().any(|row| &row.object_id == id),
-            "{id} is still live after deletion"
-        );
-    }
 
     let check_state = |proof: &Proof| {
+        assert_eq!(count_sql(proof, live_refs), 0);
+        // `evidence_meta` and `object_registry` are stamped by separate statements.
+        for table in ["object_registry", "evidence_meta"] {
+            assert_eq!(
+                ids_sql(
+                    proof,
+                    &format!(
+                        "SELECT object_id FROM {table} WHERE invalidated_commit_seq={}
+                         ORDER BY object_id",
+                        result.commit_seq
+                    )
+                ),
+                result.affected_object_ids,
+                "{table} did not stamp the affected ids at the deletion commit"
+            );
+        }
+        let known = proof.store().known_as_of(proof.tip()).unwrap();
+        for id in &result.affected_object_ids {
+            assert!(
+                !known.objects.iter().any(|row| &row.object_id == id),
+                "{id} is still live after deletion"
+            );
+        }
+        // The bytes stay on disk, but the deleted handle must not read them.
+        assert_eq!(
+            proof.store().read_artifact(&handle).unwrap_err().kind(),
+            ArtifactErrorKind::ReferenceUnavailable
+        );
         let rows = propagation_rows(proof, result.commit_seq);
         let mut kinds = rows
             .iter()
