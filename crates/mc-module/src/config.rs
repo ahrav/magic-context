@@ -32,7 +32,10 @@ pub const DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS: usize = 20;
 /// The caveman defaults match the TypeScript `caveman_text_compression` schema.
 pub const DEFAULT_CAVEMAN_MIN_SIZE: usize = 500;
 
-/// `derive_historian_chunk_tokens` matches the TS runner's context-window-based historian producer-budget derivation.
+/// Derives the historian producer budget as 25 percent of context capacity, in tokens.
+///
+/// Rounds to the nearest token, then clamps the result to 8,000 through 50,000 tokens. This
+/// matches the TypeScript runner.
 pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
     (((context_limit_tokens as f64) * 0.25).round() as usize)
         .clamp(MIN_HISTORIAN_CHUNK_TOKENS, MAX_HISTORIAN_CHUNK_TOKENS)
@@ -92,8 +95,8 @@ pub struct McModuleConfig {
     pub inject_docs: bool,
     /// The overlay option controls temporal gap overlays when the active wire surface supports overlays.
     pub temporal_awareness: bool,
-    /// Route binding resolves trusted USER-tier guidance bytes from the user config directory.
-    /// filesystem path.
+    /// Contains trusted user-tier guidance text resolved during route binding.
+    /// Relative override paths resolve from the user config directory.
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
@@ -183,6 +186,7 @@ impl McModuleConfig {
         default()
     }
 
+    /// Resolves the effective cache TTL and discards whether it came from an explicit model rule.
     pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
         self.resolve_cache_ttl_with_provenance(model_key).value
     }
@@ -203,11 +207,18 @@ pub struct ConfigCache {
 }
 
 impl ConfigCache {
+    /// Loads user config from the platform path and project config below `project_root`.
+    ///
+    /// Missing, unreadable, and malformed files act as absent tiers. Warnings go to stderr.
     pub fn effective_for_project(&mut self, project_root: &Path) -> McModuleConfig {
         let user_path = user_config_path();
         self.effective_for_paths(&user_path, project_root)
     }
 
+    /// Loads and merges config from explicit user and project paths.
+    ///
+    /// Each tier is cached by path and modification time. User values apply first, then permitted
+    /// project values. User guidance paths resolve relative to `user_path`.
     pub fn effective_for_paths(&mut self, user_path: &Path, project_root: &Path) -> McModuleConfig {
         let project_path = project_root.join(".cortexkit").join("magic-context.jsonc");
         let user = read_tier_cached(&mut self.user, user_path.to_path_buf());
@@ -603,6 +614,10 @@ fn number_at(value: &Value, pointer: &str) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
+/// Removes line comments, block comments, and trailing commas outside JSON strings.
+///
+/// Preserves comment markers and escapes inside strings. Unterminated block comments consume the
+/// remaining input. This function normalizes JSONC syntax but does not validate resulting JSON.
 pub fn strip_jsonc(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
