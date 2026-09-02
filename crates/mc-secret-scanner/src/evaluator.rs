@@ -1221,15 +1221,44 @@ mod tests {
             "example".to_owned(),
             "changeme".to_owned(),
         ];
+        assert_prepared_replays_scalar_work(
+            &needles,
+            &[
+                b"ordinary text".as_slice(),
+                b"EXAMPLE value".as_slice(),
+                b"prefix ChangeMe".as_slice(),
+            ],
+        );
+    }
+
+    // Case-insensitive duplicate needles at one offset make scalar work stop at the lowest matching pattern index, not the number of reported matches.
+    #[test]
+    fn prepared_case_insensitive_any_replays_scalar_work_for_case_duplicate_needles() {
+        let needles = vec![
+            "placeholder".to_owned(),
+            "PLACEHOLDER".to_owned(),
+            "example".to_owned(),
+            "EXAMPLE".to_owned(),
+        ];
+        assert_prepared_replays_scalar_work(
+            &needles,
+            &[
+                b"ordinary text".as_slice(),
+                b"placeholder value".as_slice(),
+                b"PLACEHOLDER value".as_slice(),
+                b"PlaceHolder value".as_slice(),
+                b"an example and a PLACEHOLDER".as_slice(),
+                b"an EXAMPLE only".as_slice(),
+            ],
+        );
+    }
+
+    fn assert_prepared_replays_scalar_work(needles: &[String], haystacks: &[&[u8]]) {
         let matcher = AhoCorasick::builder()
             .ascii_case_insensitive(true)
-            .build(&needles)
+            .build(needles)
             .unwrap();
-        for haystack in [
-            b"ordinary text".as_slice(),
-            b"EXAMPLE value".as_slice(),
-            b"prefix ChangeMe".as_slice(),
-        ] {
+        for haystack in haystacks {
             for max_work_bytes in 0..=haystack.len() * needles.len() + 1 {
                 let limits = ScanLimits {
                     max_work_bytes,
@@ -1238,19 +1267,20 @@ mod tests {
                 let mut scalar_work = 0;
                 let scalar = contains_any_charged_ignore_case_scalar(
                     haystack,
-                    &needles,
+                    needles,
                     &mut scalar_work,
                     limits,
                 );
                 let mut prepared_work = 0;
                 let prepared = contains_any_charged_ignore_case(
                     haystack,
-                    &needles,
+                    needles,
                     Some(&matcher),
                     &mut prepared_work,
                     limits,
                 );
                 assert_eq!(scalar_work, prepared_work);
+                assert!(prepared_work <= max_work_bytes || prepared.is_err());
                 assert_eq!(scalar.is_ok(), prepared.is_ok());
                 if let (Ok(scalar), Ok(prepared)) = (scalar, prepared) {
                     assert_eq!(scalar, prepared);

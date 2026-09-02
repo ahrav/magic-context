@@ -20,14 +20,16 @@ use std::sync::{Arc, LazyLock};
 
 static EMBEDDED_RULES: LazyLock<Result<Arc<RuleSet>, ConstructionError>> =
     LazyLock::new(|| RuleSet::from_embedded().map(Arc::new));
-static DEFAULT_DIGESTS: LazyLock<Result<[[u8; 32]; 2], ConstructionError>> = LazyLock::new(|| {
+// Each profile owns its own cell, so constructing one profile never initializes the other profile's digest.
+static CONSERVATIVE_DIGEST: LazyLock<Result<[u8; 32], ConstructionError>> =
+    LazyLock::new(|| default_limits_digest(ScanProfile::Conservative));
+static COMPREHENSIVE_DIGEST: LazyLock<Result<[u8; 32], ConstructionError>> =
+    LazyLock::new(|| default_limits_digest(ScanProfile::Comprehensive));
+
+fn default_limits_digest(profile: ScanProfile) -> Result<[u8; 32], ConstructionError> {
     let rules = EMBEDDED_RULES.as_ref().map_err(|error| *error)?;
-    let limits = ScanLimits::default();
-    Ok([
-        rules.semantic_digest(ScanProfile::Conservative, limits)?,
-        rules.semantic_digest(ScanProfile::Comprehensive, limits)?,
-    ])
-});
+    rules.semantic_digest(profile, ScanLimits::default())
+}
 
 pub struct Scanner {
     rules: Arc<RuleSet>,
@@ -51,15 +53,11 @@ impl Scanner {
             .map(Arc::clone)
             .map_err(|error| *error)?;
         let semantic_digest = if limits == ScanLimits::default() {
-            DEFAULT_DIGESTS
-                .as_ref()
-                .map(|digests| {
-                    digests[match profile {
-                        ScanProfile::Conservative => 0,
-                        ScanProfile::Comprehensive => 1,
-                    }]
-                })
-                .map_err(|error| *error)?
+            let cached = match profile {
+                ScanProfile::Conservative => &CONSERVATIVE_DIGEST,
+                ScanProfile::Comprehensive => &COMPREHENSIVE_DIGEST,
+            };
+            cached.as_ref().copied().map_err(|error| *error)?
         } else {
             rules.semantic_digest(profile, limits)?
         };
