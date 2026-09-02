@@ -291,7 +291,7 @@ impl Obligation {
                 status: Status::Landed {
                     tests: &[
                         Test { path: PROOFS_O9, function: "eligibility_matrix_is_exhaustive" },
-                        Test { path: PROOFS_O9, function: "expected_policy_never_widens_when_a_reference_is_added" },
+                        Test { path: PROOFS_O9, function: "expected_policy_never_widens_when_a_reference_joins_a_referenced_artifact" },
                         Test { path: PROOFS_O9, function: "unknown_and_dereferenced_digests_allow_local_and_deny_remote" },
                         Test { path: PROOFS_O9, function: "tombstone_denies_before_any_reference_is_consulted" },
                         Test { path: PROOFS_O9, function: "admission_hides_sensitive_subjects_on_remote_capable_surfaces" },
