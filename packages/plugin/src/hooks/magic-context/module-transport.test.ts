@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Deadline } from "../../shared/mc-host-client";
-import { McHostModuleTransport } from "./module-transport";
+import { WaiterDetachedError } from "../../shared/mc-host-lifecycle/policy";
+import { __moduleTransportTest, McHostModuleTransport } from "./module-transport";
 
 type TransportInternals = {
     connectionPromise: Promise<unknown> | null;
@@ -38,5 +39,30 @@ describe("McHostModuleTransport shared connection wait", () => {
 
         await expect(waiting).rejects.toBe(reason);
         expect(transport.connectionPromise).toBe(shared);
+    });
+});
+
+describe("waiter detach is not a connection failure", () => {
+    // A detached waiter carries ETIMEDOUT so callers classifying retryability on `code` see a
+    // timeout. If that also classified as a connection failure, the `call` catch would
+    // invalidate the shared connection and bump the generation, and the still-connecting
+    // owner's candidate would be evicted -- one caller's deadline would abort the connect for
+    // every caller waiting on the same flight.
+    test("a deadline detach does not classify as a connection failure", () => {
+        const detached = new WaiterDetachedError("deadline");
+        expect(detached.code).toBe("ETIMEDOUT");
+        expect(__moduleTransportTest.isConnectionFailure(detached)).toBe(false);
+    });
+
+    test("an abort detach does not classify as a connection failure", () => {
+        expect(__moduleTransportTest.isConnectionFailure(new WaiterDetachedError("aborted"))).toBe(
+            false,
+        );
+    });
+
+    // The exclusion must be the class, not the code: a genuine ETIMEDOUT still invalidates.
+    test("a plain ETIMEDOUT still classifies as a connection failure", () => {
+        const error = Object.assign(new Error("connect timed out"), { code: "ETIMEDOUT" });
+        expect(__moduleTransportTest.isConnectionFailure(error)).toBe(true);
     });
 });

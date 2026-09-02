@@ -2,7 +2,6 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use super::envelope::{Envelope, ObjectRow, PendingChange};
-use super::object_write::{insert_registry, map_write_error, record_registry_fields};
 use super::redaction::{record, redact, RedactedField};
 use super::{KernelError, Sensitivity};
 
@@ -88,16 +87,38 @@ impl Envelope<'_> {
             return Err(KernelError::NotFound);
         }
         let object = spec.object_row(self.commit_seq);
-        insert_registry(self.tx, self.commit_seq, &object)?;
-        record_registry_fields(
-            self.tx,
-            &spec.object_id.text,
-            &spec.domain_id,
-            &spec.object_id,
-            &spec.source_kind,
-            &spec.source_id,
-            self.commit_seq,
-        )?;
+        self.tx
+            .execute(
+                "INSERT INTO object_registry(
+                     object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                     created_commit_seq,sensitivity_class
+                 ) VALUES (?1,'scope',?2,?3,?4,?5,?6,?7)",
+                params![
+                    object.object_id,
+                    object.domain_id,
+                    object.source_kind,
+                    object.source_id,
+                    object.source_revision,
+                    self.commit_seq,
+                    object.sensitivity.as_str(),
+                ],
+            )
+            .map_err(super::map_sqlite)?;
+        for (name, field) in [
+            ("object_id", &spec.object_id),
+            ("domain_id", &spec.domain_id),
+            ("source_kind", &spec.source_kind),
+            ("source_id", &spec.source_id),
+        ] {
+            record(
+                self.tx,
+                "object_registry",
+                &spec.object_id.text,
+                name,
+                field,
+                Some(self.commit_seq),
+            )?;
+        }
         self.tx
             .execute(
                 "INSERT INTO scopes(
@@ -111,7 +132,7 @@ impl Envelope<'_> {
                     spec.sensitivity.as_str(),
                 ],
             )
-            .map_err(map_write_error)?;
+            .map_err(super::map_sqlite)?;
         insert_scope_terms(self.tx, &spec.scope_id.text, &spec.terms)?;
         let redactions = spec.text_fields();
         for (name, field) in &redactions {
@@ -303,7 +324,7 @@ fn insert_scope_terms(
                 term.payload.as_ref().map(|value| value.text.as_bytes()),
             ],
         )
-        .map_err(map_write_error)?;
+        .map_err(super::map_sqlite)?;
     }
     Ok(())
 }
@@ -312,10 +333,8 @@ fn insert_scope_terms(
 // Scope algebra: closed vocabulary, canonical form, and predicates.
 // ---------------------------------------------------------------------------
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-// Distinct secrets collapse to the same replacement token, so a value
-// containing one must stay out of equality, matching, and dedup decisions.
 pub(super) fn contains_redaction_placeholder(value: &str) -> bool {
     mc_core::redaction::contains_redaction_token(value)
         || value.contains(super::envelope::OPERATOR_REDACTION_PLACEHOLDER)
@@ -371,7 +390,24 @@ impl Dimension {
             .into_iter()
             .find(|dimension| dimension.as_str() == value)
     }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Domain => 0,
+            Self::Project => 1,
+            Self::Entity => 2,
+            Self::Branch => 3,
+            Self::Environment => 4,
+            Self::Region => 5,
+            Self::Deployment => 6,
+            Self::RequestClass => 7,
+            Self::CallerClass => 8,
+            Self::Platform => 9,
+        }
+    }
 }
+
+const DIMENSION_COUNT: usize = Dimension::ALL.len();
 
 /// One decoded scope term value. `RedactedPlaceholder` captures values the
 /// write path already replaced with a redaction token: they are unresolvable
@@ -396,15 +432,13 @@ pub enum TermValue {
 pub struct VersionSpec {
     raw: String,
     req: semver::VersionReq,
-    /// `None` when the requirement has no interval reading.
     interval: Option<VersionInterval>,
 }
 
 impl VersionSpec {
-    /// `None` when `raw` is not a valid semver requirement.
     pub fn parse(raw: &str) -> Option<Self> {
         let req = semver::VersionReq::parse(raw).ok()?;
-        let interval = req_interval(&req);
+        let interval = parsed_version_req_interval(&req);
         Some(Self {
             raw: raw.to_string(),
             req,
@@ -417,7 +451,14 @@ impl VersionSpec {
     }
 }
 
-/// Equality compares raw requirement strings, not parsed requirements.
+impl std::ops::Deref for VersionSpec {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
 impl PartialEq for VersionSpec {
     fn eq(&self, other: &Self) -> bool {
         self.raw == other.raw
@@ -490,7 +531,10 @@ impl std::error::Error for ScopeFormError {}
 /// is canonical by construction and predicates can require it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalScope {
-    terms: BTreeMap<Dimension, TermValue>,
+    terms: [Option<TermValue>; DIMENSION_COUNT],
+    version_requirements: [Option<semver::VersionReq>; DIMENSION_COUNT],
+    version_intervals: [Option<VersionInterval>; DIMENSION_COUNT],
+    present: u16,
 }
 
 impl CanonicalScope {
@@ -498,46 +542,95 @@ impl CanonicalScope {
     /// dimensions, unknown vocabulary, and undecodable payloads are
     /// malformed.
     pub fn from_term_specs(terms: &[ScopeTermSpec]) -> Result<Self, ScopeFormError> {
-        let mut canonical = BTreeMap::new();
+        let mut canonical = std::array::from_fn(|_| None);
+        let mut version_requirements = std::array::from_fn(|_| None);
+        let mut version_intervals = std::array::from_fn(|_| None);
+        let mut present = 0u16;
         for term in terms {
             let dimension = Dimension::from_stored(&term.dimension)
                 .ok_or_else(|| ScopeFormError::UnknownDimension(term.dimension.clone()))?;
+            let index = dimension.index();
             let value = decode_term_value(dimension, term)?;
-            if canonical.insert(dimension, value).is_some() {
+            let parsed_version = match &value {
+                TermValue::VersionRange(spec) => Some((spec.req.clone(), spec.interval.clone())),
+                _ => None,
+            };
+            if canonical[index].replace(value).is_some() {
                 return Err(ScopeFormError::DuplicateDimension(dimension));
             }
+            present |= 1 << index;
+            if let Some((requirement, interval)) = parsed_version {
+                version_requirements[index] = Some(requirement);
+                if let Some(interval) = interval {
+                    version_intervals[index] = Some(interval);
+                }
+            }
         }
-        Ok(Self { terms: canonical })
+        Ok(Self {
+            terms: canonical,
+            version_requirements,
+            version_intervals,
+            present,
+        })
     }
 
     /// The empty scope constrains nothing and matches every context.
     pub fn unconstrained() -> Self {
         Self {
-            terms: BTreeMap::new(),
+            terms: std::array::from_fn(|_| None),
+            version_requirements: std::array::from_fn(|_| None),
+            version_intervals: std::array::from_fn(|_| None),
+            present: 0,
         }
     }
 
     pub fn terms(&self) -> impl Iterator<Item = (Dimension, &TermValue)> {
-        self.terms
-            .iter()
-            .map(|(dimension, value)| (*dimension, value))
+        let mut present = self.present;
+        std::iter::from_fn(move || {
+            if present == 0 {
+                return None;
+            }
+            let index = present.trailing_zeros() as usize;
+            present &= present - 1;
+            let dimension = Dimension::ALL[index];
+            Some((
+                dimension,
+                self.terms[index]
+                    .as_ref()
+                    .expect("occupancy bit identifies a canonical term"),
+            ))
+        })
     }
 
     pub fn term(&self, dimension: Dimension) -> Option<&TermValue> {
-        self.terms.get(&dimension)
+        self.terms[dimension.index()].as_ref()
+    }
+
+    fn version_requirement(&self, dimension: Dimension) -> Option<&semver::VersionReq> {
+        self.version_requirements[dimension.index()].as_ref()
+    }
+
+    fn version_interval(&self, dimension: Dimension) -> Option<&VersionInterval> {
+        self.version_intervals[dimension.index()].as_ref()
     }
 
     fn has_placeholder(&self) -> bool {
         self.terms
-            .values()
+            .iter()
+            .flatten()
             .any(|value| matches!(value, TermValue::RedactedPlaceholder))
     }
 }
 
-/// 40 and 64 hex digits identify SHA-1 and SHA-256 commit OIDs, respectively.
+pub(super) fn is_lower_hex_oid(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(super) fn is_commit_oid(value: &str) -> bool {
-    mc_core::claim_operation::is_lower_hex(value, 40)
-        || mc_core::claim_operation::is_lower_hex(value, 64)
+    is_lower_hex_oid(value)
 }
 
 fn decode_term_value(
@@ -605,7 +698,6 @@ fn decode_term_value(
             if start.as_deref() == Some("") || end.as_deref() == Some("") {
                 return Err(ScopeFormError::InvalidRange(dimension));
             }
-            // Redaction placeholders cannot be ordered.
             if start.as_deref().is_some_and(contains_redaction_placeholder)
                 || end.as_deref().is_some_and(contains_redaction_placeholder)
             {
@@ -642,7 +734,7 @@ fn decode_term_value(
                 .git_oid
                 .as_deref()
                 .ok_or(ScopeFormError::MissingValue(dimension))?;
-            if !is_commit_oid(oid) {
+            if !is_lower_hex_oid(oid) {
                 return Err(ScopeFormError::InvalidOid(dimension));
             }
             Ok(TermValue::GitReachable(oid.to_string()))
@@ -685,25 +777,13 @@ pub enum MatchOutcome {
     Uncertain,
 }
 
-impl MatchOutcome {
-    fn and(self, other: MatchOutcome) -> MatchOutcome {
-        match (self, other) {
-            (Self::DoesNotMatch, _) | (_, Self::DoesNotMatch) => Self::DoesNotMatch,
-            (Self::Uncertain, _) | (_, Self::Uncertain) => Self::Uncertain,
-            _ => Self::Matches,
-        }
-    }
-}
-
 /// Resolved query-side values the scope predicates compare against, one text
 /// value per dimension plus the checkout HEAD for git-reachability terms.
 /// Values are resolved before predicate evaluation (never ambient state).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeMatchContext {
-    values: BTreeMap<Dimension, String>,
-    /// Caching coerced versions during insertion avoids re-coercion during
-    /// evaluation.
-    coerced: BTreeMap<Dimension, VersionReading>,
+    values: [Option<String>; DIMENSION_COUNT],
+    coerced: [Option<VersionReading>; DIMENSION_COUNT],
     head_commit: Option<String>,
 }
 
@@ -714,15 +794,8 @@ impl ScopeMatchContext {
 
     pub fn with_value(mut self, dimension: Dimension, value: impl Into<String>) -> Self {
         let value = value.into();
-        match VersionReading::parse(&value) {
-            Some(reading) => {
-                self.coerced.insert(dimension, reading);
-            }
-            None => {
-                self.coerced.remove(&dimension);
-            }
-        }
-        self.values.insert(dimension, value);
+        self.coerced[dimension.index()] = VersionReading::parse(&value);
+        self.values[dimension.index()] = Some(value);
         self
     }
 
@@ -732,18 +805,14 @@ impl ScopeMatchContext {
     }
 
     pub fn value(&self, dimension: Dimension) -> Option<&str> {
-        self.values.get(&dimension).map(String::as_str)
+        self.values[dimension.index()].as_deref()
     }
 
     fn coerced_version(&self, dimension: Dimension) -> Option<&VersionReading> {
-        self.coerced.get(&dimension)
+        self.coerced[dimension.index()].as_ref()
     }
 }
 
-/// Both readings of one raw version string. `comparable` demotes every
-/// qualifier to build metadata, because `VersionReq::matches` excludes
-/// prereleases unless a comparator names one. `prerelease` preserves the
-/// caller's valid prerelease version for requirements that name a prerelease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionReading {
     comparable: semver::Version,
@@ -751,7 +820,6 @@ pub struct VersionReading {
 }
 
 impl VersionReading {
-    /// `None` when no usable numeric core can be parsed.
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -778,19 +846,12 @@ impl VersionReading {
     }
 }
 
-/// A requirement whose own comparators name a prerelease opts into
-/// prerelease matching; every other requirement stays release-only.
 fn req_names_prerelease(req: &semver::VersionReq) -> bool {
     req.comparators
         .iter()
         .any(|comparator| !comparator.pre.is_empty())
 }
 
-/// Coerces a platform-version style string into a semver `Version`: missing
-/// minor/patch components pad with zero, numeric components after the third
-/// are discarded, and vendor suffixes use build metadata because
-/// pre-releases do not satisfy plain semver ranges. Returns `None` when no
-/// usable numeric core can be parsed.
 pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     VersionReading::parse(raw).map(|reading| reading.comparable)
 }
@@ -820,10 +881,6 @@ fn coerce_platform_version(raw: &str) -> Option<semver::Version> {
                 cursor += part_len + 1;
             }
             Err(_) => {
-                // A vendor suffix glued to a numeric component, such as
-                // "3ubuntu1", splits into the digits and a build qualifier.
-                // Every later component joins that qualifier, keeping
-                // "1.2ubuntu1.7" and "1.2ubuntu1.9" distinct.
                 let digit_len = part.bytes().take_while(u8::is_ascii_digit).count();
                 if digit_len == 0 || digit_len == part.len() {
                     return None;
@@ -862,8 +919,6 @@ fn coerce_platform_version(raw: &str) -> Option<semver::Version> {
     Some(version)
 }
 
-/// `VersionReq::matches` excludes prereleases from plain requirements; build
-/// metadata preserves the qualifier without affecting comparison.
 fn demote_pre_to_build(mut version: semver::Version) -> Option<semver::Version> {
     if version.pre.is_empty() {
         return Some(version);
@@ -962,10 +1017,6 @@ impl VersionInterval {
     }
 }
 
-fn next_major(v: u64) -> Option<u64> {
-    v.checked_add(1)
-}
-
 /// Maps one comparator (with empty pre-release) to an interval. `None` when
 /// the comparator shape has no interval reading, which routes callers into
 /// the approximation rule.
@@ -991,7 +1042,7 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
             },
             (None, _) => VersionInterval {
                 lo: Some((version(major, 0, 0), true)),
-                hi: Some((version(next_major(major)?, 0, 0), false)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
             },
         },
         Op::Greater => match (minor, patch) {
@@ -1004,7 +1055,7 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
                 hi: None,
             },
             (None, _) => VersionInterval {
-                lo: Some((version(next_major(major)?, 0, 0), true)),
+                lo: Some((version(major.checked_add(1)?, 0, 0), true)),
                 hi: None,
             },
         },
@@ -1027,7 +1078,7 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
             },
             (None, _) => VersionInterval {
                 lo: None,
-                hi: Some((version(next_major(major)?, 0, 0), false)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
             },
         },
         Op::Tilde => match (minor, patch) {
@@ -1037,12 +1088,12 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
             },
             (None, _) => VersionInterval {
                 lo: Some((lo_exact, true)),
-                hi: Some((version(next_major(major)?, 0, 0), false)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
             },
         },
         Op::Caret => {
             let hi = if major > 0 || minor.is_none() {
-                version(next_major(major)?, 0, 0)
+                version(major.checked_add(1)?, 0, 0)
             } else if minor != Some(0) || patch.is_none() {
                 version(0, minor?.checked_add(1)?, 0)
             } else {
@@ -1058,8 +1109,15 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
     Some(interval)
 }
 
-/// Returns `None` when any comparator has no representable interval.
-fn req_interval(req: &semver::VersionReq) -> Option<VersionInterval> {
+/// Normalizes a validated requirement string into one interval. `None` when
+/// any comparator resists the interval reading (pre-release comparators or
+/// unknown operators).
+fn version_req_interval(raw: &str) -> Option<VersionInterval> {
+    let req = semver::VersionReq::parse(raw).ok()?;
+    parsed_version_req_interval(&req)
+}
+
+fn parsed_version_req_interval(req: &semver::VersionReq) -> Option<VersionInterval> {
     let mut interval = VersionInterval::full();
     for comparator in &req.comparators {
         interval = interval.intersect(comparator_interval(comparator)?);
@@ -1067,9 +1125,13 @@ fn req_interval(req: &semver::VersionReq) -> Option<VersionInterval> {
     Some(interval)
 }
 
-pub(super) fn version_req_matches(req: &semver::VersionReq, value: &str) -> Option<bool> {
-    let reading = VersionReading::parse(value)?;
-    Some(reading.matches(req))
+pub(super) fn version_req_matches(raw: &str, value: &str) -> Option<bool> {
+    let req = semver::VersionReq::parse(raw).ok()?;
+    parsed_version_req_matches(&req, value)
+}
+
+pub(super) fn parsed_version_req_matches(req: &semver::VersionReq, value: &str) -> Option<bool> {
+    Some(VersionReading::parse(value)?.matches(req))
 }
 
 /// Whether every context matched by `b` is matched by `a`, per the
@@ -1092,11 +1154,11 @@ fn term_subsumes(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
             Some(range_bound_le(ps, rs) && range_bound_ge(pe, re))
         }
         (Range { .. }, _) => Some(false),
-        (VersionRange(q), Exact(v)) => version_req_matches(&q.req, v),
+        (VersionRange(q), Exact(v)) => version_req_matches(q, v),
         (VersionRange(q), Set(s)) => {
             let mut all = true;
             for value in s {
-                match version_req_matches(&q.req, value) {
+                match version_req_matches(q, value) {
                     Some(true) => {}
                     Some(false) => {
                         all = false;
@@ -1111,9 +1173,9 @@ fn term_subsumes(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
             if q == vr {
                 return Some(true);
             }
-            let outer = q.interval.as_ref()?;
-            let inner = vr.interval.as_ref()?;
-            Some(outer.contains(inner))
+            let outer = version_req_interval(q)?;
+            let inner = version_req_interval(vr)?;
+            Some(outer.contains(&inner))
         }
         (VersionRange(_), _) => Some(false),
         (GitReachable(h), GitReachable(g)) => {
@@ -1138,7 +1200,7 @@ fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
         (Exact(u), Range { start, end }) | (Range { start, end }, Exact(u)) => {
             Some(range_contains(start, end, u))
         }
-        (Exact(u), VersionRange(q)) | (VersionRange(q), Exact(u)) => version_req_matches(&q.req, u),
+        (Exact(u), VersionRange(q)) | (VersionRange(q), Exact(u)) => version_req_matches(q, u),
         (Set(t), Set(s)) => Some(!t.is_disjoint(s)),
         (Set(s), Range { start, end }) | (Range { start, end }, Set(s)) => {
             Some(s.iter().any(|value| range_contains(start, end, value)))
@@ -1146,7 +1208,7 @@ fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
         (Set(s), VersionRange(q)) | (VersionRange(q), Set(s)) => {
             let mut any = false;
             for value in s {
-                match version_req_matches(&q.req, value) {
+                match version_req_matches(q, value) {
                     Some(true) => {
                         any = true;
                         break;
@@ -1162,12 +1224,12 @@ fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
         }
         (VersionRange(q), VersionRange(vr)) => {
             if q == vr {
-                let interval = q.interval.as_ref()?;
+                let interval = version_req_interval(q)?;
                 return Some(!interval.is_empty());
             }
-            let left = q.interval.as_ref()?;
-            let right = vr.interval.as_ref()?;
-            Some(left.overlaps(right))
+            let left = version_req_interval(q)?;
+            let right = version_req_interval(vr)?;
+            Some(left.overlaps(&right))
         }
         (GitReachable(h), GitReachable(g)) => {
             if h == g {
@@ -1228,6 +1290,7 @@ fn ranges_overlap(
 
 fn term_matches(
     term: &TermValue,
+    version_requirement: Option<&semver::VersionReq>,
     dimension: Dimension,
     ctx: &ScopeMatchContext,
     oracle: &dyn GraphOracle,
@@ -1255,10 +1318,14 @@ fn term_matches(
         TermValue::Exact(expected) => bool_outcome(expected == value),
         TermValue::Set(values) => bool_outcome(values.contains(value)),
         TermValue::Range { start, end } => bool_outcome(range_contains(start, end, value)),
-        TermValue::VersionRange(spec) => match ctx.coerced_version(dimension) {
-            Some(reading) => bool_outcome(reading.matches(&spec.req)),
-            None => MatchOutcome::Uncertain,
-        },
+        TermValue::VersionRange(_) => ctx
+            .coerced_version(dimension)
+            .map(|version| {
+                bool_outcome(version.matches(
+                    version_requirement.expect("canonical version range has a parsed requirement"),
+                ))
+            })
+            .unwrap_or(MatchOutcome::Uncertain),
         TermValue::GitReachable(_) | TermValue::RedactedPlaceholder => unreachable!(),
     }
 }
@@ -1278,10 +1345,21 @@ pub fn scope_matches(
     ctx: &ScopeMatchContext,
     oracle: &dyn GraphOracle,
 ) -> MatchOutcome {
-    scope
-        .terms()
-        .map(|(dimension, term)| term_matches(term, dimension, ctx, oracle))
-        .fold(MatchOutcome::Matches, MatchOutcome::and)
+    let mut outcome = MatchOutcome::Matches;
+    for (dimension, term) in scope.terms() {
+        match term_matches(
+            term,
+            scope.version_requirement(dimension),
+            dimension,
+            ctx,
+            oracle,
+        ) {
+            MatchOutcome::DoesNotMatch => return MatchOutcome::DoesNotMatch,
+            MatchOutcome::Uncertain => outcome = MatchOutcome::Uncertain,
+            MatchOutcome::Matches => {}
+        }
+    }
+    outcome
 }
 
 /// Sound, not complete: `true` guarantees every context matched by `b` is
@@ -1289,7 +1367,30 @@ pub fn scope_matches(
 pub fn scope_subsumes(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
     a.terms()
         .all(|(dimension, term_a)| match b.term(dimension) {
-            Some(term_b) => term_subsumes(term_a, term_b, oracle).unwrap_or(false),
+            Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(_), TermValue::Exact(value)) => a
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(false),
+                (TermValue::VersionRange(_), TermValue::Set(values)) => {
+                    let Some(requirement) = a.version_requirement(dimension) else {
+                        return false;
+                    };
+                    values.iter().all(|value| {
+                        parsed_version_req_matches(requirement, value).unwrap_or(false)
+                    })
+                }
+                (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
+                    if left == right {
+                        true
+                    } else {
+                        a.version_interval(dimension)
+                            .zip(b.version_interval(dimension))
+                            .is_some_and(|(outer, inner)| outer.contains(inner))
+                    }
+                }
+                _ => term_subsumes(term_a, term_b, oracle).unwrap_or(false),
+            },
             // `a` constrains a dimension `b` leaves open: some context outside
             // `a`'s value set matches `b`.
             None => false,
@@ -1301,7 +1402,45 @@ pub fn scope_subsumes(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn Graph
 pub fn scope_overlaps(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
     a.terms()
         .all(|(dimension, term_a)| match b.term(dimension) {
-            Some(term_b) => term_overlaps(term_a, term_b, oracle).unwrap_or(true),
+            Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(_), TermValue::Exact(value)) => a
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(true),
+                (TermValue::Exact(value), TermValue::VersionRange(_)) => b
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(true),
+                (TermValue::VersionRange(_), TermValue::Set(values)) => a
+                    .version_requirement(dimension)
+                    .map(|requirement| {
+                        values.iter().any(|value| {
+                            parsed_version_req_matches(requirement, value).unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
+                (TermValue::Set(values), TermValue::VersionRange(_)) => b
+                    .version_requirement(dimension)
+                    .map(|requirement| {
+                        values.iter().any(|value| {
+                            parsed_version_req_matches(requirement, value).unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
+                (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
+                    match (a.version_interval(dimension), b.version_interval(dimension)) {
+                        (Some(left_interval), Some(right_interval)) => {
+                            if left == right {
+                                !left_interval.is_empty()
+                            } else {
+                                left_interval.overlaps(right_interval)
+                            }
+                        }
+                        _ => true,
+                    }
+                }
+                _ => term_overlaps(term_a, term_b, oracle).unwrap_or(true),
+            },
             None => true,
         })
 }
@@ -1313,4 +1452,60 @@ pub fn scope_equivalent(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn Gra
         return true;
     }
     scope_subsumes(a, b, oracle) && scope_subsumes(b, a, oracle)
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{version_req_matches, VersionReading};
+
+    fn requirement_strategy() -> impl Strategy<Value = String> {
+        (0u64..5, 0u64..5, 0u64..5, 0u8..8).prop_map(|(major, minor, patch, shape)| match shape {
+            0 => format!("={major}.{minor}.{patch}"),
+            1 => format!(">={major}.{minor}.{patch}"),
+            2 => format!("<{major}.{minor}.{patch}"),
+            3 => format!("^{major}.{minor}.{patch}"),
+            4 => format!("~{major}.{minor}.{patch}"),
+            5 => format!("{major}.{minor}.*"),
+            6 => format!(">={major}.{minor}.{patch}, <{}.0.0", major + 1),
+            _ => format!(">={major}.{minor}.{patch}-beta.1"),
+        })
+    }
+
+    fn version_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            (0u64..7, 0u64..7, 0u64..7)
+                .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}")),
+            (0u64..7, 0u64..7).prop_map(|(major, minor)| format!("{major}.{minor}")),
+            (0u64..7).prop_map(|major| major.to_string()),
+            (0u64..7, 0u64..7, 0u64..7)
+                .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}-beta.1")),
+            Just("not-a-version".to_string()),
+            Just(String::new()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_algorithm: prop::test_runner::RngAlgorithm::ChaCha,
+            rng_seed: prop::test_runner::RngSeed::Fixed(0x5C0BEA16F),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn version_matching_agrees_with_semver(
+            requirement in requirement_strategy(),
+            value in version_strategy(),
+        ) {
+            let expected = semver::VersionReq::parse(&requirement)
+                .ok()
+                .and_then(|requirement| {
+                    VersionReading::parse(&value)
+                        .map(|version| version.matches(&requirement))
+                });
+            prop_assert_eq!(version_req_matches(&requirement, &value), expected);
+        }
+    }
 }

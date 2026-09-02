@@ -1649,4 +1649,3 @@ these records has an executing check.
   both markers are hard: nothing in this subsystem emits anything, so a campaign
   that wants to witness a situation has to read durable state or the response, and
   those are the only two surfaces there are.
-

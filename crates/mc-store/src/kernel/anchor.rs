@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::scope::{contains_redaction_placeholder, is_commit_oid, version_req_matches};
+use super::scope::{contains_redaction_placeholder, is_commit_oid, parsed_version_req_matches};
 
 /// Schema tag for capture-time anchor representations stored in the frozen
 /// `anchors.payload` BLOB. The fallback ladder matches a fresh checkout
@@ -411,7 +411,7 @@ pub fn evaluate_non_git(condition: &AnchorCondition, ctx: &QueryContext) -> Anch
             if contains_redaction_placeholder(raw) {
                 return AnchorEvaluation::Uncertain;
             }
-            match version_req_matches(req, raw) {
+            match parsed_version_req_matches(req, raw) {
                 Some(result) => holds(result),
                 None => AnchorEvaluation::Uncertain,
             }

@@ -1391,4 +1391,3 @@ these records has an executing check.
   markers but is a precondition for both, since a boundary crossed with nothing
   staged witnesses nothing. Cost order is mid-sequence first (a three-page series),
   then graceful (in-process `shutdown`), then abrupt (a real process kill).
-

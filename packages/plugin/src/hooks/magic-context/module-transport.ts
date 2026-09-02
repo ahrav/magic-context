@@ -306,6 +306,14 @@ function isStaleOrDeadRouteFailure(error: unknown): boolean {
 }
 
 function isConnectionFailure(error: unknown): boolean {
+    // One caller's own deadline or abort is not a connection failure. It carries ETIMEDOUT so
+    // callers classifying retryability on `code` see a timeout, but treating it as a
+    // connection failure would invalidate the shared connection and bump the generation,
+    // which evicts the still-connecting owner's candidate — one waiter's deadline would
+    // abort the connect for every waiter. The backoff path already excludes this class.
+    if (error instanceof WaiterDetachedError) {
+        return false;
+    }
     if (
         error instanceof SocketClosedError ||
         error instanceof SocketTimeoutError ||

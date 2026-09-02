@@ -3,7 +3,7 @@
 //! fallback ladder with stop-on-ambiguity.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use gix::ObjectId;
@@ -21,6 +21,7 @@ pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v4";
 pub const CANDIDATE_WINDOW: usize = 512;
 
 const MAX_PATCH_BLOB_BYTES: u64 = 32 * 1024 * 1024;
+const ANCESTRY_WALK_CAP: usize = 1 << 20;
 
 /// Verdict for one git anchor condition against one checkout snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,8 @@ pub struct ResolutionLadder<'s> {
     /// result cannot be trusted. Read once per request. commentlint: allow(JUDGE)
     shallow: bool,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
+    graph: RefCell<Option<gix::revwalk::Graph<'s, 's, gix::revwalk::graph::Commit<u64>>>>,
+    graph_query: Cell<u64>,
     window: RefCell<Option<CandidateWindow>>,
     /// A candidate's patch identity depends only on its commit.
     patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
@@ -75,12 +78,22 @@ impl<'s> ResolutionLadder<'s> {
             budget,
             shallow: snapshot.is_shallow(),
             ancestry_cache: RefCell::new(HashMap::new()),
+            graph: RefCell::new(None),
+            graph_query: Cell::new(0),
             window: RefCell::new(None),
             patch_id_cache: RefCell::new(HashMap::new()),
             graph_operations: Cell::new(0),
             saw_unreadable_object: Cell::new(false),
             repository_state_moved: Cell::new(false),
         }
+    }
+
+    pub(super) fn snapshot(&self) -> &CheckoutSnapshot {
+        self.snapshot
+    }
+
+    pub(super) fn budget(&self) -> &EvalBudget {
+        self.budget
     }
 
     /// Object-database operations performed so far: ancestry walks,
@@ -531,6 +544,9 @@ impl<'s> ResolutionLadder<'s> {
             self.note_unreadable_object();
             return None;
         }
+        if !self.shallow {
+            return self.test_ancestry_graph(ancestor, descendant);
+        }
         // Both endpoints exist, so a failure here is a missing object further
         // in: an intermediate parent a later fetch can supply.
         let bases = match repo.merge_bases_many(ancestor, &[descendant]) {
@@ -549,6 +565,59 @@ impl<'s> ResolutionLadder<'s> {
             return None;
         }
         Some(reachable)
+    }
+
+    fn test_ancestry_graph(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+        let mut graph = self.graph.borrow_mut();
+        let graph = graph.get_or_insert_with(|| self.snapshot.revision_graph());
+        let ancestor_generation = match graph.get_or_insert_commit(ancestor, |_| {}) {
+            Ok(Some(commit)) => commit.generation,
+            Ok(None) | Err(_) => {
+                self.note_unreadable_object();
+                return None;
+            }
+        };
+        let mut query = self.graph_query.get().wrapping_add(1);
+        if query == 0 {
+            graph.clear_commit_data(|seen| *seen = 0);
+            query = 1;
+        }
+        self.graph_query.set(query);
+
+        let mut pending = VecDeque::from([descendant]);
+        let mut steps = 0usize;
+        while let Some(id) = pending.pop_front() {
+            if self.budget.is_exhausted() || steps >= ANCESTRY_WALK_CAP {
+                return None;
+            }
+            let mut seen = false;
+            let commit = match graph.get_or_insert_commit(id, |last_query| {
+                seen = *last_query == query;
+                *last_query = query;
+            }) {
+                Ok(Some(commit)) => commit,
+                Ok(None) | Err(_) => {
+                    self.note_unreadable_object();
+                    return None;
+                }
+            };
+            if seen {
+                continue;
+            }
+            steps += 1;
+            if id == ancestor {
+                return Some(true);
+            }
+            if commit
+                .generation
+                .zip(ancestor_generation)
+                .is_some_and(|(generation, ancestor)| generation < ancestor)
+            {
+                continue;
+            }
+            pending.extend(commit.parents.iter().copied());
+        }
+        Some(false)
     }
 }
 

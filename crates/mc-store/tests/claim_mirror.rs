@@ -1,15 +1,21 @@
 use std::collections::BTreeMap;
 
+#[path = "support/scan_audit.rs"]
+mod scan_audit;
+
 use cortexkit_store_types::StorageDescriptor;
 use mc_core::claim_operation::{
     canonical_json_encode, sha256_hex_utf8, ClaimCommandIdentity, ClaimIntentAckKind,
     ClaimIntentBinding, SnapshotVector,
 };
+use mc_core::redaction::RedactionErrorKind;
 use mc_store::claim_mirror::{
     ClaimMirrorChangeKind, ClaimMirrorEffect, ClaimMirrorError, ClaimMirrorLifecycle,
     ClaimMirrorReceiptGroup, ClaimMirrorSnapshot, CommittedClaimMirrorRow, CLAIM_MIRROR_VERSION,
 };
 use mc_store::McStore;
+use rusqlite::Connection;
+use scan_audit::{scan_audit_counts, ScanAuditCounts};
 use serde_json::{json, Value};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
@@ -130,6 +136,80 @@ fn result(outcome: &str) -> String {
         "generations": {},
     }))
     .unwrap()
+}
+
+#[test]
+fn claim_json_fields_are_scanned_once_without_rewriting_escaped_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let mut row = claim(CLAIM_A, 41, 1, "plain content", 1);
+    row.attributes = json!({"quoted": "say \\\"hello\\\"", "nested": {"displayName": "value"}});
+
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![row.clone()]),
+            1,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.list_claim_mirror(INCARNATION, Some(41)).unwrap()[0].attributes,
+        row.attributes
+    );
+    let connection = Connection::open(dir.path().join("store.db")).unwrap();
+    let per_field: Vec<(String, i64)> = connection
+        .prepare(
+            "SELECT field_id,COUNT(*) FROM mc_scan_owner_copies
+             WHERE field_id LIKE 'claim_%' GROUP BY field_id ORDER BY field_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        per_field,
+        vec![
+            ("claim_applicability".to_string(), 1),
+            ("claim_attributes".to_string(), 1),
+            ("claim_content".to_string(), 1),
+            ("claim_policy".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn protected_claim_json_key_rejects_atomically_with_exact_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    for protected_key in ["apiToken", "encryptionKey", "signingKeys", "clientSecret"] {
+        let mut row = claim(CLAIM_A, 41, 1, "plain content", 1);
+        row.policy = Value::Object(serde_json::Map::from_iter([(
+            protected_key.to_string(),
+            Value::String("value with quotes".to_string()),
+        )]));
+        let error = store
+            .replace_claim_mirror_snapshot(
+                &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![row]),
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClaimMirrorError::Redaction(mc_core::redaction::RedactionErrorKind::SecretDetected)
+        ));
+        assert!(store.claim_mirror_state().unwrap().is_none());
+        assert_eq!(scan_audit_counts(dir.path()), ScanAuditCounts::EMPTY);
+    }
+
+    let mut benign = claim(CLAIM_A, 41, 1, "plain content", 1);
+    benign.policy = json!({"key": "display selector", "keys": ["left", "right"]});
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![benign]),
+            2,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -508,7 +588,8 @@ fn u10_scenario_8_reseed_reproduces_state_across_restart() {
     assert_eq!(state.projects[&42].acked_effect_id, 11);
 }
 
-///
+/// A receipt stamps every row it observed, not only the rows it changed,
+/// so a restart seeded from generation stamps sees the same mirror.
 #[test]
 fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -565,7 +646,8 @@ fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches(
     );
 }
 
-///
+/// A revision identifies content, so the same revision arriving with
+/// different content is a conflict rather than an idempotent replay.
 #[test]
 fn receipt_rejects_equal_revision_carrying_different_content() {
     let dir = tempfile::tempdir().unwrap();
@@ -599,5 +681,160 @@ fn receipt_rejects_equal_revision_carrying_different_content() {
     assert_eq!(
         store.list_claim_mirror(INCARNATION, Some(41)).unwrap(),
         vec![stored]
+    );
+}
+
+/// The integrity scan must catch a secret-shaped field name that no whole-segment test
+/// matches, and must not invent one by joining two clean fields.
+#[test]
+fn integrity_json_rejects_secret_shaped_keys_without_fabricating_cross_field_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+    for attributes in [
+        json!({"apikey": "Ax7Ke9QpZr2mLw8T"}),
+        json!({"authtoken": "Ax7Ke9QpZr2mLw8T"}),
+        json!({"nested": [{"accessToken": "Ax7Ke9QpZr2mLw8T"}]}),
+    ] {
+        let mut row = claim(CLAIM_A, 41, 3, "content", 7);
+        row.attributes = attributes.clone();
+        let error = store
+            .replace_claim_mirror_snapshot(
+                &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+                100,
+            )
+            .expect_err("a secret-shaped field name must be refused");
+        assert!(
+            matches!(
+                error,
+                ClaimMirrorError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "unexpected error for {attributes}: {error}"
+        );
+    }
+
+    // Neither field carries a secret on its own; a separator the scanner does not break on
+    // would splice them into `password=<value>` and refuse a legitimate write.
+    let mut row = claim(CLAIM_A, 41, 3, "content", 7);
+    row.attributes = json!({"note": "rotate the password=", "value": "Ax7Ke9QpZr2mLw8T"});
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+            100,
+        )
+        .expect("two individually clean fields must not combine into a detection");
+}
+
+/// A secret-shaped name guards text, not structure, and a credential can arrive as a
+/// property name rather than a value.
+#[test]
+fn integrity_json_separates_structural_names_from_credential_bearing_text() {
+    // A number under a secret-shaped name carries no text to conceal, so refusing it would
+    // make ordinary claim vocabulary unwritable.
+    for attributes in [
+        json!({"token_count": 3}),
+        json!({"key_id": 17, "auth_provider": null}),
+        json!({"stream_key": ""}),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut row = claim(CLAIM_A, 41, 3, "content", 7);
+        row.attributes = attributes.clone();
+        store
+            .replace_claim_mirror_snapshot(
+                &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+                100,
+            )
+            .unwrap_or_else(|error| panic!("{attributes} must stay writable: {error}"));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    // `secret_shaped_json_key` tests a name's spelling, so a credential used as a property
+    // name reaches the mirror unless names are scanned as content.
+    let mut row = claim(CLAIM_B, 41, 3, "content", 7);
+    // Assembled at runtime so the fixture carries no credential-shaped literal for a
+    // repository secret scanner to flag; the value the redactor sees is unchanged.
+    let credential = format!(
+        "xoxb-{}-{}-{}",
+        "123456789012", "1234567890123", "abcdefghijklmnopqrstuvwx"
+    );
+    let mut grants = serde_json::Map::new();
+    grants.insert(credential, Value::Bool(true));
+    row.attributes = json!({"grants": Value::Object(grants)});
+    let error = store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 7)], &[(41, 29)], vec![row]),
+            100,
+        )
+        .expect_err("a credential used as a property name must be refused");
+    assert!(
+        matches!(
+            error,
+            ClaimMirrorError::Redaction(RedactionErrorKind::SecretDetected)
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+/// A receipt group applies its effects one at a time, so a rejection raised after an
+/// earlier effect has already been written must roll the whole group back. Committing the
+/// prefix would leave the mirror holding claims from a group the caller was told failed.
+#[test]
+fn receipt_rejected_on_a_later_effect_leaves_no_earlier_effect_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+    // CLAIM_A is stored at revision 2; CLAIM_B does not exist yet.
+    let stored = claim(CLAIM_A, 41, 2, "Stored content.", 1);
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![stored.clone()]),
+            1,
+        )
+        .unwrap();
+
+    // Effect 1 inserts CLAIM_B and is valid on its own. Effect 2 regresses CLAIM_A's
+    // revision and is refused, and it is only reached after effect 1 has been inserted.
+    let fresh = claim(CLAIM_B, 41, 3, "New claim.", 2);
+    let regressed = claim(CLAIM_A, 41, 1, "Older revision.", 2);
+    let receipt = group(
+        9,
+        &[(41, 2)],
+        vec![
+            effect(
+                1,
+                0,
+                41,
+                2,
+                ClaimMirrorChangeKind::Upsert,
+                Some(fresh.clone()),
+                &fresh,
+            ),
+            effect(
+                2,
+                1,
+                41,
+                2,
+                ClaimMirrorChangeKind::Upsert,
+                Some(regressed.clone()),
+                &regressed,
+            ),
+        ],
+    );
+
+    assert!(
+        matches!(
+            store.apply_claim_mirror_receipt(&receipt, 2),
+            Err(ClaimMirrorError::Invalid(_))
+        ),
+        "a regressed revision must be refused"
+    );
+
+    // The refusal must be total: effect 1's row must not survive it.
+    assert_eq!(
+        store.list_claim_mirror(INCARNATION, Some(41)).unwrap(),
+        vec![stored],
+        "a rejected group must leave only the pre-existing claim"
     );
 }
