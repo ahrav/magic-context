@@ -30,6 +30,7 @@ struct Subject {
     proof: Proof,
     handle: ArtifactHandle,
     object_id: String,
+    evidence_object_id: String,
 }
 
 /// Ingests an artifact and admits a candidate whose trigger observation
@@ -44,10 +45,9 @@ fn admitted_subject() -> Subject {
         envelope.register_outbox_consumer("search", 10)?;
         Ok(String::new())
     });
-    let handle = proof
-        .store()
-        .ingest_artifact(ingest("evidence", b"evidence bytes", Sensitivity::Normal))
-        .unwrap();
+    let request = ingest("evidence", b"evidence bytes", Sensitivity::Normal);
+    let evidence_object_id = request.object_id.clone();
+    let handle = proof.store().ingest_artifact(request).unwrap();
     proof
         .store()
         .stage_candidate(staging("run-1", CANDIDATE, "name"))
@@ -67,14 +67,8 @@ fn admitted_subject() -> Subject {
         proof,
         handle,
         object_id,
+        evidence_object_id,
     }
-}
-
-/// The evidence object the ingest fixture registers for `handle`.
-fn handle_object_id(handle: &ArtifactHandle) -> String {
-    handle
-        .evidence_id
-        .replacen("evidence-", "evidence-object-", 1)
 }
 
 fn auto_inject_ids(proof: &Proof) -> Vec<String> {
@@ -115,6 +109,7 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         mut proof,
         handle,
         object_id,
+        evidence_object_id,
     } = admitted_subject();
     // Positive control: the dependent subject is served before deletion.
     assert!(auto_inject_ids(&proof).contains(&object_id));
@@ -141,7 +136,7 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
 
     assert_eq!(
         result.affected_object_ids,
-        vec![handle_object_id(&handle)],
+        vec![evidence_object_id],
         "deletion invalidates the evidence object, not the admitted subject"
     );
     let check_state = |proof: &Proof| {
@@ -196,6 +191,7 @@ fn deletion_fault_before_commit_leaves_references_live_and_no_barrier_across_res
         mut proof,
         handle,
         object_id,
+        ..
     } = admitted_subject();
     assert!(auto_inject_ids(&proof).contains(&object_id));
     proof.fault_deletion(deletion("delete", &handle.digest));
