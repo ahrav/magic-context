@@ -177,6 +177,8 @@ pub(crate) struct Rule {
     pub source: RuleSource,
     pub declaration: RuleDeclaration,
     pub regex: Regex,
+    pub keyword_matcher: Option<AhoCorasick>,
+    pub suppressor_matcher: Option<AhoCorasick>,
 }
 
 pub(crate) struct RuleSet {
@@ -451,11 +453,30 @@ fn compile_rule(
     {
         return Err(ConstructionError::InvalidRulePattern);
     }
+    let keyword_matcher = declaration
+        .keywords_any
+        .as_deref()
+        .map(build_case_insensitive_matcher)
+        .transpose()?;
+    let suppressor_matcher = declaration
+        .value_suppressors_any
+        .as_deref()
+        .map(build_case_insensitive_matcher)
+        .transpose()?;
     Ok(Rule {
         source,
         declaration,
         regex,
+        keyword_matcher,
+        suppressor_matcher,
     })
+}
+
+fn build_case_insensitive_matcher(patterns: &[String]) -> Result<AhoCorasick, ConstructionError> {
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(patterns)
+        .map_err(|_| ConstructionError::InvalidRulePattern)
 }
 
 fn validate_policy(rule: &RuleDeclaration) -> Result<(), ConstructionError> {

@@ -1,3 +1,4 @@
+use aho_corasick::AhoCorasick;
 use regex::bytes::Captures;
 
 use crate::api::REVISION;
@@ -199,22 +200,25 @@ fn evaluate_candidate(
         }
     }
     if let Some(keywords) = &rule.declaration.keywords_any {
-        let mut matched = false;
-        for key in keywords {
-            if contains_charged_ignore_case(window, key.as_bytes(), work, limits)? {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
+        if !contains_any_charged_ignore_case(
+            window,
+            keywords,
+            rule.keyword_matcher.as_ref(),
+            work,
+            limits,
+        )? {
             return Ok(None);
         }
     }
     if let Some(values) = &rule.declaration.value_suppressors_any {
-        for item in values {
-            if contains_charged_ignore_case(value, item.as_bytes(), work, limits)? {
-                return Ok(None);
-            }
+        if contains_any_charged_ignore_case(
+            value,
+            values,
+            rule.suppressor_matcher.as_ref(),
+            work,
+            limits,
+        )? {
+            return Ok(None);
         }
     }
 
@@ -362,6 +366,49 @@ fn contains_charged_ignore_case(
 ) -> Result<bool, Abort> {
     add_work(work, haystack.len(), limits.max_work_bytes)?;
     Ok(find_ignore_ascii_case(haystack, needle))
+}
+
+fn contains_any_charged_ignore_case(
+    haystack: &[u8],
+    needles: &[String],
+    matcher: Option<&AhoCorasick>,
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<bool, Abort> {
+    let Some(matcher) = matcher else {
+        return contains_any_charged_ignore_case_scalar(haystack, needles, work, limits);
+    };
+    let Some(full_charge) = haystack.len().checked_mul(needles.len()) else {
+        return contains_any_charged_ignore_case_scalar(haystack, needles, work, limits);
+    };
+    if work
+        .checked_add(full_charge)
+        .is_none_or(|total| total > limits.max_work_bytes)
+    {
+        return contains_any_charged_ignore_case_scalar(haystack, needles, work, limits);
+    }
+
+    let first_match = matcher
+        .find_overlapping_iter(haystack)
+        .map(|found| found.pattern().as_usize())
+        .min();
+    let probes = first_match.map_or(needles.len(), |index| index + 1);
+    *work += haystack.len() * probes;
+    Ok(first_match.is_some())
+}
+
+fn contains_any_charged_ignore_case_scalar(
+    haystack: &[u8],
+    needles: &[String],
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<bool, Abort> {
+    for needle in needles {
+        if contains_charged_ignore_case(haystack, needle.as_bytes(), work, limits)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1162,6 +1209,53 @@ mod tests {
             source: RuleSource::ConservativeOverlay,
             declaration,
             regex,
+            keyword_matcher: None,
+            suppressor_matcher: None,
+        }
+    }
+
+    #[test]
+    fn prepared_case_insensitive_any_replays_scalar_work() {
+        let needles = vec![
+            "placeholder".to_owned(),
+            "example".to_owned(),
+            "changeme".to_owned(),
+        ];
+        let matcher = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&needles)
+            .unwrap();
+        for haystack in [
+            b"ordinary text".as_slice(),
+            b"EXAMPLE value".as_slice(),
+            b"prefix ChangeMe".as_slice(),
+        ] {
+            for max_work_bytes in 0..=haystack.len() * needles.len() + 1 {
+                let limits = ScanLimits {
+                    max_work_bytes,
+                    ..ScanLimits::default()
+                };
+                let mut scalar_work = 0;
+                let scalar = contains_any_charged_ignore_case_scalar(
+                    haystack,
+                    &needles,
+                    &mut scalar_work,
+                    limits,
+                );
+                let mut prepared_work = 0;
+                let prepared = contains_any_charged_ignore_case(
+                    haystack,
+                    &needles,
+                    Some(&matcher),
+                    &mut prepared_work,
+                    limits,
+                );
+                assert_eq!(scalar_work, prepared_work);
+                assert_eq!(scalar.is_ok(), prepared.is_ok());
+                if let (Ok(scalar), Ok(prepared)) = (scalar, prepared) {
+                    assert_eq!(scalar, prepared);
+                }
+            }
         }
     }
 
