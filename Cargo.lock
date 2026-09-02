@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-store"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "cortexkit-lease",
  "cortexkit-store-types",

@@ -376,7 +376,7 @@ fn prepare_integrity_json(
 }
 
 fn existing_claim_ids_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &cortexkit_store::GuardedConn<'_>,
     incarnation: &str,
 ) -> rusqlite::Result<BTreeSet<String>> {
     let mut statement = tx.prepare(
@@ -710,7 +710,7 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommittedClaimMirro
 }
 
 fn read_claims(
-    conn: &rusqlite::Connection,
+    conn: &cortexkit_store::GuardedConn<'_>,
     database_incarnation_id: &str,
     project_id: Option<i64>,
 ) -> rusqlite::Result<Vec<CommittedClaimMirrorRow>> {
@@ -729,7 +729,7 @@ fn read_claims(
 }
 
 fn insert_claim(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &cortexkit_store::GuardedConn<'_>,
     incarnation: &str,
     claim: &CommittedClaimMirrorRow,
 ) -> rusqlite::Result<()> {
@@ -782,7 +782,7 @@ fn insert_claim(
 }
 
 fn read_project_states(
-    conn: &rusqlite::Connection,
+    conn: &cortexkit_store::GuardedConn<'_>,
     incarnation: &str,
 ) -> rusqlite::Result<BTreeMap<i64, ClaimMirrorProjectState>> {
     let mut statement = conn.prepare_cached(
@@ -804,7 +804,7 @@ fn read_project_states(
 }
 
 pub(crate) fn snapshot_vector_from_connection(
-    conn: &rusqlite::Connection,
+    conn: &cortexkit_store::GuardedConn<'_>,
 ) -> rusqlite::Result<Option<SnapshotVector>> {
     let state = conn
         .query_row(
@@ -839,7 +839,9 @@ pub(crate) fn snapshot_vector_from_connection(
     }))
 }
 
-fn claim_intent_control(conn: &rusqlite::Connection) -> rusqlite::Result<Option<(String, String)>> {
+fn claim_intent_control(
+    conn: &cortexkit_store::GuardedConn<'_>,
+) -> rusqlite::Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT database_incarnation_id, transition_state
            FROM mc_claim_intent_controls WHERE id = 1",
@@ -849,7 +851,7 @@ fn claim_intent_control(conn: &rusqlite::Connection) -> rusqlite::Result<Option<
     .optional()
 }
 
-fn unresolved_claim_intents(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+fn unresolved_claim_intents(conn: &cortexkit_store::GuardedConn<'_>) -> rusqlite::Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM mc_claim_intents
           WHERE state IN ('staged', 'context-committed')",
@@ -858,7 +860,7 @@ fn unresolved_claim_intents(conn: &rusqlite::Connection) -> rusqlite::Result<i64
     )
 }
 
-fn clear_claim_mirror(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+fn clear_claim_mirror(tx: &cortexkit_store::GuardedConn<'_>) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM mc_claim_mirror_receipts", [])?;
     tx.execute("DELETE FROM mc_claim_mirror_claims", [])?;
     tx.execute("DELETE FROM mc_claim_mirror_projects", [])?;
