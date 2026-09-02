@@ -94,6 +94,11 @@ function heredoc_literals(p) {
   return (p ~ /\.sh$/) ? 1 : 0
 }
 
+# A single-quoted body processes backslash escapes only in these languages.
+function apostrophe_escapes(p) {
+  return (p ~ /\.(ts|tsx|js|mjs|cjs|py)$/) ? 1 : 0
+}
+
 # JavaScript template literals permit unescaped line breaks; quoted strings do not.
 function template_quotes(p) {
   return (p ~ /\.(ts|tsx|js|mjs|cjs)$/) ? 1 : 0
@@ -131,7 +136,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     }
     c = substr(line, i, 1)
     if (q != "") {
-      if (c == BS) { i += 2; continue }
+      if (c == BS && (q != SQ || sq_escapes)) { i += 2; continue }
       if (q == BT && substr(line, i, 2) == "${") { tsub = 1; q = ""; i += 2; continue }
       if (c == q) { q = ""; if (c == BT) tq = 0 }
       i++
@@ -294,8 +299,8 @@ function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, 
       dot = index(t, ".")
       base = (dot > 0) ? substr(t, 1, dot - 1) : t
       if (!(t in bead_id)) continue
-      # Some all-letter IDs are also ordinary words, so a bare one is exempt while the prefixed spelling still reports.
-      if (dot > 0 || base ~ /[0-9]/) { hit = 1; break }
+      # A bare ID needs a letter and either a digit or a dot, so an ordinary word or a plain number is not a match.
+      if (base ~ /[a-z]/ && (dot > 0 || base ~ /[0-9]/)) { hit = 1; break }
     }
   }
 
@@ -327,6 +332,7 @@ BEGIN {
     if (path == "" || excluded(path) || !wanted(path)) continue
     style = style_of(path)
     sq_quotes = apostrophe_quotes(path)
+    sq_escapes = apostrophe_escapes(path)
     blk_nest = block_nests(path)
     rust_lit = rust_literals(path)
     tmpl_quotes = template_quotes(path)

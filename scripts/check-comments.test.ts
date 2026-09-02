@@ -367,6 +367,29 @@ describe("comment hygiene gate", () => {
         }
     });
 
+    test("a plain number matching a legacy ID is not a citation", () => {
+        const result = scan({
+            "num.rs": [
+                "// retry after 456 requests",
+                "// timeout 237ms, port 515",
+                "// tracked in magic-context-456",
+            ].join("\n"),
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("num.rs:1:");
+        expect(result.out).not.toContain("num.rs:2:");
+        expect(result.out).toContain("num.rs:3:");
+    });
+
+    test("a shell apostrophe does not escape, so the comment after it is read", () => {
+        const result = scan({ "bs.sh": "sep='\\' # commentlint: allow(JUDGE)" });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("suppression on disk: ");
+        expect(result.out).toContain("bs.sh:1:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [
