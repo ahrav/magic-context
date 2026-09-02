@@ -83,14 +83,18 @@ fn content(proof: &Proof, kind: Kind) -> BTreeMap<String, String> {
         .map(|name| format!("quote({name})"))
         .collect::<Vec<_>>()
         .join("||'|'||");
-    db.prepare(&format!(
-        "SELECT object_id,{projection} FROM {table} ORDER BY object_id"
-    ))
-    .unwrap()
-    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-    .unwrap()
-    .collect::<rusqlite::Result<_>>()
-    .unwrap()
+    // Bound to a local so the statement drops before `db` does; a tail expression
+    // would drop them in the wrong order.
+    let rows = db
+        .prepare(&format!(
+            "SELECT object_id,{projection} FROM {table} ORDER BY object_id"
+        ))
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    rows
 }
 
 fn assert_successor_content(proof: &Proof, kind: Kind, object_id: &str, index: usize) {
