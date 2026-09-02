@@ -18,6 +18,7 @@ use crate::descriptor::{
 /// Serialized prefix size in bytes: schema, wire header, incarnation, lane, sequence, and body length.
 pub const SAMPLE_PREFIX_BYTES: usize = 2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8;
 
+/// `SamplePrefix` stores fixed fields copied from an untrusted serialized sample prefix.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SamplePrefix {
     schema: u16,
@@ -126,6 +127,7 @@ impl std::fmt::Debug for SamplePrefix {
     }
 }
 
+/// `ValidatedSample` stores identity and body length accepted by [`SamplePrefix::validate`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedSample {
     identity: ReleaseIdentity,

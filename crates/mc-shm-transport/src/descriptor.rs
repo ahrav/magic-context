@@ -28,6 +28,7 @@ pub const MAX_SPANS: usize = 2;
 pub struct HardwareProfileId(String);
 
 impl HardwareProfileId {
+    /// Validates and stores a hardware-profile identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, DescriptorError> {
         let value = value.into();
         if value.is_empty()
@@ -41,6 +42,7 @@ impl HardwareProfileId {
         Ok(Self(value))
     }
 
+    /// Tests exact equality with a hardware-profile identifier.
     pub fn matches(&self, value: &str) -> bool {
         self.0 == value
     }
@@ -101,6 +103,7 @@ impl Incarnation {
         Ok(Self(bytes))
     }
 
+    /// Restores an incarnation from its setup-channel bytes.
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -129,6 +132,7 @@ pub struct ReleaseIdentity {
 }
 
 impl ReleaseIdentity {
+    /// Constructs an identity from its exact completion-matching fields.
     pub const fn new(incarnation: Incarnation, lane: u32, sequence: u64) -> Self {
         Self {
             incarnation,
@@ -142,10 +146,12 @@ impl ReleaseIdentity {
         self.incarnation
     }
 
+    /// Returns the lane number.
     pub const fn lane(self) -> u32 {
         self.lane
     }
 
+    /// Returns the nonzero sequence number.
     pub const fn sequence(self) -> u64 {
         self.sequence
     }
@@ -174,6 +180,7 @@ pub struct FrameDescriptor {
 }
 
 impl FrameDescriptor {
+    /// Copies untrusted descriptor fields without validating them.
     #[allow(
         clippy::too_many_arguments,
         reason = "models fixed shared descriptor fields"
@@ -331,30 +338,37 @@ pub struct ValidatedFrame {
 }
 
 impl ValidatedFrame {
+    /// Returns the validated wire-v2 header.
     pub const fn wire_header(self) -> [u8; WIRE_V2_HEADER_BYTES] {
         self.wire_header
     }
 
+    /// Returns the validated release identity.
     pub const fn identity(self) -> ReleaseIdentity {
         self.identity
     }
 
+    /// Returns the declared body length in bytes.
     pub const fn body_len(self) -> u64 {
         self.body_len
     }
 
+    /// Returns the logical allocation start in bytes.
     pub const fn allocation_start(self) -> u64 {
         self.allocation_start
     }
 
+    /// Returns the allocation capacity in bytes.
     pub const fn allocation_len(self) -> u64 {
         self.allocation_len
     }
 
+    /// Returns the number of physical spans.
     pub const fn span_count(self) -> u8 {
         self.span_count
     }
 
+    /// Returns a validated span by index.
     pub fn span(self, index: usize) -> Option<ArenaSpan> {
         (index < usize::from(self.span_count)).then_some(self.spans[index])
     }
@@ -373,11 +387,17 @@ impl fmt::Debug for ValidatedFrame {
 pub struct DescriptorCounts {
     /// Reusable descriptors.
     pub free: u64,
+    /// Descriptors reserved by producers.
     pub producer_reserved: u64,
+    /// Descriptors visible to receivers.
     pub published: u64,
+    /// Descriptors claimed by receivers before lease creation.
     pub receiver_held: u64,
+    /// Descriptors exposed through receive leases.
     pub receiver_leased: u64,
+    /// Descriptors waiting for release processing.
     pub release_pending: u64,
+    /// Descriptors excluded from reuse.
     pub quarantined: u64,
 }
 
@@ -399,24 +419,38 @@ impl DescriptorCounts {
     }
 }
 
+/// Reports rejected descriptor fields or descriptor construction failures.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorError {
+    /// Operating-system entropy was unavailable.
     RandomSourceUnavailable,
+    /// Hardware-profile identifier is empty, too long, or contains unsupported bytes.
     InvalidHardwareProfile,
+    /// Serialized fixed fields are incomplete.
     Truncated,
+    /// Descriptor schema does not match [`DESCRIPTOR_SCHEMA_VERSION`].
     UnsupportedSchema,
+    /// Release identity belongs to another transport incarnation.
     WrongIncarnation,
+    /// Release identity names another lane.
     WrongLane,
     /// Sequence is zero or does not match the expected sequence.
     InvalidSequence,
     /// Body length exceeds [`MAX_FRAME_BYTES`].
     FrameTooLarge,
+    /// Allocation length or capacity is inconsistent with the arena or body.
     InvalidAllocation,
+    /// Span count is outside `1..=MAX_SPANS`.
     InvalidSpanCount,
+    /// A span extends outside the arena.
     OutOfBounds,
+    /// Checked descriptor arithmetic overflowed.
     Overflow,
+    /// Declared lengths disagree.
     LengthMismatch,
+    /// Physical spans do not describe the declared logical wrap.
     InvalidWrapMetadata,
+    /// Wire header version or length disagrees with the descriptor.
     WireHeaderMismatch,
 }
 

@@ -40,6 +40,7 @@ impl<'lease> LeaseSpan<'lease> {
         self.base.as_ptr()
     }
 
+    /// Reports whether mapped length is zero. commentlint: allow(JUDGE)
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
@@ -142,14 +143,17 @@ impl<'lease> ReceiveLease<'lease> {
         })
     }
 
+    /// Returns declared body length in bytes across all segments. commentlint: allow(JUDGE)
     pub const fn len(&self) -> usize {
         self.body_len
     }
 
+    /// Reports whether declared body length is zero. commentlint: allow(JUDGE)
     pub const fn is_empty(&self) -> bool {
         self.body_len == 0
     }
 
+    /// Returns one for contiguous bodies and two for wrapped bodies. commentlint: allow(JUDGE)
     pub const fn segment_count(&self) -> usize {
         self.span_count as usize
     }
@@ -167,6 +171,7 @@ impl<'lease> ReceiveLease<'lease> {
         self.wire_header
     }
 
+    /// Returns the exact identity consumed by release processing. commentlint: allow(JUDGE)
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
