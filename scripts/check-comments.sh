@@ -55,20 +55,28 @@ function wanted(p,   i, c, ext) {
     if (c == ".") { ext = substr(p, i + 1); break }
     if (c == "/") break
   }
-  if (ext == "") return shell_shebang(p)
+  shebang_lang = ""
+  if (ext == "") { shebang_lang = shebang_kind(p); return (shebang_lang != "") }
   return (ext in ok_ext)
 }
 
-function shell_shebang(p,   first, rc) {
+# The interpreter word decides the language of an extensionless script; options after it are ignored.
+function shebang_kind(p,   first, rc, w) {
   rc = (getline first < p)
   close(p)
-  if (rc <= 0) return 0
-  return (first ~ /^#![ \t]*\/.*(sh|bash|zsh|python[0-9.]*)[ \t]*$/ ||
-          first ~ /^#![ \t]*\/usr\/bin\/env[ \t]+(sh|bash|zsh|python[0-9.]*)/)
+  if (rc <= 0 || first !~ /^#!/) return ""
+  w = first
+  sub(/^#![ \t]*/, "", w)
+  if (w ~ /^\/usr\/bin\/env[ \t]+/) sub(/^\/usr\/bin\/env[ \t]+/, "", w)
+  sub(/[ \t].*$/, "", w)
+  sub(/^.*\//, "", w)
+  if (w ~ /^(sh|bash|zsh|dash|ksh)$/) return "sh"
+  if (w ~ /^python[0-9.]*$/) return "py"
+  return ""
 }
 
 function style_of(p) {
-  if (p ~ /\.(py|sh|ps1|yml|yaml|toml)$/ || p !~ /\.[A-Za-z0-9]+$/) return "hash"
+  if (p ~ /\.(py|sh|ps1|yml|yaml|toml)$/ || shebang_lang != "") return "hash"
   # CSS supports block comments but not line comments.
   if (p ~ /\.css$/) return "block"
   return "c"
@@ -96,11 +104,11 @@ function regex_literals(p) {
 
 # Python and TOML share the triple-quote form.
 function triple_literals(p) {
-  return (p ~ /\.(py|toml)$/) ? 1 : 0
+  return (p ~ /\.(py|toml)$/ || shebang_lang == "py") ? 1 : 0
 }
 
 function heredoc_literals(p) {
-  return (p ~ /\.sh$/ || p !~ /\.[A-Za-z0-9]+$/) ? 1 : 0
+  return (p ~ /\.sh$/ || shebang_lang == "sh") ? 1 : 0
 }
 
 # PowerShell adds a block-comment form and here-strings whose terminators are distinctive.
@@ -110,7 +118,7 @@ function powershell_literals(p) {
 
 # A shell command substitution inside a double-quoted body holds code, not data.
 function cmdsub_literals(p) {
-  return (p ~ /\.sh$/ || p !~ /\.[A-Za-z0-9]+$/) ? 1 : 0
+  return (p ~ /\.sh$/ || shebang_lang == "sh") ? 1 : 0
 }
 
 # PowerShell uses a backtick where the other languages use a backslash.
@@ -120,7 +128,7 @@ function escape_char(p) {
 
 # A single-quoted body processes backslash escapes only in these languages.
 function apostrophe_escapes(p) {
-  return (p ~ /\.(ts|tsx|js|mjs|cjs|py)$/) ? 1 : 0
+  return (p ~ /\.(ts|tsx|js|mjs|cjs|py|css)$/) ? 1 : 0
 }
 
 # Script-goal JavaScript also accepts the legacy HTML comment openers.
@@ -134,7 +142,7 @@ function template_quotes(p) {
 }
 
 function hash_boundary(p) {
-  if (p ~ /\.(sh|ps1)$/) return 2
+  if (p ~ /\.(sh|ps1)$/ || shebang_lang == "sh") return 2
   if (p ~ /\.(yml|yaml)$/) return 1
   return 0
 }
@@ -175,7 +183,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     if (q != "") {
       if (c == esc_ch && (q != SQ || sq_escapes)) { i += 2; continue }
       if (q == BT && substr(line, i, 2) == "${") { subd[tq] = 1; q = ""; i += 2; continue }
-      if (q == DQ && cmdsub_lit && substr(line, i, 2) == "$(") { dqsub = 1; q = ""; i += 2; continue }
+      if (q == DQ && cmdsub_lit && substr(line, i, 2) == "$(") { dqsub++; qrest[dqsub] = 1; q = ""; i += 2; continue }
       if (c == q) {
         q = ""
         if (c == BT) { tq--; if (tq > 0 && subd[tq] == 0) q = BT }
@@ -186,8 +194,8 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     # An escape outside a string covers the shell form that embeds an apostrophe.
     if (c == BS) { i += 2; continue }
     if (dqsub > 0) {
-      if (c == "(") { dqsub++; i++; continue }
-      if (c == ")") { dqsub--; if (dqsub == 0) q = DQ; i++; continue }
+      if (c == "(") { dqsub++; qrest[dqsub] = 0; i++; continue }
+      if (c == ")") { if (qrest[dqsub]) q = DQ; dqsub--; i++; continue }
     }
     # Substitution contents are code, so its braces decide where the template resumes.
     if (tq > 0 && subd[tq] > 0) {
@@ -455,6 +463,7 @@ BEGIN {
     heredoc_dash = 0
     hstr = ""
     dqsub = 0
+    split("", qrest)
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
@@ -464,7 +473,10 @@ BEGIN {
         } else continue
       }
       if (heredoc != "") {
-        if (line ~ (heredoc_dash ? ("^[ \t]*" heredoc "[ \t]*$") : ("^" heredoc "[ \t]*$"))) heredoc = ""
+        term = line
+        sub(/[ \t]+$/, "", term)
+        if (heredoc_dash) sub(/^[ \t]+/, "", term)
+        if (term == heredoc) heredoc = ""
         continue
       }
       if (depth == 0 && hdepth == 0 && tq == 0 && litend == "" && dqsub == 0) {
@@ -477,6 +489,10 @@ BEGIN {
                    !(tmpl_quotes && index(line, BT) > 0) &&
                    !(rust_lit && index(line, DQ) > 0) &&
                    !(html_lit && (index(line, "<!--") > 0 || index(line, "-->") > 0))) continue
+      }
+      if (lno == 1 && regex_lit && substr(line, 1, 2) == "#!") {
+        check(path, lno, line, substr(line, 3))
+        continue
       }
       text = comment_of(line, style, 0)
       # An apostrophe left open is prose rather than a string, so retry without it.

@@ -517,10 +517,44 @@ describe("comment hygiene gate", () => {
     test("a shell command substitution inside a quoted body holds code", () => {
         const result = scan({
             "cs.sh": 'x="$(printf hi # tracked in magic-context-om3y\n)"',
+            "nest.sh": 'x="$(echo "$(echo hi)")" # tracked in magic-context-om3y',
         });
 
         expect(result.code).toBe(1);
         expect(result.out).toContain("cs.sh:1:");
+        expect(result.out).toContain("nest.sh:1:");
+    });
+
+    test("a shebang may carry options, and its interpreter decides the language", () => {
+        const result = scan({
+            opts: "#!/bin/sh -e\n# tracked in magic-context-om3y",
+            pyshift: "#!/usr/bin/env python3\nvalue = 1 << bits\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("opts:2:");
+        expect(result.out).toContain("pyshift:3:");
+    });
+
+    test("a heredoc terminator is compared literally", () => {
+        const result = scan({
+            "meta.sh": "cat <<'E+F'\n# runtime magic-context-om3y\nE+F\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("meta.sh:2:");
+        expect(result.out).toContain("meta.sh:4:");
+    });
+
+    test("CSS strings escape, and a JavaScript hashbang is a comment", () => {
+        const result = scan({
+            "esc.css": ".x::after { content: 'can\\'t /* magic-context-om3y */'; }",
+            "hb.mjs": "#!/usr/bin/env node magic-context-om3y\nconst a = 1;",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("esc.css:1:");
+        expect(result.out).toContain("hb.mjs:1:");
     });
 
     test("prose, product names, and string literals stay clean", () => {
