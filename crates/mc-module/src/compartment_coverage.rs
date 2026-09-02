@@ -5,7 +5,7 @@
 //! resolve_coverage returns the last compartment's end_message and end_message_id as the coverage end.
 //! resolve_coverage uses the returned coverage end as the combined m0/m1 coverage anchor.
 //! resolve_coverage permits sparse coordinate gaps because store data cannot distinguish retired ordinals from missing live messages.
-//!    gaps are allowed here and live-aware callers guard against dropping present input.
+//! Live-aware callers guard against dropping present input across those gaps.
 
 use mc_store::StoredCompartment;
 
@@ -21,7 +21,6 @@ use mc_store::StoredCompartment;
 /// docs_hash is persisted with rendered m0 bytes as a snapshot marker.
 /// docs_hash is a snapshot marker, not a HARD-fold trigger.
 ///
-///
 /// Content-only staleness may defer until the next HARD fold; composition changes require a HARD.
 /// Changes to `workspace_fingerprint`, `upgrade_state`, or the external memory epoch require a HARD because they alter m0 composition or format.
 /// An external memory-epoch change requires a HARD because m0 cannot otherwise observe the out-of-process edit.
@@ -30,7 +29,6 @@ use mc_store::StoredCompartment;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct M0ContentEpoch {
     /// `workspace_fingerprint` tracks workspace membership and shared-category policy for visible foreign memories.
-    /// visible.
     pub workspace_fingerprint: String,
     /// A session upgrade rewrites the memory pool under the current taxonomy, changing `upgrade_state`.
     pub upgrade_state: String,
@@ -120,9 +118,13 @@ impl std::fmt::Display for CoverageGap {
     }
 }
 
-/// overlap found.
+/// Resolves the terminal coverage and cache anchor from store-ordered compartments.
 ///
-/// The store-only check rejects overlaps (`next.start_message <= prev.end_message`) but allows coordinate gaps.
+/// Coordinate gaps remain valid because retired ordinals are absent from store data.
+///
+/// # Errors
+///
+/// Returns `CoverageGap` when adjacent ranges overlap or fail to increase strictly.
 pub fn resolve_coverage(
     compartments: &[StoredCompartment],
 ) -> Result<Option<CompartmentCoverage>, CoverageGap> {
@@ -148,6 +150,7 @@ pub fn resolve_coverage(
     }))
 }
 
+/// Preserves input order within the folded and later output vectors.
 pub fn partition_by_folded_seq(
     compartments: &[StoredCompartment],
     folded_seq: i64,

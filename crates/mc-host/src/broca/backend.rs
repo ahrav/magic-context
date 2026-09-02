@@ -1,6 +1,7 @@
+//! Backend-neutral execution types for Broca harness requests.
 //!
 //! The supervisor owns admission, identity, status, replay, and lifecycle.
-//! Subprocess adapters and the deterministic test backend implement the same trait, so supervisor behavior never depends on which one runs.
+//! Subprocess adapters and the deterministic test backend implement the same trait, so supervisor behavior does not depend on which one runs.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,6 +17,7 @@ pub enum Harness {
 }
 
 impl Harness {
+    /// Accepts only lowercase harness wire names and returns `None` otherwise.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "opencode" => Some(Self::OpenCode),
@@ -24,6 +26,7 @@ impl Harness {
         }
     }
 
+    /// Returns the canonical lowercase wire name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
@@ -35,14 +38,23 @@ impl Harness {
 /// The supervisor validates `session.send` and route identity before creating a `BackendRequest`.
 #[derive(Clone)]
 pub struct BackendRequest {
+    /// User prompt sent to the selected harness.
     pub prompt: String,
+    /// Optional system prompt sent before the user prompt.
     pub system: Option<String>,
+    /// Provider wire name.
     pub provider: String,
+    /// Provider model wire name.
     pub model: String,
+    /// Maximum number of output tokens requested from the provider.
     pub max_output_tokens: u64,
+    /// Provider sampling temperature.
     pub temperature: f64,
+    /// Harness selected when the route was bound.
     pub harness: Harness,
+    /// Supervisor session identity.
     pub session: String,
+    /// Unique supervisor run identity.
     pub run_id: String,
 }
 
@@ -70,6 +82,7 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
+    /// Returns the spelling preserved on the producer wire.
     pub fn as_wire_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
@@ -89,6 +102,7 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
+    /// Returns the historian producer's wire spelling.
     pub fn as_wire_str(self) -> &'static str {
         match self {
             Self::Transient => "transient",
@@ -102,10 +116,12 @@ impl ErrorClass {
 /// Producer policy consumes `BackendError`'s error class, retry metadata, and bounded provider diagnostics.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BackendError {
+    /// Stable policy class consumed by the historian producer.
     pub class: ErrorClass,
     /// Always host-authored:
     /// `BackendError::message` rides the wire into module state and caller logs, where provider output can echo prompt, memory-pool, or credential content.
     pub message: String,
+    /// Provider retry delay in seconds, when supplied.
     pub retry_after_secs: Option<u64>,
     /// (see `sanitized_provider_code`).
     pub provider_code: Option<String>,
@@ -167,6 +183,7 @@ impl EventSink {
         Self { deliver }
     }
 
+    /// Returns `Closed` when the supervisor no longer accepts events for this run.
     pub fn emit(&self, event: BackendEvent) -> SinkStatus {
         (self.deliver)(event)
     }
@@ -180,11 +197,11 @@ impl std::fmt::Debug for EventSink {
 
 pub type BackendFuture = Pin<Box<dyn Future<Output = BackendTerminal> + Send + 'static>>;
 
+/// Executes harness requests under supervisor cancellation and terminal arbitration.
 ///
 /// Backends emit zero or more events through `events` and observe `cancel`.
 /// After cancellation, control operations wait for this future to resolve.
-/// The supervisor discards terminals returned after cancellation.
-/// first-terminal-wins arbitration.
+/// The supervisor discards terminals returned after cancellation; the first committed terminal wins.
 pub trait LlmExecutionBackend: Send + Sync + 'static {
     fn execute(
         &self,
@@ -202,7 +219,7 @@ pub trait LlmExecutionBackend: Send + Sync + 'static {
     }
 }
 
-///
+/// Routes each request to the backend selected by its bound harness.
 pub struct HarnessDispatchBackend {
     opencode: Arc<dyn LlmExecutionBackend>,
     pi: Arc<dyn LlmExecutionBackend>,
