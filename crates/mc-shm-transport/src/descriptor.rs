@@ -1,3 +1,10 @@
+//! Untrusted shared-memory descriptor types and validation.
+//!
+//! Validation binds each frame to an expected incarnation, lane, and sequence before
+//! exposing spans. Lengths are bytes. Checked arithmetic rejects overflow and arena
+//! wrap metadata must describe one contiguous logical body split across at most two
+//! physical spans.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +20,9 @@ pub const WIRE_V2_HEADER_BYTES: usize = 21;
 /// A complete-frame descriptor contains at most two shared spans.
 pub const MAX_SPANS: usize = 2;
 
-/// Validated opaque hardware-profile identifier.
+/// Opaque hardware-profile identifier containing 1 to 64 safe ASCII characters.
+///
+/// Accepted characters are alphanumeric, `-`, `_`, and `.`. Debug output is redacted.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HardwareProfileId(String);
@@ -43,7 +52,9 @@ impl fmt::Debug for HardwareProfileId {
     }
 }
 
-/// Fixed ring profile identity carried by an authenticated grant.
+/// Fixed schema and hardware profile carried by an authenticated transport grant.
+///
+/// Debug output redacts the profile identifier.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportDescriptor {
     schema_version: u16,
@@ -76,11 +87,14 @@ impl fmt::Debug for TransportDescriptor {
     }
 }
 
-/// Each candidate receives a fresh 128-bit identity.
+/// 128-bit identity separating transport incarnations.
+///
+/// Random construction uses operating-system entropy. Debug output is redacted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Incarnation([u8; 16]);
 
 impl Incarnation {
+    /// Uses operating-system entropy and reports failure as `RandomSourceUnavailable`.
     pub fn random() -> Result<Self, DescriptorError> {
         let mut bytes = [0u8; 16];
         getrandom::getrandom(&mut bytes).map_err(|_| DescriptorError::RandomSourceUnavailable)?;
@@ -103,7 +117,10 @@ impl fmt::Debug for Incarnation {
     }
 }
 
-/// ReleaseIdentity qualifies a completion by incarnation, lane, and sequence.
+/// Completion identity qualified by incarnation, lane, and sequence.
+///
+/// Exact equality across all fields is required before a descriptor can release or
+/// reuse transport state. Debug output is redacted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseIdentity {
     incarnation: Incarnation,
@@ -140,7 +157,10 @@ impl fmt::Debug for ReleaseIdentity {
     }
 }
 
-/// FrameDescriptor stores a complete metadata snapshot received from an untrusted source.
+/// Complete frame metadata snapshot received from an untrusted source.
+///
+/// Construction performs no validation. Call [`FrameDescriptor::validate`] before
+/// using any offset or length. Debug output is redacted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameDescriptor {
     schema_version: u16,
@@ -180,6 +200,12 @@ impl FrameDescriptor {
         }
     }
 
+    /// Validates identity, byte lengths, arena spans, and frozen wire-v2 header fields.
+    ///
+    /// `arena_bytes` is the physical ring size in bytes. A valid logical body occupies
+    /// one span or wraps exactly once into a second span. The allocation may exceed the
+    /// body length but cannot exceed the arena. All additions are checked. This method
+    /// returns a specific [`DescriptorError`] and does not panic.
     pub fn validate(
         self,
         expected: ReleaseIdentity,
@@ -290,6 +316,9 @@ impl fmt::Debug for FrameDescriptor {
     }
 }
 
+/// Frame descriptor whose identity, lengths, spans, and wire header were validated.
+///
+/// Accessors return the exact snapshot checked by [`FrameDescriptor::validate`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedFrame {
     wire_header: [u8; WIRE_V2_HEADER_BYTES],
@@ -337,7 +366,9 @@ impl fmt::Debug for ValidatedFrame {
     }
 }
 
-/// Descriptor-state snapshot.
+/// Counts for mutually exclusive descriptor lifecycle states.
+///
+/// A consistent snapshot conserves configured ring depth across all fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DescriptorCounts {
     /// Reusable descriptors.
@@ -351,6 +382,7 @@ pub struct DescriptorCounts {
 }
 
 impl DescriptorCounts {
+    /// Uses checked addition so corrupt counters cannot wrap into apparent conservation.
     pub fn conserves(self, depth: u64) -> bool {
         [
             self.free,
@@ -377,7 +409,7 @@ pub enum DescriptorError {
     WrongLane,
     /// Sequence is zero or does not match the expected sequence.
     InvalidSequence,
-    /// body_len exceeds MAX_FRAME_BYTES.
+    /// Body length exceeds [`MAX_FRAME_BYTES`].
     FrameTooLarge,
     InvalidAllocation,
     InvalidSpanCount,

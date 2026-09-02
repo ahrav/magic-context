@@ -1,3 +1,9 @@
+//! Synapse job tests pin exact admission limits and process-local lifecycle behavior.
+//!
+//! Jobs survive route loss but not expiry or process incarnation changes. Live work is
+//! never evicted for new admission, and shutdown joins running work without starting
+//! queued work.
+
 mod support;
 
 use std::sync::atomic::Ordering;
@@ -10,6 +16,11 @@ use support::synapse::{
     test_lane, DeterministicEngine, SynapseHost, BUDGET,
 };
 
+/// Polls until a job returns vectors or a terminal error.
+///
+/// # Panics
+///
+/// Panics if the job remains pending beyond [`BUDGET`].
 async fn wait_ready(
     client: &mut support::raw_client::RawClient,
     channel: u16,
@@ -358,7 +369,6 @@ async fn cancelled_query_before_cpu_admission_runs_no_inference() {
     assert_eq!(frame.error_code(), "cancelled");
 
     // The cancelled queued query never reached the engine.
-    // engine.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
     assert_eq!(engine.texts_embedded.load(Ordering::SeqCst), 1);
@@ -454,8 +464,7 @@ async fn failed_jobs_report_their_stored_error() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The result-count invariant failure marks the lane failing; new work is refused.
-    // Later binds reject after the lane fails.
+    // The result-count invariant failure marks the lane failing. New work and later binds are refused.
     let mut params = constraints(&lane);
     params["text"] = "after failure".into();
     let frame = call(&mut client, channel, epoch, "embed.query", params).await;
@@ -531,8 +540,7 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
     // Graceful shutdown joins the running native call, cancels the queued wrapper, and releases retention before the handler drops.
     host.shutdown().await.expect("graceful shutdown");
 
-    // The queued job never ran; the engine received one call for the retained job.
-    // running job.
+    // The queued job never ran; the engine received one call each for the retained and running jobs.
     assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
 }
 
