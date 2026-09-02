@@ -5,6 +5,10 @@
 //! `crates/mc-module/src/historian_chunk.rs`.
 //!
 //! `reference` defines expected behavior; optimized output must match it.
+//!
+//! Budgets are estimated tokens. Prefix positions are UTF-16 code units, matching historian
+//! protocol semantics. The reference backs off a trailing high surrogate before lossy decoding,
+//! so every probe ends on a valid surrogate-pair boundary.
 
 mod reference {
     use mc_tokenizer::estimate_tokens;
@@ -58,6 +62,7 @@ use mc_module::historian_chunk::truncate_historian_input_if_needed;
 use mc_tokenizer::estimate_tokens;
 use proptest::prelude::*;
 
+/// Generates text that stresses token boundaries, whitespace, and surrogate pairs.
 fn fragment() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("The historian summarizes long sessions into compartments. ".to_string()),
@@ -76,6 +81,7 @@ fn fragment() -> impl Strategy<Value = String> {
     ]
 }
 
+/// Builds bounded documents for exact-budget and small-window comparisons.
 fn document() -> impl Strategy<Value = String> {
     proptest::collection::vec(fragment(), 0..24).prop_map(|frags| frags.concat())
 }

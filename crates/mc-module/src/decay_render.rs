@@ -12,6 +12,7 @@
 use mc_core::decay::{compute_budget_pressure, rendered_tier, DecayInput};
 use mc_store::StoredCompartment;
 
+/// Default hard budget measured by the caller's token estimator.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: u32 = 60_000;
 
 /// `p1` must be non-empty for a row to use v2 tier rendering.
@@ -53,6 +54,10 @@ impl From<&StoredCompartment> for DecayRenderCompartment {
     }
 }
 
+/// Projects stored rows and renders them in caller-provided chronological order.
+///
+/// `history_budget_tokens` and `estimate_tokens` must use the same token unit. Positive budgets
+/// enable oldest-first guard demotion; nonpositive budgets skip that guard.
 pub fn render_stored_compartments(
     compartments: &[StoredCompartment],
     history_budget_tokens: f64,
@@ -187,7 +192,10 @@ fn legacy_tier(c: &DecayRenderCompartment) -> u8 {
     }
 }
 
-/// `m1` renders new compartments at P1, bypassing decay.
+/// Renders one compartment at an explicit tier without applying decay or a token budget.
+///
+/// Tiers 1 through 4 select progressively denser output. Tier 5 and larger archive the row and
+/// return an empty string.
 pub fn render_compartment_at_tier(c: &DecayRenderCompartment, tier: u8) -> String {
     render_one_compartment(c, tier)
 }
@@ -270,8 +278,13 @@ fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -
         .collect()
 }
 
-/// The renderer returns the decayed compartment-history body without a `<session-history>` wrapper.
-/// The renderer never renders session facts.
+/// Renders a decayed compartment-history body without a `<session-history>` wrapper.
+///
+/// Input order must be chronological from oldest to newest because curve indexing and guard
+/// demotion depend on position. The renderer never emits session facts. `history_budget_tokens`
+/// and `estimate_tokens` must use the same token unit. For a positive budget, the guard demotes
+/// oldest rows first until output fits or every row reaches tier 5. Nonpositive budgets disable
+/// the guard.
 pub fn render_decayed_compartments(
     compartments: &[DecayRenderCompartment],
     history_budget_tokens: f64,
@@ -316,8 +329,10 @@ pub fn render_decayed_compartments(
     body
 }
 
-/// The parser returns the first `<tag>…</tag>` slice, or `None`.
-/// first `<tag>`.
+/// Returns the first complete `<tag>...</tag>` slice in byte order.
+///
+/// Returns `None` when the opening delimiter is absent or no closing delimiter follows it.
+/// Delimiters are matched literally without XML parsing or nesting validation.
 pub fn extract_m0_block(m0_text: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");

@@ -59,6 +59,7 @@ pub enum FrameType {
 }
 
 impl FrameType {
+    /// Returns `None` for bytes not assigned by protocol version 2.
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             0 => Self::Request,
@@ -305,9 +306,11 @@ fn header_len_for_version(ver: u8) -> Option<usize> {
     }
 }
 
-/// frozen-prefix discipline:
+/// Decodes and validates one envelope header.
 ///
-/// `decode_header` returns a typed [`DecodeError`] instead of panicking on malformed input.
+/// Only the first version-specific header bytes are read; trailing body bytes are ignored.
+/// Malformed input returns a typed [`DecodeError`] without panicking. Validation covers version,
+/// frame type, reserved flags, admission class, channel epoch, and pure-header body length.
 pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     if bytes.len() < FROZEN_PREFIX_LEN {
         return Err(DecodeError::TooShortForPrefix { have: bytes.len() });
@@ -373,8 +376,10 @@ pub const MAX_BODY_LEN: u32 = MAX_FRAME_BODY_LEN;
 
 pub const MAX_CONTROL_BODY_LEN: u32 = 65_536;
 
+/// Shared byte-counting budget for concurrent ingress work.
 ///
-/// wait.
+/// Charges hold semaphore permits until dropped. [`ByteBudget::charge`] waits for capacity;
+/// [`ByteBudget::try_charge`] returns immediately and never acquires a partial charge.
 #[derive(Clone)]
 pub struct ByteBudget {
     semaphore: Arc<Semaphore>,
@@ -382,6 +387,11 @@ pub struct ByteBudget {
 }
 
 impl ByteBudget {
+    /// Fixes capacity for the lifetime of this budget and all its clones.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the platform-converted count exceeds Tokio's semaphore permit limit.
     pub fn new(max_bytes: u64) -> Self {
         let capacity = max_bytes as usize;
         Self {
@@ -394,6 +404,10 @@ impl ByteBudget {
         self.capacity
     }
 
+    /// Waits until exactly `bytes` permits can be acquired.
+    ///
+    /// Cancellation before completion acquires no permits. This type never closes its semaphore,
+    /// so the internal closed-semaphore expectation is an invariant.
     pub async fn charge(&self, bytes: u32) -> ByteCharge {
         let permit = self
             .semaphore
@@ -406,6 +420,10 @@ impl ByteBudget {
         }
     }
 
+    /// Tries to acquire exactly `bytes` permits without waiting.
+    ///
+    /// Returns `None` when `bytes` exceeds `u32`, exceeds total capacity, or is not currently
+    /// available. A zero-byte request succeeds with an unbacked charge.
     pub fn try_charge(&self, bytes: usize) -> Option<ByteCharge> {
         let bytes = u32::try_from(bytes).ok()?;
         if bytes == 0 {
@@ -504,6 +522,7 @@ impl FrameId {
     }
 }
 
+/// Reports a body length that the frame protocol cannot encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeError {
     pub body_len: usize,
@@ -540,6 +559,10 @@ pub fn encode_frame(
     Ok(buf)
 }
 
+/// Prepends a wire-v2 header to an owned body.
+///
+/// Returns [`EncodeError`] when the body exceeds [`MAX_FRAME_BODY_LEN`]. This encoder assumes the
+/// caller supplies protocol-valid flags and channel epoch values; decoding performs validation.
 pub fn encode_owned_frame(
     ty: FrameType,
     flags: Flags,
@@ -575,6 +598,10 @@ pub fn encode_owned_frame(
 /// the body.
 const SPLIT_WRITE_MIN_BODY: usize = 16 * 1024;
 
+/// Encodes small bodies contiguously and large bodies as a header and unchanged tail.
+///
+/// Bodies below 16 KiB use the contiguous representation. Bodies above
+/// [`MAX_FRAME_BODY_LEN`] return [`EncodeError`].
 pub fn encode_split_frame(
     ty: FrameType,
     flags: Flags,
