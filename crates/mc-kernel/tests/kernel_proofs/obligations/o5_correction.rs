@@ -34,13 +34,17 @@ fn snapshots(proof: &Proof) -> Frozen {
         .collect()
 }
 
+fn table_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Domain => "domains",
+        Kind::Decision => "decisions",
+    }
+}
+
 /// The typed table's own lifecycle columns, which `content` excludes and the
 /// registry assertions never read.
 fn lifecycle(proof: &Proof, kind: Kind) -> BTreeMap<String, (Option<i64>, Option<String>)> {
-    let table = match kind {
-        Kind::Domain => "domains",
-        Kind::Decision => "decisions",
-    };
+    let table = table_name(kind);
     proof
         .db()
         .prepare(&format!(
@@ -57,10 +61,7 @@ fn lifecycle(proof: &Proof, kind: Kind) -> BTreeMap<String, (Option<i64>, Option
 /// `invalidated_commit_seq` and `superseded_by` are excluded because
 /// corrections update predecessor rows.
 fn content(proof: &Proof, kind: Kind) -> BTreeMap<String, String> {
-    let table = match kind {
-        Kind::Domain => "domains",
-        Kind::Decision => "decisions",
-    };
+    let table = table_name(kind);
     let db = proof.db();
     // Reading the column list from the live schema covers columns added later.
     let columns = db
