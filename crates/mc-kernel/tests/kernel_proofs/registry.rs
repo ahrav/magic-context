@@ -64,6 +64,7 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.26",
     "magic-context-kh8.27",
     "magic-context-kh8.28",
+    "magic-context-kh8.30",
 ];
 
 const KERNEL_ADMISSION: &str = "tests/kernel_admission.rs";
@@ -330,6 +331,7 @@ registry_enum! {
         R8CapConfigurable,
         R9PayloadCap,
         R10SensitivityAtIngestion,
+        R10RedactionMetadata,
         R11EgressEligibility,
         R11EgressGate,
         R11ExtractionDelegation,
@@ -358,6 +360,7 @@ impl PolicyRow {
                     tests: &[
                         Test { path: KERNEL_SLICE_FIXTURES, function: "false_lru_classification_is_corrected_append_only" },
                         Test { path: KERNEL_SCHEMA, function: "replace_cannot_bypass_the_append_only_guards" },
+                        Test { path: KERNEL_SCHEMA, function: "canonical_parents_refuse_deletion_instead_of_cascading" },
                         Test { path: KERNEL_DELETION, function: "deletion_invalidates_every_reference_in_one_commit_and_emits_complete_target_work" },
                         Test { path: PROOFS_O5, function: "correction_chains_preserve_every_prior_snapshot_and_predecessor" },
                     ],
@@ -399,6 +402,7 @@ impl PolicyRow {
                 status: Status::Landed {
                     tests: &[
                         Test { path: KERNEL_RETENTION, function: "renew_advances_the_lease_and_never_shortens_it" },
+                        Test { path: KERNEL_RETENTION, function: "renew_rejects_an_unknown_run_a_backwards_heartbeat_and_an_expired_lease" },
                         Test { path: KERNEL_RETENTION, function: "reaper_abandons_a_run_at_exactly_its_stored_lease_expiry" },
                         Test { path: KERNEL_RETENTION, function: "completed_staging_survives_day_29_and_is_deleted_day_31" },
                         Test { path: KERNEL_RETENTION, function: "staging_cleanup_preserves_exact_denormalized_admission_facts" },
@@ -488,6 +492,14 @@ impl PolicyRow {
                         Test { path: KERNEL_ADMISSION, function: "taint_sensitivity_floor_applies_to_existing_canonical_objects" },
                         Test { path: KERNEL_ADMISSION, function: "dispositions_and_sensitivity_only_reduce_visibility" },
                     ],
+                },
+            },
+            PolicyRow::R10RedactionMetadata => Row {
+                id: "kh8.1 R10/metadata",
+                claim: "redaction metadata carries only detector id, secret type, offset, and length",
+                status: Status::Contradiction {
+                    bead: "magic-context-kh8.30",
+                    policy_text: "R10 restricts persisted detection metadata to detector id, secret type, source UTF-8 offset, and source UTF-8 length. Production also persists a field key, and staging_metadata_retains_no_verifier_for_a_redacted_secret asserts all five while its message names only four.",
                 },
             },
             PolicyRow::R11EgressEligibility => Row {
@@ -756,6 +768,9 @@ pub fn validate(rows: &[Row], catalog: &Catalog, known_beads: &[&str]) -> Result
     }
 }
 
+/// The `cfg` conditions CI satisfies for every kernel test target, so a named oracle behind one still reaches the harness.
+const CI_ENABLED_CFG: &[&str] = &["unix", "feature = \"test-support\""];
+
 fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
     let source = match catalog.get(test.path) {
         Some(Some(source)) => source,
@@ -774,6 +789,23 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
     let target = owning_test_target(test.path).map(|target| format!("--test {target} "));
     for line in &attributes {
         let line = line.trim();
+        // Cargo omits tests disabled by unsatisfied `cfg` values from the harness; accept only conditions CI is known to satisfy.
+        if let Some(condition) = line
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+        {
+            if !CI_ENABLED_CFG.contains(&condition) {
+                return Err(format!(
+                    "{}::{} is behind #[cfg({condition})], which is not known to be enabled",
+                    test.path, test.function
+                ));
+            }
+        } else if line.starts_with("#[cfg_attr(") {
+            return Err(format!(
+                "{}::{} is behind #[cfg_attr(..)]; name an unconditional oracle",
+                test.path, test.function
+            ));
+        }
         if line.starts_with("#[ignore") {
             // The rerun command has to select this ignored test in the package
             // and test target that own its file; `cargo test` runs no ignored
@@ -940,6 +972,8 @@ const IGNORED_WRONG_PACKAGE: &str =
 const IGNORED_WRONG_TARGET: &str =
     "#[test]\n#[ignore = \"run with: cargo test -p mc-kernel --test other proven -- --ignored\"]\nfn proven() {}\n";
 const RENAMED_TO_COMMENT: &str = "#[test]\n// formerly fn proven()\nfn renamed() {}\n";
+const CFG_DISABLED: &str = "#[test]\n#[cfg(any())]\nfn proven() {}\n";
+const CFG_ENABLED: &str = "#[test]\n#[cfg(unix)]\nfn proven() {}\n";
 const DUPLICATED: &str = "#[test]\nfn proven() {}\nmod inner { #[test]\nfn proven() {} }\n";
 
 #[test]
@@ -964,7 +998,7 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
         .filter(|row| matches!(row.status, Status::Contradiction { .. }))
         .count();
     assert!(landed > pending, "{landed} landed, {pending} pending");
-    assert_eq!(contradicted, 2);
+    assert_eq!(contradicted, 3);
 }
 
 #[test]
@@ -1026,6 +1060,21 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     )
     .unwrap_err();
     assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // A `cfg` CI does not satisfy keeps the oracle out of the harness.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(CFG_DISABLED))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("#[cfg(any())]"), "{errors:?}");
+    validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(CFG_ENABLED))]),
+        &[],
+    )
+    .unwrap();
 }
 
 #[test]
