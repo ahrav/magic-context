@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier,
     },
+    time::Duration,
 };
 
 #[path = "support/scan_audit.rs"]
@@ -24,10 +25,7 @@ use mc_store::{
     NoteEvaluationInput, NoteInput, NoteTransitionInput, NoteWriteInput, StoredCompartment,
     TailHygieneBaseline, DURABLE_WRITE_REGISTRY,
 };
-use rusqlite::{
-    backup::{Backup, StepResult},
-    Connection,
-};
+use rusqlite::{backup::Backup, Connection};
 use scan_audit::{scan_audit_counts, ScanAuditCounts};
 use serde::Deserialize;
 use serde_json::json;
@@ -160,6 +158,9 @@ fn active_note_scan_audit_is_atomic_complete_and_opaque() {
             .windows(forbidden.len())
             .any(|window| window == forbidden.as_bytes()));
     }
+    // A detection row may carry only identity, ordinal, and bounded classifier metadata.
+    // Any new column must be added here deliberately, so a byte offset, span length, or
+    // matched text cannot appear under an unanticipated name.
     let columns = connection
         .prepare("PRAGMA table_info(mc_scan_detections)")
         .unwrap()
@@ -167,11 +168,17 @@ fn active_note_scan_audit_is_atomic_complete_and_opaque() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert!(!columns.iter().any(|column| {
-        ["offset", "length", "start", "end"]
-            .iter()
-            .any(|forbidden| column.contains(forbidden))
-    }));
+    assert_eq!(
+        columns,
+        [
+            "scan_id",
+            "detection_ordinal",
+            "exactness",
+            "label_id",
+            "span_kind",
+            "action",
+        ]
+    );
     drop(connection);
     drop(store);
     let reopened = McStore::open(&descriptor).unwrap();
@@ -356,16 +363,20 @@ fn lineage_copy_links_source_scans_without_rescanning_and_survives_source_deleti
         .collect::<rusqlite::Result<BTreeSet<_>>>()
         .unwrap();
     assert!(!source_scan_ids.is_empty());
-    let copied_content_scans_before: i64 = connection
-        .query_row(
-            "SELECT COUNT(DISTINCT scans.scan_id)
-               FROM mc_field_scans scans
-               JOIN mc_scan_owner_copies copies USING(scan_id)
-              WHERE copies.field_id='content' AND scans.finding_count>0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    // Descent scans the target metadata it writes, so total scans grow; the source's
+    // password detection must not be rescanned.
+    let secret_scans = |connection: &Connection| -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(DISTINCT scan_id) FROM mc_scan_detections
+                  WHERE label_id='password'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let secret_scans_before = secret_scans(&connection);
+    assert!(secret_scans_before > 0);
     drop(connection);
 
     let constituents = [LineageConstituent {
@@ -396,17 +407,11 @@ fn lineage_copy_links_source_scans_without_rescanning_and_survives_source_deleti
     assert_eq!(outcome.disposition, LineageDescentDisposition::Descended);
 
     let connection = Connection::open(temp.path().join("store.db")).unwrap();
-    let copied_content_scans_after: i64 = connection
-        .query_row(
-            "SELECT COUNT(DISTINCT scans.scan_id)
-               FROM mc_field_scans scans
-               JOIN mc_scan_owner_copies copies USING(scan_id)
-              WHERE copies.field_id='content' AND scans.finding_count>0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(copied_content_scans_after, copied_content_scans_before);
+    assert_eq!(
+        secret_scans(&connection),
+        secret_scans_before,
+        "lineage copy rescanned the source instead of linking its scans"
+    );
     for scan_id in &source_scan_ids {
         let owner_count: i64 = connection
             .query_row(
@@ -458,15 +463,9 @@ fn sqlite_online_backup_preserves_active_scan_audit_rows() {
     let mut restored_connection = Connection::open(restored.path().join("store.db")).unwrap();
     {
         let backup = Backup::new(&source_connection, &mut restored_connection).unwrap();
-        loop {
-            match backup.step(64).unwrap() {
-                StepResult::Done => break,
-                StepResult::More | StepResult::Busy | StepResult::Locked => {
-                    std::thread::yield_now();
-                }
-                _ => panic!("unexpected SQLite backup result"),
-            }
-        }
+        backup
+            .run_to_completion(64, Duration::from_millis(1), None)
+            .unwrap();
     }
     drop(restored_connection);
     drop(source_connection);
@@ -774,10 +773,98 @@ fn mural_artifacts_reject_secret_bytes_hashes_and_new_identity() {
         assert!(matches!(error, mc_store::McStoreError::Redaction(_)));
         assert!(!error.to_string().contains("secret"));
     }
+    let persisted: i64 = Connection::open(temp.path().join("store.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM mc_project_mural_artifacts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted, 0,
+        "a rejected artifact was stored under some project key"
+    );
     assert!(store
         .load_project_mural_artifact("project")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn workspace_member_seed_redacts_share_categories_and_rejects_secret_identities() {
+    let temp = tempfile::tempdir().unwrap();
+    let descriptor = McStore::test_descriptor(temp.path(), "production-redaction-workspace");
+    let store = McStore::open(&descriptor).unwrap();
+
+    store
+        .seed_workspace_member(
+            "workspace",
+            "project",
+            r#"["CONSTRAINTS","password=share-secret"]"#,
+        )
+        .unwrap();
+    let connection = Connection::open(temp.path().join("store.db")).unwrap();
+    let (share_categories, members): (String, i64) = connection
+        .query_row(
+            "SELECT share_categories,
+                    (SELECT COUNT(*) FROM mc_workspace_members)
+               FROM mc_workspaces WHERE name = 'workspace'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(share_categories.contains("CONSTRAINTS"));
+    assert!(
+        share_categories.contains("<REDACTED:"),
+        "{share_categories}"
+    );
+    assert!(!share_categories.contains("share-secret"));
+    assert_eq!(members, 1);
+    let seeded_audit = ScanAuditCounts {
+        batches: 1,
+        owner_scopes: 1,
+        domain_owners: 1,
+        field_scans: 3,
+        owner_copies: 3,
+        detections: 1,
+    };
+    assert_eq!(scan_audit_counts(temp.path()), seeded_audit);
+    drop(connection);
+
+    for (workspace, project_path) in [
+        ("password=workspace-secret", "project"),
+        ("other-workspace", "password=path-secret"),
+    ] {
+        let error = store
+            .seed_workspace_member(workspace, project_path, "[]")
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("secret"));
+    }
+    let connection = Connection::open(temp.path().join("store.db")).unwrap();
+    let (workspaces, members): (i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM mc_workspaces),
+                    (SELECT COUNT(*) FROM mc_workspace_members)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((workspaces, members), (1, 1));
+    assert_eq!(scan_audit_counts(temp.path()), seeded_audit);
+    let family = store_family_bytes(temp.path(), "CONSTRAINTS");
+    for forbidden in ["share-secret", "workspace-secret", "path-secret"] {
+        assert!(!family
+            .windows(forbidden.len())
+            .any(|window| window == forbidden.as_bytes()));
+    }
 }
 
 #[test]
@@ -1362,12 +1449,40 @@ fn fresh_claim_intent_identities_and_integrity_payloads_reject() {
     let temp = tempfile::tempdir().unwrap();
     let descriptor = McStore::test_descriptor(temp.path(), "production-redaction-claim-intent");
     let store = McStore::open(&descriptor).unwrap();
+
+    // Staging checks the route's memories authority before it checks identities, so an
+    // unmanaged route would refuse both requests without reaching redaction.
+    store
+        .bind_authority_route("store-uuid", "project", "route")
+        .unwrap();
+    let preparing = store
+        .authority_begin_prepare("store-uuid", "project", "memories")
+        .unwrap();
+    let authority = store
+        .authority_finish_prepare(
+            "store-uuid",
+            "project",
+            "memories",
+            preparing.generation,
+            "same",
+            "same",
+            true,
+        )
+        .unwrap();
     let binding = ClaimIntentBinding {
         database_incarnation_id: "0123456789abcdef0123456789abcdef".to_string(),
         format_epoch: 1,
         authority_project: "project".to_string(),
-        authority_generation: 1,
+        authority_generation: authority.generation,
     };
+    let clean_identity = ClaimCommandIdentity {
+        producer: "producer".to_string(),
+        operation_key: "operation".to_string(),
+    };
+    store
+        .stage_claim_intent("route", &binding, &clean_identity, &json!({}), 1)
+        .unwrap();
+
     let secret_identity = ClaimCommandIdentity {
         producer: "producer".to_string(),
         operation_key: "password=operation-secret".to_string(),
@@ -1375,24 +1490,42 @@ fn fresh_claim_intent_identities_and_integrity_payloads_reject() {
     let error = store
         .stage_claim_intent("route", &binding, &secret_identity, &json!({}), 1)
         .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+        ),
+        "{error:?}"
+    );
     assert!(!error.to_string().contains("operation-secret"));
+    assert!(store
+        .inspect_claim_intent(&secret_identity)
+        .unwrap()
+        .is_none());
 
-    let clean_identity = ClaimCommandIdentity {
+    let request_identity = ClaimCommandIdentity {
         producer: "producer".to_string(),
-        operation_key: "operation".to_string(),
+        operation_key: "request".to_string(),
     };
     let error = store
         .stage_claim_intent(
             "route",
             &binding,
-            &clean_identity,
+            &request_identity,
             &json!({"content":"password=request-secret"}),
             1,
         )
         .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            McStoreError::Redaction(RedactionErrorKind::SecretDetected)
+        ),
+        "{error:?}"
+    );
     assert!(!error.to_string().contains("request-secret"));
     assert!(store
-        .inspect_claim_intent(&clean_identity)
+        .inspect_claim_intent(&request_identity)
         .unwrap()
         .is_none());
 }
