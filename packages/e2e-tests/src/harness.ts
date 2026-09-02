@@ -56,6 +56,14 @@ export interface SdkClient extends SdkClientCore {
  */
 export const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
 
+/** Thrown by `sendPrompt` when its timer wins the race; `pending` is the SDK request the timer abandoned, which the server and provider are still executing. */
+export class PromptTimeoutError extends Error {
+    constructor(message: string, readonly pending: Promise<unknown>) {
+        super(message);
+        this.name = "PromptTimeoutError";
+    }
+}
+
 export class TestHarness {
     readonly mock: MockProvider;
     readonly opencode: SpawnedOpencode;
@@ -232,8 +240,11 @@ export class TestHarness {
         );
         const result = await Promise.race([promptPromise, timeout]);
         if (result === null) {
-            throw new Error(
+            /** The SDK request is still running when the race is lost, and the provider still bills it. The promise rides on the error so a caller that accounts for spend can wait for or observe the request instead of losing it with the wrapper. Its own rejection is observed here so an abandoned request cannot surface as an unhandled rejection. commentlint: allow(JUDGE) */
+            promptPromise.catch(() => {});
+            throw new PromptTimeoutError(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencode.stderr().slice(-2000)}`,
+                promptPromise,
             );
         }
         return result;

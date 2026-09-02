@@ -132,9 +132,9 @@ jobs:
           bun packages/e2e-tests/scripts/run-paired-delta.ts "${ARGS[@]}"
 
       # Cache entries are immutable, so the attempt is part of the key: a rerun writes its own accumulated progress instead of failing to replace the first attempt's checkpoint.
-      # Saved after every outcome, including `usage-unmeasured`: that attempt's entry carries the `.unmeasured` marker, restore prefers the newest match, and the runner refuses a marked path, so an older attempt's checkpoint cannot be resumed around it.
+      # Saved after every outcome, including `usage-unmeasured`: that attempt's entry carries the `.unmeasured` marker, restore prefers the newest match, and the runner refuses a marked path, so an older attempt's checkpoint cannot be resumed around it. The condition tests either file, because a first rollout whose record never published leaves a marker with no records file beside it.
       - name: Save rollout records for the next attempt
-        if: always() && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE)) != ''
+        if: always() && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE), format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json.unmeasured', env.PAIRED_DELTA_MODE)) != ''
         uses: actions/cache/save@v4
         with:
           path: |

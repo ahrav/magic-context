@@ -9,7 +9,7 @@ import manifestJson from "../pools/paired-delta-manifest.json";
 import policyJson from "../pools/paired-delta-policy.json";
 import { ballastProse } from "../src/ballast";
 import { compareCodeUnits } from "../src/code-unit-order";
-import { TestHarness, type TestHarnessOptions } from "../src/harness";
+import { PromptTimeoutError, TestHarness, type TestHarnessOptions } from "../src/harness";
 import { MagicContextRpcClient } from "../../plugin/src/shared/rpc-client";
 import { storageSubtreePath } from "../../plugin/src/shared/data-path";
 import { CHARS_PER_TOKEN } from "../src/ballast";
@@ -109,6 +109,8 @@ const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
 /** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. commentlint: allow(JUDGE) */
 async function runOrReportInvalidRecords(
     run: () => Promise<PairedDeltaRunResult>,
+    /** Called for a publication that lost its lock: unlike a malformed file, that error follows a paid rollout whose record is not in the file, so the caller records the refusal to resume before the shared exit code is set. commentlint: allow(JUDGE) */
+    onPublishConflict: () => void = () => {},
 ): Promise<PairedDeltaRunResult | null> {
     try {
         return await run();
@@ -117,6 +119,7 @@ async function runOrReportInvalidRecords(
         const inspectable = error instanceof RolloutRecordsInvalidError ||
             error instanceof RolloutStorePublishConflictError;
         if (!inspectable) throw error;
+        if (error instanceof RolloutStorePublishConflictError) onPublishConflict();
         console.error(`paired-delta: ${(error as Error).message}`);
         process.exitCode = EXIT_CODES["invalid-stored-records"];
         return null;
@@ -1382,6 +1385,10 @@ export function createLiveDependencies(input: {
                 inFlight = promise;
                 try {
                     return await promise;
+                } catch (error) {
+                    /** The harness's own timer loses the race but does not stop the request; the SDK call it abandoned is what the provider is still billing, so that is what stays in flight. commentlint: allow(JUDGE) */
+                    if (error instanceof PromptTimeoutError) inFlight = error.pending;
+                    throw error;
                 } finally {
                     if (inFlight === promise) inFlight = null;
                 }
@@ -2172,6 +2179,8 @@ async function runLive(args: CliArgs): Promise<void> {
         }
     };
     let result: PairedDeltaRunResult | null = null;
+    /** Set once `runOrReportInvalidRecords` has classified and reported an error itself; those are pre-rollout validation failures that already refuse resume with their own code and must not also be marked unmeasured, which would hide the actual record problem on the next attempt. commentlint: allow(JUDGE) */
+    let handled = false;
     try {
         result = await runOrReportInvalidRecords(() => runPairedDelta(
             {
@@ -2200,10 +2209,11 @@ async function runLive(args: CliArgs): Promise<void> {
                 providerId: model.providerId,
                 modelId: model.modelId,
             }),
-        ));
+        ), () => writeUnmeasuredMarker("publish-conflict", null));
+        handled = result === null;
     } finally {
-        /** A returned result, even a failed one, has published every record it paid for; only an escape has not. commentlint: allow(JUDGE) */
-        if (result === null) writeUnmeasuredMarker("run-escaped", null);
+        /** A returned result, even a failed one, has published every record it paid for, and a handled validation failure ran no rollout; only an escape has spent without recording. commentlint: allow(JUDGE) */
+        if (result === null && !handled) writeUnmeasuredMarker("run-escaped", null);
     }
     if (result === null) return;
     /** Written before any report or calibration work, which can throw — an unwritable `--report` destination, a malformed record — and would otherwise leave the records file unmarked for the always-on cache save. commentlint: allow(JUDGE) */
