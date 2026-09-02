@@ -41,19 +41,19 @@ if [ -n "$staged" ] && [ -x scripts/check-comments.sh ]; then
 
   # A partially staged file differs from its working-tree copy, so the scan reads
   # index content to judge what the commit will actually contain.
-  printf '%s\n' "$staged" | while IFS= read -r f; do
+  # A heredoc keeps the loop in this shell, so a path holding whitespace stays one
+  # argument and a materialization failure aborts the commit.
+  set --
+  while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in */*) mkdir -p "$work/${f%/*}" || exit 1 ;; esac
     git cat-file blob ":$f" > "$work/$f" || exit 1
-  done || exit 1
+    set -- "$@" "$work/$f"
+  done <<STAGED
+$staged
+STAGED
 
-  paths=""
-  for f in $staged; do
-    paths="$paths $work/$f"
-  done
-
-  # shellcheck disable=SC2086
-  if ! out=$("$root/scripts/check-comments.sh" $paths 2>&1); then
+  if ! out=$("$root/scripts/check-comments.sh" "$@" 2>&1); then
     printf '%s\n' "$out" | sed "s|$work/||g" >&2
     exit 1
   fi

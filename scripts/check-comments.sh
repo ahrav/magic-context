@@ -63,6 +63,11 @@ function style_of(p) {
   return "c"
 }
 
+# A Rust apostrophe introduces a lifetime, so string-delimiter handling there would consume the rest of the line.
+function apostrophe_quotes(p) {
+  return (p ~ /\.rs$/) ? 0 : 1
+}
+
 # Quote tracking keeps a delimiter inside a string literal from opening a comment.
 # Only block-comment state survives across lines, so an unbalanced quote cannot desync the next line.
 function comment_of(line, st,   i, n, c, two, rest, e, prev, q, out) {
@@ -85,7 +90,7 @@ function comment_of(line, st,   i, n, c, two, rest, e, prev, q, out) {
       i++
       continue
     }
-    if (c == DQ || c == SQ || c == BT) { q = c; i++; continue }
+    if (c == DQ || c == BT || (c == SQ && sq_quotes)) { q = c; i++; continue }
     if (st == "hash") {
       if (c == "#") return out " " substr(line, i + 1)
       i++
@@ -130,8 +135,8 @@ function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base) {
       if (t == "") continue
       dot = index(t, ".")
       base = (dot > 0) ? substr(t, 1, dot - 1) : t
-      if (!(base in bead_base)) continue
-      # A bare all-letter base reads as prose, while a dotted or digit-bearing base reads as a citation.
+      if (!(t in bead_id)) continue
+      # A bare all-letter ID reads as prose, while a dotted or digit-bearing one reads as a citation.
       if (dot > 0 || base ~ /[0-9]/) { hit = 1; break }
     }
   }
@@ -153,15 +158,14 @@ BEGIN {
 
   parts_n = split(BEAD_IDS, parts, " ")
   for (k = 1; k <= parts_n; k++) {
-    at = index(parts[k], ".")
-    stem = (at > 0) ? substr(parts[k], 1, at - 1) : parts[k]
-    if (stem != "") bead_base[stem] = 1
+    if (parts[k] != "") bead_id[parts[k]] = 1
   }
 
   status = 0
   while ((lrc = (getline path < LISTFILE)) > 0) {
     if (path == "" || excluded(path) || !wanted(path)) continue
     style = style_of(path)
+    sq_quotes = apostrophe_quotes(path)
     inblock = 0
     lno = 0
     while ((frc = (getline line < path)) > 0) {

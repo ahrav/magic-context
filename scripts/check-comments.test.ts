@@ -9,13 +9,12 @@ const gate = join(repoRoot, "scripts", "check-comments.sh");
 
 // The short-form lookup only recognizes exported IDs, so the fixtures cite a real
 // one drawn from the export rather than an invented token.
-function exportedShortId(): string {
+function exportedDottedId(): string {
     const export_ = readFileSync(join(repoRoot, ".beads", "issues.jsonl"), "utf8");
-    for (const match of export_.matchAll(/magic-context-([a-z0-9]{3,4})\b/g)) {
-        const suffix = match[1]!;
-        if (/[0-9]/.test(suffix)) return suffix;
+    for (const match of export_.matchAll(/magic-context-([a-z0-9]{2,4}\.[0-9]+)\b/g)) {
+        return match[1]!;
     }
-    throw new Error("the ID export holds no digit-bearing short form");
+    throw new Error("the ID export holds no dotted short form");
 }
 
 function scan(files: Record<string, string>): { code: number; out: string } {
@@ -53,10 +52,10 @@ describe("comment hygiene gate", () => {
     });
 
     test("an allowed token elsewhere on the line cannot hide an ID", () => {
-        const short = exportedShortId();
+        const dotted = exportedDottedId();
         const result = scan({
             "b.rs": [
-                `// see ${short}.6 in resolve.rs for details`,
+                `// see ${dotted} in resolve.rs for details`,
                 "// tracked in magic-context-om3y, see rfc7231 and p99.9",
             ].join("\n"),
         });
@@ -64,6 +63,23 @@ describe("comment hygiene gate", () => {
         expect(result.code).toBe(1);
         expect(result.out).toContain("b.rs:1:");
         expect(result.out).toContain("b.rs:2:");
+    });
+
+    test("a Rust lifetime does not hide the comment after it", () => {
+        const result = scan({
+            "life.rs": "fn borrow<'a>(value: &str) { // tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("life.rs:1:");
+    });
+
+    test("a dotted token sharing a real ID stem stays clean", () => {
+        const stem = exportedDottedId().split(".")[0]!;
+        const result = scan({ "stem.rs": `// the RFC cites ${stem}.999999 in the spec` });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
     });
 
     test("prose, product names, and string literals stay clean", () => {
