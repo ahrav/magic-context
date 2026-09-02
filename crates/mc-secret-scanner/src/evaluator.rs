@@ -56,6 +56,8 @@ pub(crate) fn evaluate(
         });
     }
 
+    let input_is_ascii = input.is_ascii();
+
     'rules: for rule in rules.preselect(profile, bytes) {
         if add_work(&mut work, bytes.len(), limits.max_work_bytes).is_err() {
             limits_hit = Some(LimitExhausted::Work);
@@ -65,7 +67,7 @@ pub(crate) fn evaluate(
         {
             continue;
         }
-        if rule.declaration.name == "magic-keyed-assignment" && input.is_ascii() {
+        if rule.declaration.name == "magic-keyed-assignment" && input_is_ascii {
             let mut cursor = 0;
             while let Some(equals) =
                 memchr::memchr(b'=', &bytes[cursor..]).map(|equals| cursor + equals)
@@ -100,7 +102,7 @@ pub(crate) fn evaluate(
             }
             continue;
         }
-        if input.is_ascii() {
+        if input_is_ascii {
             if let Some(value_quote) = ascii_assignment_quoted_rule(rule.declaration.name.as_str())
             {
                 let mut cursor = 0;
@@ -139,7 +141,7 @@ pub(crate) fn evaluate(
                 continue;
             }
         }
-        if input.is_ascii() {
+        if input_is_ascii {
             if let Some((key_quote, value_quote)) =
                 ascii_quoted_keyed_rule(rule.declaration.name.as_str())
             {
