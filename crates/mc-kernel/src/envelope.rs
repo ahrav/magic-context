@@ -19,9 +19,8 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
-    // Only the policy digest enumerates the vocabulary.
-    #[cfg(test)]
-    pub(super) const ALL: &'static [Self] = &[Self::Normal, Self::Sensitive, Self::Secret];
+    /// The whole vocabulary, in increasing strictness.
+    pub const ALL: &'static [Self] = &[Self::Normal, Self::Sensitive, Self::Secret];
 
     pub(super) fn as_str(self) -> &'static str {
         match self {

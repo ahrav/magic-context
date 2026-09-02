@@ -70,6 +70,9 @@ pub enum ProviderEgress {
 }
 
 impl ProviderEgress {
+    /// Egress proofs derive provider classes from this list.
+    pub const ALL: &'static [Self] = &[Self::RemoteAllowed, Self::LocalOnly];
+
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::RemoteAllowed => "remote_allowed",
@@ -122,6 +125,11 @@ pub struct ArtifactHandle {
 pub enum ArtifactDestination {
     Local,
     Remote,
+}
+
+impl ArtifactDestination {
+    /// Egress proofs derive destinations from this list.
+    pub const ALL: &'static [Self] = &[Self::Local, Self::Remote];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
