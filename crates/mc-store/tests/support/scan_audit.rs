@@ -6,6 +6,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+/// Row counts for every table participating in scan-audit atomicity checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanAuditCounts {
     pub batches: i64,
@@ -17,6 +18,7 @@ pub struct ScanAuditCounts {
 }
 
 impl ScanAuditCounts {
+    /// Expected state when no scan-audit transaction has committed.
     pub const EMPTY: Self = Self {
         batches: 0,
         owner_scopes: 0,
@@ -27,6 +29,12 @@ impl ScanAuditCounts {
     };
 }
 
+/// Reads all counts from one SQLite statement and snapshot.
+///
+/// # Panics
+///
+/// Panics when `store.db` cannot be opened, the query fails, or a count cannot
+/// be decoded as `i64`.
 pub fn scan_audit_counts(root: &Path) -> ScanAuditCounts {
     Connection::open(root.join("store.db"))
         .unwrap()
