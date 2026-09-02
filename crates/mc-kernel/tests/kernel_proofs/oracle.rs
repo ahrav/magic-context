@@ -12,7 +12,7 @@ use mc_kernel::schema::KERNEL_SCHEMA_COMPONENT_NAMES;
 use mc_kernel::{BackupManifest, BackupRequest, KernelStore, Sensitivity};
 use rusqlite::{params, Connection};
 
-use crate::canonical_state::{digest, digested_tables, Profile};
+use crate::canonical_state::{cross_root_compared_clock_columns, digest, digested_tables, Profile};
 use crate::fixtures::{deletion, domain, ingest, intent, now_ms, root_domain, staging};
 
 /// Seeds a domain, a registered consumer, two ingested artifacts, and two
@@ -410,6 +410,44 @@ fn cross_root_digest_refuses_an_unresolved_identity_reference() {
         )
         .unwrap();
     digest(root.path(), Profile::CrossRoot);
+}
+
+/// Pins the instant and epoch columns `CrossRoot` still compares exactly.
+///
+/// Membership means the column is treated as part of the history rather than as a value the
+/// kernel stamps from its own clock. A new stamp on an existing table lands here and fails,
+/// which forces the choice between adding it to `column_rule` and recording it as caller-supplied.
+#[test]
+fn cross_root_compared_clock_columns_are_pinned() {
+    let root = tempfile::tempdir().unwrap();
+    let _store = KernelStore::open(root.path()).unwrap();
+    let expected = [
+        "artifact_pending_unlinks.created_at",
+        "artifact_pending_unlinks.last_attempt_at",
+        "artifact_purge_tombstones.purged_at",
+        "candidate_scores.scored_at",
+        "candidates.created_at",
+        "candidates.heartbeat_at",
+        "candidates.lease_expires_at",
+        "capture_pins.purge_degraded_at",
+        "consumer_abandonments.abandoned_at",
+        "decision_events.recorded_at",
+        "deletion_backfill_barrier_consumers.acknowledged_at",
+        "deletion_backfill_barriers.completed_at",
+        "deletion_backfill_barriers.created_at",
+        "extraction_runs.heartbeat_at",
+        "extraction_runs.lease_expires_at",
+        "extraction_runs.started_at",
+        "mc_kernel_format_marker.format_epoch",
+        "observations.observed_at",
+        "outbox.published_at",
+        "outbox_consumers.updated_at",
+        "outbox_publication.published_at",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect::<BTreeSet<_>>();
+    assert_eq!(cross_root_compared_clock_columns(root.path()), expected);
 }
 
 #[test]

@@ -238,6 +238,25 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
     CanonicalDigest { tables }
 }
 
+/// Every `(table, column)` in the live schema whose name reads as an instant or an epoch and
+/// which `CrossRoot` still compares exactly.
+///
+/// `column_rule` is a hand-written match, so a new stamp on an existing table would otherwise
+/// fall through to `Rule::Keep` unnoticed. A proof pins this set, which forces a decision.
+pub fn cross_root_compared_clock_columns(root: &Path) -> BTreeSet<String> {
+    let connection = open_read_only(root);
+    let mut compared = BTreeSet::new();
+    for table in table_names(&connection) {
+        for column in columns_of(&connection, &table) {
+            let reads_as_clock = column.ends_with("_at") || column.contains("epoch");
+            if reads_as_clock && column_rule(Profile::CrossRoot, &table, &column) == Rule::Keep {
+                compared.insert(format!("{table}.{column}"));
+            }
+        }
+    }
+    compared
+}
+
 /// Names of every table the digest covers at `root`, in sorted order. The
 /// oracle reads the live schema so a new kernel table is digested without an
 /// edit here; the inventory test in `kernel_proofs` pins that set against the
@@ -334,7 +353,7 @@ impl State {
                             Ok(match row.get_ref(index)? {
                                 ValueRef::Null => Cell::Null,
                                 ValueRef::Integer(value) => Cell::Integer(value),
-                                ValueRef::Real(value) => Cell::Real(value.to_bits()),
+                                ValueRef::Real(value) => Cell::Real(canonical_real_bits(value)),
                                 ValueRef::Text(value) => {
                                     Cell::Text(String::from_utf8(value.to_vec()).unwrap_or_else(
                                         |_| panic!("{name}.{} is not UTF-8", columns[index]),
@@ -629,6 +648,20 @@ fn replace_tokens(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Collapses the `f64` encodings SQL treats as one value.
+///
+/// `to_bits` separates `-0.0` from `0.0` and one NaN payload from another, so two roots that
+/// reached an equal score by different arithmetic would digest apart.
+fn canonical_real_bits(value: f64) -> u64 {
+    if value == 0.0 {
+        0.0f64.to_bits()
+    } else if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
@@ -642,11 +675,11 @@ fn assert_no_unresolved_identity(table: &str, cell: &Cell) {
         Cell::Blob(bytes) => bytes,
         _ => return,
     };
+    // `replace_tokens` skips a match adjoined by another identity byte, so a token sitting
+    // directly after a hex byte is neither renamed nor reported if this scan skips it too.
     for index in 0..bytes.len().saturating_sub(65) {
         let window = &bytes[index..index + 64];
-        let preceded_by_hex = index > 0 && is_lower_hex(bytes[index - 1]);
-        if !preceded_by_hex
-            && window.iter().copied().all(is_lower_hex)
+        if window.iter().copied().all(is_lower_hex)
             && bytes[index + 64] == b'-'
             && bytes[index + 65].is_ascii_digit()
         {
@@ -875,8 +908,14 @@ fn recovery_marker_rows(root: &Path, profile: Profile) -> Vec<Vec<Cell>> {
             }
         } else if metadata.file_type().is_symlink() {
             Cell::Text(SYMLINK_MARKER.to_string())
-        } else {
+        } else if metadata.is_dir() {
             Cell::Text(DIRECTORY_MARKER.to_string())
+        } else {
+            // A fifo, socket, or device left here is not a directory and must not read as one.
+            Cell::Text(format!(
+                "<other:{:o}>",
+                metadata.permissions().mode() & 0o170000
+            ))
         };
         rows.push(vec![Cell::Text(suffix.to_string()), content]);
     }

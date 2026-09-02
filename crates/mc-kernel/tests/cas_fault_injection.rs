@@ -322,6 +322,13 @@ fn assert_semantic_oracle(root: &Path) -> SemanticState {
     let reconciled_usage = store.artifact_budget_facts().unwrap().usage_bytes;
     drop(store);
     let state = SemanticState::read(root);
+    // The shared scanner routes a non-shard entry here instead of failing on a hash mismatch,
+    // so the anomaly is only caught if the oracle looks.
+    assert!(
+        state.unexpected_objects.is_empty(),
+        "stray entries under artifacts/objects: {:?}",
+        state.unexpected_objects
+    );
     for (_, digest, reference, _, invalidated) in &state.canonical_refs {
         if invalidated.is_none() {
             assert_eq!(
