@@ -205,6 +205,15 @@ describe("deterministic metamorphic runner", () => {
         // Equal tuples parse, including the null pair this runner produces.
         expect(report.entries[scoredIndex]).toMatchObject({ baselineScore: { system: null }, derivativeScore: { system: null } });
         expect(() => parseMetamorphicReport(report)).not.toThrow();
+
+        // A baseline score lifted from another scenario would let one passing bundle stand in for every pair.
+        const unbound = structuredClone(report);
+        const unboundEntry = unbound.entries[scoredIndex]!;
+        if (unboundEntry.kind !== "scored") throw new Error("unreachable");
+        unboundEntry.baselineScore.scenarioId = `${unboundEntry.scenarioId}-other`;
+        expect(metamorphicExitCode(unbound)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(unbound))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.baselineScore\\.scenarioId: pair-scenario-mismatch`));
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {

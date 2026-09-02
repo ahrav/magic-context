@@ -23,7 +23,7 @@ import type {
     Interval,
     RawRegretRecord,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, includesZero, mean } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -344,7 +344,12 @@ function parseFamilyEstimate(raw: unknown, label: string): FamilyEstimate {
 }
 
 // `allowed` is the estimator's bucket for this array: primary, live-regret, or provider-mixed-regret endpoints only.
-function parseEndpointEstimates(raw: unknown, label: string, allowed: readonly DeltaEndpoint[]): EndpointEstimate[] {
+function parseEndpointEstimates(
+    raw: unknown,
+    label: string,
+    allowed: readonly DeltaEndpoint[],
+    minimumAnalyzableFamilyCount: number,
+): EndpointEstimate[] {
     return p.array(raw, label).map((entry, index) => {
         const itemLabel = `${label}[${index}]`;
         const value = p.record(entry, itemLabel);
@@ -353,12 +358,29 @@ function parseEndpointEstimates(raw: unknown, label: string, allowed: readonly D
             .map((family, familyIndex) => parseFamilyEstimate(family, `${itemLabel}.families[${familyIndex}]`));
         const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
+        const pointEstimate = finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
+        const interval = parseInterval(value.interval, `${itemLabel}.interval`);
+        const resolution = p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${itemLabel}.resolution`);
+        const familyMeans = families.map((family) => family.pointEstimate);
+        // Using the estimator's `mean` prevents last-bit drift during recomputation.
+        if (families.length > 0 && pointEstimate !== mean(familyMeans)) {
+            p.fail(`${itemLabel}.pointEstimate: derived-mismatch`);
+        }
+        // The endpoint rule is recomputable because each term is published. The per-family rule is not:
+        // the report does not carry the per-family observation count.
+        const derivedResolution = families.length >= minimumAnalyzableFamilyCount &&
+            families.length >= 2 &&
+            !includesZero(interval) &&
+            !families.some((family) => family.noise.label === "inside-floor")
+            ? "resolved"
+            : "unresolved";
+        if (resolution !== derivedResolution) p.fail(`${itemLabel}.resolution: derived-mismatch`);
         return {
             endpoint: p.enumeration(value.endpoint, allowed, `${itemLabel}.endpoint`),
-            pointEstimate: finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`),
-            interval: parseInterval(value.interval, `${itemLabel}.interval`),
+            pointEstimate,
+            interval,
             familyCount,
-            resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${itemLabel}.resolution`),
+            resolution,
             families,
         };
     });
@@ -375,6 +397,12 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     const analyzableFamilyCount = p.integer(value.analyzableFamilyCount, `${label}.analyzableFamilyCount`);
     const evidenceSufficient = p.boolean(value.evidenceSufficient, `${label}.evidenceSufficient`);
     if (evidenceSufficient !== analyzableFamilyCount >= minimumAnalyzableFamilyCount) p.fail(`${label}.evidenceSufficient: derived-mismatch`);
+    const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, minimumAnalyzableFamilyCount);
+    p.unique(endpoints.map(({ endpoint }) => endpoint), `${label}.endpoints`);
+    // `estimateFamilyDeltas` counts the distinct families observed on paired coordinates at the primary
+    // endpoints, and every such family appears under at least one of them, so the union reproduces it.
+    const observedFamilies = new Set(endpoints.flatMap(({ families }) => families.map(({ familyId }) => familyId)));
+    if (analyzableFamilyCount !== observedFamilies.size) p.fail(`${label}.analyzableFamilyCount: derived-mismatch`);
     return {
         poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, `${label}.poolManifestFingerprint`),
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, `${label}.pinnedSnapshotId`),
@@ -385,9 +413,9 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         minimumAnalyzableFamilyCount,
         analyzableFamilyCount,
         evidenceSufficient,
-        endpoints: parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS),
-        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`, LIVE_REGRET_ENDPOINTS),
-        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`, PROVIDER_MIXED_REGRET_ENDPOINTS),
+        endpoints,
+        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`, LIVE_REGRET_ENDPOINTS, minimumAnalyzableFamilyCount),
+        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`, PROVIDER_MIXED_REGRET_ENDPOINTS, minimumAnalyzableFamilyCount),
         rawRegretRecords: p.array(value.rawRegretRecords, `${label}.rawRegretRecords`).map((entry, index) => {
             const itemLabel = `${label}.rawRegretRecords[${index}]`;
             const item = p.record(entry, itemLabel);
@@ -442,6 +470,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         "status", "spentUsd", "observedCostRollouts", "estimatedCostRollouts", "refusedRegretLadders",
         "plannedCoordinates", "healthyCoordinates", "evidenceComplete", "calibrationFingerprint",
     ], "report.body.runSummary");
+    const analysis = parseAnalysis(value.analysis, "report.body.analysis");
     const body: PairedDeltaReportBody = {
         limitations: p.array(value.limitations, "report.body.limitations")
             .map((line, index) => p.string(line, `report.body.limitations[${index}]`)),
@@ -449,7 +478,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, "report.body.pinnedSnapshotId"),
         policyFingerprint: p.hex64(value.policyFingerprint, "report.body.policyFingerprint"),
         implementationDigest: p.string(value.implementationDigest, "report.body.implementationDigest"),
-        analysis: parseAnalysis(value.analysis, "report.body.analysis"),
+        analysis,
         exclusions: p.array(value.exclusions, "report.body.exclusions").map((entry, index) => {
             const label = `report.body.exclusions[${index}]`;
             const item = p.record(entry, label);
@@ -467,8 +496,8 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm"),
         },
         regret: {
-            live: parseEndpointEstimates(regret.live, "report.body.regret.live", LIVE_REGRET_ENDPOINTS),
-            providerMixed: parseEndpointEstimates(regret.providerMixed, "report.body.regret.providerMixed", PROVIDER_MIXED_REGRET_ENDPOINTS),
+            live: parseEndpointEstimates(regret.live, "report.body.regret.live", LIVE_REGRET_ENDPOINTS, analysis.minimumAnalyzableFamilyCount),
+            providerMixed: parseEndpointEstimates(regret.providerMixed, "report.body.regret.providerMixed", PROVIDER_MIXED_REGRET_ENDPOINTS, analysis.minimumAnalyzableFamilyCount),
             raw: p.array(regret.raw, "report.body.regret.raw").map((entry, index) => {
                 const label = `report.body.regret.raw[${index}]`;
                 const item = p.record(entry, label);

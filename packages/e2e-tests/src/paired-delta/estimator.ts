@@ -114,7 +114,7 @@ export interface FamilyDeltaAnalysis extends LaneBinding {
     rawRegretRecords: RawRegretRecord[];
 }
 
-function mean(values: readonly number[]): number {
+export function mean(values: readonly number[]): number {
     return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
@@ -149,7 +149,7 @@ function floorKey(familyId: string, endpoint: PrimaryEndpoint | undefined): stri
     return tupleKey(familyId, endpoint);
 }
 
-function includesZero(interval: Interval): boolean {
+export function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
 }
 

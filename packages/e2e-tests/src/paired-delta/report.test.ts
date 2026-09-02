@@ -983,6 +983,17 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.analysis\.bootstrapResamples: integer-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapSeed = 0x1_0000_0000; })))
             .toThrow(/report\.body\.analysis\.bootstrapSeed: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[0]!.pointEstimate += 0.5;
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.pointEstimate: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const endpoint = body.analysis.endpoints[0]!;
+            endpoint.resolution = endpoint.resolution === "resolved" ? "unresolved" : "resolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.resolution: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.analyzableFamilyCount += 1;
+            body.analysis.evidenceSufficient = body.analysis.analyzableFamilyCount >= body.analysis.minimumAnalyzableFamilyCount;
+        }))).toThrow(/report\.body\.analysis\.analyzableFamilyCount: derived-mismatch/);
     });
 
     it("preserves an endpoint-scoped noise floor through the round trip", () => {
