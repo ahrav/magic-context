@@ -105,6 +105,13 @@ export type TierInvalidReason =
     | { kind: "selection-empty"; reason: string }
     | { kind: "deadline-exhausted"; nextRole: "control-a" | "control-b" | "baseline" | "derivative" };
 
+/** Rejects an array the builder would have emitted in another order, which its own sort makes unreachable. */
+function requireSorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void {
+    for (let index = 1; index < values.length; index += 1) {
+        if (rank(values[index - 1]!).localeCompare(rank(values[index]!)) > 0) p.fail(`${label}: order-invalid`);
+    }
+}
+
 function key(entry: PairKey): string {
     return `${entry.scenarioId}\u0000${entry.transformId}\u0000${entry.transformVersion}\u0000${entry.seed}`;
 }
@@ -389,13 +396,16 @@ function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason 
             }
             return { kind, systemMismatch, failedInvariants };
         }
-        case "control-error":
+        case "control-error": {
             p.exact(value, ["kind", "controlAErrorReason", "controlBErrorReason"], label);
-            return {
-                kind,
-                controlAErrorReason: value.controlAErrorReason === null ? null : p.text(value.controlAErrorReason, `${label}.controlAErrorReason`),
-                controlBErrorReason: value.controlBErrorReason === null ? null : p.text(value.controlBErrorReason, `${label}.controlBErrorReason`),
-            };
+            const controlAErrorReason = value.controlAErrorReason === null ? null : p.text(value.controlAErrorReason, `${label}.controlAErrorReason`);
+            const controlBErrorReason = value.controlBErrorReason === null ? null : p.text(value.controlBErrorReason, `${label}.controlBErrorReason`);
+            // This reason is recorded only when a control errored, and an ERROR score carries its reason.
+            if (controlAErrorReason === null && controlBErrorReason === null) {
+                p.fail(`${label}: control-error-reason-required`);
+            }
+            return { kind, controlAErrorReason, controlBErrorReason };
+        }
         case "selection-empty":
             p.exact(value, ["kind", "reason"], label);
             return { kind, reason: p.text(value.reason, `${label}.reason`) };
@@ -418,9 +428,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
                 .map((entry, index) => parseEntry(entry, `report.entries[${index}]`));
             // One pair is observed once, so a repeated key means a duplicated observation.
             p.unique(entries.map(key), "report.entries");
+            requireSorted(entries, key, "report.entries");
             return entries;
         })(),
-        coverage: p.array(root.coverage, "report.coverage").map((entry, index) => {
+        coverage: (() => { const coverage = p.array(root.coverage, "report.coverage").map((entry, index) => {
             const label = `report.coverage[${index}]`;
             const value = p.record(entry, label);
             p.exact(value, ["scenarioId", "applied", "inapplicable", "violations"], label);
@@ -435,8 +446,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
                 }),
                 violations: textArray(value.violations, `${label}.violations`),
             };
-        }),
-        injectionCanaryHits: p.array(root.injectionCanaryHits, "report.injectionCanaryHits").map((entry, index) => {
+        });
+            requireSorted(coverage, ({ scenarioId }) => scenarioId, "report.coverage");
+            return coverage; })(),
+        injectionCanaryHits: (() => { const hits = p.array(root.injectionCanaryHits, "report.injectionCanaryHits").map((entry, index) => {
             const label = `report.injectionCanaryHits[${index}]`;
             const value = p.record(entry, label);
             p.exact(value, ["scenarioId", "role", "transformId", "transformVersion", "seed"], label);
@@ -456,7 +469,9 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
                 p.fail(`${label}: canary-coordinates-unexpected`);
             }
             return { scenarioId: p.string(value.scenarioId, `${label}.scenarioId`), role, transformId, transformVersion, seed };
-        }),
+        });
+            requireSorted(hits, (hit) => JSON.stringify(hit), "report.injectionCanaryHits");
+            return hits; })(),
         tierInvalidReason: parseTierInvalidReason(root.tierInvalidReason, "report.tierInvalidReason"),
     };
 }

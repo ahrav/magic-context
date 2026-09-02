@@ -162,6 +162,15 @@ describe("deterministic metamorphic runner", () => {
         const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         unknownKind.entries[0]!.kind = "skipped";
         expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        // The builder sorts each array, so a reordered archive is not a shape it can emit.
+        const reordered = structuredClone(report);
+        expect(reordered.entries.length).toBeGreaterThan(1);
+        reordered.entries.reverse();
+        expect(() => parseMetamorphicReport(reordered)).toThrow(/report\.entries: order-invalid/);
+        const bothNull = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        bothNull.tierInvalidReason = { kind: "control-error", controlAErrorReason: null, controlBErrorReason: null };
+        expect(() => parseMetamorphicReport(bothNull))
+            .toThrow(/report\.tierInvalidReason: control-error-reason-required/);
         // A control disagreement is recorded only with a cause, and only over the live comparator's invariants.
         const causeless = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
         causeless.tierInvalidReason.systemMismatch = false;
