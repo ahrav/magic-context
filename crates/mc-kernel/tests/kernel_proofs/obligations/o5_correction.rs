@@ -94,32 +94,83 @@ fn content(proof: &Proof, kind: Kind) -> BTreeMap<String, String> {
 }
 
 fn assert_successor_content(proof: &Proof, kind: Kind, object_id: &str, index: usize) {
-    let (sql, expected) = match kind {
-        Kind::Domain => (
-            "SELECT domain_id||'|'||name FROM domains WHERE object_id=?1",
-            vec![format!("domain-{index}"), format!("name-{index}")],
-        ),
-        Kind::Decision => (
-            "SELECT decision_id||'|'||decision_kind||'|'||CAST(decision_payload AS TEXT)
-             FROM decisions WHERE object_id=?1",
-            vec![
-                format!("decision-{index}"),
-                "architecture".to_string(),
-                format!("decision {index}"),
-                format!("rationale {index}"),
-            ],
-        ),
-    };
-    let stored: String = proof
-        .db()
-        .query_row(sql, [object_id], |row| row.get(0))
-        .unwrap();
-    for value in expected {
-        assert!(
-            stored.contains(&value),
-            "{object_id} lost {value:?} from its correction: {stored}"
-        );
+    let tip = proof.tip();
+    match kind {
+        Kind::Domain => {
+            let spec = domain(index);
+            let stored: (String, String, i64) = proof
+                .db()
+                .query_row(
+                    "SELECT domain_id,name,created_commit_seq
+                     FROM domains WHERE object_id=?1",
+                    [object_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (spec.domain_id, spec.name, tip));
+        }
+        Kind::Decision => {
+            let spec = decision(index);
+            let served = proof.store().slice_as_of(tip).unwrap().decisions;
+            let stored = served
+                .iter()
+                .find(|row| row.object_id == object_id)
+                .unwrap_or_else(|| panic!("{object_id} is not served in the decision slice"));
+            assert_eq!(
+                stored,
+                &DecisionRow {
+                    decision_id: spec.decision_id,
+                    object_id: spec.object_id,
+                    proposition_id: None,
+                    scope_id: None,
+                    anchor_id: None,
+                    evidence_id: None,
+                    decision_kind: spec.decision_kind,
+                    payload: spec.payload,
+                    created_commit_seq: tip,
+                    sensitivity: spec.sensitivity,
+                }
+            );
+        }
     }
+    // Source metadata and sensitivity live in the registry, not the typed table.
+    let expected = match kind {
+        Kind::Domain => {
+            let spec = domain(index);
+            (
+                spec.source_kind,
+                spec.source_id,
+                spec.source_revision,
+                spec.sensitivity,
+            )
+        }
+        Kind::Decision => {
+            let spec = decision(index);
+            (
+                spec.source_kind,
+                spec.source_id,
+                spec.source_revision,
+                spec.sensitivity,
+            )
+        }
+    };
+    let object = proof
+        .store()
+        .known_as_of(tip)
+        .unwrap()
+        .objects
+        .into_iter()
+        .find(|row| row.object_id == object_id)
+        .unwrap_or_else(|| panic!("{object_id} is not live at the tip"));
+    assert_eq!(
+        (
+            object.source_kind,
+            object.source_id,
+            object.source_revision,
+            object.sensitivity
+        ),
+        expected
+    );
 }
 
 fn correct(proof: &mut Proof, kind: Kind, old: &str, index: usize) -> String {

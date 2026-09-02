@@ -226,6 +226,8 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
             assert_eq!(payload["audit"]["barrier_id"], result.barrier_id);
             assert_eq!(payload["audit"]["target_class"], *kind);
             assert_eq!(payload["audit"]["digest"], handle.digest);
+            assert_eq!(payload["audit"]["deletion_kind"], "delete");
+            assert_eq!(payload["audit"]["deletion_commit_seq"], result.commit_seq);
             // Without the ids, a consumer cannot tell what to invalidate.
             assert_eq!(
                 payload["audit"]["affected_object_ids"],
@@ -255,20 +257,24 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     };
     check_state(&proof);
     assert_object_retained(&proof, &handle.digest);
+    // `visible_as_of` never consults evidence liveness, so the subject stays
+    // served until a consumer of `admission_state` records a new decision.
+    assert!(auto_inject_ids(&proof).contains(&object_id));
     let projection = proof.store().rebuild_alignment().unwrap();
     let before_restart = proof.digest();
 
     proof.restart();
     check_state(&proof);
     assert_object_retained(&proof, &handle.digest);
+    assert!(auto_inject_ids(&proof).contains(&object_id));
     assert_eq!(proof.store().rebuild_alignment().unwrap(), projection);
     assert_eq!(proof.digest(), before_restart);
 
-    // A plain repeated request takes the no-live-references branch.
+    // A fresh operation key exercises deletion without receipt replay.
     let before_repeat = proof.digest();
     let repeated = proof
         .store()
-        .delete_artifact(deletion("delete", &handle.digest))
+        .delete_artifact(deletion("delete-again", &handle.digest))
         .unwrap();
     assert!(repeated.already_applied);
     assert_eq!(repeated.kind, ArtifactDeletionKind::Delete);
