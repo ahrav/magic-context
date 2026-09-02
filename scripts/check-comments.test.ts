@@ -441,6 +441,48 @@ describe("comment hygiene gate", () => {
         expect(result.code).toBe(0);
     });
 
+    test("a nested template keeps its outer substitution state", () => {
+        const result = scan({
+            "deep.ts": "const v = `outer ${`inner ${x}`} rest`; // tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("deep.ts:1:");
+    });
+
+    test("PowerShell escapes with a backtick and nests its block comments", () => {
+        const result = scan({
+            "esc.ps1": '$x = "runtime `" value"; # tracked in magic-context-om3y',
+            "nb.ps1": "<# outer <# nested #> tracked in magic-context-om3y #>",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("esc.ps1:1:");
+        expect(result.out).toContain("nb.ps1:1:");
+    });
+
+    test("only the dash heredoc form accepts an indented terminator", () => {
+        const result = scan({
+            "ind.sh": "cat <<DATA\n DATA\n# runtime magic-context-om3y\nDATA",
+            "dash.sh": "cat <<-DATA\n\tDATA\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).not.toContain("ind.sh:3:");
+        expect(result.out).toContain("dash.sh:3:");
+    });
+
+    test("legacy HTML openers and shell shebang files are in scope", () => {
+        const result = scan({
+            "html.cjs": "<!-- tracked in magic-context-om3y",
+            hookish: "#!/usr/bin/env sh\n# tracked in magic-context-om3y",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("html.cjs:1:");
+        expect(result.out).toContain("hookish:2:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

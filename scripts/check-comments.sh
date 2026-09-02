@@ -42,7 +42,7 @@ fi
 status=0
 awk -v LISTFILE="$list" -v EXTS="$EXTS" -v BEAD_IDS="$BEAD_IDS" '
 function excluded(p) {
-  if (p ~ /(^|\/)\.beads\//) return 1
+  if (p ~ /(^|\/)\.beads\// && p !~ /(^|\/)\.beads\/hooks\//) return 1
   if (p ~ /(^|\/)node_modules\//) return 1
   if (p ~ /(^|\/)target\//) return 1
   return 0
@@ -55,11 +55,20 @@ function wanted(p,   i, c, ext) {
     if (c == ".") { ext = substr(p, i + 1); break }
     if (c == "/") break
   }
+  if (ext == "") return shell_shebang(p)
   return (ext in ok_ext)
 }
 
+function shell_shebang(p,   first, rc) {
+  rc = (getline first < p)
+  close(p)
+  if (rc <= 0) return 0
+  return (first ~ /^#![ \t]*\/.*(sh|bash|zsh|python[0-9.]*)[ \t]*$/ ||
+          first ~ /^#![ \t]*\/usr\/bin\/env[ \t]+(sh|bash|zsh|python[0-9.]*)/)
+}
+
 function style_of(p) {
-  if (p ~ /\.(py|sh|ps1|yml|yaml|toml)$/) return "hash"
+  if (p ~ /\.(py|sh|ps1|yml|yaml|toml)$/ || p !~ /\.[A-Za-z0-9]+$/) return "hash"
   # CSS supports block comments but not line comments.
   if (p ~ /\.css$/) return "block"
   return "c"
@@ -91,7 +100,7 @@ function triple_literals(p) {
 }
 
 function heredoc_literals(p) {
-  return (p ~ /\.sh$/) ? 1 : 0
+  return (p ~ /\.sh$/ || p !~ /\.[A-Za-z0-9]+$/) ? 1 : 0
 }
 
 # PowerShell adds a block-comment form and here-strings whose terminators are distinctive.
@@ -99,9 +108,19 @@ function powershell_literals(p) {
   return (p ~ /\.ps1$/) ? 1 : 0
 }
 
+# PowerShell uses a backtick where the other languages use a backslash.
+function escape_char(p) {
+  return (p ~ /\.ps1$/) ? BT : BS
+}
+
 # A single-quoted body processes backslash escapes only in these languages.
 function apostrophe_escapes(p) {
   return (p ~ /\.(ts|tsx|js|mjs|cjs|py)$/) ? 1 : 0
+}
+
+# Script-goal JavaScript also accepts the legacy HTML comment openers.
+function html_comments(p) {
+  return (p ~ /\.(js|mjs|cjs)$/) ? 1 : 0
 }
 
 # JavaScript template literals permit unescaped line breaks; quoted strings do not.
@@ -129,11 +148,12 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     i = e + length(litend)
     litend = ""
   }
-  q = (tq && tsub == 0) ? BT : ""
+  q = (tq > 0 && subd[tq] == 0) ? BT : ""
   while (i <= n) {
     if (hdepth > 0) {
       two = substr(line, i, 2)
       if (two == "#>") { hdepth--; i += 2; continue }
+      if (two == "<#") { hdepth++; i += 2; continue }
       out = out substr(line, i, 1)
       i++
       continue
@@ -148,18 +168,21 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
     }
     c = substr(line, i, 1)
     if (q != "") {
-      if (c == BS && (q != SQ || sq_escapes)) { i += 2; continue }
-      if (q == BT && substr(line, i, 2) == "${") { tsub = 1; q = ""; i += 2; continue }
-      if (c == q) { q = ""; if (c == BT) tq-- }
+      if (c == esc_ch && (q != SQ || sq_escapes)) { i += 2; continue }
+      if (q == BT && substr(line, i, 2) == "${") { subd[tq] = 1; q = ""; i += 2; continue }
+      if (c == q) {
+        q = ""
+        if (c == BT) { tq--; if (tq > 0 && subd[tq] == 0) q = BT }
+      }
       i++
       continue
     }
     # An escape outside a string covers the shell form that embeds an apostrophe.
     if (c == BS) { i += 2; continue }
     # Substitution contents are code, so its braces decide where the template resumes.
-    if (tq && tsub > 0) {
-      if (c == "{") { tsub++; i++; continue }
-      if (c == "}") { tsub--; if (tsub == 0) q = BT; i++; continue }
+    if (tq > 0 && subd[tq] > 0) {
+      if (c == "{") { subd[tq]++; i++; continue }
+      if (c == "}") { subd[tq]--; if (subd[tq] == 0) q = BT; i++; continue }
     }
     if (rust_lit && (c == "r" || c == "b" || c == "c")) {
       j = (c == "b" || c == "c") ? i + 1 : i
@@ -206,7 +229,7 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
       if (e > 0) { i = e; continue }
     }
     if (c == DQ || (c == SQ && sq_quotes && !nosq)) { q = c; i++; continue }
-    if (c == BT && tmpl_quotes) { q = BT; tq++; i++; continue }
+    if (c == BT && tmpl_quotes) { q = BT; tq++; subd[tq] = 0; i++; continue }
     if (st == "hash") {
       if (ps_lit && substr(line, i, 2) == "<#") { hdepth = 1; out = out " "; i += 2; continue }
       if (ps_lit && (substr(line, i, 2) == "@" DQ || substr(line, i, 2) == "@" SQ)) {
@@ -224,6 +247,10 @@ function comment_of(line, st, nosq,   i, n, c, two, three, q, out, j, k, m, hash
       if (c == "#" && hash_opens(line, i)) return out " " substr(line, i + 1)
       i++
       continue
+    }
+    if (html_lit && substr(line, i, 4) == "<!--") return out " " substr(line, i + 4)
+    if (html_lit && substr(line, i, 3) == "-->" && substr(line, 1, i - 1) ~ /^[ \t]*$/) {
+      return out " " substr(line, i + 3)
     }
     two = substr(line, i, 2)
     if (st != "block" && two == "//") {
@@ -296,7 +323,8 @@ function prev_code_char(line, i,   j, c) {
 # A heredoc body ends at a line holding only its delimiter, so the word is retained rather than matched as a substring.
 function heredoc_word(line, i,   j, c, w) {
   j = i + 2
-  if (substr(line, j, 1) == "-") j++
+  heredoc_dash = 0
+  if (substr(line, j, 1) == "-") { heredoc_dash = 1; j++ }
   while (substr(line, j, 1) == " ") j++
   c = substr(line, j, 1)
   if (c == DQ || c == SQ) j++
@@ -385,6 +413,8 @@ BEGIN {
     style = style_of(path)
     sq_quotes = apostrophe_quotes(path)
     sq_escapes = apostrophe_escapes(path)
+    esc_ch = escape_char(path)
+    html_lit = html_comments(path)
     blk_nest = block_nests(path)
     rust_lit = rust_literals(path)
     tmpl_quotes = template_quotes(path)
@@ -396,14 +426,15 @@ BEGIN {
     depth = 0
     hdepth = 0
     tq = 0
-    tsub = 0
+    split("", subd)
     litend = ""
     heredoc = ""
+    heredoc_dash = 0
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
       if (heredoc != "") {
-        if (line ~ ("^[ \t]*" heredoc "[ \t]*$")) heredoc = ""
+        if (line ~ (heredoc_dash ? ("^[ \t]*" heredoc "[ \t]*$") : ("^" heredoc "[ \t]*$"))) heredoc = ""
         continue
       }
       if (depth == 0 && hdepth == 0 && !tq && litend == "") {
@@ -414,7 +445,8 @@ BEGIN {
               !(ps_lit && index(line, "@") > 0)) continue
         } else if (index(line, "/") == 0 &&
                    !(tmpl_quotes && index(line, BT) > 0) &&
-                   !(rust_lit && index(line, DQ) > 0)) continue
+                   !(rust_lit && index(line, DQ) > 0) &&
+                   !(html_lit && (index(line, "<!--") > 0 || index(line, "-->") > 0))) continue
       }
       text = comment_of(line, style, 0)
       # An apostrophe left open is prose rather than a string, so retry without it.
