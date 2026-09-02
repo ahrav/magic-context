@@ -1,4 +1,8 @@
+//! Memory-tool adapters for committed claims, durable claim intents, and search.
 //!
+//! Functions preserve store errors as [`MemoryToolError`] and validate wire
+//! protocol versions before mutation. Search combines compartment and note hits
+//! with deterministic rank, recency, and identifier ordering.
 
 use std::collections::BTreeSet;
 
@@ -18,6 +22,7 @@ pub use mc_core::claim_operation::{
     CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION,
 };
 
+/// Failure returned by memory-tool adapters.
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
@@ -49,6 +54,16 @@ impl From<ClaimMirrorError> for MemoryToolError {
     }
 }
 
+/// Lists visible positive-memory claims from the current mirror incarnation.
+///
+/// Public-ID and positive-category filters run before optional category filtering
+/// and `limit` truncation. An empty public-ID set permits every mirrored claim.
+/// The store's mirror order is preserved.
+///
+/// # Errors
+///
+/// Returns [`MemoryToolError::Store`] or [`MemoryToolError::ClaimMirror`] when
+/// mirror state or rows cannot be read.
 pub fn list_committed_claims(
     store: &McStore,
     public_claim_ids: &BTreeSet<String>,
@@ -100,6 +115,15 @@ fn intent_wire_record(record: ClaimIntentRecord) -> ClaimIntentWireRecord {
     }
 }
 
+/// Validates and durably stages an idempotent claim intent.
+///
+/// `now_ms` is a Unix timestamp in milliseconds recorded by the store. Matching
+/// prior intent identity may produce a replayed response.
+///
+/// # Errors
+///
+/// Returns [`MemoryToolError::IntentProtocol`] for unsupported protocol or
+/// request-encoding versions. Store failures retain their typed variant.
 pub fn stage_claim_intent(
     store: &McStore,
     route_project_root: &str,
@@ -127,6 +151,16 @@ pub fn stage_claim_intent(
     })
 }
 
+/// Inspects one command identity or lists claim intents.
+///
+/// Command lookup returns at most one record and applies `unresolved_only` after
+/// lookup. List lookup delegates ordering and truncation to the store.
+///
+/// # Errors
+///
+/// Returns [`MemoryToolError::IntentProtocol`] when the protocol version is
+/// unsupported or `limit` is outside 1 through 10,000. Returns a store error when
+/// inspection fails.
 pub fn inspect_claim_intents(
     store: &McStore,
     request: &ClaimIntentInspectRequest,
@@ -152,6 +186,15 @@ pub fn inspect_claim_intents(
     })
 }
 
+/// Applies an acknowledgement to a staged claim intent.
+///
+/// `now_ms` is a Unix timestamp in milliseconds. Repeating an already committed
+/// acknowledgement may return a replayed response.
+///
+/// # Errors
+///
+/// Returns [`MemoryToolError::IntentProtocol`] for an unsupported protocol
+/// version, or a store error when identity, digest, or state validation fails.
 pub fn acknowledge_claim_intent(
     store: &McStore,
     request: &ClaimIntentAckRequest,
@@ -173,6 +216,7 @@ pub fn acknowledge_claim_intent(
     })
 }
 
+/// Field that supplied a memory-search hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemorySearchSourceKind {
     CompartmentTitle,
@@ -180,6 +224,7 @@ pub enum MemorySearchSourceKind {
     Note,
 }
 
+/// Search hit with source-specific metadata and a bounded display snippet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySearchResult {
     pub source_kind: MemorySearchSourceKind,
@@ -199,6 +244,18 @@ struct RankedSearchResult {
     recency: i64,
 }
 
+/// Searches one session's compartment titles, bodies, and notes.
+///
+/// Blank queries and zero limits return no rows without reading the store.
+/// Matching is lowercase-based and non-regex. Title and note hits rank before
+/// compartment-body hits. Equal ranks sort by descending sequence or update time,
+/// then ascending source identifier. Results are truncated after sorting.
+/// Snippets contain at most 200 Unicode scalar values with about 100 bytes of
+/// context on each side of the first match.
+///
+/// # Errors
+///
+/// Returns a store error if either compartment or note search fails.
 pub fn search_compartments_and_notes_for_session(
     store: &McStore,
     project_path: &str,

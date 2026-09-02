@@ -1,3 +1,9 @@
+//! Integration coverage for artifact reclamation, retention, and crash recovery.
+//!
+//! Fixture timestamps are integer milliseconds. Tests exercise writer fencing,
+//! capture-pin grace, reservation expiry, capacity recovery, and per-candidate
+//! failure isolation against temporary stores.
+
 #![cfg(feature = "test-support")]
 
 use std::fs::{self, File, FileTimes};
@@ -551,8 +557,8 @@ fn seed_pending_unlink(root: &std::path::Path, digest: &str) {
         .unwrap();
 }
 
-/// A directory where the object file belongs makes `unlink_artifact` fail for that
-/// digest alone.
+/// Replaces an expected object file with a directory so unlink fails for only
+/// that digest. Parent shard permissions match normal object storage.
 fn poison_object_path(root: &std::path::Path, digest: &str) {
     let path = object_path(root, digest);
     fs::create_dir_all(&path).unwrap();
