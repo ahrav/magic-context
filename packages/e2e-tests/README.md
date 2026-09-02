@@ -260,6 +260,87 @@ pinned at exactly 0.0 the whole time.) If a scenario needs a shortcut, shrink
 the window; if you must inflate, document which asserted conditions become
 unreachable.
 
+### Scorecard
+
+`src/scorecard/` joins the archived lane reports into one release decision. It
+reads, it never re-runs: every value in the report is a count, ratio, or
+fingerprint taken from a lane report, and every gate is either observed by a
+lane or listed as not observed.
+
+**Pre-registration.** `prospective-holdout/policies/scorecard-policy.json` is
+the `magic-context-x4l.15` policy-owner document. Its `policy` payload
+(`scorecard-policy/v1`) fixes the primary endpoint, secondary metric slots, the
+five gate ids, the injection canary scenario ids, the tolerated regression
+count, the bootstrap resample count and noise-floor source, the model matrix,
+replicate count, and release cost budget, the required lanes with their report
+schema and build-identity projection, the required metric slots, the bound
+paired-delta policy fingerprint, and the baseline scorecard report fingerprint
+(`null` for the first release). The freeze manifest records the document's
+fingerprint, so a run refuses (`policy-not-frozen`) when the policy on disk is
+not the one the approved freeze binds. A paired-delta report bound to another
+paired-delta policy fingerprint is `schema-mismatch`; one whose run settings or
+spend differ from the pre-registered values is `incomplete` with
+`pre-registration-mismatch`.
+
+**Gate statuses.** Each of `gate-cross-project-leak`,
+`gate-unrelated-scope-secret`, `gate-injection-promoted`,
+`gate-false-enforced-policy`, and `gate-database-corruption` is `passed`,
+`failed`, `not-observed`, or `errored`. Only `passed` supports promotion. A gate
+with no producing lane is `not-observed` with `no-producing-lane`; there is no
+exemption. `gate-injection-promoted` is observed from the metamorphic report
+when every pre-registered canary scenario has at least one applied transform;
+partial coverage is `not-observed` with `canary-coverage-incomplete`.
+
+**Lane statuses and reason codes.** Each required lane is `present`,
+`missing`, `incomplete`, or `schema-mismatch`. Only `present` counts toward
+`mandatoryEvidenceComplete`. Diagnostics and limitations are closed-vocabulary
+kebab-case codes (`run-incomplete`, `privacy-rejected`, `report-parse-failed`,
+`build-identity-mismatch`, `identity-unverified-<lane>`, `no-baseline`,
+`hard-gates-unobserved`, ...); the report never carries free text, scenario
+content, paths, or raw intake. Every lane artifact is privacy-scanned before it
+is parsed, so an archived report that embeds an absolute path or an XML manifest
+lowers its lane to `schema-mismatch` with `privacy-rejected`.
+
+**Exit codes.** `2` when any gate is non-passing or the run was refused
+(`policy-not-frozen`, `privacy-rejected`); `1` when evidence is incomplete, the
+baseline is not comparable, or blocking regressions exceed the tolerance; `0`
+when promotion is allowed. Until the four unproduced gate probes exist, every
+release-grade run exits `2` with four `not-observed` gates listed. That is the
+fail-closed default, not a bug.
+
+**Operator steps.**
+
+1. Freeze: write `scorecard-policy.json` as `ready`, compute its fingerprint,
+   record it in the freeze manifest, and collect the two approvals through the
+   holdout freeze path.
+2. Collect: after the lane workflows archive their reports, download them into
+   one directory named `<lane>-report.json` for each of `paired-delta`,
+   `historian`, `metamorphic`, `dreamer` (a JSON array of run reports),
+   `incident`, and `retrieval`:
+
+   ```sh
+   gh run download <run-id> --name <artifact> --dir artifacts/
+   ```
+
+3. Score:
+
+   ```sh
+   bun scripts/run-scorecard.ts \
+     --freeze <freeze-manifest-dir> \
+     --freeze-fingerprint <trusted-manifest-fingerprint> \
+     --artifacts artifacts/ \
+     --out scorecard-report.json \
+     [--baseline <previous-scorecard-report.json>]
+   ```
+
+   The script prints the `outcome` section and the report fingerprint, writes
+   the report as canonical two-space JSON, and exits per the table above.
+4. Review: read `safetyGates` first, then blocking rows in `adverseDeltas`,
+   then the five score families, then `limitations`. Cite `reportFingerprint`
+   in the promote or hold decision.
+
+Unit suite: `bun run test:scorecard-unit`.
+
 ### CI
 
 The broad Rust-mode lane is not part of the default host suite. Focused direct-host

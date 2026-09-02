@@ -7,7 +7,6 @@ import {
     LANE_IDS,
     REASON_CODE_RE,
     SCORECARD_GATE_IDS,
-    SCORE_FAMILY_IDS,
     SLOT_IDS_BY_FAMILY,
     array,
     enumeration,
@@ -413,9 +412,5 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
         fail("report.body.evidence.baseline: shape-invalid");
     }
     return { schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint };
-}
-
-export function familySections(body: ScorecardReportBody): ScoreFamilySection[] {
-    return SCORE_FAMILY_IDS.map((family) => body[family]);
 }
 
