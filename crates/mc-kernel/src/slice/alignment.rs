@@ -1,3 +1,9 @@
+//! Derives decision-to-observation alignment at a requested commit snapshot.
+//!
+//! Derivation follows decision supersession chains, excludes ineligible evidence, and
+//! emits rows ordered by `(decision_id, observation_id)`. Rebuilds publish the complete
+//! projection in one fenced writer transaction.
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The one dependency kind the alignment projection reads.
@@ -14,6 +20,7 @@ use super::read::snapshot_tip;
 use crate::envelope::{check_fence, replace_alignment_projection_tx, AlignmentProjectionSpec};
 use crate::{KernelError, KernelStore};
 
+/// One active decision and classified observation pair emitted by derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlignmentRow {
     pub decision_id: String,
@@ -22,6 +29,10 @@ pub struct AlignmentRow {
     pub alignment_payload: String,
 }
 
+/// Alignment rows derived from one historical view.
+///
+/// `known_as_of` preserves the requested sequence while `tip` is the resolved snapshot
+/// tip. Rows are sorted lexicographically by decision ID and observation ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlignmentSnapshot {
     pub known_as_of: i64,
@@ -73,6 +84,11 @@ struct ObservationClassification {
 }
 
 impl KernelStore {
+    /// Derives alignment from a consistent deferred transaction at `requested`.
+    ///
+    /// Returns [`KernelError::CorruptCanonicalRow`] for malformed stored observation
+    /// JSON, [`KernelError::Conflict`] for a supersession cycle, and
+    /// [`KernelError::Io`] for database failures.
     pub fn alignment_as_of(&self, requested: i64) -> Result<AlignmentSnapshot, KernelError> {
         let mut reader = self.lock_reader()?;
         let tx = reader
@@ -83,12 +99,17 @@ impl KernelStore {
         derive_alignment(input)
     }
 
+    /// Replaces the persisted projection with rows derived at the current commit tip.
+    ///
+    /// The immediate writer transaction verifies the lease fence before publishing.
+    /// An empty commit log returns `published: false` without replacing the projection.
     pub fn rebuild_alignment(&self) -> Result<AlignmentRebuild, KernelError> {
         let mut writer = self.lock_writer()?;
         rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
     }
 }
 
+/// Uses an immediate transaction and verifies `lease_epoch` before rebuilding.
 pub(crate) fn rebuild_alignment_with_writer(
     writer: &mut Connection,
     lease_epoch: u64,
@@ -102,6 +123,7 @@ pub(crate) fn rebuild_alignment_with_writer(
     Ok(result)
 }
 
+/// Derives and replaces alignment at `tx`'s current commit tip.
 pub(crate) fn rebuild_alignment_tx(tx: &Transaction<'_>) -> Result<AlignmentRebuild, KernelError> {
     let tip = tx
         .query_row(
@@ -268,6 +290,10 @@ fn derive_alignment(input: AlignmentInput) -> Result<AlignmentSnapshot, KernelEr
     })
 }
 
+/// Follows supersession links to an active, evidence-eligible decision.
+///
+/// Returns `Ok(None)` for missing, terminally invalidated, or evidence-ineligible
+/// decisions. A cycle returns [`KernelError::Conflict`].
 fn resolve_decision<'a>(
     decisions: &'a HashMap<String, DecisionHistory>,
     object_id: &str,
