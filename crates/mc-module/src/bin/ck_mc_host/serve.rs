@@ -123,6 +123,7 @@ struct HarnessSelection {
     credential_identities: BTreeMap<String, String>,
 }
 
+/// Validated launcher state ready to become a daemon startup envelope.
 pub struct PreparedLauncherEnvelope {
     data_dir: PathBuf,
     closure_root: PathBuf,
@@ -133,6 +134,7 @@ pub struct PreparedLauncherEnvelope {
     pub changed: bool,
 }
 
+/// Rules for merging supplied harnesses with the committed selection.
 pub enum SelectionMode<'a> {
     Fresh,
     Running {
@@ -142,6 +144,7 @@ pub enum SelectionMode<'a> {
 }
 
 impl PreparedLauncherEnvelope {
+    /// Builds a startup envelope for one validated payload generation.
     pub fn to_startup(&self, payload_manifest_digest: String) -> StartupEnvelope {
         StartupEnvelope {
             schema: STARTUP_ENVELOPE_SCHEMA,
@@ -153,6 +156,10 @@ impl PreparedLauncherEnvelope {
         }
     }
 
+    /// Persists selected closure digests and keyed credential identities.
+    ///
+    /// Returns an error when the connection key cannot be read or the selection
+    /// cannot be written and synchronized.
     pub fn commit_selection(&self, publication: &Path) -> Result<(), &'static str> {
         let key = credential_identity_key(publication)?;
         let mut selection = self.selection.clone();
@@ -162,6 +169,7 @@ impl PreparedLauncherEnvelope {
 }
 
 impl StartupEnvelope {
+    /// Validates schema, absolute data root, canonical digests, and credential bounds.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema != STARTUP_ENVELOPE_SCHEMA {
             return Err("unsupported startup envelope schema");
@@ -180,6 +188,7 @@ impl StartupEnvelope {
 }
 
 impl LauncherEnvelope {
+    /// Returns a schema-1 launcher envelope with no harnesses or credentials.
     pub fn empty() -> Self {
         Self {
             schema: 1,
@@ -187,6 +196,7 @@ impl LauncherEnvelope {
         }
     }
 
+    /// Validates schema, candidate descriptor bounds, and credential bounds.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema != 1 {
             return Err("unsupported launcher envelope schema");
@@ -196,6 +206,11 @@ impl LauncherEnvelope {
         validate_credentials(&self.credentials)
     }
 
+    /// Materializes supplied closures and merges them with the active selection.
+    ///
+    /// Running mode rejects stale selections, unavailable supplied descriptors,
+    /// forbidden selection changes, and loss of existing credential identities.
+    /// Closure validation is memoized by digest during this call.
     pub fn prepare(
         self,
         data_dir: PathBuf,
@@ -386,6 +401,10 @@ fn hmac_sha256(key: &[u8], segments: &[&[u8]]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+/// Reads the 32-byte connection key used to derive credential identities.
+///
+/// Returns an error when the connection file is unavailable or carries a key of
+/// another length.
 pub fn credential_identity_key(publication: &Path) -> Result<[u8; 32], &'static str> {
     let info =
         mc_host::read_connection_file(publication).map_err(|_| "connection key is unavailable")?;
@@ -486,8 +505,7 @@ fn qualified_manifest(
     Ok(manifest)
 }
 
-///
-///
+/// Memoizes closure validation results by manifest digest for one preparation pass.
 struct ClosureValidator<'a> {
     store: Option<&'a HarnessClosureStore>,
     validated: BTreeMap<String, bool>,
@@ -580,7 +598,7 @@ fn selected_snapshot(
     })
 }
 
-///
+/// Classification of the committed harness-selection file.
 enum SelectionState {
     Absent,
     Active(HarnessSelection),
@@ -694,6 +712,9 @@ fn write_selection(closure_root: &Path, selection: &HarnessSelection) -> Result<
     result
 }
 
+/// Validates and durably removes the active harness selection.
+///
+/// Absence is success. An unreadable or invalid selection is not removed.
 pub fn clear_active_selection() -> Result<(), &'static str> {
     let data_dir = mc_host::data_dir_path(None)
         .ok()
@@ -840,6 +861,11 @@ fn read_envelope() -> Result<StartupEnvelope, &'static str> {
     Ok(envelope)
 }
 
+/// Reads one size-capped launcher envelope from standard input.
+///
+/// A terminal, empty input yields [`LauncherEnvelope::empty`]. Returns an error
+/// for I/O failure, input above `MAX_ENVELOPE_BYTES`, malformed JSON, or failed
+/// envelope validation.
 pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Ok(LauncherEnvelope::empty());
@@ -925,6 +951,10 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
     }
 }
 
+/// Revalidates startup state and runs the fixed host profile until shutdown.
+///
+/// The Tokio runtime uses four worker threads. SIGTERM or SIGINT cancels the
+/// host. Initialization, signal setup, and host failures return stable errors.
 pub fn run() -> Result<(), &'static str> {
     let envelope = read_envelope()?;
     let root = envelope.data_dir.clone();
@@ -985,7 +1015,7 @@ pub fn run() -> Result<(), &'static str> {
     let shutdown = CancellationToken::new();
     runtime.block_on(async {
         let signal_shutdown = shutdown.clone();
-        //
+        // Install both handlers before starting the host so either signal cancels it.
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|_| "SIGTERM handler installation failed")?;
