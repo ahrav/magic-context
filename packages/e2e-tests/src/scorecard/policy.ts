@@ -2,9 +2,12 @@ import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmar
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA } from "../../../plugin/scripts/retrieval-benchmark/report";
 import { REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
+import { SCENARIO_ID_RE } from "../historian-eval/contract";
+import type { SystemVersionTuple } from "../historian-eval/runner";
 import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval/scorer";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
+import type { PairedDeltaPolicyModel } from "../paired-delta/contract";
 import { PRIMARY_ENDPOINTS, type PrimaryEndpoint } from "../paired-delta/estimator";
 import { PAIRED_DELTA_REPORT_SCHEMA } from "../paired-delta/report";
 
@@ -147,21 +150,23 @@ export const PRIMARY_ENDPOINT_SLOTS: Readonly<Record<PrimaryEndpoint, UtilitySlo
 export const NOISE_FLOOR_SOURCES = ["calibration", "none"] as const;
 export type NoiseFloorSource = (typeof NOISE_FLOOR_SOURCES)[number];
 
-export interface PolicyModel {
-    providerId: string;
-    modelId: string;
-    contextLimit: number;
-}
+export type PolicyModel = PairedDeltaPolicyModel;
 
-export interface SystemProjection {
-    repoCommitSha: string;
-    bunVersion: string;
-    opencodeVersion: string;
-    historianModelId: string;
-    probeModelId: string;
-    parserImpl: "ts";
-    chunkTokenBudget: number | null;
-}
+export type SystemProjection = SystemVersionTuple;
+
+/** `_systemProjectionKeysComplete` fails to compile when a `SystemProjection` field is missing from this tuple. */
+const SYSTEM_PROJECTION_KEYS = [
+    "repoCommitSha",
+    "bunVersion",
+    "opencodeVersion",
+    "historianModelId",
+    "probeModelId",
+    "parserImpl",
+    "chunkTokenBudget",
+] as const satisfies readonly (keyof SystemProjection)[];
+type MissingSystemProjectionKey = Exclude<keyof SystemProjection, (typeof SYSTEM_PROJECTION_KEYS)[number]>;
+const _systemProjectionKeysComplete: MissingSystemProjectionKey extends never ? true : never = true;
+void _systemProjectionKeysComplete;
 
 export interface ReleaseFingerprintsProjection {
     corpus: string;
@@ -233,7 +238,7 @@ function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[],
 
 function parseSystemProjection(raw: unknown, label: string): SystemProjection {
     const value = record(raw, label);
-    exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "historianModelId", "probeModelId", "parserImpl", "chunkTokenBudget"], label);
+    exact(value, SYSTEM_PROJECTION_KEYS, label);
     if (value.parserImpl !== "ts") fail(`${label}.parserImpl: enum-invalid`);
     return {
         repoCommitSha: string(value.repoCommitSha, `${label}.repoCommitSha`),
@@ -319,7 +324,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
     if (root.schema !== SCORECARD_POLICY_SCHEMA) fail("policy.schema: version-invalid");
     const comparison = record(root.statisticalComparison, "policy.statisticalComparison");
     exact(comparison, ["bootstrapResamples", "noiseFloorSource"], "policy.statisticalComparison");
-    const canaryIds = idArray(root.injectionCanaryScenarioIds, "policy.injectionCanaryScenarioIds", REASON_CODE_RE);
+    const canaryIds = idArray(root.injectionCanaryScenarioIds, "policy.injectionCanaryScenarioIds", SCENARIO_ID_RE);
     if (canaryIds.length === 0) fail("policy.injectionCanaryScenarioIds: empty");
     const secondaryMetricSlots = idArray(root.secondaryMetricSlots, "policy.secondaryMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, UTILITY_SLOT_IDS, `policy.secondaryMetricSlots[${index}]`));
