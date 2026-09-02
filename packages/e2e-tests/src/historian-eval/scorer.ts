@@ -1823,23 +1823,14 @@ function parseRatio(value: unknown, label: string): number | null {
     return value as number;
 }
 
-function parseText(value: unknown, label: string): string {
-    if (typeof value !== "string") p.fail(`${label}: string-invalid`);
-    return value as string;
-}
-
 function parseNullableText(value: unknown, label: string): string | null {
-    return value === null ? null : parseText(value, label);
-}
-
-function parseBoolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") p.fail(`${label}: boolean-invalid`);
-    return value as boolean;
+    return value === null ? null : p.text(value, label);
 }
 
 function parseCountRecord(raw: unknown, label: string): Record<string, number> {
     const value = p.record(raw, label);
-    return Object.fromEntries(Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`)]));
+    // `buildLaneReport` only ever increments these, so a key present with a zero count is corruption.
+    return Object.fromEntries(Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`, 1)]));
 }
 
 export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
@@ -1850,7 +1841,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         "falseAuthoritativeMatches", "structuralFindings", "probeVerdicts", "system", "source",
     ], label);
     const stringArray = (field: "falseAuthoritativeMatches" | "structuralFindings"): string[] =>
-        p.array(value[field], `${label}.${field}`).map((entry, index) => parseText(entry, `${label}.${field}[${index}]`));
+        p.array(value[field], `${label}.${field}`).map((entry, index) => p.text(entry, `${label}.${field}[${index}]`));
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
         verdict: p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`),
@@ -1873,7 +1864,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
             return {
                 probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
                 outcome: p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`),
-                expected: parseText(probe.expected, `${probeLabel}.expected`),
+                expected: p.text(probe.expected, `${probeLabel}.expected`),
                 actual: parseNullableText(probe.actual, `${probeLabel}.actual`),
             };
         }),
@@ -1904,8 +1895,8 @@ export function parseLaneReport(raw: unknown): LaneReport {
             recall: parseRatio(aggregate.recall, "report.aggregate.recall"),
             falseAuthoritativeRate: parseRatio(aggregate.falseAuthoritativeRate, "report.aggregate.falseAuthoritativeRate"),
         },
-        red: parseBoolean(root.red, "report.red"),
-        runFatal: parseBoolean(root.runFatal, "report.runFatal"),
+        red: p.boolean(root.red, "report.red"),
+        runFatal: p.boolean(root.runFatal, "report.runFatal"),
     };
     // Rebuilding verifies that the scenarios satisfy the builder's admission rules and that the archived derived fields match.
     let rebuilt: LaneReport;

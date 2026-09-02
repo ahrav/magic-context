@@ -2517,6 +2517,11 @@ describe("buildLaneReport", () => {
         const rawOutput = structuredClone(report);
         rawOutput.scenarios[0]!.source = "raw-output";
         expect(() => parseLaneReport(rawOutput)).toThrow(/report\.scenarios: lane-invalid \(.*raw-output seam/);
+        // A reason key is only ever written by incrementing, so a zero count fails on its own field.
+        const zeroCount = structuredClone(report);
+        zeroCount.aggregate.failCountsByReason = { "false-authoritative": 0 };
+        expect(() => parseLaneReport(zeroCount))
+            .toThrow(/report\.aggregate\.failCountsByReason\.false-authoritative: integer-invalid/);
     });
 });
 

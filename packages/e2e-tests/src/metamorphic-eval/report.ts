@@ -1,3 +1,4 @@
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { SystemVersionTuple } from "../historian-eval/runner";
 import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
@@ -167,18 +168,8 @@ const CHANGE_DIRECTIONS = vocabulary<Extract<InvariantVerdict, { invariant: "inj
     "added-in-derivative": true,
 });
 
-function text(value: unknown, label: string): string {
-    if (typeof value !== "string") p.fail(`${label}: string-invalid`);
-    return value as string;
-}
-
-function boolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") p.fail(`${label}: boolean-invalid`);
-    return value as boolean;
-}
-
 function textArray(value: unknown, label: string): string[] {
-    return p.array(value, label).map((entry, index) => text(entry, `${label}[${index}]`));
+    return p.array(value, label).map((entry, index) => p.text(entry, `${label}[${index}]`));
 }
 
 function parsePairKey(value: Record<string, unknown>, label: string): PairKey {
@@ -206,7 +197,7 @@ function parseInvariantEvidence(value: Record<string, unknown>, invariant: Metam
                     p.exact(claim, ["category", "content"], `${changeLabel}.claim`);
                     return {
                         direction: p.enumeration(change.direction, CHANGE_DIRECTIONS, `${changeLabel}.direction`),
-                        claim: { category: text(claim.category, `${changeLabel}.claim.category`), content: text(claim.content, `${changeLabel}.claim.content`) },
+                        claim: { category: p.text(claim.category, `${changeLabel}.claim.category`), content: p.text(claim.content, `${changeLabel}.claim.content`) },
                     };
                 }),
             };
@@ -240,7 +231,7 @@ function parseInvariantEvidence(value: Record<string, unknown>, invariant: Metam
 function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdict {
     const value = p.record(raw, label);
     const invariant = p.enumeration(value.invariant, INVARIANT_IDS, `${label}.invariant`);
-    const holds = boolean(value.holds, `${label}.holds`);
+    const holds = p.boolean(value.holds, `${label}.holds`);
     const evidence = parseInvariantEvidence(value, invariant, label);
     if (invariantHolds(evidence) !== holds) p.fail(`${label}.holds: derived-mismatch`);
     return { ...evidence, holds } as MetamorphicInvariantVerdict;
@@ -261,21 +252,29 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
                 kind,
                 role: p.enumeration(value.role, SCORED_ROLES, `${label}.role`),
                 stage: p.enumeration(value.stage, UNSCORED_STAGES, `${label}.stage`),
-                error: text(value.error, `${label}.error`),
+                error: p.text(value.error, `${label}.error`),
             };
-        case "scored":
+        case "scored": {
             p.exact(value, [...PAIR_KEYS, "kind", "baselineScore", "derivativeScore", "invariants"], label);
+            const baselineScore = parseScenarioScore(value.baselineScore, `${label}.baselineScore`);
+            const derivativeScore = parseScenarioScore(value.derivativeScore, `${label}.derivativeScore`);
+            // Equality rather than the live runner's non-null `sameSystem`: the raw-output path scores both
+            // roles with a null tuple, so requiring non-null would reject its reports.
+            if (canonicalJson(baselineScore.system) !== canonicalJson(derivativeScore.system)) {
+                p.fail(`${label}: pair-system-mismatch`);
+            }
             return {
                 ...pair,
                 kind,
-                baselineScore: parseScenarioScore(value.baselineScore, `${label}.baselineScore`),
-                derivativeScore: parseScenarioScore(value.derivativeScore, `${label}.derivativeScore`),
+                baselineScore,
+                derivativeScore,
                 invariants: p.array(value.invariants, `${label}.invariants`)
                     .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`)),
             };
+        }
         case "error":
             p.exact(value, [...PAIR_KEYS, "kind", "error"], label);
-            return { ...pair, kind, error: text(value.error, `${label}.error`) };
+            return { ...pair, kind, error: p.text(value.error, `${label}.error`) };
     }
 }
 
@@ -291,7 +290,7 @@ function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason 
             p.exact(value, ["kind", "systemMismatch", "failedInvariants"], label);
             return {
                 kind,
-                systemMismatch: boolean(value.systemMismatch, `${label}.systemMismatch`),
+                systemMismatch: p.boolean(value.systemMismatch, `${label}.systemMismatch`),
                 failedInvariants: p.array(value.failedInvariants, `${label}.failedInvariants`)
                     .map((entry, index) => p.enumeration(entry, INVARIANT_IDS, `${label}.failedInvariants[${index}]`)),
             };
@@ -299,12 +298,12 @@ function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason 
             p.exact(value, ["kind", "controlAErrorReason", "controlBErrorReason"], label);
             return {
                 kind,
-                controlAErrorReason: value.controlAErrorReason === null ? null : text(value.controlAErrorReason, `${label}.controlAErrorReason`),
-                controlBErrorReason: value.controlBErrorReason === null ? null : text(value.controlBErrorReason, `${label}.controlBErrorReason`),
+                controlAErrorReason: value.controlAErrorReason === null ? null : p.text(value.controlAErrorReason, `${label}.controlAErrorReason`),
+                controlBErrorReason: value.controlBErrorReason === null ? null : p.text(value.controlBErrorReason, `${label}.controlBErrorReason`),
             };
         case "selection-empty":
             p.exact(value, ["kind", "reason"], label);
-            return { kind, reason: text(value.reason, `${label}.reason`) };
+            return { kind, reason: p.text(value.reason, `${label}.reason`) };
         case "deadline-exhausted":
             p.exact(value, ["kind", "nextRole"], label);
             return { kind, nextRole: p.enumeration(value.nextRole, ROLES, `${label}.nextRole`) };
@@ -331,7 +330,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
                     const itemLabel = `${label}.inapplicable[${itemIndex}]`;
                     const inapplicable = p.record(item, itemLabel);
                     p.exact(inapplicable, [...PAIR_KEYS, "reason"], itemLabel);
-                    return { ...parsePairKey(inapplicable, itemLabel), reason: text(inapplicable.reason, `${itemLabel}.reason`) };
+                    return { ...parsePairKey(inapplicable, itemLabel), reason: p.text(inapplicable.reason, `${itemLabel}.reason`) };
                 }),
                 violations: textArray(value.violations, `${label}.violations`),
             };

@@ -302,11 +302,6 @@ function nonNegativeNumber(value: unknown, label: string): number {
     return result;
 }
 
-function boolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") p.fail(`${label}: boolean-invalid`);
-    return value as boolean;
-}
-
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
     p.exact(value, ["lower", "upper"], label);
@@ -372,7 +367,7 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     ], label);
     const minimumAnalyzableFamilyCount = p.integer(value.minimumAnalyzableFamilyCount, `${label}.minimumAnalyzableFamilyCount`, 1);
     const analyzableFamilyCount = p.integer(value.analyzableFamilyCount, `${label}.analyzableFamilyCount`);
-    const evidenceSufficient = boolean(value.evidenceSufficient, `${label}.evidenceSufficient`);
+    const evidenceSufficient = p.boolean(value.evidenceSufficient, `${label}.evidenceSufficient`);
     if (evidenceSufficient !== analyzableFamilyCount >= minimumAnalyzableFamilyCount) p.fail(`${label}.evidenceSufficient: derived-mismatch`);
     return {
         poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, `${label}.poolManifestFingerprint`),
@@ -493,7 +488,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             refusedRegretLadders: parseCountRecord(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
             plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates"),
             healthyCoordinates: p.integer(summary.healthyCoordinates, "report.body.runSummary.healthyCoordinates"),
-            evidenceComplete: boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
+            evidenceComplete: p.boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
             calibrationFingerprint: summary.calibrationFingerprint === null
                 ? null
                 : p.hex64(summary.calibrationFingerprint, "report.body.runSummary.calibrationFingerprint"),

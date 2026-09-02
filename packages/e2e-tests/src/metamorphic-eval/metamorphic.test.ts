@@ -183,6 +183,28 @@ describe("deterministic metamorphic runner", () => {
         expect(metamorphicExitCode(flipped)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(flipped))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants\\[${verdictEquality}\\]\\.holds: derived-mismatch`));
+
+        // A scored pair whose roles ran different systems cannot isolate the transform, so parsing rejects it.
+        const crossSystem = structuredClone(report);
+        const crossEntry = crossSystem.entries[scoredIndex]!;
+        if (crossEntry.kind !== "scored") throw new Error("unreachable");
+        crossEntry.derivativeScore.system = {
+            repoCommitSha: "f".repeat(40),
+            bunVersion: "9.9.9",
+            opencodeVersion: "9.9.9",
+            historianModelId: "other-model",
+            probeModelId: "other-probe",
+            parserImpl: "ts",
+            chunkTokenBudget: null,
+        };
+        // Both roles still say PASS and every archived invariant still holds, so the exit code stays green.
+        expect(metamorphicExitCode(crossSystem)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(crossSystem))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-system-mismatch`));
+
+        // Equal tuples parse, including the null pair this runner produces.
+        expect(report.entries[scoredIndex]).toMatchObject({ baselineScore: { system: null }, derivativeScore: { system: null } });
+        expect(() => parseMetamorphicReport(report)).not.toThrow();
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {

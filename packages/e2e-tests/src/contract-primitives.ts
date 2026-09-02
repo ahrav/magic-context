@@ -26,6 +26,9 @@ export interface ContractPrimitives {
     record(value: unknown, label: string): Record<string, unknown>;
     exact(recordValue: Record<string, unknown>, keys: readonly string[], label: string): void;
     string(value: unknown, label: string): string;
+    /** Any string, including empty: for free-form fields where emptiness carries no meaning. `string` rejects blanks. */
+    text(value: unknown, label: string): string;
+    boolean(value: unknown, label: string): boolean;
     staticId(value: unknown, label: string, pattern: RegExp): string;
     hex64(value: unknown, label: string): string;
     enumeration<T extends string>(value: unknown, allowed: readonly T[], label: string): T;
@@ -58,6 +61,16 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
     function stringValue(value: unknown, label: string): string {
         if (typeof value !== "string" || value.trim().length === 0) fail(`${label}: string-invalid`);
         return value;
+    }
+
+    function textValue(value: unknown, label: string): string {
+        if (typeof value !== "string") fail(`${label}: string-invalid`);
+        return value as string;
+    }
+
+    function booleanValue(value: unknown, label: string): boolean {
+        if (typeof value !== "boolean") fail(`${label}: boolean-invalid`);
+        return value as boolean;
     }
 
     function staticId(value: unknown, label: string, pattern: RegExp): string {
@@ -97,5 +110,5 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return values;
     }
 
-    return { fail, record, exact, string: stringValue, staticId, hex64, enumeration, array, integer, unique, idArray };
+    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, integer, unique, idArray };
 }
