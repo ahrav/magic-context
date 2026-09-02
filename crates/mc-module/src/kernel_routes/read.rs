@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::project::{ProjectBinding, ScopeFilter};
+use super::serving;
 use super::{blocking, kernel_response, state_only, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
@@ -20,10 +21,26 @@ pub(crate) struct ReadRequest {
     /// `None` reads the tip.
     #[serde(default)]
     as_of: Option<i64>,
-    /// Whether the serving policy judges freshness before rows are returned;
-    /// the policy consumes this field, the read itself does not.
+    /// Whether the serving policy judges freshness before rows are returned.
     #[serde(default)]
     gated: bool,
+    /// Clock the lag age is measured against, so a test can place a read on
+    /// either side of the age threshold; production reads take the wall clock.
+    #[cfg(feature = "test-support")]
+    #[serde(default)]
+    now_ms: Option<i64>,
+}
+
+impl ReadRequest {
+    #[cfg(feature = "test-support")]
+    fn clock_ms(&self) -> i64 {
+        self.now_ms.unwrap_or_else(crate::now_ms)
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    fn clock_ms(&self) -> i64 {
+        crate::now_ms()
+    }
 }
 
 pub(crate) struct ReadResponse {
@@ -92,6 +109,18 @@ impl McHandler {
                 "{OPERATION} surface must be one of auto_inject, auto_search, explicit_search"
             ));
         };
+        if parsed.gated {
+            let store = scope.store.clone();
+            let now_ms = parsed.clock_ms();
+            let outcome = match blocking(move || store.outbox_lag(now_ms)).await {
+                Ok(Ok(lag)) => serving::project(serving::decide(&lag), surface),
+                Ok(Err(error)) => KernelOutcome::from(error),
+                Err(outcome) => outcome,
+            };
+            if !outcome.is_available() {
+                return state_only(outcome);
+            }
+        }
         let store = scope.store.clone();
         let project = scope.project.clone();
         let as_of = parsed.as_of;

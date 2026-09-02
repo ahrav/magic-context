@@ -166,6 +166,15 @@ pub enum ArtifactEligibility {
     Denied(EligibilityDeniedReason),
 }
 
+/// An egress verdict and the class it was derived from, read in one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactEgressFacts {
+    pub eligibility: ArtifactEligibility,
+    /// The restrictive fold over every live reference to the digest; `None`
+    /// when no live reference exists or the digest is tombstoned.
+    pub stored_class: Option<(Sensitivity, ProviderEgress)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactErrorKind {
     PayloadTooLarge,

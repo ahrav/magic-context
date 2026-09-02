@@ -1239,3 +1239,424 @@ async fn a_commit_that_cannot_take_the_writer_by_its_deadline_is_store_busy() {
     assert_eq!(object_ids(&read), ["decision-object-2"]);
     daemon.handler.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Serving policy and the egress decision
+// ---------------------------------------------------------------------------
+
+fn gated_read_request(project: &Path, surface: &str, now_ms: i64) -> Value {
+    let mut request = read_request(project, surface, None);
+    request["gated"] = json!(true);
+    request["now_ms"] = json!(now_ms);
+    request
+}
+
+fn core_connection(daemon: &Daemon) -> rusqlite::Connection {
+    rusqlite::Connection::open(kernel_root(&daemon.descriptor).join("core.sqlite")).unwrap()
+}
+
+/// The newest outbox position, which is always the last row of its commit and
+/// so a legal publication watermark.
+fn newest_outbox_position(daemon: &Daemon) -> i64 {
+    core_connection(daemon)
+        .query_row("SELECT MAX(outbox_position) FROM outbox", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// Creation time of the oldest outbox row past `checkpoint`, the row whose
+/// age the lag facts report.
+fn oldest_unconsumed_created_at(daemon: &Daemon, checkpoint: i64) -> i64 {
+    core_connection(daemon)
+        .query_row(
+            "SELECT MIN(created_at) FROM outbox WHERE commit_seq > ?1",
+            [checkpoint],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+impl Daemon {
+    async fn gated_read(&self, surface: &str, now_ms: i64) -> Value {
+        self.call(
+            self.route,
+            gated_read_request(&self.project, surface, now_ms),
+        )
+        .await
+    }
+
+    fn register_consumer(&self, consumer: &str) -> i64 {
+        self.store()
+            .commit(intent(&format!("register-{consumer}")), |envelope| {
+                envelope.register_outbox_consumer(consumer, 1)?;
+                Ok(String::new())
+            })
+            .unwrap()
+            .commit_seq
+    }
+
+    fn deregister_consumer(&self, consumer: &str) {
+        self.store()
+            .commit(intent(&format!("deregister-{consumer}")), |envelope| {
+                envelope.deregister_outbox_consumer(consumer, 1)?;
+                Ok(String::new())
+            })
+            .unwrap();
+    }
+
+    /// Emits `count` outbox rows and publishes every row emitted so far.
+    fn publish_domains(&self, first: i64, count: i64) {
+        let store = self.store();
+        let mut next = first;
+        while next < first + count {
+            let batch = (first + count - next).min(2_500);
+            insert_domains(&store, next, batch);
+            next += batch;
+        }
+        store
+            .mark_outbox_published_through(newest_outbox_position(self), 1)
+            .unwrap();
+    }
+}
+
+fn assert_stale(value: &Value, lag_positions: i64) {
+    assert_state(value, "stale", None);
+    assert_eq!(value["state"]["lag_positions"], lag_positions, "{value}");
+    assert!(value.get("rows").is_none(), "{value}");
+}
+
+#[tokio::test]
+async fn search_returns_stale_marker_and_injection_abstains_past_threshold() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit("create-1", vec![insert_decision(1)], vec![])
+        .await;
+
+    // No registered consumer: freshness cannot be judged, so explicit search
+    // says so, automatic surfaces abstain, and ungated reads serve rows.
+    let explicit = daemon.gated_read("explicit_search", 1).await;
+    assert_state(&explicit, "unavailable", Some("no_required_consumer"));
+    assert!(explicit.get("rows").is_none());
+    for surface in ["auto_search", "auto_inject"] {
+        assert_state(&daemon.gated_read(surface, 1).await, "abstained", None);
+    }
+    assert_eq!(
+        object_ids(&daemon.read("explicit_search", None).await),
+        ["decision-object-1"]
+    );
+
+    // A consumer caught up to its registration, then 9,999 published rows.
+    let registered = daemon.register_consumer("projector");
+    store
+        .acknowledge_outbox("projector", registered, 1)
+        .unwrap();
+    daemon.publish_domains(1, 9_999);
+    let created_at = oldest_unconsumed_created_at(&daemon, registered);
+    let below = daemon
+        .gated_read("explicit_search", created_at + 59_999)
+        .await;
+    assert_state(&below, "available", None);
+    assert_eq!(object_ids(&below), ["decision-object-1"]);
+
+    // The 10,000th published position trips the counter threshold.
+    daemon.publish_domains(10_000, 1);
+    let stale = daemon
+        .gated_read("explicit_search", created_at + 59_999)
+        .await;
+    assert_stale(&stale, 10_000);
+    assert_eq!(stale["state"]["oldest_unconsumed_age_ms"], 59_999);
+    for surface in ["auto_search", "auto_inject"] {
+        let abstained = daemon.gated_read(surface, created_at + 59_999).await;
+        assert_state(&abstained, "abstained", None);
+        assert_eq!(abstained["state"]["lag_positions"], 10_000);
+        assert!(abstained.get("rows").is_none());
+    }
+    // Canonical writes continue past the threshold, and ungated reads see them.
+    let receipt = daemon
+        .commit("create-2", vec![insert_decision(2)], vec![])
+        .await;
+    assert_state(&receipt, "available", None);
+    assert!(receipt["receipt"]["commit_seq"].is_i64(), "{receipt}");
+    assert_eq!(
+        object_ids(&daemon.read("explicit_search", None).await),
+        ["decision-object-1", "decision-object-2"]
+    );
+    assert_state(&daemon.read("auto_search", None).await, "available", None);
+
+    // Acknowledging everything but the last commit leaves one unpublished
+    // commit whose age alone decides the verdict.
+    let tip = daemon.tip();
+    store.acknowledge_outbox("projector", tip - 1, 1).unwrap();
+    let created_at = oldest_unconsumed_created_at(&daemon, tip - 1);
+    let fresh = daemon
+        .gated_read("explicit_search", created_at + 59_999)
+        .await;
+    assert_state(&fresh, "available", None);
+    assert_eq!(fresh["known_as_of"], tip);
+    let aged = daemon
+        .gated_read("explicit_search", created_at + 60_000)
+        .await;
+    assert_stale(&aged, 0);
+    assert_eq!(aged["state"]["oldest_unconsumed_age_ms"], 60_000);
+    assert_state(
+        &daemon.gated_read("auto_search", created_at + 60_000).await,
+        "abstained",
+        None,
+    );
+
+    // Catching up and leaving returns the store to the unjudgeable state.
+    store.acknowledge_outbox("projector", tip, 1).unwrap();
+    daemon.deregister_consumer("projector");
+    assert_state(
+        &daemon
+            .gated_read("explicit_search", created_at + 60_000)
+            .await,
+        "unavailable",
+        Some("no_required_consumer"),
+    );
+
+    // A consumer that joins behind 12,000 published rows is stale by exactly
+    // that many until it acknowledges past the threshold.
+    let before = daemon.tip();
+    let first_batch = insert_domains(&store, 20_000, 1_000);
+    daemon.publish_domains(21_000, 11_000);
+    let joined = daemon.register_consumer("late");
+    store.acknowledge_outbox("late", before, 1).unwrap();
+    let created_at = oldest_unconsumed_created_at(&daemon, before);
+    assert_stale(
+        &daemon.gated_read("explicit_search", created_at).await,
+        12_000,
+    );
+    store.acknowledge_outbox("late", first_batch, 1).unwrap();
+    assert_stale(
+        &daemon.gated_read("explicit_search", created_at).await,
+        11_000,
+    );
+    // The next commit holds 2,500 rows, so acknowledging it crosses back
+    // under the threshold.
+    store
+        .acknowledge_outbox("late", first_batch + 1, 1)
+        .unwrap();
+    let caught_up = daemon.gated_read("explicit_search", created_at).await;
+    assert_state(&caught_up, "available", None);
+    assert_eq!(
+        object_ids(&caught_up),
+        ["decision-object-1", "decision-object-2"]
+    );
+    store.acknowledge_outbox("late", joined, 1).unwrap();
+    daemon.deregister_consumer("late");
+    assert_state(
+        &daemon.gated_read("explicit_search", created_at).await,
+        "unavailable",
+        Some("no_required_consumer"),
+    );
+    assert_state(
+        &daemon.gated_read("auto_search", created_at).await,
+        "abstained",
+        None,
+    );
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// Stands in for a provider: the test dispatches through it only when the
+/// gate answered `allowed`, so its count is the number of requests made.
+struct Recorder(std::sync::atomic::AtomicUsize);
+
+impl Recorder {
+    fn dispatch(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn requests(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn egress_request(
+    project: &Path,
+    digest: &str,
+    destination: &str,
+    asserted: &str,
+    owning_object_id: &str,
+) -> Value {
+    json!({
+        "method": "kernel.egress.decide",
+        "v": 1,
+        "session_id": SESSION,
+        "project_root": project.to_str().unwrap(),
+        "artifact_digest": digest,
+        "destination": destination,
+        "asserted_sensitivity": asserted,
+        "owning_object_id": owning_object_id,
+    })
+}
+
+impl Daemon {
+    /// Asks the gate and dispatches through `recorder` exactly when it allows,
+    /// returning the wire decision.
+    async fn egress(
+        &self,
+        recorder: &Recorder,
+        digest: &str,
+        destination: &str,
+        asserted: &str,
+        owning_object_id: &str,
+    ) -> Value {
+        let response = self
+            .call(
+                self.route,
+                egress_request(
+                    &self.project,
+                    digest,
+                    destination,
+                    asserted,
+                    owning_object_id,
+                ),
+            )
+            .await;
+        assert_state(&response, "available", None);
+        if response["decision"] == json!("allowed") {
+            recorder.dispatch();
+        }
+        response["decision"].clone()
+    }
+}
+
+fn refused(reason: &str) -> Value {
+    json!({"refused": reason})
+}
+
+/// Artifacts of every class plus an owning object in the bound project and
+/// one in another project.
+async fn egress_fixture(daemon: &Daemon) -> [String; 3] {
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit("create-1", vec![insert_decision(1)], vec![])
+        .await;
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut write_b = commit_request(&project_b, "b", vec![insert_decision(2)], vec![]);
+    write_b["session_id"] = json!("session-b");
+    assert_state(&daemon.call(route_b, write_b).await, "available", None);
+    let normal = store
+        .ingest_artifact(ingest("normal", b"public bytes", Sensitivity::Normal))
+        .unwrap();
+    let sensitive = store
+        .ingest_artifact(ingest(
+            "sensitive",
+            b"private bytes",
+            Sensitivity::Sensitive,
+        ))
+        .unwrap();
+    let secret = store
+        .ingest_artifact(ingest("secret", b"classified bytes", Sensitivity::Secret))
+        .unwrap();
+    [normal.digest, sensitive.digest, secret.digest]
+}
+
+#[tokio::test]
+async fn egress_gate_rejects_sensitive_remote_and_all_secret_without_a_request() {
+    let daemon = Daemon::start().await;
+    let [normal, sensitive, secret] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    let owner = "decision-object-1";
+
+    assert_eq!(
+        daemon
+            .egress(&recorder, &sensitive, "remote", "normal", owner)
+            .await,
+        refused("under_declared")
+    );
+    assert_eq!(
+        daemon
+            .egress(&recorder, &sensitive, "remote", "sensitive", owner)
+            .await,
+        refused("sensitive_remote")
+    );
+    for destination in ["local", "remote"] {
+        for asserted in ["normal", "sensitive", "secret"] {
+            assert_eq!(
+                daemon
+                    .egress(&recorder, &secret, destination, asserted, owner)
+                    .await,
+                refused("secret"),
+                "{destination} {asserted}"
+            );
+        }
+    }
+    assert_eq!(
+        daemon
+            .egress(&recorder, &"a".repeat(64), "remote", "normal", owner)
+            .await,
+        refused("unknown_sensitive")
+    );
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-2")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "never-written")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 0, "a refusal made a provider request");
+
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", owner)
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+    // Local egress of a sensitive artifact is eligible when declared honestly.
+    assert_eq!(
+        daemon
+            .egress(&recorder, &sensitive, "local", "sensitive", owner)
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 2);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_rejects_an_under_declared_normal_request_without_a_request() {
+    let daemon = Daemon::start().await;
+    let [_, sensitive, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "remote",
+                "normal",
+                "decision-object-1"
+            )
+            .await,
+        refused("under_declared")
+    );
+    // The same artifact declared honestly is refused for its destination, not
+    // its declaration, so the first refusal was the assertion's.
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "remote",
+                "sensitive",
+                "decision-object-1"
+            )
+            .await,
+        refused("sensitive_remote")
+    );
+    assert_eq!(recorder.requests(), 0);
+    daemon.handler.shutdown().await.unwrap();
+}

@@ -12105,6 +12105,7 @@ impl McHandler {
                     self.handle_kernel_eligibility_batch(channel, &request)
                         .await
                 }
+                "kernel.egress.decide" => self.handle_kernel_egress_decide(channel, &request).await,
                 // The handler echoes only explicit wire-debugging requests.
                 // Unknown request bodies must fail so misrouted callers cannot mistake an echo for success.
                 // An unconditional echo lets a misrouted caller mistake an echo for success.

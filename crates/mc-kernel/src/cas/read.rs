@@ -2,8 +2,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::{
-    is_artifact_digest, read_capped, ArtifactDestination, ArtifactEligibility, ArtifactError,
-    ArtifactErrorKind, ArtifactHandle, EligibilityDeniedReason, ProviderEgress,
+    is_artifact_digest, read_capped, ArtifactDestination, ArtifactEgressFacts, ArtifactEligibility,
+    ArtifactError, ArtifactErrorKind, ArtifactHandle, EligibilityDeniedReason, ProviderEgress,
 };
 use crate::durable_fs::{open_regular_nofollow, open_secure_directory};
 use crate::{KernelStore, Sensitivity};
@@ -81,6 +81,18 @@ impl KernelStore {
         handle: &ArtifactHandle,
         destination: ArtifactDestination,
     ) -> Result<ArtifactEligibility, ArtifactError> {
+        self.artifact_egress_facts(handle, destination)
+            .map(|facts| facts.eligibility)
+    }
+
+    /// The egress verdict together with the class it was derived from, read
+    /// in one snapshot so a caller comparing its own assertion against the
+    /// stored class judges the same rows the verdict did.
+    pub fn artifact_egress_facts(
+        &self,
+        handle: &ArtifactHandle,
+        destination: ArtifactDestination,
+    ) -> Result<ArtifactEgressFacts, ArtifactError> {
         if !is_artifact_digest(&handle.digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
@@ -100,9 +112,10 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?
             .is_some();
         if tombstoned {
-            return Ok(ArtifactEligibility::Denied(
-                EligibilityDeniedReason::Tombstoned,
-            ));
+            return Ok(ArtifactEgressFacts {
+                eligibility: ArtifactEligibility::Denied(EligibilityDeniedReason::Tombstoned),
+                stored_class: None,
+            });
         }
         let mut statement = snapshot
             .prepare(
@@ -115,13 +128,13 @@ impl KernelStore {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
-        let mut classification: Option<(Sensitivity, ProviderEgress)> = None;
+        let mut stored_class: Option<(Sensitivity, ProviderEgress)> = None;
         for row in rows {
             let (sensitivity, egress) =
                 row.map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
             let sensitivity = Sensitivity::from_stored(&sensitivity);
             let egress = ProviderEgress::from_stored(&egress);
-            classification = Some(match classification {
+            stored_class = Some(match stored_class {
                 Some((current_sensitivity, current_egress)) => (
                     current_sensitivity.restrictive(sensitivity),
                     current_egress.restrictive(egress),
@@ -132,30 +145,35 @@ impl KernelStore {
         drop(statement);
         drop(snapshot);
         drop(reader);
-
-        let Some((sensitivity, egress)) = classification else {
-            return Ok(match destination {
-                ArtifactDestination::Local => ArtifactEligibility::Allowed,
-                ArtifactDestination::Remote => {
-                    ArtifactEligibility::Denied(EligibilityDeniedReason::UnknownSensitive)
-                }
-            });
-        };
-        if sensitivity == Sensitivity::Secret {
-            return Ok(ArtifactEligibility::Denied(EligibilityDeniedReason::Secret));
-        }
-        if destination == ArtifactDestination::Remote {
-            if sensitivity != Sensitivity::Normal {
-                return Ok(ArtifactEligibility::Denied(
-                    EligibilityDeniedReason::SensitiveRemote,
-                ));
-            }
-            if egress == ProviderEgress::LocalOnly {
-                return Ok(ArtifactEligibility::Denied(
-                    EligibilityDeniedReason::ProviderRestricted,
-                ));
-            }
-        }
-        Ok(ArtifactEligibility::Allowed)
+        Ok(ArtifactEgressFacts {
+            eligibility: eligibility_for(stored_class, destination),
+            stored_class,
+        })
     }
+}
+
+fn eligibility_for(
+    stored_class: Option<(Sensitivity, ProviderEgress)>,
+    destination: ArtifactDestination,
+) -> ArtifactEligibility {
+    let Some((sensitivity, egress)) = stored_class else {
+        return match destination {
+            ArtifactDestination::Local => ArtifactEligibility::Allowed,
+            ArtifactDestination::Remote => {
+                ArtifactEligibility::Denied(EligibilityDeniedReason::UnknownSensitive)
+            }
+        };
+    };
+    if sensitivity == Sensitivity::Secret {
+        return ArtifactEligibility::Denied(EligibilityDeniedReason::Secret);
+    }
+    if destination == ArtifactDestination::Remote {
+        if sensitivity != Sensitivity::Normal {
+            return ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote);
+        }
+        if egress == ProviderEgress::LocalOnly {
+            return ArtifactEligibility::Denied(EligibilityDeniedReason::ProviderRestricted);
+        }
+    }
+    ArtifactEligibility::Allowed
 }

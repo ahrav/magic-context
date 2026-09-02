@@ -6,9 +6,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use mc_kernel::{
-    ArtifactDestination, ArtifactEligibility, ArtifactErrorKind, ArtifactHandle,
-    ArtifactIngestFault, ArtifactIngestRequest, CommitIntent, DomainSpec, EligibilityDeniedReason,
-    KernelStore, ProviderEgress, RepositoryProvenance, Sensitivity, MAX_PAYLOAD_BYTES,
+    ArtifactDestination, ArtifactEgressFacts, ArtifactEligibility, ArtifactErrorKind,
+    ArtifactHandle, ArtifactIngestFault, ArtifactIngestRequest, CommitIntent, DomainSpec,
+    EligibilityDeniedReason, KernelStore, ProviderEgress, RepositoryProvenance, Sensitivity,
+    MAX_PAYLOAD_BYTES,
 };
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -566,6 +567,79 @@ fn eligibility_matrix_includes_secret_unknown_and_tombstone() {
             .unwrap_err()
             .kind(),
         ArtifactErrorKind::ReAdmissionBlocked
+    );
+}
+
+#[test]
+fn egress_facts_carry_the_eligibility_verdict_and_the_stored_class() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let mut checked = 0;
+    for (index, &sensitivity) in Sensitivity::ALL.iter().enumerate() {
+        for (offset, &egress) in ProviderEgress::ALL.iter().enumerate() {
+            let key = format!("class-{index}-{offset}");
+            let mut ingest = request(&key, format!("payload {key}").into_bytes());
+            ingest.asserted_sensitivity = sensitivity;
+            ingest.provider_egress = egress;
+            let handle = store.ingest_artifact(ingest).unwrap();
+            for &destination in ArtifactDestination::ALL {
+                let facts = store.artifact_egress_facts(&handle, destination).unwrap();
+                assert_eq!(
+                    facts,
+                    ArtifactEgressFacts {
+                        eligibility: store.artifact_eligibility(&handle, destination).unwrap(),
+                        stored_class: Some((sensitivity, egress)),
+                    },
+                    "{sensitivity:?} {egress:?} to {destination:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(
+        checked,
+        Sensitivity::ALL.len() * ProviderEgress::ALL.len() * ArtifactDestination::ALL.len()
+    );
+
+    // Two references over the same bytes fold to the stricter class.
+    let payload = b"shared bytes".to_vec();
+    let merged = store
+        .ingest_artifact(request("merged-normal", payload.clone()))
+        .unwrap();
+    let mut stricter = request("merged-sensitive", payload);
+    stricter.asserted_sensitivity = Sensitivity::Sensitive;
+    stricter.provider_egress = ProviderEgress::LocalOnly;
+    store.ingest_artifact(stricter).unwrap();
+    assert_eq!(
+        store
+            .artifact_egress_facts(&merged, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEgressFacts {
+            eligibility: ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote),
+            stored_class: Some((Sensitivity::Sensitive, ProviderEgress::LocalOnly)),
+        }
+    );
+
+    let unknown = ArtifactHandle {
+        digest: "a".repeat(64),
+        evidence_id: "absent".to_string(),
+    };
+    for &destination in ArtifactDestination::ALL {
+        assert_eq!(
+            store.artifact_egress_facts(&unknown, destination).unwrap(),
+            ArtifactEgressFacts {
+                eligibility: store.artifact_eligibility(&unknown, destination).unwrap(),
+                stored_class: None,
+            }
+        );
+    }
+    assert_eq!(
+        store
+            .artifact_egress_facts(&unknown, ArtifactDestination::Remote)
+            .unwrap()
+            .eligibility,
+        ArtifactEligibility::Denied(EligibilityDeniedReason::UnknownSensitive)
     );
 }
 

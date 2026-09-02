@@ -55,8 +55,8 @@ pub use cas::{
 };
 pub use cas::{
     ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
-    ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,
-    ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
+    ArtifactDeletionResult, ArtifactDestination, ArtifactEgressFacts, ArtifactEligibility,
+    ArtifactError, ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
     BarrierConsumerStatus, DeletionBarrierStatus, EligibilityDeniedReason, ProviderEgress,
     MAX_PAYLOAD_BYTES,
 };

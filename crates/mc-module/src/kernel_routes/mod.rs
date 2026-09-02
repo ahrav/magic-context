@@ -6,6 +6,7 @@
 //! can read the phase from one atomic without touching the store.
 
 pub mod commit;
+pub mod egress;
 pub mod eligibility;
 pub mod health;
 pub(crate) mod project;
