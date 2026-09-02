@@ -88,7 +88,10 @@
 /// Stands in for a content digest, which is 64 hex characters and cannot collide with it.
 const DIRECTORY_MARKER: &str = "<directory>";
 
-/// `(depth, name, content digest, byte length)`.
+/// Stands in for a content digest, which is 64 hex characters.
+const SYMLINK_MARKER: &str = "<symlink>";
+
+/// `(depth, relative path, content digest, byte length)`.
 type CasEntry = (u64, String, String, u64);
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -210,6 +213,10 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         hash_rows(&normalized.identity),
     );
     tables.insert("cas_layout".to_string(), hash_rows(&layout_rows(root)));
+    tables.insert(
+        "recovery_markers".to_string(),
+        hash_rows(&recovery_marker_rows(root)),
+    );
     let metadata_rows = scan_object_metadata(root)
         .into_iter()
         .map(|(digest, uid, mode, links)| {
@@ -755,15 +762,54 @@ fn schema_identity_rows(connection: &Connection) -> Vec<Vec<Cell>> {
 /// `open_secure_directory` refuses a directory that is not owner-only, so the mode is state.
 fn layout_rows(root: &Path) -> Vec<Vec<Cell>> {
     let mut rows = Vec::new();
-    for relative in ["artifacts", "artifacts/objects", "artifacts/tmp"] {
-        let Ok(metadata) = fs::symlink_metadata(root.join(relative)) else {
+    let mut paths = vec![
+        "artifacts".to_string(),
+        "artifacts/objects".to_string(),
+        "artifacts/tmp".to_string(),
+    ];
+    // A shard opens through the same owner-only check, so its mode is state too.
+    if let Ok(entries) = fs::read_dir(root.join("artifacts/objects")) {
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().unwrap().is_dir() && name.len() == 2 {
+                paths.push(format!("artifacts/objects/{name}"));
+            }
+        }
+    }
+    paths.sort();
+    for relative in paths {
+        let Ok(metadata) = fs::symlink_metadata(root.join(&relative)) else {
             continue;
         };
         rows.push(vec![
-            Cell::Text(relative.to_string()),
+            Cell::Text(relative),
             Cell::Integer(i64::from(metadata.uid())),
             Cell::Integer(i64::from(metadata.permissions().mode() & 0o7777)),
         ]);
+    }
+    rows
+}
+
+/// The recovery markers `KernelStore::open` inspects before it opens the live family.
+///
+/// An invalid marker makes the next open fail, so its presence and contents are state.
+fn recovery_marker_rows(root: &Path) -> Vec<Vec<Cell>> {
+    let mut rows = Vec::new();
+    for suffix in [".mc-restore", ".mc-reset", ".mc-reset.staging"] {
+        let path = root.join(format!("core.sqlite{suffix}"));
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let content = if metadata.is_file() {
+            let bytes = fs::read(&path).unwrap();
+            Cell::Text(format!("{:x}", Sha256::digest(&bytes)))
+        } else if metadata.file_type().is_symlink() {
+            Cell::Text(SYMLINK_MARKER.to_string())
+        } else {
+            Cell::Text(DIRECTORY_MARKER.to_string())
+        };
+        rows.push(vec![Cell::Text(suffix.to_string()), content]);
     }
     rows
 }
@@ -781,7 +827,15 @@ fn hash_rows(rows: &[Vec<Cell>]) -> String {
 }
 
 fn open_read_only(root: &Path) -> Connection {
-    Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+    let path = root.join("core.sqlite");
+    // `KernelStore::open` inspects this file without following, and refuses a symlink.
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "{} is a symlink",
+        path.display()
+    );
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
 }
 
 fn table_names(connection: &Connection) -> Vec<String> {
@@ -881,11 +935,15 @@ pub fn scan_temps(root: &Path) -> Vec<CasEntry> {
     };
     let mut collected = Vec::new();
     for entry in entries {
-        collect_file_digests(&entry.unwrap().path(), 0, &mut collected);
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        collect_file_digests(&entry.path(), &name, 0, &mut collected);
     }
     let mut result = collected
         .into_iter()
-        .map(|(depth, name, digest, len)| (depth, temp_stem(&name), digest, len))
+        .map(|(depth, relative, digest, len)| {
+            (depth, temp_stem(last_component(&relative)), digest, len)
+        })
         .collect::<Vec<_>>();
     result.sort();
     result
@@ -954,22 +1012,20 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<CasEntry> {
             && name.len() == 2
             && name.bytes().all(is_lower_hex);
         if !is_shard {
-            collect_file_digests(&entry.path(), 0, &mut collected);
+            collect_file_digests(&entry.path(), &name, 0, &mut collected);
             continue;
         }
         // Only a regular file inside a shard is an object, so anything else is stray state.
         for inner in fs::read_dir(entry.path()).unwrap() {
-            let inner = inner.unwrap().path();
-            if !fs::symlink_metadata(&inner).unwrap().is_file() {
-                collect_file_digests(&inner, 1, &mut collected);
+            let inner = inner.unwrap();
+            let path = inner.path();
+            if !fs::symlink_metadata(&path).unwrap().is_file() {
+                let relative = format!("{name}/{}", inner.file_name().to_string_lossy());
+                collect_file_digests(&path, &relative, 1, &mut collected);
             }
         }
     }
-    // A stray name carries no meaning production reads, unlike a temp name.
-    let mut result = collected
-        .into_iter()
-        .map(|(depth, _, digest, len)| (depth, String::new(), digest, len))
-        .collect::<Vec<_>>();
+    let mut result = collected;
     result.sort();
     result
 }
@@ -978,27 +1034,33 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<CasEntry> {
 ///
 /// `depth` accompanies each digest because `regular_file_bytes` charges a root-level file but
 /// descends only one level, so the same bytes cost different usage at different depths.
-fn collect_file_digests(path: &Path, depth: u64, out: &mut Vec<CasEntry>) {
+fn collect_file_digests(path: &Path, relative: &str, depth: u64, out: &mut Vec<CasEntry>) {
     let metadata = fs::symlink_metadata(path).unwrap();
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if metadata.is_dir() {
+    if metadata.file_type().is_symlink() {
+        // A symlink at a future digest path fails a no-replace publication.
+        out.push((depth, relative.to_string(), SYMLINK_MARKER.to_string(), 0));
+    } else if metadata.is_dir() {
         // A directory holding no regular file would otherwise read the same as its absence.
-        out.push((depth, name, DIRECTORY_MARKER.to_string(), 0));
+        out.push((depth, relative.to_string(), DIRECTORY_MARKER.to_string(), 0));
         for entry in fs::read_dir(path).unwrap() {
-            collect_file_digests(&entry.unwrap().path(), depth + 1, out);
+            let entry = entry.unwrap();
+            let child = format!("{relative}/{}", entry.file_name().to_string_lossy());
+            collect_file_digests(&entry.path(), &child, depth + 1, out);
         }
     } else if metadata.is_file() {
         let bytes = fs::read(path).unwrap();
         out.push((
             depth,
-            name,
+            relative.to_string(),
             format!("{:x}", Sha256::digest(&bytes)),
             bytes.len() as u64,
         ));
     }
+}
+
+/// The final component of a relative path.
+fn last_component(relative: &str) -> &str {
+    relative.rsplit('/').next().unwrap_or(relative)
 }
 
 /// The part of a temp name that is state, with the process-unique counter removed.
