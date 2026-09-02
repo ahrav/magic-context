@@ -567,26 +567,52 @@ export function publishCalibrationRecord(
 /**
  * Whether a noise row could have come from real observations.
  *
- * A primary endpoint delta is one of `{-1, 0, 1}`. Observations spanning 1 have sample variance of at least `1/n`, from `n-1` equal values and one differing by 1; observations spanning 2 contain both -1 and 1, so at least `2/(n-1)`, from the rest at 0. Accepting `1/n` for `spread: 2` lets a record claim a variance no such series produces and derive a smaller pool. Without either floor, a self-consistently fingerprinted record can pair `spread: 0` with a token `variance: 1e-12`, satisfy the `variance > 0` gate, and shrink the derived pool to something the live cohort happens to clear. The relationship is checked rather than the discrete observations retained, since the record is a summary by design. commentlint: allow(JUDGE)
+ * A primary endpoint delta is one of `{-1, 0, 1}`, so `n` observations are a count triple over those three values, and the row's spread fixes which values occur: 0 means one value, 1 means two adjacent values, 2 means both endpoints. The sample variance of every such triple is enumerated and the row must match one. A floor alone still admits values between reachable ones — three observations spanning 2 produce only 1 or 4/3, and a claimed 1.01 would clear a floor of 1 and derive a smaller pool than the genuine 4/3 pilot. The relationship is checked rather than the discrete observations retained, since the record is a summary by design. commentlint: allow(JUDGE)
  */
 function arithmeticallyReachable(noise: CalibrationFamilyNoise): boolean {
-    if (noise.observationCount < 2) return false;
+    const n = noise.observationCount;
+    if (!Number.isSafeInteger(n) || n < 2) return false;
     if (!Number.isInteger(noise.spread) || noise.spread < 0 || noise.spread > MAX_ENDPOINT_SPREAD) {
         return false;
     }
     if (noise.spread === 0) return noise.variance === 0;
-    const floor = noise.spread === MAX_ENDPOINT_SPREAD
-        ? 2 / (noise.observationCount - 1)
-        : 1 / noise.observationCount;
-    /** The writer sums squared deviations from a rounded mean, so at the floor its variance can land one ulp below the closed form — `n = 11` gives `0.0909090909090909` against `0.09090909090909091` — and an exact comparison rejects a series the writer produced. The next larger reachable variance is at least `1/(n(n-1))` away, so the tolerance admits no forgery. commentlint: allow(JUDGE) */
-    return noise.variance >= floor * (1 - VARIANCE_FLOOR_TOLERANCE);
+    return reachableVariances(n, noise.spread).some((reachable) =>
+        Math.abs(noise.variance - reachable) <= reachable * VARIANCE_TOLERANCE);
+}
+
+/**
+ * Every sample variance `n` observations in `{-1, 0, 1}` can have at the given spread.
+ *
+ * Observations are a count triple over the three values, and the sum of squared deviations from the
+ * mean is determined by the counts alone, so the set is the image of the admissible triples. Spread
+ * 2 needs both endpoints present. Spread 1 uses two adjacent values; `{-1, 0}` and `{0, 1}` are a
+ * shift apart and share every variance, so only `{-1, 0}` is enumerated.
+ */
+function reachableVariances(n: number, spread: number): number[] {
+    const variances = new Set<number>();
+    for (let low = 1; low <= n - 1; low++) {
+        for (let high = 1; low + high <= n; high++) {
+            const middle = n - low - high;
+            /** Spread 1: `low` at -1, `high` at 0, nothing at 1, so the two must account for every observation. Spread 2: `low` at -1, `middle` at 0, `high` at 1. */
+            if (spread === 1 && middle !== 0) continue;
+            const counts = spread === 1 ? [low, high, 0] : [low, middle, high];
+            const values = [-1, 0, 1];
+            const mean = counts.reduce((sum, count, index) => sum + count * values[index]!, 0) / n;
+            const squares = counts.reduce(
+                (sum, count, index) => sum + count * (values[index]! - mean) ** 2,
+                0,
+            );
+            variances.add(squares / (n - 1));
+        }
+    }
+    return [...variances];
 }
 
 /** `{-1, 0, 1}` deltas cannot range wider than 2. */
 const MAX_ENDPOINT_SPREAD = 2;
 
-/** Relative slack for the writer's floating-point variance, far below any gap between reachable variances. */
-const VARIANCE_FLOOR_TOLERANCE = 1e-9;
+/** Relative slack for the writer's floating-point variance — it sums squared deviations from a rounded mean and can land one ulp off the closed form — and far below the gap between any two reachable variances, which is at least `1/(n(n-1))`. commentlint: allow(JUDGE) */
+const VARIANCE_TOLERANCE = 1e-9;
 
 export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecord {
     const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;

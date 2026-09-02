@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, type Stats } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync, type Stats } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import { canonicalFingerprint } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -442,7 +442,7 @@ function recordsRepoCommit(ownedPaths: readonly string[]): string {
     /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
     const relative = (path: string): string | null => relativeTo(root, path);
     /** The exact paths are excluded as literals because they come from `--records`: a value carrying pathspec metacharacters — `artifacts/run[1].json` — would otherwise exclude unrelated matching paths, dropping their changes from the status, the diff, and the untracked hash, so a resume could reuse records produced against different working code. commentlint: allow(JUDGE) */
-    const exact = ownedPaths.flatMap((path) => [path, `${path}.lock`])
+    const exact = ownedPaths.flatMap((path) => [path, `${path}.lock`, unmeasuredMarkerPath(path)])
         .map(relative)
         .filter((path): path is string => path !== null)
         .map((path) => `:(exclude,literal)${path}`);
@@ -763,6 +763,8 @@ function mergeHarnessOptions(
 }
 
 interface PromptResult {
+    /** The assistant message the prompt produced, which the session ledger must later list. */
+    messageId: string;
     providerId: string;
     modelId: string;
     usage: RolloutObservation["usage"];
@@ -773,6 +775,7 @@ interface PromptResult {
 function parsePromptResult(raw: unknown): PromptResult {
     const data = (raw as { data?: unknown } | null)?.data as {
         info?: {
+            id?: unknown;
             providerID?: unknown;
             modelID?: unknown;
             error?: unknown;
@@ -786,7 +789,9 @@ function parsePromptResult(raw: unknown): PromptResult {
     } | undefined;
     const info = data?.info;
     if (
-        typeof info?.providerID !== "string" ||
+        typeof info?.id !== "string" ||
+        info.id === "" ||
+        typeof info.providerID !== "string" ||
         typeof info.modelID !== "string" ||
         typeof info.tokens?.input !== "number" ||
         typeof info.tokens.output !== "number" ||
@@ -796,6 +801,7 @@ function parsePromptResult(raw: unknown): PromptResult {
         throw new Error("live prompt returned malformed assistant metadata");
     }
     return {
+        messageId: info.id,
         providerId: info.providerID,
         modelId: info.modelID,
         usage: {
@@ -860,6 +866,8 @@ interface SessionUsage {
     offPinRoute: { providerId: string; modelId: string } | null;
     /** Fixture-served assistant entries seen. R1 schedules exactly `SCRIPTED_ORACLE_MOCK_ENTRIES`; a shortfall is a scripted turn that did not land, and the ledger is not an R1 ledger. */
     mockEntries: number;
+    /** Ids of every priced assistant entry, so the caller can check that each response it was handed is in the ledger it is charging from. */
+    messageIds: Set<string>;
 }
 
 const ZERO_USAGE = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
@@ -883,6 +891,9 @@ const LEDGER_SETTLE_ATTEMPTS_ON_FAILURE = Math.max(
     Math.floor(LATE_DISPOSAL_GRACE_MS / 2 / LEDGER_SETTLE_INTERVAL_MS),
 );
 
+/** How long the failure read waits for an interrupted prompt before pricing without its row. Sized so one ledger read still fits inside the grace after the wait. */
+const IN_FLIGHT_PROMPT_WAIT_MS = Math.floor(LATE_DISPOSAL_GRACE_MS / 2);
+
 function addUsage(
     left: RolloutObservation["usage"],
     right: RolloutObservation["usage"],
@@ -896,6 +907,7 @@ function addUsage(
 }
 
 interface LedgerMessage {
+    id?: unknown;
     role?: unknown;
     providerID?: unknown;
     modelID?: unknown;
@@ -1051,6 +1063,7 @@ async function sessionUsage(
     let usage = ZERO_USAGE;
     let offPinRoute: SessionUsage["offPinRoute"] = null;
     let mockEntries = 0;
+    const messageIds = new Set<string>();
     let frontier = [sessionId];
     const seen = new Set<string>();
     while (frontier.length > 0) {
@@ -1064,6 +1077,11 @@ async function sessionUsage(
         frontier = [];
         for (const { messages, children } of fetched) {
         for (const info of ledgerEntries(messages)) {
+            /** An assistant entry without an id cannot be reconciled against the responses the rollout received, so the ledger is incomplete rather than merely anonymous. */
+            if (typeof info.id !== "string" || info.id === "") {
+                throw new Error("live paired-delta session ledger has an assistant entry with no id");
+            }
+            messageIds.add(info.id);
             const route = {
                 providerId: info.providerID as string,
                 modelId: typeof info.modelID === "string" ? info.modelID : "",
@@ -1126,7 +1144,7 @@ async function sessionUsage(
         }
         }
     }
-    return { usage, offPinRoute, mockEntries };
+    return { usage, offPinRoute, mockEntries, messageIds };
 }
 
 /**
@@ -1255,6 +1273,22 @@ export function createLiveDependencies(input: {
             let scriptedTurnText: string | undefined;
             /** Captured so the failure path can price the session the rollout was using. */
             let activeSessionId: string | undefined;
+            /** Set by the failure read. The runner's deadline rejects a race, not the rollout, so without this the turn loop would keep issuing paid prompts after the failed record was priced. */
+            let abortRequested = false;
+            /** The prompt currently awaiting the provider, if any, so the failure read can wait for its row rather than price around it. */
+            let inFlight: Promise<unknown> | null = null;
+            const trackedPrompt = async <T,>(work: () => Promise<T>): Promise<T> => {
+                if (abortRequested) {
+                    throw new Error("live paired-delta rollout aborted after its failure accounting began");
+                }
+                const promise = work();
+                inFlight = promise;
+                try {
+                    return await promise;
+                } finally {
+                    if (inFlight === promise) inFlight = null;
+                }
+            };
             /** The declaration names the point the evidence must already be buried by, so the ballast is keyed to it rather than to a literal turn id. */
             const burialTurnId = scenario.interventions.r1.insertAfterTurnId;
             /** R2 supplies the gold as memory and R3 supplies the same content in the prompt, so the seeded row carries the declared claim alone; a second labelled copy of the evidence would make `R3 - R2` measure duplicated content as well as representation. */
@@ -1332,14 +1366,14 @@ export function createLiveDependencies(input: {
                                 content: r3PromptEvidence(scenario),
                             }])}\n\n${content}`;
                         }
-                        const response = parsePromptResult(await harness.sendPrompt(
+                        const response = parsePromptResult(await trackedPrompt(() => harness.sendPrompt(
                             sessionId,
                             content,
                             {
                                 providerID: input.providerId,
                                 modelID: input.modelId,
                             },
-                        ));
+                        )));
                         if (response.error != null) {
                             const tolerated = coordinate.armId === "mc-off" &&
                                 detectOverflow(response.error).isOverflow;
@@ -1354,11 +1388,11 @@ export function createLiveDependencies(input: {
                             coordinate.armId === "r1" &&
                             turn.id === scenario.interventions.r1.insertAfterTurnId
                         ) {
-                            scriptedTurnText = await scriptedCtxSearchTurn(
+                            scriptedTurnText = await trackedPrompt(() => scriptedCtxSearchTurn(
                                 harness,
                                 sessionId,
                                 seeded,
-                            );
+                            ));
                         }
                     }
                     const last = responses.at(-1);
@@ -1371,6 +1405,14 @@ export function createLiveDependencies(input: {
                         logPath,
                         PLUGIN_BACKED_ARMS.includes(coordinate.armId),
                     );
+                    /** Every response the rollout was handed was billed, so a settled ledger that omits one is charging from an incomplete record and may also be hiding that response's route. */
+                    const unlisted = responses.filter(({ messageId }) => !ledger.messageIds.has(messageId));
+                    if (unlisted.length > 0) {
+                        throw new Error(
+                            `live paired-delta session ledger omits ${unlisted.length} authored ` +
+                            `response(s) the rollout received: ${unlisted.map(({ messageId }) => messageId).join(", ")}`,
+                        );
+                    }
                     /**
                      * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
                      * A rollout whose earlier turns were served by a fallback provider or snapshot produced its outcome, and its persisted memory, partly off the pin.
@@ -1469,8 +1511,24 @@ export function createLiveDependencies(input: {
                  * bound and the measurement is larger.
                  */
                 async usageOnFailure() {
+                    abortRequested = true;
                     /** No session means no prompt was sent: `prepare` and `createSession` run before the first provider call, so a failure there billed nothing, and reading the ledger for an empty id would report that nothing as unmeasured. commentlint: allow(JUDGE) */
                     if (activeSessionId === undefined) return { usage: ZERO_USAGE, settled: true };
+                    /** A prompt the deadline interrupted is still being billed. Its row lands when the provider answers, so the read waits for it inside the grace; one that outlasts the wait leaves the ledger unsettled by construction. commentlint: allow(JUDGE) */
+                    const startedAt = Date.now();
+                    const landed = inFlight === null || await Promise.race([
+                        inFlight.then(() => true, () => true),
+                        Bun.sleep(IN_FLIGHT_PROMPT_WAIT_MS).then(() => false),
+                    ]);
+                    /** The settle window shrinks by however long the wait took, so the whole read still returns inside the grace the runner allows it rather than being cut off with nothing. */
+                    const remainingMs = LATE_DISPOSAL_GRACE_MS - (Date.now() - startedAt);
+                    const attempts = Math.max(
+                        1,
+                        Math.min(
+                            LEDGER_SETTLE_ATTEMPTS_ON_FAILURE,
+                            Math.floor(remainingMs / 2 / LEDGER_SETTLE_INTERVAL_MS),
+                        ),
+                    );
                     /** The same settle path as a scored rollout, charging rather than rejecting an incomplete ledger: a single snapshot misses an abandoned historian's retries, and a rejection falls back to the four-call bound those retries exceed. */
                     const { usage, settled } = await settledSessionUsage(
                         harness,
@@ -1479,9 +1537,9 @@ export function createLiveDependencies(input: {
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                         logPath,
                         PLUGIN_BACKED_ARMS.includes(coordinate.armId),
-                        { attempts: LEDGER_SETTLE_ATTEMPTS_ON_FAILURE, incomplete: "charge" },
+                        { attempts: landed ? attempts : 1, incomplete: "charge" },
                     );
-                    return { usage, settled };
+                    return { usage, settled: settled && landed };
                 },
                 async dispose() {
                     await harness.dispose();
@@ -1698,8 +1756,33 @@ function deskCostCeilingUsd(
  * the manifest and policy together, which a per-field table cannot express. Grouping them here
  * gives the single enumeration a reader needs without flattening the diagnostics.
  */
+/**
+ * Written beside the records file when a run ends with `usage-unmeasured`, and refused on the next
+ * start at the same path.
+ *
+ * The status itself lives only in the process that produced it. The records file carries the
+ * failed attempt priced from its estimate and nothing that says the estimate stood in for a
+ * measurement, so a later invocation that finds the file and resumes would admit arms against a
+ * `spentUsd` the run refused to continue from. The marker travels with the records — the workflow
+ * caches both under one key — so any checkpoint chain that can restore the records also restores
+ * the refusal. commentlint: allow(JUDGE)
+ */
+function unmeasuredMarkerPath(recordsPath: string): string {
+    return `${recordsPath}.unmeasured`;
+}
+
 async function runLive(args: CliArgs): Promise<void> {
     const mode = args.mode as LiveMode;
+    const marker = unmeasuredMarkerPath(args.recordsPath);
+    if (existsSync(marker)) {
+        console.error(
+            `paired-delta refuses to run against ${args.recordsPath}: a previous attempt ended with ` +
+            `unmeasured usage (${marker}). Inspect the archived records, then remove the marker or ` +
+            "point --records at a fresh path.",
+        );
+        process.exitCode = EXIT_CODES["usage-unmeasured"];
+        return;
+    }
     const apiKey = process.env.PAIRED_DELTA_ANTHROPIC_API_KEY;
     if (!apiKey) {
         throw new Error("live paired-delta mode requires PAIRED_DELTA_ANTHROPIC_API_KEY");
@@ -2060,6 +2143,14 @@ async function runLive(args: CliArgs): Promise<void> {
         refusedRegretLadders,
         validForPoolSizing: mode === "calibration" ? calibrationValidForSizing : null,
     }, null, 2));
+    if (result.status === "usage-unmeasured") {
+        writeFileSync(marker, `${JSON.stringify({
+            status: result.status,
+            recordsPath: args.recordsPath,
+            spentUsd: result.spentUsd,
+            writtenAt: new Date().toISOString(),
+        }, null, 2)}\n`);
+    }
     /** A non-completed status outranks the calibration verdict, because the caller keyed on `harness-unreclaimed` must not lose it. */
     if (result.status !== "completed") {
         process.exitCode = EXIT_CODES[result.status];

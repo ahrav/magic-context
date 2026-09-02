@@ -791,6 +791,18 @@ describe("paired-delta calibration reader: series integrity", () => {
             .toThrow(/validity-inconsistent/);
     });
 
+    it("rejects a variance between two reachable discrete values", () => {
+        // Three observations spanning 2 produce only 1 or 4/3; 1.01 clears a floor of 1 and nothing else.
+        const between = build3().familyNoise.map((noise) => ({
+            ...noise,
+            spread: 2,
+            variance: 1.01,
+        }));
+
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: between })))
+            .toThrow(/validity-inconsistent/);
+    });
+
     it("accepts a two-point spread at its own floor", () => {
         // Deltas of +1, -1, and 0 span 2 with variance exactly 1.
         const spread2 = buildCalibrationRecord({
