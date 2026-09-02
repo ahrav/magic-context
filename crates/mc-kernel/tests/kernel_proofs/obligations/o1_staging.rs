@@ -36,6 +36,10 @@ fn assert_absent_as_of(proof: &Proof, seq: i64, needle: &str) {
     let known = proof.store().known_as_of(seq).unwrap();
     assert!(!known.objects.is_empty());
     assert!(!format!("{known:?}").contains(needle));
+    // `known_as_of` filters invalidated rows; `object_history_as_of` does not.
+    let history = proof.store().object_history_as_of(seq).unwrap();
+    assert!(!history.objects.is_empty());
+    assert!(!format!("{history:?}").contains(needle));
     let slice = proof.store().slice_as_of(seq).unwrap();
     assert!(!slice.decisions.is_empty() && !slice.observations.is_empty());
     assert!(!format!("{slice:?}").contains(needle));
@@ -88,10 +92,20 @@ fn staged_payload(proof: &Proof, candidate: &str) -> String {
 #[test]
 fn staged_candidate_is_invisible_on_every_surface_until_admitted_across_restart() {
     let mut proof = populated();
+    let before_staging = proof.digest();
     proof
         .store()
         .stage_candidate(staging("run-1", CANDIDATE, TEXT))
         .unwrap();
+    // Staging is not a canonical commit, so it queues no propagation work.
+    let after_staging = proof.digest();
+    for table in ["change_event", "outbox", "outbox_publication", "commit_log"] {
+        assert_eq!(
+            after_staging.tables.get(table),
+            before_staging.tables.get(table),
+            "staging wrote to {table}"
+        );
+    }
     // Positive control: the candidate text is durably staged.
     assert_eq!(staged_payload(&proof, CANDIDATE), TEXT);
     assert_absent_everywhere(&proof, CANDIDATE);

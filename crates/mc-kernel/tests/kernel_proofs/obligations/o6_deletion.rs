@@ -121,6 +121,16 @@ fn ids_sql(proof: &Proof, sql: &str) -> Vec<String> {
         .unwrap()
 }
 
+/// A logical delete invalidates references; only a purge unlinks the bytes.
+fn assert_object_retained(proof: &Proof, digest: &str) {
+    let path = proof
+        .path()
+        .join("artifacts/objects")
+        .join(&digest[..2])
+        .join(&digest[2..]);
+    assert!(path.exists(), "the CAS object was unlinked: {path:?}");
+}
+
 fn propagation_rows(proof: &Proof, commit_seq: i64) -> Vec<(String, serde_json::Value)> {
     proof
         .db()
@@ -221,11 +231,13 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         assert!(!barrier.cleared);
     };
     check_state(&proof);
+    assert_object_retained(&proof, &handle.digest);
     let projection = proof.store().rebuild_alignment().unwrap();
     let before_restart = proof.digest();
 
     proof.restart();
     check_state(&proof);
+    assert_object_retained(&proof, &handle.digest);
     assert_eq!(proof.store().rebuild_alignment().unwrap(), projection);
     assert_eq!(proof.digest(), before_restart);
 
