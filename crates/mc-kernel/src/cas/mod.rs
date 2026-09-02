@@ -70,6 +70,9 @@ pub enum ProviderEgress {
 }
 
 impl ProviderEgress {
+    /// Egress proofs derive provider classes from this list.
+    pub const ALL: &'static [Self] = &[Self::RemoteAllowed, Self::LocalOnly];
+
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::RemoteAllowed => "remote_allowed",

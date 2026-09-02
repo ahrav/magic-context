@@ -19,14 +19,23 @@ use crate::harness::Proof;
 
 /// Every (sensitivity, egress class) a reference can carry; the matrix
 /// indexes into this so its keys stay `Ord` without deriving on kernel types.
-const CLASSES: [(Sensitivity, ProviderEgress); 6] = [
-    (Sensitivity::Normal, ProviderEgress::RemoteAllowed),
-    (Sensitivity::Normal, ProviderEgress::LocalOnly),
-    (Sensitivity::Sensitive, ProviderEgress::RemoteAllowed),
-    (Sensitivity::Sensitive, ProviderEgress::LocalOnly),
-    (Sensitivity::Secret, ProviderEgress::RemoteAllowed),
-    (Sensitivity::Secret, ProviderEgress::LocalOnly),
-];
+/// Adding a variant to either vocabulary widens this product. commentlint: allow(JUDGE)
+const CLASS_COUNT: usize = Sensitivity::ALL.len() * ProviderEgress::ALL.len();
+const CLASSES: [(Sensitivity, ProviderEgress); CLASS_COUNT] = classes();
+
+const fn classes() -> [(Sensitivity, ProviderEgress); CLASS_COUNT] {
+    let egresses = ProviderEgress::ALL.len();
+    let mut out = [(Sensitivity::Normal, ProviderEgress::RemoteAllowed); CLASS_COUNT];
+    let mut index = 0;
+    while index < CLASS_COUNT {
+        out[index] = (
+            Sensitivity::ALL[index / egresses],
+            ProviderEgress::ALL[index % egresses],
+        );
+        index += 1;
+    }
+    out
+}
 const DESTINATIONS: [ArtifactDestination; 2] =
     [ArtifactDestination::Local, ArtifactDestination::Remote];
 
@@ -102,7 +111,13 @@ fn eligibility_matrix_is_exhaustive() {
         Ok(String::new())
     });
     let sets = reference_sets();
-    assert_eq!(sets.len(), 6 + 21 + 56);
+    // The closed-form multiset count keeps a widened vocabulary from silently
+    // shrinking the matrix. commentlint: allow(JUDGE)
+    let classes = CLASSES.len();
+    assert_eq!(
+        sets.len(),
+        classes + classes * (classes + 1) / 2 + classes * (classes + 1) * (classes + 2) / 6
+    );
     let mut allowed = 0;
     for (point, references) in sets.iter().enumerate() {
         let handle = ingest_merged(&proof, point, references);
@@ -277,11 +292,19 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
             .find(|row| row.object.object_id == object_id)
             .map(|row| row.visibility)
     };
-    for surface in [
-        Surface::AutoInject,
-        Surface::AutoSearch,
-        Surface::ExplicitSearch,
-    ] {
+    // The match forces every `Surface` variant to declare whether sensitive
+    // subjects are visible. commentlint: allow(JUDGE)
+    fn sensitive_is_visible(surface: Surface) -> bool {
+        match surface {
+            Surface::AutoInject | Surface::AutoSearch => false,
+            Surface::ExplicitSearch => true,
+        }
+    }
+    // These assertions require at least one visible and one hidden sensitive
+    // surface. commentlint: allow(JUDGE)
+    assert!(Surface::ALL.iter().copied().any(sensitive_is_visible));
+    assert!(!Surface::ALL.iter().copied().all(sensitive_is_visible));
+    for &surface in Surface::ALL {
         assert_eq!(
             visibility(surface, "object-1"),
             Some(SurfaceVisibility::Visible),
@@ -292,11 +315,10 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
             None,
             "secret subject on {surface:?}"
         );
+        assert_eq!(
+            visibility(surface, "object-2"),
+            sensitive_is_visible(surface).then_some(SurfaceVisibility::Visible),
+            "sensitive subject on {surface:?}"
+        );
     }
-    assert_eq!(visibility(Surface::AutoInject, "object-2"), None);
-    assert_eq!(visibility(Surface::AutoSearch, "object-2"), None);
-    assert_eq!(
-        visibility(Surface::ExplicitSearch, "object-2"),
-        Some(SurfaceVisibility::Visible)
-    );
 }
