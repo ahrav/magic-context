@@ -272,10 +272,12 @@ describe("comment hygiene gate", () => {
                 "// tracked in magic-context-om3y",
                 "x}b`;",
             ].join("\n"),
+            "block.ts": "const v = `${1 /* tracked in magic-context-om3y */}`;",
         });
 
         expect(result.code).toBe(1);
         expect(result.out).toContain("subst.ts:2:");
+        expect(result.out).toContain("block.ts:1:");
     });
 
     test("the caller can supply the ID export", () => {
