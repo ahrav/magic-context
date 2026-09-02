@@ -65,7 +65,7 @@ import type {
  * `LANE_REPORT_SCHEMA` must change when the report shape becomes incompatible.
  * `LANE_REPORT_SCHEMA` lets consumers distinguish archived reports from reports with the current shape.
  */
-const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
+export const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
 
 /* */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;

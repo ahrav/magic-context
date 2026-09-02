@@ -13,6 +13,9 @@ import {
 
 export type GreenHarness = "all" | "opencode" | "pi";
 
+/** Script tests claimed by the prospective and scorecard selections, so the incident glob does not run them twice. */
+const SCRIPT_TESTS_OWNED_ELSEWHERE = ["scripts/prospective-holdout.test.ts", "scripts/run-scorecard.test.ts"];
+
 export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         ...new Glob("src/incident-pool/**/*.test.ts").scanSync({
@@ -23,7 +26,7 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
         ...[...new Glob("scripts/*.test.ts").scanSync({
             cwd: root,
             onlyFiles: true,
-        })].filter((file) => file !== "scripts/prospective-holdout.test.ts"),
+        })].filter((file) => !SCRIPT_TESTS_OWNED_ELSEWHERE.includes(file)),
     ].sort();
     if (files.length === 0) throw new Error("incident unit selection is empty");
     return files;
@@ -118,6 +121,19 @@ export function pairedDeltaUnitFiles(root: string = E2E_ROOT): string[] {
     return assertPresent(files, root);
 }
 
+/** Credential-free scorecard policy, evidence, gate, family, and report tests plus the operator script. */
+export function scorecardUnitFiles(root: string = E2E_ROOT): string[] {
+    const laneFiles = [...new Glob("src/scorecard/**/*.test.ts").scanSync({
+        cwd: root,
+        onlyFiles: true,
+    })];
+    if (laneFiles.length === 0) throw new Error("scorecard unit selection is empty");
+    return assertPresent(
+        [...laneFiles, ...["scripts/run-scorecard.test.ts"].filter((file) => existsSync(resolve(root, file)))].sort(),
+        root,
+    );
+}
+
 /**
  * TS mode alone runs TestHarness-booting historian-eval tests because the Rust historian producer does not promote claims.
  *
@@ -176,6 +192,7 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
         ...metamorphicEvalUnitFiles(root),
         ...dreamerEvalUnitFiles(root),
         ...pairedDeltaUnitFiles(root),
+        ...scorecardUnitFiles(root),
         ...standaloneUnitFiles(root),
         ...tsOpenCodeStandaloneFiles(root),
         ...rustStandaloneFiles(root),
@@ -236,6 +253,7 @@ const UNIT_SELECTIONS = {
     "--metamorphic-eval-unit": metamorphicEvalUnitFiles,
     "--dreamer-eval-unit": dreamerEvalUnitFiles,
     "--paired-delta-unit": pairedDeltaUnitFiles,
+    "--scorecard-unit": scorecardUnitFiles,
 } as const;
 
 type UnitSelectionFlag = keyof typeof UNIT_SELECTIONS;
@@ -295,7 +313,7 @@ export function parseArgs(args: string[]): CliArgs {
             maxConcurrency = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --metamorphic-eval-unit | --dreamer-eval-unit | --paired-delta-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
+                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --metamorphic-eval-unit | --dreamer-eval-unit | --paired-delta-unit | --scorecard-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
             );
             process.exit(0);
         } else {
@@ -304,7 +322,7 @@ export function parseArgs(args: string[]): CliArgs {
     }
     if (selection === null || selectionConflict) {
         throw new Error(
-            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, --metamorphic-eval-unit, --dreamer-eval-unit, --paired-delta-unit, or --mode",
+            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, --metamorphic-eval-unit, --dreamer-eval-unit, --paired-delta-unit, --scorecard-unit, or --mode",
         );
     }
     if (selection.kind === "unit" && harness !== "all") {

@@ -4,6 +4,8 @@
  */
 
 export const HEX64_RE = /^[0-9a-f]{64}$/;
+export const REASON_CODE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+export const GATE_ID_RE = /^gate-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 export interface ContractErrorConstructor {
     new (diagnostics: readonly string[]): Error;
@@ -20,6 +22,7 @@ export interface ContractPrimitives {
     array(value: unknown, label: string): unknown[];
     integer(value: unknown, label: string, minimum?: number): number;
     unique(values: readonly string[], label: string): void;
+    idArray(value: unknown, label: string, pattern: RegExp): string[];
 }
 
 export function makeContractPrimitives(errorClass: ContractErrorConstructor): ContractPrimitives {
@@ -78,5 +81,11 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
     }
 
-    return { fail, record, exact, string: stringValue, staticId, hex64, enumeration, array, integer, unique };
+    function idArray(value: unknown, label: string, pattern: RegExp): string[] {
+        const values = array(value, label).map((entry, index) => staticId(entry, `${label}[${index}]`, pattern));
+        unique(values, label);
+        return values;
+    }
+
+    return { fail, record, exact, string: stringValue, staticId, hex64, enumeration, array, integer, unique, idArray };
 }

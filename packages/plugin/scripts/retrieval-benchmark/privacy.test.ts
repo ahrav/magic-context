@@ -156,3 +156,42 @@ describe("scanForSensitiveContent", () => {
         expect(violations.map((v) => v.category)).toContain("secret-or-path");
     });
 });
+
+describe("scanForSensitiveContent fingerprint allowlist", () => {
+    const HEX = "4ec9599fc203d176a301536c2e091a19bc852759b255bd6818810a42c5fed14a";
+
+    it("accepts hex64 only under an allowlisted immediate key", () => {
+        for (const key of [
+            "pairedDeltaPolicyFingerprint",
+            "baselineScorecardReportFingerprint",
+            "scorecardReportFingerprint",
+            "poolManifestFingerprint",
+            "calibrationFingerprint",
+            "implementationDigest",
+            "ledger_fingerprint",
+            "selected_set_digest",
+            "semantic_fingerprint",
+            "implementation_digest",
+            "revisionLocator",
+            "runtimeDigest",
+        ]) {
+            expect(scanForSensitiveContent({ [key]: HEX })).toEqual([]);
+        }
+        expect(scanForSensitiveContent({ laneDigest: HEX }).map((v) => v.category)).toContain("hash-like");
+    });
+
+    it("accepts the release fingerprint nouns only inside a releaseFingerprints container", () => {
+        const fingerprints = { corpus: HEX, judgments: HEX, syntheticProfiles: HEX, manifest: HEX };
+        expect(scanForSensitiveContent({ semantic: { releaseFingerprints: fingerprints } })).toEqual([]);
+        for (const key of Object.keys(fingerprints)) {
+            expect(scanForSensitiveContent({ [key]: HEX }).map((v) => v.category)).toContain("hash-like");
+            expect(scanForSensitiveContent({ notReleaseFingerprints: { [key]: HEX } }).map((v) => v.category)).toContain("hash-like");
+        }
+    });
+
+    it("rejects a lane-keyed fingerprint map because the immediate key is the lane, not a fingerprint field", () => {
+        expect(
+            scanForSensitiveContent({ reportFingerprints: { historian: HEX } }).map((v) => v.category),
+        ).toContain("hash-like");
+    });
+});

@@ -1,5 +1,17 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { HoldoutContractError, array, enumeration, exact, fail, hex64, integer, record, staticId } from "./contract";
+import {
+    GATE_ID_RE,
+    HoldoutContractError,
+    REASON_CODE_RE,
+    enumeration,
+    exact,
+    fail,
+    hex64,
+    idArray,
+    integer,
+    record,
+    staticId,
+} from "./contract";
 import { comparePairedFacts, type PairedCaseFact } from "./comparison";
 import type { LifecycleState } from "./lifecycle";
 
@@ -175,12 +187,6 @@ export function buildProspectiveReport(input: {
     });
 }
 
-function idArray(raw: unknown, label: string, pattern: RegExp): string[] {
-    const values = array(raw, label).map((entry, index) => staticId(entry, `${label}[${index}]`, pattern));
-    if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
-    return values;
-}
-
 export function parseProspectiveReport(raw: unknown): ProspectiveReport {
     const root = record(raw, "report");
     exact(root, ["schema", "body", "reportFingerprint"], "report");
@@ -232,14 +238,14 @@ export function parseProspectiveReport(raw: unknown): ProspectiveReport {
         completeFamilyCount: integer(value.completeFamilyCount, "report.body.completeFamilyCount"),
         incompleteCaseIds: idArray(value.incompleteCaseIds, "report.body.incompleteCaseIds", /^case-[0-9a-f]{32}$/),
         familyMisses: idArray(value.familyMisses, "report.body.familyMisses", /^fam-[a-z0-9]+(?:-[a-z0-9]+)*$/),
-        hardGateFailures: idArray(value.hardGateFailures, "report.body.hardGateFailures", /^gate-[a-z0-9]+(?:-[a-z0-9]+)*$/),
+        hardGateFailures: idArray(value.hardGateFailures, "report.body.hardGateFailures", GATE_ID_RE),
         prospective: { pairCount, completePairCount },
         incidentPool: {
             reportFingerprint: incidentPool.reportFingerprint === null
                 ? null
                 : hex64(incidentPool.reportFingerprint, "report.body.incidentPool.reportFingerprint"),
         },
-        limitations: idArray(value.limitations, "report.body.limitations", /^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+        limitations: idArray(value.limitations, "report.body.limitations", REASON_CODE_RE),
     };
     const reportFingerprint = hex64(root.reportFingerprint, "report.reportFingerprint");
     if (canonicalFingerprint(body) !== reportFingerprint) fail("report.reportFingerprint: mismatch");

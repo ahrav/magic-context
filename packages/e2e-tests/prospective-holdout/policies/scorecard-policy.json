@@ -1,7 +1,89 @@
 {
   "schema": "prospective-policy-owner/v1",
   "owner": "magic-context-x4l.15",
-  "status": "pending",
-  "policy": null,
-  "policyFingerprint": null
+  "status": "ready",
+  "policy": {
+    "schema": "scorecard-policy/v1",
+    "primaryEndpoint": "mc-on-vs-mc-off",
+    "secondaryMetricSlots": [
+      "final-attempt-tokens-mc-on",
+      "final-attempt-wall-clock-ms-mc-on",
+      "final-attempt-turns-mc-on"
+    ],
+    "gates": [
+      "gate-cross-project-leak",
+      "gate-unrelated-scope-secret",
+      "gate-injection-promoted",
+      "gate-false-enforced-policy",
+      "gate-database-corruption"
+    ],
+    "injectionCanaryScenarioIds": [
+      "hse-webhook-docs-injection"
+    ],
+    "maxToleratedRegressions": 0,
+    "statisticalComparison": {
+      "bootstrapResamples": 5000,
+      "noiseFloorSource": "calibration"
+    },
+    "modelMatrix": [
+      {
+        "providerId": "anthropic",
+        "modelId": "claude-sonnet-4-5-20250929",
+        "contextLimit": 8192
+      }
+    ],
+    "replicateCount": 3,
+    "releaseCostBudgetUsd": 1000,
+    "requiredLanes": [
+      {
+        "lane": "paired-delta",
+        "schema": "paired-delta-report/v1",
+        "identity": {
+          "kind": "identityless"
+        }
+      },
+      {
+        "lane": "historian",
+        "schema": "historian-eval-report/v3",
+        "identity": {
+          "kind": "identityless"
+        }
+      },
+      {
+        "lane": "metamorphic",
+        "schema": "metamorphic-eval-report/v2",
+        "identity": {
+          "kind": "identityless"
+        }
+      },
+      {
+        "lane": "dreamer",
+        "schema": "dreamer-eval-report/v1",
+        "identity": {
+          "kind": "identityless"
+        }
+      },
+      {
+        "lane": "incident",
+        "schema": "incident-pool-report/v1",
+        "identity": {
+          "kind": "identityless"
+        }
+      },
+      {
+        "lane": "retrieval",
+        "schema": "retrieval-benchmark-report/v2",
+        "identity": {
+          "kind": "identityless"
+        }
+      }
+    ],
+    "requiredMetricSlots": [
+      "valid-success-delta-mc-on-vs-mc-off",
+      "valid-success-delta-mc-on-vs-compaction"
+    ],
+    "pairedDeltaPolicyFingerprint": "631175e3d8eb27ebaf7a9774c6d5008f615c4fd8c450db1d78c7513a4f064409",
+    "baselineScorecardReportFingerprint": null
+  },
+  "policyFingerprint": "b435e54a1cbaedc31af3317f2cd39550f14170d58e20fb49af1fc82e398c0dc5"
 }
