@@ -593,6 +593,9 @@ fn encode_rule(hash: &mut Sha256, rule: &Rule) -> Result<(), ConstructionError> 
 mod tests {
     use super::*;
 
+    /// Pattern count above which `AhoCorasickKind::Auto` stops building a DFA and falls back to a contiguous NFA.
+    const AUTO_DFA_PATTERN_LIMIT: usize = 100;
+
     /// A matching rule must be preselected because unselected rules are not
     /// evaluated.
     #[test]
@@ -643,19 +646,38 @@ mod tests {
     }
 
     // The evaluator probes keyword and suppressor matchers with `find_overlapping_iter`, which panics for every match kind except `Standard`.
+    // `AhoCorasickKind::Auto` builds a DFA for an unanchored automaton holding at most 100 patterns, so the kind assertion below holds without pinning the kind and forfeiting the contiguous-NFA fallback that keeps a larger list from failing construction.
     #[test]
     fn every_prepared_matcher_supports_overlapping_search() {
         let rules = RuleSet::from_embedded().unwrap();
         let mut prepared = 0;
         for rule in rules.active(ScanProfile::Comprehensive) {
-            for matcher in [&rule.keyword_matcher, &rule.suppressor_matcher]
-                .into_iter()
-                .flatten()
-            {
+            for (patterns, matcher) in [
+                (&rule.declaration.keywords_any, &rule.keyword_matcher),
+                (
+                    &rule.declaration.value_suppressors_any,
+                    &rule.suppressor_matcher,
+                ),
+            ] {
+                let (Some(patterns), Some(matcher)) = (patterns, matcher) else {
+                    continue;
+                };
                 assert!(
                     matches!(matcher.match_kind(), MatchKind::Standard),
                     "{} builds a matcher whose match kind rejects overlapping search",
                     rule.declaration.name
+                );
+                assert!(
+                    patterns.len() <= AUTO_DFA_PATTERN_LIMIT,
+                    "{} declares {} patterns, past the limit that keeps `Auto` on a DFA",
+                    rule.declaration.name,
+                    patterns.len()
+                );
+                assert!(
+                    matches!(matcher.kind(), AhoCorasickKind::DFA),
+                    "{} resolves overlapping search with {:?} rather than a DFA",
+                    rule.declaration.name,
+                    matcher.kind()
                 );
                 let _ = matcher
                     .find_overlapping_iter(b"placeholder example")
