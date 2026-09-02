@@ -9,6 +9,8 @@
 
 #[path = "../support/canonical_state.rs"]
 mod canonical_state;
+#[path = "../support/git_fixtures.rs"]
+mod git_fixtures;
 
 mod fixtures;
 mod harness;
