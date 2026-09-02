@@ -1,8 +1,10 @@
-//! This binary generates hermetic Synapse query and batch load.
+//! Hermetic Synapse query and batch performance harness.
 //!
-//! Open-loop work preserves absolute scheduled-send timestamps.
-//! Closed-loop work holds fixed concurrency.
-//! The harness retains every wire call and caller-level operation as NDJSON before the validated summary.
+//! Open-loop work preserves absolute scheduled-send timestamps. Closed-loop work holds fixed
+//! concurrency. All timestamps use nanoseconds from one monotonic origin. The harness emits every
+//! wire attempt, logical operation, and service sample as NDJSON before a validated summary.
+//! Invalid ledgers, missed open-loop slots, excessive censoring or polling, late writes, empty
+//! measurement windows, and fatal task errors make the process exit unsuccessfully.
 
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
@@ -524,12 +526,13 @@ impl RoutedWire {
         u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
     }
 
+    /// Sends one request and waits for its correlated terminal until `deadline`.
     ///
-    /// Waiting for the shared writer is time the caller's deadline is spending.
-    /// The caller starts the deadline timer before waiting for `writer`, so writer contention cannot extend the effective deadline.
-    ///
-    /// `write_all` is not cancel-safe: dropping it mid-frame leaves a partial request on the shared connection.
-    /// finished.
+    /// Writer acquisition consumes the caller's deadline, so contention cannot extend it. Once
+    /// `write_all` starts, the write runs to completion because cancellation could leave a partial
+    /// frame on the shared connection. Completion after the deadline increments
+    /// `overdeadline_writes` and invalidates the repetition. A reply timeout installs a tombstone
+    /// before removing the live correlation.
     async fn call(&self, body: Vec<u8>, deadline: Instant) -> Result<WireReply, WireCallError> {
         if let Some(error) = self.reader_error.lock().await.clone() {
             return Err(WireCallError::Transport(error));
@@ -663,10 +666,10 @@ struct RunContext {
     opts: Opts,
 }
 
+/// Failure from one wire call after harness-level classification.
 ///
-/// The timeout arm carries the send timestamp the attempt ledger recorded
-/// Logical-request latency starts at the first wire send.
-/// A timed-out first attempt retains its send timestamp.
+/// `Timeout` carries the send timestamp recorded in the attempt ledger, preserving the first-send
+/// origin for logical-request latency. `Expired` means no request bytes reached the wire.
 enum CallError {
     Timeout { sent_ns: u64 },
     Expired,
@@ -1473,8 +1476,7 @@ async fn warm(ctx: &RunContext) -> Result<(), String> {
     Ok(())
 }
 
-///
-/// two interpretable.
+/// Completed load records and validity observations for one hold window.
 struct LoadOutcome {
     records: Vec<LogicalRecord>,
     send_lag_max_ns: u64,
@@ -1484,8 +1486,9 @@ struct LoadOutcome {
     task_window: Option<TaskWindow>,
 }
 
+/// Task-counter deltas paired with their actual observation span.
 ///
-/// TaskWindow keeps deltas and their observed span together because unknown spans cannot support resource-shift claims.
+/// Unknown or mismatched spans cannot support resource-shift comparisons.
 struct TaskWindow {
     deltas: Vec<process_resources::TaskDelta>,
     /// The boundary timestamps report when the observations actually landed.
@@ -1549,9 +1552,9 @@ fn open_loop_send_lag(records: &[LogicalRecord], rate: u64) -> (u64, u64) {
     (send_lag_max_ns, missed_slots)
 }
 
-/// `start` maps `window`'s nanosecond offsets to the caller's clock.
+/// Maps hold-window nanosecond offsets onto the caller's monotonic clock.
 ///
-/// partitioned by.
+/// Returns warmup-end and measurement-end instants in that order.
 fn window_boundaries(window: &perf_measurement::HoldWindow, start: Instant) -> (Instant, Instant) {
     (
         start + Duration::from_nanos(window.warmup_end_ns.saturating_sub(window.start_ns)),
@@ -1697,7 +1700,7 @@ struct Summary {
     hold_window_end_ns: u64,
     warmup_offered: u64,
     warmup_attempts: u64,
-    /// `window: "after_window"`.
+    /// Logical requests classified as `window: "after_window"`.
     after_window_offered: u64,
     after_window_attempts: u64,
     censored_per_mille: f64,
@@ -1705,7 +1708,7 @@ struct Summary {
     task_window_start_ns: Option<u64>,
     task_window_end_ns: Option<u64>,
     connection_loss_errors: u64,
-    /// inadmissible.
+    /// Writes that started before their deadline but completed after it; any nonzero value is inadmissible.
     overdeadline_writes: u64,
     fatal_errors: Vec<String>,
 }
@@ -1975,7 +1978,7 @@ fn censored_count(ledger: &perf_measurement::SynapseLedgerSummary) -> u64 {
     ledger.timed_out.saturating_add(ledger.in_flight)
 }
 
-/// percentiles omit.
+/// Returns whether logical-latency percentiles must omit this disposition.
 fn is_censored(disposition: LogicalDisposition) -> bool {
     matches!(
         disposition,

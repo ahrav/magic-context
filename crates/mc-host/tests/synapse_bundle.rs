@@ -1,5 +1,7 @@
-//! These tests validate bundle handling and certified-inference conformance for the synapse-tiny fixture.
-//! synapse-tiny fixture.
+//! Synapse bundle rejection, lifecycle, and native-inference conformance tests.
+//!
+//! Artifact and limit rejection tests run without loading ONNX Runtime. Native tests use the
+//! `synapse-tiny` corpus to check dimensions, output selection, pooling, and truncation.
 //!
 //! Native-inference tests require an ONNX Runtime shared library at `MC_SYNAPSE_TEST_ORT_LIBRARY`.
 //! Set `MC_SYNAPSE_TEST_ORT_LIBRARY` to the ONNX Runtime shared-library path.
@@ -114,11 +116,8 @@ async fn expect_disabled_with(mutate: impl FnOnce(&Path), expected_fragment: &st
     );
 }
 
-/// Infeasible limits fail host startup instead of disabling Synapse while the host remains healthy.
-/// Infeasible limits fail host startup instead of disabling Synapse while the host remains healthy.
-///
-/// An `Err` from `activate` fails host startup.
-/// An `Err` from `activate` fails host startup.
+/// Applies `mutate` before initialization and requires activation to fail with
+/// `expected_fragment` while the lane is still in `Starting` state.
 async fn expect_limits_fail_startup(
     mutate: impl FnOnce(&mut SynapseLimits),
     expected_fragment: &str,

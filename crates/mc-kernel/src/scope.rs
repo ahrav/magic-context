@@ -1,3 +1,10 @@
+//! Scope persistence, canonicalization, and conservative set predicates.
+//!
+//! Write paths redact text before storage and append scope changes to the surrounding envelope.
+//! Predicate inputs use a closed ten-dimension vocabulary. Canonical scopes contain at most one
+//! term per dimension. Unknown graph relations and unresolvable values fail closed for matching
+//! and subsumption, while overlap intentionally over-approximates unknown pairs.
+
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
@@ -5,6 +12,10 @@ use super::envelope::{Envelope, ObjectRow, PendingChange};
 use super::redaction::{record, redact, RedactedField};
 use super::{KernelError, Sensitivity};
 
+/// Unvalidated storage representation of one scope term.
+///
+/// `operator` selects which value field is legal. Canonical decoding rejects missing values,
+/// conflicting fields, unknown operators, empty sets, invalid ranges, and invalid commit OIDs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeTermSpec {
     pub dimension: String,
@@ -20,6 +31,10 @@ pub struct ScopeTermSpec {
     pub payload: Option<String>,
 }
 
+/// Scope insertion request and ordered term rows.
+///
+/// Identifiers must be nonblank and `source_revision` must be nonnegative. Text fields pass
+/// through redaction before any row or change record is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeSpec {
     pub scope_id: String,
@@ -70,6 +85,11 @@ struct RedactedTerm {
 }
 
 impl Envelope<'_> {
+    /// Inserts one scope, its object-registry row, and its ordered terms in this transaction.
+    ///
+    /// The referenced domain must exist and remain valid. Success appends a `scope_insert`
+    /// pending change. Invalid fields return `InvalidInput`; a missing domain returns `NotFound`.
+    /// The surrounding envelope transaction owns commit or rollback.
     pub fn insert_scope(&mut self, spec: ScopeSpec) -> Result<ScopeWriteOutcome, KernelError> {
         let spec = RedactedScope::new(spec)?;
         let domain_exists = self
@@ -584,6 +604,7 @@ impl CanonicalScope {
         }
     }
 
+    /// Iterates present terms in `Dimension::ALL` order.
     pub fn terms(&self) -> impl Iterator<Item = (Dimension, &TermValue)> {
         let mut present = self.present;
         std::iter::from_fn(move || {
@@ -788,10 +809,12 @@ pub struct ScopeMatchContext {
 }
 
 impl ScopeMatchContext {
+    /// Creates a context with no resolved dimension values or checkout commit.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets one resolved dimension value and caches its version coercion, if parseable.
     pub fn with_value(mut self, dimension: Dimension, value: impl Into<String>) -> Self {
         let value = value.into();
         self.coerced[dimension.index()] = VersionReading::parse(&value);
@@ -799,6 +822,10 @@ impl ScopeMatchContext {
         self
     }
 
+    /// Sets the checkout commit used by `git_reachable` terms.
+    ///
+    /// This builder does not validate OID syntax. Graph-oracle resolution determines whether the
+    /// value can participate in a match.
     pub fn with_head_commit(mut self, oid: impl Into<String>) -> Self {
         self.head_commit = Some(oid.into());
         self
@@ -852,6 +879,11 @@ fn req_names_prerelease(req: &semver::VersionReq) -> bool {
         .any(|comparator| !comparator.pre.is_empty())
 }
 
+/// Coerces semantic and platform-style version text into a comparable semantic version.
+///
+/// Prerelease text is moved to build metadata unless a requirement explicitly names a
+/// prerelease. One to three numeric components are accepted. Invalid or empty input returns
+/// `None`.
 pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     VersionReading::parse(raw).map(|reading| reading.comparable)
 }
