@@ -11636,7 +11636,7 @@ impl McStore {
         Ok(())
     }
 
-    /// The epoch and row-version update share one fenced transaction, so an in-flight historian cannot publish against the retired compartment set.
+    /// The full-session form of the revert re-cut: compartments and their recoverable transcripts are removed, while the cache row is replaced with an empty core and default meta carrying a bumped revert epoch. The epoch and row-version update share one fenced transaction, so an in-flight historian cannot publish against the retired compartment set.
     pub fn reset_session_for_recomp(
         &self,
         session_id: &str,
