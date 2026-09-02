@@ -34,6 +34,9 @@ describe("paired-delta completion claims", () => {
             "I never finished the task.",
             "I have not finished the task.",
             "I failed to complete the request.",
+            "The task could not be completed.",
+            "It did not get done.",
+            "The request has not been completed.",
         ]) {
             expect(reachesTheClassifier(text)).toBe(true);
             expect(claimsCompletion(text)).toBe(false);

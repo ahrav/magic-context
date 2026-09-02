@@ -877,6 +877,19 @@ describe("paired-delta calibration reader: series integrity", () => {
         expect(readCalibrationRecord(path).validForPoolSizing).toBe(true);
     });
 
+    it("rejects an observation count no declared depth could supply before enumerating", () => {
+        // A fingerprint-valid record can claim any count; the reader must refuse it in constant time.
+        const oversized = build3().familyNoise.map((noise) => ({
+            ...noise,
+            observationCount: 50_000_000,
+        }));
+        const started = performance.now();
+
+        expect(() => readCalibrationRecord(rewrite({ familyNoise: oversized })))
+            .toThrow(/observation-count-exceeds-depth/);
+        expect(performance.now() - started).toBeLessThan(1_000);
+    });
+
     it("rejects a scenario depth above the declared replicate count", () => {
         // Inflating depth and series counts together clears the family-sum cross-check.
         const inflated = build3();

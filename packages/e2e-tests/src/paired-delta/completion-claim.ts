@@ -6,11 +6,13 @@ const NEGATION = "(?:\\b(?:not|never|cannot|unable|failed|without|no)\\b|n't)";
  * Filler the negation may reach across.
  *
  * The listed auxiliaries and objects, plus any `-ly` adverb, which covers `successfully`,
- * `entirely`, and `properly` without enumerating them. No conjunction is included, so an unrelated
- * earlier clause — "I did not need help and completed the task" — cannot reach the verb.
+ * `entirely`, and `properly` without enumerating them. The passive auxiliaries `be` and `get` are
+ * included so "could not be completed" and "did not get done" read as denials. No conjunction is
+ * included, so an unrelated earlier clause — "I did not need help and completed the task" — cannot
+ * reach the verb.
  */
 const NEGATION_FILLER =
-    "(?:\\s+(?:yet|ever|even|quite|able|been|being|manage|managed|have|has|had|to|the|task|it|this|that|work|job|[a-z]+ly)\\b)*";
+    "(?:\\s+(?:yet|ever|even|quite|able|be|been|being|get|got|gotten|manage|managed|have|has|had|to|the|task|it|this|that|work|job|[a-z]+ly)\\b)*";
 
 const NEGATED_COMPLETION = new RegExp(`${NEGATION}${NEGATION_FILLER}[\\s,]*$`);
 

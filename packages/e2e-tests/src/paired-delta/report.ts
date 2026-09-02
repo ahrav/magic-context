@@ -656,6 +656,24 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
      * no established variance, or no measured series at all.
      */
     const measured = Array.isArray(record.familyNoise) ? record.familyNoise : [];
+    /**
+     * Bounded before anything enumerates over it. `reachableVariances` is quadratic in the count,
+     * and the record is fingerprint-valid whatever count it claims, so a large safe integer would
+     * hold the paid-run preflight in that loop before the depth checks below ever rejected it. A
+     * series can hold at most one observation per scenario coordinate, and the record declares
+     * those depths itself.
+     */
+    const declaredDepths = record.scenarioDepth as Record<string, unknown> | null | undefined;
+    const maxObservations = declaredDepths !== null && declaredDepths !== undefined &&
+            typeof declaredDepths === "object"
+        ? Object.values(declaredDepths)
+            .filter((count): count is number => Number.isSafeInteger(count) && (count as number) >= 0)
+            .reduce((sum, count) => sum + count, 0)
+        : 0;
+    if (measured.some((noise) =>
+        !Number.isSafeInteger(noise.observationCount) || noise.observationCount > maxObservations)) {
+        throw new Error("paired-delta-calibration: observation-count-exceeds-depth");
+    }
     const families = new Set(measured.map(({ familyId }) => familyId));
     /**
      * Exactly one series per family and endpoint.
