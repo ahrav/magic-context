@@ -1,3 +1,8 @@
+//! Content-addressed artifact types, limits, layout, and fail-closed state.
+//!
+//! Payload limits are byte counts. The store latches non-capacity storage
+//! failures with release/acquire ordering so later ingestion fails closed.
+
 mod deletion;
 pub(super) mod gc;
 mod ingest;
@@ -15,9 +20,13 @@ use crate::durable_fs::{
 };
 use crate::{KernelError, KernelStore};
 
+/// Default total artifact capacity in bytes.
 pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum payload accepted by one ingest, in bytes.
 pub(super) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum recognized-secret detections accepted in one payload.
 pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
+/// Maximum UTF-8 byte length of each artifact text field.
 pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
 
 #[cfg(feature = "test-support")]
@@ -63,6 +72,7 @@ impl From<ArtifactIngestFault> for IngestFaults {
     }
 }
 
+/// Most permissive destination class allowed by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderEgress {
     RemoteAllowed,
@@ -96,6 +106,10 @@ impl ProviderEgress {
     }
 }
 
+/// Complete metadata and payload for one atomic artifact ingest.
+///
+/// Validation rejects oversized payloads, oversized text fields, negative source
+/// revisions, and negative retention deadlines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactIngestRequest {
     pub intent: CommitIntent,
@@ -106,21 +120,25 @@ pub struct ArtifactIngestRequest {
     pub domain_id: String,
     pub source_kind: String,
     pub source_id: String,
+    /// Nonnegative revision supplied by the source system.
     pub source_revision: i64,
     pub media_type: String,
     pub retention_class: String,
+    /// Optional absolute retention deadline in milliseconds.
     pub retain_until: Option<i64>,
     pub asserted_sensitivity: Sensitivity,
     pub provider_egress: ProviderEgress,
     pub provenance: Option<RepositoryProvenance>,
 }
 
+/// Stable identifiers returned after artifact bytes and evidence are committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHandle {
     pub digest: String,
     pub evidence_id: String,
 }
 
+/// Destination considered by artifact egress eligibility checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactDestination {
     Local,
@@ -168,6 +186,9 @@ pub enum ArtifactErrorKind {
     PurgeUnlinkPending,
 }
 
+/// Bounded artifact failure with optional capacity or digest context.
+///
+/// Display and debug output expose no payload bytes.
 pub struct ArtifactError {
     kind: ArtifactErrorKind,
     usage: Option<u64>,

@@ -104,8 +104,10 @@ fn fsync_preserving_storage<Fd: rustix::fd::AsFd>(
     })
 }
 
+/// Returns whether an I/O error reports exhausted filesystem space or quota.
 ///
-/// `statvfs` cannot detect per-user quota exhaustion because it reports filesystem free blocks, not the caller's remaining quota.
+/// `statvfs` cannot predict per-user quota exhaustion because it reports
+/// filesystem free blocks, not the caller's remaining quota.
 fn is_storage_exhausted(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
@@ -145,10 +147,16 @@ pub struct GenerationManifest {
 }
 
 impl GenerationManifest {
+    /// Serializes fields in declaration order for hashing and persistence.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serialization of this fixed data model fails.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("manifest serialization cannot fail")
     }
 
+    /// Returns the lowercase SHA-256 digest of [`Self::canonical_bytes`].
     pub fn digest(&self) -> String {
         hex(&sha2::Sha256::digest(self.canonical_bytes()))
     }
@@ -483,10 +491,16 @@ impl GenerationStore {
         }))
     }
 
+    /// Returns the lifecycle store root used to open this descriptor-backed store.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Reads and validates the current-profile selector without selecting a fallback.
+    ///
+    /// Unknown schemas return [`CurrentProfile::Quarantined`]. Malformed JSON,
+    /// insecure file metadata, and noncanonical digests return
+    /// [`GenerationError::NativePayloadInvalid`].
     pub fn read_current(&self) -> Result<CurrentProfile, GenerationError> {
         let fd = match openat(
             &self.root_fd,
@@ -589,6 +603,10 @@ impl GenerationStore {
         Ok(manifest)
     }
 
+    /// Returns bytes available to an unprivileged caller on the generations filesystem.
+    ///
+    /// The value saturates on multiplication overflow. Filesystem query failures
+    /// return [`GenerationError::NativePayloadInvalid`].
     pub fn available_bytes(&self) -> Result<u64, GenerationError> {
         let stat =
             rustix::fs::fstatvfs(&self.generations_fd).map_err(|_| invalid("statvfs failed"))?;
@@ -1184,8 +1202,9 @@ fn remove_tree(parent: &OwnedFd, name: &str) -> Result<(), GenerationError> {
     Ok(())
 }
 
+/// Enumerates UTF-8 entry names from an already-open directory.
 ///
-/// fdopendir enumerates the already-open directory, preventing pathname replacement from changing the listing.
+/// `fdopendir` enumerates the already-open directory, preventing pathname replacement from changing the listing.
 /// Unlike a `/proc/self/fd` round-trip, `fdopendir` needs no procfs.
 /// `fdopendir` uses the lifecycle root's validation path on every supported platform, not only Linux.
 /// `read_dir_names` excludes `.` and `..` so callers cannot delete the listed directory or its parent.

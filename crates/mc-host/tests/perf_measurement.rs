@@ -1,3 +1,8 @@
+//! Contract tests for benchmark scheduling, accounting, and measurement windows.
+//!
+//! All timestamps and latencies in these tests use nanoseconds unless a field
+//! name states another unit.
+
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 
