@@ -52,6 +52,7 @@ import {
     tokenCostUsd,
     verifyDualMockResolution,
     type PairedDeltaRunResult,
+    type RolloutHandle,
     type RolloutObservation,
     type RolloutRecord,
     type RunnerDependencies,
@@ -1213,6 +1214,14 @@ function configMatchesArm(
     return Array.isArray(config.plugin) && config.plugin.length > 0;
 }
 
+/**
+ * A live handle must account for what it billed. `usageOnFailure` is optional on the runner's
+ * interface because the scripted and mock handles bill nothing, so for them the estimate is exact;
+ * a live handle without it would price every failure from a bound the historian's retry tree can
+ * exceed, and the runner cannot tell the two apart at runtime. commentlint: allow(JUDGE)
+ */
+type LiveRolloutHandle = RolloutHandle & Required<Pick<RolloutHandle, "usageOnFailure">>;
+
 export function createLiveDependencies(input: {
     apiKey: string;
     providerId: string;
@@ -1225,7 +1234,7 @@ export function createLiveDependencies(input: {
             coordinate,
             baseScriptFingerprint: expectedFingerprint,
             intervention,
-        }) {
+        }): Promise<LiveRolloutHandle> {
             /** Resolved from this file, matching `resolvePaths`, so the log never lands in the repository root where it would enter the implementation digest. */
             const logPath = resolve(
                 import.meta.dir,
