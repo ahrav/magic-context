@@ -76,6 +76,7 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.28",
     "magic-context-kh8.30",
     "magic-context-kh8.31",
+    "magic-context-kh8.35",
 ];
 
 const KERNEL_ADMISSION: &str = "tests/kernel_admission.rs";
@@ -335,6 +336,7 @@ registry_enum! {
         R3VectorConsumer,
         R4StagingLeases,
         R5ArtifactRetention,
+        R5StartupLease,
         R6SearchRebuild,
         R6VectorRebuild,
         R7CoreWarning,
@@ -344,8 +346,10 @@ registry_enum! {
         R9DaemonPayloadCap,
         R10SensitivityAtIngestion,
         R10RedactionMetadata,
+        R10DaemonRedaction,
         R11EgressEligibility,
         R11EgressGate,
+        R11UnderDeclaration,
         R11ExtractionDelegation,
         R12aBackupContents,
         R12bRestoreExact,
@@ -354,6 +358,7 @@ registry_enum! {
         R12dOutboxPosition,
         R12dLagFacts,
         R12dServing,
+        R12dHealthWarnings,
         R12dProjector,
         R12dVectorLag,
         R12eBackupPermissions,
@@ -435,6 +440,14 @@ impl PolicyRow {
                         Test { path: KERNEL_CAS, function: "commit_failure_cleans_reference_and_errors_never_leak_payload" },
                         Test { path: CAS_FAULT_INJECTION, function: "startup_leaves_reservations_whose_digest_still_has_reference_history" },
                     ],
+                },
+            },
+            PolicyRow::R5StartupLease => Row {
+                id: "kh8.1 R5/startup-lease",
+                claim: "an unreferenced write stays covered until its ingestion reservation lease expires",
+                status: Status::Contradiction {
+                    bead: "magic-context-kh8.35",
+                    policy_text: "R5 keeps a never-referenced artifact write covered until its ingestion reservation lease expires. The reclaim promotion in cas/gc.rs matches on state='Live' with no lease_expires_at predicate, unlike cas/deletion.rs, and crash_windows_recover_idempotently_and_match_no_crash_execution expects the object to disappear on an immediate reopen.",
                 },
             },
             PolicyRow::R6SearchRebuild => Row {
@@ -522,6 +535,14 @@ impl PolicyRow {
                     policy_text: "R10 restricts persisted detection metadata to detector id, secret type, source UTF-8 offset, and source UTF-8 length. Production also persists a field key, and staging_metadata_retains_no_verifier_for_a_redacted_secret asserts all five while its message names only four.",
                 },
             },
+            PolicyRow::R10DaemonRedaction => Row {
+                id: "kh8.1 R10/daemon",
+                claim: "the daemon ingestion route redacts secrets before any durable write",
+                status: Status::Pending {
+                    owner_bead: "magic-context-kh8.8",
+                    expected_tests: &[Test { path: HOST_KERNEL_ROUTES, function: "ingest_route_redacts_a_secret_before_every_durable_surface" }],
+                },
+            },
             PolicyRow::R11EgressEligibility => Row {
                 id: "kh8.1 R11/eligibility",
                 claim: "eligibility derives maximum sensitivity from stored records, treats unknown as sensitive, and refuses sensitive-to-remote and all secret egress",
@@ -540,6 +561,14 @@ impl PolicyRow {
                 status: Status::Pending {
                     owner_bead: "magic-context-kh8.8",
                     expected_tests: &[Test { path: HOST_KERNEL_ROUTES, function: "egress_gate_rejects_sensitive_remote_and_all_secret_without_a_request" }],
+                },
+            },
+            PolicyRow::R11UnderDeclaration => Row {
+                id: "kh8.1 R11/under-declaration",
+                claim: "the gate rejects a caller-declared normal request whose stored class is sensitive, without issuing a provider request",
+                status: Status::Pending {
+                    owner_bead: "magic-context-kh8.8",
+                    expected_tests: &[Test { path: HOST_KERNEL_ROUTES, function: "egress_gate_rejects_an_under_declared_normal_request_without_a_request" }],
                 },
             },
             PolicyRow::R11ExtractionDelegation => Row {
@@ -609,6 +638,17 @@ impl PolicyRow {
                 status: Status::Pending {
                     owner_bead: "magic-context-kh8.8",
                     expected_tests: &[Test { path: HOST_KERNEL_ROUTES, function: "search_returns_stale_marker_and_injection_abstains_past_threshold" }],
+                },
+            },
+            PolicyRow::R12dHealthWarnings => Row {
+                id: "kh8.1 R12d/health",
+                claim: "crossing the lag threshold and having no required consumers each raise a daemon health warning",
+                status: Status::Pending {
+                    owner_bead: "magic-context-kh8.8",
+                    expected_tests: &[
+                        Test { path: HOST_KERNEL_ROUTES, function: "crossing_the_lag_threshold_raises_a_daemon_health_warning" },
+                        Test { path: HOST_KERNEL_ROUTES, function: "an_empty_required_consumer_set_raises_a_daemon_health_warning" },
+                    ],
                 },
             },
             PolicyRow::R12dProjector => Row {
@@ -760,9 +800,9 @@ fn declarations_reach(manifest: &Path, path: &str) -> Result<(), String> {
         }
         let source = fs::read_to_string(&parent)
             .map_err(|_| format!("{path} is unreachable: {} does not exist", parent.display()))?;
-        if !declares_module(&source, name) {
+        if let Err(reason) = declares_module(&source, name) {
             return Err(format!(
-                "{path} is unreachable: {} does not declare `mod {name}`",
+                "{path} is unreachable: {} {reason}",
                 parent.display()
             ));
         }
@@ -785,21 +825,67 @@ fn declarations_reach(manifest: &Path, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn declares_module(source: &str, name: &str) -> bool {
-    strip_block_comments(source).iter().any(|line| {
-        let trimmed = line.trim();
-        let rest = trimmed
-            .strip_prefix("pub ")
-            .or_else(|| trimmed.strip_prefix("pub(crate) "))
-            .or_else(|| trimmed.strip_prefix("pub(super) "))
-            .unwrap_or(trimmed);
-        rest.strip_prefix("mod ")
-            .map(str::trim)
-            .and_then(|rest| rest.strip_prefix(name))
-            .is_some_and(|tail| {
-                let tail = tail.trim_start();
-                tail.starts_with(';') || tail.starts_with('{')
-            })
+/// Reports whether `source` declares `mod name` with no `cfg` that CI leaves unsatisfied. A
+/// declaration behind `#[cfg(any())]` omits the module and every oracle in it from the harness, so
+/// its attributes decide reachability just as the declaration text does.
+fn declares_module(source: &str, name: &str) -> Result<(), String> {
+    let lines = strip_block_comments(source);
+    for (index, line) in lines.iter().enumerate() {
+        if !line_declares_module(line, name) {
+            continue;
+        }
+        let mut attributes = Vec::new();
+        let inline = line
+            .split_once("mod ")
+            .map_or("", |(before, _)| before)
+            .trim();
+        if !inline.is_empty() {
+            attributes.push(inline.to_string());
+        }
+        let mut depth = 0i32;
+        for above in lines[..index].iter().rev() {
+            let trimmed = above.trim();
+            if depth > 0 {
+                depth += bracket_delta(trimmed);
+                attributes.push(trimmed.to_string());
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                attributes.push(trimmed.to_string());
+            } else if trimmed.ends_with(']') {
+                depth += bracket_delta(trimmed);
+                attributes.push(trimmed.to_string());
+            } else if !trimmed.starts_with("//") {
+                break;
+            }
+        }
+        attributes.reverse();
+        for attribute in join_attributes(&attributes) {
+            if let Some(condition) = attribute
+                .strip_prefix("#[cfg(")
+                .and_then(|rest| rest.strip_suffix(")]"))
+            {
+                let condition = normalize_condition(condition);
+                if !CI_ENABLED_CFG
+                    .iter()
+                    .any(|allowed| normalize_condition(allowed) == condition)
+                {
+                    return Err(format!("`mod {name}` is behind #[cfg({condition})]"));
+                }
+            }
+        }
+        return Ok(());
+    }
+    Err(format!("does not declare `mod {name}`"))
+}
+
+fn line_declares_module(line: &str, name: &str) -> bool {
+    let Some((_, after)) = line.split_once("mod ") else {
+        return false;
+    };
+    after.trim_start().strip_prefix(name).is_some_and(|tail| {
+        let tail = tail.trim_start();
+        tail.starts_with(';') || tail.starts_with('{')
     })
 }
 
@@ -1113,6 +1199,30 @@ fn raw_prefix_len(rest: &[u8], hashes: usize) -> usize {
     prefix + hashes + 1
 }
 
+/// Reports whether `index` falls inside a `macro_rules!` body, whose contents become items only
+/// where the macro is invoked. A function that exists only in an unexpanded macro is compiled into
+/// no harness, so it cannot stand as a registered oracle. `proptest!` and other invocations are
+/// expansions rather than definitions and are deliberately not matched here.
+fn inside_macro_definition(lines: &[String], index: usize) -> bool {
+    for (start, line) in lines.iter().enumerate().take(index) {
+        if !line.contains("macro_rules!") || !line.contains('{') {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (offset, body) in lines.iter().enumerate().skip(start) {
+            depth += i32::try_from(body.matches('{').count()).unwrap_or(i32::MAX);
+            depth -= i32::try_from(body.matches('}').count()).unwrap_or(i32::MAX);
+            if depth <= 0 {
+                if offset > index {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// Returns the `cfg` conditions on every `mod` block enclosing `index`, so an oracle inside
 /// `#[cfg(any())] mod disabled { .. }` is rejected even though its own attributes look enabled.
 fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
@@ -1211,6 +1321,7 @@ fn locate_with_module_cfgs(
         .enumerate()
         .filter(|(_, line)| defines_function(line, &signature))
         .map(|(index, _)| index)
+        .filter(|index| !inside_macro_definition(&lines, *index))
         .collect::<Vec<_>>();
     let index = match matches.as_slice() {
         [index] => *index,
@@ -1338,6 +1449,8 @@ const MODULE_DISABLED: &str = "#[cfg(any())]\nmod disabled {\n    #[test]\n    f
 const MODULE_ENABLED: &str = "#[cfg(test)]\nmod enabled {\n    #[test]\n    fn proven() {}\n}\n";
 const MULTILINE_CFG_DISABLED: &str = "#[cfg(\n    any()\n)]\n#[test]\nfn proven() {}\n";
 const MULTILINE_CFG_ENABLED: &str = "#[cfg(\n    unix\n)]\n#[test]\nfn proven() {}\n";
+const MACRO_ONLY: &str =
+    "macro_rules! never_used {\n    () => {\n        #[test]\n        fn proven() {}\n    };\n}\n";
 const SHOULD_PANIC: &str = "#[test]\n#[should_panic]\nfn proven() {}\n";
 const IGNORED_SUBSTRING_SELECTOR: &str =
     "#[test]\n#[ignore = \"run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
@@ -1370,7 +1483,7 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
         .filter(|row| matches!(row.status, Status::Contradiction { .. }))
         .count();
     assert!(landed > pending, "{landed} landed, {pending} pending");
-    assert_eq!(contradicted, 3);
+    assert_eq!(contradicted, 4);
 }
 
 #[test]
@@ -1492,6 +1605,15 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
         &[],
     )
     .unwrap();
+
+    // A definition that exists only inside an unexpanded macro is in no harness.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MACRO_ONLY))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
 
     // `should_panic` can pass on a setup panic without reaching the assertions.
     let errors = validate(
