@@ -5,8 +5,14 @@ use rusqlite::TransactionBehavior;
 use super::open::family_sidecars;
 use super::{KernelError, KernelStore};
 
+/// One-gibibyte main database size used by callers as an operational warning threshold.
+///
+/// The value is measured in bytes. [`KernelStore::facts`] reports the current size but
+/// does not apply this threshold itself.
 pub const MAIN_FILE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Combines transaction-consistent commit counters with separately sampled file sizes.
+///
 /// Sizes are sampled per file outside any transaction, so a concurrent commit or
 /// checkpoint can change them between reads. They describe recent growth for
 /// alerting, not a snapshot consistent with `commit_seq`.
@@ -21,6 +27,8 @@ pub struct KernelFacts {
     pub artifact_budget: ArtifactBudgetFacts,
 }
 
+/// `warn` becomes true at 80 percent of `cap_bytes`. Saturating arithmetic also makes
+/// a zero-byte cap warn for every usage value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtifactBudgetFacts {
     pub usage_bytes: u64,
@@ -29,6 +37,10 @@ pub struct ArtifactBudgetFacts {
 }
 
 impl KernelStore {
+    /// Samples transaction-consistent commit facts, then database-family and artifact sizes.
+    ///
+    /// `now_ms` and `oldest_unconsumed_age_ms` are Unix-epoch milliseconds. Future-dated
+    /// outbox rows report age zero. Missing database sidecar files contribute zero bytes.
     pub fn facts(&self, now_ms: i64) -> Result<KernelFacts, KernelError> {
         if now_ms < 0 {
             return Err(KernelError::InvalidInput);
@@ -84,6 +96,7 @@ impl KernelStore {
         })
     }
 
+    /// Artifact traversal failures propagate as [`KernelError`].
     pub fn artifact_budget_facts(&self) -> Result<ArtifactBudgetFacts, KernelError> {
         let usage_bytes = super::cas::gc::object_usage(self)?;
         let warn_at = self.artifact_cap.saturating_sub(self.artifact_cap / 5);

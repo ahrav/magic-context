@@ -4,6 +4,9 @@
 //!
 //! Every submodule is declared here so the binary links once; code other test
 //! binaries share lives under `tests/support/` and is `#[path]`-included.
+//!
+//! Assertions report proof failures by panicking. Repository and store fixtures use isolated
+//! test state. This crate exports no production API.
 
 #![cfg(feature = "test-support")]
 

@@ -248,6 +248,11 @@ impl Drop for ChildHost {
     }
 }
 
+/// Validated configuration for one retained-evidence attempt.
+///
+/// CPU pairs are ordered as collector then host. `block` is one-based in generated attempt
+/// names. Open-loop rate validation occurs during parsing even though the value is read again
+/// when the arm-specific configuration is built.
 struct CollectConfig {
     out: PathBuf,
     arm: String,
@@ -256,6 +261,8 @@ struct CollectConfig {
     block: u32,
 }
 
+/// Rejects missing output and arm settings, unknown arms or classes, malformed CPU pairs,
+/// rates, and block numbers before an attempt directory is created.
 fn read_collect_config() -> Result<CollectConfig, String> {
     let out = PathBuf::from(env_var("MC_IPC_BUDGET_OUT").ok_or("MC_IPC_BUDGET_OUT unset")?);
     let arm = env_var("MC_IPC_BUDGET_ARM").ok_or("MC_IPC_BUDGET_ARM unset")?;
@@ -639,6 +646,8 @@ fn check_correctness(outcomes: &perf_measurement::OutcomeCounts) -> Result<(), S
     Ok(())
 }
 
+/// Requires a live child and exactly one terminal outcome per scheduled slot before applying
+/// protocol, body, frame, and histogram correctness gates.
 fn check_host_and_conservation(
     host: &mut ChildHost,
     outcomes: &perf_measurement::OutcomeCounts,
@@ -1029,6 +1038,11 @@ fn run_aggregate() -> i32 {
 }
 
 /// Aggregation excludes attempts with a running or missing manifest.
+///
+/// The persisted plan is authoritative: every planned attempt must have a final manifest,
+/// every loaded directory must match its manifest identity, and complete attempts must pass
+/// sidecar verification. Groups are sorted before serialization, and output ends with one
+/// newline. Filesystem, JSON, identity, integrity, or completeness failures return `Err`.
 fn aggregate(run_dir: &Path) -> Result<String, String> {
     // Aggregation excludes attempts with a running or missing manifest.
     // Aggregation excludes attempts with a running or missing manifest.
@@ -1452,6 +1466,8 @@ fn run_finalize_interrupted() -> i32 {
     }
 }
 
+/// Runs developer-facing scalar benchmarks without writing retained-evidence manifests.
+/// Missing topology or child-host support skips the affected group and reports the reason.
 fn run_criterion() {
     let mut criterion = Criterion::default().configure_from_args();
 
