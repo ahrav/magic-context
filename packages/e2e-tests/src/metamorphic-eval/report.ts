@@ -383,18 +383,24 @@ function parseCoverage(raw: unknown, label: string): ScenarioCoverage[] {
         const itemLabel = `${label}[${index}]`;
         const value = p.record(entry, itemLabel);
         p.exact(value, ["scenarioId", "applied", "inapplicable", "violations"], itemLabel);
+        const scenarioId = p.string(value.scenarioId, `${itemLabel}.scenarioId`);
         return {
-            scenarioId: p.string(value.scenarioId, `${itemLabel}.scenarioId`),
+            scenarioId,
             applied: p.integer(value.applied, `${itemLabel}.applied`),
             inapplicable: p.array(value.inapplicable, `${itemLabel}.inapplicable`).map((item, innerIndex) => {
                 const innerLabel = `${itemLabel}.inapplicable[${innerIndex}]`;
                 const inapplicable = p.record(item, innerLabel);
                 p.exact(inapplicable, [...PAIR_KEYS, "reason"], innerLabel);
-                return { ...parsePairKey(inapplicable, innerLabel), reason: p.text(inapplicable.reason, `${innerLabel}.reason`) };
+                const pair = parsePairKey(inapplicable, innerLabel);
+                // An inapplicable pair is recorded under the scenario it was admitted against.
+                if (pair.scenarioId !== scenarioId) p.fail(`${innerLabel}.scenarioId: coverage-scenario-mismatch`);
+                return { ...pair, reason: p.text(inapplicable.reason, `${innerLabel}.reason`) };
             }),
             violations: textArray(value.violations, `${itemLabel}.violations`),
         };
     });
+    // One coverage row per scenario, and `requireSorted` alone admits an adjacent repeat.
+    p.unique(coverage.map(({ scenarioId }) => scenarioId), label);
     requireSorted(coverage, ({ scenarioId }) => scenarioId, label);
     return coverage;
 }

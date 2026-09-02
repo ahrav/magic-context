@@ -162,6 +162,13 @@ describe("deterministic metamorphic runner", () => {
         const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         unknownKind.entries[0]!.kind = "skipped";
         expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        const duplicateCoverage = structuredClone(invalid);
+        duplicateCoverage.coverage.push(structuredClone(duplicateCoverage.coverage[0]!));
+        expect(() => parseMetamorphicReport(duplicateCoverage)).toThrow(/report\.coverage: duplicate/);
+        const strayInapplicable = structuredClone(invalid);
+        strayInapplicable.coverage[0]!.inapplicable[0]!.scenarioId = "hse-elsewhere";
+        expect(() => parseMetamorphicReport(strayInapplicable))
+            .toThrow(/report\.coverage\[0\]\.inapplicable\[0\]\.scenarioId: coverage-scenario-mismatch/);
         // The builder sorts each array, so a reordered archive is not a shape it can emit.
         const reordered = structuredClone(report);
         expect(reordered.entries.length).toBeGreaterThan(1);
