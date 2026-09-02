@@ -91,6 +91,9 @@ const DIRECTORY_MARKER: &str = "<directory>";
 /// Stands in for a content digest, which is 64 hex characters.
 const SYMLINK_MARKER: &str = "<symlink>";
 
+/// `cortexkit_lease::EPOCH_WIDTH`, the fixed byte width of a persisted lease epoch.
+const LEASE_EPOCH_WIDTH: usize = 20;
+
 /// `(depth, relative path, content digest, byte length)`.
 type CasEntry = (u64, String, String, u64);
 
@@ -874,8 +877,13 @@ fn verify_lease_epoch(root: &Path, tables: &BTreeMap<String, Table>) {
             continue;
         }
         let text = fs::read_to_string(&path).unwrap_or_default();
-        let digits = text.trim_matches('x');
-        if let Ok(epoch) = digits.trim().parse::<i64>() {
+        // `persist_epoch` pads a short file with `x` before overwriting from offset 0, so a
+        // surviving `x` marks a torn write rather than a digit to strip. Only a complete
+        // zero-padded epoch is read; anything else is invalid content, not a lower epoch.
+        if text.len() != LEASE_EPOCH_WIDTH || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(epoch) = text.parse::<i64>() {
             persisted = Some(persisted.unwrap_or(epoch).max(epoch));
         }
     }
