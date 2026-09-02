@@ -1431,15 +1431,7 @@ function failedRecord(
     /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. Unavailability no longer discounts the charge: it can be raised by a later turn's request, after earlier turns have already billed, and this path keeps no usage to price. Charging the full bound overstates a first-turn refusal rather than understating a mid-script failure, and only the understatement admits an arm the cap should have stopped. commentlint: allow(JUDGE) */
     /** The measured charge when the handle could read it: a nested retry tree in the plugin can bill past any bound this module can derive, and only the understatement admits an arm the cap should have stopped. */
     /** Untrusted like any observation: a non-finite counter would poison the cap it feeds. */
-    const measured = billedOnFailure === null || billedOnFailure === undefined ||
-            [
-                billedOnFailure.input,
-                billedOnFailure.output,
-                billedOnFailure.cacheCreation,
-                billedOnFailure.cacheRead,
-            ].some((count) => !Number.isSafeInteger(count) || count < 0)
-        ? null
-        : billedOnFailure;
+    const measured = finiteUsage(billedOnFailure);
     const billed = measured === null
         ? 0
         : tokenCostUsd(measured, options.pricesPerMillionTokens);

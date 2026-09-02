@@ -23,8 +23,8 @@ const PROSPECTIVE_FILLER = "(?:\\s+(?:be|being|get|getting|soon|then|now|[a-z]+l
 
 const PROSPECTIVE_COMPLETION = new RegExp(`${PROSPECTIVE_HEAD}${PROSPECTIVE_FILLER}[\\s,]*$`);
 
-/** How far back a negation may sit from the verb it negates. */
-const LOOKBEHIND = 40;
+/** How far back a negation or prospective head may sit from the verb it governs. Both patterns anchor at the verb and admit only filler in between, so a wider window cannot let an unrelated earlier clause reach it; it only lets a long filler chain — "not yet been fully able to successfully manage to entirely" — keep its negation in view. commentlint: allow(JUDGE) */
+const LOOKBEHIND = 200;
 
 /**
  * Whether a response asserts it completed the task.

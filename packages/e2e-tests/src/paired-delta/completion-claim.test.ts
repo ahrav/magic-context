@@ -67,6 +67,8 @@ describe("paired-delta completion claims: negation scope", () => {
             "I was not able to complete it.",
             "I could not quite complete the task.",
             "I have not managed to complete this.",
+            // A filler chain longer than the old 40-character window pushed the negation out of view.
+            "I have not yet been fully able to successfully manage to entirely complete the task.",
         ]) {
             expect(reachesTheClassifier(text)).toBe(true);
             expect(claimsCompletion(text)).toBe(false);

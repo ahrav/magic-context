@@ -854,6 +854,29 @@ describe("paired-delta calibration reader: series integrity", () => {
         expect(readCalibrationRecord(path).validForPoolSizing).toBe(true);
     });
 
+    it("reads a record built at a replicate depth of one", () => {
+        // Two scenarios in one family reach two observations per series at depth 1.
+        const shallow = buildCalibrationRecord({
+            records: [
+                ...coordinate("var-a", 0, { "mc-on": true, "mc-off": false, compaction: true }),
+                ...coordinate("var-b", 0, { "mc-on": true, "mc-off": true, compaction: false }),
+            ],
+            scenarioFamilies: new Map([["var-a", "fam-one"], ["var-b", "fam-one"]]),
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            policyFingerprint: H2,
+            implementationDigest: "abc123",
+            targetMinimumDetectableDelta: 0.15,
+            decisions: { familyCount: 1, replicateCount: 1, cadence: "weekly-and-release" },
+        });
+        expect(shallow.validForPoolSizing).toBe(true);
+
+        const path = join(root, `record-${Math.random().toString(16).slice(2)}.json`);
+        require("node:fs").writeFileSync(path, JSON.stringify(shallow));
+        expect(readCalibrationRecord(path).validForPoolSizing).toBe(true);
+    });
+
     it("rejects a scenario depth above the declared replicate count", () => {
         // Inflating depth and series counts together clears the family-sum cross-check.
         const inflated = build3();

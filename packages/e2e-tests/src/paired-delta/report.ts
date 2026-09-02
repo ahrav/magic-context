@@ -683,10 +683,8 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
             record.decisions.familyCount,
         )
         : null;
-    /** The declared depth, not a hard-coded two: `buildCalibrationRecord` requires every scenario to reach `replicateCount`, and a reader accepting less would admit the undersampled pilot the writer refused. */
-    const depth = Number.isSafeInteger(record.decisions?.replicateCount)
-        ? Math.max(2, record.decisions.replicateCount)
-        : 2;
+    /** The declared depth exactly: `buildCalibrationRecord` records `replicateCount` per scenario, and the decisions check above already refused a count below 1, so a floor here would reject a record the writer built correctly at depth 1. commentlint: allow(JUDGE) */
+    const depth = record.decisions.replicateCount;
     /** Per scenario, not per family: a family with two scenarios is satisfied by one of them at full depth if only the aggregate is checked. */
     const perScenario = record.scenarioDepth as Record<string, number> | null | undefined;
     /** Exactly the declared depth, not at least it: the rollout matrix holds `replicateCount` coordinates per scenario and the store keeps one record per coordinate, so a larger depth describes observations the writer cannot have made, and inflating every depth and `observationCount` together clears the family-sum cross-check while the larger `n` admits a smaller variance. commentlint: allow(JUDGE) */
