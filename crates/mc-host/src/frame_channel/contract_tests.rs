@@ -19,12 +19,13 @@ use crate::frame_channel::{FrameSender, InboundEvent, OutboundFrame};
 use crate::ring_transport::ShmReceiver;
 use crate::wire::{encode_frame, pure_header_flags, response_flags, ByteBudget, FrameId};
 
-/// `ChannelFactory` maps scenario-controlled channel dimensions onto its transport.
-/// transport.
+/// Scenario-controlled dimensions passed unchanged to each transport factory.
+///
+/// `queue_frames` limits queued frames. `write_deadline` bounds publication.
+/// `budget_bytes` backs inbound and test-created outbound byte charges.
 pub(crate) struct ContractConfig {
     pub queue_frames: usize,
     pub write_deadline: Duration,
-    /// `budget_bytes` backs every inbound and test-created outbound charge.
     pub budget_bytes: u64,
     pub publish_hook: Option<crate::ring_transport::PublishHook>,
 }
@@ -40,15 +41,16 @@ impl Default for ContractConfig {
     }
 }
 
-/// `Harness` contains the channel under test and an independent peer for its far side.
-/// far side.
+/// Channel under test plus an independently encoded peer at its far side.
+///
+/// `io_task` owns transport progress. `generation` is the engine-side retirement
+/// root shared with the channel. `budget` is the pool created from
+/// [`ContractConfig::budget_bytes`], allowing scenarios to verify charge release.
 pub(crate) struct Harness<P> {
     pub sender: FrameSender,
     pub channel: ShmReceiver,
     pub peer: P,
-    /// `generation` is the engine-side retirement root shared with the channel.
     pub generation: CancellationToken,
-    /// `budget` is the pool created from `ContractConfig::budget_bytes`; scenarios assert charge release against it.
     pub budget: ByteBudget,
     pub io_task: tokio::task::JoinHandle<()>,
 }
@@ -295,6 +297,7 @@ pub(crate) async fn failure_after_publication_begins_retires_without_replay<F: C
     assert!(h.sender.send(outbound(10, b"late")).await.is_err());
 }
 
+/// Graceful finish rejects new work, drains admitted frames in FIFO order, then closes.
 pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: ChannelFactory>(
     factory: &F,
 ) {
@@ -317,7 +320,10 @@ pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: Chann
     );
 }
 
-/// carried.
+/// Discard drops queued frames and releases each frame's byte charge.
+///
+/// The publication hook holds the writer so queued ownership remains observable
+/// until discard races with publication.
 pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelFactory>(
     factory: &F,
 ) {
@@ -357,7 +363,7 @@ pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelF
     );
 }
 
-/// charge lives exactly as long as the delivered body.
+/// An inbound payload charge lives exactly as long as its delivered frame.
 pub(crate) async fn inbound_payload_ownership_travels_with_the_frame<F: ChannelFactory>(
     factory: &F,
 ) {

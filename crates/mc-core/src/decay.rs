@@ -6,10 +6,14 @@
 //! compartment renders identically for a given index, importance, and
 //! pressure.
 
-/// Half-life (in compartments) for importance 50 at pressure 1.
+/// Half-life in compartment positions for importance 50 at budget pressure 1.
 pub const H50: f64 = 24.0;
-/// Importance points needed to double the half-life (imp 75 → 2×, 100 → 4×).
+/// Importance-point interval that doubles the half-life.
+///
+/// For example, importance 75 produces twice the baseline half-life and 100
+/// produces four times the baseline half-life.
 pub const D: f64 = 25.0;
+/// Maximum anchor-overlap extension to the archive boundary, in half-lives.
 pub const G: f64 = 2.0;
 
 /// P1→P2 boundary.
@@ -24,7 +28,10 @@ pub const Z4: f64 = 2.587;
 /// Pressure floor: prevents div-by-zero and caps relaxation at 10×.
 pub const P_FLOOR: f64 = 0.1;
 
-/// Tier costs indexed by tier number; index 0 is reserved.
+/// Estimated token cost per compartment, indexed by tier number.
+///
+/// Index 0 is reserved. Entries 1 through 5 correspond to paraphrase tiers
+/// P1 through P5.
 pub const TIER_COST: [u32; 6] = [0, 322, 109, 35, 20, 5];
 
 /// A paraphrase tier represented by values 1 through 5.
@@ -53,8 +60,12 @@ fn z_value(compartment_index: u32, importance: i32, budget_pressure: f64) -> f64
     a / h
 }
 
-/// `compartment_index` is 1-based from newest (1 = newest); `importance` clamps to 1 through 100.
-/// `budget_pressure` is clamped to at least 0.10.
+/// Maps compartment age onto fixed exponential-decay boundaries.
+///
+/// `compartment_index` is one-based from newest and clamps upward to 1.
+/// `importance` clamps to 1 through 100. `budget_pressure` has a floor of
+/// [`P_FLOOR`]. Boundaries are lower-inclusive for the older tier: a value
+/// exactly equal to [`Z1`], [`Z2`], [`Z3`], or [`Z4`] enters the next tier.
 pub fn tier(compartment_index: u32, importance: i32, budget_pressure: f64) -> Tier {
     let z = z_value(compartment_index, importance, budget_pressure);
     if z < Z1 {
@@ -70,9 +81,11 @@ pub fn tier(compartment_index: u32, importance: i32, budget_pressure: f64) -> Ti
     }
 }
 
-/// P5 denotes archival and is not rendered.
-/// Anchor overlap raises the archive threshold by up to [`G`] half-lives.
-/// With `anchor_overlap = 0.0`, archiving requires `z >= Z4`.
+/// Tests decay position against an anchor-adjusted archive boundary.
+///
+/// P5 denotes archival and is not rendered. Anchor overlap clamps to 0 through
+/// 1 and raises the archive threshold by up to [`G`] half-lives. With
+/// `anchor_overlap = 0.0`, archiving requires `z >= Z4`.
 pub fn should_archive(
     compartment_index: u32,
     importance: i32,
@@ -84,7 +97,10 @@ pub fn should_archive(
     z >= Z4 + G * o
 }
 
-/// P5 denotes archival, not a verbosity tier.
+/// Applies archival protection before selecting a renderable tier.
+///
+/// P5 denotes archival, not a verbosity tier. A compartment naturally in P5
+/// remains P4 while anchor overlap protects it from archival.
 pub fn rendered_tier(
     compartment_index: u32,
     importance: i32,
@@ -102,9 +118,12 @@ pub fn rendered_tier(
     tier(compartment_index, importance, budget_pressure).min(4)
 }
 
-/// `H ∝ 1/p`, the per-tier compartment counts scale as `1/p`, so `C(p) ≈ C(1)/p`;
-/// Before applying [`P_FLOOR`], `p = C(1)/B` targets cost `B` under this approximation.
-/// budgets (<8K).
+/// Derives pressure from natural tier costs and a history budget.
+///
+/// `history_budget` and tier costs use estimated tokens. A non-positive budget
+/// returns 1. Otherwise, `H ∝ 1/p` makes per-tier compartment counts scale as
+/// `1/p`, so `C(p) ≈ C(1)/p`; `p = C(1)/B` targets budget `B` before applying
+/// [`P_FLOOR`]. Archived P5 compartments contribute no natural cost.
 pub fn compute_budget_pressure(compartments: &[DecayInput], history_budget: f64) -> f64 {
     if history_budget <= 0.0 {
         return 1.0;
