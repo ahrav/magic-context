@@ -2491,6 +2491,33 @@ describe("buildLaneReport", () => {
         badVerdict.scenarios[0]!.verdict = "GREEN";
         expect(() => parseLaneReport(badVerdict)).toThrow(/report\.scenarios\[0\]\.verdict: enum-invalid/);
     });
+
+    test("parseLaneReport rejects derived fields that disagree with the scenarios and re-applies admission rules", () => {
+        const fa: ScenarioScore = {
+            ...passScore("hse-b"),
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: ["abs-x"],
+        };
+        const report = buildLaneReport([passScore("hse-a"), fa]);
+        expect(laneExitCode(report)).toBe(2);
+        const greenwashed = structuredClone(report);
+        greenwashed.red = false;
+        greenwashed.runFatal = false;
+        expect(() => parseLaneReport(greenwashed)).toThrow(/^report: derived-mismatch/);
+        const zeroed = structuredClone(report);
+        zeroed.aggregate.failCountsByReason = {};
+        expect(() => parseLaneReport(zeroed)).toThrow(/^report: derived-mismatch/);
+        const empty = { ...structuredClone(report), scenarios: [], aggregate: { ...report.aggregate, total: 0, scored: 0 }, red: false, runFatal: false };
+        expect(() => parseLaneReport(empty)).toThrow(/report\.scenarios: lane-invalid \(.*empty lane report/);
+        const duplicated = structuredClone(report);
+        duplicated.scenarios.push(structuredClone(duplicated.scenarios[0]!));
+        duplicated.aggregate.total = 3;
+        expect(() => parseLaneReport(duplicated)).toThrow(/report\.scenarios: lane-invalid \(.*duplicate scenario/);
+        const rawOutput = structuredClone(report);
+        rawOutput.scenarios[0]!.source = "raw-output";
+        expect(() => parseLaneReport(rawOutput)).toThrow(/report\.scenarios: lane-invalid \(.*raw-output seam/);
+    });
 });
 
 describe("scoring database provisioning", () => {

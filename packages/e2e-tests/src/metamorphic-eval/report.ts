@@ -1,7 +1,8 @@
-import { makeContractPrimitives } from "../contract-primitives";
+import { makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { SystemVersionTuple } from "../historian-eval/runner";
-import { FAIL_REASONS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
-import type { InvariantVerdict } from "./invariants";
+import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
+import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
+import { invariantHolds, type InvariantEvidence, type InvariantVerdict } from "./invariants";
 
 export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
@@ -134,16 +135,37 @@ export class MetamorphicReportError extends Error {
 
 const p = makeContractPrimitives(MetamorphicReportError);
 
-const INVARIANT_IDS = [
-    "injection-set-equality",
-    "expected-absent-empty",
-    "verdict-monotonicity",
-    "expectation-predicate-equality",
-    "false-authoritative-set-equality",
-    "scenario-verdict-equality",
-] as const satisfies readonly MetamorphicInvariantVerdict["invariant"][];
-const SCENARIO_VERDICTS = ["PASS", "FAIL", "ERROR"] as const;
-const ROLES = ["baseline", "derivative", "control-a", "control-b"] as const;
+const INVARIANT_IDS = vocabulary<MetamorphicInvariantVerdict["invariant"]>({
+    "injection-set-equality": true,
+    "expected-absent-empty": true,
+    "verdict-monotonicity": true,
+    "expectation-predicate-equality": true,
+    "false-authoritative-set-equality": true,
+    "scenario-verdict-equality": true,
+});
+const ENTRY_KINDS = vocabulary<MetamorphicReportEntry["kind"]>({
+    "lint-red": true,
+    "stage-not-scored": true,
+    scored: true,
+    error: true,
+});
+const TIER_INVALID_KINDS = vocabulary<TierInvalidReason["kind"]>({
+    incomplete: true,
+    "control-disagreement": true,
+    "control-error": true,
+    "selection-empty": true,
+    "deadline-exhausted": true,
+});
+const ROLES = vocabulary<InjectionCanaryHit["role"]>({ baseline: true, derivative: true, "control-a": true, "control-b": true });
+const SCORED_ROLES = vocabulary<Extract<MetamorphicReportEntry, { kind: "stage-not-scored" }>["role"]>({ baseline: true, derivative: true });
+const UNSCORED_STAGES = vocabulary<Extract<MetamorphicReportEntry, { kind: "stage-not-scored" }>["stage"]>({
+    "validation-rejected": true,
+    "authored-evidence-unprocessed": true,
+});
+const CHANGE_DIRECTIONS = vocabulary<Extract<InvariantVerdict, { invariant: "injection-set-equality" }>["changes"][number]["direction"]>({
+    "missing-from-derivative": true,
+    "added-in-derivative": true,
+});
 
 function text(value: unknown, label: string): string {
     if (typeof value !== "string") p.fail(`${label}: string-invalid`);
@@ -170,16 +192,12 @@ function parsePairKey(value: Record<string, unknown>, label: string): PairKey {
 
 const PAIR_KEYS = ["scenarioId", "transformId", "transformVersion", "seed"] as const;
 
-function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdict {
-    const value = p.record(raw, label);
-    const invariant = p.enumeration(value.invariant, INVARIANT_IDS, `${label}.invariant`);
-    const holds = boolean(value.holds, `${label}.holds`);
+function parseInvariantEvidence(value: Record<string, unknown>, invariant: MetamorphicInvariantVerdict["invariant"], label: string): InvariantEvidence {
     switch (invariant) {
         case "injection-set-equality":
             p.exact(value, ["invariant", "holds", "changes"], label);
             return {
                 invariant,
-                holds,
                 changes: p.array(value.changes, `${label}.changes`).map((entry, index) => {
                     const changeLabel = `${label}.changes[${index}]`;
                     const change = p.record(entry, changeLabel);
@@ -187,7 +205,7 @@ function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdic
                     const claim = p.record(change.claim, `${changeLabel}.claim`);
                     p.exact(claim, ["category", "content"], `${changeLabel}.claim`);
                     return {
-                        direction: p.enumeration(change.direction, ["missing-from-derivative", "added-in-derivative"] as const, `${changeLabel}.direction`),
+                        direction: p.enumeration(change.direction, CHANGE_DIRECTIONS, `${changeLabel}.direction`),
                         claim: { category: text(claim.category, `${changeLabel}.claim.category`), content: text(claim.content, `${changeLabel}.claim.content`) },
                     };
                 }),
@@ -195,12 +213,11 @@ function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdic
         case "expected-absent-empty":
         case "false-authoritative-set-equality":
             p.exact(value, ["invariant", "holds", "baselineMatches", "derivativeMatches"], label);
-            return { invariant, holds, baselineMatches: textArray(value.baselineMatches, `${label}.baselineMatches`), derivativeMatches: textArray(value.derivativeMatches, `${label}.derivativeMatches`) };
+            return { invariant, baselineMatches: textArray(value.baselineMatches, `${label}.baselineMatches`), derivativeMatches: textArray(value.derivativeMatches, `${label}.derivativeMatches`) };
         case "verdict-monotonicity":
             p.exact(value, ["invariant", "holds", "baselineVerdict", "derivativeVerdict", "introducedFailReasons"], label);
             return {
                 invariant,
-                holds,
                 baselineVerdict: p.enumeration(value.baselineVerdict, SCENARIO_VERDICTS, `${label}.baselineVerdict`),
                 derivativeVerdict: p.enumeration(value.derivativeVerdict, SCENARIO_VERDICTS, `${label}.derivativeVerdict`),
                 introducedFailReasons: p.array(value.introducedFailReasons, `${label}.introducedFailReasons`)
@@ -208,21 +225,30 @@ function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdic
             };
         case "expectation-predicate-equality":
             p.exact(value, ["invariant", "holds", "changedExpectationIds"], label);
-            return { invariant, holds, changedExpectationIds: textArray(value.changedExpectationIds, `${label}.changedExpectationIds`) };
+            return { invariant, changedExpectationIds: textArray(value.changedExpectationIds, `${label}.changedExpectationIds`) };
         case "scenario-verdict-equality":
             p.exact(value, ["invariant", "holds", "baselineVerdict", "derivativeVerdict"], label);
             return {
                 invariant,
-                holds,
                 baselineVerdict: p.enumeration(value.baselineVerdict, SCENARIO_VERDICTS, `${label}.baselineVerdict`),
                 derivativeVerdict: p.enumeration(value.derivativeVerdict, SCENARIO_VERDICTS, `${label}.derivativeVerdict`),
             };
     }
 }
 
+// `metamorphicExitCode` reads `holds` alone, so a recorded value that disagrees with its evidence is rejected rather than trusted.
+function parseInvariant(raw: unknown, label: string): MetamorphicInvariantVerdict {
+    const value = p.record(raw, label);
+    const invariant = p.enumeration(value.invariant, INVARIANT_IDS, `${label}.invariant`);
+    const holds = boolean(value.holds, `${label}.holds`);
+    const evidence = parseInvariantEvidence(value, invariant, label);
+    if (invariantHolds(evidence) !== holds) p.fail(`${label}.holds: derived-mismatch`);
+    return { ...evidence, holds } as MetamorphicInvariantVerdict;
+}
+
 function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
     const value = p.record(raw, label);
-    const kind = p.enumeration(value.kind, ["lint-red", "stage-not-scored", "scored", "error"] as const, `${label}.kind`);
+    const kind = p.enumeration(value.kind, ENTRY_KINDS, `${label}.kind`);
     const pair = parsePairKey(value, label);
     switch (kind) {
         case "lint-red":
@@ -233,8 +259,8 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             return {
                 ...pair,
                 kind,
-                role: p.enumeration(value.role, ["baseline", "derivative"] as const, `${label}.role`),
-                stage: p.enumeration(value.stage, ["validation-rejected", "authored-evidence-unprocessed"] as const, `${label}.stage`),
+                role: p.enumeration(value.role, SCORED_ROLES, `${label}.role`),
+                stage: p.enumeration(value.stage, UNSCORED_STAGES, `${label}.stage`),
                 error: text(value.error, `${label}.error`),
             };
         case "scored":
@@ -256,7 +282,7 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
 function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason | null {
     if (raw === null) return null;
     const value = p.record(raw, label);
-    const kind = p.enumeration(value.kind, ["incomplete", "control-disagreement", "control-error", "selection-empty", "deadline-exhausted"] as const, `${label}.kind`);
+    const kind = p.enumeration(value.kind, TIER_INVALID_KINDS, `${label}.kind`);
     switch (kind) {
         case "incomplete":
             p.exact(value, ["kind"], label);
@@ -285,22 +311,6 @@ function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason 
     }
 }
 
-function parseSystem(raw: unknown, label: string): SystemVersionTuple | null {
-    if (raw === null) return null;
-    const value = p.record(raw, label);
-    p.exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "historianModelId", "probeModelId", "parserImpl", "chunkTokenBudget"], label);
-    if (value.parserImpl !== "ts") p.fail(`${label}.parserImpl: enum-invalid`);
-    return {
-        repoCommitSha: p.string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: p.string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: p.string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: p.string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: p.string(value.probeModelId, `${label}.probeModelId`),
-        parserImpl: "ts",
-        chunkTokenBudget: value.chunkTokenBudget === null ? null : p.integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
-    };
-}
-
 /** Strict consumer parser: exact keys over every entry variant and every `tierInvalidReason` variant. */
 export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     const root = p.record(raw, "report");
@@ -308,7 +318,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     if (root.schema !== METAMORPHIC_REPORT_SCHEMA) p.fail("report.schema: version-invalid");
     return {
         schema: METAMORPHIC_REPORT_SCHEMA,
-        system: parseSystem(root.system, "report.system"),
+        system: parseSystemVersionTuple(p, root.system, "report.system"),
         entries: p.array(root.entries, "report.entries").map((entry, index) => parseEntry(entry, `report.entries[${index}]`)),
         coverage: p.array(root.coverage, "report.coverage").map((entry, index) => {
             const label = `report.coverage[${index}]`;

@@ -3,6 +3,7 @@ import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA } from "../../../plugi
 import { GATE_ID_RE, REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval/scorer";
+import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
 import { PRIMARY_ARM_IDS } from "../paired-delta/contract";
@@ -235,18 +236,7 @@ function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[],
 }
 
 function parseSystemProjection(raw: unknown, label: string): SystemProjection {
-    const value = record(raw, label);
-    exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "historianModelId", "probeModelId", "parserImpl", "chunkTokenBudget"], label);
-    if (value.parserImpl !== "ts") fail(`${label}.parserImpl: enum-invalid`);
-    return {
-        repoCommitSha: string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: string(value.probeModelId, `${label}.probeModelId`),
-        parserImpl: "ts",
-        chunkTokenBudget: value.chunkTokenBudget === null ? null : integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
-    };
+    return parseSystemVersionTuple(p, raw, label) ?? fail(`${label}: object-required`);
 }
 
 function parseIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {

@@ -26,6 +26,7 @@ import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { makeContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
+import { parseSystemVersionTuple } from "./system-tuple";
 import {
     containsCompleteValue,
     decodeXmlEntities,
@@ -71,17 +72,21 @@ export const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
 /* */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;
 export type FailReason = (typeof FAIL_REASONS)[number];
+export const SCENARIO_VERDICTS = ["PASS", "FAIL", "ERROR"] as const;
+export type ScenarioVerdict = (typeof SCENARIO_VERDICTS)[number];
+export const PROBE_OUTCOMES = ["pass", "fail", "error-trimmed"] as const;
+export const SCORE_SOURCES = ["run-record", "raw-output"] as const;
 
 export interface ProbeVerdict {
     probeId: string;
-    outcome: "pass" | "fail" | "error-trimmed";
+    outcome: (typeof PROBE_OUTCOMES)[number];
     expected: string;
     actual: string | null;
 }
 
 export interface ScenarioScore {
     scenarioId: string;
-    verdict: "PASS" | "FAIL" | "ERROR";
+    verdict: ScenarioVerdict;
     failReasons: FailReason[];
     errorReason: string | null;
     errorDetail: string | null;
@@ -105,7 +110,7 @@ export interface ScenarioScore {
      *
      * Malformed-record artifacts must become per-scenario `ERROR` results, not seam results.
      */
-    source: "run-record" | "raw-output";
+    source: (typeof SCORE_SOURCES)[number];
 }
 
 export type RawOutputStageResult =
@@ -1837,22 +1842,6 @@ function parseCountRecord(raw: unknown, label: string): Record<string, number> {
     return Object.fromEntries(Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`)]));
 }
 
-function parseSystemTuple(raw: unknown, label: string): SystemVersionTuple | null {
-    if (raw === null) return null;
-    const value = p.record(raw, label);
-    p.exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "historianModelId", "probeModelId", "parserImpl", "chunkTokenBudget"], label);
-    if (value.parserImpl !== "ts") p.fail(`${label}.parserImpl: enum-invalid`);
-    return {
-        repoCommitSha: p.string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: p.string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: p.string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: p.string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: p.string(value.probeModelId, `${label}.probeModelId`),
-        parserImpl: "ts",
-        chunkTokenBudget: value.chunkTokenBudget === null ? null : p.integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
-    };
-}
-
 export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const value = p.record(raw, label);
     p.exact(value, [
@@ -1864,7 +1853,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         p.array(value[field], `${label}.${field}`).map((entry, index) => parseText(entry, `${label}.${field}[${index}]`));
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
-        verdict: p.enumeration(value.verdict, ["PASS", "FAIL", "ERROR"] as const, `${label}.verdict`),
+        verdict: p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`),
         failReasons: p.array(value.failReasons, `${label}.failReasons`)
             .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`)),
         errorReason: parseNullableText(value.errorReason, `${label}.errorReason`),
@@ -1883,27 +1872,26 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
             p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
             return {
                 probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
-                outcome: p.enumeration(probe.outcome, ["pass", "fail", "error-trimmed"] as const, `${probeLabel}.outcome`),
+                outcome: p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`),
                 expected: parseText(probe.expected, `${probeLabel}.expected`),
                 actual: parseNullableText(probe.actual, `${probeLabel}.actual`),
             };
         }),
-        system: parseSystemTuple(value.system, `${label}.system`),
-        source: p.enumeration(value.source, ["run-record", "raw-output"] as const, `${label}.source`),
+        system: parseSystemVersionTuple(p, value.system, `${label}.system`),
+        source: p.enumeration(value.source, SCORE_SOURCES, `${label}.source`),
     };
 }
 
-/** Strict consumer parser for an archived lane report: exact keys at every level and closed verdict and fail-reason vocabularies. */
 export function parseLaneReport(raw: unknown): LaneReport {
     const root = p.record(raw, "report");
     p.exact(root, ["schema", "releaseVersion", "system", "scenarios", "aggregate", "red", "runFatal"], "report");
     if (root.schema !== LANE_REPORT_SCHEMA) p.fail("report.schema: version-invalid");
     const aggregate = p.record(root.aggregate, "report.aggregate");
     p.exact(aggregate, ["total", "scored", "errors", "errorCountsByReason", "failCountsByReason", "precision", "recall", "falseAuthoritativeRate"], "report.aggregate");
-    return {
+    const report: LaneReport = {
         schema: LANE_REPORT_SCHEMA,
         releaseVersion: parseNullableText(root.releaseVersion, "report.releaseVersion"),
-        system: parseSystemTuple(root.system, "report.system"),
+        system: parseSystemVersionTuple(p, root.system, "report.system"),
         scenarios: p.array(root.scenarios, "report.scenarios")
             .map((entry, index) => parseScenarioScore(entry, `report.scenarios[${index}]`)),
         aggregate: {
@@ -1919,6 +1907,18 @@ export function parseLaneReport(raw: unknown): LaneReport {
         red: parseBoolean(root.red, "report.red"),
         runFatal: parseBoolean(root.runFatal, "report.runFatal"),
     };
+    // Rebuilding verifies that the scenarios satisfy the builder's admission rules and that the archived derived fields match.
+    let rebuilt: LaneReport;
+    try {
+        rebuilt = buildLaneReport(report.scenarios, {
+            releaseVersion: report.releaseVersion ?? undefined,
+            system: report.system ?? undefined,
+        });
+    } catch (error) {
+        throw new HistorianReportError([`report.scenarios: lane-invalid (${error instanceof Error ? error.message : String(error)})`]);
+    }
+    if (canonicalJson(rebuilt) !== canonicalJson(report)) p.fail("report: derived-mismatch");
+    return report;
 }
 
 /**

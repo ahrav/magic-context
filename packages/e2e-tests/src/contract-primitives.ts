@@ -11,6 +11,16 @@ export interface ContractErrorConstructor {
     new (diagnostics: readonly string[]): Error;
 }
 
+/**
+ * Builds a closed vocabulary from a `Record<T, true>` so the list is checked for completeness, not just membership.
+ *
+ * `[...] as const satisfies readonly T[]` only proves each element is a `T`; it does not require every `T` member.
+ * A member missing from the record form is a type error, so a parser cannot silently reject a valid report.
+ */
+export function vocabulary<T extends string>(members: Record<T, true>): readonly T[] {
+    return Object.keys(members) as T[];
+}
+
 export interface ContractPrimitives {
     fail(code: string): never;
     record(value: unknown, label: string): Record<string, unknown>;

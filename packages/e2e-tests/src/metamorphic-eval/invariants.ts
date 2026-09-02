@@ -106,30 +106,14 @@ export function compareInvariants(
     );
 
     return [
-        {
-            invariant: "injection-set-equality",
-            holds: changes.length === 0,
-            changes,
-        },
-        {
-            invariant: "expected-absent-empty",
-            holds: baselineMatches.length === 0 && derivativeMatches.length === 0,
-            baselineMatches,
-            derivativeMatches,
-        },
-        {
+        withHolds({ invariant: "injection-set-equality", changes }),
+        withHolds({ invariant: "expected-absent-empty", baselineMatches, derivativeMatches }),
+        withHolds({
             invariant: "verdict-monotonicity",
-            // A derivative preserves the scenario's semantics, so a baseline that
-            // passed and a derivative that does not is the transform's doing.
-            // Only that direction is a violation: a derivative that passes where
-            // the baseline failed is not a regression to report here.
-            holds: !(
-                baselineScore.verdict === "PASS" && derivativeScore.verdict !== "PASS"
-            ),
             baselineVerdict: baselineScore.verdict,
             derivativeVerdict: derivativeScore.verdict,
             introducedFailReasons,
-        },
+        }),
     ];
 }
 
@@ -149,22 +133,43 @@ export function compareScoreInvariants(
     const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
     const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
     return [
-        {
-            invariant: "expectation-predicate-equality",
-            holds: changedExpectationIds.length === 0,
-            changedExpectationIds,
-        },
-        {
-            invariant: "false-authoritative-set-equality",
-            holds: JSON.stringify(baselineMatches) === JSON.stringify(derivativeMatches),
-            baselineMatches,
-            derivativeMatches,
-        },
-        {
+        withHolds({ invariant: "expectation-predicate-equality", changedExpectationIds }),
+        withHolds({ invariant: "false-authoritative-set-equality", baselineMatches, derivativeMatches }),
+        withHolds({
             invariant: "scenario-verdict-equality",
-            holds: baselineScore.verdict === derivativeScore.verdict,
             baselineVerdict: baselineScore.verdict,
             derivativeVerdict: derivativeScore.verdict,
-        },
+        }),
     ];
+}
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** An invariant verdict with `holds` removed; every `holds` is a function of the remaining evidence fields. */
+export type InvariantEvidence = DistributiveOmit<MetamorphicInvariantVerdict, "holds">;
+
+/** `holds` is recomputed when parsing archived reports to verify it matches the recorded evidence. */
+export function invariantHolds(evidence: InvariantEvidence): boolean {
+    switch (evidence.invariant) {
+        case "injection-set-equality":
+            return evidence.changes.length === 0;
+        case "expected-absent-empty":
+            return evidence.baselineMatches.length === 0 && evidence.derivativeMatches.length === 0;
+        case "verdict-monotonicity":
+            // A derivative preserves the scenario's semantics, so a baseline that
+            // passed and a derivative that does not is the transform's doing.
+            // Only that direction is a violation: a derivative that passes where
+            // the baseline failed is not a regression to report here.
+            return !(evidence.baselineVerdict === "PASS" && evidence.derivativeVerdict !== "PASS");
+        case "expectation-predicate-equality":
+            return evidence.changedExpectationIds.length === 0;
+        case "false-authoritative-set-equality":
+            return JSON.stringify(evidence.baselineMatches) === JSON.stringify(evidence.derivativeMatches);
+        case "scenario-verdict-equality":
+            return evidence.baselineVerdict === evidence.derivativeVerdict;
+    }
+}
+
+function withHolds<E extends InvariantEvidence>(evidence: E): E & { holds: boolean } {
+    return { ...evidence, holds: invariantHolds(evidence) };
 }

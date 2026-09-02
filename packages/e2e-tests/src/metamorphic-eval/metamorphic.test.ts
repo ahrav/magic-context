@@ -168,6 +168,21 @@ describe("deterministic metamorphic runner", () => {
         const badReason = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
         badReason.tierInvalidReason.kind = "tired";
         expect(() => parseMetamorphicReport(badReason)).toThrow(/report\.tierInvalidReason\.kind: enum-invalid/);
+
+        // `holds` is derivable from each invariant's evidence, so a recorded value that disagrees is rejected rather than trusted.
+        const scoredIndex = report.entries.findIndex((entry) => entry.kind === "scored");
+        expect(scoredIndex).toBeGreaterThanOrEqual(0);
+        const flipped = structuredClone(report);
+        const scored = flipped.entries[scoredIndex]!;
+        if (scored.kind !== "scored") throw new Error("unreachable");
+        const verdictEquality = scored.invariants.findIndex((entry) => entry.invariant === "scenario-verdict-equality");
+        const target = scored.invariants[verdictEquality]!;
+        if (target.invariant !== "scenario-verdict-equality") throw new Error("unreachable");
+        target.derivativeVerdict = target.baselineVerdict === "PASS" ? "FAIL" : "PASS";
+        // The flipped evidence leaves `holds` untouched, so the exit code alone cannot see the contradiction.
+        expect(metamorphicExitCode(flipped)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(flipped))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants\\[${verdictEquality}\\]\\.holds: derived-mismatch`));
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {

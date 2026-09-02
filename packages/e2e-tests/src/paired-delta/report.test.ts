@@ -948,6 +948,39 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(badStatus)).toThrow(/report\.body\.runSummary\.status: enum-invalid/);
     });
 
+    it("rejects a fingerprint-consistent body that violates the builder's cross-field invariants", () => {
+        const built = report();
+        // The fingerprint is an unkeyed digest, so a writer can recompute it over a rewritten body.
+        const forge = (mutate: (body: typeof built.body) => void): unknown => {
+            const body = structuredClone(built.body);
+            mutate(body);
+            return { schema: built.schema, body, reportFingerprint: canonicalFingerprint(body) };
+        };
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.evidenceSufficient = false; })))
+            .toThrow(/report\.body\.analysis\.evidenceSufficient: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.familyCount = 99; })))
+            .toThrow(/report\.body\.analysis\.endpoints\[0\]\.familyCount: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints.push({ ...body.analysis.endpoints[0]!, endpoint: "representation" });
+        }))).toThrow(/report\.body\.analysis\.endpoints\[2\]\.endpoint: enum-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.policyFingerprint = H1; })))
+            .toThrow(/report\.body\.analysis: lane-binding-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.regret.providerMixed = []; })))
+            .toThrow(/report\.body\.regret\.providerMixed: analysis-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.regret.raw[0]!.retrieval = 9; })))
+            .toThrow(/report\.body\.regret\.raw: analysis-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.invalidSuccessRateByArm["mc-on"] = 1.5; })))
+            .toThrow(/invalidSuccessRateByArm\.mc-on: number-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = -1; })))
+            .toThrow(/finalAttemptTokensByArm\.mc-on: number-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.spentUsd = -1; })))
+            .toThrow(/report\.body\.runSummary\.spentUsd: number-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.healthyCoordinates = 13; })))
+            .toThrow(/report\.body\.runSummary\.healthyCoordinates: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions.push({ ...body.exclusions[0]! }); })))
+            .toThrow(/report\.body\.exclusions: duplicate/);
+    });
+
     it("preserves an endpoint-scoped noise floor through the round trip", () => {
         const policy = policyDocument();
         const analysis = estimateFamilyDeltas({
