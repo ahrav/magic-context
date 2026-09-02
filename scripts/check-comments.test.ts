@@ -82,6 +82,63 @@ describe("comment hygiene gate", () => {
         expect(result.code).toBe(0);
     });
 
+    test("a nested Rust block comment stays open until its outer close", () => {
+        const result = scan({
+            "nest.rs": "/* outer /* nested */ tracked in magic-context-om3y */",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("nest.rs:1:");
+    });
+
+    test("a product name whose suffix names no task stays clean", () => {
+        const result = scan({
+            "prod.ts": [
+                "// Configure magic-context-pi before startup",
+                "// The magic-context-next module handles it",
+                "// `--magic-context-dreamer-actions` registers the dreamer surface",
+            ].join("\n"),
+        });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
+    });
+
+    test("sentence punctuation does not hide a short ID", () => {
+        const result = scan({ "dot.rs": `// tracked in ${exportedDottedId()}.` });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("dot.rs:1:");
+    });
+
+    test("a hash inside a word or scalar is runtime data", () => {
+        const result = scan({
+            "word.sh": 'printf "%s" foo#magic-context-om3y',
+            "scalar.yml": "key: foo#magic-context-om3y",
+        });
+
+        expect(result.out).toBe("");
+        expect(result.code).toBe(0);
+    });
+
+    test("a label followed by a comment is still a comment", () => {
+        const result = scan({ "label.ts": "outer:// tracked in magic-context-om3y" });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("label.ts:1:");
+    });
+
+    test("manifest comments and single-digit tickets are in scope", () => {
+        const result = scan({
+            "probe.toml": "# tracked in magic-context-om3y",
+            "tick.rs": "// tracked in PR-7",
+        });
+
+        expect(result.code).toBe(1);
+        expect(result.out).toContain("probe.toml:1:");
+        expect(result.out).toContain("tick.rs:1:");
+    });
+
     test("prose, product names, and string literals stay clean", () => {
         const result = scan({
             "c.ts": [

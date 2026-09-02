@@ -9,7 +9,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-EXTS='rs ts tsx js mjs py sh yml yaml'
+EXTS='rs ts tsx js mjs py sh yml yaml toml'
 IDS_FILE=.beads/issues.jsonl
 
 if [ ! -f "$IDS_FILE" ]; then
@@ -59,7 +59,7 @@ function wanted(p,   i, c, ext) {
 
 # A hash-style file has line comments only; a c-style file has both forms.
 function style_of(p) {
-  if (p ~ /\.(py|sh|yml|yaml)$/) return "hash"
+  if (p ~ /\.(py|sh|yml|yaml|toml)$/) return "hash"
   return "c"
 }
 
@@ -68,21 +68,27 @@ function apostrophe_quotes(p) {
   return (p ~ /\.rs$/) ? 0 : 1
 }
 
+# Rust block comments nest, so a closing delimiter there ends only the innermost span.
+function block_nests(p) {
+  return (p ~ /\.rs$/) ? 1 : 0
+}
+
 # Quote tracking keeps a delimiter inside a string literal from opening a comment.
 # Only block-comment state survives across lines, so an unbalanced quote cannot desync the next line.
-function comment_of(line, st,   i, n, c, two, rest, e, prev, q, out) {
+function comment_of(line, st,   i, n, c, two, q, out) {
   out = ""
   n = length(line)
   i = 1
-  if (inblock) {
-    e = index(line, "*/")
-    if (e == 0) return line
-    out = substr(line, 1, e - 1)
-    inblock = 0
-    i = e + 2
-  }
   q = ""
   while (i <= n) {
+    if (depth > 0) {
+      two = substr(line, i, 2)
+      if (two == "*/") { depth--; i += 2; continue }
+      if (blk_nest && two == "/*") { depth++; i += 2; continue }
+      out = out substr(line, i, 1)
+      i++
+      continue
+    }
     c = substr(line, i, 1)
     if (q != "") {
       if (c == BS) { i += 2; continue }
@@ -92,31 +98,22 @@ function comment_of(line, st,   i, n, c, two, rest, e, prev, q, out) {
     }
     if (c == DQ || c == BT || (c == SQ && sq_quotes)) { q = c; i++; continue }
     if (st == "hash") {
-      if (c == "#") return out " " substr(line, i + 1)
+      # A hash starts a comment only at line start or after whitespace, so a shell word or YAML scalar containing one stays runtime data.
+      if (c == "#" && (i == 1 || substr(line, i - 1, 1) == " " || substr(line, i - 1, 1) == "\t")) {
+        return out " " substr(line, i + 1)
+      }
       i++
       continue
     }
     two = substr(line, i, 2)
-    if (two == "//") {
-      prev = (i > 1) ? substr(line, i - 1, 1) : ""
-      # A URL scheme separator is not a comment opener.
-      if (prev == ":") { i += 2; continue }
-      return out " " substr(line, i + 2)
-    }
-    if (two == "/*") {
-      rest = substr(line, i + 2)
-      e = index(rest, "*/")
-      if (e == 0) { inblock = 1; return out " " rest }
-      out = out " " substr(rest, 1, e - 1)
-      i = i + e + 3
-      continue
-    }
+    if (two == "//") return out " " substr(line, i + 2)
+    if (two == "/*") { depth = 1; out = out " "; i += 2; continue }
     i++
   }
   return out
 }
 
-function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base) {
+function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base, rest, tok) {
   if (txt ~ /commentlint:[ \t]*allow[ \t]*\(/) {
     printf "comment-lint suppression on disk: %s:%d:%s\n", p, lno, raw
     status = 1
@@ -124,14 +121,22 @@ function check(p, lno, raw, txt,   lt, hit, count, i, toks, t, dot, base) {
 
   lt = tolower(txt) " "
   hit = 0
-  # A trailing non-suffix character stands in for a word boundary, so a product
-  # name such as the dreamer flag does not read as an ID.
-  if (lt ~ /magic-context-[a-z0-9][a-z0-9][a-z0-9]?[a-z0-9]?(\.[0-9]+)*[^a-z0-9-]/) hit = 1
-  if (!hit && txt ~ /(^|[^A-Za-z0-9])(CR|PR|MR|SIM|TT|JIRA)-[0-9][0-9]/) hit = 1
+  # The prefix disambiguates, so a base lookup suffices here. A product name carrying an unknown base does not trigger.
+  rest = lt
+  while (match(rest, /magic-context-[a-z0-9]+(\.[0-9]+)*/)) {
+    tok = substr(rest, RSTART + 14, RLENGTH - 14)
+    dot = index(tok, ".")
+    base = (dot > 0) ? substr(tok, 1, dot - 1) : tok
+    if (base in bead_base) { hit = 1; break }
+    rest = substr(rest, RSTART + RLENGTH)
+  }
+  if (!hit && txt ~ /(^|[^A-Za-z0-9])(CR|PR|MR|SIM|TT|JIRA)-[0-9]/) hit = 1
   if (!hit) {
     count = split(lt, toks, /[^a-z0-9.]+/)
     for (i = 1; i <= count; i++) {
       t = toks[i]
+      # Sentence punctuation is not part of the ID.
+      sub(/\.+$/, "", t)
       if (t == "") continue
       dot = index(t, ".")
       base = (dot > 0) ? substr(t, 1, dot - 1) : t
@@ -158,7 +163,10 @@ BEGIN {
 
   parts_n = split(BEAD_IDS, parts, " ")
   for (k = 1; k <= parts_n; k++) {
-    if (parts[k] != "") bead_id[parts[k]] = 1
+    if (parts[k] == "") continue
+    bead_id[parts[k]] = 1
+    at = index(parts[k], ".")
+    bead_base[(at > 0) ? substr(parts[k], 1, at - 1) : parts[k]] = 1
   }
 
   status = 0
@@ -166,11 +174,12 @@ BEGIN {
     if (path == "" || excluded(path) || !wanted(path)) continue
     style = style_of(path)
     sq_quotes = apostrophe_quotes(path)
-    inblock = 0
+    blk_nest = block_nests(path)
+    depth = 0
     lno = 0
     while ((frc = (getline line < path)) > 0) {
       lno++
-      if (!inblock) {
+      if (depth == 0) {
         if (style == "hash") {
           if (index(line, "#") == 0) continue
         } else if (index(line, "/") == 0) continue
