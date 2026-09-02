@@ -56,6 +56,7 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.10",
     "magic-context-3q5.9",
     "magic-context-3q5.15",
+    "magic-context-kh8.18",
     "magic-context-kh8.21",
     "magic-context-kh8.22",
     "magic-context-kh8.24",
@@ -182,6 +183,9 @@ impl Obligation {
                     tests: &[
                         Test { path: KERNEL_SCOPE_ALGEBRA, function: "canonicalization_is_idempotent_and_order_insensitive" },
                         Test { path: KERNEL_SCOPE_ALGEBRA, function: "version_range_containment_uses_interval_normalization" },
+                        Test { path: KERNEL_SCOPE_ALGEBRA, function: "subsumption_is_reflexive" },
+                        Test { path: KERNEL_SCOPE_ALGEBRA, function: "subsumption_is_transitive" },
+                        Test { path: KERNEL_SCOPE_ALGEBRA, function: "overlap_is_symmetric" },
                         Test { path: KERNEL_SCOPE_ALGEBRA, function: "law_generators_reach_nontrivial_subsumption_pairs" },
                         Test { path: KERNEL_SCOPE_ALGEBRA, function: "git_terms_decide_through_a_graph_oracle" },
                     ],
@@ -323,6 +327,7 @@ registry_enum! {
         R6VectorRebuild,
         R7CoreWarning,
         R8ArtifactBudget,
+        R8CapConfigurable,
         R9PayloadCap,
         R10SensitivityAtIngestion,
         R11EgressEligibility,
@@ -360,7 +365,7 @@ impl PolicyRow {
             },
             PolicyRow::R2CommitHistoryRetained => Row {
                 id: "kh8.1 R2",
-                claim: "commit_log and change_event are never updated or deleted",
+                claim: "commit_log rejects update and delete, change_event and receipt identity fields are immutable and undeletable, and only R8 payload remediation may overwrite a payload",
                 status: Status::Landed {
                     tests: &[
                         Test { path: KERNEL_SCHEMA, function: "commit_log_rejects_update_and_delete" },
@@ -403,13 +408,14 @@ impl PolicyRow {
             },
             PolicyRow::R5ArtifactRetention => Row {
                 id: "kh8.1 R5",
-                claim: "referenced artifacts are retained, dereferenced ones reclaim after grace, commit failure cleans up, and crash orphans reclaim at reservation expiry",
+                claim: "referenced artifacts are retained, dereferenced ones reclaim after grace, commit failure cleans up, crash orphans reclaim at reservation expiry, and repeated maintenance is idempotent",
                 status: Status::Landed {
                     tests: &[
                         Test { path: KERNEL_GC, function: "referenced_and_recently_invalidated_artifacts_survive" },
                         Test { path: KERNEL_GC, function: "invalidated_artifact_reclaims_after_grace_but_backward_clock_keeps_it" },
                         Test { path: KERNEL_GC, function: "reservation_honors_stored_and_renewed_lease_expiry" },
                         Test { path: KERNEL_GC, function: "reclaiming_blocks_delayed_commit_and_startup_converges" },
+                        Test { path: KERNEL_GC, function: "reclaimed_digests_stop_being_gc_candidates" },
                         Test { path: KERNEL_CAS, function: "commit_failure_cleans_reference_and_errors_never_leak_payload" },
                         Test { path: CAS_FAULT_INJECTION, function: "startup_leaves_reservations_whose_digest_still_has_reference_history" },
                     ],
@@ -441,7 +447,7 @@ impl PolicyRow {
             },
             PolicyRow::R8ArtifactBudget => Row {
                 id: "kh8.1 R8",
-                claim: "the artifact cap is configurable, cap errors are typed with usage and cap, and referenced artifacts are never reclaimed for pressure",
+                claim: "cap errors are typed with usage and cap, and referenced artifacts are never reclaimed for pressure",
                 status: Status::Landed {
                     tests: &[
                         Test { path: KERNEL_CAS, function: "cap_error_reports_usage_and_cap_without_poisoning_reads" },
@@ -450,6 +456,14 @@ impl PolicyRow {
                         Test { path: KERNEL_GC, function: "a_full_artifact_cap_is_reported_as_retriable" },
                         Test { path: KERNEL_GC, function: "orphan_mtime_grace_and_budget_facts_are_reconciled_from_objects" },
                     ],
+                },
+            },
+            PolicyRow::R8CapConfigurable => Row {
+                id: "kh8.1 R8/configurable",
+                claim: "the artifact cap is configurable through a production constructor",
+                status: Status::Pending {
+                    owner_bead: "magic-context-kh8.18",
+                    expected_tests: &[Test { path: KERNEL_CAS, function: "a_production_open_accepts_a_configured_artifact_cap" }],
                 },
             },
             PolicyRow::R9PayloadCap => Row {
@@ -629,6 +643,8 @@ pub type Catalog = BTreeMap<String, Option<String>>;
 
 pub fn read_catalog(rows: &[Row]) -> Catalog {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Collect the distinct paths first; many rows name the same file, and
+    // reading once per row would re-read it for every reference.
     rows.iter()
         .flat_map(|row| match row.status {
             Status::Landed { tests }
@@ -638,10 +654,13 @@ pub fn read_catalog(rows: &[Row]) -> Catalog {
             } => tests,
             Status::Contradiction { .. } => &[],
         })
-        .map(|test| {
+        .map(|test| test.path)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|path| {
             (
-                test.path.to_string(),
-                fs::read_to_string(manifest.join(test.path)).ok(),
+                path.to_string(),
+                fs::read_to_string(manifest.join(path)).ok(),
             )
         })
         .collect()
@@ -752,19 +771,30 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
         ));
     }
     let package = format!("-p {} ", owning_package(test.path));
+    let target = owning_test_target(test.path).map(|target| format!("--test {target} "));
     for line in &attributes {
         let line = line.trim();
         if line.starts_with("#[ignore") {
             // The rerun command has to select this ignored test in the package
-            // that owns its file; `cargo test` runs no ignored test otherwise.
+            // and test target that own its file; `cargo test` runs no ignored
+            // test otherwise, and a selector naming another target errors
+            // before Cargo evaluates this test.
+            let selects_target = target
+                .as_ref()
+                .is_none_or(|target| line.contains(target.as_str()));
             let runnable = line.starts_with("#[ignore = \"")
                 && line.contains("run with: cargo test")
                 && line.contains(&package)
+                && selects_target
                 && line.contains(test.function)
                 && line.contains("--ignored");
             if !runnable {
+                let selector = match &target {
+                    Some(target) => format!("{package}{target}"),
+                    None => package.clone(),
+                };
                 return Err(format!(
-                    "{}::{} is ignored without a rerun command for {package}",
+                    "{}::{} is ignored without a rerun command for {selector}",
                     test.path, test.function
                 ));
             }
@@ -777,6 +807,15 @@ fn owning_package(path: &str) -> &str {
     path.strip_prefix("../")
         .and_then(|rest| rest.split('/').next())
         .unwrap_or(env!("CARGO_PKG_NAME"))
+}
+
+/// Returns the `cargo test --test` target owning `path`; a path outside `tests/` yields `None`.
+fn owning_test_target(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("../").map_or(path, |rest| {
+        rest.split_once('/').map_or(rest, |(_, rest)| rest)
+    });
+    let head = rest.strip_prefix("tests/")?.split('/').next()?;
+    Some(head.strip_suffix(".rs").unwrap_or(head))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,6 +833,32 @@ impl std::fmt::Display for LocateError {
     }
 }
 
+/// Reports whether `line` defines `signature` rather than merely mentioning it.
+/// Restricting the prefix to `LEADING` prevents comments and strings that
+/// mention `signature` from matching, so a named function that no longer exists
+/// cannot resolve to a line that only refers to it.
+fn defines_function(line: &str, signature: &str) -> bool {
+    const LEADING: &[&str] = &[
+        "pub",
+        "pub(crate)",
+        "pub(super)",
+        "pub(self)",
+        "const",
+        "async",
+        "unsafe",
+        "extern",
+        "\"C\"",
+        "\"C-unwind\"",
+        "default",
+    ];
+    let Some(offset) = line.find(signature) else {
+        return false;
+    };
+    line[..offset]
+        .split_whitespace()
+        .all(|token| LEADING.contains(&token))
+}
+
 /// Finds the single definition of `function` and returns the attribute and
 /// comment lines immediately above it, stopping at the first line that is
 /// neither, so an attribute on the previous item is never attributed to this
@@ -804,7 +869,7 @@ fn locate(source: &str, function: &str) -> Result<Vec<String>, LocateError> {
     let matches = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.contains(&signature))
+        .filter(|(_, line)| defines_function(line, &signature))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let index = match matches.as_slice() {
@@ -840,6 +905,10 @@ const ABSENT: &[Test] = &[Test {
     path: "a.rs",
     function: "absent",
 }];
+const PROVEN_IN_TARGET: &[Test] = &[Test {
+    path: "tests/x.rs",
+    function: "proven",
+}];
 
 fn landed(tests: &'static [Test]) -> Row {
     Row {
@@ -868,6 +937,9 @@ const IGNORED_RUNNABLE: &str =
 const IGNORED_VAGUE: &str = "#[test]\n#[ignore = \"run with: cargo test\"]\nfn proven() {}\n";
 const IGNORED_WRONG_PACKAGE: &str =
     "#[test]\n#[ignore = \"run with: cargo test -p mc-store --test x proven -- --ignored\"]\nfn proven() {}\n";
+const IGNORED_WRONG_TARGET: &str =
+    "#[test]\n#[ignore = \"run with: cargo test -p mc-kernel --test other proven -- --ignored\"]\nfn proven() {}\n";
+const RENAMED_TO_COMMENT: &str = "#[test]\n// formerly fn proven()\nfn renamed() {}\n";
 const DUPLICATED: &str = "#[test]\nfn proven() {}\nmod inner { #[test]\nfn proven() {} }\n";
 
 #[test]
@@ -898,6 +970,21 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
 #[test]
 #[ignore = "epic-close gate; run with: cargo test -p mc-kernel --test kernel_proofs registry::epic_close -- --ignored"]
 fn epic_close() {
+    // `every_row_resolves_to_a_checked_test_or_a_known_bead` does not run under an `epic_close` name filter.
+    // Revalidating here, and deriving closure from the row statuses, stops an emptied KNOWN_BEADS from authorizing closure alone.
+    let rows = all_rows();
+    if let Err(errors) = validate(&rows, &read_catalog(&rows), KNOWN_BEADS) {
+        panic!("registry violations:\n{}", errors.join("\n"));
+    }
+    let unresolved = rows
+        .iter()
+        .filter(|row| !matches!(row.status, Status::Landed { .. }))
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    assert!(
+        unresolved.is_empty(),
+        "epic cannot close while rows are unresolved: {unresolved:?}"
+    );
     assert!(
         KNOWN_BEADS.is_empty(),
         "epic cannot close while rows still name open beads: {KNOWN_BEADS:?}"
@@ -930,6 +1017,15 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     )
     .unwrap_err();
     assert!(errors[0].contains("ambiguous"), "{errors:?}");
+
+    // A comment naming a renamed test must not inherit the `#[test]` above it.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(RENAMED_TO_COMMENT))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
 }
 
 #[test]
@@ -948,6 +1044,24 @@ fn an_ignored_test_needs_a_runnable_rerun_command() {
         &[],
     )
     .unwrap();
+
+    // A path under `tests/` also has to be selected by `--test <target>`.
+    let errors = validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_WRONG_TARGET))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].contains("without a rerun command for -p mc-kernel --test x"),
+        "{errors:?}"
+    );
+    validate(
+        &[landed(PROVEN_IN_TARGET)],
+        &catalog(&[("tests/x.rs", Some(IGNORED_RUNNABLE))]),
+        &[],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -958,6 +1072,19 @@ fn a_sibling_crate_path_is_owned_by_that_crate() {
     );
     assert_eq!(owning_package("tests/kernel_backup.rs"), "mc-kernel");
     assert_eq!(owning_package("src/durable_fs.rs"), "mc-kernel");
+    assert_eq!(
+        owning_test_target("../mc-host/tests/kernel_routes.rs"),
+        Some("kernel_routes")
+    );
+    assert_eq!(
+        owning_test_target("tests/kernel_backup.rs"),
+        Some("kernel_backup")
+    );
+    assert_eq!(
+        owning_test_target("tests/kernel_proofs/registry.rs"),
+        Some("kernel_proofs")
+    );
+    assert_eq!(owning_test_target("src/durable_fs.rs"), None);
 }
 
 #[test]
