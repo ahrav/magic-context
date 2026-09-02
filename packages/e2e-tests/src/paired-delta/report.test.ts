@@ -1016,6 +1016,20 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions[0]!.count = 99; })))
             .toThrow(/report\.body\.exclusions: [a-z-]+-exceeds-plan/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { vibes: 1 }; })))
+            .toThrow(/report\.body\.runSummary\.refusedRegretLadders\.vibes: enum-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { "intervention-mismatch": 99 }; })))
+            .toThrow(/report\.body\.runSummary\.refusedRegretLadders: exceeds-plan/);
+        // Outside calibration, completeness follows from sufficiency and a fully healthy matrix.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.calibrationFingerprint = H1;
+            body.runSummary.evidenceComplete = !body.runSummary.evidenceComplete;
+        }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
+        // A calibration report derives completeness from calibration validity instead, which the body does not carry.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            expect(body.runSummary.calibrationFingerprint).toBeNull();
+            body.runSummary.evidenceComplete = !body.runSummary.evidenceComplete;
+        }))).not.toThrow();
         // Every analyzable family needs a coordinate whose primary arms all completed.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.healthyCoordinates = 0;

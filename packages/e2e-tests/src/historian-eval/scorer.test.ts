@@ -2501,6 +2501,16 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(badReason)).toThrow(/report\.scenarios\[1\]\.failReasons\[0\]: enum-invalid/);
         const badVerdict = structuredClone(report) as unknown as { scenarios: { verdict: string }[] };
         badVerdict.scenarios[0]!.verdict = "GREEN";
+        // Error metadata belongs to ERROR alone, and every ERROR names its reason.
+        const passWithReason = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        passWithReason.scenarios[0]!.errorReason = "stray";
+        expect(() => parseLaneReport(passWithReason)).toThrow(/report\.scenarios\[0\]\.errorReason: derived-mismatch/);
+        const reasonlessError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        reasonlessError.scenarios[2]!.errorReason = null;
+        expect(() => parseLaneReport(reasonlessError)).toThrow(/report\.scenarios\[2\]\.errorReason: derived-mismatch/);
+        const doubledProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown[]>[] };
+        doubledProbe.scenarios[1]!.probeVerdicts!.push(structuredClone(doubledProbe.scenarios[1]!.probeVerdicts![0]!));
+        expect(() => parseLaneReport(doubledProbe)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: duplicate/);
         expect(() => parseLaneReport(badVerdict)).toThrow(/report\.scenarios\[0\]\.verdict: enum-invalid/);
     });
 

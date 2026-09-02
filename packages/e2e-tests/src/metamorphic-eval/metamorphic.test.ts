@@ -162,6 +162,11 @@ describe("deterministic metamorphic runner", () => {
         const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         unknownKind.entries[0]!.kind = "skipped";
         expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        // On a completed run, every applied pair left an entry behind.
+        const inflatedApplied = structuredClone(report);
+        inflatedApplied.coverage[0]!.applied += 1;
+        expect(metamorphicExitCode(inflatedApplied)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(inflatedApplied)).toThrow(/report\.coverage\[0\]\.applied: derived-mismatch/);
         const duplicateCoverage = structuredClone(invalid);
         duplicateCoverage.coverage.push(structuredClone(duplicateCoverage.coverage[0]!));
         expect(() => parseMetamorphicReport(duplicateCoverage)).toThrow(/report\.coverage: duplicate/);

@@ -1850,7 +1850,7 @@ function parseNullableText(value: unknown, label: string): string | null {
 
 
 function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
-    return p.array(raw, label).map((entry, index) => {
+    const verdicts = p.array(raw, label).map((entry, index) => {
         const probeLabel = `${label}[${index}]`;
         const probe = p.record(entry, probeLabel);
         p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
@@ -1865,6 +1865,9 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
             actual,
         };
     });
+    // The scenario contract requires unique probe ids, and each declared probe yields one verdict.
+    p.unique(verdicts.map(({ probeId }) => probeId), label);
+    return verdicts;
 }
 
 export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
@@ -1912,9 +1915,15 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     for (const reason of failReasons) {
         if (reason !== "invalid-output" && !derivedReasons.has(reason)) p.fail(`${label}.failReasons: derived-mismatch`);
     }
+    const errorReason = parseNullableText(value.errorReason, `${label}.errorReason`);
+    const errorDetail = parseNullableText(value.errorDetail, `${label}.errorDetail`);
     if (verdict === "ERROR") {
         if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
+        // Every ERROR is built by `errorScore`, which always names its reason.
+        if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
     } else {
+        // `assembleScore` clears both on any non-error score.
+        if (errorReason !== null || errorDetail !== null) p.fail(`${label}.errorReason: derived-mismatch`);
         if ((verdict === "PASS") !== (failReasons.length === 0)) p.fail(`${label}.verdict: derived-mismatch`);
         // `assembleScore` turns an unmeasurable probe with no other failure into an ERROR, never a PASS.
         if (failReasons.length === 0 && probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
@@ -1930,8 +1939,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
         verdict,
         failReasons,
-        errorReason: parseNullableText(value.errorReason, `${label}.errorReason`),
-        errorDetail: parseNullableText(value.errorDetail, `${label}.errorDetail`),
+        errorReason,
+        errorDetail,
         precision,
         recall,
         expectedClaimsMatched,

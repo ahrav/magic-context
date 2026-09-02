@@ -536,6 +536,17 @@ function parseArmMetrics(raw: unknown, label: string, maximum = Number.POSITIVE_
 }
 
 
+const REFUSED_REGRET_REASONS = vocabulary<NonNullable<PairedDeltaRunResult["coordinates"][number]["regret"]>["refusedReason"] & string>({
+    "base-fingerprint-mismatch": true,
+    "intervention-mismatch": true,
+});
+
+function parseRefusedRegretLadders(raw: unknown, label: string): Record<string, number> {
+    const record = p.countRecord(raw, label);
+    for (const key of Object.keys(record)) p.enumeration(key, REFUSED_REGRET_REASONS, `${label}.${key}`);
+    return record;
+}
+
 /** Strict consumer parser: rejects unknown fields at every level and a `reportFingerprint` that does not match the body. */
 export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const root = p.record(raw, "report");
@@ -605,7 +616,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             spentUsd: nonNegativeNumber(summary.spentUsd, "report.body.runSummary.spentUsd"),
             observedCostRollouts: p.integer(summary.observedCostRollouts, "report.body.runSummary.observedCostRollouts"),
             estimatedCostRollouts: p.integer(summary.estimatedCostRollouts, "report.body.runSummary.estimatedCostRollouts"),
-            refusedRegretLadders: p.countRecord(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
+            refusedRegretLadders: parseRefusedRegretLadders(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
             plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates"),
             healthyCoordinates: p.integer(summary.healthyCoordinates, "report.body.runSummary.healthyCoordinates"),
             evidenceComplete: p.boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
@@ -641,6 +652,14 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     // estimate, so each one carries at least one observed rollout per primary arm.
     if (body.runSummary.observedCostRollouts < PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates) {
         p.fail("report.body.runSummary.observedCostRollouts: healthy-coordinate-shortfall");
+    }
+    // A refusal is counted at most once per planned coordinate.
+    const refusedTotal = Object.values(body.runSummary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);
+    if (refusedTotal > body.runSummary.plannedCoordinates) p.fail("report.body.runSummary.refusedRegretLadders: exceeds-plan");
+    // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix.
+    if (body.runSummary.calibrationFingerprint !== null) {
+        const derived = body.analysis.evidenceSufficient && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
+        if (body.runSummary.evidenceComplete !== derived) p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
     }
     // Raw regret records are written while iterating the planned coordinates.
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
