@@ -162,13 +162,25 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
     let temp_rows = normalized
         .temps
         .into_iter()
-        .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
+        .map(|(depth, digest, len)| {
+            vec![
+                Cell::Integer(depth as i64),
+                Cell::Text(digest),
+                Cell::Integer(len as i64),
+            ]
+        })
         .collect::<Vec<_>>();
     tables.insert("cas_temps".to_string(), hash_rows(&temp_rows));
     let unexpected_rows = normalized
         .unexpected
         .into_iter()
-        .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
+        .map(|(depth, digest, len)| {
+            vec![
+                Cell::Integer(depth as i64),
+                Cell::Text(digest),
+                Cell::Integer(len as i64),
+            ]
+        })
         .collect::<Vec<_>>();
     tables.insert("cas_unexpected".to_string(), hash_rows(&unexpected_rows));
     let sequence_rows = normalized
@@ -233,16 +245,16 @@ struct State {
     tables: BTreeMap<String, Table>,
     sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
-    unexpected: Vec<(String, u64)>,
-    temps: Vec<(String, u64)>,
+    unexpected: Vec<(u64, String, u64)>,
+    temps: Vec<(u64, String, u64)>,
 }
 
 struct Normalized {
     tables: BTreeMap<String, Vec<Vec<Cell>>>,
     sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
-    unexpected: Vec<(String, u64)>,
-    temps: Vec<(String, u64)>,
+    unexpected: Vec<(u64, String, u64)>,
+    temps: Vec<(u64, String, u64)>,
 }
 
 impl State {
@@ -705,22 +717,19 @@ pub fn scan_objects(root: &Path) -> Vec<(String, u64)> {
     result
 }
 
-/// Every file left under `artifacts/tmp` as `(sha256(bytes), byte_length)`.
+/// Every file left under `artifacts/tmp` as `(depth, sha256(bytes), byte_length)`.
+///
 /// Names are excluded because they embed the per-process `next_unique_id()`;
 /// the content digest is what a leaked plaintext copy of a purged artifact
 /// shares across roots. Missing `artifacts/tmp` reads as empty.
-pub fn scan_temps(root: &Path) -> Vec<(String, u64)> {
+/// `prepare_layout` unlinks only files and symlinks, so a directory here survives a restart.
+pub fn scan_temps(root: &Path) -> Vec<(u64, String, u64)> {
     let Some(entries) = read_dir_or_absent(&root.join("artifacts/tmp")) else {
         return Vec::new();
     };
     let mut result = Vec::new();
     for entry in entries {
-        let entry = entry.unwrap();
-        if !entry.file_type().unwrap().is_file() {
-            continue;
-        }
-        let bytes = fs::read(entry.path()).unwrap();
-        result.push((format!("{:x}", Sha256::digest(&bytes)), bytes.len() as u64));
+        collect_file_digests(&entry.unwrap().path(), 0, &mut result);
     }
     result.sort();
     result
@@ -748,7 +757,7 @@ fn read_dir_or_absent(path: &Path) -> Option<fs::ReadDir> {
 /// Hash regular files outside valid shards so digest comparison detects unexpected CAS state.
 ///
 /// Content digests are recorded instead of names, as `scan_temps` does.
-pub fn scan_unexpected_objects(root: &Path) -> Vec<(String, u64)> {
+pub fn scan_unexpected_objects(root: &Path) -> Vec<(u64, String, u64)> {
     let Some(entries) = read_dir_or_absent(&root.join("artifacts/objects")) else {
         return Vec::new();
     };
@@ -760,7 +769,7 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<(String, u64)> {
             && name.len() == 2
             && name.bytes().all(is_lower_hex);
         if !is_shard {
-            collect_file_digests(&entry.path(), &mut result);
+            collect_file_digests(&entry.path(), 0, &mut result);
         }
     }
     result.sort();
@@ -768,14 +777,21 @@ pub fn scan_unexpected_objects(root: &Path) -> Vec<(String, u64)> {
 }
 
 /// Symlinks are excluded rather than followed.
-fn collect_file_digests(path: &Path, out: &mut Vec<(String, u64)>) {
+///
+/// `depth` accompanies each digest because `regular_file_bytes` charges a root-level file but
+/// descends only one level, so the same bytes cost different usage at different depths.
+fn collect_file_digests(path: &Path, depth: u64, out: &mut Vec<(u64, String, u64)>) {
     let metadata = fs::symlink_metadata(path).unwrap();
     if metadata.is_dir() {
         for entry in fs::read_dir(path).unwrap() {
-            collect_file_digests(&entry.unwrap().path(), out);
+            collect_file_digests(&entry.unwrap().path(), depth + 1, out);
         }
     } else if metadata.is_file() {
         let bytes = fs::read(path).unwrap();
-        out.push((format!("{:x}", Sha256::digest(&bytes)), bytes.len() as u64));
+        out.push((
+            depth,
+            format!("{:x}", Sha256::digest(&bytes)),
+            bytes.len() as u64,
+        ));
     }
 }
