@@ -273,6 +273,7 @@ fn run_chain(kind: Kind, length: usize) {
     // nothing rather than creating a competing successor.
     let stale = chain[chain.len() - 2].clone();
     let before = proof.digest();
+    // Chain indices stop at `length + 1`; these offsets stay clear of them.
     let stale_index = length + 200;
     let error = match kind {
         Kind::Domain => proof
