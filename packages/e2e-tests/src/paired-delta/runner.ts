@@ -155,7 +155,9 @@ export interface PairedDeltaRunResult {
         | "cost-cap-reached"
         | "deadline-reached"
         | "invalid-stored-records"
-        | "harness-unreclaimed";
+        | "harness-unreclaimed"
+        /** A failed rollout's billed usage could not be read, so its record carries only the worst-case estimate, which the historian's retry tree can exceed; the run stops rather than admit later arms against an understated `spentUsd`. commentlint: allow(JUDGE) */
+        | "usage-unmeasured";
     records: RolloutRecord[];
     coordinates: CoordinateResult[];
     spentUsd: number;
@@ -968,6 +970,7 @@ export async function runPairedDelta(
                 let observation: RolloutObservation | null = null;
                 let failure: unknown;
                 let billedOnFailure: TokenUsage | null = null;
+                let usageUnmeasured = false;
                 let disposed = false;
                 let disposalFailed = false;
                 try {
@@ -1014,8 +1017,9 @@ export async function runPairedDelta(
                     failure = error;
                     /**
                      * Read before disposal, while the harness is still up. Bounded like every other
-                     * step, and its own failure is swallowed: this only ever raises the charge, so
-                     * losing it falls back to the estimate rather than losing the record.
+                     * step. Its own failure still writes the record, priced from the estimate, but
+                     * ends the run: the estimate cannot bound the historian's retry tree, so admitting
+                     * further arms against it could pass the cap.
                      */
                     const billed = handle?.usageOnFailure?.bind(handle);
                     if (billed) {
@@ -1034,6 +1038,7 @@ export async function runPairedDelta(
                             );
                         } catch {
                             billedOnFailure = null;
+                            usageUnmeasured = true;
                         }
                     }
                 } finally {
@@ -1089,6 +1094,7 @@ export async function runPairedDelta(
                 reserveUsd = bumpReserve(reserveUsd, record);
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
                 if (disposalFailed) status = "harness-unreclaimed";
+                else if (usageUnmeasured) status = "usage-unmeasured";
                 else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
                 return record;
             };

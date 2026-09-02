@@ -98,6 +98,8 @@ const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
     "deadline-reached": 1,
     "invalid-stored-records": 2,
     "harness-unreclaimed": 3,
+    /** Distinct from the budget stops because a resume that simply continues would admit arms against a `spentUsd` the failed record understates; the operator has to see the estimate stood in for a measurement. commentlint: allow(JUDGE) */
+    "usage-unmeasured": 5,
 };
 
 /** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. commentlint: allow(JUDGE) */
@@ -945,14 +947,26 @@ function ledgerEntries(payload: unknown): LedgerMessage[] {
  * one moment a background call can outlive the response. Quiescence cannot be inferred from the
  * ledger in that case: an in-flight request adds no row while it runs, so any finite stable interval
  * can elapse mid-call. This is the explicit signal, so the cell is rejected rather than priced from a
- * ledger that is still being written.
+ * ledger that is still being written. The signal is best-effort on the plugin side — the logger drops
+ * lines under `NODE_ENV=test` and swallows append errors — so its absence is only evidence when the
+ * log shows the plugin was writing for this session at all.
  */
-function historianAbandoned(logPath: string, sessionId: string): boolean {
-    if (!existsSync(logPath)) return false;
-    return readFileSync(logPath, "utf8")
+function historianState(
+    logPath: string,
+    sessionId: string,
+    pluginBacked: boolean,
+): "clear" | "abandoned" | "unobservable" {
+    /** With the plugin disabled there is no historian to abandon and no log to expect. */
+    if (!pluginBacked) return "clear";
+    if (!existsSync(logPath)) return "unobservable";
+    const lines = readFileSync(logPath, "utf8")
         .split("\n")
-        .filter((line) => line.includes(`[${sessionId}]`))
-        .some((line) => line.includes(COMPARTMENT_AWAIT_TIMED_OUT_MARKER));
+        .filter((line) => line.includes(`[${sessionId}]`));
+    /** The plugin logs every transform pass for a session it processed, so a session with no lines at all is diagnostics that were never written — silenced by `NODE_ENV=test`, or a swallowed append error — not a session with nothing to report. The marker cannot be trusted absent from a log that was never written. commentlint: allow(JUDGE) */
+    if (lines.length === 0) return "unobservable";
+    return lines.some((line) => line.includes(COMPARTMENT_AWAIT_TIMED_OUT_MARKER))
+        ? "abandoned"
+        : "clear";
 }
 
 /**
@@ -972,6 +986,8 @@ async function settledSessionUsage(
     pinned: { providerId: string; modelId: string },
     expectedMockEntries: number,
     logPath: string,
+    /** Whether the arm runs the plugin, and so can have a historian and must have written its log. */
+    pluginBacked: boolean,
     settle: {
         /** Smaller on the failure path, which runs inside `LATE_DISPOSAL_GRACE_MS`; a settle that outlasts the grace is cut off every time and measures nothing. */
         attempts: number;
@@ -980,10 +996,11 @@ async function settledSessionUsage(
 ): Promise<SessionUsage> {
     let previous: string | null = null;
     let last: SessionUsage | null = null;
+    let state: ReturnType<typeof historianState> = "unobservable";
     for (let attempt = 0; attempt < settle.attempts; attempt++) {
-        /** Checked every pass, not once: the plugin buffers its log for 500 ms, so the marker can appear after the first read. */
-        const abandoned = historianAbandoned(logPath, sessionId);
-        if (abandoned && settle.incomplete === "reject") {
+        /** Checked every pass, not once: the plugin buffers its log for 500 ms, so the marker — or the first line for the session — can appear after the first read. */
+        state = historianState(logPath, sessionId, pluginBacked);
+        if (state === "abandoned" && settle.incomplete === "reject") {
             throw new Error(
                 "live paired-delta cannot price this rollout: the plugin resumed the parent with " +
                 "a historian still running, so the ledger is incomplete by construction",
@@ -991,13 +1008,19 @@ async function settledSessionUsage(
         }
         const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
         const signature = JSON.stringify(reading);
-        /** A running historian can append rows after two identical reads; charged incomplete ledgers wait for all attempts. */
-        if (signature === previous && !abandoned) return reading;
+        /** Two agreeing reads settle only a ledger whose historian is known clear: a running historian can append rows after them, and an unobservable log cannot say one is not running. Charged incomplete ledgers wait for all attempts. commentlint: allow(JUDGE) */
+        if (signature === previous && state === "clear") return reading;
         previous = signature;
         last = reading;
         await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
     }
     if (settle.incomplete === "charge" && last !== null) return last;
+    if (state === "unobservable") {
+        throw new Error(
+            "live paired-delta cannot price this rollout: the plugin wrote no diagnostics for the " +
+            `session at ${logPath}, so an abandoned historian cannot be ruled out`,
+        );
+    }
     throw new Error(
         `live paired-delta session ledger did not settle within ` +
         `${settle.attempts} reads; a background call may still be running`,
@@ -1324,6 +1347,7 @@ export function createLiveDependencies(input: {
                         { providerId: input.providerId, modelId: input.modelId },
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                         logPath,
+                        PLUGIN_BACKED_ARMS.includes(coordinate.armId),
                     );
                     /**
                      * The runner compares one echoed route against the pin, so the offending turn is reported rather than the final one.
@@ -1427,6 +1451,7 @@ export function createLiveDependencies(input: {
                         { providerId: input.providerId, modelId: input.modelId },
                         scriptedTurnText === undefined ? 0 : SCRIPTED_ORACLE_MOCK_ENTRIES,
                         logPath,
+                        PLUGIN_BACKED_ARMS.includes(coordinate.armId),
                         { attempts: LEDGER_SETTLE_ATTEMPTS_ON_FAILURE, incomplete: "charge" },
                     )).usage;
                 },

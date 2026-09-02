@@ -19,6 +19,7 @@ import {
     computeRegretRungs,
     interventionFor,
     runPairedDelta,
+    tokenCostUsd,
     verifyDualMockResolution,
     type RolloutHandle,
     type RolloutObservation,
@@ -663,6 +664,65 @@ describe("paired-delta runner", () => {
         });
         expect(store.records.filter(({ armId }) => armId === "mc-off")).toHaveLength(1);
         expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+    });
+
+    it("stops the run when a failed rollout's usage cannot be read", async () => {
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            throw new Error("session ledger unavailable");
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        // When failure usage is unavailable, the estimated cost is recorded and no later arm starts.
+        expect(result.status).toBe("usage-unmeasured");
+        expect(result.records).toHaveLength(1);
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        expect(result.records[0]?.costUsd).toBeGreaterThan(0);
+    });
+
+    it("charges a failed rollout's measured usage when it exceeds the estimate", async () => {
+        const store = new MemoryStore();
+        const measured = { input: 50_000_000, output: 0, cacheCreation: 0, cacheRead: 0 };
+        const result = await runPairedDelta(
+            options(store),
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            return measured;
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+        const record = result.records[0];
+        if (!record) throw new Error("missing record");
+
+        expect(result.status).not.toBe("usage-unmeasured");
+        expect(record.costUsd).toBeGreaterThanOrEqual(
+            tokenCostUsd(measured, options().pricesPerMillionTokens),
+        );
     });
 
     it("reports an unreclaimed harness even when the rollout timed out first", async () => {
