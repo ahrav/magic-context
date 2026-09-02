@@ -1,9 +1,12 @@
+//! Prompt guidance and tool-manifest selection with content-derived cache identities.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+/// Whether a tool may mutate durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
@@ -11,6 +14,7 @@ pub enum ExecutionMode {
     Mutating,
 }
 
+/// Tool manifest entry exposed to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
@@ -25,6 +29,7 @@ use super::{
     ctx_note_description, ctx_note_schema, ctx_search_description, ctx_search_schema,
 };
 
+/// Diagnostic emitted when light assets are unavailable and full assets are used.
 pub const LIGHT_FALLBACK_NOTICE: &str = "prompt_surface selected light, but built-in light assets are not available yet; using the byte-identical full guidance and tool descriptions until light assets ship.";
 
 pub(crate) const GUIDANCE_FULL_PRIMARY: &str = include_str!("../assets/guidance_primary.txt");
@@ -60,6 +65,7 @@ const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = Some(&[
 const CTX_REDUCE_DESCRIPTION: &str =
     "Acknowledge a tagged reduction request for asynchronous delivery";
 
+/// Tool IDs whose descriptions may be selected or overridden.
 pub const PROMPT_SURFACE_TOOL_IDS: [&str; 5] = [
     "ctx_reduce",
     "ctx_memory",
@@ -68,6 +74,7 @@ pub const PROMPT_SURFACE_TOOL_IDS: [&str; 5] = [
     "ctx_note",
 ];
 
+/// Authored prompt and description set selected for a session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptSurfacePreset {
@@ -85,18 +92,23 @@ impl PromptSurfacePreset {
     }
 }
 
+/// Guidance shape selected according to availability of reduction support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuidanceVariant {
     Full,
     NoReduce,
 }
 
+/// Selected static guidance and whether selection fell back to full guidance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidanceAsset {
     pub bytes: &'static str,
     pub fallback: bool,
 }
 
+/// Frozen per-session prompt-surface inputs.
+///
+/// `tool_descriptions` keys are tool IDs. `BTreeMap` ordering makes derived identities independent of insertion order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSurfaceSelection {
     pub model_key: Option<String>,
@@ -118,6 +130,7 @@ impl Default for PromptSurfaceSelection {
     }
 }
 
+/// Selects authored guidance, using full bytes only when requested light bytes are absent.
 pub fn guidance_asset(preset: PromptSurfacePreset, variant: GuidanceVariant) -> GuidanceAsset {
     let full = match variant {
         GuidanceVariant::Full => GUIDANCE_FULL_PRIMARY,
@@ -233,6 +246,7 @@ pub fn session_tools(selection: &PromptSurfaceSelection) -> Vec<Tool> {
         .collect()
 }
 
+/// Returns configured identity verbatim, or hashes length-delimited selection fields.
 pub fn selection_freeze_identity(selection: &PromptSurfaceSelection) -> String {
     if !selection.config_identity.is_empty() {
         return selection.config_identity.clone();
@@ -250,6 +264,9 @@ pub fn selection_freeze_identity(selection: &PromptSurfaceSelection) -> String {
     format!("legacy{}", hex_digest(hasher.finalize()))
 }
 
+/// Derives a manifest epoch from preset and effective session-tool descriptions.
+///
+/// Legacy full selection with no overrides returns an empty epoch.
 pub fn manifest_content_epoch(selection: &PromptSurfaceSelection) -> String {
     if selection.preset == PromptSurfacePreset::Full && selection.tool_descriptions.is_empty() {
         return String::new();
@@ -268,6 +285,7 @@ pub fn manifest_content_epoch(selection: &PromptSurfaceSelection) -> String {
     format!("pm{}", hex_digest(hasher.finalize()))
 }
 
+/// Hashes guidance bytes and domain-separates light preset content.
 pub fn guidance_content_hash(text: &str, preset: PromptSurfacePreset) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -277,6 +295,9 @@ pub fn guidance_content_hash(text: &str, preset: PromptSurfacePreset) -> String 
     hex_digest(hasher.finalize())
 }
 
+/// Combines guidance and non-legacy manifest identities into one prompt-surface epoch.
+///
+/// Legacy manifest selection returns an empty epoch regardless of guidance hash.
 pub fn unified_content_epoch(
     system_prompt_hash: &str,
     selection: &PromptSurfaceSelection,

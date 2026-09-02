@@ -1,3 +1,7 @@
+//! N-API bridge for bounded shared-memory transport channels.
+//!
+//! Channel registries are thread-local, while grant claims are process-wide to prevent duplicate mappings across JavaScript workers. External views keep ring mappings alive until detachment succeeds.
+
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod lifecycle;
@@ -30,6 +34,7 @@ const PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 /// to. Grant bytes, pids, fds, and key names never reach error messages.
 const DESCRIPTOR_ERROR: &str = "invalid shared-memory descriptor";
 
+/// Pair of local channel IDs plus profile dimensions returned to transport tests.
 #[napi(object)]
 pub struct NativeTestPair {
     pub first: u32,
@@ -38,6 +43,9 @@ pub struct NativeTestPair {
     pub arena_bytes: u32,
 }
 
+/// Authenticated setup inputs supplied by JavaScript.
+///
+/// `timeout_ms` is a wall-clock setup deadline in milliseconds. `key` and `daemon_id` remain opaque bytes.
 #[napi(object)]
 pub struct NativeSetupOptions {
     pub setup_socket: String,
@@ -640,6 +648,7 @@ fn setup_error(failure: std::io::Error) -> Error {
     }
 }
 
+/// N-API worker task that authenticates setup without blocking JavaScript execution.
 pub struct BeginSetupTask {
     setup_socket: String,
     key: Vec<u8>,
@@ -707,6 +716,7 @@ impl Task for BeginSetupTask {
     }
 }
 
+/// N-API worker task that activates an authenticated pending setup.
 pub struct FinishSetupTask {
     pending_id: u32,
     setup: Option<setup::PendingSetup>,
@@ -855,6 +865,9 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
     }
 }
 
+/// Fills and publishes one frame synchronously.
+///
+/// `capacity` and `timeout_ms` are bytes and milliseconds. Callback failure aborts publication. Full rings report a retryable `shared-memory ring is full` error.
 #[napi]
 pub fn produce(
     env: &Env,
@@ -933,6 +946,9 @@ pub fn produce(
     })
 }
 
+/// Reserves producer segments and transfers external segment views to JavaScript.
+///
+/// Caller must later invoke `commit_reservation` or `abort_reservation` with returned token. Reservation remains tracked until aliases detach.
 #[napi]
 pub fn reserve(
     env: &Env,
@@ -1156,6 +1172,9 @@ pub fn readiness_handled() -> bool {
     })
 }
 
+/// Delivers at most one received frame and its external segment views.
+///
+/// Returns `false` when no frame is ready. A delivered token remains live until `release`; callback failure releases it before returning the callback error.
 #[napi]
 pub fn poll(
     env: &Env,
@@ -1304,6 +1323,9 @@ pub fn peer_closed(channel_id: u32) -> Result<bool> {
     })
 }
 
+/// Closes a channel after detaching producer and receive aliases.
+///
+/// Failed detachment keeps the registry entry and mapping alive so a later call can retry safely.
 #[napi]
 pub fn close(env: &Env, channel_id: u32) -> Result<()> {
     REGISTRY.with(|registry| {
@@ -1331,6 +1353,9 @@ pub fn close(env: &Env, channel_id: u32) -> Result<()> {
     })
 }
 
+/// Quarantines both rings and closes peer setup before detaching aliases.
+///
+/// Unlike `close`, outstanding receive leases are detached without releasing their ring identities.
 #[napi]
 pub fn force_close(env: &Env, channel_id: u32) -> Result<()> {
     REGISTRY.with(|registry| {

@@ -9,6 +9,11 @@ use crate::durable_fs::{open_regular_nofollow, open_secure_directory};
 use crate::{KernelStore, Sensitivity};
 
 impl KernelStore {
+    /// Reads and verifies an artifact referenced by live evidence.
+    ///
+    /// The metadata snapshot must contain the exact evidence and digest pair, and no purge tombstone may exist. Object reads reject links and non-regular files, enforce the object size cap, and verify the SHA-256 digest before returning bytes.
+    ///
+    /// Returns `InvalidInput` for malformed digests, `ReferenceUnavailable` for stale or tombstoned references, `MissingObject` for inaccessible storage, and `CorruptObject` for oversized or digest-mismatched content.
     pub fn read_artifact(&self, handle: &ArtifactHandle) -> Result<Vec<u8>, ArtifactError> {
         if !is_artifact_digest(&handle.digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
@@ -66,6 +71,11 @@ impl KernelStore {
         Ok(bytes)
     }
 
+    /// Computes the most restrictive live classification for an artifact destination.
+    ///
+    /// Tombstones deny every destination. Missing live metadata permits local use but denies remote use as unknown-sensitive. Any secret classification denies use; remote use additionally requires normal sensitivity and provider egress permission.
+    ///
+    /// Returns `InvalidInput` for malformed digests and `ReferenceUnavailable` when metadata cannot be read.
     pub fn artifact_eligibility(
         &self,
         handle: &ArtifactHandle,
