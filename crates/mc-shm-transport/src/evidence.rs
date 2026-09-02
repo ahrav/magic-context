@@ -1,4 +1,6 @@
-//! Operation counters and disqualification reason codes.
+//! Timed-path operation evidence and stable disqualification reason codes.
+//!
+//! Counters are accumulated observations. Any nonzero forbidden counter disqualifies the sample.
 
 /// Operation counters used to produce disqualification reason codes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,7 +20,10 @@ pub struct OperationCounters {
 }
 
 impl OperationCounters {
-    /// Returns one reason code for each nonzero forbidden operation.
+    /// Returns one stable reason code for each nonzero forbidden operation.
+    ///
+    /// Codes follow field-check order, not operation occurrence order. A qualified eventfd wake permits
+    /// syscall, park/wake, and scheduler-handoff counts, but never copies, allocations, or queue hops.
     pub fn disqualifications(self, eventfd_wake_qualified: bool) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if self.body_copies != 0 {
