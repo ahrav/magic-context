@@ -77,6 +77,7 @@ pub const KNOWN_BEADS: &[&str] = &[
     "magic-context-kh8.30",
     "magic-context-kh8.31",
     "magic-context-kh8.35",
+    "magic-context-kh8.36",
 ];
 
 const KERNEL_ADMISSION: &str = "tests/kernel_admission.rs";
@@ -333,6 +334,7 @@ registry_enum! {
         R1AppendOnlyRetention,
         R2CommitHistoryRetained,
         R3OutboxPruning,
+        R3PositionPruning,
         R3VectorConsumer,
         R4StagingLeases,
         R5ArtifactRetention,
@@ -403,6 +405,14 @@ impl PolicyRow {
                         Test { path: KERNEL_OUTBOX, function: "deregistration_uses_commit_tip_without_publication_and_abandonment_records_four_facts" },
                         Test { path: KERNEL_OUTBOX, function: "derived_projection_discard_preserves_exact_checkpoints_and_receipts" },
                     ],
+                },
+            },
+            PolicyRow::R3PositionPruning => Row {
+                id: "kh8.1 R3/position",
+                claim: "registration and pruning use the minimum acknowledged outbox_position",
+                status: Status::Contradiction {
+                    bead: "magic-context-kh8.36",
+                    policy_text: "R3 requires registration and pruning to use the minimum acknowledged outbox_position, which R12d defines as independent of commit_seq. prune_outbox reads MIN(checkpoint_commit_seq) and deletes by commit_seq, so a commit carrying several outbox rows cannot express a partial acknowledgement.",
                 },
             },
             PolicyRow::R3VectorConsumer => Row {
@@ -831,8 +841,13 @@ fn declarations_reach(manifest: &Path, path: &str) -> Result<(), String> {
 fn declares_module(source: &str, name: &str) -> Result<(), String> {
     let lines = strip_block_comments(source);
     for (index, line) in lines.iter().enumerate() {
-        if !line_declares_module(line, name) {
+        let Some(inline) = line_declares_module(line, name) else {
             continue;
+        };
+        if inline {
+            return Err(format!(
+                "`mod {name}` is declared inline, so its conventional file is not compiled"
+            ));
         }
         let mut attributes = Vec::new();
         let inline = line
@@ -884,17 +899,20 @@ fn declares_module(source: &str, name: &str) -> Result<(), String> {
     Err(format!("does not declare `mod {name}`"))
 }
 
-fn line_declares_module(line: &str, name: &str) -> bool {
+/// `Some(true)` when the declaration has an inline body, `Some(false)` for a file-backed `mod x;`.
+fn line_declares_module(line: &str, name: &str) -> Option<bool> {
     // `strip_block_comments` keeps line comments so the attribute scan can walk past doc lines, so
     // cut the comment here; a commented-out declaration compiles nothing.
     let line = line.split_once("//").map_or(line, |(code, _)| code);
-    let Some((_, after)) = line.split_once("mod ") else {
-        return false;
-    };
-    after.trim_start().strip_prefix(name).is_some_and(|tail| {
-        let tail = tail.trim_start();
-        tail.starts_with(';') || tail.starts_with('{')
-    })
+    let (_, after) = line.split_once("mod ")?;
+    let tail = after.trim_start().strip_prefix(name)?.trim_start();
+    if tail.starts_with(';') {
+        Some(false)
+    } else if tail.starts_with('{') {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Validates `rows` against `catalog` and `known_beads`; every failure is
@@ -998,16 +1016,11 @@ fn check_landed(catalog: &Catalog, test: &Test) -> Result<(), String> {
     };
     let (attributes, module_cfgs) = locate_with_module_cfgs(source, test.function)
         .map_err(|error| format!("{}::{}: {error}", test.path, test.function))?;
-    for condition in &module_cfgs {
-        if !CI_ENABLED_CFG
-            .iter()
-            .any(|allowed| normalize_condition(allowed) == normalize_condition(condition))
-        {
-            return Err(format!(
-                "{}::{} is inside a module behind #[cfg({condition})], which is not known to be enabled",
-                test.path, test.function
-            ));
-        }
+    if let Some(problem) = module_cfgs.first() {
+        return Err(format!(
+            "{}::{} is inside a module behind {problem}",
+            test.path, test.function
+        ));
     }
     if !attributes.iter().any(|line| line.trim() == "#[test]") {
         return Err(format!(
@@ -1234,13 +1247,21 @@ fn raw_prefix_len(rest: &[u8], hashes: usize) -> usize {
 /// expansions rather than definitions and are deliberately not matched here.
 fn inside_macro_definition(lines: &[String], index: usize) -> bool {
     for (start, line) in lines.iter().enumerate().take(index) {
-        if !line.contains("macro_rules!") || !line.contains('{') {
+        if !line.contains("macro_rules!") {
             continue;
         }
+        // A macro body may be delimited by braces, parentheses, or brackets.
+        let Some((open, close)) = [('{', '}'), ('(', ')'), ('[', ']')]
+            .into_iter()
+            .filter(|(open, _)| line.contains(*open))
+            .min_by_key(|(open, _)| line.find(*open).unwrap_or(usize::MAX))
+        else {
+            continue;
+        };
         let mut depth = 0i32;
         for (offset, body) in lines.iter().enumerate().skip(start) {
-            depth += i32::try_from(body.matches('{').count()).unwrap_or(i32::MAX);
-            depth -= i32::try_from(body.matches('}').count()).unwrap_or(i32::MAX);
+            depth += i32::try_from(body.matches(open).count()).unwrap_or(i32::MAX);
+            depth -= i32::try_from(body.matches(close).count()).unwrap_or(i32::MAX);
             if depth <= 0 {
                 if offset > index {
                     return true;
@@ -1255,6 +1276,8 @@ fn inside_macro_definition(lines: &[String], index: usize) -> bool {
 /// Returns the `cfg` conditions on every `mod` block enclosing `index`, so an oracle inside
 /// `#[cfg(any())] mod disabled { .. }` is rejected even though its own attributes look enabled.
 fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
+    // Each entry is a rendered problem, so a `cfg_attr` that cannot be evaluated here is reported
+    // rather than silently contributing no condition.
     let mut conditions = Vec::new();
     for (start, line) in lines.iter().enumerate().take(index) {
         let trimmed = line.trim_start();
@@ -1278,17 +1301,42 @@ fn enclosing_module_cfgs(lines: &[String], index: usize) -> Vec<String> {
         if end.is_none_or(|end| end < index) {
             continue;
         }
+        let mut raw = Vec::new();
+        let mut bracket = 0i32;
         for above in lines[..start].iter().rev() {
             let attribute = above.trim();
+            if bracket > 0 {
+                bracket += bracket_delta(attribute);
+                raw.push(attribute.to_string());
+                continue;
+            }
             if attribute.starts_with("#[") {
-                if let Some(condition) = attribute
+                raw.push(attribute.to_string());
+            } else if attribute.ends_with(']') {
+                bracket += bracket_delta(attribute);
+                raw.push(attribute.to_string());
+            } else if !attribute.starts_with("//") && !attribute.is_empty() {
+                break;
+            }
+        }
+        raw.reverse();
+        for attribute in join_attributes(&raw) {
+            let attribute = attribute.trim();
+            if attribute.starts_with("#[") {
+                if attribute.starts_with("#[cfg_attr(") {
+                    conditions.push("#[cfg_attr(..)], which can expand to a disabling cfg".into());
+                } else if let Some(condition) = attribute
                     .strip_prefix("#[cfg(")
                     .and_then(|rest| rest.strip_suffix(")]"))
                 {
-                    conditions.push(condition.to_string());
+                    let condition = normalize_condition(condition);
+                    if !CI_ENABLED_CFG
+                        .iter()
+                        .any(|allowed| normalize_condition(allowed) == condition)
+                    {
+                        conditions.push(format!("#[cfg({condition})]"));
+                    }
                 }
-            } else if !attribute.starts_with("//") && !attribute.is_empty() {
-                break;
             }
         }
     }
@@ -1523,6 +1571,10 @@ const IGNORED_PROSE_SELECTOR: &str =
     "#[test]\n#[ignore = \"proven run with: cargo test -p mc-kernel --test x not_proven -- --ignored\"]\nfn proven() {}\n";
 const QUOTE_CHAR_THEN_COMMENT: &str =
     "let quote = b'\\\"';\n/*\n#[test]\nfn proven() {}\n*/\nfn other() {}\n";
+const MACRO_PAREN_BODY: &str =
+    "macro_rules! never_used (\n    () => (\n        #[test]\n        fn proven() {}\n    );\n);\n";
+const MODULE_CFG_ATTR: &str =
+    "#[cfg_attr(unix, cfg(any()))]\nmod maybe {\n    #[test]\n    fn proven() {}\n}\n";
 const MACRO_ONLY: &str =
     "macro_rules! never_used {\n    () => {\n        #[test]\n        fn proven() {}\n    };\n}\n";
 const SHOULD_PANIC: &str = "#[test]\n#[should_panic]\nfn proven() {}\n";
@@ -1559,7 +1611,7 @@ fn every_row_resolves_to_a_checked_test_or_a_known_bead() {
     // A floor, not a comparison against `pending`: filing a pending row is ordinary and must not
     // fail this control, while a registry that stopped resolving landed rows would.
     assert!(landed >= 20, "{landed} landed, {pending} pending");
-    assert_eq!(contradicted, 4);
+    assert_eq!(contradicted, 5);
 }
 
 #[test]
@@ -1690,6 +1742,24 @@ fn a_landed_test_resolves_and_missing_or_untested_functions_fail() {
     )
     .unwrap_err();
     assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // A macro body delimited by parentheses hides a definition just as braces do.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MACRO_PAREN_BODY))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("function not found"), "{errors:?}");
+
+    // `cfg_attr` on an enclosing module cannot be evaluated here, so it is rejected.
+    let errors = validate(
+        &[landed(PROVEN)],
+        &catalog(&[("a.rs", Some(MODULE_CFG_ATTR))]),
+        &[],
+    )
+    .unwrap_err();
+    assert!(errors[0].contains("#[cfg_attr(..)]"), "{errors:?}");
 
     // A definition that exists only inside an unexpanded macro is in no harness.
     let errors = validate(
