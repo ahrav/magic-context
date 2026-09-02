@@ -474,6 +474,8 @@ fn compile_rule(
 
 fn build_case_insensitive_matcher(patterns: &[String]) -> Result<AhoCorasick, ConstructionError> {
     AhoCorasickBuilder::new()
+        // The evaluator probes these matchers with `find_overlapping_iter`, which panics for every match kind except `Standard`.
+        .match_kind(MatchKind::Standard)
         .ascii_case_insensitive(true)
         .build(patterns)
         .map_err(|_| ConstructionError::InvalidRulePattern)
@@ -638,6 +640,30 @@ mod tests {
     fn embedded_sources_match_expected_digests() {
         assert_eq!(digest_hex(UPSTREAM_BYTES), UPSTREAM_CORPUS_SHA256);
         assert_eq!(digest_hex(OVERLAY_BYTES), CONSERVATIVE_OVERLAY_SHA256);
+    }
+
+    // The evaluator probes keyword and suppressor matchers with `find_overlapping_iter`, which panics for every match kind except `Standard`.
+    #[test]
+    fn every_prepared_matcher_supports_overlapping_search() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let mut prepared = 0;
+        for rule in rules.active(ScanProfile::Comprehensive) {
+            for matcher in [&rule.keyword_matcher, &rule.suppressor_matcher]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    matches!(matcher.match_kind(), MatchKind::Standard),
+                    "{} builds a matcher whose match kind rejects overlapping search",
+                    rule.declaration.name
+                );
+                let _ = matcher
+                    .find_overlapping_iter(b"placeholder example")
+                    .count();
+                prepared += 1;
+            }
+        }
+        assert!(prepared > 0, "no rule compiled a prepared matcher");
     }
 
     #[test]

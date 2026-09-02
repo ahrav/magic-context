@@ -54,12 +54,14 @@ fn scan_conservative(c: &mut Criterion) {
     group.finish();
 }
 
+// The embedded rule set and the default-limits digests live in process-wide `LazyLock` cells, so only the first construction in a process does real work.
+// A `b.iter()` loop therefore cannot observe cold construction: every sample after the first is an `Arc` clone plus a digest copy, which is the cost this benchmark tracks.
 fn construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("construction");
     group.warm_up_time(Duration::from_millis(400));
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(10);
-    group.bench_function("scanner_with_limits", |b| {
+    group.bench_function("scanner_with_limits_cached", |b| {
         b.iter(|| {
             Scanner::with_limits(
                 black_box(ScanProfile::Comprehensive),
