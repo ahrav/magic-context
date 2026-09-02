@@ -310,6 +310,16 @@ describe("deterministic metamorphic runner", () => {
         // The pair checks only prove the roles agree with each other, not that they ran the named system.
         const rootMismatch = structuredClone(report);
         rootMismatch.system = systemTuple();
+        // A raw-output report publishes no root tuple at all.
+        expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.system: report-system-mismatch/);
+        // Relabelled as a live report, the roles must still name the root's system.
+        for (const entry of rootMismatch.entries) {
+            if (entry.kind !== "scored") continue;
+            entry.baselineScore.source = "run-record";
+            entry.derivativeScore.source = "run-record";
+            entry.invariants = entry.invariants.filter(({ invariant }) =>
+                invariant !== "expected-absent-empty" && invariant !== "verdict-monotonicity");
+        }
         const rootEntry = rootMismatch.entries[scoredIndex]!;
         if (rootEntry.kind !== "scored") throw new Error("unreachable");
         const otherSystem = { ...systemTuple(), historianModelId: "another-model" };
@@ -317,6 +327,14 @@ describe("deterministic metamorphic runner", () => {
         rootEntry.derivativeScore.system = otherSystem;
         expect(() => parseMetamorphicReport(rootMismatch))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: report-system-mismatch`));
+        // Each producer emits a fixed invariant set, so dropping a row hides a failure.
+        const missingInvariant = structuredClone(report);
+        const missingEntry = missingInvariant.entries[scoredIndex]!;
+        if (missingEntry.kind !== "scored") throw new Error("unreachable");
+        missingEntry.invariants = missingEntry.invariants.filter(({ invariant }) => invariant !== "injection-set-equality");
+        expect(metamorphicExitCode(missingInvariant)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(missingInvariant))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants: invariant-set-mismatch`));
 
         // Each producer scores both roles through one path, so a mixed-source pair is unreachable.
         const mixedSource = structuredClone(report);

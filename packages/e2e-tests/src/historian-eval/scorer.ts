@@ -1854,11 +1854,15 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         const probeLabel = `${label}[${index}]`;
         const probe = p.record(entry, probeLabel);
         p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
+        const outcome = p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`);
+        const actual = parseNullableText(probe.actual, `${probeLabel}.actual`);
+        // `compareProbeAnswer` passes only a non-null answer.
+        if (outcome === "pass" && actual === null) p.fail(`${probeLabel}.outcome: derived-mismatch`);
         return {
             probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
-            outcome: p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`),
+            outcome,
             expected: p.text(probe.expected, `${probeLabel}.expected`),
-            actual: parseNullableText(probe.actual, `${probeLabel}.actual`),
+            actual,
         };
     });
 }
@@ -1910,8 +1914,17 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     }
     if (verdict === "ERROR") {
         if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
-    } else if ((verdict === "PASS") !== (failReasons.length === 0)) {
-        p.fail(`${label}.verdict: derived-mismatch`);
+    } else {
+        if ((verdict === "PASS") !== (failReasons.length === 0)) p.fail(`${label}.verdict: derived-mismatch`);
+        // `assembleScore` turns an unmeasurable probe with no other failure into an ERROR, never a PASS.
+        if (failReasons.length === 0 && probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
+            p.fail(`${label}.verdict: derived-mismatch`);
+        }
+        // Null recall over a nonzero expectation count is emitted only by the all-attempts-invalid path,
+        // which always carries `invalid-output`.
+        if (recall === null && expectedClaimsTotal > 0 && !failReasons.includes("invalid-output")) {
+            p.fail(`${label}.recall: derived-mismatch`);
+        }
     }
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),

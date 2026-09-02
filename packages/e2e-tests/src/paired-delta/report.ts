@@ -631,6 +631,22 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.analysis.analyzableFamilyCount > body.runSummary.healthyCoordinates) {
         p.fail("report.body.analysis.analyzableFamilyCount: healthy-coordinate-shortfall");
     }
+    // Exclusions count final rollout records, at most one per arm per planned coordinate.
+    const exclusionsByArm = new Map<string, number>();
+    for (const { armId, count } of body.exclusions) exclusionsByArm.set(armId, (exclusionsByArm.get(armId) ?? 0) + count);
+    for (const [armId, total] of exclusionsByArm) {
+        if (total > body.runSummary.plannedCoordinates) p.fail(`report.body.exclusions: ${armId}-exceeds-plan`);
+    }
+    // A healthy coordinate completed every primary arm, and the runner refuses a completed cell priced as an
+    // estimate, so each one carries at least one observed rollout per primary arm.
+    if (body.runSummary.observedCostRollouts < PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates) {
+        p.fail("report.body.runSummary.observedCostRollouts: healthy-coordinate-shortfall");
+    }
+    // Raw regret records are written while iterating the planned coordinates.
+    const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
+    if (rawCoordinates.size > body.runSummary.plannedCoordinates) {
+        p.fail("report.body.analysis.rawRegretRecords: exceeds-plan");
+    }
     if (canonicalFingerprint(body.regret.live) !== canonicalFingerprint(body.analysis.liveRegret)) {
         p.fail("report.body.regret.live: analysis-mismatch");
     }

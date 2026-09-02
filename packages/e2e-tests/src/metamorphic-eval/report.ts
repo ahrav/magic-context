@@ -180,6 +180,16 @@ type ControlInvariantId =
     | "expectation-predicate-equality"
     | "false-authoritative-set-equality"
     | "scenario-verdict-equality";
+/** The invariants each producer emits per scored pair; the raw-output path runs both comparators, the live path its own. */
+const INVARIANTS_BY_SOURCE: Readonly<Record<ScenarioScore["source"], readonly MetamorphicInvariantVerdict["invariant"][]>> = {
+    "raw-output": [
+        "injection-set-equality", "expected-absent-empty", "verdict-monotonicity",
+        "expectation-predicate-equality", "false-authoritative-set-equality", "scenario-verdict-equality",
+    ],
+    "run-record": [
+        "injection-set-equality", "expectation-predicate-equality", "false-authoritative-set-equality", "scenario-verdict-equality",
+    ],
+};
 const CONTROL_INVARIANT_IDS = vocabulary<ControlInvariantId>({
     "injection-set-equality": true,
     "expectation-predicate-equality": true,
@@ -363,14 +373,16 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             if (derivativeScore.scenarioId !== derivativeScenarioId) {
                 p.fail(`${label}.derivativeScore.scenarioId: pair-scenario-mismatch`);
             }
-            return {
-                ...pair,
-                kind,
-                baselineScore,
-                derivativeScore,
-                invariants: p.array(value.invariants, `${label}.invariants`)
-                    .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`, { baselineScore, derivativeScore })),
-            };
+            const invariants = p.array(value.invariants, `${label}.invariants`)
+                .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`, { baselineScore, derivativeScore }));
+            // Each producer emits a fixed invariant set, so a missing row hides a failure rather than omitting evidence.
+            const expected = INVARIANTS_BY_SOURCE[baselineScore.source];
+            const actual = invariants.map(({ invariant }) => invariant);
+            p.unique(actual, `${label}.invariants`);
+            if (canonicalJson([...actual].sort()) !== canonicalJson([...expected].sort())) {
+                p.fail(`${label}.invariants: invariant-set-mismatch`);
+            }
+            return { ...pair, kind, baselineScore, derivativeScore, invariants };
         }
         case "error":
             p.exact(value, [...PAIR_KEYS, "kind", "error"], label);
@@ -493,6 +505,11 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     };
     // The pair checks prove the two roles agree with each other, not that either ran the system the report
     // names. Where both tuples are stated they have to be the same run.
+    const sources = new Set(report.entries.flatMap((entry) => entry.kind === "scored" ? [entry.baselineScore.source] : []));
+    // One producer writes a report, and each producer scores through one seam.
+    if (sources.size > 1) p.fail("report.entries: source-mismatch");
+    // The raw-output path scores without a system tuple and publishes none at the root.
+    if (sources.has("raw-output") && report.system !== null) p.fail("report.system: report-system-mismatch");
     if (report.system !== null) {
         const rootSystem = canonicalJson(report.system);
         for (const [index, entry] of report.entries.entries()) {

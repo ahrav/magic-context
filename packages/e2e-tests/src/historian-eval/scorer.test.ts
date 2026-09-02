@@ -2547,7 +2547,22 @@ describe("buildLaneReport", () => {
         // recall stays admissible where a wrong number does not.
         const nullRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         nullRecall.scenarios[0]!.recall = null;
-        expect(() => parseLaneReport(nullRecall)).not.toThrow();
+        nullRecall.scenarios[0]!.verdict = "FAIL";
+        nullRecall.scenarios[0]!.failReasons = ["invalid-output"];
+        expect(() => parseLaneReport(nullRecall)).toThrow(/^report: derived-mismatch/);
+        // Without `invalid-output`, the same null recall is a passing scenario hiding its shortfall.
+        const hushedRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        hushedRecall.scenarios[0]!.recall = null;
+        expect(() => parseLaneReport(hushedRecall)).toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
+        // An unmeasurable probe with no other failure is an ERROR, never a PASS.
+        const trimmedPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        trimmedPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null }];
+        expect(() => parseLaneReport(trimmedPass)).toThrow(/report\.scenarios\[0\]\.verdict: derived-mismatch/);
+        // A probe passes only on a non-null answer.
+        const answerlessPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        answerlessPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: null }];
+        expect(() => parseLaneReport(answerlessPass))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
         // `assembleScore` turns each published condition into its reason, and the rebuild trusts the declared
         // ones, so a green scenario over failing evidence would otherwise survive both checks.
         const greenOverEvidence = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };

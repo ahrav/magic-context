@@ -88,7 +88,8 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         runSummary: {
             status: "completed" as const,
             spentUsd: 12.5,
-            observedCostRollouts: 6,
+            // Twelve healthy coordinates each completed three primary arms, so the runner observed at least 36 rollouts.
+            observedCostRollouts: 36,
             estimatedCostRollouts: 1,
             refusedRegretLadders: { "intervention-mismatch": 2 },
             plannedCoordinates: 12,
@@ -1011,6 +1012,10 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.observedCostRollouts = 0; })))
+            .toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions[0]!.count = 99; })))
+            .toThrow(/report\.body\.exclusions: [a-z-]+-exceeds-plan/);
         // Every analyzable family needs a coordinate whose primary arms all completed.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.healthyCoordinates = 0;
