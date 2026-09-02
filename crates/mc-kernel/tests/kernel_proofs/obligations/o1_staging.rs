@@ -20,29 +20,32 @@ const TEXT: &str = "staged-only-text";
 /// Every read surface must hold real rows (so absence is not the emptiness
 /// of an unpopulated view) and none of them may mention `needle` in any
 /// rendered field.
-fn assert_absent_everywhere(proof: &Proof, needle: &str) {
-    let tip = proof.tip();
+fn assert_absent_as_of(proof: &Proof, seq: i64, needle: &str) {
     for surface in [
         Surface::AutoInject,
         Surface::AutoSearch,
         Surface::ExplicitSearch,
     ] {
-        let visible = proof.store().visible_as_of(surface, tip).unwrap();
+        let visible = proof.store().visible_as_of(surface, seq).unwrap();
         assert!(!visible.rows.is_empty(), "{surface:?} served nothing");
         assert!(
             !format!("{visible:?}").contains(needle),
             "{surface:?} served the staged candidate: {visible:?}"
         );
     }
-    let known = proof.store().known_as_of(tip).unwrap();
+    let known = proof.store().known_as_of(seq).unwrap();
     assert!(!known.objects.is_empty());
     assert!(!format!("{known:?}").contains(needle));
-    let slice = proof.store().slice_as_of(tip).unwrap();
+    let slice = proof.store().slice_as_of(seq).unwrap();
     assert!(!slice.decisions.is_empty() && !slice.observations.is_empty());
     assert!(!format!("{slice:?}").contains(needle));
-    let alignment = proof.store().alignment_as_of(tip).unwrap();
+    let alignment = proof.store().alignment_as_of(seq).unwrap();
     assert!(!alignment.rows.is_empty());
     assert!(!format!("{alignment:?}").contains(needle));
+}
+
+fn assert_absent_everywhere(proof: &Proof, needle: &str) {
+    assert_absent_as_of(proof, proof.tip(), needle);
 }
 
 /// Seeds one served subject, one decision with an implementing observation,
@@ -98,6 +101,7 @@ fn staged_candidate_is_invisible_on_every_surface_until_admitted_across_restart(
 
     let admitted = admitted_domain(CANDIDATE, TEXT);
     let object_id = admitted.object_id.clone();
+    let staged_tip = proof.tip();
     proof.commit(intent("admit"), |envelope| {
         let trigger = code_observation(CANDIDATE);
         let request = admit_request(CANDIDATE, &trigger.observation_id);
@@ -105,6 +109,8 @@ fn staged_candidate_is_invisible_on_every_surface_until_admitted_across_restart(
         envelope.admit_domain_candidate(request, admitted)?;
         Ok(String::new())
     });
+    // Admission must not reach backwards into the sequence that predates it.
+    assert_absent_as_of(&proof, staged_tip, CANDIDATE);
     let tip = proof.tip();
     for surface in [
         Surface::AutoInject,

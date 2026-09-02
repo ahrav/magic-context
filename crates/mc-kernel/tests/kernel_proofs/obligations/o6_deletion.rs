@@ -148,17 +148,20 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         "deletion invalidates every evidence reference, not the admitted subject"
     );
     // `evidence_meta` and `object_registry` are stamped by separate statements.
-    assert_eq!(
-        ids_sql(
-            &proof,
-            &format!(
-                "SELECT object_id FROM object_registry WHERE invalidated_commit_seq={}
-                 ORDER BY object_id",
-                result.commit_seq
-            )
-        ),
-        result.affected_object_ids
-    );
+    for table in ["object_registry", "evidence_meta"] {
+        assert_eq!(
+            ids_sql(
+                &proof,
+                &format!(
+                    "SELECT object_id FROM {table} WHERE invalidated_commit_seq={}
+                     ORDER BY object_id",
+                    result.commit_seq
+                )
+            ),
+            result.affected_object_ids,
+            "{table} did not stamp the affected ids at the deletion commit"
+        );
+    }
     let known = proof.store().known_as_of(proof.tip()).unwrap();
     for id in &result.affected_object_ids {
         assert!(
@@ -191,6 +194,13 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         let barrier = proof.store().deletion_barrier(&result.barrier_id).unwrap();
         assert_eq!(barrier.deletion_commit_seq, result.commit_seq);
         assert_eq!(barrier.consumers.len(), 1);
+        let consumer = &barrier.consumers[0];
+        assert_eq!(consumer.consumer_id, "search");
+        // A required checkpoint below the deletion commit would let the next checkpoint clear the barrier without consuming this deletion's work.
+        assert_eq!(consumer.required_checkpoint_commit_seq, result.commit_seq);
+        assert!(consumer.checkpoint_commit_seq.is_none());
+        assert!(!consumer.satisfied);
+        assert!(consumer.abandoned_by.is_none());
         assert!(!barrier.cleared);
     };
     check_state(&proof);
@@ -209,6 +219,7 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
     let reingested_handle = proof.store().ingest_artifact(reingested).unwrap();
     assert_eq!(reingested_handle.digest, handle.digest);
     assert_eq!(count_sql(&proof, live_refs), 1);
+    let before_replay = proof.digest();
 
     let replayed = proof
         .store()
@@ -236,6 +247,20 @@ fn deletion_invalidates_references_and_emits_complete_work_across_restart() {
         1,
         "the replay opened a second barrier"
     );
+    // A replay writes no table. The alignment projection is exempt because a
+    // rebuild may re-derive it for the reference ingested after the deletion.
+    let after_replay = proof.digest();
+    for (table, before) in &before_replay.tables {
+        if table.starts_with("alignment_projection") {
+            continue;
+        }
+        assert_eq!(
+            after_replay.tables.get(table),
+            Some(before),
+            "the replay wrote to {table}"
+        );
+    }
+    assert_eq!(after_replay.tables.len(), before_replay.tables.len());
 }
 
 #[test]
