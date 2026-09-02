@@ -38,6 +38,23 @@ permissions:
 # gauntlet.
 
 jobs:
+  comment-hygiene:
+    name: Comment hygiene gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install ripgrep
+        run: sudo apt-get install -y ripgrep
+
+      - name: Reject tracker IDs and lint suppressions in comments
+        run: sh scripts/check-comments.sh
+
   shm-hardening-gate:
     name: SHM failure-hardening matrix gate
     runs-on: ubuntu-latest
