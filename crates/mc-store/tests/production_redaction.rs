@@ -574,11 +574,25 @@ fn durable_write_registry_references_real_bindings_and_checked_tests() {
                 entry.family, entry.test
             )
         });
-        // Attributes such as `#[ignore]` may sit between `#[test]` and the signature.
         let preceding = &source[position.saturating_sub(256)..position];
+        let attributes = preceding
+            .rsplit_once("#[test]")
+            .map(|(_, attributes)| attributes)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?} references {} which is not a #[test] function",
+                    entry.family, entry.test
+                )
+            });
         assert!(
-            preceding.contains("#[test]"),
-            "{:?} references {} which is not a #[test] function",
+            !attributes.contains('}') && !attributes.contains("fn "),
+            "{:?} references {} but the nearest #[test] belongs to another item",
+            entry.family,
+            entry.test
+        );
+        assert!(
+            !attributes.contains("ignore"),
+            "{:?} references {} which is ignored and never runs",
             entry.family,
             entry.test
         );
