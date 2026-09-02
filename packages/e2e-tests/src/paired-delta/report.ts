@@ -23,7 +23,7 @@ import type {
     Interval,
     RawRegretRecord,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -302,6 +302,12 @@ function nonNegativeNumber(value: unknown, label: string): number {
     return result;
 }
 
+function boundedInteger(value: unknown, label: string, minimum: number, maximum: number): number {
+    const result = p.integer(value, label, minimum);
+    if (result > maximum) p.fail(`${label}: integer-invalid`);
+    return result;
+}
+
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
     p.exact(value, ["lower", "upper"], label);
@@ -374,8 +380,8 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, `${label}.pinnedSnapshotId`),
         policyFingerprint: p.hex64(value.policyFingerprint, `${label}.policyFingerprint`),
         pairedFactsFingerprint: p.hex64(value.pairedFactsFingerprint, `${label}.pairedFactsFingerprint`),
-        bootstrapSeed: p.integer(value.bootstrapSeed, `${label}.bootstrapSeed`),
-        bootstrapResamples: p.integer(value.bootstrapResamples, `${label}.bootstrapResamples`, 1),
+        bootstrapSeed: boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
+        bootstrapResamples: p.integer(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES),
         minimumAnalyzableFamilyCount,
         analyzableFamilyCount,
         evidenceSufficient,

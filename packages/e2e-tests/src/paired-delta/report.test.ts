@@ -979,6 +979,10 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.runSummary\.healthyCoordinates: integer-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions.push({ ...body.exclusions[0]! }); })))
             .toThrow(/report\.body\.exclusions: duplicate/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapResamples = 1; })))
+            .toThrow(/report\.body\.analysis\.bootstrapResamples: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapSeed = 0x1_0000_0000; })))
+            .toThrow(/report\.body\.analysis\.bootstrapSeed: integer-invalid/);
     });
 
     it("preserves an endpoint-scoped noise floor through the round trip", () => {
