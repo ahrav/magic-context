@@ -2,6 +2,8 @@
 //! plus the CAS listings under `artifacts/objects` and `artifacts/tmp`,
 //! normalizes the rows for the requested comparison, and hashes each table
 //! separately so an unequal comparison names the table that differs.
+//! `sqlite_sequence` stores `AUTOINCREMENT` counters, which outlive rows allocated from them.
+//! `digest` hashes `sqlite_sequence` under its own key.
 //!
 //! Two normalization profiles answer two different questions about one store:
 //!
@@ -158,6 +160,12 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         .map(|(digest, len)| vec![Cell::Text(digest), Cell::Integer(len as i64)])
         .collect::<Vec<_>>();
     tables.insert("cas_temps".to_string(), hash_rows(&temp_rows));
+    let sequence_rows = normalized
+        .sequences
+        .into_iter()
+        .map(|(name, seq)| vec![Cell::Text(name), Cell::Integer(seq)])
+        .collect::<Vec<_>>();
+    tables.insert("sqlite_sequence".to_string(), hash_rows(&sequence_rows));
     CanonicalDigest { tables }
 }
 
@@ -212,12 +220,14 @@ struct Table {
 
 struct State {
     tables: BTreeMap<String, Table>,
+    sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
     temps: Vec<(String, u64)>,
 }
 
 struct Normalized {
     tables: BTreeMap<String, Vec<Vec<Cell>>>,
+    sequences: Vec<(String, i64)>,
     objects: Vec<(String, u64)>,
     temps: Vec<(String, u64)>,
 }
@@ -262,6 +272,7 @@ impl State {
         }
         Self {
             tables,
+            sequences: read_sequences(&connection),
             objects: scan_objects(root),
             temps: scan_temps(root),
         }
@@ -306,6 +317,7 @@ impl State {
         self.temps.sort();
         Normalized {
             tables,
+            sequences: self.sequences,
             objects: self.objects,
             temps: self.temps,
         }
@@ -558,6 +570,32 @@ fn columns_of(connection: &Connection, table: &str) -> Vec<String> {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap()
+}
+
+/// The `AUTOINCREMENT` high-water mark per table, empty until such a table is written.
+///
+/// `outbox.outbox_position` is declared `INTEGER PRIMARY KEY AUTOINCREMENT`.
+/// Pruning every emitted row leaves this counter as the only record of the next position.
+fn read_sequences(connection: &Connection) -> Vec<(String, i64)> {
+    let present = connection
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    if !present {
+        return Vec::new();
+    }
+    let mut rows = connection
+        .prepare("SELECT name,seq FROM sqlite_sequence")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    rows.sort();
+    rows
 }
 
 /// Every published CAS object as `(digest, byte_length)`, verifying each

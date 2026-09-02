@@ -422,5 +422,6 @@ fn digested_table_set_equals_schema_inventory() {
     let mut keys = digested.tables.keys().cloned().collect::<BTreeSet<_>>();
     assert!(keys.remove("cas_objects"));
     assert!(keys.remove("cas_temps"));
+    assert!(keys.remove("sqlite_sequence"));
     assert_eq!(keys, declared);
 }
