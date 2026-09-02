@@ -54,6 +54,14 @@ export type AnswerMatch = (typeof ANSWER_MATCHES)[number];
 export const RUN_MODES = ["calibration", "weekly", "release"] as const;
 export type RunMode = (typeof RUN_MODES)[number];
 export const PAIRED_DELTA_MANIFEST_SCHEMA = "paired-delta-manifest/v1";
+export const PAIRED_DELTA_POLICY_SCHEMA = "paired-delta-policy/v1";
+
+export const PAIRED_DELTA_POLICY_GATES = [
+    "all-primary-arms-completed",
+    "absence-precondition-held",
+    "arm-identity-matched",
+    "pinned-model-echo-matched",
+] as const;
 
 const idPattern = (prefix: string): RegExp =>
     new RegExp(`^${prefix}-[a-z0-9]+(?:-[a-z0-9]+)*$`);
@@ -505,6 +513,122 @@ export function parsePairedDeltaManifest(raw: unknown): PairedDeltaManifest {
         p.fail("manifest.scenarios: run-mode-uncovered");
     }
     return { schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios };
+}
+
+export interface PairedDeltaPolicyModel {
+    providerId: string;
+    modelId: string;
+    contextLimit: number;
+}
+
+export interface PairedDeltaPolicy {
+    schema: typeof PAIRED_DELTA_POLICY_SCHEMA;
+    endpoint: string;
+    targetMinimumDetectableDelta: number;
+    minimumAnalyzableFamilyCount: number;
+    bootstrapResamples: number;
+    poolManifestFingerprint: string;
+    modelMatrix: PairedDeltaPolicyModel[];
+    replicateCount: number;
+    costBudgetUsd: Record<RunMode, number>;
+    pricesPerMillionTokens: {
+        input: number;
+        output: number;
+        cacheCreation: number;
+        cacheRead: number;
+    };
+    gates: string[];
+}
+
+function positiveNumber(value: unknown, label: string): number {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+        return value;
+    }
+    return p.fail(`${label}: positive-number-required`);
+}
+
+export function parsePairedDeltaPolicy(raw: unknown): PairedDeltaPolicy {
+    const root = p.record(raw, "policy");
+    p.exact(root, [
+        "schema",
+        "endpoint",
+        "targetMinimumDetectableDelta",
+        "minimumAnalyzableFamilyCount",
+        "bootstrapResamples",
+        "poolManifestFingerprint",
+        "modelMatrix",
+        "replicateCount",
+        "costBudgetUsd",
+        "pricesPerMillionTokens",
+        "gates",
+    ], "policy");
+    if (root.schema !== PAIRED_DELTA_POLICY_SCHEMA) {
+        p.fail("policy.schema: version-invalid");
+    }
+    const modelMatrix = p.array(root.modelMatrix, "policy.modelMatrix").map(
+        (rawModel, index) => {
+            const label = `policy.modelMatrix[${index}]`;
+            const model = p.record(rawModel, label);
+            p.exact(model, ["providerId", "modelId", "contextLimit"], label);
+            return {
+                providerId: p.string(model.providerId, `${label}.providerId`),
+                modelId: p.string(model.modelId, `${label}.modelId`),
+                contextLimit: p.integer(model.contextLimit, `${label}.contextLimit`, 1),
+            };
+        },
+    );
+    if (modelMatrix.length === 0) p.fail("policy.modelMatrix: empty");
+    const costBudgetUsd = p.record(root.costBudgetUsd, "policy.costBudgetUsd");
+    p.exact(costBudgetUsd, RUN_MODES, "policy.costBudgetUsd");
+    const prices = p.record(root.pricesPerMillionTokens, "policy.pricesPerMillionTokens");
+    p.exact(
+        prices,
+        ["input", "output", "cacheCreation", "cacheRead"],
+        "policy.pricesPerMillionTokens",
+    );
+    const gates = p.array(root.gates, "policy.gates").map((gate, index) =>
+        p.enumeration(gate, PAIRED_DELTA_POLICY_GATES, `policy.gates[${index}]`));
+    if (
+        gates.length !== PAIRED_DELTA_POLICY_GATES.length ||
+        gates.some((gate, index) => gate !== PAIRED_DELTA_POLICY_GATES[index])
+    ) {
+        p.fail("policy.gates: exact-gate-set-required");
+    }
+    return {
+        schema: PAIRED_DELTA_POLICY_SCHEMA,
+        endpoint: p.string(root.endpoint, "policy.endpoint"),
+        targetMinimumDetectableDelta: positiveNumber(
+            root.targetMinimumDetectableDelta,
+            "policy.targetMinimumDetectableDelta",
+        ),
+        minimumAnalyzableFamilyCount: p.integer(
+            root.minimumAnalyzableFamilyCount,
+            "policy.minimumAnalyzableFamilyCount",
+            1,
+        ),
+        bootstrapResamples: p.integer(root.bootstrapResamples, "policy.bootstrapResamples", 1),
+        poolManifestFingerprint: p.hex64(
+            root.poolManifestFingerprint,
+            "policy.poolManifestFingerprint",
+        ),
+        modelMatrix,
+        replicateCount: p.integer(root.replicateCount, "policy.replicateCount", 1),
+        costBudgetUsd: {
+            calibration: positiveNumber(costBudgetUsd.calibration, "policy.costBudgetUsd.calibration"),
+            weekly: positiveNumber(costBudgetUsd.weekly, "policy.costBudgetUsd.weekly"),
+            release: positiveNumber(costBudgetUsd.release, "policy.costBudgetUsd.release"),
+        },
+        pricesPerMillionTokens: {
+            input: positiveNumber(prices.input, "policy.pricesPerMillionTokens.input"),
+            output: positiveNumber(prices.output, "policy.pricesPerMillionTokens.output"),
+            cacheCreation: positiveNumber(
+                prices.cacheCreation,
+                "policy.pricesPerMillionTokens.cacheCreation",
+            ),
+            cacheRead: positiveNumber(prices.cacheRead, "policy.pricesPerMillionTokens.cacheRead"),
+        },
+        gates,
+    };
 }
 
 /** The R3 arm receives its gold in the prompt rather than as memory, so its content is exactly the R2 claim set — deriving it keeps `R3 - R2` a comparison of representation instead of also comparing what each arm was told. commentlint: allow(JUDGE) */

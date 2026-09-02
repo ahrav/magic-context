@@ -86,7 +86,26 @@ export interface RolloutRecord extends RolloutCoordinate {
     harnessDisposed: boolean;
 }
 
+export interface FailureUsage {
+    usage: TokenUsage;
+    settled: boolean;
+}
+
 export interface RolloutHandle {
+    /**
+     * Usage the rollout already billed, read after `run` threw.
+     *
+     * A rollout that fails partway has often already paid for authored turns and for internal calls
+     * the handle can still account for. The fallback charge is a bound, and a bound over a nested
+     * retry tree in another package cannot be derived from constants here, so an implementation that
+     * can measure what it spent reports it and the charge takes whichever is larger.
+     *
+     * `settled` is whether the reported usage is final. A handle that knows a call is still in flight
+     * — a historian the plugin abandoned — reports what has landed so far as `settled: false`; the
+     * runner charges it and then stops admitting arms, because neither the partial measurement nor
+     * the bound can be trusted to cover the rest.
+     */
+    usageOnFailure?(): Promise<FailureUsage>;
     /** Oracle setup runs before the handle creates or uses a session in `run`. */
     prepare?(): Promise<void>;
     run(): Promise<RolloutObservation>;
@@ -146,7 +165,16 @@ export interface PairedDeltaRunResult {
         | "cost-cap-reached"
         | "deadline-reached"
         | "invalid-stored-records"
-        | "harness-unreclaimed";
+        | "harness-unreclaimed"
+        /** A failed rollout's billed usage could not be read, so its record carries only the worst-case estimate, which the historian's retry tree can exceed; the run stops rather than admit later arms against an understated `spentUsd`. commentlint: allow(JUDGE) */
+        | "usage-unmeasured";
+    /**
+     * Whether some failed rollout's spend could not be measured, independent of `status`.
+     *
+     * `status` is one value, and an unreclaimed harness in the same rollout outranks it; the refusal
+     * to resume has to survive that, so it is carried separately for the caller that persists it.
+     */
+    usageUnmeasured: boolean;
     records: RolloutRecord[];
     coordinates: CoordinateResult[];
     spentUsd: number;
@@ -160,7 +188,13 @@ export interface PairedDeltaRunResult {
 
 export class ProviderUnavailableError extends Error {}
 
-const LATE_DISPOSAL_GRACE_MS = 5_000;
+/**
+ * How long a late disposal, or a failure-path accounting read, may run past the rollout deadline.
+ *
+ * Exported so the live lane can size its ledger-settle budget to fit: a settle that outlasts this
+ * grace is cut off every time, and the accounting it exists to take is never available.
+ */
+export const LATE_DISPOSAL_GRACE_MS = 5_000;
 
 /** Thrown when an in-flight rollout outlives the run deadline. */
 export class RolloutDeadlineError extends Error {}
@@ -673,6 +707,7 @@ export async function runPairedDelta(
     let resumedRollouts = 0;
     let reserveUsd = options.deskCostCeilingUsd;
     let status: PairedDeltaRunResult["status"] = "completed";
+    let anyUsageUnmeasured = false;
     let startedAny = false;
     /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. commentlint: allow(JUDGE) */
     const lateDisposals: Promise<boolean>[] = [];
@@ -952,6 +987,8 @@ export async function runPairedDelta(
                 let creation: Promise<RolloutHandle> | null = null;
                 let observation: RolloutObservation | null = null;
                 let failure: unknown;
+                let billedOnFailure: TokenUsage | null = null;
+                let usageUnmeasured = false;
                 let disposed = false;
                 let disposalFailed = false;
                 try {
@@ -996,6 +1033,37 @@ export async function runPairedDelta(
                     observation = await withRolloutDeadline(() => started.run(), rolloutMs);
                 } catch (error) {
                     failure = error;
+                    /**
+                     * Read before disposal, while the harness is still up. Bounded like every other
+                     * step. Its own failure still writes the record, priced from the estimate, but
+                     * ends the run: the estimate cannot bound the historian's retry tree, so admitting
+                     * further arms against it could pass the cap.
+                     */
+                    const billed = handle?.usageOnFailure?.bind(handle);
+                    if (billed) {
+                        /**
+                         * Its own grace, not what remains of the rollout deadline. On the path this
+                         * matters most — a rollout that ran out of time after billing several calls —
+                         * the remainder is already negative, and clamping to it left one millisecond
+                         * for several read-only requests, so the measurement it exists to take was
+                         * never available. Bounded like a late disposal, which is the same trade:
+                         * a little wall clock after the deadline to avoid losing accounting.
+                         */
+                        try {
+                            const reported = await withRolloutDeadline(
+                                billed,
+                                LATE_DISPOSAL_GRACE_MS,
+                            );
+                            /** Validated here, not only in `failedRecord`: that sanitizer nulls a malformed counter and prices the estimate, which is the fallback this status exists to refuse. commentlint: allow(JUDGE) */
+                            billedOnFailure = finiteUsage(reported?.usage);
+                            if (billedOnFailure === null || reported.settled !== true) {
+                                usageUnmeasured = true;
+                            }
+                        } catch {
+                            billedOnFailure = null;
+                            usageUnmeasured = true;
+                        }
+                    }
                 } finally {
                     if (handle) {
                         /** A `dispose()` that never settles would hold the run open with the paid record unwritten, so cleanup is bounded like a late handle's and a hang is reported as an unreclaimed harness rather than waited on. commentlint: allow(JUDGE) */
@@ -1040,6 +1108,7 @@ export async function runPairedDelta(
                         priorAttemptsCostUsd,
                         priorMaxAttemptCostUsd,
                         disposalFailed,
+                        billedOnFailure,
                     });
                 options.store.put(record);
                 records.push(record);
@@ -1047,7 +1116,9 @@ export async function runPairedDelta(
                 spentUsd += record.costUsd;
                 reserveUsd = bumpReserve(reserveUsd, record);
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
+                if (usageUnmeasured) anyUsageUnmeasured = true;
                 if (disposalFailed) status = "harness-unreclaimed";
+                else if (usageUnmeasured) status = "usage-unmeasured";
                 else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
                 return record;
             };
@@ -1120,14 +1191,20 @@ export async function runPairedDelta(
         if (reclaimed.some((ok) => !ok)) status = "harness-unreclaimed";
     }
 
-    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. commentlint: allow(JUDGE) */
-    if (status !== "harness-unreclaimed" && invalidStoredCoordinates.length > 0) {
+    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. Unmeasured usage also stands: it is the one status whose checkpoint must not be resumed at all, and the workflow keys that refusal on this status alone. commentlint: allow(JUDGE) */
+    /** Read through the declared type: `status` is assigned inside `runArm`, which control-flow narrowing does not see, and a narrowed literal makes the second comparison a type error. commentlint: allow(JUDGE) */
+    const outranksStoredRecords: readonly PairedDeltaRunResult["status"][] = [
+        "harness-unreclaimed",
+        "usage-unmeasured",
+    ];
+    if (!outranksStoredRecords.includes(status) && invalidStoredCoordinates.length > 0) {
         status = "invalid-stored-records";
     }
 
     /** Derived from `records` at the end rather than counted along the way: every field they summarize already lives on each record, and a future path that pushes one — a new arm, another resume branch — cannot forget to update a counter it does not touch. commentlint: allow(JUDGE) */
     return {
         status,
+        usageUnmeasured: anyUsageUnmeasured,
         records,
         coordinates,
         spentUsd,
@@ -1334,7 +1411,9 @@ function completedRecord(
     };
 }
 
-function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecord {
+function failedRecord(
+    inputs: RecordInputs & { failure: unknown; billedOnFailure?: TokenUsage | null },
+): RolloutRecord {
     const {
         options,
         coordinate,
@@ -1348,6 +1427,7 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
         priorAttemptsCostUsd,
         priorMaxAttemptCostUsd,
         disposalFailed,
+        billedOnFailure,
     } = inputs;
     /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
     const providerUnavailable = !disposalFailed && failure instanceof ProviderUnavailableError;
@@ -1359,7 +1439,13 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
             : "harness-failure";
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId);
     /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. Unavailability no longer discounts the charge: it can be raised by a later turn's request, after earlier turns have already billed, and this path keeps no usage to price. Charging the full bound overstates a first-turn refusal rather than understating a mid-script failure, and only the understatement admits an arm the cap should have stopped. commentlint: allow(JUDGE) */
-    const attemptCostUsd = Math.max(reserveUsd, worstCase);
+    /** The measured charge when the handle could read it: a nested retry tree in the plugin can bill past any bound this module can derive, and only the understatement admits an arm the cap should have stopped. */
+    /** Untrusted like any observation: a non-finite counter would poison the cap it feeds. */
+    const measured = finiteUsage(billedOnFailure);
+    const billed = measured === null
+        ? 0
+        : tokenCostUsd(measured, options.pricesPerMillionTokens);
+    const attemptCostUsd = Math.max(reserveUsd, worstCase, billed);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
@@ -1384,7 +1470,7 @@ function failedRecord(inputs: RecordInputs & { failure: unknown }): RolloutRecor
             reasonCode,
         },
         checks: [],
-        usage: zeroUsage(),
+        usage: measured ?? zeroUsage(),
         costUsd: attemptCostUsd,
         priorAttemptsCostUsd,
         maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, attemptCostUsd),
@@ -1438,8 +1524,9 @@ function zeroUsage(): TokenUsage {
 }
 
 /** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. commentlint: allow(JUDGE) */
-function finiteUsage(usage: TokenUsage): TokenUsage | null {
-    const counters = [usage?.input, usage?.output, usage?.cacheCreation, usage?.cacheRead];
+function finiteUsage(usage: TokenUsage | null | undefined): TokenUsage | null {
+    if (usage === null || usage === undefined || typeof usage !== "object") return null;
+    const counters = [usage.input, usage.output, usage.cacheCreation, usage.cacheRead];
     /** Safe integers rather than merely finite ones: a counter near `Number.MAX_VALUE` prices to `Infinity`, which JSON writes as `null` and the next resume rejects as `cost-invalid`. commentlint: allow(JUDGE) */
     if (counters.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) {
         return null;
@@ -1469,6 +1556,13 @@ function finiteUsage(usage: TokenUsage): TokenUsage | null {
  * until its call cost is declared instead of silently defaulting to zero.
  * commentlint: allow(JUDGE)
  */
+/**
+ * Model calls a rollout can make outside its authored turns: OpenCode's own compaction summary plus
+ * the historian's attempts. Bounded rather than measured, because the fallback charge exists for the
+ * path where no usage came back.
+ */
+const INTERNAL_CALL_BOUND = 4;
+
 const ORACLE_CALLS_BY_INTERVENTION: Readonly<
     Record<InterventionDescriptor["kind"], number>
 > = {
@@ -1497,7 +1591,13 @@ function worstCaseUsd(
     const oracleCalls = armId === undefined
         ? 0
         : ORACLE_CALLS_BY_INTERVENTION[interventionFor(scenario, armId).kind];
-    return perCallUsd * (billableTurns + oracleCalls);
+    /**
+     * Native compaction summarizes and the historian runs in a child session, and neither call is an
+     * authored turn. A rollout that fails after triggering them returns no usage, so the fallback
+     * charge is all the ledger the cap has for calls that were already billed; omitting them let an
+     * arm pass admission and then bill past the reserve.
+     */
+    return perCallUsd * (billableTurns + oracleCalls + INTERNAL_CALL_BOUND);
 }
 
 function exclusionCountsOf(

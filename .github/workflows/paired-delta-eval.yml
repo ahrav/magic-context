@@ -1,0 +1,162 @@
+name: paired-delta-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Paired-delta pool mode
+        type: choice
+        options:
+          - calibration
+          - weekly
+          - release
+        default: weekly
+  schedule:
+    - cron: "29 6 * * 4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paired-delta-eval-live
+  cancel-in-progress: false
+
+jobs:
+  live-lane:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Resolve closed mode
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+        run: |
+          case "${MODE_INPUT:-weekly}" in
+            calibration|weekly|release) MODE="${MODE_INPUT:-weekly}" ;;
+            *) echo "unknown paired-delta mode: $MODE_INPUT" >&2; exit 1 ;;
+          esac
+          echo "PAIRED_DELTA_MODE=$MODE" >> "$GITHUB_ENV"
+
+      # Hashed once and reused by all three calibration cache keys. Kept in one place because a
+      # restore key that drifts from the save key stops hitting the cache silently, with no error —
+      # `CALIBRATION_SCOPE` in run-paired-delta.ts is the matching declaration.
+      - name: Resolve the calibration scope digest
+        env:
+          SCOPE_DIGEST: ${{ hashFiles('packages/plugin/src/**', 'packages/plugin/scripts/retrieval-benchmark/**', 'packages/e2e-tests/src/**', 'packages/e2e-tests/scripts/run-paired-delta.ts', 'packages/e2e-tests/pools/**', 'bun.lock', 'package.json', 'packages/plugin/package.json', 'packages/e2e-tests/package.json', '.github/workflows/paired-delta-eval.yml') }}
+        run: echo "PAIRED_DELTA_SCOPE=$SCOPE_DIGEST" >> "$GITHUB_ENV"
+
+      # The smoke lane drives the same orchestration the live modes use — provider resolution, the
+      # regret ladder, exclusion classification — against mocks, so a regression in it fails here
+      # rather than after a scheduled dispatch has spent live budget.
+      - name: Gate deterministic lane without credentials
+        run: |
+          bun run --cwd packages/e2e-tests typecheck
+          bun run --cwd packages/e2e-tests test:paired-delta-unit
+          bun run --cwd packages/e2e-tests validate-mode-manifest
+          bun packages/e2e-tests/scripts/run-paired-delta.ts --smoke
+
+      # A later step in this job injects a live provider credential, so the
+      # binary is pinned to a release and verified against a pinned digest
+      # before it runs; an unpinned install script would execute whatever the
+      # install endpoint serves that day.
+      - name: Install OpenCode (pinned)
+        env:
+          OPENCODE_VERSION: "1.18.25"
+          OPENCODE_SHA256: "58a3729a6f3432dd6d2917fcc4a949788891a035818646ad480e12c947f56e78"
+        run: |
+          curl -fsSL -o /tmp/opencode.tar.gz \
+            "https://github.com/sst/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
+          echo "${OPENCODE_SHA256}  /tmp/opencode.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.opencode/bin"
+          tar -xzf /tmp/opencode.tar.gz -C "$HOME/.opencode/bin"
+          "$HOME/.opencode/bin/opencode" --version
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Build harness plugin
+        run: bun run --cwd packages/plugin build
+
+      # Reruns share `github.run_id`; the prefix restore keeps progress accumulating across attempts of one dispatch while a fresh run cannot reuse it.
+      # The `.unmeasured` marker rides in the same entry as the records: the runner writes it when a
+      # failed rollout's spend could not be read and refuses to start against a records path that
+      # has one, so whichever attempt's checkpoint this restores, its refusal is restored with it.
+      - name: Restore mode rollout records
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
+            packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json.unmeasured
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-
+
+      # Keyed on the same calibration scope the runner digests, not on the commit: a commit-scoped
+      # key invalidated every record on the next push to the default branch and left this lane
+      # refusing until calibration was re-dispatched. `CALIBRATION_SCOPE` in run-paired-delta.ts
+      # is the matching declaration; the two are independent hashes of the same path set, so a
+      # scope change misses the cache rather than restoring a record the runner will reject.
+      - name: Restore calibration evidence
+        if: env.PAIRED_DELTA_MODE != 'calibration'
+        uses: actions/cache/restore@v4
+        with:
+          path: packages/e2e-tests/artifacts/paired-delta-calibration.json
+          key: paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-${{ github.run_id }}
+          restore-keys: |
+            paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-
+
+      - name: Run live paired-delta lane
+        timeout-minutes: 300
+        env:
+          NODE_ENV: ""
+          PAIRED_DELTA_ANTHROPIC_API_KEY: ${{ secrets.PAIRED_DELTA_ANTHROPIC_API_KEY }}
+        run: |
+          RECORDS="packages/e2e-tests/artifacts/paired-delta-${PAIRED_DELTA_MODE}-records.json"
+          REPORT="packages/e2e-tests/artifacts/paired-delta-${PAIRED_DELTA_MODE}-report.json"
+          CALIBRATION="packages/e2e-tests/artifacts/paired-delta-calibration.json"
+          ARGS=("--${PAIRED_DELTA_MODE}" "--records" "$RECORDS" "--report" "$REPORT")
+          ARGS+=("--calibration-record" "$CALIBRATION" "--deadline-minutes" "290")
+          if [[ -f "$RECORDS" ]]; then ARGS+=("--resume"); fi
+          bun packages/e2e-tests/scripts/run-paired-delta.ts "${ARGS[@]}"
+
+      # Cache entries are immutable, so the attempt is part of the key: a rerun writes its own accumulated progress instead of failing to replace the first attempt's checkpoint.
+      # Saved after every outcome, including `usage-unmeasured`: that attempt's entry carries the `.unmeasured` marker, restore prefers the newest match, and the runner refuses a marked path, so an older attempt's checkpoint cannot be resumed around it. The condition tests either file, because a first rollout whose record never published leaves a marker with no records file beside it.
+      - name: Save rollout records for the next attempt
+        if: always() && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE), format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json.unmeasured', env.PAIRED_DELTA_MODE)) != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
+            packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json.unmeasured
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Weekly and release dispatches now fail closed on an invalid record, so caching one would block every later run.
+      # The attempt is in the key for the same immutability reason as the rollout checkpoint: without it a rerun's corrected record would no-op against attempt 1's entry, and the stale one would keep being restored.
+      - name: Save calibration evidence
+        if: success() && env.PAIRED_DELTA_MODE == 'calibration' && hashFiles('packages/e2e-tests/artifacts/paired-delta-calibration.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: packages/e2e-tests/artifacts/paired-delta-calibration.json
+          key: paired-delta-calibration-${{ env.PAIRED_DELTA_SCOPE }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # `upload-artifact@v4` artifacts are immutable, so the attempt is part of the name: a rerun uploading under the prior attempt's name conflicts instead of replacing it.
+      - name: Archive reports and rollout records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: packages/e2e-tests/artifacts/
+          if-no-files-found: warn
+          retention-days: 30

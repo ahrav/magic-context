@@ -19,6 +19,7 @@ import {
     computeRegretRungs,
     interventionFor,
     runPairedDelta,
+    tokenCostUsd,
     verifyDualMockResolution,
     type RolloutHandle,
     type RolloutObservation,
@@ -663,6 +664,156 @@ describe("paired-delta runner", () => {
         });
         expect(store.records.filter(({ armId }) => armId === "mc-off")).toHaveLength(1);
         expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+    });
+
+    it("stops the run when a failed rollout's usage cannot be read", async () => {
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            throw new Error("session ledger unavailable");
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        // When failure usage is unavailable, the estimated cost is recorded and no later arm starts.
+        expect(result.status).toBe("usage-unmeasured");
+        expect(result.records).toHaveLength(1);
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        expect(result.records[0]?.costUsd).toBeGreaterThan(0);
+    });
+
+    it("stops the run when a failed rollout's usage is reported unsettled or malformed", async () => {
+        for (const reported of [
+            { usage: { input: 10, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: false },
+            { usage: { input: -1, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: true },
+            { usage: { input: Number.NaN, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: true },
+            { usage: { input: 1.5, output: 0, cacheCreation: 0, cacheRead: 0 }, settled: true },
+        ]) {
+            const result = await runPairedDelta(
+                options(new MemoryStore()),
+                {
+                    now: () => 100,
+                    async createRollout(): Promise<RolloutHandle> {
+                        return {
+                            async run() {
+                                throw new Error("provider closed the stream");
+                            },
+                            async usageOnFailure() {
+                                return reported;
+                            },
+                            async dispose() {},
+                        };
+                    },
+                },
+            );
+
+            expect(result.status, JSON.stringify(reported)).toBe("usage-unmeasured");
+            expect(result.records).toHaveLength(1);
+        }
+    });
+
+    it("keeps usage-unmeasured over invalid stored records", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(options(store), dependencies());
+        const stored = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stored) throw new Error("missing fixture record");
+        stored.checks = stored.checks.map((check, index) => ({
+            ...check,
+            id: `check-drifted-${index}`,
+        }));
+
+        // Replicate 0 is blocked by the drifted record; replicate 1 runs and cannot read its spend.
+        const result = await runPairedDelta(
+            { ...options(store), replicateCount: 2, resume: true },
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            return {
+                                usage: { input: 1, output: 0, cacheCreation: 0, cacheRead: 0 },
+                                settled: false,
+                            };
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.invalidStoredCoordinates).toHaveLength(1);
+        expect(result.status).toBe("usage-unmeasured");
+    });
+
+    it("reports unmeasured usage separately when disposal also fails", async () => {
+        const result = await runPairedDelta(
+            options(new MemoryStore()),
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            throw new Error("session ledger unavailable");
+                        },
+                        async dispose() {
+                            throw new Error("harness would not stop");
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.usageUnmeasured).toBe(true);
+    });
+
+    it("charges a failed rollout's measured usage when it exceeds the estimate", async () => {
+        const store = new MemoryStore();
+        const measured = { input: 50_000_000, output: 0, cacheCreation: 0, cacheRead: 0 };
+        const result = await runPairedDelta(
+            options(store),
+            {
+                now: () => 100,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            throw new Error("provider closed the stream");
+                        },
+                        async usageOnFailure() {
+                            return { usage: measured, settled: true };
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+        const record = result.records[0];
+        if (!record) throw new Error("missing record");
+
+        expect(result.status).not.toBe("usage-unmeasured");
+        expect(record.costUsd).toBeGreaterThanOrEqual(
+            tokenCostUsd(measured, options().pricesPerMillionTokens),
+        );
     });
 
     it("reports an unreclaimed harness even when the rollout timed out first", async () => {
@@ -2520,7 +2671,7 @@ describe("paired-delta runner", () => {
         expect(third.observedCostRollouts + third.estimatedCostRollouts)
             .toBe(third.records.length);
     });
-    it("floors failure cost estimates at one full-context request per billable turn", async () => {
+    it("floors failure cost estimates at one full-context request per billable and internal call", async () => {
         const expensive = {
             ...options(),
             pricesPerMillionTokens: {
@@ -2541,8 +2692,13 @@ describe("paired-delta runner", () => {
         // Each user turn can bill its own request, and the observation reports all of them.
         const billableTurns = scenario.turnScript.filter(({ role }) => role === "user").length;
         expect(billableTurns).toBeGreaterThan(1);
+        /**
+         * Plus the internal calls a failing rollout may already have billed — OpenCode's compaction
+         * summary and the historian's attempts — which return no usage on the failure path.
+         */
+        const internalCalls = 4;
         expect(failed?.costUsd).toBeCloseTo(
-            (scenario.modelContextLimit * (100 + 200) * billableTurns) / 1_000_000,
+            (scenario.modelContextLimit * (100 + 200) * (billableTurns + internalCalls)) / 1_000_000,
             12,
         );
     });

@@ -1,5 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
+import { tupleKey } from "./tuple-key";
 import { compareCodeUnits } from "../code-unit-order";
 import { fnv1a32 } from "../fnv1a";
 import {
@@ -15,9 +16,9 @@ export const MIN_BOOTSTRAP_RESAMPLES = 2000;
 // `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
 export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
-// The intervention arm behind the retrieval rung is mock-served, so its estimate is provider-mixed rather than live.
-export const PROVIDER_MIXED_REGRET_ENDPOINTS = ["retrieval"] as const;
-export const LIVE_REGRET_ENDPOINTS = ["formation", "representation"] as const;
+// Both rungs that read R1 are provider-mixed: R1's scripted `ctx_search` turn and its follow-up are mock-served, and `formation` is R2 - R1. Only `representation` compares two wholly live arms.
+export const PROVIDER_MIXED_REGRET_ENDPOINTS = ["retrieval", "formation"] as const;
+export const LIVE_REGRET_ENDPOINTS = ["representation"] as const;
 // Composing the regret set from the two partitions keeps a new rung from landing in neither aggregate bucket.
 export const REGRET_ENDPOINTS = [
     ...PROVIDER_MIXED_REGRET_ENDPOINTS,
@@ -54,6 +55,8 @@ export interface FamilyDeltaObservation {
 }
 
 export interface FamilyNoiseFloor {
+    /** Which delta the floor was measured on. A floor from one primary baseline does not describe the other. */
+    endpoint?: PrimaryEndpoint;
     familyId: string;
     value: number;
     interval: Interval;
@@ -142,6 +145,10 @@ function bootstrapInterval(
     };
 }
 
+function floorKey(familyId: string, endpoint: PrimaryEndpoint | undefined): string {
+    return tupleKey(familyId, endpoint);
+}
+
 function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
 }
@@ -161,6 +168,16 @@ function estimateEndpoint(
         byFamily.set(observation.familyId, values);
     }
     const enoughFamilies = byFamily.size >= minimumAnalyzableFamilyCount;
+    /**
+     * Calibration samples the primary arms and scores them on the binary valid-success endpoint, so
+     * its floors describe those series alone. Applying them to a regret rung compares a fraction over
+     * the whole check vector against a threshold measured from a different quantity on arms the
+     * calibration never sampled, which can both resolve noisy representation evidence and suppress a
+     * stable one.
+     */
+    const primary = PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint)
+        ? (endpoint as PrimaryEndpoint)
+        : null;
     const families = [...byFamily].sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([familyId, values]): FamilyEstimate => {
             const pointEstimate = mean(values);
@@ -169,21 +186,26 @@ function estimateEndpoint(
                 bootstrapResamples,
                 bootstrapSeed ^ fnv1a32(`${endpoint}:${familyId}`),
             );
-            const floor = noiseFloors.get(familyId) ?? null;
+            /** An endpoint-keyed floor first, then one recorded without an endpoint, so a record from either shape resolves. */
+            const floor = primary === null
+                ? null
+                : noiseFloors.get(floorKey(familyId, primary)) ??
+                    noiseFloors.get(floorKey(familyId, undefined)) ??
+                    null;
+            const label: NoiseComparison = floor === null
+                ? "no-noise-floor"
+                : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
             return {
                 familyId,
                 pointEstimate,
                 interval,
                 // A nonzero singleton yields a zero-width interval without variance evidence; keep it unresolved.
-                resolution: enoughFamilies && values.length >= 2 && !includesZero(interval)
+                /** A delta no larger than its family's calibrated floor is not separable from measured noise, so the floor decides resolution rather than only annotating it. */
+                resolution: enoughFamilies && values.length >= 2 && !includesZero(interval) &&
+                    label !== "inside-floor"
                     ? "resolved"
                     : "unresolved",
-                noise: {
-                    label: floor === null
-                        ? "no-noise-floor"
-                        : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor",
-                    floor,
-                },
+                noise: { label, floor },
             };
         });
     const familyMeans = families.map(({ pointEstimate }) => pointEstimate);
@@ -192,12 +214,15 @@ function estimateEndpoint(
         bootstrapResamples,
         bootstrapSeed ^ fnv1a32(endpoint),
     );
+    /** An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor family leaves the endpoint unresolved. */
+    const insideFloor = families.some(({ noise }) => noise.label === "inside-floor");
     return {
         endpoint,
         pointEstimate: mean(familyMeans),
         interval,
         familyCount: families.length,
-        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval)
+        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval) &&
+            !insideFloor
             ? "resolved"
             : "unresolved",
         families,
@@ -285,7 +310,7 @@ export function estimateFamilyDeltas(input: {
         // A malformed floor must surface as a typed estimator error, not a TypeError from reading `interval`.
         const interval: Interval | null | undefined = floor.interval;
         if (
-            noiseFloors.has(floor.familyId) ||
+            noiseFloors.has(floorKey(floor.familyId, floor.endpoint)) ||
             !Number.isFinite(floor.value) ||
             floor.value < 0 ||
             interval === null ||
@@ -299,7 +324,7 @@ export function estimateFamilyDeltas(input: {
         ) {
             throw new PairedDeltaEstimatorError(`noise-floor-invalid-${floor.familyId}`);
         }
-        noiseFloors.set(floor.familyId, floor);
+        noiseFloors.set(floorKey(floor.familyId, floor.endpoint), floor);
     }
 
     const sorted = [...input.observations].sort((left, right) =>
