@@ -2476,7 +2476,18 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: ["abs-x"],
             probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "" }],
         };
-        const errored: ScenarioScore = { ...passScore("hse-c"), verdict: "ERROR", errorReason: "script-drift", precision: null, recall: null };
+        // `errorScore` zeroes every count alongside the null ratios, so a partial override is not a real shape.
+        const errored: ScenarioScore = {
+            ...passScore("hse-c"),
+            verdict: "ERROR",
+            errorReason: "script-drift",
+            precision: null,
+            recall: null,
+            expectedClaimsMatched: 0,
+            expectedClaimsTotal: 0,
+            visibleClaimsMatched: 0,
+            visibleClaimsTotal: 0,
+        };
         const report = buildLaneReport([passScore("hse-a"), fa, errored], { releaseVersion: "v2.0.0" });
         expect(parseLaneReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
         expect(() => parseLaneReport({ ...report, schema: "historian-eval-report/v2" })).toThrow(/report\.schema: version-invalid/);
@@ -2517,6 +2528,25 @@ describe("buildLaneReport", () => {
         const rawOutput = structuredClone(report);
         rawOutput.scenarios[0]!.source = "raw-output";
         expect(() => parseLaneReport(rawOutput)).toThrow(/report\.scenarios: lane-invalid \(.*raw-output seam/);
+        // `scoreFacts` derives both ratios from the counts, and the rebuild carries scenarios through
+        // unchanged, so these are the parser's only chance to check them.
+        const overMatched = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        overMatched.scenarios[0]!.visibleClaimsMatched = 99;
+        expect(() => parseLaneReport(overMatched))
+            .toThrow(/report\.scenarios\[0\]\.visibleClaimsMatched: integer-invalid/);
+        const skewedPrecision = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        skewedPrecision.scenarios[0]!.precision = 0.5;
+        expect(() => parseLaneReport(skewedPrecision))
+            .toThrow(/report\.scenarios\[0\]\.precision: derived-mismatch/);
+        const skewedRecall = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        skewedRecall.scenarios[0]!.recall = 0.5;
+        expect(() => parseLaneReport(skewedRecall))
+            .toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
+        // A run whose every attempt failed states a null recall over a nonzero expectation count, so a null
+        // recall stays admissible where a wrong number does not.
+        const nullRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        nullRecall.scenarios[0]!.recall = null;
+        expect(() => parseLaneReport(nullRecall)).not.toThrow();
         // A reason key is only ever written by incrementing, so a zero count fails on its own field.
         const zeroCount = structuredClone(report);
         zeroCount.aggregate.failCountsByReason = { "false-authoritative": 0 };

@@ -296,7 +296,7 @@ function checkScoreDerivedEvidence(
 function parseInvariant(
     raw: unknown,
     label: string,
-    scores?: { baselineScore: ScenarioScore; derivativeScore: ScenarioScore },
+    scores: { baselineScore: ScenarioScore; derivativeScore: ScenarioScore },
 ): MetamorphicInvariantVerdict {
     const value = p.record(raw, label);
     const invariant = p.enumeration(value.invariant, INVARIANT_IDS, `${label}.invariant`);
@@ -304,9 +304,7 @@ function parseInvariant(
     const evidence = parseInvariantEvidence(value, invariant, label);
     if (invariantHolds(evidence) !== holds) p.fail(`${label}.holds: derived-mismatch`);
     // Editing both sides of one invariant keeps `holds` self-consistent, so the scores are the outside oracle.
-    if (scores !== undefined) {
-        checkScoreDerivedEvidence(evidence, scores.baselineScore, scores.derivativeScore, label);
-    }
+    checkScoreDerivedEvidence(evidence, scores.baselineScore, scores.derivativeScore, label);
     return { ...evidence, holds } as MetamorphicInvariantVerdict;
 }
 

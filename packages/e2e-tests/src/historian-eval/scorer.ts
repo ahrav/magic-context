@@ -1837,6 +1837,23 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     ], label);
     const stringArray = (field: "falseAuthoritativeMatches" | "structuralFindings"): string[] =>
         p.array(value[field], `${label}.${field}`).map((entry, index) => p.text(entry, `${label}.${field}[${index}]`));
+    const precision = parseRatio(value.precision, `${label}.precision`);
+    const recall = parseRatio(value.recall, `${label}.recall`);
+    const expectedClaimsMatched = p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`);
+    const expectedClaimsTotal = p.integer(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`);
+    const visibleClaimsMatched = p.integer(value.visibleClaimsMatched, `${label}.visibleClaimsMatched`);
+    const visibleClaimsTotal = p.integer(value.visibleClaimsTotal, `${label}.visibleClaimsTotal`);
+    if (expectedClaimsMatched > expectedClaimsTotal) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
+    if (visibleClaimsMatched > visibleClaimsTotal) p.fail(`${label}.visibleClaimsMatched: integer-invalid`);
+    // `buildLaneReport` carries scenarios through unchanged, so its rebuild cannot reach these fields.
+    if (precision !== (visibleClaimsTotal === 0 ? null : visibleClaimsMatched / visibleClaimsTotal)) {
+        p.fail(`${label}.precision: derived-mismatch`);
+    }
+    // A run whose every attempt failed reports a null recall over a nonzero expectation count, so recall is
+    // checked only where it is stated.
+    if (recall !== null && (expectedClaimsTotal === 0 || recall !== expectedClaimsMatched / expectedClaimsTotal)) {
+        p.fail(`${label}.recall: derived-mismatch`);
+    }
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
         verdict: p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`),
@@ -1844,12 +1861,12 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
             .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`)),
         errorReason: parseNullableText(value.errorReason, `${label}.errorReason`),
         errorDetail: parseNullableText(value.errorDetail, `${label}.errorDetail`),
-        precision: parseRatio(value.precision, `${label}.precision`),
-        recall: parseRatio(value.recall, `${label}.recall`),
-        expectedClaimsMatched: p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`),
-        expectedClaimsTotal: p.integer(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`),
-        visibleClaimsMatched: p.integer(value.visibleClaimsMatched, `${label}.visibleClaimsMatched`),
-        visibleClaimsTotal: p.integer(value.visibleClaimsTotal, `${label}.visibleClaimsTotal`),
+        precision,
+        recall,
+        expectedClaimsMatched,
+        expectedClaimsTotal,
+        visibleClaimsMatched,
+        visibleClaimsTotal,
         falseAuthoritativeMatches: stringArray("falseAuthoritativeMatches"),
         structuralFindings: stringArray("structuralFindings"),
         probeVerdicts: p.array(value.probeVerdicts, `${label}.probeVerdicts`).map((entry, index) => {
