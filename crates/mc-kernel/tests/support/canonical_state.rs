@@ -34,7 +34,7 @@
 //! | `admission_decisions` | `decided_at` |
 //! | `capture_pins` | `lease_epoch`, `writer_epoch`, `created_at`; `expires_at`, `released_at` reduced to null-or-set |
 //! | `capture_pin_refs` | `expires_at`, `released_at` reduced to null-or-set |
-//! | `artifact_ingestion_reservations` | `writer_epoch`, `created_at`, `heartbeat_at`, `lease_expires_at`, `reclaim_started_at` |
+//! | `artifact_ingestion_reservations` | `created_at`, `heartbeat_at`, `lease_expires_at`, `reclaim_started_at`; `writer_epoch` reduced to whether it matches the `writer_fence` epoch |
 //! | `extraction_runs` | `terminal_at` reduced to null-or-set |
 //! | `candidates` | `terminal_at` reduced to null-or-set |
 //!
@@ -170,6 +170,11 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
     for (table, rows) in normalized.tables {
         tables.insert(table, hash_rows(&rows));
     }
+    let object_digests = normalized
+        .objects
+        .iter()
+        .map(|(digest, _)| digest.clone())
+        .collect::<Vec<_>>();
     let object_rows = normalized
         .objects
         .into_iter()
@@ -218,7 +223,7 @@ pub fn digest(root: &Path, profile: Profile) -> CanonicalDigest {
         "recovery_markers".to_string(),
         hash_rows(&recovery_marker_rows(root, profile)),
     );
-    let metadata_rows = scan_object_metadata(root)
+    let metadata_rows = scan_object_metadata(root, &object_digests)
         .into_iter()
         .map(|(digest, uid, mode, links)| {
             vec![
@@ -1041,9 +1046,9 @@ fn read_dir_or_absent(root: &Path, relative: &str) -> Option<fs::ReadDir> {
 ///
 /// `open_regular_nofollow` refuses an object whose `nlink` is not 1, whose owner is not the
 /// caller, or whose mode intersects `0o177`, so all three decide whether the artifact reads.
-pub fn scan_object_metadata(root: &Path) -> Vec<(String, u32, u32, u64)> {
+pub fn scan_object_metadata(root: &Path, digests: &[String]) -> Vec<(String, u32, u32, u64)> {
     let mut result = Vec::new();
-    for (digest, _) in scan_objects(root) {
+    for digest in digests {
         let path = root.join(format!(
             "artifacts/objects/{}/{}",
             &digest[..2],
@@ -1051,7 +1056,7 @@ pub fn scan_object_metadata(root: &Path) -> Vec<(String, u32, u32, u64)> {
         ));
         let metadata = fs::symlink_metadata(&path).unwrap();
         result.push((
-            digest,
+            digest.clone(),
             metadata.uid(),
             metadata.permissions().mode() & 0o7777,
             metadata.nlink(),
