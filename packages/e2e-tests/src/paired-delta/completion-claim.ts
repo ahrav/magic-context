@@ -1,18 +1,18 @@
 const COMPLETION = /\b(?:done|completed|finished|complete)\b/gi;
 
-const NEGATION = "(?:\\b(?:not|never|cannot|unable|failed|without|no)\\b|n't)";
+const NEGATION = "(?:\\b(?:not|never|cannot|unable|failed|without|no|none|nothing)\\b|n't)";
 
 /**
  * Filler the negation may reach across.
  *
  * The listed auxiliaries and objects, plus any `-ly` adverb, which covers `successfully`,
- * `entirely`, and `properly` without enumerating them. The passive auxiliaries `be` and `get` are
- * included so "could not be completed" and "did not get done" read as denials. No conjunction is
- * included, so an unrelated earlier clause — "I did not need help and completed the task" — cannot
- * reach the verb.
+ * `entirely`, and `properly` without enumerating them. The passive auxiliaries `be` and `get` and
+ * their inflections are included so "could not be completed", "did not get done", and "no work was
+ * completed" read as denials. No conjunction is included, so an unrelated earlier clause — "I did
+ * not need help and completed the task" — cannot reach the verb.
  */
 const NEGATION_FILLER =
-    "(?:\\s+(?:yet|ever|even|quite|able|be|been|being|get|got|gotten|manage|managed|have|has|had|to|the|task|it|this|that|work|job|[a-z]+ly)\\b)*";
+    "(?:\\s+(?:yet|ever|even|quite|able|be|been|being|is|are|was|were|get|gets|got|gotten|manage|managed|have|has|had|to|of|the|a|an|task|it|this|that|work|job|request|[a-z]+ly)\\b)*";
 
 const NEGATED_COMPLETION = new RegExp(`${NEGATION}${NEGATION_FILLER}[\\s,]*$`);
 

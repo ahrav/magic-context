@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync, type Stats } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync, type Stats } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import { canonicalFingerprint } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -1880,6 +1880,17 @@ async function runLive(args: CliArgs): Promise<void> {
         process.exitCode = EXIT_CODES["usage-unmeasured"];
         return;
     }
+    /**
+     * The marker shares the records directory, so a directory that stops accepting writes mid-run
+     * would lose the marker and the record together. Proving the directory writable here does not
+     * prevent that, but it does refuse the far more common case — a path that was never writable —
+     * before any provider call, so the refusal path is exercised where it can still be cheap. A
+     * mid-run loss of the directory is reported on stderr by the marker write itself. commentlint: allow(JUDGE)
+     */
+    mkdirSync(dirname(args.recordsPath), { recursive: true });
+    const probe = `${marker}.probe-${process.pid}`;
+    writeFileSync(probe, "");
+    rmSync(probe, { force: true });
     const apiKey = process.env.PAIRED_DELTA_ANTHROPIC_API_KEY;
     if (!apiKey) {
         throw new Error("live paired-delta mode requires PAIRED_DELTA_ANTHROPIC_API_KEY");
@@ -2144,12 +2155,21 @@ async function runLive(args: CliArgs): Promise<void> {
      * refuse the same way an unmeasured record does. commentlint: allow(JUDGE)
      */
     const writeUnmeasuredMarker = (status: string, spentUsd: number | null): void => {
-        writeFileSync(marker, `${JSON.stringify({
+        const body = `${JSON.stringify({
             status,
             recordsPath: args.recordsPath,
             spentUsd,
             writtenAt: new Date().toISOString(),
-        }, null, 2)}\n`);
+        }, null, 2)}\n`;
+        try {
+            writeFileSync(marker, body);
+        } catch (error) {
+            /** The refusal could not be persisted beside the records, so it is left where the run's own output goes; a checkpoint saved from this attempt is not safe to resume, and the operator has to see that in the log. commentlint: allow(JUDGE) */
+            console.error(
+                `paired-delta could not write ${marker} (${error instanceof Error ? error.message : String(error)}); ` +
+                `do not resume ${args.recordsPath}: ${body.trim()}`,
+            );
+        }
     };
     let result: PairedDeltaRunResult | null = null;
     try {
