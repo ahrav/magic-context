@@ -167,3 +167,203 @@ async fn a_kernel_file_this_build_cannot_read_leaves_the_kernel_unavailable() {
     ));
     handler.shutdown().await.unwrap();
 }
+
+/// Encodes a prepared response the way the transport would and parses it back.
+fn response_json(output: &mc_module::dispatch::PreparedOutput) -> serde_json::Value {
+    let measured = output.measure().expect("response measures");
+    let mut bytes = Vec::with_capacity(measured.len());
+    measured.write_to(&mut bytes).expect("response encodes");
+    serde_json::from_slice(&bytes).expect("response is JSON")
+}
+
+fn kernel_block(health: &mc_host::HealthReport) -> serde_json::Value {
+    health.metrics.as_ref().expect("health metrics")["kernel"].clone()
+}
+
+fn intent(key: &str) -> mc_kernel::CommitIntent {
+    mc_kernel::CommitIntent {
+        producer: "kernel-routes-test".to_string(),
+        operation_key: key.to_string(),
+        request_digest: "c".repeat(64),
+        actor: "test".to_string(),
+        cause: "proof".to_string(),
+    }
+}
+
+fn domain(index: i64) -> mc_kernel::DomainSpec {
+    mc_kernel::DomainSpec {
+        domain_id: format!("domain-{index}"),
+        object_id: format!("object-{index}"),
+        name: format!("name-{index}"),
+        source_kind: "fixture".to_string(),
+        source_id: format!("source-{index}"),
+        source_revision: index,
+        sensitivity: mc_kernel::Sensitivity::Normal,
+    }
+}
+
+/// Emits `count` outbox rows in one commit and returns the commit sequence.
+fn insert_domains(store: &mc_kernel::KernelStore, first: i64, count: i64) -> i64 {
+    store
+        .commit(intent(&format!("domains-{first}-{count}")), |envelope| {
+            for index in first..first + count {
+                envelope.insert_domain(domain(index))?;
+            }
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq
+}
+
+#[tokio::test]
+async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
+    let daemon = Daemon::start().await;
+    daemon.handler.sample_kernel_health_for_test(1_000).await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok);
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "ready");
+    assert_eq!(kernel["sampled_at_ms"], 1_000);
+    assert_eq!(kernel["core_file_warn"], false);
+    assert_eq!(kernel["artifact_warn"], false);
+    assert!(kernel["artifact_cap_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(kernel["retained_outbox_rows"], 0);
+
+    // Dropping the slot on shutdown republishes the phase; the sampler holds no
+    // strong reference between ticks, so the successor can take the lease.
+    daemon.handler.shutdown().await.unwrap();
+    let after = daemon.handler.health().await;
+    let kernel = kernel_block(&after);
+    assert_eq!(kernel["kernel_state"], "unavailable");
+    assert_eq!(kernel["unavailable_reason"], "store_unavailable");
+    assert!(kernel.get("core_file_bytes").is_none());
+    let successor = McHandler::new();
+    PrimaryComponent::initialize(&successor, init(&daemon.descriptor))
+        .await
+        .unwrap();
+    PrimaryComponent::activate(&successor).await.unwrap();
+    wait_for_state(&successor, KernelState::Ready).await;
+    successor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_required_consumer_set_raises_a_daemon_health_warning() {
+    let daemon = Daemon::start().await;
+    let store = daemon.handler.kernel_store_for_test().unwrap();
+    insert_domains(&store, 1, 3);
+    store.mark_outbox_published_through(3, 1).unwrap();
+    daemon.handler.sample_kernel_health_for_test(1_000).await;
+
+    // No consumer: lag is unknown, the block says so, and the daemon stays Ok.
+    // The readiness surface renders this as `warn (no_required_consumer)`.
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok);
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["required_consumer_count"], 0);
+    assert_eq!(kernel["outbox_position_lag"], serde_json::Value::Null);
+    assert_eq!(kernel["oldest_unconsumed_age_ms"], serde_json::Value::Null);
+    assert_eq!(kernel["retained_outbox_rows"], 3);
+    assert_eq!(kernel["lag_threshold_tripped"], false);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
+    let daemon = Daemon::start().await;
+    let store = daemon.handler.kernel_store_for_test().unwrap();
+    let registered = store
+        .commit(intent("register"), |envelope| {
+            envelope.register_outbox_consumer("projector", 1)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    // The registration's own control row sits at position 1; acknowledging that
+    // commit leaves only the domain rows at positions 2..=10_000 unconsumed.
+    store
+        .acknowledge_outbox("projector", registered, 1)
+        .unwrap();
+    let mut next = 1;
+    while next <= 9_999 {
+        let count = (9_999 - next + 1).min(2_500);
+        insert_domains(&store, next, count);
+        next += count;
+    }
+    store.mark_outbox_published_through(10_000, 1).unwrap();
+    let created_at: i64 =
+        rusqlite::Connection::open(kernel_root(&daemon.descriptor).join("core.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT MIN(created_at) FROM outbox WHERE commit_seq > ?1",
+                [registered],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+    // 9,999 published positions of lag and 59,999 ms of age: below both thresholds.
+    daemon
+        .handler
+        .sample_kernel_health_for_test(created_at + 59_999)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok, "{health:?}");
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["outbox_position_lag"], 9_999);
+    assert_eq!(kernel["required_consumer_count"], 1);
+    assert_eq!(kernel["lag_threshold_tripped"], false);
+
+    // The 10,000th published position trips the counter threshold.
+    insert_domains(&store, 10_000, 1);
+    store.mark_outbox_published_through(10_001, 1).unwrap();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(created_at + 59_999)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded);
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel outbox lag past threshold")));
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["outbox_position_lag"], 10_000);
+    assert_eq!(kernel["lag_threshold_tripped"], true);
+
+    // Acknowledging to the tip clears the counter; age alone trips at 60 s.
+    let tip = store.facts(created_at).unwrap().commit_seq;
+    store.acknowledge_outbox("projector", tip - 1, 1).unwrap();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(created_at + 59_999)
+        .await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+    daemon
+        .handler
+        .sample_kernel_health_for_test(created_at + 120_000)
+        .await;
+    let health = daemon.handler.health().await;
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["outbox_position_lag"], 1);
+    assert!(kernel["oldest_unconsumed_age_ms"].as_i64().unwrap() >= 60_000);
+    assert_eq!(kernel["lag_threshold_tripped"], true);
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded);
+
+    // The routed status method reports the same block from live facts.
+    let status = daemon
+        .handler
+        .dispatch_value_for_test(
+            daemon.route,
+            serde_json::json!({"method": "status", "session_id": "session-a"}),
+        )
+        .await;
+    let mc_module::dispatch::PreparedOutcome::Response(output) = status else {
+        panic!("status responded with {status:?}");
+    };
+    let value = response_json(&output);
+    assert_eq!(value["kernel"]["kernel_state"], "ready");
+    assert_eq!(value["kernel"]["required_consumer_count"], 1);
+    daemon.handler.shutdown().await.unwrap();
+}

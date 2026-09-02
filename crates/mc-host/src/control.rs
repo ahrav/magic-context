@@ -527,6 +527,64 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
     .expect("route response serialization cannot fail")
 }
 
+/// Passes the kernel health block through field by field. Each field is
+/// re-emitted only when it has the declared type and range; an invalid field
+/// is dropped while the rest of the block survives, and a block without a
+/// recognizable `kernel_state` is dropped whole so the CLI renders `unknown`.
+fn sanitize_kernel_block(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    const MAX_COUNTER: u64 = 1 << 53;
+    let raw = raw.as_object()?;
+    let state = raw
+        .get("kernel_state")
+        .and_then(serde_json::Value::as_str)?;
+    if !matches!(state, "ready" | "starting" | "unavailable") {
+        return None;
+    }
+    let mut block = serde_json::Map::new();
+    block.insert(
+        "kernel_state".to_owned(),
+        serde_json::Value::String(state.to_owned()),
+    );
+    if let Some(reason) = raw
+        .get("unavailable_reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| matches!(*reason, "store_unavailable" | "store_unsupported"))
+    {
+        block.insert(
+            "unavailable_reason".to_owned(),
+            serde_json::Value::String(reason.to_owned()),
+        );
+    }
+    for name in [
+        "sampled_at_ms",
+        "core_file_bytes",
+        "artifact_usage_bytes",
+        "artifact_cap_bytes",
+        "outbox_position_lag",
+        "oldest_unconsumed_age_ms",
+        "retained_outbox_rows",
+        "required_consumer_count",
+    ] {
+        match raw.get(name) {
+            Some(serde_json::Value::Null) => {
+                block.insert(name.to_owned(), serde_json::Value::Null);
+            }
+            Some(value) => {
+                if let Some(value) = value.as_u64().filter(|value| *value <= MAX_COUNTER) {
+                    block.insert(name.to_owned(), serde_json::Value::from(value));
+                }
+            }
+            None => {}
+        }
+    }
+    for name in ["core_file_warn", "artifact_warn", "lag_threshold_tripped"] {
+        if let Some(value) = raw.get(name).and_then(serde_json::Value::as_bool) {
+            block.insert(name.to_owned(), serde_json::Value::Bool(value));
+        }
+    }
+    Some(serde_json::Value::Object(block))
+}
+
 /// Returns the fixed successful `host.shutdown` response.
 pub fn host_shutdown_response_json() -> Vec<u8> {
     br#"{"op":"host.shutdown"}"#.to_vec()
@@ -620,6 +678,13 @@ pub fn host_status_response_json(
                             .insert("epochs".to_owned(), serde_json::Value::Object(values));
                     }
                 }
+            }
+            if let Some(kernel) = component
+                .get("metrics")
+                .and_then(|metrics| metrics.get("kernel"))
+                .and_then(sanitize_kernel_block)
+            {
+                sanitized_metrics.insert("kernel".to_owned(), kernel);
             }
         }
         components.insert(
@@ -1125,6 +1190,74 @@ mod tests {
             .contains("secret detail"),
             "handler detail is tainted and never exposed"
         );
+    }
+
+    #[test]
+    fn status_passes_valid_kernel_fields_and_drops_invalid_ones() {
+        let report = |kernel: serde_json::Value| crate::handler::HealthReport {
+            status: crate::handler::HealthStatus::Ok,
+            detail: None,
+            metrics: Some(serde_json::json!({
+                "components": {
+                    "magic-context": {
+                        "status": "ok",
+                        "metrics": { "storage_state": "ready", "kernel": kernel }
+                    }
+                }
+            })),
+        };
+        let kernel_of = |report: &crate::handler::HealthReport| -> serde_json::Value {
+            let response: serde_json::Value = serde_json::from_slice(&host_status_response_json(
+                report,
+                serde_json::json!({"state": "healthy"}),
+            ))
+            .expect("status JSON");
+            response["metrics"]["components"]["magic-context"]["metrics"]["kernel"].clone()
+        };
+
+        let full = kernel_of(&report(serde_json::json!({
+            "kernel_state": "ready",
+            "sampled_at_ms": 1_700_000_000_000_u64,
+            "core_file_bytes": 4096,
+            "core_file_warn": false,
+            "artifact_usage_bytes": 10,
+            "artifact_cap_bytes": 100,
+            "artifact_warn": false,
+            "outbox_position_lag": 3,
+            "oldest_unconsumed_age_ms": null,
+            "retained_outbox_rows": 8,
+            "required_consumer_count": 1,
+            "lag_threshold_tripped": true,
+            "extra_field": "dropped",
+        })));
+        assert_eq!(full["kernel_state"], "ready");
+        assert_eq!(full["outbox_position_lag"], 3);
+        assert_eq!(full["oldest_unconsumed_age_ms"], serde_json::Value::Null);
+        assert_eq!(full["lag_threshold_tripped"], true);
+        assert!(full.get("extra_field").is_none());
+        assert!(full.get("unavailable_reason").is_none());
+
+        // Out-of-range and mistyped fields vanish; the block and its state stay.
+        let partial = kernel_of(&report(serde_json::json!({
+            "kernel_state": "unavailable",
+            "unavailable_reason": "store_unsupported",
+            "core_file_bytes": -1,
+            "artifact_usage_bytes": "many",
+            "retained_outbox_rows": 1_u64 << 60,
+            "lag_threshold_tripped": "yes",
+        })));
+        assert_eq!(partial["kernel_state"], "unavailable");
+        assert_eq!(partial["unavailable_reason"], "store_unsupported");
+        assert!(partial.get("core_file_bytes").is_none());
+        assert!(partial.get("artifact_usage_bytes").is_none());
+        assert!(partial.get("retained_outbox_rows").is_none());
+        assert!(partial.get("lag_threshold_tripped").is_none());
+
+        // No recognizable state: no block at all.
+        let missing = kernel_of(&report(serde_json::json!({ "kernel_state": "broken" })));
+        assert!(missing.is_null());
+        let absent = kernel_of(&report(serde_json::json!(7)));
+        assert!(absent.is_null());
     }
 
     #[test]

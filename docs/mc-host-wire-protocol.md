@@ -568,6 +568,36 @@ activation, starting components refresh on a bounded 50 ms cadence; after
 activation settles, polling returns to the configured health interval.
 Handler detail strings are tainted and omitted.
 
+The `magic-context` component also carries a sanitized `metrics.kernel`
+block describing the kernel store and its outbox projector:
+
+| field | type | meaning |
+| --- | --- | --- |
+| `kernel_state` | `ready \| starting \| unavailable` | always present when the block is present |
+| `unavailable_reason` | `store_unavailable \| store_unsupported` | present only when `kernel_state` is `unavailable` |
+| `sampled_at_ms` | unsigned integer or `null` | wall-clock sample time of the numeric fields |
+| `core_file_bytes` | unsigned integer | core store file size |
+| `core_file_warn` | boolean | core file size crossed its warning threshold |
+| `artifact_usage_bytes` | unsigned integer | bytes held by retained artifacts |
+| `artifact_cap_bytes` | unsigned integer | configured artifact byte cap |
+| `artifact_warn` | boolean | artifact usage crossed its warning threshold |
+| `outbox_position_lag` | unsigned integer or `null` | outbox positions not yet consumed by the slowest required consumer |
+| `oldest_unconsumed_age_ms` | unsigned integer or `null` | age of the oldest unconsumed outbox row |
+| `retained_outbox_rows` | unsigned integer | outbox rows retained for consumers |
+| `required_consumer_count` | unsigned integer | registered required consumers |
+| `lag_threshold_tripped` | boolean | `outbox_position_lag` or `oldest_unconsumed_age_ms` crossed its threshold |
+
+Sanitization is per field: the whole block is dropped when `kernel_state` is
+missing or outside its closed set, `unavailable_reason` is dropped when it is
+outside its closed set, and each numeric field is dropped when it is not an
+unsigned integer at or below 2^53 (an explicit `null` passes through). A
+missing block, whether from an older daemon or from sanitization, is an
+unknown state: managed clients report kernel readiness as `unavailable` with
+reason `kernel_unavailable`, never as absent or healthy. A `ready` block with
+`lag_threshold_tripped: true` reports `kernel_lagging`, and a `ready` block
+with `required_consumer_count: 0` reports `no_required_consumer`; both are
+warn-class, non-failing readiness reasons.
+
 The `magic-context` component additionally carries a sanitized
 `metrics.epochs` object holding exactly these five compatibility epochs, in
 this order:

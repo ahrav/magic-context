@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { CatalogEntry } from "../mc-host-client";
 import type { PlatformReaders } from "./bootstrap";
+import { parseDaemonResult } from "./contract";
 import { releaseContract } from "./generated-contract";
 import { buildManagedCredentialEnvelope } from "./managed-policy";
 import {
@@ -503,6 +504,76 @@ describe("native invocation mapping", () => {
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("status and doctor classify kernel readiness as pass, warn, or fail", async () => {
+        const cases = [
+            {
+                kernel: { state: "ready", reason: "healthy" },
+                status: "pass",
+                ok: true,
+                remediation: null,
+            },
+            {
+                kernel: { state: "ready", reason: "kernel_lagging" },
+                status: "warn",
+                ok: true,
+                remediation: "inspect_kernel_projector",
+            },
+            {
+                kernel: { state: "ready", reason: "no_required_consumer" },
+                status: "warn",
+                ok: true,
+                remediation: null,
+            },
+            {
+                kernel: { state: "starting", reason: "kernel_starting" },
+                status: "fail",
+                ok: false,
+                remediation: "wait_and_retry",
+            },
+            {
+                kernel: { state: "unavailable", reason: "kernel_unavailable" },
+                status: "fail",
+                ok: false,
+                remediation: "inspect_storage",
+            },
+        ] as const;
+        for (const { kernel, status, ok, remediation } of cases) {
+            const root = tempDir(`mc-policy-kernel-${kernel.reason}-`);
+            const { binary } = fakeBinary(root);
+            try {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    readinessProbe: async () => ({
+                        ...compatibleObservation(),
+                        readiness: {
+                            transport: { state: "ready", reason: "healthy" },
+                            storage: { state: "ready", reason: "healthy" },
+                            synapse: { state: "ready", reason: "healthy" },
+                            kernel,
+                        },
+                    }),
+                });
+                for (const result of [await policy.status(), await policy.doctor()]) {
+                    expect(result.ok).toBe(ok);
+                    // A warn-class kernel reason never becomes the result reason.
+                    expect(result.reason).toBe(ok ? "healthy" : kernel.reason);
+                    expect(result.readiness?.kernel).toEqual(kernel);
+                    expect(result.checks.find((check) => check.id === "readiness.kernel")).toEqual({
+                        id: "readiness.kernel",
+                        status,
+                        reason: kernel.reason,
+                        remediation,
+                    });
+                    // The rendered result must round-trip through the strict parser.
+                    expect(() => parseDaemonResult(JSON.stringify(result))).not.toThrow();
+                }
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
         }
     });
 

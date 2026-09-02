@@ -23,6 +23,9 @@ path = "src/bin/ck-mc-host.rs"
 mc-core = { workspace = true }
 mc-store = { workspace = true }
 mc-kernel = { workspace = true }
+# Lock-free snapshot swap for the kernel health projection; already a transitive
+# dependency through gix, so it adds no new supply-chain root.
+arc-swap = "1"
 mc-tokenizer = { path = "../mc-tokenizer" }
 mc-host = { path = "../mc-host" }
 cortexkit-store-types = { workspace = true }
@@ -76,5 +79,6 @@ tokio = { workspace = true, features = ["signal"] }
 mc-store = { workspace = true, features = ["test-support"] }
 mc-kernel = { workspace = true, features = ["test-support"] }
 mc-module = { path = ".", features = ["test-support"] }
+rusqlite = { workspace = true }
 tempfile = "3"
 filetime = "0.2"

@@ -20,6 +20,7 @@
       "lifecycle.fences",
       "lifecycle.publication",
       "platform.support",
+      "readiness.kernel",
       "readiness.storage",
       "readiness.synapse",
       "readiness.transport"
@@ -50,6 +51,11 @@
       "usage": 2
     },
     "readiness_states": {
+      "kernel": [
+        "ready",
+        "starting",
+        "unavailable"
+      ],
       "storage": [
         "ready",
         "starting",
@@ -166,7 +172,15 @@
           "remediation": "inspect_storage"
         },
         {
+          "id": "kernel_unavailable",
+          "remediation": "inspect_storage"
+        },
+        {
           "id": "storage_starting",
+          "remediation": "wait_and_retry"
+        },
+        {
+          "id": "kernel_starting",
           "remediation": "wait_and_retry"
         },
         {
@@ -199,15 +213,21 @@
         "already_running",
         "already_stopped",
         "healthy",
+        "kernel_lagging",
+        "no_required_consumer",
         "started",
         "stopped",
         "synapse_unsupported"
-      ]
+      ],
+      "warn_remediations": {
+        "kernel_lagging": "inspect_kernel_projector"
+      }
     },
     "remediations": [
       "align_versions",
       "free_storage",
       "inspect_daemon_process",
+      "inspect_kernel_projector",
       "inspect_storage",
       "inspect_synapse",
       "install_native_payload",

@@ -5,6 +5,8 @@
 //! route can never observe a `Ready` phase with an empty slot, and `health()`
 //! can read the phase from one atomic without touching the store.
 
+pub mod health;
+pub mod serving;
 pub(crate) mod state;
 
 use std::path::{Path, PathBuf};
@@ -29,6 +31,12 @@ pub enum KernelState {
     Starting = 0,
     Ready = 1,
     Unavailable = 2,
+}
+
+impl serde::Serialize for KernelState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 impl KernelState {
@@ -57,6 +65,7 @@ pub(crate) struct KernelOpenCoordinator {
     /// Which [`UnavailableReason`] an `Unavailable` state carries.
     unavailable_kind: AtomicU8,
     slot: Mutex<Option<Arc<KernelStore>>>,
+    health: health::KernelHealthProjection,
 }
 
 impl KernelOpenCoordinator {
@@ -65,7 +74,13 @@ impl KernelOpenCoordinator {
             state: AtomicU8::new(KernelState::Starting as u8),
             unavailable_kind: AtomicU8::new(UNAVAILABLE_STORE),
             slot: Mutex::new(None),
+            health: health::KernelHealthProjection::new(),
         }
+    }
+
+    /// The last published health block; reads one atomic pointer.
+    pub(crate) fn health_block(&self) -> Arc<health::KernelHealthBlock> {
+        self.health.load()
     }
 
     pub(crate) fn state(&self) -> KernelState {
@@ -122,6 +137,7 @@ impl KernelOpenCoordinator {
         self.state
             .store(KernelState::Unavailable as u8, Ordering::Release);
         *self.slot.lock().expect("kernel store slot mutex") = None;
+        self.publish_phase();
     }
 
     /// Opens the kernel store under `root`, waiting through a held lease the

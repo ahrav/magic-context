@@ -64,6 +64,30 @@ function storageState(metrics: Record<string, unknown>): "ready" | "starting" | 
     return state === "ready" || state === "unavailable" ? state : "starting";
 }
 
+export type KernelReadiness =
+    | { state: "ready"; reason: "healthy" | "kernel_lagging" | "no_required_consumer" }
+    | { state: "starting"; reason: "kernel_starting" }
+    | { state: "unavailable"; reason: "kernel_unavailable" };
+
+export function kernelReadiness(metrics: Record<string, unknown>): KernelReadiness {
+    const components = asRecord(metrics.components);
+    const magicContext = asRecord(components?.["magic-context"]);
+    const componentMetrics = asRecord(magicContext?.metrics);
+    const kernel = asRecord(componentMetrics?.kernel);
+    const state = kernel?.kernel_state;
+    if (state === "starting") return { state: "starting", reason: "kernel_starting" };
+    // An absent block is an unknown state and never reads as healthy.
+    if (state !== "ready") return { state: "unavailable", reason: "kernel_unavailable" };
+    // A lagging projector outranks an empty required-consumer set.
+    if (kernel?.lag_threshold_tripped === true) {
+        return { state: "ready", reason: "kernel_lagging" };
+    }
+    if (kernel?.required_consumer_count === 0) {
+        return { state: "ready", reason: "no_required_consumer" };
+    }
+    return { state: "ready", reason: "healthy" };
+}
+
 /**
  */
 class StorageProbeDaemonMismatchError extends Error {
@@ -288,6 +312,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     }
     const components = asRecord(status.metrics.components);
     const storage = storageState(status.metrics);
+    const kernel = kernelReadiness(status.metrics);
     const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
     const synapseState = synapseMetrics?.synapse_state;
     const synapse =
@@ -330,6 +355,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                           : "storage_unavailable",
             },
             synapse,
+            kernel,
         },
     };
 }

@@ -7,6 +7,7 @@ import { evaluateCompatibility } from "./compatibility";
 import { releaseContract } from "./generated-contract";
 import {
     createManagedLifecyclePolicy,
+    kernelReadiness,
     type ManagedCompatibilityClient,
     readCompatibilitySnapshot,
 } from "./managed-policy";
@@ -267,5 +268,116 @@ describe("managed observational platform gate", () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+});
+
+describe("kernel readiness from host.status metrics", () => {
+    const readyBlock = {
+        kernel_state: "ready",
+        sampled_at_ms: 1_700_000_000_000,
+        core_file_bytes: 4096,
+        core_file_warn: false,
+        artifact_usage_bytes: 0,
+        artifact_cap_bytes: 1_048_576,
+        artifact_warn: false,
+        outbox_position_lag: 0,
+        oldest_unconsumed_age_ms: 0,
+        retained_outbox_rows: 0,
+        required_consumer_count: 1,
+        lag_threshold_tripped: false,
+    };
+    const metricsWith = (kernel: unknown) => ({
+        components: {
+            "magic-context": {
+                metrics: {
+                    storage_state: "ready",
+                    ...(kernel === undefined ? {} : { kernel }),
+                },
+            },
+        },
+    });
+
+    test("a missing block is unknown, never absent or healthy", () => {
+        expect(kernelReadiness(metricsWith(undefined))).toEqual({
+            state: "unavailable",
+            reason: "kernel_unavailable",
+        });
+        expect(kernelReadiness({})).toEqual({
+            state: "unavailable",
+            reason: "kernel_unavailable",
+        });
+    });
+
+    test("a block without a valid kernel_state is unavailable", () => {
+        expect(kernelReadiness(metricsWith({}))).toEqual({
+            state: "unavailable",
+            reason: "kernel_unavailable",
+        });
+        expect(kernelReadiness(metricsWith({ kernel_state: "degraded" }))).toEqual({
+            state: "unavailable",
+            reason: "kernel_unavailable",
+        });
+        expect(kernelReadiness(metricsWith("ready"))).toEqual({
+            state: "unavailable",
+            reason: "kernel_unavailable",
+        });
+    });
+
+    test("starting and unavailable states pass through with their reasons", () => {
+        expect(kernelReadiness(metricsWith({ kernel_state: "starting" }))).toEqual({
+            state: "starting",
+            reason: "kernel_starting",
+        });
+        expect(
+            kernelReadiness(
+                metricsWith({
+                    kernel_state: "unavailable",
+                    unavailable_reason: "store_unsupported",
+                }),
+            ),
+        ).toEqual({ state: "unavailable", reason: "kernel_unavailable" });
+    });
+
+    test("a ready block with lag past threshold warns as kernel_lagging", () => {
+        expect(
+            kernelReadiness(
+                metricsWith({
+                    ...readyBlock,
+                    outbox_position_lag: 5000,
+                    lag_threshold_tripped: true,
+                }),
+            ),
+        ).toEqual({ state: "ready", reason: "kernel_lagging" });
+    });
+
+    test("lag outranks an empty required-consumer set", () => {
+        expect(
+            kernelReadiness(
+                metricsWith({
+                    ...readyBlock,
+                    required_consumer_count: 0,
+                    lag_threshold_tripped: true,
+                }),
+            ),
+        ).toEqual({ state: "ready", reason: "kernel_lagging" });
+    });
+
+    test("a ready block with no required consumer warns as no_required_consumer", () => {
+        expect(kernelReadiness(metricsWith({ ...readyBlock, required_consumer_count: 0 }))).toEqual(
+            { state: "ready", reason: "no_required_consumer" },
+        );
+    });
+
+    test("a ready block within threshold and with a consumer is healthy", () => {
+        expect(kernelReadiness(metricsWith(readyBlock))).toEqual({
+            state: "ready",
+            reason: "healthy",
+        });
+        // The sanitizer may drop invalid numeric fields; a bare ready state is
+        // still healthy because neither warn signal is asserted.
+        expect(kernelReadiness(metricsWith({ kernel_state: "ready" }))).toEqual({
+            state: "ready",
+            reason: "healthy",
+        });
     });
 });

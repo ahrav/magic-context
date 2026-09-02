@@ -92,10 +92,9 @@ fn remediation_for(reason: &'static str) -> Option<&'static str> {
         | "incompatible_daemon"
         | "incompatible_module"
         | "incompatible_epochs" => Some("align_versions"),
-        "lifecycle_busy" | "storage_starting" | "synapse_starting" | "stopping" | "starting" => {
-            Some("wait_and_retry")
-        }
-        "storage_unavailable" => Some("inspect_storage"),
+        "lifecycle_busy" | "storage_starting" | "kernel_starting" | "synapse_starting"
+        | "stopping" | "starting" => Some("wait_and_retry"),
+        "storage_unavailable" | "kernel_unavailable" => Some("inspect_storage"),
         "synapse_degraded" => Some("inspect_synapse"),
         "not_running" => Some("run_daemon_start"),
         // Non-failing reasons.

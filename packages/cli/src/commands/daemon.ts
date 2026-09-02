@@ -128,6 +128,13 @@ export function renderDaemonHuman(result: DaemonResultV1): string {
                 lines.push(`Readiness ${component}: ${readiness.state} (${readiness.reason})`);
             }
         }
+        // Unobserved kernel readiness renders as `unknown` so the line is never omitted.
+        const kernel = result.readiness.kernel;
+        lines.push(
+            kernel === undefined
+                ? "Readiness kernel: unknown"
+                : `Readiness kernel: ${kernel.state} (${kernel.reason})`,
+        );
     }
     for (const check of result.checks) {
         const remediation = check.remediation === null ? "" : ` remediation=${check.remediation}`;

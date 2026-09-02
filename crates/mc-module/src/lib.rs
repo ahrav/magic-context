@@ -2858,7 +2858,7 @@ pub struct McHandler {
     /// `cancel` is the sole source of task-admission state.
     /// spawn_gate prevents the admission check and following `tasks.spawn` from straddling tracker shutdown.
     /// A second admission boolean would have to change in lockstep with `cancel`, but nothing enforces that.
-    spawn_gate: Mutex<()>,
+    spawn_gate: Arc<Mutex<()>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     producer_factory: Arc<dyn HistorianProducerFactory>,
@@ -3376,7 +3376,7 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             kernel: Arc::new(kernel_routes::KernelOpenCoordinator::new()),
             pending_storage: Mutex::new(None),
-            spawn_gate: Mutex::new(()),
+            spawn_gate: Arc::new(Mutex::new(())),
             cancel,
             tasks: TaskTracker::new(),
             producer_factory,
@@ -3450,6 +3450,24 @@ impl McHandler {
         Some(self.tasks.spawn(future))
     }
 
+    /// A spawner a running task can use to admit a follow-on task under the
+    /// same gate and tracker, since it holds no `&self`.
+    fn tracked_spawner(
+        &self,
+    ) -> impl Fn(Arc<kernel_routes::KernelOpenCoordinator>, CancellationToken) + Send + 'static
+    {
+        let gate = Arc::clone(&self.spawn_gate);
+        let cancel = self.cancel.clone();
+        let tasks = self.tasks.clone();
+        move |kernel, task_cancel| {
+            let _gate = gate.lock().expect("module spawn gate mutex");
+            if cancel.is_cancelled() {
+                return;
+            }
+            tasks.spawn(kernel.run_sampler(task_cancel));
+        }
+    }
+
     fn spawn_module_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -3485,6 +3503,7 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let kernel = Arc::clone(&self.kernel);
+        let sampler_spawn = self.tracked_spawner();
         let coordinator = Arc::clone(&self.store_open);
         let task_coordinator = Arc::clone(&coordinator);
         let cancel = self.cancel.clone();
@@ -3510,8 +3529,11 @@ impl McHandler {
                 match (opened, &descriptor.backend) {
                     (true, StorageBackend::Sqlite { path }) => {
                         kernel
-                            .open(kernel_routes::kernel_root_for(path), policy, cancel)
+                            .open(kernel_routes::kernel_root_for(path), policy, cancel.clone())
                             .await;
+                        if kernel.state() == kernel_routes::KernelState::Ready {
+                            sampler_spawn(Arc::clone(&kernel), cancel);
+                        }
                     }
                     (true, _) | (false, _) => {
                         kernel.mark_unavailable(kernel_routes::UnavailableReason::StoreUnavailable)
@@ -3709,7 +3731,7 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             kernel: Arc::new(kernel_routes::KernelOpenCoordinator::new()),
             pending_storage: Mutex::new(None),
-            spawn_gate: Mutex::new(()),
+            spawn_gate: Arc::new(Mutex::new(())),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
             producer_factory: factory,
@@ -7790,6 +7812,7 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
+                    "kernel": kernel_routes::health::live_block(&self.kernel, now_ms()).to_json(),
                 })),
                 Err(e) => PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -7855,6 +7878,7 @@ impl McHandler {
                 "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "storage_versions": storage_versions_block(&store),
+            "kernel": kernel_routes::health::live_block(&self.kernel, now_ms()).to_json(),
         }))
     }
 
@@ -11749,6 +11773,21 @@ impl CompositeComponent for McHandler {
             "storage_state".to_owned(),
             serde_json::Value::String(storage_state.to_owned()),
         );
+        // One atomic load; only the sampler task reads the store for this block.
+        let kernel = self.kernel.health_block();
+        if storage_state == "ready" && kernel.degrades_health() {
+            report.status = HealthStatus::Degraded;
+            let reason = match kernel.kernel_state {
+                kernel_routes::KernelState::Ready => "kernel outbox lag past threshold",
+                kernel_routes::KernelState::Starting => "kernel store is opening",
+                kernel_routes::KernelState::Unavailable => "kernel store is unavailable",
+            };
+            report.detail = Some(match report.detail.take() {
+                Some(detail) => format!("{detail}; {reason}"),
+                None => reason.to_owned(),
+            });
+        }
+        metrics.insert("kernel".to_owned(), kernel.to_json());
         metrics.insert(
             "epochs".to_owned(),
             json!({
@@ -11970,10 +12009,14 @@ impl McHandler {
         self.kernel.kernel_store().ok()
     }
 
+    /// Runs one health sample at `now_ms` instead of waiting for the sampler tick.
     #[cfg(feature = "test-support")]
-    pub fn kernel_unavailable_reason_for_test(
-        &self,
-    ) -> Option<kernel_routes::UnavailableReason> {
+    pub async fn sample_kernel_health_for_test(&self, now_ms: i64) {
+        self.kernel.sample(now_ms).await;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn kernel_unavailable_reason_for_test(&self) -> Option<kernel_routes::UnavailableReason> {
         (self.kernel.state() == kernel_routes::KernelState::Unavailable)
             .then(|| self.kernel.unavailable_reason())
     }

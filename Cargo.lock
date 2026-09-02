@@ -2032,6 +2032,7 @@ name = "mc-module"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "arc-swap",
  "async-trait",
  "chrono",
  "chrono-tz",
@@ -2050,6 +2051,7 @@ dependencies = [
  "memchr",
  "proptest",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
