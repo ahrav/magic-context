@@ -517,7 +517,20 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             if (row.applied > (backed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: derived-mismatch`);
         }
     }
+    // Both producers write one coverage row per selected scenario, and `metamorphicExitCode` reads violations
+    // only from rows that exist, so a scenario with entries but no row would hide its own violations.
+    const covered = new Set(report.coverage.map(({ scenarioId }) => scenarioId));
+    for (const [index, entry] of report.entries.entries()) {
+        if (entry.transformId === CONTROL_TRANSFORM_ID) continue;
+        if (!covered.has(entry.scenarioId)) p.fail(`report.entries[${index}]: coverage-row-required`);
+    }
     const sources = new Set(report.entries.flatMap((entry) => entry.kind === "scored" ? [entry.baselineScore.source] : []));
+    // The live runner completes and validates its control pair before any product pair, so a tier-valid
+    // run-record report carries exactly one scored control.
+    if (report.tierInvalidReason === null && sources.has("run-record")) {
+        const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
+        if (controls.length !== 1 || controls[0]!.kind !== "scored") p.fail("report.entries: control-pair-required");
+    }
     // One producer writes a report, and each producer scores through one seam.
     if (sources.size > 1) p.fail("report.entries: source-mismatch");
     // The raw-output path scores without a system tuple and publishes none at the root.

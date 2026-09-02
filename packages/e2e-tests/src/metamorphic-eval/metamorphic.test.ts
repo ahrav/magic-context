@@ -325,13 +325,27 @@ describe("deterministic metamorphic runner", () => {
             entry.invariants = entry.invariants.filter(({ invariant }) =>
                 invariant !== "expected-absent-empty" && invariant !== "verdict-monotonicity");
         }
+        // A live report carries its stability control before any product pair.
+        expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries: control-pair-required/);
         const rootEntry = rootMismatch.entries[scoredIndex]!;
         if (rootEntry.kind !== "scored") throw new Error("unreachable");
         const otherSystem = { ...systemTuple(), historianModelId: "another-model" };
         rootEntry.baselineScore.system = otherSystem;
         rootEntry.derivativeScore.system = otherSystem;
-        expect(() => parseMetamorphicReport(rootMismatch))
-            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: report-system-mismatch`));
+        const control = structuredClone(rootEntry);
+        control.transformId = "baseline-control";
+        control.transformVersion = 1;
+        control.seed = 0;
+        control.derivativeScore.scenarioId = control.scenarioId;
+        rootMismatch.entries.push(control);
+        rootMismatch.entries.sort((left, right) =>
+            `${left.scenarioId}\u0000${left.transformId}`.localeCompare(`${right.scenarioId}\u0000${right.transformId}`));
+        expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries\[\d+\]: report-system-mismatch/);
+        // Every scenario with entries has its coverage row, or its violations could vanish with it.
+        const uncovered = structuredClone(report);
+        const dropped = uncovered.coverage.shift()!;
+        expect(uncovered.entries.some((entry) => entry.scenarioId === dropped.scenarioId)).toBe(true);
+        expect(() => parseMetamorphicReport(uncovered)).toThrow(/report\.entries\[\d+\]: coverage-row-required/);
         // Each producer emits a fixed invariant set, so dropping a row hides a failure.
         const missingInvariant = structuredClone(report);
         const missingEntry = missingInvariant.entries[scoredIndex]!;
