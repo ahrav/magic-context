@@ -33,8 +33,28 @@ fi
 # --- END BEADS INTEGRATION v1.2.2 ---
 
 # Comment hygiene on staged source files.
-staged=$(git diff --cached --name-only --diff-filter=ACMR -- "*.rs" "*.ts" "*.tsx" "*.js" "*.mjs" "*.py" "*.sh")
+staged=$(git diff --cached --name-only --diff-filter=ACMR -- "*.rs" "*.ts" "*.tsx" "*.js" "*.mjs" "*.py" "*.sh" "*.yml" "*.yaml")
 if [ -n "$staged" ] && [ -x scripts/check-comments.sh ]; then
+  root=$(git rev-parse --show-toplevel) || exit 1
+  work=$(mktemp -d) || exit 1
+  trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+  # A partially staged file differs from its working-tree copy, so the scan reads
+  # index content to judge what the commit will actually contain.
+  printf '%s\n' "$staged" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in */*) mkdir -p "$work/${f%/*}" || exit 1 ;; esac
+    git cat-file blob ":$f" > "$work/$f" || exit 1
+  done || exit 1
+
+  paths=""
+  for f in $staged; do
+    paths="$paths $work/$f"
+  done
+
   # shellcheck disable=SC2086
-  scripts/check-comments.sh $staged || exit 1
+  if ! out=$("$root/scripts/check-comments.sh" $paths 2>&1); then
+    printf '%s\n' "$out" | sed "s|$work/||g" >&2
+    exit 1
+  fi
 fi
