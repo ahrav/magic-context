@@ -332,6 +332,21 @@ export const OPENCODE_MEMORY_PATH_FILES = [
     "plugin/tool-registry.ts",
 ];
 
+/** Every Pi file on the memory path, relative to `packages/pi-plugin/src`; the same bans scan it. */
+export const PI_MEMORY_PATH_FILES = [
+    "tools/ctx-memory.ts",
+    "tools/ctx-search.ts",
+    "tools/index.ts",
+    "kernel-client-pi.ts",
+    "inject-compartments-pi.ts",
+    "context-handler.ts",
+    "auto-search-pi.ts",
+    "dialogs/status-dialog.ts",
+    "commands/ctx-status.ts",
+    "clone-inheritance.ts",
+    "pi-historian-runner.ts",
+];
+
 const TEXT_BANS = ["claim.intent", "authorityState", "rustToolBackends.memory"];
 
 /**
@@ -358,6 +373,17 @@ describe("ctx_memory memory path text bans", () => {
         const sources = new Map<string, string>();
         for (const file of OPENCODE_MEMORY_PATH_FILES) {
             sources.set(file, readFileSync(resolve(import.meta.dir, "../..", file), "utf8"));
+        }
+        expect(scanForBans(sources)).toEqual([]);
+    });
+
+    test("no Pi memory-path file names the claim lane, authority state, or the Rust memory backend", () => {
+        const sources = new Map<string, string>();
+        for (const file of PI_MEMORY_PATH_FILES) {
+            sources.set(
+                `pi-plugin/${file}`,
+                readFileSync(resolve(import.meta.dir, "../../../../pi-plugin/src", file), "utf8"),
+            );
         }
         expect(scanForBans(sources)).toEqual([]);
     });

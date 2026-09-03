@@ -9,6 +9,7 @@ import {
 	type PendingPiCompactionMarker,
 } from "@magic-context/core/features/magic-context/storage";
 import { log } from "@magic-context/core/shared/logger";
+import { isolatePiSessionKernelTokens } from "./kernel-client-pi";
 import { convertEntriesToRawMessages } from "./read-session-pi";
 
 const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
@@ -182,6 +183,9 @@ export async function handlePiCloneSessionStart(
 		if (destinationSessionId.length === 0) {
 			throw new Error("Pi clone session id is empty");
 		}
+		// The fork copies session rows below; kernel tokens and `known_as_of` are
+		// process state the clone must not share, so its first read fetches from tip.
+		isolatePiSessionKernelTokens(destinationSessionId);
 
 		stage = "read-source-header";
 		sourceSessionId = await readPiSessionIdFromFile(event.previousSessionFile);

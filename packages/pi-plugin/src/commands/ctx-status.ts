@@ -3,7 +3,6 @@ import { getCompartments } from "@magic-context/core/features/magic-context/comp
 import { getMostRecentTaskRunAt } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import { CANONICAL_DREAM_TASKS } from "@magic-context/core/features/magic-context/dreamer/task-registry";
-import type { SnapshotVector } from "@magic-context/core/features/magic-context/memory/claim-operation-contract";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getPendingOps } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
@@ -11,16 +10,23 @@ import { getOverflowState } from "@magic-context/core/features/magic-context/sto
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
-import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { describeError } from "@magic-context/core/shared/error-message";
+import {
+	type KernelClientResolver,
+	type KernelMemorySnapshot,
+	type StateKey,
+	stateKey,
+} from "@magic-context/core/shared/kernel-client";
 import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
-import { showStatusDialog } from "../dialogs/status-dialog";
+import { readStatusMemory, showStatusDialog } from "../dialogs/status-dialog";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
 export interface RegisterCtxStatusDeps {
 	db: ContextDatabase;
+	/** Serves the memory count and state the command reports. */
+	kernelClient: KernelClientResolver;
 	projectIdentity: string;
 	resolveStatusDeps?: (ctx: { cwd: string }) => CtxStatusRuntimeDeps;
 	resolveProject?: (ctx: { cwd: string }) => {
@@ -32,7 +38,6 @@ export interface RegisterCtxStatusDeps {
 		| number
 		| { default: number; [modelKey: string]: number };
 	historyBudgetPercentage?: number;
-	injectionBudgetTokens?: number;
 	commitClusterTrigger?: { enabled: boolean; min_clusters: number };
 	executeThresholdTokens?: {
 		default?: number;
@@ -56,9 +61,10 @@ export interface CtxStatusDetails {
 	lastExecuteThreshold: number;
 	compartmentCount: number;
 	lastCompartmentRange: string | null;
+	/** Rows the kernel serves this project on the `explicit_search` surface. */
 	memoryCount: number;
-	memoryClaims: Array<{ publicClaimId: string; revisionLocator: string }>;
-	memorySnapshotVector: SnapshotVector | null;
+	/** The kernel's state for that read, such as `available` or `unavailable:daemon_absent`. */
+	memoryState: StateKey;
 	noteCount: number;
 	dreamer: {
 		enabled: boolean;
@@ -146,7 +152,11 @@ export function registerCtxStatusCommand(
 					windowGeometry,
 					resolveTailHygieneStatus(getPiChannel1Baseline(sessionId)),
 				);
-				const details = buildStatusDetails(currentDeps, sessionId);
+				const details = buildStatusDetails(
+					currentDeps,
+					sessionId,
+					await readStatusMemory(currentDeps, sessionId, ctx.cwd),
+				);
 				sendCtxStatusMessage(
 					pi,
 					{ title: "/ctx-status", text: statusText, level: "info" },
@@ -163,9 +173,10 @@ export function registerCtxStatusCommand(
 	});
 }
 
-function buildStatusDetails(
+export function buildStatusDetails(
 	deps: RegisterCtxStatusDeps,
 	sessionId: string,
+	memory: KernelMemorySnapshot,
 ): CtxStatusDetails {
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
 	const tags = getTagsBySession(deps.db, sessionId);
@@ -174,11 +185,6 @@ function buildStatusDetails(
 	const compartments = getCompartments(deps.db, sessionId);
 	const lastCompartment = compartments[compartments.length - 1];
 	const totalBytes = activeTags.reduce((sum, tag) => sum + tag.byteSize, 0);
-	const claimLane = readProjectClaimLaneSnapshot(deps.db, deps.projectIdentity);
-	const memoryClaims = (claimLane?.items ?? []).map((item) => ({
-		publicClaimId: item.publicClaimId,
-		revisionLocator: item.revisionLocator,
-	}));
 
 	return {
 		sessionId,
@@ -192,9 +198,8 @@ function buildStatusDetails(
 		lastCompartmentRange: lastCompartment
 			? `${lastCompartment.startMessage}-${lastCompartment.endMessage}`
 			: null,
-		memoryCount: memoryClaims.length,
-		memoryClaims,
-		memorySnapshotVector: claimLane?.snapshotVector ?? null,
+		memoryCount: memory.rows.length,
+		memoryState: stateKey(memory.state),
 		noteCount:
 			getNotes(deps.db, { sessionId, type: "session", status: "active" })
 				.length +

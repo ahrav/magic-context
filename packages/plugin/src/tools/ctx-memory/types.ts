@@ -1,5 +1,4 @@
 import type { AntiMemoryPayload } from "../../features/magic-context/memory/anti-memory-content";
-import type { ClaimMutationToken } from "../../features/magic-context/memory/claim-operation-contract";
 import type { KernelClientResolver } from "../../shared/kernel-client";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
@@ -29,17 +28,6 @@ export interface CtxMemoryArgs extends ImitatedReducedArgs {
     objectIds?: string[];
     limit?: number;
     reason?: string;
-}
-
-/**
- * Arguments of the claim-lane executor in `claim-actions.ts`, which addresses
- * claims by public id and proves freshness with a mutation token.
- */
-export interface CtxMemoryClaimArgs extends CtxMemoryArgs {
-    publicClaimId?: string;
-    publicClaimIds?: string[];
-    mutationToken?: ClaimMutationToken;
-    mutationTokens?: ClaimMutationToken[];
 }
 
 export type { KernelClientResolver };

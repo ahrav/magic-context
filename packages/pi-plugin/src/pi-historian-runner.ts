@@ -26,10 +26,9 @@ import {
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "@magic-context/core/features/magic-context/memory";
 import {
-	readAuthorizedClaimMemorySnapshot,
-	renderClaimMemoryBlock,
-} from "@magic-context/core/features/magic-context/memory/claim-memory-render";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+	resolveProjectIdentityForSession,
+	resolveProjectRootDirectory,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	clearEmergencyDrainLatch,
 	clearEmergencyRecovery,
@@ -75,6 +74,10 @@ import {
 	isTransientHistorianPromptError,
 	MAX_HISTORIAN_RETRIES,
 } from "@magic-context/core/hooks/magic-context/historian-retry-policy";
+import {
+	memoryRows,
+	renderKernelMemoryBlock,
+} from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
 	createDefaultBoundarySnapshotForTests,
@@ -92,6 +95,11 @@ import {
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
+import {
+	isAvailable,
+	type KernelClientResolver,
+	stateKey,
+} from "@magic-context/core/shared/kernel-client";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
@@ -318,6 +326,8 @@ export interface PiHistorianDeps {
 	thinkingLevel?: string;
 	/** `memory.enabled` enables cross-session memory. */
 	memoryEnabled?: boolean;
+	/** Serves the project-memory block the historian deduplicates against; absent when no daemon transport exists. */
+	kernelClient?: KernelClientResolver;
 	/** allowHomeProject permits sessions started exactly in the canonical home directory only when user-level configuration enables it. */
 	allowHomeProject?: boolean;
 	/* */
@@ -373,6 +383,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		twoPass,
 		thinkingLevel,
 		memoryEnabled,
+		kernelClient,
 		allowHomeProject,
 		autoPromote,
 		userMemoriesEnabled,
@@ -615,24 +626,34 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				rollbackDrainReservation();
 				return;
 			}
-			const memorySnapshot = readAuthorizedClaimMemorySnapshot(db, {
-				authorizedIdentities: [projectPath],
-				ownIdentities: [projectPath],
-				sharedCategories: [],
-				workspaceEpoch: `pi-historian:${sessionId}:${chunk.startIndex}-${chunk.endIndex}`,
-			});
-			if (!memorySnapshot) {
-				sessionLog(
+			// The historian sees the same baseline the model saw so it does not
+			// re-derive facts already held as project memory. A non-available
+			// read omits the block; the marker line is for the model, not the historian.
+			let projectMemory = "";
+			if (memoryEnabled !== false && kernelClient) {
+				const read = await kernelClient({
 					sessionId,
-					"pi historian claim snapshot remained stale; omitting memories",
-				);
+					projectRoot: resolveProjectRootDirectory(directory),
+				}).read({ surface: "auto_inject", gated: false });
+				if (isAvailable(read)) {
+					projectMemory = renderKernelMemoryBlock(
+						memoryRows({
+							state: read.state,
+							rows: read.rows,
+							knownAsOf: read.known_as_of,
+						}),
+						read.state,
+					);
+				} else {
+					sessionLog(
+						sessionId,
+						`historian memory read answered ${stateKey(read.state)}; omitting memories`,
+					);
+				}
 			}
-			const memoryBlock =
-				renderClaimMemoryBlock(memorySnapshot?.items ?? []) ?? undefined;
 
 			// The historian receives bounded reference blocks instead of all prior compartments.
 			// The historian receives four rotating cross-project seed examples for importance-band calibration and the last six same-session compartments for continuity.
-			const projectMemory = memoryBlock ?? "";
 			const references = buildReferenceBlocks({
 				sessionId,
 				chunkStart: chunk.startIndex,

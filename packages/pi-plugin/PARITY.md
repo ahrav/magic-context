@@ -155,7 +155,7 @@ shared resolver's log-only dubious-ownership warning while still using the same
   **stdin** (Pi concatenates stdin + positional) to avoid Linux `MAX_ARG_STRLEN`
   / E2BIG; the positional is omitted when piping.
 - `--no-session` keeps subagent JSONL out of the user's session picker.
-- Claim writes are intentionally not divergent. OpenCode and Pi wrappers keep harness-specific authorization, formatting, and post-commit embedding/module dispatch, but both call the same transaction-local claim kernel. Same operation commits crosswalk, immutable revision metadata, outbox, and generation. Public-tool e2e covers OpenCode→Pi and Pi→OpenCode writes against shared DB.
+- Project memory is not divergent. Every memory surface on both harnesses (`ctx_memory`, the `memory` source of `ctx_search`, the m[0] `<project-memory>` block, auto-search, the historian's baseline block, and the status views) reads and writes through the shared kernel client in `packages/plugin/src/shared/kernel-client`, which Pi imports through the `@magic-context/core/*` alias. Pi and OpenCode wrappers parse their own tool argument shapes and call the same `executeCtxMemory` and `executeCtxSearch`, so tool text, state markers, and conflict wording are byte-identical. Neither harness reads the claim-lane tables on the memory path; Biome `noRestrictedImports` overrides in both packages forbid those imports.
 - Ship Pi, OpenCode, CLI, and the directly linked mc-host component from the same revision. There is no migration or backfill lane: the claims-only direct format is the only database family this binary opens, and every other shape is refused before SQLite recovery. A refused family is abandoned with `magic-context doctor reset-db` (or repaired with `magic-context doctor repair-db`), then both harnesses restart. Archive/delete retire claim visibility and retain claim history; no Pi or OpenCode response promises erasure.
 
 ---
@@ -772,6 +772,12 @@ copy compartments, tags, reductions, and deferred Pi marker state while filterin
 them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
 entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
 a separate future design based on a stable cross-fork identity.
+
+Kernel token state is not inherited. A forked Pi session gets its own
+`TokenCache` (`kernel-client-pi.ts`), so it starts with no mutation tokens and no
+cached `known_as_of`; its first read fetches from the daemon tip. The copied
+session rows carry no cached m[0], so the first pass re-renders memory from that
+read.
 
 ---
 

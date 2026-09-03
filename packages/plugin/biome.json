@@ -73,7 +73,6 @@
         {
             "includes": [
                 "src/tools/ctx-memory/**",
-                "!src/tools/ctx-memory/claim-actions.ts",
                 "src/tools/ctx-search/**",
                 "src/hooks/magic-context/kernel-transport.ts",
                 "src/hooks/magic-context/kernel-memory-render.ts",

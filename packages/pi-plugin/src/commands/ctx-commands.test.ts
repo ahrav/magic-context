@@ -4,6 +4,7 @@ import { queuePendingOp } from "@magic-context/core/features/magic-context/stora
 import { insertTag } from "@magic-context/core/features/magic-context/storage-tags";
 import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { awaitInFlightRecomps } from "../pi-recomp-runner";
+import { fakeKernelResolver } from "../test-utils";
 import { registerCtxDreamCommand } from "./ctx-dream";
 import { registerCtxFlushCommand } from "./ctx-flush";
 import { registerCtxRecompCommand } from "./ctx-recomp";
@@ -123,6 +124,7 @@ describe("Pi Magic Context commands", () => {
 
 		registerCtxStatusCommand(pi as never, {
 			db,
+			kernelClient: fakeKernelResolver().kernelClient,
 			projectIdentity: "/tmp/project",
 		});
 		await handlers.get("ctx-status")?.("", ctx);
@@ -138,6 +140,7 @@ describe("Pi Magic Context commands", () => {
 
 		registerCtxStatusCommand(pi as never, {
 			db,
+			kernelClient: fakeKernelResolver().kernelClient,
 			projectIdentity: "/tmp/project",
 		});
 		await handlers.get("ctx-status")?.("", createCtx());
@@ -175,6 +178,7 @@ describe("Pi Magic Context commands", () => {
 		const { pi, handlers, sent } = createMockPi();
 		registerCtxStatusCommand(pi as never, {
 			db,
+			kernelClient: fakeKernelResolver().kernelClient,
 			projectIdentity: "/tmp/project",
 		});
 
@@ -343,6 +347,7 @@ describe("Pi Magic Context commands", () => {
 		const { pi, handlers, sent } = createMockPi();
 		registerCtxStatusCommand(pi as never, {
 			db,
+			kernelClient: fakeKernelResolver().kernelClient,
 			projectIdentity: "/tmp/boot",
 			resolveProject: (ctx) => ({
 				projectDir: ctx.cwd,
@@ -356,11 +361,45 @@ describe("Pi Magic Context commands", () => {
 		});
 	});
 
+	it("/ctx-status reports the kernel state and row count, no claim-lane counts", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		const fake = fakeKernelResolver();
+		fake.kernel.seedDecision({
+			object_id: `mem_${"2".repeat(32)}`,
+			decision_kind: "NAMING",
+			summary: "One memory.",
+		});
+		registerCtxStatusCommand(pi as never, {
+			db,
+			kernelClient: fake.kernelClient,
+			projectIdentity: "/tmp/project",
+		});
+
+		await handlers.get("ctx-status")?.("", createCtx());
+		const details = sent[0]?.data.details as Record<string, unknown>;
+		expect(details).toMatchObject({ memoryCount: 1, memoryState: "available" });
+		expect(details).not.toHaveProperty("memoryClaims");
+		expect(details).not.toHaveProperty("memorySnapshotVector");
+		expect(fake.transport.calls[0]?.body).toMatchObject({
+			surface: "explicit_search",
+			gated: true,
+		});
+
+		fake.transport.fileExists = false;
+		await handlers.get("ctx-status")?.("", createCtx());
+		expect(sent[1]?.data.details).toMatchObject({
+			memoryCount: 0,
+			memoryState: "unavailable:daemon_absent",
+		});
+	});
+
 	it("/ctx-status passes dreamer enabled field through details", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
 		registerCtxStatusCommand(pi as never, {
 			db,
+			kernelClient: fakeKernelResolver().kernelClient,
 			projectIdentity: "/tmp/project",
 			dreamer: { runnable: true, scheduleSummary: "verify 0 3 * * *" },
 		});

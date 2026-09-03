@@ -4,6 +4,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { setHarness } from "@magic-context/core/shared/harness";
+import {
+	KernelClient,
+	type KernelClientResolver,
+	TokenCache,
+} from "@magic-context/core/shared/kernel-client";
+import {
+	FakeKernel,
+	FakeKernelTransport,
+} from "@magic-context/core/shared/kernel-client-testing/fake-kernel";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
 export type PiMessage = ContextEvent["messages"][number];
@@ -184,4 +193,28 @@ export function createCountingPi() {
 		sendUserMessage: () => undefined,
 	} as unknown as ExtensionAPI;
 	return { pi, events, tools, flags, commands, entryRenderers };
+}
+
+/** A kernel client resolver over an in-memory fake; `transport.calls` records every round trip. */
+export function fakeKernelResolver(kernel = new FakeKernel()): {
+	kernel: FakeKernel;
+	transport: FakeKernelTransport;
+	tokens: TokenCache;
+	kernelClient: KernelClientResolver;
+} {
+	const transport = new FakeKernelTransport(kernel);
+	const tokens = new TokenCache();
+	return {
+		kernel,
+		transport,
+		tokens,
+		kernelClient: ({ sessionId, projectRoot }) =>
+			new KernelClient({
+				transport,
+				enabled: true,
+				sessionId,
+				projectRoot,
+				tokens,
+			}),
+	};
 }

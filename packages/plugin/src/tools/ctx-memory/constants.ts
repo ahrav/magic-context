@@ -18,23 +18,6 @@ export const DEFAULT_SEARCH_LIMIT = 10;
 export const GET_MAX_CLAIMS = 20;
 
 /**
- * A decode schema must include the token required by revise, archive, restore, and merge.
- *
- */
-export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
-    type: "object",
-    fields: {
-        tokenVersion: "number",
-        publicClaimId: "string",
-        revision: "number",
-        contentDigest: "string",
-        lifecycleSeq: "number",
-        applicabilityHeadsDigest: "string",
-        policyHeadsDigest: "string",
-    },
-};
-
-/**
  */
 export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
     type: "object",

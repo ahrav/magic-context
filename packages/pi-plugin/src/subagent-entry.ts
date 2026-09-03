@@ -37,12 +37,16 @@ import { configureSynapseManagedDemandStart } from "@magic-context/core/features
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { createLazyManagedDemandStart } from "@magic-context/core/hooks/magic-context/module-transport";
+import {
+	configureManagedDemandStart,
+	createLazyManagedDemandStart,
+} from "@magic-context/core/hooks/magic-context/module-transport";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import { loadPiConfig } from "./config";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import { createPiKernelClientResolver } from "./kernel-client-pi";
 import { registerMagicContextTools } from "./tools";
 
 const SUBAGENT_DREAMER_ACTIONS_FLAG = "magic-context-dreamer-actions";
@@ -54,6 +58,7 @@ const managedDemandStart = createLazyManagedDemandStart({
 let openedDb: ContextDatabase | undefined;
 
 export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
+	configureManagedDemandStart(managedDemandStart);
 	configureSynapseManagedDemandStart(managedDemandStart);
 	// Shared-core session writes tag rows with `harness='pi'`.
 	setHarness("pi");
@@ -88,6 +93,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 
 			registerMagicContextTools(pi, {
 				db,
+				kernelClient: createPiKernelClientResolver(() => cfg),
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				resolveProjectIdentity: (ctx) =>
 					resolveProjectIdentityForSession(ctx.cwd, cfg.allow_home_project),

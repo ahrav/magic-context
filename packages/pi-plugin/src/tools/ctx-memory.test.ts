@@ -1,56 +1,50 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { installAuthorityManagedMarker } from "@magic-context/core/features/magic-context/context-authority";
-import { readAntiMemory } from "@magic-context/core/features/magic-context/memory/storage-anti-memory";
+import { renderToolStateText } from "@magic-context/core/shared/kernel-client";
+import { FakeKernel } from "@magic-context/core/shared/kernel-client-testing/fake-kernel";
 import {
-	computeProjectMemoryMutationToken,
-	getProjectMemoryClaimByPublicId,
-} from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
-import {
-	createClaimReaderTestDatabase,
-	seedProjectMemoryClaim,
-} from "@magic-context/core/features/magic-context/test-claim-database";
+	MEMORY_STATE_TABLE,
+	stubKernelClient,
+} from "@magic-context/core/shared/kernel-client-testing/state-table";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createCtxMemoryTools } from "@magic-context/core/tools/ctx-memory/tools";
+import { createTestDb, fakeKernelResolver } from "../test-utils";
 import { createCtxMemoryTool } from "./ctx-memory";
 
-const PROJECT = "git:u4-pi";
-const FOREIGN = "git:u4-pi-foreign";
+const PROJECT = "git:kernel-pi";
+const CWD = "/tmp/kernel-pi";
+const SESSION = "ses-kernel-pi";
 
-type MutationToken = ReturnType<typeof computeProjectMemoryMutationToken>;
-type JsonResult = {
+interface CommitJson {
 	action: string;
 	outcome: string;
-	staleReason: string | null;
-	affectedClaims?: Array<{
-		publicClaimId: string;
-		revisionLocator: string;
-		mutationToken: MutationToken;
-	}>;
-	claims?: Array<{
-		publicClaimId: string;
-		revisionLocator: string;
-		content: string;
-		category?: string;
-		antiMemory?: Record<string, string | null>;
-		lifecycleState: string;
-		mutationToken: MutationToken;
-	}>;
-	missingPublicClaimIds?: string[];
-	effects: unknown[];
-	generation: number | null;
-};
+	commitSeq: number;
+	knownAsOf: number;
+	objects: string[];
+}
+
+interface ReadJson {
+	action: string;
+	knownAsOf: number;
+	memories: Array<{ objectId: string; category: string; content: string }>;
+	missingObjectIds?: string[];
+}
 
 function harness(
-	db: ReturnType<typeof createClaimReaderTestDatabase>,
-	allowDreamerActions = false,
-	resolveProjectIdentity: () => string = () => PROJECT,
+	kernel = new FakeKernel(),
+	options: {
+		allowDreamerActions?: boolean;
+		kernelClient?: ReturnType<typeof fakeKernelResolver>["kernelClient"];
+	} = {},
 ) {
+	const db = createTestDb();
+	const fake = fakeKernelResolver(kernel);
 	const tool = createCtxMemoryTool({
 		db,
-		resolveProjectIdentity,
-		allowDreamerActions,
+		kernelClient: options.kernelClient ?? fake.kernelClient,
+		resolveProjectIdentity: () => PROJECT,
+		allowDreamerActions: options.allowDreamerActions ?? false,
 	});
 	const execute = async (args: Record<string, unknown>, callId: string) =>
 		tool.execute(
@@ -59,557 +53,312 @@ function harness(
 			new AbortController().signal,
 			undefined,
 			{
-				cwd: "/tmp/u4-pi",
-				sessionManager: { getSessionId: () => "ses-u4-pi" },
+				cwd: CWD,
+				sessionManager: { getSessionId: () => SESSION },
 			} as never,
 		);
-	return { tool, execute };
+	return { db, tool, execute, ...fake, close: () => closeQuietly(db) };
 }
 
-function textOf(
-	result: Awaited<ReturnType<ReturnType<typeof harness>["execute"]>>,
-): string {
+type ExecuteResult = Awaited<ReturnType<ReturnType<typeof harness>["execute"]>>;
+
+function textOf(result: ExecuteResult): string {
 	return result.content[0]?.text ?? "";
 }
 
-function parseResult(
-	result: Awaited<ReturnType<ReturnType<typeof harness>["execute"]>>,
-): JsonResult {
-	const text = textOf(result);
+function parseResult<T>(result: ExecuteResult): T {
 	expect(result.isError).toBeUndefined();
-	return JSON.parse(text) as JsonResult;
+	return JSON.parse(textOf(result)) as T;
 }
 
 function createArgs(content: string) {
 	return { action: "create", category: "ARCHITECTURE", content };
 }
 
-/**
- */
 function reduced(inner: Record<string, unknown>) {
 	return { reduced: true, summary: JSON.stringify(inner) };
 }
 
-describe("Pi ctx_memory U4 scenario 1: create", () => {
-	it("returns canonical direct-claim result", async () => {
-		const db = createClaimReaderTestDatabase();
+describe("Pi ctx_memory create", () => {
+	it("returns a commit receipt and stores the decision in the kernel", async () => {
+		const tool = harness();
 		try {
-			const result = parseResult(
-				await harness(db).execute(
-					createArgs("Pi uses direct claims."),
-					"call-create",
-				),
+			const created = parseResult<CommitJson>(
+				await tool.execute(createArgs("Pi uses the kernel."), "call-create"),
 			);
-			expect(result).toMatchObject({
+			expect(created).toMatchObject({
 				action: "create",
 				outcome: "applied",
+				commitSeq: 1,
 			});
-			expect(result.affectedClaims?.[0]?.publicClaimId).toMatch(
-				/^mcm_[0-9a-f]{32}$/,
-			);
-			expect(result.affectedClaims?.[0]?.revisionLocator).toContain("/r1/");
-			expect(result.generation).toBe(1);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory anti-memory write union", () => {
-	it("creates typed anti-memory and rejects cross-arm payloads", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const tool = harness(db);
-			const antiMemory = {
-				trigger: "Choosing a cache backend",
-				rejectedStrategy: "Use Redis",
-				rejectionReason: "The project must work offline",
-				saferAlternative: "Use SQLite",
-				preconditions: "offline operation",
-				attemptedApproach: "external cache",
-				observedFailure: "startup failed",
-				rootCause: "network dependency",
-				recovery: "remove Redis",
-				nonApplicableWhen: null,
+			expect(created.objects).toHaveLength(1);
+			const objectId = created.objects[0] as string;
+			expect(objectId).toMatch(/^mem_[0-9a-f]{32}$/);
+			expect(tool.kernel.objects.get(objectId)?.decision).toEqual({
+				decision_kind: "ARCHITECTURE",
+				payload: { summary: "Pi uses the kernel.", rationale: "" },
+			});
+			const commit = tool.transport.calls[0]?.body as {
+				intent: { actor: string };
 			};
-			const created = parseResult(
-				await tool.execute(
-					reduced({
-						action: "create",
-						category: "REJECTED_APPROACH",
-						antiMemory,
-					}),
-					"call-anti-create",
-				),
-			);
-			const id = created.affectedClaims?.[0]?.publicClaimId;
-			expect(readAntiMemory(db, id as string)?.payload).toMatchObject(
-				antiMemory,
-			);
-			for (const [callId, args] of [
-				[
-					"call-anti-missing",
-					{ action: "create", category: "REJECTED_APPROACH" },
-				],
-				[
-					"call-positive-anti",
-					{
-						action: "create",
-						category: "ARCHITECTURE",
-						content: "positive",
-						antiMemory,
-					},
-				],
-			] as const) {
-				const result = await tool.execute(args, callId);
-				expect(result.isError).toBeTrue();
-			}
+			expect(commit.intent.actor).toBe("agent:pi");
 		} finally {
-			closeQuietly(db);
+			tool.close();
+		}
+	});
+
+	it("replays a duplicate call and creates no second object", async () => {
+		const tool = harness();
+		try {
+			const args = createArgs("Replay exact bytes.");
+			const first = parseResult<CommitJson>(
+				await tool.execute(args, "call-replay"),
+			);
+			const second = parseResult<CommitJson>(
+				await tool.execute(args, "call-replay"),
+			);
+			expect(second).toMatchObject({
+				outcome: "already applied",
+				objects: first.objects,
+			});
+			expect(tool.kernel.liveRows()).toHaveLength(1);
+		} finally {
+			tool.close();
 		}
 	});
 });
 
-describe("Pi ctx_memory U4 scenario 2: get/list", () => {
-	it("reads by public ID and role-gates list", async () => {
-		const db = createClaimReaderTestDatabase();
+describe("Pi ctx_memory revise", () => {
+	it("revises by object id through the cached token and supersedes the target", async () => {
+		const tool = harness();
 		try {
-			const seeded = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Pi reader claim.",
-				operationKey: "u4-pi-read",
-			});
-			const primary = harness(db);
-			const got = parseResult(
-				await primary.execute(
-					{ action: "get", publicClaimIds: [seeded.publicClaimId] },
-					"call-get",
-				),
+			const created = parseResult<CommitJson>(
+				await tool.execute(createArgs("Pi uses the kernel."), "call-create"),
 			);
-			expect(got.claims?.[0]).toMatchObject({
-				publicClaimId: seeded.publicClaimId,
-				revisionLocator: seeded.revisionLocator,
-				content: "Pi reader claim.",
-			});
-			expect(
-				textOf(await primary.execute({ action: "list" }, "call-list")),
-			).toContain("not allowed");
-			const listed = parseResult(
-				await harness(db, true).execute(
-					{ action: "list" },
-					"call-list-dreamer",
-				),
-			);
-			expect(listed.claims?.map((claim) => claim.publicClaimId)).toEqual([
-				seeded.publicClaimId,
-			]);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory U4 scenario 3: revise/lifecycle", () => {
-	it("revises, archives, and restores with claim tokens", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const tool = harness(db);
-			const created = parseResult(
-				await tool.execute(createArgs("Pi lifecycle original."), "call-create"),
-			);
-			const first = created.affectedClaims?.[0];
-			if (!first) throw new Error("missing create result");
-			const revised = parseResult(
+			const objectId = created.objects[0] as string;
+			const revised = parseResult<CommitJson>(
 				await tool.execute(
-					{
-						action: "revise",
-						publicClaimId: first.publicClaimId,
-						mutationToken: first.mutationToken,
-						content: "Pi lifecycle revised.",
-					},
+					{ action: "revise", objectId, content: "Pi uses the kernel routes." },
 					"call-revise",
 				),
 			);
-			const second = revised.affectedClaims?.[0];
-			if (!second) throw new Error("missing revise result");
-			expect(second.revisionLocator).toContain("/r2/");
-			const archived = parseResult(
-				await tool.execute(
-					{
-						action: "archive",
-						publicClaimId: second.publicClaimId,
-						mutationToken: second.mutationToken,
-					},
-					"call-archive",
-				),
-			);
-			const archivedToken = archived.affectedClaims?.[0]?.mutationToken;
-			if (!archivedToken) throw new Error("missing archive token");
-			const restored = parseResult(
-				await tool.execute(
-					{
-						action: "restore",
-						publicClaimId: second.publicClaimId,
-						mutationToken: archivedToken,
-					},
-					"call-restore",
-				),
-			);
-			expect(restored.outcome).toBe("applied");
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory U4 scenario 4: same-project merge", () => {
-	it("retires same-project sources and rejects foreign sources", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const target = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Pi merge target.",
-				operationKey: "u4-pi-merge-target",
-			});
-			const source = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Pi merge source.",
-				operationKey: "u4-pi-merge-source",
-			});
-			const foreign = seedProjectMemoryClaim(db, {
-				projectIdentity: FOREIGN,
-				content: "Pi foreign source.",
-				operationKey: "u4-pi-merge-foreign",
-			});
-			const tool = harness(db);
-			const merged = parseResult(
-				await tool.execute(
-					{
-						action: "merge",
-						mutationTokens: [target.token, source.token],
-						content: "Pi merged claim.",
-					},
-					"call-merge",
-				),
-			);
+			expect(revised.outcome).toBe("applied");
+			const survivor = revised.objects.find((id) => id !== objectId) as string;
+			expect(tool.kernel.objects.get(objectId)?.superseded_by).toBe(survivor);
 			expect(
-				merged.affectedClaims?.map((claim) => claim.publicClaimId).sort(),
-			).toEqual([target.publicClaimId, source.publicClaimId].sort());
-			const blocked = await tool.execute(
-				{
-					action: "merge",
-					mutationTokens: [
-						computeProjectMemoryMutationToken(db, target.publicClaimId),
-						foreign.token,
-					],
-				},
-				"call-merge-foreign",
-			);
-			expect(blocked.isError).toBeTrue();
-			expect(textOf(blocked)).toBe(
-				"Error: claim not found or not visible from this project",
-			);
+				tool.kernel.objects.get(survivor)?.decision?.payload.summary,
+			).toBe("Pi uses the kernel routes.");
+			expect(tool.transport.methods()).toEqual([
+				"kernel.commit",
+				"kernel.read",
+				"kernel.commit",
+			]);
 		} finally {
-			closeQuietly(db);
+			tool.close();
 		}
 	});
-});
 
-describe("Pi ctx_memory U4 scenario 5: replay", () => {
-	it("replays exact args and rejects key reuse", async () => {
-		const db = createClaimReaderTestDatabase();
+	it("renders the same conflict text as OpenCode after a concurrent change", async () => {
+		const kernel = new FakeKernel();
+		kernel.seedDecision({
+			object_id: "mem_seeded",
+			decision_kind: "CONSTRAINTS",
+			summary: "Seeded.",
+		});
+		const pi = harness(kernel);
 		try {
-			const tool = harness(db);
-			const args = createArgs("Pi replay claim.");
-			const firstResult = await tool.execute(args, "call-replay");
-			const firstText = textOf(firstResult);
-			const first = parseResult(firstResult).affectedClaims?.[0];
-			if (!first) throw new Error("missing Pi replay create result");
-			await tool.execute(
-				{
-					action: "revise",
-					publicClaimId: first.publicClaimId,
-					mutationToken: first.mutationToken,
-					content: "Pi replay state moved later.",
-				},
-				"call-replay-state-move",
+			parseResult<ReadJson>(
+				await pi.execute(
+					{ action: "get", objectIds: ["mem_seeded"] },
+					"call-get",
+				),
 			);
-			expect(textOf(await tool.execute(args, "call-replay"))).toBe(firstText);
-			const changed = await tool.execute(
-				createArgs("Changed Pi args."),
-				"call-replay",
+			kernel.beforeCommit = () => kernel.touch("mem_seeded");
+			const piResult = await pi.execute(
+				{ action: "revise", objectId: "mem_seeded", content: "Moved." },
+				"call-revise-conflict",
 			);
-			expect(changed.isError).toBeTrue();
-			expect(textOf(changed)).toBe(
-				"Error: this tool call id was already committed with different arguments. Retry as a new call.",
-			);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory U4 scenario 6: privacy/ownership", () => {
-	it("makes hidden equal missing and refuses foreign mutation", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const hidden = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Pi hidden claim.",
-				operationKey: "u4-pi-hidden",
+			expect(piResult.isError).toBe(true);
+			const conflictText = renderToolStateText({
+				kind: "conflict",
+				reason: "known_as_of_advanced",
 			});
-			const hiddenRef = getProjectMemoryClaimByPublicId(
-				db,
-				hidden.publicClaimId,
+			expect(textOf(piResult)).toBe(
+				`Error: ${conflictText} Re-read mem_seeded with ctx_memory get, then retry.`,
 			);
-			if (!hiddenRef) throw new Error("missing hidden claim");
-			db.transaction(() => {
-				db.prepare(
-					`INSERT INTO claim_disposition_events
-						(revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
-					 VALUES (?, ?, 'quarantined', 'assert', 'user:test', 1, ?)`,
-				).run(hiddenRef.currentRevisionId, hidden.projectId, Date.now());
-				db.prepare(
-					"UPDATE claim_effective_policy SET hard_hidden = 1, auto_eligible = 0, explicit_eligible = 0 WHERE revision_id = ?",
-				).run(hiddenRef.currentRevisionId);
-			}).immediate();
-			const missingId = `mcm_${"e".repeat(32)}`;
-			const tool = harness(db);
-			const hiddenGet = parseResult(
-				await tool.execute(
-					{ action: "get", publicClaimIds: [hidden.publicClaimId] },
-					"call-hidden",
-				),
-			);
-			const missingGet = parseResult(
-				await tool.execute(
-					{ action: "get", publicClaimIds: [missingId] },
-					"call-missing",
-				),
-			);
-			expect(hiddenGet.claims).toEqual(missingGet.claims);
-			const foreign = seedProjectMemoryClaim(db, {
-				projectIdentity: FOREIGN,
-				content: "Pi foreign claim.",
-				operationKey: "u4-pi-foreign",
+
+			const openCodeKernel = new FakeKernel();
+			openCodeKernel.seedDecision({
+				object_id: "mem_seeded",
+				decision_kind: "CONSTRAINTS",
+				summary: "Seeded.",
 			});
-			const blocked = await tool.execute(
-				{
-					action: "archive",
-					publicClaimId: foreign.publicClaimId,
-					mutationToken: foreign.token,
-				},
-				"call-foreign-archive",
-			);
-			expect(blocked.isError).toBeTrue();
-			expect(textOf(blocked)).toBe(
-				"Error: claim not found or not visible from this project",
-			);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory U4 scenario 6b: active project binding", () => {
-	it("rejects a mutation retry after the active project changes", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			let activeProject = PROJECT;
-			const tool = harness(db, false, () => activeProject);
-			const args = createArgs("Project-bound Pi operation.");
-			expect(
-				(await tool.execute(args, "call-project-bound")).isError,
-			).toBeUndefined();
-			activeProject = FOREIGN;
-			const retry = await tool.execute(args, "call-project-bound");
-			expect(retry.isError).toBeTrue();
-			expect(textOf(retry)).toContain("different arguments");
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory U4 scenario 7: human authority", () => {
-	it("rejects agent approve and enforce", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const tool = harness(db);
-			const approve = await tool.execute({ action: "approve" }, "call-approve");
-			const enforce = await tool.execute({ action: "enforce" }, "call-enforce");
-			for (const result of [approve, enforce]) {
-				expect(result.isError).toBeTrue();
-				expect(textOf(result)).toContain("human-host-owned");
-			}
-			const unknown = await harness(db, true).execute(
-				{ action: "delete" },
-				"call-delete",
-			);
-			expect(unknown.isError).toBeTrue();
-			expect(textOf(unknown)).toContain("not allowed");
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("Pi ctx_memory imitated reduced arguments carry mutation tokens", () => {
-	it("decodes a reduced revise that carries its single token", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const tool = harness(db);
-			const created = parseResult(
-				await tool.execute(
-					createArgs("Pi reduced original."),
-					"call-reduced-create",
-				),
-			);
-			const first = created.affectedClaims?.[0];
-			if (!first) throw new Error("missing create result");
-			const revised = parseResult(
-				await tool.execute(
-					reduced({
-						action: "revise",
-						publicClaimId: first.publicClaimId,
-						mutationToken: first.mutationToken,
-						content: "Pi reduced revised.",
-					}),
-					"call-reduced-revise",
-				),
-			);
-			expect(revised).toMatchObject({ action: "revise", outcome: "applied" });
-			expect(revised.affectedClaims?.[0]?.revisionLocator).toContain("/r2/");
-			expect(
-				getProjectMemoryClaimByPublicId(db, first.publicClaimId)?.revision,
-			).toBe(2);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-
-	it("decodes a reduced merge that carries an ordered token array", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const target = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Pi reduced merge target.",
-				operationKey: "u4-pi-reduced-merge-target",
-			});
-			const source = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Pi reduced merge source.",
-				operationKey: "u4-pi-reduced-merge-source",
-			});
-			const tool = harness(db);
-			const merged = parseResult(
-				await tool.execute(
-					reduced({
-						action: "merge",
-						mutationTokens: [target.token, source.token],
-						content: "Pi reduced merged claim.",
-					}),
-					"call-reduced-merge",
-				),
-			);
-			expect(
-				merged.affectedClaims?.map((claim) => claim.publicClaimId).sort(),
-			).toEqual([target.publicClaimId, source.publicClaimId].sort());
-			const sourceGet = parseResult(
-				await tool.execute(
-					{ action: "get", publicClaimIds: [source.publicClaimId] },
-					"call-reduced-merge-get",
-				),
-			);
-			expect(sourceGet.claims?.[0]?.lifecycleState).toBe("retired");
-		} finally {
-			closeQuietly(db);
-		}
-	});
-
-	it("rejects a malformed reduced token without reaching the mutation path", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const tool = harness(db);
-			const created = parseResult(
-				await tool.execute(
-					createArgs("Pi reduced malformed base."),
-					"call-reduced-create",
-				),
-			);
-			const first = created.affectedClaims?.[0];
-			if (!first) throw new Error("missing create result");
-
-			for (const [index, badToken] of [
-				{
-					...first.mutationToken,
-					revision: String(first.mutationToken.revision),
-				},
-				{ ...first.mutationToken, extra: "smuggled" },
-				"not-an-object",
-			].entries()) {
-				const rejected = await tool.execute(
-					reduced({
-						action: "revise",
-						publicClaimId: first.publicClaimId,
-						mutationToken: badToken,
-						content: "Must not apply.",
-					}),
-					`call-reduced-bad-${index}`,
-				);
-				expect(rejected.isError).toBeTrue();
-				expect(textOf(rejected)).toContain("not allowed");
-			}
-
-			expect(
-				getProjectMemoryClaimByPublicId(db, first.publicClaimId)?.revision,
-			).toBe(1);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-});
-
-describe("ctx_memory U4 cross-harness parity", () => {
-	it("returns identical canonical reads and authority errors", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			const seeded = seedProjectMemoryClaim(db, {
-				projectIdentity: PROJECT,
-				content: "Cross-harness claim.",
-				operationKey: "u4-cross-harness",
-			});
+			const openCodeFake = fakeKernelResolver(openCodeKernel);
 			const openCode = createCtxMemoryTools({
-				db,
+				kernelClient: openCodeFake.kernelClient,
 				resolveProjectPath: () => PROJECT,
 			}).ctx_memory;
-			const openCodeExecute = (args: Record<string, unknown>, callID: string) =>
+			const openCodeExecute = (
+				args: Record<string, unknown>,
+				callID: string,
+			) =>
 				openCode.execute(
 					args as never,
 					{
-						sessionID: "ses-u4-cross-harness",
-						directory: "/tmp/u4-cross-harness",
+						sessionID: SESSION,
+						directory: CWD,
 						callID,
 						agent: "primary",
 					} as never,
 				) as Promise<string>;
-			const pi = harness(db);
-			const args = { action: "get", publicClaimIds: [seeded.publicClaimId] };
-			expect(textOf(await pi.execute(args, "call-get-pi"))).toBe(
-				await openCodeExecute(args, "call-get-opencode"),
+			await openCodeExecute(
+				{ action: "get", objectIds: ["mem_seeded"] },
+				"call-get",
 			);
+			openCodeKernel.beforeCommit = () => openCodeKernel.touch("mem_seeded");
 			expect(
-				textOf(await pi.execute({ action: "approve" }, "call-approve-pi")),
-			).toBe(
-				await openCodeExecute({ action: "approve" }, "call-approve-opencode"),
-			);
+				await openCodeExecute(
+					{ action: "revise", objectId: "mem_seeded", content: "Moved." },
+					"call-revise-conflict",
+				),
+			).toBe(textOf(piResult));
 		} finally {
-			closeQuietly(db);
+			pi.close();
 		}
 	});
 });
 
-describe("Pi ctx_memory U4 scenario 8: no legacy active path", () => {
+describe("Pi ctx_memory reads and role gates", () => {
+	it("reads by object id, reports missing ids, and gates list behind dreamer actions", async () => {
+		const kernel = new FakeKernel();
+		kernel.seedDecision({
+			object_id: "mem_a",
+			decision_kind: "NAMING",
+			summary: "A.",
+		});
+		const primary = harness(kernel);
+		const dreamer = harness(kernel, { allowDreamerActions: true });
+		try {
+			const read = parseResult<ReadJson>(
+				await primary.execute(
+					{ action: "get", objectIds: ["mem_a", "mem_missing"] },
+					"call-get",
+				),
+			);
+			expect(read.memories.map((memory) => memory.objectId)).toEqual(["mem_a"]);
+			expect(read.missingObjectIds).toEqual(["mem_missing"]);
+
+			const denied = await primary.execute({ action: "list" }, "call-list");
+			expect(denied.isError).toBe(true);
+			expect(textOf(denied)).toContain("not allowed");
+
+			const listed = parseResult<ReadJson>(
+				await dreamer.execute({ action: "list" }, "call-list"),
+			);
+			expect(listed.memories.map((memory) => memory.objectId)).toEqual(["mem_a"]);
+		} finally {
+			primary.close();
+			dreamer.close();
+		}
+	});
+
+	it("rejects agent approve and enforce", async () => {
+		const tool = harness();
+		try {
+			for (const action of ["approve", "enforce"]) {
+				const result = await tool.execute({ action }, `call-${action}`);
+				expect(result.isError).toBe(true);
+				expect(textOf(result)).toBe(
+					"Error: approve and enforce are human-host-owned commands, not agent actions.",
+				);
+			}
+			expect(tool.transport.calls).toHaveLength(0);
+		} finally {
+			tool.close();
+		}
+	});
+});
+
+describe("Pi ctx_memory imitated reduced arguments", () => {
+	it("decodes a reduced revise that names its object id", async () => {
+		const kernel = new FakeKernel();
+		kernel.seedDecision({
+			object_id: "mem_reduced",
+			decision_kind: "NAMING",
+			summary: "Before.",
+		});
+		const tool = harness(kernel);
+		try {
+			const revised = parseResult<CommitJson>(
+				await tool.execute(
+					reduced({
+						action: "revise",
+						objectId: "mem_reduced",
+						content: "After.",
+					}),
+					"call-reduced-revise",
+				),
+			);
+			expect(revised.outcome).toBe("applied");
+			expect(tool.kernel.objects.get("mem_reduced")?.superseded_by).toBeString();
+		} finally {
+			tool.close();
+		}
+	});
+
+	it("decodes a reduced merge that names its object ids", async () => {
+		const kernel = new FakeKernel();
+		kernel.seedDecision({ object_id: "mem_x", decision_kind: "NAMING", summary: "X." });
+		kernel.seedDecision({ object_id: "mem_y", decision_kind: "NAMING", summary: "Y." });
+		const tool = harness(kernel);
+		try {
+			const merged = parseResult<CommitJson>(
+				await tool.execute(
+					reduced({
+						action: "merge",
+						objectIds: ["mem_x", "mem_y"],
+						content: "XY.",
+					}),
+					"call-reduced-merge",
+				),
+			);
+			expect(merged.outcome).toBe("applied");
+			expect(tool.kernel.objects.get("mem_x")?.superseded_by).toBe(
+				tool.kernel.objects.get("mem_y")?.superseded_by ?? "",
+			);
+		} finally {
+			tool.close();
+		}
+	});
+});
+
+describe("Pi ctx_memory memory state table", () => {
+	it.each(MEMORY_STATE_TABLE)(
+		"a stubbed client answering %s drives the tool text",
+		async (_key, state) => {
+			const tool = harness(new FakeKernel(), {
+				allowDreamerActions: true,
+				kernelClient: () => stubKernelClient(state),
+			});
+			try {
+				const result = await tool.execute({ action: "list" }, "call-list");
+				if (state.kind === "available") {
+					expect(parseResult<ReadJson>(result)).toMatchObject({
+						action: "list",
+						memories: [],
+					});
+				} else {
+					expect(result.isError).toBe(true);
+					expect(textOf(result)).toBe(`Error: ${renderToolStateText(state)}`);
+				}
+			} finally {
+				tool.close();
+			}
+		},
+	);
+});
+
+describe("Pi ctx_memory source", () => {
 	it("contains no legacy IDs, embeddings, or mutation-log writes", () => {
 		const source = readFileSync(
 			resolve(import.meta.dir, "ctx-memory.ts"),
@@ -621,40 +370,10 @@ describe("Pi ctx_memory U4 scenario 8: no legacy active path", () => {
 			"storage-memory-claims",
 			'storage-memory"',
 			"memoryId",
+			"publicClaimId",
+			"mutationToken",
 		]) {
 			expect(source).not.toContain(forbidden);
-		}
-	});
-});
-
-describe("Pi ctx_memory module-authority fence", () => {
-	it("refuses mutations while a module authority marker exists without writing a receipt", async () => {
-		const db = createClaimReaderTestDatabase();
-		try {
-			installAuthorityManagedMarker(db, PROJECT, "context-store-test");
-			const before = (
-				db
-					.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts")
-					.get() as {
-					count: number;
-				}
-			).count;
-			const result = await harness(db).execute(
-				createArgs("must remain uncommitted"),
-				"call-module-owned",
-			);
-			expect(result.isError).toBe(true);
-			expect(textOf(result)).toContain("module-owned or transitioning");
-			const after = (
-				db
-					.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts")
-					.get() as {
-					count: number;
-				}
-			).count;
-			expect(after).toBe(before);
-		} finally {
-			closeQuietly(db);
 		}
 	});
 });

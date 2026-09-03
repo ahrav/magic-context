@@ -64,7 +64,10 @@ import {
 	resolveHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
-import { createLazyManagedDemandStart } from "@magic-context/core/hooks/magic-context/module-transport";
+import {
+	configureManagedDemandStart,
+	createLazyManagedDemandStart,
+} from "@magic-context/core/hooks/magic-context/module-transport";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -145,6 +148,7 @@ import {
 } from "./dreamer";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
+import { createPiKernelClientResolver } from "./kernel-client-pi";
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
@@ -680,6 +684,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	configureManagedDemandStart(managedDemandStart);
 	configureSynapseManagedDemandStart(managedDemandStart);
 	markPiMagicContextActive();
 	beginBootQuietPeriod();
@@ -885,12 +890,20 @@ async function startPiMagicContextRuntime(
 	// The memoized project-dependency accessor resolves project-sensitive configuration for the active cwd.
 	const projectDepsByDir = new Map<string, ResolvedPiProjectDeps>();
 
+	// One resolver serves every memory surface; it reads the configuration of the
+	// project root it is asked about, so a `/cd` into another project dials with
+	// that project's settings.
+	const kernelClient = createPiKernelClientResolver(
+		(projectRoot) => resolveProjectDepsForDir(projectRoot).config,
+	);
+
 	const buildContextOptions = (
 		cfg: MagicContextConfig,
 		hist: PiHistorianOptions | undefined,
 		auto: PiAutoSearchHandlerOptions,
 	): PiContextHandlerOptions => ({
 		db: database,
+		kernelClient,
 		smartDrops: cfg.smart_drops === true,
 		protectedTags: cfg.protected_tags ?? 20,
 		heuristics: {
@@ -948,6 +961,7 @@ async function startPiMagicContextRuntime(
 	): ResolvedPiProjectDeps {
 		const hist = resolveHistorianFromConfig(cfg);
 		if (hist) {
+			hist.kernelClient = kernelClient;
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
 					db: database,
@@ -1020,6 +1034,7 @@ async function startPiMagicContextRuntime(
 	// Pi registers tools and slash commands once per process.
 	registerMagicContextTools(pi, {
 		db,
+		kernelClient,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 		// `--magic-context-dreamer-actions` flag.
 		allowDreamerActions: false,
@@ -1105,14 +1120,13 @@ async function startPiMagicContextRuntime(
 	const upgradeRunner = new PiSubagentRunner();
 	registerCtxStatusCommand(pi, {
 		db,
+		kernelClient,
 		projectIdentity,
 		resolveProject: resolveCurrentProject,
 		protectedTags: bootProjectDeps.config.protected_tags,
 		executeThresholdPercentage:
 			bootProjectDeps.config.execute_threshold_percentage,
 		historyBudgetPercentage: bootProjectDeps.config.history_budget_percentage,
-		injectionBudgetTokens:
-			bootProjectDeps.config.memory?.injection_budget_tokens,
 		commitClusterTrigger: bootProjectDeps.config.commit_cluster_trigger,
 		executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
 		dreamer: {
@@ -1123,11 +1137,11 @@ async function startPiMagicContextRuntime(
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
 				db,
+				kernelClient,
 				projectIdentity: current.projectIdentity,
 				protectedTags: current.config.protected_tags,
 				executeThresholdPercentage: current.config.execute_threshold_percentage,
 				historyBudgetPercentage: current.config.history_budget_percentage,
-				injectionBudgetTokens: current.config.memory?.injection_budget_tokens,
 				commitClusterTrigger: current.config.commit_cluster_trigger,
 				executeThresholdTokens: current.config.execute_threshold_tokens,
 				dreamer: {
