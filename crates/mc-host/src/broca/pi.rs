@@ -1,3 +1,4 @@
+//! Pi print-mode backend.
 //!
 //! Pi runs print-mode JSON without a persisted session or tools.
 //! Pi stores the system prompt in a private `0600` file.
@@ -21,17 +22,19 @@ use super::subprocess::{
 };
 use crate::harness_closure::ValidatedHarnessClosure;
 
-/// The Magic Context Pi recursion guard causes the plugin to return before full extension registration.
-/// extension registration).
+/// Magic Context recursion guard that stops full extension registration in Pi children.
 pub const MAGIC_CONTEXT_PI_SUBAGENT_ENV: &str = "MAGIC_CONTEXT_PI_SUBAGENT";
 
-/// PiBackend passes requested generation values to the bundled payload hook.
-/// The variables carry only bounded numbers, never requested text.
+/// Maximum output-token environment variable consumed by the bundled payload hook.
+///
+/// Its value is a bounded number and never contains request text.
 pub const BROCA_MAX_OUTPUT_TOKENS_ENV: &str = "MC_BROCA_MAX_OUTPUT_TOKENS";
+/// Temperature environment variable consumed by the bundled payload hook.
+///
+/// Its value is a bounded number and never contains request text.
 pub const BROCA_TEMPERATURE_ENV: &str = "MC_BROCA_TEMPERATURE";
 
-/// Pi materializes the hook per run in an owner-only temporary file and loads it last.
-/// explicit extension.
+/// Bundled payload hook that Pi materializes in an owner-only file and loads last.
 pub const PI_BROCA_EXTENSION_BYTES: &[u8] = include_bytes!("../../assets/pi-broca-extension.mjs");
 
 /// Pi materializes the hook in each run's private directory under this name.
@@ -47,10 +50,11 @@ pub struct PiRuntimeDescriptor {
     pub provider_extension_nodes: Vec<String>,
 }
 
+/// Executes Broca requests through a validated Pi runtime closure.
 pub struct PiBackend {
     descriptor: PiRuntimeDescriptor,
-    /// Pi receives `--thinking <level>` only when `thinking_level` is set; otherwise Pi resolves the level.
-    /// resolution runs.
+    /// Pi receives `--thinking <level>` only when this value is set.
+    /// Otherwise Pi chooses the level.
     thinking_level: Option<String>,
     limits: SubprocessLimits,
     env: EnvSnapshot,
@@ -83,9 +87,7 @@ impl LlmExecutionBackend for PiBackend {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BackendFuture {
-        // A run bound to another harness must fail, not silently execute
-        // PiBackend must not execute a non-Pi request with Pi provider aliases or credentials.
-        // credentials.
+        // A non-Pi request must fail before Pi provider aliases or credentials are used.
         if request.harness != Harness::Pi {
             let terminal = backend::harness_mismatch(Harness::Pi, request.harness);
             return Box::pin(async move { terminal });
@@ -113,8 +115,7 @@ impl LlmExecutionBackend for PiBackend {
     }
 }
 
-/// Known auth-plugin aliases map to Pi provider prefixes.
-/// Known auth-plugin aliases map to Pi provider prefixes; unknown providers pass through unchanged.
+/// Maps known auth-plugin providers to Pi prefixes and leaves unknown providers unchanged.
 pub fn pi_model_ref(provider: &str, model: &str) -> String {
     let pi_provider = match provider {
         "openai" => "openai-codex",
@@ -128,7 +129,6 @@ pub fn pi_model_ref(provider: &str, model: &str) -> String {
 /// Direct `openai` and `google` API-key users lack credentials under subscription-extension aliases.
 /// Pi tries each provider at most once.
 /// Both attempts share one wall-clock budget; the retry receives only the remainder.
-/// first attempt whose private-directory cleanup failed forfeits the retry,
 /// A first-attempt cleanup failure blocks the retry so retry success cannot mask disk residue.
 async fn run_pi_with_provider_fallback(
     descriptor: PiRuntimeDescriptor,
@@ -255,8 +255,7 @@ async fn run_pi(
         "--no-skills".to_owned(),
         "--no-prompt-templates".to_owned(),
         "--no-context-files".to_owned(),
-        // The run exposes a closed tool surface: it maps the prompt to text.
-        // transform.
+        // The run exposes a closed tool surface and only transforms the prompt to text.
         "--no-tools".to_owned(),
         // `--no-approve` treats project-local settings and extensions as untrusted for the run.
         "--no-approve".to_owned(),
@@ -364,8 +363,7 @@ async fn run_pi(
 /// The caller supplies each complete line once, so probing is linear.
 /// Arming on a transcript that parsing later rejects only shortens the wait for the same failure.
 fn pi_terminal_probe(lines: &[u8]) -> ProbeSignal {
-    // The last non-quiet line wins so a retry's opening event overrides a preceding failed terminal event.
-    // The last non-quiet line determines whether the run is over.
+    // Last non-quiet line decides whether the run is over, so a retry opening overrides its preceding failed terminal.
     lines
         .split(|byte| *byte == b'\n')
         .map(pi_line_probe_signal)
@@ -377,8 +375,7 @@ fn pi_terminal_probe(lines: &[u8]) -> ProbeSignal {
 
 /// The probe returns terminal events so the drain loop can start its short grace.
 ///
-/// Pi print mode emits terminal assistant `message_end` on stdout, not `agent_end`.
-/// exists for.
+/// Pi print mode emits terminal assistant `message_end` events on stdout.
 ///
 /// `stop` and `length` are decisive; `error` and `aborted` are provisional.
 /// A full-timeout idle run yields `TimedOut` rather than `AuthRequired`, preventing canonical-provider fallback.
@@ -399,7 +396,6 @@ fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
         return ProbeSignal::Quiet;
     };
     let message = match value.get("type").and_then(serde_json::Value::as_str) {
-        // `message_start` and `auto_retry_*` indicate that the run is not over.
         // `message_start` and `auto_retry_*` clear a preceding provisional terminal.
         Some("message_start" | "auto_retry_start" | "auto_retry_end") => {
             return ProbeSignal::Continues;
@@ -438,7 +434,6 @@ fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
 
 /// The parser accepts only the Pi print-mode JSON vocabulary.
 /// A decisive final assistant message in `agent_end` replaces a provisional `message_end` decision.
-/// `message_end` one.
 /// Lifecycle, compaction, retry, queue, and session-state events do not decide the run.
 /// `message_start` and `auto_retry_*` clear the provisional decision they supersede.
 /// `tool_execution_*` events violate this zero-tool transform's transcript contract.
@@ -500,8 +495,7 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                 if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
                     continue;
                 }
-                // A later terminal supersedes a retried attempt's terminal and assistant text; first-terminal-wins would reject valid retries.
-                // contradictory transcript.
+                // A later terminal supersedes a retried attempt's terminal and text; first-terminal-wins would reject valid retries.
                 if let Some(decision) = assistant_message_terminal(message, line_no)? {
                     provisional = Some(decision);
                 }

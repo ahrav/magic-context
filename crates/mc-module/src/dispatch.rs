@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-///
-/// `MAX_WIRE_BODY_BYTES` mirrors `mc_host::MAX_FRAME_BODY_LEN` so output preparation and frame admission use the same limit.
+/// Maximum body size shared with host frame admission.
 pub const MAX_WIRE_BODY_BYTES: usize = mc_host::MAX_FRAME_BODY_LEN as usize;
 
 #[derive(Clone)]
@@ -33,7 +32,6 @@ enum PreparedSegmentSource {
     Served(crate::transform::ServedMessage),
 }
 
-/// PreparedSegment represents one immutable encoded transform message.
 #[derive(Clone)]
 pub struct PreparedSegment {
     source: PreparedSegmentSource,
@@ -84,8 +82,7 @@ impl fmt::Debug for PreparedSegment {
 }
 
 impl PreparedOutput {
-    ///
-    /// Measurement serializes JSON without retaining encoded bytes so large bodies remain within the host reservation.
+    /// JSON measurement does not retain encoded bytes because it precedes host memory reservation.
     pub fn json(value: Value) -> Self {
         Self {
             source: PreparedSource::Json(Arc::new(value)),
@@ -123,7 +120,6 @@ impl PreparedOutput {
     /// Measures this immutable source exactly before output reservation.
     ///
     /// JSON measurement does not retain encoded bytes because it precedes the host's resident-byte reservation.
-    /// short body.
     pub fn measure(&self) -> Result<MeasuredOutput<'_>, PreparedOutputError> {
         let (source, len) = match &self.source {
             PreparedSource::Json(value) => {
@@ -326,7 +322,6 @@ fn checked_body_len(
 /// Measures a JSON value's exact encoded length without retaining the bytes.
 ///
 /// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
-/// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
 fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
     let mut writer = CountingWriter::default();
     let result = serde_json::to_writer(&mut writer, value).map_err(PreparedOutputError::Serialize);
@@ -405,7 +400,7 @@ enum CountFailure {
     TooLarge(usize),
 }
 
-/// CountingWriter rejects writes that exceed MAX_WIRE_BODY_BYTES.
+/// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
 #[derive(Default)]
 struct CountingWriter {
     len: usize,

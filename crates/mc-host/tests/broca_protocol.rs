@@ -344,9 +344,6 @@ fn the_512kib_boundary_admits_exactly_and_rejects_one_byte_over() {
 fn error_unit_stays_within_terminal_headroom_after_json_escaping() {
     use mc_host::broca::backend::{BackendError, ErrorClass};
 
-    // Admission headroom must accommodate two diagnostic fields and the `run_started` unit.
-    // Admission headroom must accommodate the worst-case diagnostic encoding and the `run_started` unit.
-    // The `run_started` unit shares the reserved slice.
     let hostile = "\u{1}".repeat(4096);
     let run_id = "r".repeat(protocol::MAX_RUN_ID_BYTES);
     let unit = protocol::error_unit(
@@ -620,7 +617,6 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     )
     .await;
     assert_eq!(cancelled.json(), serde_json::json!({ "ok": true }));
-    // committed state.
     let status = call(
         &mut client,
         command_ch,

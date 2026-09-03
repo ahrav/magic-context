@@ -1,4 +1,3 @@
-//!
 //! Dev-mode lifecycle tests require exact KTD12 result shapes.
 
 #![cfg(unix)]
@@ -173,7 +172,7 @@ fn try_flock_exclusive(path: &Path) -> bool {
     locked
 }
 
-/// `InstanceGuard` attempts to stop its daemon on drop so failed assertions do not leak it.
+/// Stops an active daemon on drop so failed assertions do not leak it.
 #[cfg(target_os = "linux")]
 struct DaemonJanitor {
     root: PathBuf,
@@ -394,8 +393,7 @@ fn dev_payload_without_explicit_test_self_exec_fails_closed() {
     );
 }
 
-/// `probe_lifecycle`, `start`, `restart`, and `stop` must return `unsupported_state_schema` for a quarantined record with both fences free.
-/// every command.
+/// Every command returns `unsupported_state_schema` for a quarantined record with both fences free.
 ///
 /// A command that checks only the `wedged` shape would treat the quarantined record as startable.
 /// `start` and `restart` would spawn a child that `InstanceGuard` refuses, then report `startup_timeout`.
@@ -442,7 +440,6 @@ fn quarantined_record_is_classified_alike_by_every_command() {
     }
 }
 
-///
 /// `restart` resolves the successor before stopping; otherwise it can commit `stop` without committing `start` and leave no takeover.
 /// `restart` leaves the running daemon serving when successor resolution fails.
 #[cfg(target_os = "linux")]
@@ -585,7 +582,7 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert_result(&value, "restart", true, "running", "started");
     assert_eq!(effects(&value), (true, true));
 
-    // stop: commits at full-frame acknowledgement and waits for teardown.
+    // `stop` commits at full-frame acknowledgement and waits for teardown.
     let out = run(&data, &["stop"]);
     assert_eq!(out.code, 0, "stop failed: {} {}", out.stdout, out.stderr);
     let value = out.json();
