@@ -258,7 +258,13 @@ impl KernelOpenCoordinator {
             Err(_) => return self.phase_block(Some(now_ms)),
         };
         let worker = tokio::task::spawn_blocking(move || store.facts_unless(now_ms, &cancelled));
-        match worker.await {
+        let outcome = worker.await;
+        // The store may have been retired while the worker ran; the phase wins,
+        // as it does for the sampler.
+        if self.state() != KernelState::Ready {
+            return self.phase_block(Some(now_ms));
+        }
+        match outcome {
             Ok(Ok(Some(facts))) => {
                 KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts))
             }
