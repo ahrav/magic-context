@@ -320,14 +320,20 @@ function parseEvidenceRow(raw: unknown, index: number): EvidenceRow {
     };
 }
 
+export interface OutcomePolicyTerms {
+    requiredMetricSlots: readonly MetricSlotId[];
+    maxToleratedRegressions: number;
+}
+
+/** `UNBOUNDED_POLICY_TERMS` omits required slots and permits every regression, so derived flags only bound claims. */
+const UNBOUNDED_POLICY_TERMS: OutcomePolicyTerms = { requiredMetricSlots: [], maxToleratedRegressions: Number.POSITIVE_INFINITY };
+
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */
-export function deriveOutcome(input: {
+export function deriveOutcome(input: OutcomePolicyTerms & {
     gates: readonly GateRow[];
     lanes: readonly EvidenceRow[];
     families: readonly ScoreFamilySection[];
-    requiredMetricSlots: readonly MetricSlotId[];
     adverseDeltas: readonly AdverseRow[];
-    maxToleratedRegressions: number;
 }): ScorecardReportBody["outcome"] {
     const hardGateFailures = input.gates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
     const measured = new Set(input.families.flatMap((family) => family.slots)
@@ -345,7 +351,26 @@ export function deriveOutcome(input: {
     };
 }
 
-export function parseScorecardReport(raw: unknown): ScorecardReport {
+/** With `policyTerms`, the claimed outcome must equal the derived one. Without them, the counts must match and each claimed flag may not exceed its unbounded derivation. */
+function verifyOutcome(body: ScorecardReportBody, policyTerms: OutcomePolicyTerms | undefined): void {
+    const derived = deriveOutcome({
+        ...(policyTerms ?? UNBOUNDED_POLICY_TERMS),
+        gates: body.safetyGates,
+        lanes: body.evidence.lanes,
+        families: familySections(body),
+        adverseDeltas: body.adverseDeltas,
+    });
+    const claimed = body.outcome;
+    if (JSON.stringify(claimed.hardGateFailures) !== JSON.stringify(derived.hardGateFailures)) fail("report.body.outcome.hardGateFailures: cross-field-invalid");
+    if (claimed.blockingRegressionCount !== derived.blockingRegressionCount) fail("report.body.outcome.blockingRegressionCount: cross-field-invalid");
+    const flagInvalid = (flag: boolean, bound: boolean): boolean => (policyTerms === undefined ? flag && !bound : flag !== bound);
+    if (flagInvalid(claimed.mandatoryEvidenceComplete, derived.mandatoryEvidenceComplete)) fail("report.body.outcome.mandatoryEvidenceComplete: cross-field-invalid");
+    if (flagInvalid(claimed.promotionAllowed, derived.promotionAllowed) || (claimed.promotionAllowed && !claimed.mandatoryEvidenceComplete)) {
+        fail("report.body.outcome.promotionAllowed: cross-field-invalid");
+    }
+}
+
+export function parseScorecardReport(raw: unknown, policyTerms?: OutcomePolicyTerms): ScorecardReport {
     const root = record(raw, "report");
     exact(root, ["schema", "body", "reportFingerprint"], "report");
     if (root.schema !== SCORECARD_REPORT_SCHEMA) fail("report.schema: version-invalid");
@@ -398,17 +423,7 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     };
     const reportFingerprint = hex64(root.reportFingerprint, "report.reportFingerprint");
     if (canonicalFingerprint(body) !== reportFingerprint) fail("report.reportFingerprint: mismatch");
-    const expectedFailures = body.safetyGates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
-    if (JSON.stringify(body.outcome.hardGateFailures) !== JSON.stringify(expectedFailures)) fail("report.body.outcome.hardGateFailures: cross-field-invalid");
-    if (body.outcome.blockingRegressionCount !== body.adverseDeltas.filter((row) => row.blocking).length) {
-        fail("report.body.outcome.blockingRegressionCount: cross-field-invalid");
-    }
-    if (body.outcome.promotionAllowed && (expectedFailures.length > 0 || !body.outcome.mandatoryEvidenceComplete)) {
-        fail("report.body.outcome.promotionAllowed: cross-field-invalid");
-    }
-    if (body.outcome.mandatoryEvidenceComplete && body.evidence.lanes.some((row) => row.status !== "present")) {
-        fail("report.body.outcome.mandatoryEvidenceComplete: cross-field-invalid");
-    }
+    verifyOutcome(body, policyTerms);
     if ((body.evidence.baseline.status === "present") !== (body.evidence.baseline.reportFingerprint !== null)) {
         fail("report.body.evidence.baseline: shape-invalid");
     }

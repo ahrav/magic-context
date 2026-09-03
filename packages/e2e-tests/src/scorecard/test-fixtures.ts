@@ -37,10 +37,20 @@ import {
     SCORECARD_GATE_IDS,
     SCORECARD_POLICY_OWNER,
     SCORECARD_POLICY_SCHEMA,
+    SCORE_FAMILY_IDS,
+    SLOT_IDS_BY_FAMILY,
     type LaneId,
     type LaneIdentity,
+    type ScoreFamilyId,
     type ScorecardPolicy,
 } from "./policy";
+import {
+    SCORECARD_REPORT_SCHEMA,
+    deriveOutcome,
+    type ScoreFamilySection,
+    type ScorecardReport,
+    type ScorecardReportBody,
+} from "./report-contract";
 
 export const CANARY_SCENARIO_IDS = ["hse-webhook-docs-injection", "hse-orders-key-conflict"];
 
@@ -471,6 +481,49 @@ export function laneFixtures(overrides: Partial<LaneFixtureSet> = {}): LaneFixtu
     };
 }
 
+function unmeasuredFamily(family: ScoreFamilyId): ScoreFamilySection {
+    return { family, slots: SLOT_IDS_BY_FAMILY[family].map((id) => ({ id, status: "not-measured", reason: "lane-missing" })) };
+}
+
+export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture(), overrides: Partial<ScorecardReportBody> = {}): ScorecardReport {
+    const rows: Omit<ScorecardReportBody, "outcome"> = {
+        target: {
+            freezeManifestFingerprint: H1,
+            policyFingerprint: canonicalFingerprint(policy),
+            pairedDeltaPolicyFingerprint: policy.pairedDeltaPolicyFingerprint,
+            baselineScorecardReportFingerprint: null,
+        },
+        utility: { ...unmeasuredFamily("utility"), family: "utility", familyEstimates: [], deltas: [] },
+        formation: unmeasuredFamily("formation"),
+        retrieval: unmeasuredFamily("retrieval"),
+        context: unmeasuredFamily("context"),
+        reliability: unmeasuredFamily("reliability"),
+        safetyGates: SCORECARD_GATE_IDS.map((gateId) => ({
+            gateId, status: "not-observed", observedCount: null, evidenceFingerprint: null, sourceLane: null, diagnostic: "lane-missing",
+        })),
+        regret: [],
+        adverseDeltas: [],
+        limitations: [],
+        evidence: {
+            lanes: LANE_IDS.map((lane) => ({ lane, status: "missing", reportFingerprint: null, identity: null, diagnostics: ["artifact-missing"] })),
+            baseline: { status: "absent", reportFingerprint: null },
+        },
+        ...overrides,
+    };
+    const body: ScorecardReportBody = {
+        ...rows,
+        outcome: overrides.outcome ?? deriveOutcome({
+            gates: rows.safetyGates,
+            lanes: rows.evidence.lanes,
+            families: SCORE_FAMILY_IDS.map((family) => rows[family]),
+            adverseDeltas: rows.adverseDeltas,
+            requiredMetricSlots: policy.requiredMetricSlots,
+            maxToleratedRegressions: policy.maxToleratedRegressions,
+        }),
+    };
+    return { schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint: canonicalFingerprint(body) };
+}
+
 // ---------------------------------------------------------------------------
 // A release-shaped directory tree: approved freeze manifest, both policy-owner
 // documents, the bound paired-delta policy, and one artifact per lane.
@@ -513,12 +566,13 @@ export function writeReleaseTree(root: string, options: ReleaseTreeOptions = {})
     writeCanonical(join(paths.policiesDir, "scorecard-policy.json"), scorecardDocument);
     writeCanonical(paths.pairedDeltaPolicy, options.pairedDeltaPolicyDocument ?? pairedDeltaPolicyDocumentFixture());
     const lanes = laneFixtures(options.lanes);
+    const publish = (path: string, value: unknown): void => writeFileSync(path, `${JSON.stringify(value, null, 4)}\n`);
     for (const lane of LANE_IDS) {
         if (options.omitLanes?.includes(lane)) continue;
         const raw = options.rawArtifacts !== undefined && lane in options.rawArtifacts ? options.rawArtifacts[lane] : lanes[lane];
-        writeFileSync(join(paths.artifactsDir, `${lane}-report.json`), `${JSON.stringify(raw, null, 4)}\n`);
+        publish(join(paths.artifactsDir, `${lane}-report.json`), raw);
     }
-    if (options.baseline !== undefined) writeCanonical(paths.baseline, options.baseline);
+    if (options.baseline !== undefined) publish(paths.baseline, options.baseline);
     return {
         freeze: { artifactDir: paths.freezeDir, expectedManifestFingerprint: canonicalFingerprint(freeze) },
         policies: {

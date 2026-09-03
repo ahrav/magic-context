@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import type { PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { laneEvidence, loadEvidenceBundle, type EvidenceSources } from "./evidence";
 import { LANE_IDS, ScorecardContractError } from "./policy";
 import {
@@ -21,6 +22,7 @@ import {
     retrievalReportFixture,
     scannableDreamerReportFixture,
     scenarioScoreFixture,
+    scorecardReportFixture,
     writeReleaseTree,
     type ReleaseTreeOptions,
 } from "./test-fixtures";
@@ -149,12 +151,32 @@ describe("loadEvidenceBundle", () => {
 
     it("loads a baseline only when its fingerprint matches the policy", () => {
         const laneSet = laneFixtures({ dreamer: [scannableDreamerReportFixture()] });
-        const named = "a".repeat(64);
-        const policy = policyFixture({ baselineScorecardReportFingerprint: named });
+        const baseline = scorecardReportFixture();
+        const policy = policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint });
         const missingPath = loadEvidenceBundle(tree({ policy, lanes: laneSet }));
         expect(missingPath.baseline).toMatchObject({ status: "schema-mismatch", diagnostics: ["baseline-path-missing"] });
-        const wrongBytes = loadEvidenceBundle(tree({ policy, lanes: laneSet, baseline: { schema: "scorecard-report/v1", body: {}, reportFingerprint: named } }));
+        const wrongBytes = loadEvidenceBundle(tree({ policy, lanes: laneSet, baseline: { ...baseline, body: {} } }));
         expect(wrongBytes.baseline).toMatchObject({ status: "schema-mismatch", diagnostics: ["baseline-parse-failed"] });
+        const other = scorecardReportFixture(policyFixture({ maxToleratedRegressions: 3 }));
+        const wrongReport = loadEvidenceBundle(tree({ policy, lanes: laneSet, baseline: other }));
+        expect(wrongReport.baseline).toMatchObject({ status: "schema-mismatch", diagnostics: ["baseline-fingerprint-mismatch"] });
+        const present = loadEvidenceBundle(tree({ policy, lanes: laneSet, baseline }));
+        expect(present.baseline).toMatchObject({ status: "present", reportFingerprint: baseline.reportFingerprint, diagnostics: [] });
+        expect(present.baseline.report).toEqual(baseline);
+    });
+
+    it("classifies a lane whose JSON is valid but not canonicalizable instead of aborting the bundle", () => {
+        const sources = tree();
+        // `JSON.parse` reads `1e999` as `Infinity`, which `canonicalFingerprint` rejects.
+        writeFileSync(join(sources.artifactsDir, "incident-report.json"), '{"schema": "incident-pool-report/v1", "spent": 1e999}\n');
+        const bundle = loadEvidenceBundle(sources);
+        expect(laneEvidence(bundle, "incident")).toMatchObject({ status: "schema-mismatch", diagnostics: ["artifact-invalid-json"], reportFingerprint: null });
+        expect(laneEvidence(bundle, "historian").status).toBe("present");
+    });
+
+    it("refuses a paired-delta policy document that carries sensitive content", () => {
+        const leaked = { ...pairedDeltaPolicyDocumentFixture(), owner: "/home/operator/magic-context-x4l.14" } as unknown as PolicyOwnerDocument;
+        expect(() => loadEvidenceBundle(tree({ pairedDeltaPolicyDocument: leaked }))).toThrow(/paired-delta-policy: privacy-rejected/);
     });
 
     it("leaves the artifacts directory untouched", () => {

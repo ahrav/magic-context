@@ -17,7 +17,6 @@ import { loadFreeze, loadPolicyDocuments } from "../prospective-holdout/freeze";
 import {
     LANE_IDS,
     SCORECARD_POLICY_OWNER,
-    SECONDARY_SLOT_SOURCES,
     ScorecardContractError,
     array,
     parseScorecardPolicy,
@@ -143,15 +142,10 @@ function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardP
     return report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint ? [] : ["policy-binding-mismatch"];
 }
 
-/** Every pre-registered run setting the paired-delta report can show is compared here; a difference is a pre-registration mismatch, not a schema problem. */
+/** A difference in a pre-registered run setting is a pre-registration mismatch, not a schema problem. */
 function pairedDeltaConformanceReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
     const body = report.body;
-    const mismatched = body.analysis.endpoints.every((estimate) => estimate.endpoint !== policy.primaryEndpoint)
-        || policy.secondaryMetricSlots.some((slot) => {
-            const source = SECONDARY_SLOT_SOURCES[slot]!;
-            return body.secondaryMetrics[source.metric][source.arm] === undefined;
-        })
-        || body.analysis.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
+    const mismatched = body.analysis.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
         || (body.runSummary.calibrationFingerprint !== null) !== (policy.statisticalComparison.noiseFloorSource === "calibration")
         || body.runSummary.spentUsd > policy.releaseCostBudgetUsd
         || canonicalFingerprint(pairedDeltaPolicy.modelMatrix) !== canonicalFingerprint(policy.modelMatrix)
@@ -174,6 +168,7 @@ interface PairedDeltaPolicyView {
 
 function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): PairedDeltaPolicyView {
     const raw = readCanonicalJsonFile(path, (code) => new ScorecardContractError([`paired-delta-policy: ${code}`]));
+    if (scanForSensitiveContent(raw).length > 0) throw new ScorecardContractError(["paired-delta-policy: privacy-rejected"]);
     const document = parsePolicyOwnerDocument(raw, "magic-context-x4l.14");
     if (document.status !== "ready" || document.policyFingerprint !== expectedFingerprint) {
         throw new ScorecardContractError(["scorecard: paired-delta-policy-binding-mismatch"]);
@@ -182,7 +177,10 @@ function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): Paire
     return { modelMatrix: policy.modelMatrix, replicateCount: policy.replicateCount, releaseCostBudgetUsd: policy.costBudgetUsd.release };
 }
 
-function readLaneArtifact(path: string): { kind: "missing" } | { kind: "unparseable" } | { kind: "json"; raw: unknown } {
+type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "json"; raw: unknown };
+
+/** Published reports are read whitespace-insensitively; their fingerprint is of the parsed value, not the bytes. */
+function readJsonArtifact(path: string): JsonArtifact {
     if (!existsSync(path)) return { kind: "missing" };
     try {
         return { kind: "json", raw: JSON.parse(readFileSync(path, "utf8")) as unknown };
@@ -191,20 +189,31 @@ function readLaneArtifact(path: string): { kind: "missing" } | { kind: "unparsea
     }
 }
 
+/** `scannedFingerprint` returns `null` for sensitive content and throws when `canonicalFingerprint` rejects parsed JSON. */
+function scannedFingerprint(raw: unknown): string | null {
+    if (scanForSensitiveContent(raw).length > 0) return null;
+    return canonicalFingerprint(raw);
+}
+
 function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView, artifactsDir: string): LaneEvidence {
     const lane = required.lane;
-    const artifact = readLaneArtifact(join(artifactsDir, laneArtifactName(lane)));
-    if (artifact.kind === "missing") return { lane, status: "missing", reportFingerprint: null, identity: null, diagnostics: ["artifact-missing"], report: null };
-    if (artifact.kind === "unparseable") return { lane, status: "schema-mismatch", reportFingerprint: null, identity: null, diagnostics: ["artifact-invalid-json"], report: null };
-    if (scanForSensitiveContent(artifact.raw).length > 0) {
-        return { lane, status: "schema-mismatch", reportFingerprint: null, identity: null, diagnostics: ["privacy-rejected"], report: null };
+    const rejected = (status: LaneStatus, diagnostic: string, reportFingerprint: string | null = null): LaneEvidence =>
+        ({ lane, status, reportFingerprint, identity: null, diagnostics: [diagnostic], report: null });
+    const artifact = readJsonArtifact(join(artifactsDir, laneArtifactName(lane)));
+    if (artifact.kind === "missing") return rejected("missing", "artifact-missing");
+    if (artifact.kind === "unparseable") return rejected("schema-mismatch", "artifact-invalid-json");
+    let reportFingerprint: string | null;
+    try {
+        reportFingerprint = scannedFingerprint(artifact.raw);
+    } catch {
+        return rejected("schema-mismatch", "artifact-invalid-json");
     }
-    const reportFingerprint = canonicalFingerprint(artifact.raw);
+    if (reportFingerprint === null) return rejected("schema-mismatch", "privacy-rejected");
     let parsed: ParsedLane;
     try {
         parsed = parseLane(lane, artifact.raw);
     } catch {
-        return { lane, status: "schema-mismatch", reportFingerprint, identity: null, diagnostics: ["report-parse-failed"], report: null };
+        return rejected("schema-mismatch", "report-parse-failed", reportFingerprint);
     }
     const identity = observedIdentity(parsed);
     const bindingReasons = parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy) : [];
@@ -224,16 +233,13 @@ function loadBaseline(policy: ScorecardPolicy, path: string | null): BaselineEvi
     if (expected === null) return { status: "absent", reportFingerprint: null, report: null, diagnostics: [] };
     const mismatch = (code: string): BaselineEvidence => ({ status: "schema-mismatch", reportFingerprint: null, report: null, diagnostics: [reasonCode(code)] });
     if (path === null) return mismatch("baseline-path-missing");
-    let raw: unknown;
-    try {
-        raw = readCanonicalJsonFile(path, (code) => new ScorecardContractError([code]));
-    } catch (error) {
-        return mismatch(`baseline-${error instanceof ScorecardContractError ? error.diagnostics[0]! : "unreadable"}`);
-    }
-    if (scanForSensitiveContent(raw).length > 0) return mismatch("baseline-privacy-rejected");
+    const artifact = readJsonArtifact(path);
+    if (artifact.kind === "missing") return mismatch("baseline-unreadable");
+    if (artifact.kind === "unparseable") return mismatch("baseline-invalid-json");
     let report: ScorecardReport;
     try {
-        report = parseScorecardReport(raw);
+        if (scannedFingerprint(artifact.raw) === null) return mismatch("baseline-privacy-rejected");
+        report = parseScorecardReport(artifact.raw);
     } catch {
         return mismatch("baseline-parse-failed");
     }
