@@ -1,3 +1,4 @@
+//! Reads and validates the host connection file for clients.
 //!
 //! Reads remain anchored to open directory and file descriptors.
 //! Traversal never follows links.
@@ -22,20 +23,33 @@ use crate::{
     wire::PROTOCOL_VERSION,
 };
 
+/// Current on-disk connection-file schema.
 pub const SCHEMA_VERSION: u32 = 2;
+/// Minimum accepted key length for callers that generate key material.
 pub const MIN_KEY_LEN: usize = 32;
+/// Exact key length accepted by [`ConnectionInfo::validate`].
 pub const KEY_LEN: usize = 32;
+/// Byte length of a daemon incarnation identifier.
 pub const DAEMON_ID_LEN: usize = 16;
+/// Maximum connection-file size read from disk.
 pub const MAX_CONNECTION_FILE_LEN: usize = 65_536;
 
+/// Authenticated endpoint and daemon identity published for clients.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
+    /// On-disk schema version.
     pub schema: u32,
+    /// Host wire protocol version.
     pub wire_version: u8,
+    /// Absolute path to the setup socket.
     pub setup_socket: String,
+    /// Connection authentication key.
     pub key: Vec<u8>,
+    /// Daemon incarnation identifier.
     pub daemon_id: [u8; DAEMON_ID_LEN],
+    /// Daemon process identifier.
     pub pid: u32,
+    /// Daemon software version.
     pub daemon_ver: String,
 }
 
@@ -54,6 +68,7 @@ impl fmt::Debug for ConnectionInfo {
 }
 
 impl ConnectionInfo {
+    /// Validates schema, protocol, endpoint, key length, and daemon version.
     pub fn validate(&self) -> Result<(), ConnectionFileError> {
         if self.schema != SCHEMA_VERSION {
             return Err(ConnectionFileError::UnsupportedSchema {
@@ -83,6 +98,7 @@ impl ConnectionInfo {
     }
 }
 
+/// Failure while opening, reading, decoding, or validating a connection file.
 #[derive(Debug)]
 pub enum ConnectionFileError {
     InvalidPath {
@@ -176,6 +192,7 @@ impl Error for ConnectionFileError {
     }
 }
 
+/// Reads a connection file without following links and rejects replacement during the read.
 pub fn read_for_client(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
     let path = path.as_ref();
     let (parent, name) = open_parent(path)?;
@@ -323,7 +340,6 @@ mod tests {
     use super::*;
 
     /// `mode_bits` widens `st_mode` to match this crate's `u32` mode constants on Darwin and Linux.
-    /// `mode_bits` widens `st_mode` to match this crate's `u32` mode constants on Darwin and Linux.
     #[test]
     fn mode_arithmetic_goes_through_the_portable_accessor() {
         for source in [
@@ -363,9 +379,6 @@ mod tests {
 
     /// A FIFO at the configured path must be rejected rather than waited on.
     /// `NONBLOCK` lets metadata validation reject a FIFO before `open` blocks.
-    ///
-    /// `open_parent` rejects a default-mode temp directory before `open_file` runs.
-    /// `open_parent` rejects a group- or world-writable leaf parent.
     #[test]
     fn a_fifo_is_rejected_rather_than_blocking_the_open() {
         use std::os::unix::fs::PermissionsExt;

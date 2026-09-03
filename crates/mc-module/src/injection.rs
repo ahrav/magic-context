@@ -1,7 +1,8 @@
 //! The producer freezes replacements only after cache busts.
 //!
-//! The builders and transition logic are pure: callers supply persisted task-list state and the frozen synthetic unit.
-//! The capture helper mutates only caller-owned [`mc_store::ModuleMeta`], allowing the same pass to commit it with the cache-state transition.
+//! Builders and transition logic are pure. Callers supply persisted task-list state and the
+//! frozen synthetic unit. The capture helper mutates only caller-owned
+//! [`mc_store::ModuleMeta`], so the same pass can commit it with the cache-state transition.
 
 #[cfg(test)]
 use crate::selection::SelMessageRole;
@@ -109,14 +110,16 @@ pub fn normalize_todo_state_json(todos_json: &str) -> Option<String> {
     serde_json::to_string(&normalized).ok()
 }
 
+/// Derives the stable synthetic call ID from normalized task-list JSON.
 pub fn synthetic_call_id(state_json: &str) -> String {
     let digest = Sha256::digest(state_json.as_bytes());
     let hex = format!("{digest:x}");
     format!("{}{}", SYNTHETIC_CALL_ID_PREFIX, &hex[..16])
 }
 
+/// Builds the assistant call and tool result for normalized task-list state.
 ///
-/// The builder returns [`None`] for invalid, empty, or all-terminal states.
+/// Returns [`None`] for invalid, empty, or all-terminal states.
 /// `completed` todos do not contribute to the title's active count.
 /// `cancelled` todos contribute to the title's active count.
 pub fn build_synthetic_todo_pair(state_json: &str) -> Option<SyntheticTodo> {
@@ -180,10 +183,12 @@ pub fn build_synthetic_todo_pair(state_json: &str) -> Option<SyntheticTodo> {
     })
 }
 
+/// Returns whether `id` uses the reserved synthetic task-list prefix.
 pub fn is_synthetic_todo_id(id: &str) -> bool {
     id.starts_with(SYNTHETIC_CALL_ID_PREFIX)
 }
 
+/// Captures the newest visible valid `todowrite` state during a bust pass.
 ///
 /// `last_todo_state` remains unchanged when no valid `todowrite` call is visible, preserving a previously captured state.
 /// The capture helper records empty and all-terminal `todowrite` calls so the next transition can clear a frozen synthetic unit.
@@ -206,6 +211,7 @@ pub fn capture_todo_state_on_bust(
     true
 }
 
+/// Advances injection from persisted metadata without capturing visible calls.
 ///
 /// On bust passes, a valid nonterminal `last_todo_state` can inject after its source call leaves `tail`.
 /// A later bust captures visible state; defer passes replay the frozen unit without reading metadata.
@@ -224,6 +230,7 @@ pub fn advance_injection_from_meta(
     )
 }
 
+/// Reports whether capture would change the frozen synthetic unit.
 ///
 /// `todowrite` takes precedence over older state-sync metadata when the tool is available.
 /// `advance_injection` returns pending only when `frozen` is present.
@@ -256,9 +263,9 @@ pub fn injection_pending_after_capture(
     }
 }
 
-/// synthetic-task-list transition.
+/// Captures visible task state, then advances the synthetic task-list transition.
 ///
-/// `advance_injection` captures before advancing so a first `todowrite` call injects on the same bust pass.
+/// Capture runs first so an initial `todowrite` call injects on the same bust pass.
 pub fn advance_injection_after_capture(
     meta: &mut ModuleMeta,
     tail: &[SelItem],
@@ -270,7 +277,7 @@ pub fn advance_injection_after_capture(
     advance_injection_from_meta(meta, frozen, is_bust_pass, todo_tool_present)
 }
 
-/// `advance_injection` does not mutate storage.
+/// Computes the synthetic task-list transition without mutating storage.
 ///
 /// `advance_injection` treats `todo_tool_present == Some(false)` as an empty task list on bust passes.
 /// `advance_injection` treats `todo_tool_present == None` as available.

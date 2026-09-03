@@ -1,9 +1,7 @@
 //! Machine-checked soundness of anchor preselection.
 //!
-//! `RuleSet::preselect` skips a rule when none of its declared anchors
-//! occurs in the input. That is only safe when a skipped rule could not
-//! have produced a finding. Every active rule must satisfy one of three
-//! sufficient conditions, checked here against the pinned corpus:
+//! `RuleSet::preselect` may skip a rule only when the skipped rule cannot produce a finding.
+//! Every active rule must satisfy one of four sufficient conditions checked against the pinned corpus:
 //!
 //! 1. keyword coverage: the rule requires a keyword in the candidate
 //!    window and every declared keyword contains an anchor, so absent

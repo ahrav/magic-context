@@ -1,3 +1,5 @@
+//! This module tests claim-intent durability, replay fencing, authority, and rebuild behavior.
+
 use cortexkit_store_types::StorageDescriptor;
 use mc_core::claim_operation::{
     canonical_json_encode, compute_claim_operation_request_digest, ClaimCommandIdentity,
@@ -8,8 +10,7 @@ use serde_json::{json, Value};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 const PROJECT: &str = "git:claim-intent-test";
-/// The context store UUID must differ from `INCARNATION` so tests detect fences that key `mc_authority` by the wrong identifier.
-/// An authority fence must not key `mc_authority` by the database incarnation.
+/// Differs from `INCARNATION` so tests detect authority fences keyed by the database incarnation.
 const STORE_UUID: &str = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
 const ROUTE_ROOT: &str = "/repo/claim-intent-test";
 
@@ -231,7 +232,6 @@ fn staging_fails_closed_without_route_resolved_module_authority() {
 
     let generation = module_authority(&store);
 
-    // A binding naming another project cannot borrow the route's authority.
     // A binding naming another project cannot borrow the route's authority.
     let mut foreign = binding(generation);
     foreign.authority_project = "git:someone-else".to_string();
