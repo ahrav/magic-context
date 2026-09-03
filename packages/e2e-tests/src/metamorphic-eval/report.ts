@@ -5,7 +5,7 @@ import type { SystemVersionTuple } from "../historian-eval/runner";
 import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
 import { parseSystemVersionTuple, requireScoreSystemBinding } from "../historian-eval/system-tuple";
 import { falseAuthoritativeMatchSet, introducedFailReasons, invariantHolds, type InvariantEvidence, type InvariantVerdict } from "./invariants";
-import { MAX_TRANSFORM_SEED } from "./transforms";
+import { MAX_TRANSFORM_SEED, derivativeScenarioId } from "./transforms";
 
 export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
@@ -21,9 +21,15 @@ export const CONTROL_SEED = 0;
  * carries its seed as a bounded integer, so a seed the transform would refuse must not reach an error entry.
  */
 export function requireRepresentableRunOptions(
+    scenarios: readonly { id: string }[],
     transforms: readonly { id: string; version: number }[],
     seeds: readonly number[],
 ): void {
+    const scenarioIds = new Set<string>();
+    for (const { id } of scenarios) {
+        if (scenarioIds.has(id)) throw new Error(`metamorphic-eval: scenario "${id}" is listed twice`);
+        scenarioIds.add(id);
+    }
     const coordinates = new Set<string>();
     for (const { id, version } of transforms) {
         if (id === CONTROL_TRANSFORM_ID) {
@@ -415,10 +421,8 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             if (isControlPair && baselineScore.source !== "run-record") {
                 p.fail(`${label}: control-pair-source-invalid`);
             }
-            const derivativeScenarioId = isControlPair
-                ? pair.scenarioId
-                : `${pair.scenarioId}-d-${pair.transformId}-v${pair.transformVersion}-s${pair.seed}`;
-            if (derivativeScore.scenarioId !== derivativeScenarioId) {
+            const expectedDerivativeId = isControlPair ? pair.scenarioId : derivativeScenarioId(pair);
+            if (derivativeScore.scenarioId !== expectedDerivativeId) {
                 p.fail(`${label}.derivativeScore.scenarioId: pair-scenario-mismatch`);
             }
             const scores = pairScores(baselineScore, derivativeScore);

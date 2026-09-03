@@ -440,6 +440,7 @@ describe("deterministic metamorphic runner", () => {
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [reorder(), reorder()] })).toThrow(/is listed twice/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), version: 1.5 }] }))
             .toThrow(/not a non-negative safe integer/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!, corpus()[0]!])).toThrow(/scenario ".*" is listed twice/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), id: "baseline-control" }] }))
             .toThrow(/reserved for the control pair/);
     });

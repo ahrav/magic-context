@@ -726,6 +726,33 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     for (const endpoint of aggregateEndpoints) {
         if (!rawEndpoints.has(endpoint)) p.fail(`report.body.analysis: aggregate-without-raw-${endpoint}`);
     }
+    // A regret family's point estimate is the mean of its raw deltas at that endpoint, and its families are
+    // exactly the families observed there. The interval is a bootstrap and stays unchecked here.
+    const rawByEndpointFamily = new Map<string, number[]>();
+    for (const record of body.analysis.rawRegretRecords) {
+        const bucket = tupleKey(record.endpoint, record.familyId);
+        rawByEndpointFamily.set(bucket, [...(rawByEndpointFamily.get(bucket) ?? []), record.delta]);
+    }
+    for (const [view, estimates] of [["liveRegret", body.analysis.liveRegret], ["providerMixedRegret", body.analysis.providerMixedRegret]] as const) {
+        for (const [index, estimate] of estimates.entries()) {
+            const observedFamilies = new Set(body.analysis.rawRegretRecords
+                .filter(({ endpoint }) => endpoint === estimate.endpoint).map(({ familyId }) => familyId));
+            if (observedFamilies.size !== estimate.families.length ||
+                estimate.families.some(({ familyId }) => !observedFamilies.has(familyId))) {
+                p.fail(`report.body.analysis.${view}[${index}].families: raw-family-mismatch`);
+            }
+            for (const [familyIndex, family] of estimate.families.entries()) {
+                const deltas = rawByEndpointFamily.get(tupleKey(estimate.endpoint, family.familyId)) ?? [];
+                if (family.pointEstimate !== mean(deltas)) {
+                    p.fail(`report.body.analysis.${view}[${index}].families[${familyIndex}].pointEstimate: derived-mismatch`);
+                }
+            }
+        }
+    }
+    // A usage-unmeasured run stored the estimated-cost failure that produced the status.
+    if (body.runSummary.status === "usage-unmeasured" && body.runSummary.estimatedCostRollouts === 0) {
+        p.fail("report.body.runSummary.estimatedCostRollouts: status-evidence-required");
+    }
     // A coordinate either refused its ladder or produced raw regret records, never both.
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
     if (rawCoordinates.size + refusedTotal > body.runSummary.plannedCoordinates) {

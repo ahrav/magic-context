@@ -793,7 +793,8 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
         !isIdentityValue(record.system.historianModelId) ||
         !isIdentityValue(record.system.probeModelId) ||
         record.system.parserImpl !== "ts" ||
-        !(record.system.chunkTokenBudget === null || typeof record.system.chunkTokenBudget === "number")
+        !(record.system.chunkTokenBudget === null ||
+            (Number.isSafeInteger(record.system.chunkTokenBudget) && record.system.chunkTokenBudget >= 1))
     ) {
         problems.push("system");
     }

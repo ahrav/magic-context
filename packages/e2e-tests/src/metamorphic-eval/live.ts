@@ -212,7 +212,7 @@ export async function runLiveMetamorphicEval(
     if (scenarios.length === 0) throw new Error("live metamorphic eval needs at least one scenario");
     const transforms = options.transforms ?? TRANSFORMS;
     const seeds = options.seeds ?? DETERMINISTIC_SEEDS;
-    requireRepresentableRunOptions(transforms, seeds);
+    requireRepresentableRunOptions(scenarios, transforms, seeds);
     const prepared = buildPairs(scenarios, transforms, seeds);
     const entries = [...prepared.entries];
     const injectionCanaryHits: InjectionCanaryHit[] = [];

@@ -1062,6 +1062,19 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
         }))).toThrow(/report\.body\.analysis\.rawRegretRecords: ladder-prefix-missing-/);
+        // A regret family's point estimate is the mean of its raw deltas.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const estimate = body.analysis.providerMixedRegret[0]!;
+            const family = estimate.families[0]!;
+            family.pointEstimate += 0.05;
+            estimate.pointEstimate = estimate.families.reduce((sum, { pointEstimate }) => sum + pointEstimate, 0) / estimate.families.length;
+            body.regret.providerMixed = body.analysis.providerMixedRegret;
+        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\]\.families\[0\]\.pointEstimate: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "usage-unmeasured";
+            body.runSummary.estimatedCostRollouts = 0;
+            body.runSummary.observedCostRollouts = 36;
+        }))).toThrow(/report\.body\.runSummary\.estimatedCostRollouts: status-evidence-required/);
         // An aggregate regret endpoint has raw observations behind it.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "formation");

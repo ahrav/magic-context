@@ -822,6 +822,20 @@ describe("scoreRunRecord", () => {
             fixture.cleanup();
         }
     });
+    test("a record whose chunk budget the report contract cannot carry is ERROR, not a tuple the parser refuses", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord({ ...record, system: { ...record.system, chunkTokenBudget: 0 } }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+            expect(score.errorDetail).toContain("system");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a record paired with a different scenario is ERROR, never a misattributed verdict", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
