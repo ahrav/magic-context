@@ -508,7 +508,9 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // The pair checks prove the two roles agree with each other, not that either ran the system the report
     // names. Where both tuples are stated they have to be the same run.
     // An admitted pair always leaves one non-lint entry, so on a completed run each scenario's applied count
-    // is backed by at least that many. A tier-invalid run keeps its scheduled coverage over a partial entry set.
+    // is backed by at least that many. The bound is not an equality: a transform that throws during admission
+    // also leaves an `error` entry without counting as applied, and the archive does not say which errors
+    // were those. A tier-invalid run keeps its scheduled coverage over a partial entry set.
     if (report.tierInvalidReason === null) {
         const backed = new Map<string, number>();
         for (const entry of report.entries) {
@@ -516,7 +518,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             backed.set(entry.scenarioId, (backed.get(entry.scenarioId) ?? 0) + 1);
         }
         for (const [index, row] of report.coverage.entries()) {
-            if (row.applied !== (backed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: derived-mismatch`);
+            if (row.applied > (backed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: derived-mismatch`);
             // Both producers record this violation whenever nothing applied.
             if (row.applied === 0 && !row.violations.includes("no transforms applied")) {
                 p.fail(`report.coverage[${index}].violations: derived-mismatch`);
