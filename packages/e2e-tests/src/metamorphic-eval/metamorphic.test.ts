@@ -184,6 +184,10 @@ describe("deterministic metamorphic runner", () => {
         const doubledInapplicable = structuredClone(invalid);
         doubledInapplicable.coverage[0]!.inapplicable.push(structuredClone(doubledInapplicable.coverage[0]!.inapplicable[0]!));
         expect(() => parseMetamorphicReport(doubledInapplicable)).toThrow(/report\.coverage\[0\]\.inapplicable: duplicate/);
+        // A control error is recorded beside the control entry that produced it.
+        const orphanControlError = structuredClone(report);
+        orphanControlError.tierInvalidReason = { kind: "control-error", controlAErrorReason: "boom", controlBErrorReason: null };
+        expect(() => parseMetamorphicReport(orphanControlError)).toThrow(/report\.tierInvalidReason: control-error-entry-required/);
         // selection-empty means nothing was admitted or scored.
         const falseEmpty = structuredClone(report);
         falseEmpty.tierInvalidReason = { kind: "selection-empty", reason: "n/a" };

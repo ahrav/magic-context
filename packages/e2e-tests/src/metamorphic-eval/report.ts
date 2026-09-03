@@ -585,6 +585,11 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             if (entryKeys.has(key(pair))) p.fail(`report.coverage[${index}].inapplicable[${innerIndex}]: entry-conflict`);
         }
     }
+    // Both sites that record a control error first append an error entry at the control coordinate.
+    if (report.tierInvalidReason?.kind === "control-error") {
+        const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
+        if (controls.length !== 1 || controls[0]!.kind !== "error") p.fail("report.tierInvalidReason: control-error-entry-required");
+    }
     // The live runner records this reason only when nothing was admitted and nothing was scored.
     if (report.tierInvalidReason?.kind === "selection-empty" &&
         (report.entries.length > 0 || report.coverage.some(({ applied }) => applied > 0))) {
