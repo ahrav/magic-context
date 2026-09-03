@@ -5,8 +5,9 @@
 use std::sync::OnceLock;
 
 use mc_core::redaction::{
-    detect_windowed_durable_text, redact_durable_text, redact_windowed_durable_text,
-    RedactionErrorKind, Redactor, DETECTOR_ID, MAX_REDACTION_LABEL_BYTES, WINDOW_OVERLAP_BYTES,
+    detect_windowed_durable_bytes, detect_windowed_durable_text, redact_durable_text,
+    redact_windowed_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID, EDGE_MARGIN_BYTES,
+    MAX_REDACTION_LABEL_BYTES, WINDOW_OVERLAP_BYTES,
 };
 use proptest::prelude::*;
 
@@ -576,4 +577,100 @@ fn direct_redaction_of_oversized_text_still_fails_closed() {
     assert_eq!(redaction.text, "<REDACTED:secret>");
     assert_eq!(redaction.detections.len(), 1);
     assert_eq!(redaction.detections[0].length, input.len());
+}
+
+/// A Hugging Face token shape whose trailing `\b` is satisfied only by an end of input.
+/// Assembled at run time so the source holds no token-shaped literal.
+fn hf_prefix_and_body() -> String {
+    format!(" hf_{}{}", "QwErTyUiOpAsDfGhJkLzXcVbNm", "QwErTyUi")
+}
+
+#[test]
+fn a_window_end_does_not_fabricate_a_word_boundary() {
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    let candidate = hf_prefix_and_body();
+    // The candidate ends exactly where the first window ends, and letters
+    // continue past it, so the whole input holds no `\b` there.
+    let mut text = "a".repeat(window - candidate.len());
+    text.push_str(&candidate);
+    assert_eq!(text.len(), window);
+    text.push_str(&"b".repeat(4096));
+
+    let redaction = redact_windowed_durable_text(&text, usize::MAX).unwrap();
+    assert!(
+        redaction.detections.is_empty(),
+        "{:?}",
+        redaction.detections
+    );
+    assert_eq!(redaction.text, text);
+    assert_eq!(detect_windowed_durable_text(&text), Ok(false));
+    assert_eq!(detect_windowed_durable_bytes(text.as_bytes()), Ok(false));
+}
+
+#[test]
+fn a_secret_inside_the_edge_margin_is_still_redacted_once() {
+    let secret_line = format!("token={AWS_KEY}");
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // Deep inside the first window's right margin and well clear of the second
+    // window's left margin, so only the second window may report it.
+    let (text, offset) = text_with_line_at(
+        window - EDGE_MARGIN_BYTES / 2,
+        &secret_line,
+        window + window / 2,
+    );
+    assert!(offset + secret_line.len() + EDGE_MARGIN_BYTES > window);
+    assert!(offset + secret_line.len() < window);
+    assert_single_windowed_detection(&text, &secret_line, offset);
+    assert_eq!(detect_windowed_durable_bytes(text.as_bytes()), Ok(true));
+}
+
+#[test]
+fn byte_detection_matches_the_lossy_text_verdict_on_a_wide_binary_payload() {
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // Every 0xff widens to three bytes, so the lossy text spans several windows
+    // while the payload itself is under one.
+    let mut clean = vec![0xff_u8; window];
+    clean[window / 2] = b'\n';
+    let lossy = String::from_utf8_lossy(&clean);
+    assert!(lossy.len() > 2 * window);
+    assert_eq!(detect_windowed_durable_text(&lossy), Ok(false));
+    assert_eq!(detect_windowed_durable_bytes(&clean), Ok(false));
+
+    for position in [0, window / 2 + 1, window - 30, window - AWS_KEY.len() - 7] {
+        let mut leaking = clean.clone();
+        let line = format!("token={AWS_KEY}\n");
+        leaking[position..position + line.len()].copy_from_slice(line.as_bytes());
+        let lossy = String::from_utf8_lossy(&leaking);
+        assert_eq!(detect_windowed_durable_text(&lossy), Ok(true), "{position}");
+        assert_eq!(
+            detect_windowed_durable_bytes(&leaking),
+            Ok(true),
+            "{position}"
+        );
+    }
+}
+
+#[test]
+fn byte_detection_handles_multibyte_characters_split_by_window_capacity() {
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // Three-byte characters never divide the window length evenly, so every
+    // window boundary falls inside a character and must move back to fit.
+    let mut text = "\u{20AC}".repeat(window);
+    text.push_str("\ntoken=");
+    text.push_str(AWS_KEY);
+    text.push('\n');
+    text.push_str(&"\u{20AC}".repeat(window / 3));
+    assert_eq!(detect_windowed_durable_bytes(text.as_bytes()), Ok(true));
+    assert_eq!(detect_windowed_durable_text(&text), Ok(true));
+
+    let mut invalid = text.into_bytes();
+    // Break one character in each third of the payload into invalid bytes.
+    for index in [7usize, invalid.len() / 2, invalid.len() - 7] {
+        invalid[index] = 0xff;
+    }
+    assert_eq!(detect_windowed_durable_bytes(&invalid), Ok(true));
+    assert_eq!(
+        detect_windowed_durable_text(&String::from_utf8_lossy(&invalid)),
+        Ok(true)
+    );
 }

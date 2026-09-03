@@ -1,5 +1,5 @@
 use mc_core::redaction::{
-    detect_windowed_durable_text, redact_durable_text, redact_windowed_durable_text, Detection,
+    detect_windowed_durable_bytes, redact_durable_text, redact_windowed_durable_text, Detection,
     RedactionError, RedactionErrorKind,
 };
 use rusqlite::{params, Transaction};
@@ -53,9 +53,9 @@ pub(super) fn redact_payload(value: &str, max_findings: usize) -> PayloadScan {
 }
 
 /// Whether a payload that will be stored verbatim holds a recognized secret;
-/// `Err` means the scan could not prove it secret-free. Renders no output.
-pub(super) fn payload_has_secret(value: &str) -> Result<bool, RedactionError> {
-    detect_windowed_durable_text(value)
+/// `Err` means scanning could not prove the payload secret-free.
+pub(super) fn payload_has_secret(payload: &[u8]) -> Result<bool, RedactionError> {
+    detect_windowed_durable_bytes(payload)
 }
 
 /// Redacts input that fits the durable-text size limit.

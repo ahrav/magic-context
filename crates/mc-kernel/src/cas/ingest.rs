@@ -144,14 +144,10 @@ impl PreparedArtifact {
                 (redaction, bytes, true)
             }
             Err(_) => {
-                {
-                    // Invalid bytes widen to three-byte replacement characters under the
-                    // lossy conversion; the windowed scan has no input limit, so the
-                    // widened text is inspected whole rather than rejected.
-                    let inspected_text = String::from_utf8_lossy(&request.payload);
-                    if payload_has_secret(&inspected_text).unwrap_or(true) {
-                        return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
-                    }
+                // Lossy decoding expands invalid bytes to three-byte U+FFFD sequences;
+                // payload_has_secret scans bounded windows to avoid materializing a lossy-decoded payload.
+                if payload_has_secret(&request.payload).unwrap_or(true) {
+                    return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
                 }
                 (
                     RedactedField {
