@@ -445,6 +445,11 @@ describe("deterministic metamorphic runner", () => {
         strayControl.injectionCanaryHits.push({ scenarioId: "hse-control", role: "control-a", transformId: null, transformVersion: null, seed: null });
         expect(() => parseMetamorphicReport(strayControl))
             .toThrow(/report\.injectionCanaryHits\[0\]: control-role-requires-live-report/);
+        // One hit per role per pair, so a repeated hit is a duplicated observation.
+        const doubledHit = structuredClone(report);
+        const hit = { scenarioId: doubledHit.coverage[0]!.scenarioId, role: "baseline" as const, transformId: null, transformVersion: null, seed: 1 };
+        doubledHit.injectionCanaryHits.push(hit, { ...hit });
+        expect(() => parseMetamorphicReport(doubledHit)).toThrow(/report\.injectionCanaryHits: duplicate/);
         // A canary hit names a covered scenario.
         const strayHit = structuredClone(report);
         strayHit.injectionCanaryHits.push({ scenarioId: "hse-nowhere", role: "baseline", transformId: null, transformVersion: null, seed: 1 });

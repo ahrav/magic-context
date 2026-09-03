@@ -243,10 +243,6 @@ const CHANGE_DIRECTIONS = vocabulary<Extract<InvariantVerdict, { invariant: "inj
     "added-in-derivative": true,
 });
 
-function textArray(value: unknown, label: string): string[] {
-    return p.array(value, label).map((entry, index) => p.text(entry, `${label}[${index}]`));
-}
-
 function parsePairKey(value: Record<string, unknown>, label: string): PairKey {
     return {
         scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
@@ -279,7 +275,7 @@ function parseInvariantEvidence(value: Record<string, unknown>, invariant: Metam
         case "expected-absent-empty":
         case "false-authoritative-set-equality":
             p.exact(value, ["invariant", "holds", "baselineMatches", "derivativeMatches"], label);
-            return { invariant, baselineMatches: textArray(value.baselineMatches, `${label}.baselineMatches`), derivativeMatches: textArray(value.derivativeMatches, `${label}.derivativeMatches`) };
+            return { invariant, baselineMatches: p.textArray(value.baselineMatches, `${label}.baselineMatches`), derivativeMatches: p.textArray(value.derivativeMatches, `${label}.derivativeMatches`) };
         case "verdict-monotonicity":
             p.exact(value, ["invariant", "holds", "baselineVerdict", "derivativeVerdict", "introducedFailReasons"], label);
             return {
@@ -291,7 +287,7 @@ function parseInvariantEvidence(value: Record<string, unknown>, invariant: Metam
             };
         case "expectation-predicate-equality":
             p.exact(value, ["invariant", "holds", "changedExpectationIds"], label);
-            return { invariant, changedExpectationIds: textArray(value.changedExpectationIds, `${label}.changedExpectationIds`) };
+            return { invariant, changedExpectationIds: p.textArray(value.changedExpectationIds, `${label}.changedExpectationIds`) };
         case "scenario-verdict-equality":
             p.exact(value, ["invariant", "holds", "baselineVerdict", "derivativeVerdict"], label);
             return {
@@ -385,7 +381,7 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
     switch (kind) {
         case "lint-red":
             p.exact(value, [...PAIR_KEYS, "kind", "diagnostics"], label);
-            return { ...pair, kind, diagnostics: textArray(value.diagnostics, `${label}.diagnostics`) };
+            return { ...pair, kind, diagnostics: p.textArray(value.diagnostics, `${label}.diagnostics`) };
         case "stage-not-scored":
             p.exact(value, [...PAIR_KEYS, "kind", "role", "stage", "error"], label);
             return {
@@ -456,7 +452,7 @@ function parseCoverage(raw: unknown, label: string): ScenarioCoverage[] {
                 if (pair.scenarioId !== scenarioId) p.fail(`${innerLabel}.scenarioId: coverage-scenario-mismatch`);
                 return { ...pair, reason: p.text(inapplicable.reason, `${innerLabel}.reason`) };
             }),
-            violations: textArray(value.violations, `${itemLabel}.violations`),
+            violations: p.textArray(value.violations, `${itemLabel}.violations`),
         };
     });
     // One coverage row per scenario, and `requireSorted` alone admits an adjacent repeat.
@@ -487,6 +483,8 @@ function parseInjectionCanaryHits(raw: unknown, label: string): InjectionCanaryH
         }
         return { scenarioId: p.string(value.scenarioId, `${itemLabel}.scenarioId`), role, transformId, transformVersion, seed };
         });
+    // One hit per role per pair, and `sorted` alone admits an adjacent repeat.
+    p.unique(hits.map(canaryKey), label);
     p.sorted(hits, canaryKey, label);
     return hits;
 }
@@ -542,9 +540,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
         entries: (() => {
             const entries = p.array(root.entries, "report.entries")
                 .map((entry, index) => parseEntry(entry, `report.entries[${index}]`));
+            const keys = entries.map(key);
             // One pair is observed once, so a repeated key means a duplicated observation.
-            p.unique(entries.map(key), "report.entries");
-            p.sorted(entries, key, "report.entries");
+            p.unique(keys, "report.entries");
+            p.sorted(keys, (entryKey) => entryKey, "report.entries");
             return entries;
         })(),
         coverage: parseCoverage(root.coverage, "report.coverage"),

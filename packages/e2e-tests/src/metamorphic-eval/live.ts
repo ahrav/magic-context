@@ -277,6 +277,11 @@ export async function runLiveMetamorphicEval(
             injectedClaims: record.injectedClaims,
         };
     });
+    /** Turns an executor failure into the error a report entry records; a system mismatch is a runner fault and propagates. */
+    const entryError = (error: unknown): Error => {
+        if (error instanceof LiveSystemMismatchError) throw error;
+        return error instanceof Error ? error : new Error(getErrorMessage(error));
+    };
     const execute: LiveScenarioExecutor = async (scenario, role, artifactDir) => {
         const observation = await executeRole(scenario, role, artifactDir);
         const observed = observation.score.system;
@@ -359,8 +364,7 @@ export async function runLiveMetamorphicEval(
         });
         observe();
     } catch (error) {
-        if (error instanceof LiveSystemMismatchError) throw error;
-        const reason = getErrorMessage(error);
+        const reason = entryError(error).message;
         entries.push({ ...controlKey, kind: "error", error: reason });
         /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. */
         if (controlA === null || controlB === null) {
@@ -389,8 +393,7 @@ export async function runLiveMetamorphicEval(
                         liveArtifactDir(options.artifactRoot, pair.base.id, "baseline"),
                     );
                 } catch (error) {
-                    if (error instanceof LiveSystemMismatchError) throw error;
-                    baseline = error instanceof Error ? error : new Error(getErrorMessage(error));
+                    baseline = entryError(error);
                 }
                 baselines.set(pair.base.id, baseline);
                 if (!(baseline instanceof Error)) {
@@ -437,8 +440,7 @@ export async function runLiveMetamorphicEval(
                 });
             }
         } catch (error) {
-            if (error instanceof LiveSystemMismatchError) throw error;
-            entries.push({ ...pair.key, kind: "error", error: getErrorMessage(error) });
+            entries.push({ ...pair.key, kind: "error", error: entryError(error).message });
         }
         observe();
     }

@@ -1895,8 +1895,6 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         "expectedClaimsMatched", "expectedClaimsTotal", "visibleClaimsMatched", "visibleClaimsTotal",
         "falseAuthoritativeMatches", "structuralFindings", "probeVerdicts", "system", "source",
     ], label);
-    const stringArray = (field: "falseAuthoritativeMatches" | "structuralFindings"): string[] =>
-        p.array(value[field], `${label}.${field}`).map((entry, index) => p.text(entry, `${label}.${field}[${index}]`));
     const precision = parseRatio(value.precision, `${label}.precision`);
     const recall = parseRatio(value.recall, `${label}.recall`);
     const expectedClaimsMatched = p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`);
@@ -1919,8 +1917,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const failReasons = p.array(value.failReasons, `${label}.failReasons`)
         .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`));
     p.unique(failReasons, `${label}.failReasons`);
-    const structuralFindings = stringArray("structuralFindings");
-    const falseAuthoritativeMatches = stringArray("falseAuthoritativeMatches");
+    const structuralFindings = p.textArray(value.structuralFindings, `${label}.structuralFindings`);
+    const falseAuthoritativeMatches = p.textArray(value.falseAuthoritativeMatches, `${label}.falseAuthoritativeMatches`);
     const probeVerdicts = parseProbeVerdicts(value.probeVerdicts, `${label}.probeVerdicts`);
     // `assembleScore` turns each of these into its reason, and `buildLaneReport` aggregates the declared
     // reasons rather than re-deriving them, so a contradictory score would rebuild unchanged.

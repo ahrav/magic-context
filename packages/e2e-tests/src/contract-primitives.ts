@@ -46,6 +46,8 @@ export interface ContractPrimitives {
     /** Rejects an array the builder would have emitted in another order, which its own code-unit sort makes unreachable. */
     sorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void;
     idArray(value: unknown, label: string, pattern: RegExp): string[];
+    /** An array of free-form strings, each admitted by `text`. */
+    textArray(value: unknown, label: string): string[];
 }
 
 export function makeContractPrimitives(errorClass: ContractErrorConstructor): ContractPrimitives {
@@ -145,5 +147,9 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return values;
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray };
+    function textArray(value: unknown, label: string): string[] {
+        return array(value, label).map((entry, index) => textValue(entry, `${label}[${index}]`));
+    }
+
+    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray };
 }
