@@ -1,5 +1,4 @@
-//! Daemon-side kernel route proofs. The proof registry in
-//! `crates/mc-kernel/tests/kernel_proofs/registry.rs` names tests in this file.
+//! Daemon-side kernel route proofs.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -365,7 +364,7 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     assert_eq!(kernel["lag_threshold_tripped"], true);
     assert_eq!(health.status, mc_host::HealthStatus::Degraded);
 
-    // The routed status method reports the same block from live facts.
+    // The routed status method reports the same sampled block.
     let status = daemon
         .handler
         .dispatch_value_for_test(
@@ -445,7 +444,7 @@ async fn a_failed_facts_sample_reports_the_kernel_unavailable_until_one_succeeds
     assert_eq!(daemon.handler.kernel_state(), KernelState::Ready);
     assert!(daemon.handler.kernel_store_for_test().is_some());
 
-    // The routed status method reports the same failure from live facts.
+    // The routed status method reports the same failed sample.
     let status = daemon
         .handler
         .dispatch_value_for_test(

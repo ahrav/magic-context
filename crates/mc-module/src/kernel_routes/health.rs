@@ -136,6 +136,17 @@ impl PublishedBlock {
     pub(crate) fn is_stale(&self) -> bool {
         self.block.kernel_state == KernelState::Ready && Instant::now() >= self.stale_at
     }
+
+    /// The block readers report: the published block, or its stale projection
+    /// once a `Ready` block has outlived [`SAMPLE_STALE_AFTER`]. The `bool`
+    /// is whether the projection applied.
+    pub(crate) fn reported(&self) -> (KernelHealthBlock, bool) {
+        if self.is_stale() {
+            (KernelHealthBlock::stale(self.block.sampled_at_ms), true)
+        } else {
+            (self.block.clone(), false)
+        }
+    }
 }
 
 /// Published projection the sampler writes and `health()` reads.
@@ -248,35 +259,6 @@ impl KernelOpenCoordinator {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(interval) => {}
             }
-        }
-    }
-
-    /// Live facts for the routed `status` method, which is not bound to the
-    /// lock-free health path and may read the store. The read runs on a
-    /// blocking worker so the artifact walk never occupies a route worker, and
-    /// `cancelled` reaches the walk so an abandoned request does not keep the
-    /// store alive; a cancelled read answers unavailable.
-    pub(crate) async fn live_block(
-        &self,
-        now_ms: i64,
-        cancelled: impl Fn() -> bool + Send + 'static,
-    ) -> KernelHealthBlock {
-        let store = match self.kernel_store() {
-            Ok(store) => store,
-            Err(_) => return self.phase_block(Some(now_ms)),
-        };
-        let worker = tokio::task::spawn_blocking(move || store.facts_unless(now_ms, &cancelled));
-        let outcome = worker.await;
-        // The store may have been retired while the worker ran; the phase wins,
-        // as it does for the sampler.
-        if self.state() != KernelState::Ready {
-            return self.phase_block(Some(now_ms));
-        }
-        match outcome {
-            Ok(Ok(Some(facts))) => {
-                KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts))
-            }
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => KernelHealthBlock::sample_failed(now_ms),
         }
     }
 }

@@ -7798,25 +7798,14 @@ impl McHandler {
         })
     }
 
-    async fn handle_status_value(
-        &self,
-        request: &Value,
-        request_cancel: CancellationToken,
-    ) -> PreparedOutcome {
+    fn handle_status_value(&self, request: &Value) -> PreparedOutcome {
         let store = match self.store() {
             Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
-        // The kernel walk stops for module shutdown or for this request's
-        // cancellation, whichever comes first.
-        let module_cancel = self.cancel.clone();
-        let kernel = self
-            .kernel
-            .live_block(now_ms(), move || {
-                module_cancel.is_cancelled() || request_cancel.is_cancelled()
-            })
-            .await
-            .to_json();
+        // The same sampled snapshot `health()` reports; a status request never
+        // walks the artifact tree itself.
+        let kernel = self.kernel.health_block().reported().0.to_json();
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return match store.load("__health__") {
                 Ok(state) => respond(json!({
@@ -11746,12 +11735,7 @@ impl CompositeComponent for McHandler {
         let request = serde_json::from_slice::<Value>(ctx.body.as_slice()).unwrap_or(Value::Null);
         let inbound_bytes = ctx.body.len();
         let outcome = self
-            .dispatch_value_with_inbound_bytes(
-                ctx.route,
-                request,
-                Some(inbound_bytes),
-                ctx.cancellation_token(),
-            )
+            .dispatch_value_with_inbound_bytes(ctx.route, request, Some(inbound_bytes))
             .await;
         settle_prepared(&ctx, outcome).await
     }
@@ -11803,13 +11787,7 @@ impl CompositeComponent for McHandler {
         // One atomic load; only the sampler task reads the store for this block.
         // A sampler that stopped publishing must not leave its last `Ready`
         // block standing, so an old sample reads as unavailable.
-        let published = self.kernel.health_block();
-        let stale = published.is_stale();
-        let kernel = if stale {
-            kernel_routes::health::KernelHealthBlock::stale(published.block.sampled_at_ms)
-        } else {
-            published.block.clone()
-        };
+        let (kernel, stale) = self.kernel.health_block().reported();
         if storage_state == "ready" && kernel.degrades_health() {
             report.status = HealthStatus::Degraded;
             let reason = match kernel.kernel_state {
@@ -12020,7 +11998,7 @@ impl McHandler {
     /// `RequestCtx` is transport-private, so this helper lets unit tests exercise routing arms without constructing one.
     #[cfg(test)]
     async fn dispatch_value(&self, route: RouteHandle, request: Value) -> PreparedOutcome {
-        self.dispatch_value_with_inbound_bytes(route, request, None, CancellationToken::new())
+        self.dispatch_value_with_inbound_bytes(route, request, None)
             .await
     }
 
@@ -12031,7 +12009,7 @@ impl McHandler {
         route: RouteHandle,
         request: Value,
     ) -> PreparedOutcome {
-        self.dispatch_value_with_inbound_bytes(route, request, None, CancellationToken::new())
+        self.dispatch_value_with_inbound_bytes(route, request, None)
             .await
     }
 
@@ -12079,7 +12057,6 @@ impl McHandler {
         channel: RouteHandle,
         request: Value,
         inbound_bytes: Option<usize>,
-        request_cancel: CancellationToken,
     ) -> PreparedOutcome {
         let method = request
             .get("method")
@@ -12087,9 +12064,7 @@ impl McHandler {
             .or_else(|| request.get("kind").and_then(Value::as_str));
         if let Some(method) = method {
             return match method {
-                "health" | "status" | "diagnostics" => {
-                    self.handle_status_value(&request, request_cancel).await
-                }
+                "health" | "status" | "diagnostics" => self.handle_status_value(&request),
                 "authority.status" => self.handle_authority_status_value(channel, &request),
                 "authority.prepare" => self.handle_authority_prepare_value(channel, &request),
                 "authority.seed" => self.handle_authority_seed_value(&request),
@@ -18441,9 +18416,7 @@ mod tests {
             });
         }
 
-        let outcome = handler
-            .handle_status_value(&json!({"method": "status"}), CancellationToken::new())
-            .await;
+        let outcome = handler.handle_status_value(&json!({"method": "status"}));
         let PreparedOutcome::Response(bytes) = outcome else {
             panic!("module status did not respond: {outcome:?}");
         };
@@ -25716,16 +25689,10 @@ mod tests {
         let diverging = call_transform_request(&handler, request(vec![ck("m1", 1, "after")])).await;
         assert!(diverging["first_divergence"].is_object());
 
-        let current_status = match handler
-            .handle_status_value(
-                &json!({
-                    "kind": "status",
-                    "session_id": "ses",
-                }),
-                CancellationToken::new(),
-            )
-            .await
-        {
+        let current_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
             PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
@@ -25734,16 +25701,10 @@ mod tests {
 
         let stable = call_transform_request(&handler, request(vec![ck("m1", 1, "after")])).await;
         assert!(stable.get("first_divergence").is_none());
-        let stable_status = match handler
-            .handle_status_value(
-                &json!({
-                    "kind": "status",
-                    "session_id": "ses",
-                }),
-                CancellationToken::new(),
-            )
-            .await
-        {
+        let stable_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
             PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
@@ -25767,16 +25728,10 @@ mod tests {
         )
         .await;
         assert!(second_diverging["first_divergence"].is_object());
-        let second_status = match handler
-            .handle_status_value(
-                &json!({
-                    "kind": "status",
-                    "session_id": "ses",
-                }),
-                CancellationToken::new(),
-            )
-            .await
-        {
+        let second_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
             PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
@@ -25871,19 +25826,9 @@ mod tests {
             other => panic!("expected status response, got {other:?}"),
         };
 
-        let health = decode(
-            handler
-                .handle_status_value(&json!({ "kind": "status" }), CancellationToken::new())
-                .await,
-        );
-        let session = decode(
-            handler
-                .handle_status_value(
-                    &json!({ "kind": "status", "session_id": "ses" }),
-                    CancellationToken::new(),
-                )
-                .await,
-        );
+        let health = decode(handler.handle_status_value(&json!({ "kind": "status" })));
+        let session =
+            decode(handler.handle_status_value(&json!({ "kind": "status", "session_id": "ses" })));
         for status in [&health, &session] {
             let versions = &status["storage_versions"];
             assert!(versions["context_db_schema_version"].is_null());
@@ -29812,13 +29757,11 @@ mod tests {
         assert!(store.load_pass_trace(&session).unwrap().is_none());
         assert!(v.get("historian").is_none());
     }
-    #[tokio::test(flavor = "current_thread")]
-    async fn module_status_emits_exact_numeric_state_sync_epoch_alongside_boolean_signal() {
+    #[test]
+    fn module_status_emits_exact_numeric_state_sync_epoch_alongside_boolean_signal() {
         let (handler, _store, _dir, _project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let outcome = handler
-            .handle_status_value(&json!({"method": "status"}), CancellationToken::new())
-            .await;
+        let outcome = handler.handle_status_value(&json!({"method": "status"}));
         let PreparedOutcome::Response(bytes) = outcome else {
             panic!("module status did not respond: {outcome:?}");
         };
