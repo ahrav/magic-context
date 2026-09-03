@@ -20,17 +20,20 @@ pub enum CloseState {
     ReleasingSamples,
     /// The lifecycle drops transport mappings and objects.
     DroppingTransport,
+    /// Shutdown completed and storage can be reused.
     Joined,
     /// Storage can never be reused after `Quarantined`.
     Quarantined,
 }
 
+/// Enforces ordered transport shutdown and fail-closed preparation state.
 pub struct Lifecycle {
     state: CloseState,
     prepared: bool,
 }
 
 impl Lifecycle {
+    /// Creates an open, unprepared lifecycle.
     pub const fn new() -> Self {
         Self {
             state: CloseState::Open,
@@ -38,6 +41,7 @@ impl Lifecycle {
         }
     }
 
+    /// Marks storage prepared once while lifecycle remains open.
     pub fn mark_prepared(&mut self) -> Result<(), LifecycleError> {
         if self.state != CloseState::Open || self.prepared {
             return Err(LifecycleError::InvalidTransition);
@@ -46,6 +50,7 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// Returns whether preparation requires later failures to close the transport.
     pub const fn must_fail_closed(&self) -> bool {
         self.prepared
     }
@@ -55,6 +60,7 @@ impl Lifecycle {
         self.state
     }
 
+    /// Advances one permitted shutdown edge.
     pub fn advance(&mut self, next: CloseState) -> Result<(), LifecycleError> {
         let valid = matches!(
             (self.state, next),
@@ -88,6 +94,7 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// Returns whether shutdown joined cleanly and storage can be reused.
     pub fn reusable(&self) -> bool {
         self.state == CloseState::Joined
     }
@@ -109,9 +116,12 @@ impl fmt::Debug for Lifecycle {
     }
 }
 
+/// Rejected lifecycle transition.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
+    /// Requested edge is not next in shutdown order.
     InvalidTransition,
+    /// Current state permits no further transitions.
     Terminal,
 }
 
