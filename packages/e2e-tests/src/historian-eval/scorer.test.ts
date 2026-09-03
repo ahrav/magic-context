@@ -2713,6 +2713,15 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: error-shape-invalid/);
         Object.assign(trimmedError.scenarios[0]!, { errorReason: "trimmed-by-injection-budget", probeVerdicts: [] });
         expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: error-shape-invalid/);
+        // A failing probe derives the `probe` reason, which no ERROR carries, so the trimmed ERROR cannot hold one.
+        Object.assign(trimmedError.scenarios[0]!, {
+            errorReason: "trimmed-by-injection-budget",
+            probeVerdicts: [
+                { probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null },
+                { probeId: "probe-2", outcome: "fail", expected: "yes", actual: "no" },
+            ],
+        });
+        expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.failReasons: derived-mismatch/);
         // Only the all-attempts-invalid FAIL, whose facts are all empty, scores without probes; a partially
         // invalid run keeps its probe evidence, and a null recall alone does not make it the all-invalid shape.
         const partialInvalid = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
