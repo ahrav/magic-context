@@ -1,6 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
+import { REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { SCENARIO_ID_RE } from "../historian-eval/contract";
 import type { SystemVersionTuple } from "../historian-eval/runner";
@@ -157,16 +157,12 @@ export type SystemProjection = SystemVersionTuple;
 
 export type ReleaseFingerprintsProjection = BenchmarkReport["semantic"]["releaseFingerprints"];
 
-/** `_releaseFingerprintsKeysComplete` fails to compile when a `ReleaseFingerprintsProjection` field is missing from this tuple. */
-const RELEASE_FINGERPRINTS_KEYS = [
-    "corpus",
-    "judgments",
-    "syntheticProfiles",
-    "manifest",
-] as const satisfies readonly (keyof ReleaseFingerprintsProjection)[];
-type MissingReleaseFingerprintsKey = Exclude<keyof ReleaseFingerprintsProjection, (typeof RELEASE_FINGERPRINTS_KEYS)[number]>;
-const _releaseFingerprintsKeysComplete: MissingReleaseFingerprintsKey extends never ? true : never = true;
-void _releaseFingerprintsKeysComplete;
+const RELEASE_FINGERPRINTS_KEYS = vocabulary<keyof ReleaseFingerprintsProjection>({
+    corpus: true,
+    judgments: true,
+    syntheticProfiles: true,
+    manifest: true,
+});
 
 export type LaneIdentity =
     | { kind: "identityless" }

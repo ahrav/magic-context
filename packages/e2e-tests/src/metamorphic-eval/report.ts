@@ -148,13 +148,6 @@ export type TierInvalidReason =
     | { kind: "selection-empty"; reason: string }
     | { kind: "deadline-exhausted"; nextRole: "control-a" | "control-b" | "baseline" | "derivative" };
 
-/** Rejects an array the builder would have emitted in another order, which its own sort makes unreachable. */
-function requireSorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void {
-    for (let index = 1; index < values.length; index += 1) {
-        if (compareCodeUnits(rank(values[index - 1]!), rank(values[index]!)) > 0) p.fail(`${label}: order-invalid`);
-    }
-}
-
 /** A field-order-independent rank, so the builder's sort and the parser's check cannot disagree. */
 function canaryKey(hit: InjectionCanaryHit): string {
     return canonicalJson([hit.scenarioId, hit.role, hit.transformId, hit.transformVersion, hit.seed]);
@@ -383,6 +376,12 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
     const value = p.record(raw, label);
     const kind = p.enumeration(value.kind, ENTRY_KINDS, `${label}.kind`);
     const pair = parsePairKey(value, label);
+    // Every control-coordinate check downstream keys on the id alone, so the fixed version and seed are
+    // enforced here for every entry kind, not only a scored pair.
+    const isControlPair = pair.transformId === CONTROL_TRANSFORM_ID;
+    if (isControlPair && (pair.transformVersion !== CONTROL_TRANSFORM_VERSION || pair.seed !== CONTROL_SEED)) {
+        p.fail(`${label}: control-pair-coordinates-invalid`);
+    }
     switch (kind) {
         case "lint-red":
             p.exact(value, [...PAIR_KEYS, "kind", "diagnostics"], label);
@@ -414,10 +413,6 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             }
             // `applyTransform` names the derivative scenario after its pair, so the id is derivable. The
             // control pair scores two runs of the base scenario and keeps that id on both roles.
-            const isControlPair = pair.transformId === CONTROL_TRANSFORM_ID;
-            if (isControlPair && (pair.transformVersion !== CONTROL_TRANSFORM_VERSION || pair.seed !== CONTROL_SEED)) {
-                p.fail(`${label}: control-pair-coordinates-invalid`);
-            }
             // The control pair requires a run-record baseline score.
             if (isControlPair && baselineScore.source !== "run-record") {
                 p.fail(`${label}: control-pair-source-invalid`);
@@ -466,7 +461,7 @@ function parseCoverage(raw: unknown, label: string): ScenarioCoverage[] {
     });
     // One coverage row per scenario, and `requireSorted` alone admits an adjacent repeat.
     p.unique(coverage.map(({ scenarioId }) => scenarioId), label);
-    requireSorted(coverage, ({ scenarioId }) => scenarioId, label);
+    p.sorted(coverage, ({ scenarioId }) => scenarioId, label);
     return coverage;
 }
 
@@ -492,7 +487,7 @@ function parseInjectionCanaryHits(raw: unknown, label: string): InjectionCanaryH
         }
         return { scenarioId: p.string(value.scenarioId, `${itemLabel}.scenarioId`), role, transformId, transformVersion, seed };
         });
-    requireSorted(hits, canaryKey, label);
+    p.sorted(hits, canaryKey, label);
     return hits;
 }
 
@@ -549,7 +544,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
                 .map((entry, index) => parseEntry(entry, `report.entries[${index}]`));
             // One pair is observed once, so a repeated key means a duplicated observation.
             p.unique(entries.map(key), "report.entries");
-            requireSorted(entries, key, "report.entries");
+            p.sorted(entries, key, "report.entries");
             return entries;
         })(),
         coverage: parseCoverage(root.coverage, "report.coverage"),

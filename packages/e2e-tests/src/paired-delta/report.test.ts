@@ -1030,6 +1030,11 @@ describe("parsePairedDeltaReport", () => {
         }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions[0]!.count = 99; })))
             .toThrow(/report\.body\.exclusions: [a-z-]+-exceeds-plan/);
+        // The builder sorts exclusions and limitations, so a reordered archive is not a shape it can emit.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions.reverse(); })))
+            .toThrow(/report\.body\.exclusions: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.limitations = ["b caveat", "a caveat"]; })))
+            .toThrow(/report\.body\.limitations: order-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { vibes: 1 }; })))
             .toThrow(/report\.body\.runSummary\.refusedRegretLadders\.vibes: enum-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { "intervention-mismatch": 99 }; })))

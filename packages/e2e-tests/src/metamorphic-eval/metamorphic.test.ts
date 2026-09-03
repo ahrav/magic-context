@@ -201,6 +201,11 @@ describe("deterministic metamorphic runner", () => {
         });
         expect(orphanDisagreement.system).toBeNull();
         expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.system: control-disagreement-requires-live-report/);
+        // The control coordinate is fixed for every entry kind, not only a scored pair.
+        const strayControlSeed = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
+        expect(strayControlSeed.entries[0]!.transformId).toBe("baseline-control");
+        strayControlSeed.entries[0]!.seed = 5;
+        expect(() => parseMetamorphicReport(strayControlSeed)).toThrow(/report\.entries\[0\]: control-pair-coordinates-invalid/);
         // selection-empty means nothing was admitted or scored.
         const falseEmpty = structuredClone(report);
         falseEmpty.tierInvalidReason = { kind: "selection-empty", reason: "n/a" };

@@ -3,6 +3,8 @@
  *
  */
 
+import { compareCodeUnits } from "./code-unit-order";
+
 export const HEX64_RE = /^[0-9a-f]{64}$/;
 export const REASON_CODE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const GATE_ID_RE = /^gate-[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -41,6 +43,8 @@ export interface ContractPrimitives {
     /** A `reason -> count` record. Counts are only ever reached by incrementing, so zero means corruption. */
     countRecord(raw: unknown, label: string): Record<string, number>;
     unique(values: readonly string[], label: string): void;
+    /** Rejects an array the builder would have emitted in another order, which its own code-unit sort makes unreachable. */
+    sorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void;
     idArray(value: unknown, label: string, pattern: RegExp): string[];
 }
 
@@ -129,11 +133,17 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
     }
 
+    function sorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void {
+        for (let index = 1; index < values.length; index += 1) {
+            if (compareCodeUnits(rank(values[index - 1]!), rank(values[index]!)) > 0) fail(`${label}: order-invalid`);
+        }
+    }
+
     function idArray(value: unknown, label: string, pattern: RegExp): string[] {
         const values = array(value, label).map((entry, index) => staticId(entry, `${label}[${index}]`, pattern));
         unique(values, label);
         return values;
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, idArray };
+    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray };
 }

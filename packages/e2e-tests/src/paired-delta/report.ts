@@ -634,6 +634,9 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         p.fail("report.body.analysis: lane-binding-mismatch");
     }
     p.unique(body.exclusions.map(({ armId, reasonCode }) => `${armId}:${reasonCode}`), "report.body.exclusions");
+    // The builder sorts both arrays by the same keys.
+    p.sorted(body.exclusions, ({ armId, reasonCode }) => `${armId}:${reasonCode}`, "report.body.exclusions");
+    p.sorted(body.limitations, (line) => line, "report.body.limitations");
     if (body.runSummary.healthyCoordinates > body.runSummary.plannedCoordinates) {
         p.fail("report.body.runSummary.healthyCoordinates: integer-invalid");
     }

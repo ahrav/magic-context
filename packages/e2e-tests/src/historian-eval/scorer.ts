@@ -1864,9 +1864,10 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         // Splitting `expected` recovers `compareProbeAnswer`'s candidate set for every answer type: the scenario
         // contract forbids the separator in an authored answer and public claim ids never contain it. commentlint: allow(JUDGE)
         // `NO_INJECTED_GOLD_CLAIM` is the empty set, which the contract forbids authoring.
-        const matches = actual !== null && expected !== NO_INJECTED_GOLD_CLAIM &&
+        const normalizedActual = actual === null ? null : normalizeContent(decodeXmlEntities(actual));
+        const matches = normalizedActual !== null && expected !== NO_INJECTED_GOLD_CLAIM &&
             expected.split(PROBE_CHOICE_SEPARATOR).some((candidate) =>
-                normalizeContent(decodeXmlEntities(candidate)) === normalizeContent(decodeXmlEntities(actual)));
+                normalizeContent(decodeXmlEntities(candidate)) === normalizedActual);
         if ((outcome === "pass") !== matches && outcome !== "error-trimmed") {
             p.fail(`${probeLabel}.outcome: derived-mismatch`);
         }
