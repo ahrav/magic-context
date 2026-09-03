@@ -1,4 +1,4 @@
-//!
+//! This module replays checked-in fuzz seeds against each shared-memory decoder.
 
 use std::fs;
 use std::path::Path;

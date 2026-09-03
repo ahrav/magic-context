@@ -866,8 +866,7 @@ const CANCELLED: u8 = 3;
 
 /// Indicates whether `stop` removed the pending entry.
 ///
-/// `Cancelled` means this stop settled the caller; `AlreadyTaken` means another owner may still send a terminal result.
-/// flight.
+/// `Cancelled` means this stop settled the caller. `AlreadyTaken` means another owner may still send a terminal result.
 #[derive(Debug)]
 enum PendingRemoval {
     /// This stop removed the entry and settled the caller.
@@ -1225,7 +1224,6 @@ impl Inner {
             // A failed Cancel enqueue returns an error without changing the request's OutcomeUnknown.
             // A concurrently retired generation can make the Cancel outcome NotSent.
             // Replacing OutcomeUnknown with the Cancel's NotSent outcome would incorrectly mark a possibly delivered request as replay-safe.
-            // is replay-safe.
             if let Err(error) = self.send_control(
                 FrameType::Cancel,
                 pure_header_flags(),
@@ -1264,7 +1262,6 @@ impl Inner {
             )
         })?;
         // `send_control` uses the reserved pool so ordinary requests cannot prevent control-frame admission.
-        // self-inflicted teardown.
         let charge = self.control_budget.charge(bytes.len()).ok_or_else(|| {
             self.retire("control_capacity_exhausted");
             CallError::local(
@@ -1339,8 +1336,6 @@ impl Inner {
                 };
                 let state = lock_unpoisoned(&self.pending).remove(&key);
                 let Some(state) = state else {
-                    // A `Response` on identity 0/0 can carry a route bound for an `open_route` caller that dropped or timed out.
-                    // A `Response` on identity 0/0 can carry a route bound for an `open_route` caller that dropped or timed out.
                     // A `Response` on identity 0/0 can carry a route bound for an `open_route` caller that dropped or timed out.
                     // An abandoned `open_route` on identity 0/0 cannot withdraw its bind because §6.2 permits no `Cancel`.
                     if header.ty == FrameType::Response && header.channel == 0 {
@@ -1426,7 +1421,6 @@ impl Inner {
                         // The stream queue charges retained bytes against the queue budget so held items cannot exhaust the reader's frame reservation.
                         // The stream handler treats retention-budget exhaustion as stream saturation.
                         // The stream handler cancels the saturated stream without advancing its generation.
-                        // the generation.
                         let retained = self.retained_budget.charge(body.len());
                         let item = retained.map(|retained| ChargedItem {
                             body,
@@ -1506,8 +1500,7 @@ impl Inner {
             PendingKind::Stream { terminal, .. } => {
                 let terminal_result = result.map(|_| ());
                 let _ = terminal.send(terminal_result);
-                // Dropping `state` retires the deadline watcher.
-                // see `PendingKind::Stream::_settled`.
+                // Dropping `state` retires the deadline watcher; see `PendingKind::Stream::_settled`.
                 self.release_stream();
             }
         }
@@ -1518,10 +1511,7 @@ impl Inner {
         *streams = streams.saturating_sub(1);
     }
 
-    ///
-    /// The route settlement sends no per-correlation `Cancel`.
-    /// `settle_all` also sends no `Cancel` frames.
-    /// reason.
+    /// Settles one route without sending per-correlation `Cancel` frames.
     fn settle_route(&self, route: RouteHandle) -> bool {
         let pending = {
             let _admission = lock_unpoisoned(&self.admission);
@@ -1728,7 +1718,7 @@ impl Drop for ByteCharge {
 struct ChargedItem {
     body: Vec<u8>,
     binary: bool,
-    /// account for.
+    /// Retained-byte charge released when this item is consumed or dropped.
     _charge: ByteCharge,
 }
 
@@ -2058,7 +2048,7 @@ async fn ring_reader_loop(inner: Arc<Inner>, mut read: RingFrameReceiver) {
     inner.retire("eof");
 }
 
-///
+/// Converts a relative request timeout into a checked absolute deadline.
 fn request_deadline(timeout: Duration) -> Result<Instant, CallError> {
     Instant::now().checked_add(timeout).ok_or_else(|| {
         CallError::local(
@@ -2194,7 +2184,6 @@ fn route_open_body(target: &RouteTarget, identity: &RouteIdentity) -> Result<Vec
         "consumer_capabilities": identity.consumer_capabilities
     });
     // A present JSON `null` makes `bind` observe `Some(..)`, unlike an absent member.
-    // never supplied.
     if let Some(facts) = identity.admission_facts.as_ref() {
         request["admission_facts"] = facts.clone();
     }
@@ -2854,8 +2843,7 @@ mod tests {
     async fn a_zero_length_stream_item_is_delivered_without_retiring() {
         // Only `StreamEnd` must be empty; zero-length `StreamData` is valid.
         // A zero-length `StreamData` incurs no charge because it carries no bytes.
-        // A zero-length `StreamData` must reach the stream instead of retiring it.
-        // generation.
+        // A zero-length `StreamData` must reach the stream instead of retiring the generation.
         let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         let (items_tx, mut items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
         let (terminal_tx, _terminal_rx) = oneshot::channel();
@@ -3005,7 +2993,7 @@ mod tests {
     async fn a_terminal_still_in_flight_wins_over_the_local_stop() {
         // Removing the pending entry before sending the terminal prevents a concurrent stop from cancelling a completed request.
         // A single `try_recv` can report `OutcomeUnknown` after the host answered if `dispatch` holds the sender before publishing the terminal.
-        // stop must wait for the owner that holds the sender.
+        // The stop must wait for the owner that holds the sender.
         let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         lock_unpoisoned(&inner.routes).insert(route(1));
         let (kind, rx) = unary_sender();
@@ -3449,7 +3437,6 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_stream_releases_its_queued_item_charges() {
         // Cancellation releases queued-item charges because `next` stops at `finished`; otherwise a retained stream pins the owner budget.
-        // generation.
         let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         lock_unpoisoned(&inner.routes).insert(route(1));
         let (items_tx, items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
@@ -3481,8 +3468,7 @@ mod tests {
             finished: false,
         };
 
-        // Queued items simulate a slow consumer.
-        // them.
+        // Queued items simulate a slow consumer holding retained-byte charges.
         const ITEMS: usize = 4;
         for _ in 0..ITEMS {
             inner.dispatch(
