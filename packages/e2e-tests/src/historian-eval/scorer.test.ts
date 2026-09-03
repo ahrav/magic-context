@@ -2580,6 +2580,29 @@ describe("buildLaneReport", () => {
         // ordinary FAIL, which must carry its probe evidence.
         Object.assign(abortedFa.scenarios[1]!, { errorReason: null, errorDetail: null });
         expect(() => parseLaneReport(abortedFa)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: probes-required/);
+        // Over the empty facts the shape is admitted, and it stays probe-free: the abort branch returns before
+        // probe scoring, so a probe verdict on it is fabricated evidence.
+        const abortedScore: ScenarioScore = {
+            ...passScore("hse-b"),
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: ["abs-x"],
+            errorReason: "harness-crash",
+            errorDetail: "boom",
+            precision: null,
+            recall: null,
+            expectedClaimsMatched: 0,
+            expectedClaimsTotal: 0,
+            visibleClaimsMatched: 0,
+            visibleClaimsTotal: 0,
+            structuralFindings: [],
+            probeVerdicts: [],
+        };
+        const abortedReport = buildLaneReport([passScore("hse-a"), abortedScore]);
+        expect(() => parseLaneReport(abortedReport)).not.toThrow();
+        const abortedWithProbe = structuredClone(abortedReport);
+        abortedWithProbe.scenarios[1]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }];
+        expect(() => parseLaneReport(abortedWithProbe)).toThrow(/report\.scenarios\[1\]: error-shape-invalid/);
         Object.assign(abortedFa.scenarios[1]!, {
             errorReason: "harness-crash", errorDetail: "boom",
             precision: null, recall: null, expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,

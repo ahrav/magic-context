@@ -1983,9 +1983,11 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         if ((errorReason !== null || errorDetail !== null) && !abortedFalseAuthoritative) {
             p.fail(`${label}.errorReason: derived-mismatch`);
         }
-        // That FAIL is `errorScore` with the matches spliced in, so every other fact stays empty.
+        // That FAIL is `errorScore` with the matches spliced in, so every other fact stays empty and, since the
+        // abort branch returns before probe scoring, it carries no probe verdict.
         if (abortedFalseAuthoritative && (precision !== null || recall !== null || expectedClaimsMatched !== 0 ||
-            expectedClaimsTotal !== 0 || visibleClaimsMatched !== 0 || visibleClaimsTotal !== 0 || structuralFindings.length > 0)) {
+            expectedClaimsTotal !== 0 || visibleClaimsMatched !== 0 || visibleClaimsTotal !== 0 ||
+            structuralFindings.length > 0 || probeVerdicts.length > 0)) {
             p.fail(`${label}: error-shape-invalid`);
         }
         // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
