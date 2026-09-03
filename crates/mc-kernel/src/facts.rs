@@ -52,6 +52,18 @@ impl KernelStore {
     /// `now_ms` is Unix-epoch milliseconds, while `oldest_unconsumed_age_ms` is an elapsed age in milliseconds measured from the oldest pending outbox row.
     /// Future-dated outbox rows report age zero. Missing database sidecar files contribute zero bytes.
     pub fn facts(&self, now_ms: i64) -> Result<KernelFacts, KernelError> {
+        Ok(self
+            .facts_unless(now_ms, &|| false)?
+            .expect("an uncancellable sample completes"))
+    }
+
+    /// [`facts`](Self::facts) whose artifact traversal, the one unbounded step,
+    /// stops once `cancelled` returns true and yields `None`.
+    pub fn facts_unless(
+        &self,
+        now_ms: i64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<KernelFacts>, KernelError> {
         if now_ms < 0 {
             return Err(KernelError::InvalidInput);
         }
@@ -86,8 +98,10 @@ impl KernelStore {
             .try_fold(main_file_bytes, |total, path| {
                 file_len(path).map(|length| total.saturating_add(length))
             })?;
-        let artifact_budget = self.artifact_budget_facts()?;
-        Ok(KernelFacts {
+        let Some(artifact_budget) = self.artifact_budget_facts_unless(cancelled)? else {
+            return Ok(None);
+        };
+        Ok(Some(KernelFacts {
             commit_seq,
             main_file_bytes,
             family_bytes,
@@ -96,7 +110,7 @@ impl KernelStore {
             outbox_lag: lag,
             retained_outbox_rows,
             artifact_budget,
-        })
+        }))
     }
 
     /// # Errors
@@ -119,13 +133,24 @@ impl KernelStore {
 
     /// Artifact traversal failures propagate as [`KernelError`].
     pub fn artifact_budget_facts(&self) -> Result<ArtifactBudgetFacts, KernelError> {
-        let usage_bytes = super::cas::gc::object_usage(self)?;
+        Ok(self
+            .artifact_budget_facts_unless(&|| false)?
+            .expect("an uncancellable walk completes"))
+    }
+
+    fn artifact_budget_facts_unless(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<ArtifactBudgetFacts>, KernelError> {
+        let Some(usage_bytes) = super::cas::gc::object_usage(self, cancelled)? else {
+            return Ok(None);
+        };
         let warn_at = self.artifact_cap.saturating_sub(self.artifact_cap / 5);
-        Ok(ArtifactBudgetFacts {
+        Ok(Some(ArtifactBudgetFacts {
             usage_bytes,
             cap_bytes: self.artifact_cap,
             warn: usage_bytes >= warn_at,
-        })
+        }))
     }
 }
 

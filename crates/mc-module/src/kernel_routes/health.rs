@@ -146,7 +146,9 @@ impl KernelOpenCoordinator {
         self.health.publish(self.phase_block(sampled_at_ms));
     }
 
-    pub(crate) async fn sample(&self, now_ms: i64) -> bool {
+    /// `cancel` is checked by the blocking sampler so shutdown can stop an
+    /// in-progress sample.
+    pub(crate) async fn sample(&self, now_ms: i64, cancel: &CancellationToken) -> bool {
         let store = match self.kernel_store() {
             Ok(store) => store,
             Err(_) => {
@@ -154,8 +156,9 @@ impl KernelOpenCoordinator {
                 return false;
             }
         };
-        let block = match sample_facts(store, now_ms).await {
-            Ok(facts) => KernelHealthBlock::ready(now_ms, facts),
+        let block = match sample_facts(store, now_ms, cancel.clone()).await {
+            Ok(Some(facts)) => KernelHealthBlock::ready(now_ms, facts),
+            Ok(None) => return false,
             Err(error) => {
                 eprintln!("mc-module: kernel facts sample failed: {error:?}");
                 KernelHealthBlock::sample_failed(now_ms)
@@ -166,13 +169,11 @@ impl KernelOpenCoordinator {
         self.publish_if_ready(block) && sampled
     }
 
-    /// Cancellation drops the in-flight sample future so shutdown does not wait
-    /// for the sample; the cancelled future publishes nothing.
     pub(crate) async fn run_sampler(self: Arc<Self>, cancel: CancellationToken) {
         loop {
             let sampled = tokio::select! {
                 _ = cancel.cancelled() => return,
-                sampled = self.sample(crate::now_ms()) => sampled,
+                sampled = self.sample(crate::now_ms(), &cancel) => sampled,
             };
             let interval = if sampled {
                 SAMPLE_INTERVAL
@@ -187,13 +188,15 @@ impl KernelOpenCoordinator {
     }
 }
 
+/// `Ok(None)` when `cancel` fired during the walk.
 async fn sample_facts(
     store: Arc<KernelStore>,
     now_ms: i64,
-) -> Result<KernelFactsBlock, mc_kernel::KernelError> {
+    cancel: CancellationToken,
+) -> Result<Option<KernelFactsBlock>, mc_kernel::KernelError> {
     tokio::task::spawn_blocking(move || {
-        let facts = store.facts(now_ms)?;
-        Ok(KernelFactsBlock::from_facts(&facts))
+        let facts = store.facts_unless(now_ms, &|| cancel.is_cancelled())?;
+        Ok(facts.as_ref().map(KernelFactsBlock::from_facts))
     })
     .await
     .unwrap_or_else(|error| panic!("kernel facts sampler worker failed: {error}"))

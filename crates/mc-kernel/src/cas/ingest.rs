@@ -559,9 +559,11 @@ impl KernelStore {
         digest: &str,
         byte_length: u64,
     ) -> Result<(), ArtifactError> {
-        let usage = regular_file_bytes(objects).map_err(|error| {
-            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
-        })?;
+        let usage = regular_file_bytes(objects, &|| false)
+            .map_err(|error| {
+                self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+            })?
+            .expect("an uncancellable walk completes");
         let already_present = object_is_present(objects, digest);
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
         if projected > self.artifact_cap {
@@ -940,10 +942,17 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
 /// Sums regular-file sizes directly below `objects` and its shard directories.
 ///
 /// Symlinks and other file types do not contribute. Entries removed during the
-/// walk are skipped. The sum saturates at [`u64::MAX`].
-pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
+/// walk are skipped. The sum saturates at [`u64::MAX`]. `cancelled` is polled
+/// before each top-level entry; a true result returns `None`.
+pub(super) fn regular_file_bytes(
+    objects: &File,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>, StorageError> {
     let mut bytes = 0_u64;
     for entry in rfs::Dir::read_from(objects).map_err(classify_errno)? {
+        if cancelled() {
+            return Ok(None);
+        }
         let entry = entry.map_err(classify_errno)?;
         let name = entry.file_name();
         if is_dot_entry(name) {
@@ -986,7 +995,7 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             }
         }
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 fn object_is_present(objects: &File, digest: &str) -> bool {

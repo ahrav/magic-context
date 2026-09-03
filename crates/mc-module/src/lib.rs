@@ -12020,7 +12020,7 @@ impl McHandler {
     /// Runs one health sample at `now_ms` instead of waiting for the sampler tick.
     #[cfg(feature = "test-support")]
     pub async fn sample_kernel_health_for_test(&self, now_ms: i64) {
-        self.kernel.sample(now_ms).await;
+        self.kernel.sample(now_ms, &CancellationToken::new()).await;
     }
 
     /// Disabling the background sampler lets tests control published snapshots.
