@@ -274,6 +274,28 @@ describe("live metamorphic orchestration", () => {
         expect(metamorphicExitCode(report)).toBe(0);
     });
 
+    test("rejects a product pair whose system tuple differs from the control run", async () => {
+        const other = { ...score().system!, historianModelId: "anthropic/other" };
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-test",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => role === "baseline" || role === "derivative"
+                ? observation({ score: score({ system: other }) })
+                : observation(),
+        });
+        // Both roles agree with each other, so only the root comparison can catch the drift the parser would reject.
+        expect(report.system).toEqual(score().system);
+        expect(report.entries).toContainEqual(expect.objectContaining({
+            kind: "error",
+            error: "pair system tuple differs from the control run",
+        }));
+        expect(report.entries.some((entry) => entry.kind === "scored" && entry.transformId !== "baseline-control")).toBe(false);
+    });
+
     test("rejects a product pair whose system tuples differ", async () => {
         const report = await runLiveMetamorphicEval([validScenario()], {
             mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },

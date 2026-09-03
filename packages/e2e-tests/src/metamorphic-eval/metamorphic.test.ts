@@ -446,11 +446,11 @@ describe("deterministic metamorphic runner", () => {
             entry.derivativeScore.system = systemTuple();
         }
         expect(() => parseMetamorphicReport(identityless)).toThrow(/report\.system: report-system-mismatch/);
-        // Control roles exist only in a live report, which names the system it ran.
-        const strayControl = structuredClone(report);
-        strayControl.injectionCanaryHits.push({ scenarioId: "hse-control", role: "control-a", transformId: null, transformVersion: null, seed: null });
-        expect(() => parseMetamorphicReport(strayControl))
-            .toThrow(/report\.injectionCanaryHits\[0\]: control-role-requires-live-report/);
+        // A control-role hit names no coverage row, and a null-tuple control observation can carry one, so the
+        // root's system says nothing about it.
+        const controlHit = structuredClone(report);
+        controlHit.injectionCanaryHits.push({ scenarioId: "hse-control", role: "control-a", transformId: null, transformVersion: null, seed: null });
+        expect(() => parseMetamorphicReport(controlHit)).not.toThrow();
         // Both producers publish violations sorted and deduplicated, and lint diagnostics sorted.
         const shuffledViolations = structuredClone(report);
         const violationRow = shuffledViolations.coverage[0]!;

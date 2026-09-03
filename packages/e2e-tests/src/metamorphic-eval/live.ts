@@ -409,6 +409,9 @@ export async function runLiveMetamorphicEval(
             }
             if (!sameSystem(baseline.score, derivative.score)) {
                 entries.push({ ...pair.key, kind: "error", error: "pair system tuple mismatch" });
+            } else if (observedSystem !== null && canonicalJson(baseline.score.system) !== canonicalJson(observedSystem)) {
+                // The report names the first tuple observed, and its parser binds every scored pair to that root.
+                entries.push({ ...pair.key, kind: "error", error: "pair system tuple differs from the control run" });
             } else {
                 entries.push({
                     ...pair.key,

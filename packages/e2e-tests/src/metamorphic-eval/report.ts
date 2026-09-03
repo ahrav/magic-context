@@ -629,11 +629,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // Both runners build a scenario's coverage row around its canary collection, so a hit names a covered
     // scenario; the control roles are the exception, since the control scenario has no row.
     for (const [index, hit] of report.injectionCanaryHits.entries()) {
-        if (hit.role === "control-a" || hit.role === "control-b") {
-            // Only the live runner runs controls, and it publishes the system it ran them on.
-            if (report.system === null) p.fail(`report.injectionCanaryHits[${index}]: control-role-requires-live-report`);
-            continue;
-        }
+        if (hit.role === "control-a" || hit.role === "control-b") continue;
         if (!covered.has(hit.scenarioId)) p.fail(`report.injectionCanaryHits[${index}]: coverage-row-required`);
     }
     const sources = new Set(report.entries.flatMap((entry) => entry.kind === "scored" ? [entry.baselineScore.source] : []));
