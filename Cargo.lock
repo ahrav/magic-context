@@ -2016,6 +2016,7 @@ dependencies = [
  "gix",
  "mc-core",
  "mc-kernel",
+ "mc-secret-scanner",
  "proptest",
  "rusqlite",
  "rustix",

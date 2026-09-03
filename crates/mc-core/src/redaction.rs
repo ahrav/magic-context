@@ -117,6 +117,8 @@ pub enum RedactionErrorKind {
     InputLimit,
     CandidateLimit,
     WorkLimit,
+    /// A candidate's full match exceeded `mc_secret_scanner::MAX_MATCH_BYTES`, so the scan stopped instead of dropping it.
+    MatchLimit,
     /// A windowed scan accumulated more findings than its caller allows.
     FindingLimit,
     InvalidSpan,
@@ -147,6 +149,7 @@ fn redaction_error_message(kind: &RedactionErrorKind) -> &'static str {
         RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
         RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
         RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
+        RedactionErrorKind::MatchLimit => "secret scan match length limit exceeded",
         RedactionErrorKind::FindingLimit => "secret scan finding limit exceeded",
         RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
         RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
@@ -209,6 +212,7 @@ impl Redactor {
                 kind: match limit {
                     LimitExhausted::Candidates => RedactionErrorKind::CandidateLimit,
                     LimitExhausted::Work => RedactionErrorKind::WorkLimit,
+                    LimitExhausted::Match => RedactionErrorKind::MatchLimit,
                 },
             });
         }

@@ -536,22 +536,67 @@ fn windowed_redaction_redacts_a_private_key_straddling_a_window_edge() {
 }
 
 #[test]
-fn a_match_past_the_scanner_bound_is_not_a_finding_on_either_path() {
+fn a_match_past_the_scanner_bound_fails_closed_on_both_paths() {
     let pem = pem_private_key(mc_secret_scanner::MAX_MATCH_BYTES);
     assert!(pem.len() > mc_secret_scanner::MAX_MATCH_BYTES);
     assert!(pem.len() < mc_secret_scanner::MAX_INPUT_BYTES);
+    // Direct redaction cannot describe the match, so the whole field is replaced.
     let direct = redact_durable_text(&pem);
-    assert!(direct.detections.is_empty());
-    assert_eq!(direct.text, pem);
+    assert_eq!(direct.text, "<REDACTED:secret>");
+    assert_eq!(direct.detections.len(), 1);
+    assert_eq!(direct.detections[0].length, pem.len());
+    assert_eq!(
+        redactor().redact(&pem).map_err(|error| error.kind()),
+        Err(RedactionErrorKind::MatchLimit)
+    );
 
+    // A window containing the full match returns `MatchLimit`; windowed redaction does not replace the field.
     let window = mc_secret_scanner::MAX_INPUT_BYTES;
-    let (text, _) = text_with_line_at(window - pem.len() / 2, &pem, 2 * window);
-    let windowed = redact_windowed_durable_text(&text, usize::MAX).unwrap();
-    assert!(windowed.detections.is_empty());
-    assert_eq!(windowed.text, text);
+    let (text, offset) = text_with_line_at(window / 4, &pem, 2 * window);
+    assert!(offset + pem.len() < window);
+    assert_eq!(
+        redact_windowed_durable_text(&text, usize::MAX).map_err(|error| error.kind()),
+        Err(RedactionErrorKind::MatchLimit)
+    );
+    assert_eq!(
+        detect_windowed_durable_text(&text).map_err(|error| error.kind()),
+        Err(RedactionErrorKind::MatchLimit)
+    );
+    assert_eq!(
+        detect_windowed_durable_bytes(text.as_bytes()).map_err(|error| error.kind()),
+        Err(RedactionErrorKind::MatchLimit)
+    );
 
     let short = pem_private_key(4 * 1024);
     assert_eq!(redact_durable_text(&short).detections.len(), 1);
+}
+
+#[test]
+fn a_match_past_the_scanner_bound_that_straddles_a_window_edge_is_still_refused() {
+    // The match is longer than the scanner bound but shorter than the overlap,
+    // so one window holds it whole and reports the limit.
+    let pem = pem_private_key(mc_secret_scanner::MAX_MATCH_BYTES);
+    assert!(pem.len() < WINDOW_OVERLAP_BYTES);
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    let (text, offset) = text_with_line_at(window - pem.len() / 2, &pem, 2 * window);
+    assert!(offset < window && offset + pem.len() > window);
+    assert_eq!(
+        redact_windowed_durable_text(&text, usize::MAX).map_err(|error| error.kind()),
+        Err(RedactionErrorKind::MatchLimit)
+    );
+}
+
+#[test]
+fn a_match_longer_than_the_overlap_that_straddles_a_window_edge_is_not_seen() {
+    // No window contains the full match: the header and footer fall in different windows.
+    let pem = pem_private_key(WINDOW_OVERLAP_BYTES + 4 * 1024);
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    let second_window_start = window - WINDOW_OVERLAP_BYTES;
+    let (text, offset) = text_with_line_at(second_window_start - 2 * 1024, &pem, 3 * window);
+    assert!(offset + 64 < second_window_start && offset + pem.len() > window);
+    let windowed = redact_windowed_durable_text(&text, usize::MAX).unwrap();
+    assert!(windowed.detections.is_empty());
+    assert_eq!(windowed.text, text);
 }
 
 #[test]
