@@ -25,7 +25,8 @@ pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
 /// Maximum payload accepted by one ingest, in bytes. Ingestion accepts exactly
 /// this many bytes and rejects one more with `PayloadTooLarge`.
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum recognized-secret detections accepted in one payload.
+/// Maximum recognized-secret findings accepted in one payload, counted before
+/// overlapping findings merge into detections; the scan stops at the cap.
 pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
 /// Maximum UTF-8 byte length of each artifact text field.
 pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
@@ -180,6 +181,8 @@ pub enum ArtifactErrorKind {
     AlignmentRebuild,
     ReclaimInProgress,
     UnredactableSecret,
+    /// The secret scan stopped before covering the whole payload, so the payload is refused unscanned rather than stored unproven.
+    ScanIncomplete,
     DetectionLimit,
     TextFieldTooLong,
     InvalidInput,
@@ -325,6 +328,9 @@ impl fmt::Display for ArtifactErrorMessage<'_> {
             }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::ScanIncomplete => {
+                formatter.write_str("artifact payload could not be fully scanned for secrets")
+            }
             ArtifactErrorKind::TextFieldTooLong => write!(
                 formatter,
                 "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"

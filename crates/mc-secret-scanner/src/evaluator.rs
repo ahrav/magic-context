@@ -7,11 +7,13 @@ use crate::rules::{
 };
 use crate::{
     Finding, LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport, TextSpan,
+    MAX_MATCH_BYTES,
 };
 
 #[derive(Debug)]
 enum Abort {
     Work,
+    Match,
     Invalid(ScanError),
 }
 
@@ -95,6 +97,10 @@ pub(crate) fn evaluate(
                                     limits_hit = Some(LimitExhausted::Work);
                                     break 'rules;
                                 }
+                                Err(Abort::Match) => {
+                                    limits_hit = Some(LimitExhausted::Match);
+                                    break 'rules;
+                                }
                                 Err(Abort::Invalid(error)) => return Err(error),
                             }
                         }
@@ -118,6 +124,10 @@ pub(crate) fn evaluate(
                 Ok(None) => {}
                 Err(Abort::Work) => {
                     limits_hit = Some(LimitExhausted::Work);
+                    break 'rules;
+                }
+                Err(Abort::Match) => {
+                    limits_hit = Some(LimitExhausted::Match);
                     break 'rules;
                 }
                 Err(Abort::Invalid(error)) => return Err(error),
@@ -229,6 +239,9 @@ fn evaluate_candidate_spans(
         value: value_span,
         key: key_span,
     } = spans;
+    if full_span.len() > MAX_MATCH_BYTES {
+        return Err(Abort::Match);
+    }
     let value = input
         .as_bytes()
         .get(value_span.start()..value_span.end())
@@ -2106,6 +2119,23 @@ mod tests {
         assert!(matches!(
             only_candidate(&rule, "auth_token=Ab3fGh1jKlMnOpQrStUv"),
             Ok(Some(_))
+        ));
+    }
+
+    #[test]
+    fn a_full_match_longer_than_the_match_bound_stops_the_scan() {
+        let rule = alternation_rule(
+            r#"{"name":"t-long","regex":"alpha=(?P<value>[A-Za-z0-9]{20,})","anchors":["alpha"],"radius":16,"value_group":"value"}"#,
+        );
+        let fits = format!("alpha={}", "Ab3fGh1jKl".repeat((MAX_MATCH_BYTES - 6) / 10));
+        assert!(fits.len() <= MAX_MATCH_BYTES);
+        assert!(matches!(only_candidate(&rule, &fits), Ok(Some(_))));
+
+        let too_long = format!("alpha={}", "Ab3fGh1jKl".repeat(MAX_MATCH_BYTES / 10 + 1));
+        assert!(too_long.len() > MAX_MATCH_BYTES);
+        assert!(matches!(
+            only_candidate(&rule, &too_long),
+            Err(Abort::Match)
         ));
     }
 }
