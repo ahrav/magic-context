@@ -1928,7 +1928,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`));
     p.unique(failReasons, `${label}.failReasons`);
     const structuralFindings = p.textArray(value.structuralFindings, `${label}.structuralFindings`);
-    const falseAuthoritativeMatches = p.textArray(value.falseAuthoritativeMatches, `${label}.falseAuthoritativeMatches`);
+    // Each match is an `ExpectedAbsent.id`, which the scenario contract admits only as a static id.
+    const falseAuthoritativeMatches = p.stringArray(value.falseAuthoritativeMatches, `${label}.falseAuthoritativeMatches`);
     const probeVerdicts = parseProbeVerdicts(value.probeVerdicts, `${label}.probeVerdicts`);
     // `assembleScore` turns each of these into its reason, and `buildLaneReport` aggregates the declared
     // reasons rather than re-deriving them, so a contradictory score would rebuild unchanged.
@@ -1980,6 +1981,11 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
             if (!abortedFalseAuthoritative) p.fail(`${label}.errorReason: derived-mismatch`);
             // `errorScore` sets both fields from the record's error, whose reason is a string.
             if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
+            // That FAIL is `errorScore` with the matches spliced in, so every other fact stays empty.
+            if (precision !== null || recall !== null || expectedClaimsMatched !== 0 || expectedClaimsTotal !== 0 ||
+                visibleClaimsMatched !== 0 || visibleClaimsTotal !== 0 || structuralFindings.length > 0) {
+                p.fail(`${label}: error-shape-invalid`);
+            }
         }
         // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
         // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.

@@ -51,6 +51,8 @@ export interface ContractPrimitives {
     idArray(value: unknown, label: string, pattern: RegExp): string[];
     /** An array of free-form strings, each admitted by `text`. */
     textArray(value: unknown, label: string): string[];
+    /** An array of non-blank strings, each admitted by `string`. */
+    stringArray(value: unknown, label: string): string[];
 }
 
 export function makeContractPrimitives(errorClass: ContractErrorConstructor): ContractPrimitives {
@@ -162,5 +164,9 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return array(value, label).map((entry, index) => textValue(entry, `${label}[${index}]`));
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray };
+    function stringArray(value: unknown, label: string): string[] {
+        return array(value, label).map((entry, index) => stringValue(entry, `${label}[${index}]`));
+    }
+
+    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray, stringArray };
 }

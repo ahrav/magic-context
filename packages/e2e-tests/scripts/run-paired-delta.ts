@@ -27,7 +27,10 @@ import {
 import { parsePolicyOwnerDocument } from "../src/prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../src/prospective-holdout/report";
 import {
+    MAX_BOOTSTRAP_WORK,
     MIN_BOOTSTRAP_RESAMPLES,
+    PRIMARY_ENDPOINTS,
+    REGRET_ENDPOINTS,
     estimateFamilyDeltas,
     type FamilyDeltaAnalysis,
     type FamilyDeltaObservation,
@@ -2160,6 +2163,14 @@ async function runLive(args: CliArgs): Promise<void> {
         throw new Error(
             `paired-delta ${mode} selects ${selectedFamilies.size} families but the policy ` +
             `requires ${policy.minimumAnalyzableFamilyCount}`,
+        );
+    }
+    /** The estimator bounds observations times resamples; at most one observation per coordinate per endpoint, checked here before any rollout is paid for. */
+    const worstCaseObservations = scenarios.length * policy.replicateCount * (PRIMARY_ENDPOINTS.length + REGRET_ENDPOINTS.length);
+    if (worstCaseObservations * policy.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+        throw new Error(
+            `paired-delta ${mode} could produce ${worstCaseObservations} observations at ` +
+            `${policy.bootstrapResamples} resamples, above the estimator's bound of ${MAX_BOOTSTRAP_WORK}`,
         );
     }
     // The fingerprinted policy documents the executed configuration, so the

@@ -225,10 +225,17 @@ export function buildPairedDeltaReport(input: {
             if (floor.endpoint === undefined) {
                 throw new Error(`paired-delta-report: noise-floor-endpoint-missing-${family.familyId}`);
             }
+            if (floor.endpoint !== endpoint.endpoint || floor.familyId !== family.familyId) {
+                throw new Error(`paired-delta-report: noise-floor-owner-mismatch-${family.familyId}`);
+            }
             if (floor.value < 0 || floor.value > 2 || floor.interval.lower !== 0 || floor.interval.upper !== floor.value) {
                 throw new Error(`paired-delta-report: noise-floor-shape-invalid-${family.familyId}`);
             }
         }
+    }
+    // A usage-unmeasured run stored the estimated-cost failure that produced the status.
+    if (input.runSummary.status === "usage-unmeasured" && input.runSummary.estimatedCostRollouts === 0) {
+        throw new Error("paired-delta-report: status-evidence-required");
     }
     // Rungs run in order and stop at the first failure, so a later regret delta exists only with every earlier one.
     const rungsByCoordinate = new Map<string, Set<string>>();

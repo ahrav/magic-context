@@ -60,6 +60,9 @@ export function requireRepresentableRunOptions(
             for (const seed of seeds) {
                 const pair = { scenarioId, transformId, transformVersion, seed };
                 const derivedId = derivativeScenarioId(pair);
+                if (scenarioIds.has(derivedId)) {
+                    throw new Error(`metamorphic-eval: pair ${canonicalJson(pair)} derives the selected scenario id "${derivedId}"`);
+                }
                 const other = derived.get(derivedId);
                 if (other !== undefined) {
                     throw new Error(`metamorphic-eval: pairs ${other} and ${canonicalJson(pair)} derive the same scenario id "${derivedId}"`);

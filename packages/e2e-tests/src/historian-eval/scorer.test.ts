@@ -2569,12 +2569,21 @@ describe("buildLaneReport", () => {
             precision: 1, recall: 1, expectedClaimsMatched: 10, expectedClaimsTotal: 10, visibleClaimsMatched: 10, visibleClaimsTotal: 10,
         });
         expect(() => parseLaneReport(evidencedError)).toThrow(/report\.scenarios\[2\]: error-shape-invalid/);
-        // An aborted record whose claims matched an expected-absent predicate keeps the abort's reason on its FAIL.
+        // An aborted record whose claims matched an expected-absent predicate keeps the abort's reason on its
+        // FAIL, over the empty facts `errorScore` writes.
         const abortedFa = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         Object.assign(abortedFa.scenarios[1]!, {
             failReasons: ["false-authoritative"], probeVerdicts: [], errorReason: "harness-crash", errorDetail: "boom",
         });
+        expect(() => parseLaneReport(abortedFa)).toThrow(/report\.scenarios\[1\]: error-shape-invalid/);
+        Object.assign(abortedFa.scenarios[1]!, {
+            precision: null, recall: null, expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,
+        });
         expect(() => parseLaneReport(abortedFa)).toThrow(/^report: derived-mismatch/);
+        // A false-authoritative match names an expected-absent id, never a blank.
+        const blankMatch = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(blankMatch.scenarios[1]!, { falseAuthoritativeMatches: [""] });
+        expect(() => parseLaneReport(blankMatch)).toThrow(/report\.scenarios\[1\]\.falseAuthoritativeMatches\[0\]: string-invalid/);
         const doubledProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown[]>[] };
         doubledProbe.scenarios[1]!.probeVerdicts!.push(structuredClone(doubledProbe.scenarios[1]!.probeVerdicts![0]!));
         expect(() => parseLaneReport(doubledProbe)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: duplicate/);

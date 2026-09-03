@@ -368,6 +368,15 @@ describe("paired-delta report", () => {
         const oddFamily = oddFloor.endpoints[0]!.families[0]!;
         oddFamily.noise = { label: "inside-floor", floor: { endpoint: oddFloor.endpoints[0]!.endpoint as "mc-on-vs-compaction", familyId: oddFamily.familyId, value: 0.2, interval: { lower: 0.1, upper: 0.3 } } };
         expect(() => report({ analysis: oddFloor })).toThrow(new RegExp(`noise-floor-shape-invalid-${oddFamily.familyId}`));
+        // A floor names the endpoint and family that carry it.
+        const swappedFloor = structuredClone(report().body.analysis);
+        const swappedFamily = swappedFloor.endpoints[0]!.families[0]!;
+        swappedFamily.noise = { label: "inside-floor", floor: { endpoint: swappedFloor.endpoints[1]!.endpoint as "mc-on-vs-mc-off", familyId: swappedFamily.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
+        expect(() => report({ analysis: swappedFloor })).toThrow(new RegExp(`noise-floor-owner-mismatch-${swappedFamily.familyId}`));
+        // A usage-unmeasured run stored the estimated-cost failure that produced the status.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, status: "usage-unmeasured", estimatedCostRollouts: 0, observedCostRollouts: 36, evidenceComplete: false },
+        })).toThrow(/status-evidence-required/);
         // A regret rung exists only with every earlier one.
         const skippedRung = structuredClone(report().body.analysis);
         skippedRung.rawRegretRecords = skippedRung.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
