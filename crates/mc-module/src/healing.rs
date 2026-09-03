@@ -1,7 +1,7 @@
+//! Serializer profiles and their request-healing coverage.
 //!
-//! The serializer profile is the operational key for provider-specific cleanup that
-//! happens before a request reaches the provider. The module only performs residual
-//! work that the selected serializer does not already cover.
+//! Profiles identify cleanup applied before provider dispatch. Residual flags
+//! identify work not covered by the selected serializer.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -113,17 +113,9 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
     }
 }
 
+/// All current profiles support tail reclamation.
 ///
-/// Every shipping profile is a full-array consumer: the provider request is rebuilt from
-/// the transformed array each pass, so prefix and tail rewrites both round-trip and the
-/// profile default is true. Full-array apply is the only serving path — the
-/// Thalamus gateway does not byte-splice the live tail — and the fail-open arm
-/// forwards the current raw request, never stale or retained bytes, so Claude
-/// Code is full-array too, which is what keeps phantom reclaims (mutations
-/// frozen by the module that a splice never carries into the real context)
-/// out of the serving path. A fenced pass forwards strictly more
-/// current content, and any tail mutation a fence skips simply reapplies on the next
-/// healthy pass. Prefix folding remains available regardless of the tail setting.
+/// The exhaustive match forces each added profile to choose this behavior.
 pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
     // The match is exhaustive so each future profile requires an explicit decision.
     match profile {
