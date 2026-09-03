@@ -21,12 +21,14 @@ use mc_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::project::ProjectBinding;
+use super::project::{IntentRequest, ProjectBinding};
 use super::{blocking, kernel_response, state_only, ConflictReason, InvalidReason, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
 
 const OPERATION: &str = "kernel.commit";
+/// Namespace of this route's receipts within a project.
+const RECEIPT_FAMILY: &str = "commit";
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_DEADLINE: Duration = Duration::from_secs(30);
 /// The whole envelope runs inside one exclusive-writer transaction and
@@ -51,15 +53,6 @@ struct CommitRequest {
     asserted_taint_class: Option<String>,
     #[serde(default)]
     deadline_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IntentRequest {
-    producer: String,
-    operation_key: String,
-    request_digest: String,
-    actor: String,
-    cause: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,18 +497,17 @@ impl McHandler {
             Ok(classes) => classes,
             Err(reason) => return state_only(KernelOutcome::invalid(reason)),
         };
+        let Some(intent) = parsed.intent.into_intent(&scope.project, RECEIPT_FAMILY) else {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} intent.operation_key must not be blank"
+            ));
+        };
         let deadline = parsed
             .deadline_ms
             .map_or(DEFAULT_DEADLINE, Duration::from_millis)
             .min(MAX_DEADLINE);
         let plan = CommitPlan {
-            intent: CommitIntent {
-                producer: parsed.intent.producer,
-                operation_key: scope.project.operation_key(&parsed.intent.operation_key),
-                request_digest: parsed.intent.request_digest,
-                actor: parsed.intent.actor,
-                cause: parsed.intent.cause,
-            },
+            intent,
             tokens: parsed.tokens,
             operations: parsed.operations,
             source_kind: parsed.source_kind,

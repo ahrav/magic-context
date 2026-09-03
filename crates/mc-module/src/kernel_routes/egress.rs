@@ -29,7 +29,7 @@ pub enum RefusalReason {
     /// The caller asserted a class laxer than the stored one.
     UnderDeclared,
     /// The owning object does not tie the artifact to the bound project: it is
-    /// scoped elsewhere or cites other evidence.
+    /// scoped elsewhere, cites other evidence, or is no longer live.
     WrongScope,
     Eligibility(EligibilityDeniedReason),
 }
@@ -122,7 +122,12 @@ fn evaluate(
     let (_, states) = store
         .object_states(std::slice::from_ref(&request.owning_object_id))
         .map_err(KernelOutcome::from)?;
-    let owner = states.first().and_then(Option::as_ref);
+    // Only a live, unsuperseded owner vouches. A retired or replaced object's
+    // registry row still carries its scope and citation, so a candidate
+    // retracted after selection would otherwise still be dispatched.
+    let owner = states.first().and_then(Option::as_ref).filter(|state| {
+        state.object.invalidated_commit_seq.is_none() && state.object.superseded_by.is_none()
+    });
     // Without the citation check any own-project object id would authorize
     // any digest.
     let cites_artifact = owner

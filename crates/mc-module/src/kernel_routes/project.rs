@@ -8,17 +8,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mc_kernel::{
-    scope_matches, CanonicalScope, Dimension, KernelError, KernelStore, MatchOutcome,
+    scope_matches, CanonicalScope, CommitIntent, Dimension, KernelError, KernelStore, MatchOutcome,
     ScopeMatchContext, ScopeSpec, ScopeTermSpec, Sensitivity, UnknownGraph,
 };
 use mc_store::canonical_root;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Source kind stamped on the scope object the route materializes per project.
 const PROJECT_SCOPE_SOURCE_KIND: &str = "kernel_route";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectBinding {
+pub struct ProjectBinding {
     /// The bound root after canonicalization; the scope term's exact value.
     root: String,
     /// `sha256(root)`, the collision-free handle both the scope id and the
@@ -43,11 +44,16 @@ impl ProjectBinding {
         format!("project:{}", self.digest)
     }
 
-    /// `(producer, operation_key)` is unique across the kernel, and two projects
-    /// may derive the same key from the same request, so the key is prefixed
-    /// with the project digest before it reaches the store.
-    pub(crate) fn operation_key(&self, operation_key: &str) -> String {
-        format!("{}:{operation_key}", self.digest)
+    /// The receipt key the store sees. `(producer, operation_key)` is unique
+    /// kernel-wide: the project digest keeps two projects apart, and `family`
+    /// keeps one route family's idempotency receipt from answering another's
+    /// request. A blank key is refused here because the prefix would otherwise
+    /// hide it from the kernel's emptiness check.
+    fn operation_key(&self, family: &str, operation_key: &str) -> Option<String> {
+        if operation_key.trim().is_empty() {
+            return None;
+        }
+        Some(format!("{}:{family}:{operation_key}", self.digest))
     }
 
     /// The scope object every route-written row names.
@@ -75,6 +81,36 @@ impl ProjectBinding {
     }
 }
 
+/// A commit intent as the wire carries it; `kernel.commit` and artifact
+/// ingestion accept the same shape.
+#[derive(Debug, Deserialize)]
+pub(crate) struct IntentRequest {
+    pub(crate) producer: String,
+    pub(crate) operation_key: String,
+    pub(crate) request_digest: String,
+    pub(crate) actor: String,
+    pub(crate) cause: String,
+}
+
+impl IntentRequest {
+    /// The intent the store receives, its key namespaced to `project` and
+    /// `family`; `None` when the caller's key is blank.
+    pub(crate) fn into_intent(
+        self,
+        project: &ProjectBinding,
+        family: &str,
+    ) -> Option<CommitIntent> {
+        let operation_key = project.operation_key(family, &self.operation_key)?;
+        Some(CommitIntent {
+            producer: self.producer,
+            operation_key,
+            request_digest: self.request_digest,
+            actor: self.actor,
+            cause: self.cause,
+        })
+    }
+}
+
 /// Answers whether a row's scope names the bound project, remembering each
 /// scope's verdict for the duration of one request.
 pub(crate) struct ScopeFilter<'a> {
@@ -92,9 +128,11 @@ impl<'a> ScopeFilter<'a> {
         }
     }
 
-    /// A row with no scope has no project and is never served; an `Uncertain`
-    /// verdict (a redacted term, a malformed scope) and a scope with no stored
-    /// row are both treated as not matching.
+    /// A row with no scope has no project and is never served, and neither is
+    /// a scope with no `project` term: it constrains nothing, so it would
+    /// match every project's route. An `Uncertain` verdict (a redacted term,
+    /// a term on a dimension the route has no value for, a malformed scope)
+    /// and a scope with no stored row are both treated as not matching.
     pub(crate) fn matches(&mut self, scope_id: Option<&str>) -> Result<bool, KernelError> {
         let Some(scope_id) = scope_id else {
             return Ok(false);
@@ -104,7 +142,8 @@ impl<'a> ScopeFilter<'a> {
         }
         let verdict = match self.store.scope_terms(scope_id) {
             Ok(terms) => CanonicalScope::from_term_specs(&terms).is_ok_and(|scope| {
-                scope_matches(&scope, &self.context, &UnknownGraph) == MatchOutcome::Matches
+                scope.term(Dimension::Project).is_some()
+                    && scope_matches(&scope, &self.context, &UnknownGraph) == MatchOutcome::Matches
             }),
             Err(KernelError::NotFound) => false,
             Err(error) => return Err(error),

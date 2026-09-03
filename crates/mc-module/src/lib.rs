@@ -220,6 +220,8 @@ struct ClaimMirrorReceiptRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
+    /// The project the `kernel.*` routes work against, canonicalized at bind.
+    pub(crate) kernel_project: kernel_routes::ProjectBinding,
     pub harness: String,
     pub session: String,
     pub model_key: Option<String>,
@@ -11697,6 +11699,7 @@ impl CompositeComponent for McHandler {
         self.bind_route(
             route,
             SessionBinding {
+                kernel_project: kernel_routes::ProjectBinding::new(&identity.project_root),
                 project_root: identity.project_root,
                 harness: identity.harness,
                 session: identity.session,
@@ -16797,6 +16800,7 @@ mod tests {
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
             project_root: PathBuf::from(root),
+            kernel_project: kernel_routes::ProjectBinding::new(Path::new(root)),
             harness: harness.to_string(),
             session: session.to_string(),
             model_key: None,

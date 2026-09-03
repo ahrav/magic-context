@@ -165,7 +165,7 @@ impl Envelope<'_> {
                 [&decision_id.text],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|_| KernelError::Io)?;
+            .map_err(crate::map_sqlite)?;
         let payload = serde_json::to_vec(&StoredEventPayload {
             summary: &spec.summary.text,
         })
@@ -811,7 +811,7 @@ fn require_live_decision_object(tx: &Transaction<'_>, object_id: &str) -> Result
         |_| Ok(()),
     )
     .optional()
-    .map_err(|_| KernelError::Io)?
+    .map_err(crate::map_sqlite)?
     .ok_or(KernelError::NotFound)
 }
 
@@ -824,7 +824,7 @@ fn require_live(
     let sql = format!("SELECT 1 FROM {table} WHERE {column}=?1 AND invalidated_commit_seq IS NULL");
     tx.query_row(&sql, [value], |_| Ok(()))
         .optional()
-        .map_err(|_| KernelError::Io)?
+        .map_err(crate::map_sqlite)?
         .ok_or(KernelError::NotFound)
 }
 
@@ -842,7 +842,7 @@ fn load_live_decision_object(
         row_to_object,
     )
     .optional()
-    .map_err(|_| KernelError::Io)?
+    .map_err(crate::map_sqlite)?
     .ok_or(KernelError::NotFound)
 }
 
@@ -861,7 +861,7 @@ fn load_live_decision_by_object(
         |row| Ok((row_to_object(row)?, row.get::<_, String>(8)?)),
     )
     .optional()
-    .map_err(|_| KernelError::Io)
+    .map_err(crate::map_sqlite)
 }
 
 fn load_live_typed_object(
@@ -878,7 +878,7 @@ fn load_live_typed_object(
         row_to_object,
     )
     .optional()
-    .map_err(|_| KernelError::Io)?
+    .map_err(crate::map_sqlite)?
     .ok_or(KernelError::NotFound)
 }
 

@@ -6,7 +6,8 @@ use std::collections::{HashMap, VecDeque};
 
 use mc_host::RouteHandle;
 use mc_kernel::{
-    ArtifactDestination, ArtifactEligibility, ArtifactHandle, KernelError, KernelStore, ObjectState,
+    ArtifactDestination, ArtifactEligibility, ArtifactHandle, KernelError, KernelStore,
+    ObjectState, Sensitivity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -105,6 +106,9 @@ fn parse_destination(value: &str) -> Option<ArtifactDestination> {
 
 /// Verdict order is fixed: an object that is gone or replaced is reported as
 /// such before its revision, scope, or sensitivity is considered.
+///
+/// A secret object is refused for every destination and a non-normal object
+/// for a remote one, whether or not the candidate cites an artifact.
 fn judge(
     store: &KernelStore,
     filter: &mut ScopeFilter<'_>,
@@ -126,6 +130,12 @@ fn judge(
     }
     if !filter.matches(state.scope_id.as_deref())? {
         return Ok(Verdict::WrongScope);
+    }
+    if state.object.sensitivity == Sensitivity::Secret
+        || (destination == ArtifactDestination::Remote
+            && state.object.sensitivity != Sensitivity::Normal)
+    {
+        return Ok(Verdict::ProviderSensitive);
     }
     if let Some(digest) = &candidate.artifact_digest {
         let handle = ArtifactHandle {

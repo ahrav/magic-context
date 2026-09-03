@@ -20,12 +20,13 @@ use base64::Engine as _;
 use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
-    ArtifactHandle, ArtifactIngestRequest, CommitIntent, KernelStore, ProviderEgress,
-    RepositoryProvenance, Sensitivity, MAX_PAYLOAD_BYTES,
+    ArtifactHandle, ArtifactIngestRequest, KernelStore, ProviderEgress, RepositoryProvenance,
+    Sensitivity, MAX_PAYLOAD_BYTES,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::project::IntentRequest;
 use super::{
     blocking, kernel_response, state_only, InvalidReason, KernelOutcome, UnavailableReason,
 };
@@ -35,6 +36,8 @@ use crate::{sha256_hex, McHandler};
 const BEGIN: &str = "kernel.artifact.ingest.begin";
 pub(crate) const PAGE: &str = "kernel.artifact.ingest.page";
 const FINISH: &str = "kernel.artifact.ingest.finish";
+/// Namespace of this route family's receipts within a project.
+const RECEIPT_FAMILY: &str = "artifact_ingest";
 
 const MIB: u64 = 1024 * 1024;
 /// The largest total an upload may declare. It exceeds the kernel cap by one
@@ -102,15 +105,6 @@ impl Default for StagingBudget {
     fn default() -> Self {
         Self::new(MAX_STAGED_BYTES, MAX_PENDING_UPLOADS)
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct IntentRequest {
-    producer: String,
-    operation_key: String,
-    request_digest: String,
-    actor: String,
-    cause: String,
 }
 
 /// Everything `ArtifactIngestRequest` carries besides the intent and the
@@ -444,6 +438,11 @@ impl McHandler {
         if parsed.total_bytes > UPLOAD_ALLOWANCE_BYTES {
             return state_only(KernelOutcome::invalid(InvalidReason::PayloadTooLarge));
         }
+        let Some(intent) = parsed.intent.into_intent(&scope.project, RECEIPT_FAMILY) else {
+            return crate::invalid_params_error(format!(
+                "{BEGIN} intent.operation_key must not be blank"
+            ));
+        };
         let artifact = parsed.request;
         let upload = Upload {
             upload_id: parsed.upload_id.clone(),
@@ -453,13 +452,7 @@ impl McHandler {
             received_bytes: 0,
             pages: BTreeMap::new(),
             request: ArtifactIngestRequest {
-                intent: CommitIntent {
-                    producer: parsed.intent.producer,
-                    operation_key: scope.project.operation_key(&parsed.intent.operation_key),
-                    request_digest: parsed.intent.request_digest,
-                    actor: parsed.intent.actor,
-                    cause: parsed.intent.cause,
-                },
+                intent,
                 payload: Vec::new(),
                 evidence_id: artifact.evidence_id,
                 object_id: artifact.object_id,
@@ -594,6 +587,7 @@ impl McHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mc_kernel::CommitIntent;
 
     fn route(channel: u16) -> RouteHandle {
         RouteHandle { channel, epoch: 1 }

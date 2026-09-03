@@ -752,6 +752,19 @@ async fn a_token_conflicts_when_its_object_advanced_was_retracted_or_was_superse
         )
         .await;
     assert_state(&missing, "invalid", Some("not_found"));
+    // A token from a snapshot no reader has seen is not "unchanged": it is
+    // refused before any object is consulted, so a malformed `known_as_of`
+    // cannot defeat the check on an object that did advance.
+    for future in [tip + 1, i64::MAX] {
+        let future_token = daemon
+            .commit(
+                "mutate-future",
+                vec![json!({"op": "retire_decision", "object_id": "decision-object-4"})],
+                vec![token("decision-object-4", future)],
+            )
+            .await;
+        assert_state(&future_token, "unavailable", Some("snapshot_diverged"));
+    }
     assert_eq!(daemon.tip(), tip, "a conflicting commit writes nothing");
 
     // A token at the current tip on an untouched object lets the mutation land.
@@ -920,6 +933,51 @@ async fn a_request_naming_another_project_root_is_refused_before_any_work() {
 }
 
 #[tokio::test]
+async fn a_route_bound_through_a_symlink_stays_on_the_project_it_was_bound_to() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let link = daemon._data.path().join("link");
+    std::os::unix::fs::symlink(&daemon.project, &link).unwrap();
+    let route = RouteHandle {
+        channel: 12,
+        epoch: 1,
+    };
+    assert!(matches!(
+        daemon
+            .handler
+            .bind(route, identity(&link, "session-c"))
+            .await,
+        BindOutcome::Accept
+    ));
+    let mut through_link = commit_request(&link, "via-link", vec![insert_decision(1)], vec![]);
+    through_link["session_id"] = json!("session-c");
+    assert_state(&daemon.call(route, through_link).await, "available", None);
+    let bound_scope = daemon.project_scope_id().await;
+
+    // Retargeting the link moves the spelling, not the binding: requests
+    // through the link now name another project, and the bound project's
+    // spelling still passes.
+    let other = daemon._data.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    let mut retargeted = commit_request(&link, "after-retarget", vec![insert_decision(2)], vec![]);
+    retargeted["session_id"] = json!("session-c");
+    assert_state(
+        &daemon.call(route, retargeted).await,
+        "invalid",
+        Some("project_mismatch"),
+    );
+    let mut direct = read_request(&daemon.project, "explicit_search", None);
+    direct["session_id"] = json!("session-c");
+    let read = daemon.call(route, direct).await;
+    assert_state(&read, "available", None);
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+    assert_eq!(read["rows"][0]["scope_id"], bound_scope);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn rows_serve_only_to_the_project_their_scope_names() {
     let daemon = Daemon::start().await;
     let store = daemon.store();
@@ -935,6 +993,7 @@ async fn rows_serve_only_to_the_project_their_scope_names() {
     assert_state(&daemon.call(route_b, write_b).await, "available", None);
 
     // A row whose project term was redacted names no resolvable project.
+    // An empty scope has no project constraint.
     store
         .commit(intent("redacted-scope"), |envelope| {
             envelope.insert_scope(ScopeSpec {
@@ -959,6 +1018,27 @@ async fn rows_serve_only_to_the_project_their_scope_names() {
                 None,
                 (SourceClass::ModelInference, TaintClass::AssistantInference),
             ))?;
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-unconstrained".to_string(),
+                object_id: "scope-unconstrained".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-unconstrained".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: Vec::new(),
+            })?;
+            envelope.insert_decision(store_decision(
+                10,
+                "scope-unconstrained",
+                "unconstrained-lineage",
+            ))?;
+            envelope.record_admission(admission(
+                "store-decision-object-10",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
             Ok(String::new())
         })
         .unwrap();
@@ -971,12 +1051,12 @@ async fn rows_serve_only_to_the_project_their_scope_names() {
     request_b["session_id"] = json!("session-b");
     let read_b = daemon.call(route_b, request_b).await;
     assert_eq!(object_ids(&read_b), ["decision-object-2"]);
-    // The unfiltered kernel view still holds all three, so the filter is what
+    // The unfiltered kernel view still holds all four, so the filter is what
     // hid them.
     let all = store
         .visible_as_of(mc_kernel::Surface::ExplicitSearch, daemon.tip())
         .unwrap();
-    assert_eq!(all.rows.len(), 3);
+    assert_eq!(all.rows.len(), 4);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -1087,6 +1167,10 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     let daemon = Daemon::start().await;
     let store = daemon.store();
     seed_domain(&store);
+    let mut secret_decision = decision_spec(8);
+    secret_decision["sensitivity"] = json!("secret");
+    let mut sensitive_decision = decision_spec(9);
+    sensitive_decision["sensitivity"] = json!("sensitive");
     daemon
         .commit(
             "create",
@@ -1096,6 +1180,8 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
                 insert_decision(3),
                 insert_decision(4),
                 insert_decision(6),
+                json!({"op": "insert_decision", "spec": secret_decision}),
+                json!({"op": "insert_decision", "spec": sensitive_decision}),
             ],
             vec![],
         )
@@ -1130,6 +1216,9 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         json!({"object_id": "decision-object-7", "source_revision": 7}),
         json!({"object_id": "decision-object-6", "source_revision": 6, "artifact_digest": sensitive.digest}),
         json!({"object_id": "never-written", "source_revision": 1}),
+        // Eligibility checks an object's class even when the object cites no artifact.
+        json!({"object_id": "decision-object-8", "source_revision": 8}),
+        json!({"object_id": "decision-object-9", "source_revision": 9}),
     ];
     let request = eligibility_request(&daemon.project, "remote", candidates.clone());
     let first = daemon.call(daemon.route, request.clone()).await;
@@ -1146,14 +1235,16 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
             ("decision-object-7", "wrong_scope"),
             ("decision-object-6", "provider_sensitive"),
             ("never-written", "retracted"),
+            ("decision-object-8", "provider_sensitive"),
+            ("decision-object-9", "provider_sensitive"),
         ]
         .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
     );
-    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 7);
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 9);
 
     // Same tip, same candidates: every verdict comes from the cache.
     let second = daemon.call(daemon.route, request.clone()).await;
-    assert_eq!(second["cache_hits"], 7);
+    assert_eq!(second["cache_hits"], 9);
     assert_eq!(verdicts(&second), verdicts(&first));
     // A different declared revision is a different key and a different verdict.
     let revised = daemon
@@ -1177,6 +1268,9 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         .await;
     assert_eq!(local["cache_hits"], 0);
     assert_eq!(verdicts(&local)[5].1, "ok");
+    // A secret object is refused locally too; a sensitive one is eligible.
+    assert_eq!(verdicts(&local)[7].1, "provider_sensitive");
+    assert_eq!(verdicts(&local)[8].1, "ok");
 
     // Retiring the `ok` candidate moves the tip, so the old entries stop matching.
     daemon
@@ -1742,6 +1836,70 @@ async fn egress_gate_requires_the_owning_object_to_cite_the_artifact() {
                 "local",
                 "sensitive",
                 "decision-object-3"
+            )
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 2);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_requires_the_owning_object_to_be_live_and_unsuperseded() {
+    let daemon = Daemon::start().await;
+    let [normal, sensitive, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+
+    // Owner 1 is retired and owner 3 superseded; both registry rows still
+    // carry their scope and citation, so only liveness separates them from a
+    // vouching owner.
+    let mut successor = decision_spec(4);
+    successor["evidence_id"] = json!("evidence-sensitive");
+    let changed = daemon
+        .commit(
+            "retract-owners",
+            vec![
+                json!({"op": "retire_decision", "object_id": "decision-object-1"}),
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-3", "spec": successor}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&changed, "available", None);
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-3"
+            )
+            .await,
+        refused("wrong_scope")
+    );
+    // The live successor vouches for the same artifact.
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-4"
             )
             .await,
         json!("allowed")
@@ -2414,6 +2572,53 @@ async fn begin_refuses_layouts_and_digests_the_kernel_could_never_accept() {
         .ingest_paged(daemon.route, "lower", &payload, 64)
         .await;
     assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_receipt_is_keyed_by_route_family_and_a_blank_key_is_refused() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let payload = vec![b'r'; 64];
+
+    // One caller-supplied key, one project, two route families: ingestion
+    // first, then a commit under the same key. Sharing a receipt would hand
+    // the commit the evidence id as its result and write none of its rows.
+    let ingested = daemon
+        .ingest_paged(daemon.route, "shared-key", &payload, 64)
+        .await;
+    assert_state(&ingested, "available", None);
+    let tip = daemon.tip();
+    let committed = daemon
+        .commit("shared-key", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&committed, "available", None);
+    assert_eq!(committed["receipt"]["replayed"], false);
+    assert_eq!(daemon.tip(), tip + 1);
+    assert_eq!(
+        committed["tokens"],
+        json!([{"object_id": "decision-object-1", "known_as_of": tip + 1}])
+    );
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+
+    // A blank key would be hidden from the kernel's own check by the prefix.
+    for blank in ["", "   "] {
+        let mut commit = commit_request(&daemon.project, blank, vec![insert_decision(2)], vec![]);
+        commit["intent"] = wire_intent(blank, "blank");
+        assert!(matches!(
+            daemon.handler.dispatch_value_for_test(daemon.route, commit).await,
+            PreparedOutcome::Error { code, .. } if code == "invalid_params"
+        ));
+        let mut begin = ingest_begin_request(&daemon.project, "blank", &payload, 1);
+        begin["intent"]["operation_key"] = json!(blank);
+        assert!(matches!(
+            daemon.handler.dispatch_value_for_test(daemon.route, begin).await,
+            PreparedOutcome::Error { code, .. } if code == "invalid_params"
+        ));
+    }
+    assert_eq!(daemon.tip(), tip + 1);
     assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
     daemon.handler.shutdown().await.unwrap();
 }

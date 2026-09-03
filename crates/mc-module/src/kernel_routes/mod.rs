@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::dispatch::PreparedOutcome;
 use crate::{jittered_store_open_delay, McHandler, StoreOpenPolicy};
+pub(crate) use project::ProjectBinding;
 pub use state::{ConflictReason, InvalidReason, KernelOutcome, UnavailableReason};
 
 /// Directory under the managed data directory holding `core.sqlite` and
@@ -283,7 +284,7 @@ pub(crate) fn state_only(state: KernelOutcome) -> PreparedOutcome {
 /// mismatch or an unopened store answers with a typed kernel state.
 pub(crate) struct RouteScope {
     pub(crate) store: Arc<KernelStore>,
-    pub(crate) project: project::ProjectBinding,
+    pub(crate) project: ProjectBinding,
 }
 
 impl McHandler {
@@ -299,7 +300,7 @@ impl McHandler {
                 "{operation} requires project_root"
             )));
         };
-        let project = project::ProjectBinding::new(&binding.project_root);
+        let project = binding.kernel_project;
         if !project.accepts(Path::new(requested_root)) {
             return Err(state_only(KernelOutcome::invalid(
                 InvalidReason::ProjectMismatch,

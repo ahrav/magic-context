@@ -381,11 +381,18 @@ impl Envelope<'_> {
     /// Succession is judged before invalidation because a superseded object is
     /// also invalidated, and advancement last because both of the others also
     /// leave a later change event.
+    ///
+    /// `known_as_of >= self.commit_seq` names a snapshot no reader has seen,
+    /// and `Advanced` would compare against it as if it were real, so
+    /// `check_token` returns `FutureSnapshot` before consulting any object.
     pub fn check_token(
         &self,
         object_id: &str,
         known_as_of: i64,
     ) -> Result<TokenCheck, KernelError> {
+        if known_as_of >= self.commit_seq {
+            return Err(KernelError::FutureSnapshot);
+        }
         Ok(match self.object_state(object_id)? {
             None => TokenCheck::Conflict(TokenConflict::Retracted),
             Some(state) => token_check(&state, known_as_of),
