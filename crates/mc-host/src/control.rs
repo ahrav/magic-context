@@ -1,3 +1,4 @@
+//! Parses authenticated control requests and serializes control responses.
 //!
 //! Byte limits are enforced before handler callbacks, route reservation, and filesystem work.
 //! The bearer key, not metadata, grants authority.
@@ -7,18 +8,30 @@ use std::path::PathBuf;
 
 use crate::handler::{ManifestSnapshot, RouteClass, RouteIdentity, RouteTarget, TargetKind};
 
+/// Error code for malformed control requests.
 pub const CODE_INVALID_CONTROL_REQUEST: &str = "invalid_control_request";
+/// Error code for control operations this host does not implement.
 pub const CODE_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
+/// Error code for module IDs absent from the target index.
 pub const CODE_UNKNOWN_MODULE: &str = "unknown_module";
+/// Error code for known modules that do not serve the requested target kind.
 pub const CODE_TARGET_UNAVAILABLE: &str = "target_unavailable";
+/// Error code for channel IDs the host does not own.
 pub const CODE_UNKNOWN_CHANNEL: &str = "unknown_channel";
+/// Error code for work rejected by host capacity limits.
 pub const CODE_SERVER_BUSY: &str = "server_busy";
+/// Error code for work cancelled before completion.
 pub const CODE_CANCELLED: &str = "cancelled";
+/// Error code for host failures without a more specific protocol code.
 pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 
+/// Operation name that opens a routed channel.
 pub const OP_ROUTE_OPEN: &str = "route.open";
+/// Operation name that lists the host catalog.
 pub const OP_CATALOG_LIST: &str = "catalog.list";
+/// Operation name that requests graceful host shutdown.
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
+/// Operation name that reads sanitized host health.
 pub const OP_HOST_STATUS: &str = "host.status";
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
@@ -66,16 +79,24 @@ const MAX_CONTROL_DEPTH: usize = MAX_ADMISSION_FACTS_DEPTH + 1;
 /// The direct-linked profile cannot change catalog content at runtime, so the generation is always 1.
 pub const CATALOG_GENERATION: u64 = 1;
 
+/// Validated action produced from a channel-0 request.
 #[derive(Debug, PartialEq)]
 pub enum ControlAction {
+    /// Lists all modules or one optional module ID.
     CatalogList {
+        /// Module ID to select, or `None` for the full catalog.
         module_id_filter: Option<String>,
     },
+    /// Opens a route to a catalog target under authenticated caller identity.
     RouteOpen {
+        /// Module and role selected from the target index.
         target: RouteTarget,
+        /// Project, harness, session, and optional consumer identity.
         identity: RouteIdentity,
     },
+    /// Requests graceful host shutdown.
     HostShutdown,
+    /// Requests sanitized host health.
     HostStatus,
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
@@ -362,6 +383,7 @@ pub(crate) fn value_depth(value: &serde_json::Value) -> usize {
     }
 }
 
+/// Stores bounded catalog serializations for allocation-free request reuse.
 ///
 /// An absent filter returns `full`; an unmatched filter returns `empty`.
 pub struct CatalogCache {
@@ -387,6 +409,7 @@ impl CatalogCache {
         })
     }
 
+    /// Returns the full, matching module, or shared empty catalog body.
     pub fn body(&self, module_id_filter: Option<&str>) -> &[u8] {
         let Some(filter) = module_id_filter else {
             return &self.full;
@@ -398,6 +421,7 @@ impl CatalogCache {
             .unwrap_or(&self.empty)
     }
 
+    /// Returns bytes retained by module IDs and all serialized bodies.
     pub fn resident_len(&self) -> usize {
         self.full.len()
             + self.empty.len()
@@ -492,6 +516,7 @@ enum ClientControlResponse {
     },
 }
 
+/// Serializes a successful `route.open` response.
 pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
     serde_json::to_vec(&ClientControlResponse::RouteOpen {
         route_channel: channel,
@@ -500,10 +525,14 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
     .expect("route response serialization cannot fail")
 }
 
+/// Returns the fixed successful `host.shutdown` response.
 pub fn host_shutdown_response_json() -> Vec<u8> {
     br#"{"op":"host.shutdown"}"#.to_vec()
 }
 
+/// Serializes host health with only allowlisted component metrics.
+///
+/// Handler detail is omitted because it may contain sensitive failure text.
 pub fn host_status_response_json(
     report: &crate::handler::HealthReport,
     shared_memory: serde_json::Value,
@@ -614,6 +643,7 @@ pub(crate) mod strict_json {
     use serde_json::Value;
     use std::fmt;
 
+    /// Parses one JSON value and rejects trailing bytes or duplicate object keys.
     pub fn parse(bytes: &[u8]) -> Result<Value, ParseError> {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         let value = StrictValue
@@ -623,9 +653,11 @@ pub(crate) mod strict_json {
         Ok(value)
     }
 
+    /// Opaque malformed-control-JSON error.
     pub struct ParseError;
 
     impl ParseError {
+        /// Returns the stable client-facing parse failure message.
         pub fn as_str(&self) -> &'static str {
             "malformed control JSON"
         }
