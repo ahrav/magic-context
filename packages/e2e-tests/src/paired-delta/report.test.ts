@@ -88,10 +88,10 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         runSummary: {
             status: "completed" as const,
             spentUsd: 12.5,
-            // A completed run stored every primary arm for all twelve coordinates: 27 observed for the nine healthy
-            // ones and nine estimated for the three unhealthy ones, which hold the primary-arm exclusions below.
-            observedCostRollouts: 27,
-            estimatedCostRollouts: 9,
+            // A completed run stored every primary arm for all twelve coordinates. Each unhealthy coordinate has
+            // one failed arm priced as an estimate, which is one of the exclusions below, and two observed arms.
+            observedCostRollouts: 33,
+            estimatedCostRollouts: 3,
             refusedRegretLadders: { "intervention-mismatch": 2 },
             plannedCoordinates: 12,
             healthyCoordinates: 9,
@@ -1040,6 +1040,7 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.healthyCoordinates = body.runSummary.plannedCoordinates;
             body.runSummary.observedCostRollouts = 36;
+            body.runSummary.estimatedCostRollouts = 0;
             body.exclusions = [];
             body.runSummary.evidenceComplete = true;
         }))).not.toThrow();
@@ -1104,8 +1105,13 @@ describe("parsePairedDeltaReport", () => {
             body.runSummary.estimatedCostRollouts = 0;
         }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: exclusion-shortfall/);
         // A completed run stored every primary arm for every planned coordinate.
-        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.estimatedCostRollouts = 3; })))
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.estimatedCostRollouts = 0; })))
             .toThrow(/report\.body\.runSummary\.observedCostRollouts: completed-run-shortfall/);
+        // An estimated cost marks a failed cell, and every failed cell is an exclusion.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "cost-cap-reached";
+            body.exclusions = [];
+        }))).toThrow(/report\.body\.runSummary\.estimatedCostRollouts: exclusion-shortfall/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = 0.5; })))
             .toThrow(/finalAttemptTokensByArm\.mc-on: integer-invalid/);
         // A primary arm's exclusions fit within the unhealthy coordinates.

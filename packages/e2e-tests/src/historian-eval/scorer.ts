@@ -1969,9 +1969,9 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         if (source === "run-record" && probeVerdicts.length === 0 && !scorerBypassed) {
             p.fail(`${label}.probeVerdicts: probes-required`);
         }
-        // A lint-admitted scenario declares at least one expected claim, and every run-record path that is not
-        // the aborted false-authoritative FAIL reports the scenario's full expectation count.
-        if (source === "run-record" && expectedClaimsTotal === 0 && !abortedFalseAuthoritative) {
+        // A lint-admitted scenario declares at least one expected claim. commentlint: allow(JUDGE)
+        // `scoreFacts` reports that count on every score other than the aborted false-authoritative FAIL. commentlint: allow(JUDGE)
+        if (expectedClaimsTotal === 0 && !abortedFalseAuthoritative) {
             p.fail(`${label}.expectedClaimsTotal: integer-invalid`);
         }
         if ((verdict === "PASS") !== (failReasons.length === 0)) p.fail(`${label}.verdict: derived-mismatch`);

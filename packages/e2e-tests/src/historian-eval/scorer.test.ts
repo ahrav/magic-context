@@ -2589,6 +2589,13 @@ describe("buildLaneReport", () => {
             source: "raw-output", system: null, probeVerdicts: [], verdict: "FAIL", failReasons: ["invalid-output"],
         });
         expect(() => parseLaneReport(rawInvalidOutput)).toThrow(/report\.scenarios\[0\]\.failReasons: seam-shape-invalid/);
+        // The raw-output seam scores a lint-admitted scenario too, so it never reports an empty expectation.
+        const rawNoExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawNoExpectations.scenarios[0]!, {
+            source: "raw-output", system: null, probeVerdicts: [],
+            expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, precision: null, recall: null,
+        });
+        expect(() => parseLaneReport(rawNoExpectations)).toThrow(/report\.scenarios\[0\]\.expectedClaimsTotal: integer-invalid/);
         // `scoreFacts` derives both ratios from the counts, and the rebuild carries scenarios through
         // unchanged, so these are the parser's only chance to check them.
         const overMatched = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };

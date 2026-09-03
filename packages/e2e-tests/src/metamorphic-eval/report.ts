@@ -27,6 +27,7 @@ export function requireRepresentableRunOptions(
 ): void {
     const scenarioIds = new Set<string>();
     for (const { id } of scenarios) {
+        if (id.trim().length === 0) throw new Error("metamorphic-eval: scenario id is blank");
         if (scenarioIds.has(id)) throw new Error(`metamorphic-eval: scenario "${id}" is listed twice`);
         scenarioIds.add(id);
     }
@@ -585,10 +586,15 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             if (entryKeys.has(key(pair))) p.fail(`report.coverage[${index}].inapplicable[${innerIndex}]: entry-conflict`);
         }
     }
-    // Both sites that record a control error first append an error entry at the control coordinate.
-    if (report.tierInvalidReason?.kind === "control-error") {
+    // `runLiveMetamorphicEval` appends one control error entry before either control reason. commentlint: allow(JUDGE)
+    // A disagreement follows two scored controls, whose run-record tuple the root then names. commentlint: allow(JUDGE)
+    const controlKind = report.tierInvalidReason?.kind;
+    if (controlKind === "control-error" || controlKind === "control-disagreement") {
         const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
-        if (controls.length !== 1 || controls[0]!.kind !== "error") p.fail("report.tierInvalidReason: control-error-entry-required");
+        if (controls.length !== 1 || controls[0]!.kind !== "error") p.fail(`report.tierInvalidReason: ${controlKind}-entry-required`);
+        if (controlKind === "control-disagreement" && report.system === null) {
+            p.fail("report.system: control-disagreement-requires-live-report");
+        }
     }
     // The live runner records this reason only when nothing was admitted and nothing was scored.
     if (report.tierInvalidReason?.kind === "selection-empty" &&

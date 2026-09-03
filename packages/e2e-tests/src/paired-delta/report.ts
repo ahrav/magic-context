@@ -669,6 +669,11 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates + excludedRecords) {
         p.fail("report.body.runSummary.observedCostRollouts: exclusion-shortfall");
     }
+    // An estimated cost means no usage came back, which leaves the cell non-completed with a reason code. commentlint: allow(JUDGE)
+    // `exclusionCountsOf` counts every such cell, so the estimated rollouts are a subset of the exclusions. commentlint: allow(JUDGE)
+    if (body.runSummary.estimatedCostRollouts > excludedRecords) {
+        p.fail("report.body.runSummary.estimatedCostRollouts: exclusion-shortfall");
+    }
     // A refusal is counted at most once per planned coordinate.
     const refusedTotal = Object.values(body.runSummary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);
     if (refusedTotal > body.runSummary.plannedCoordinates) p.fail("report.body.runSummary.refusedRegretLadders: exceeds-plan");

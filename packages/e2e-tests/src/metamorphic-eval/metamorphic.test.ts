@@ -143,6 +143,8 @@ describe("deterministic metamorphic runner", () => {
         expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
         const invalid = buildMetamorphicReport({
             entries: [
+                // The live runner records a control disagreement beside an error entry at the control coordinate.
+                { scenarioId: "hse-a", transformId: "baseline-control", transformVersion: 1, seed: 0, kind: "error", error: "tier-invalid: baseline control pair disagreed; product pairs skipped" },
                 { scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 0, kind: "error", error: "boom" },
                 {
                     scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 1,
@@ -188,6 +190,17 @@ describe("deterministic metamorphic runner", () => {
         const orphanControlError = structuredClone(report);
         orphanControlError.tierInvalidReason = { kind: "control-error", controlAErrorReason: "boom", controlBErrorReason: null };
         expect(() => parseMetamorphicReport(orphanControlError)).toThrow(/report\.tierInvalidReason: control-error-entry-required/);
+        // So is a control disagreement, and it follows two scored controls, so the report names a live system.
+        const orphanDisagreement = structuredClone(report);
+        orphanDisagreement.tierInvalidReason = { kind: "control-disagreement", systemMismatch: true, failedInvariants: [] };
+        expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.tierInvalidReason: control-disagreement-entry-required/);
+        // The control id sorts before every product transform id, so the entry belongs at the front.
+        orphanDisagreement.entries.unshift({
+            scenarioId: orphanDisagreement.entries[0]!.scenarioId, transformId: "baseline-control", transformVersion: 1, seed: 0,
+            kind: "error", error: "tier-invalid: baseline control pair disagreed; product pairs skipped",
+        });
+        expect(orphanDisagreement.system).toBeNull();
+        expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.system: control-disagreement-requires-live-report/);
         // selection-empty means nothing was admitted or scored.
         const falseEmpty = structuredClone(report);
         falseEmpty.tierInvalidReason = { kind: "selection-empty", reason: "n/a" };
@@ -445,6 +458,7 @@ describe("deterministic metamorphic runner", () => {
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), version: 1.5 }] }))
             .toThrow(/not a non-negative safe integer/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!, corpus()[0]!])).toThrow(/scenario ".*" is listed twice/);
+        expect(() => runDeterministicMetamorphicEval([{ ...corpus()[0]!, id: " " }])).toThrow(/scenario id is blank/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), id: "baseline-control" }] }))
             .toThrow(/reserved for the control pair/);
     });
