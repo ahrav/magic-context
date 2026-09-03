@@ -172,10 +172,8 @@ fn render_note_delta(notes: &[StoredNote]) -> String {
 
 /// Composes new compartments, a changed user profile, and newly claimed notes.
 ///
-/// Compartment order follows the store result. Coverage gaps return
-/// [`M1ComposeError::CoverageGap`]; store reads and note claims return
-/// [`M1ComposeError::Store`]. User profile budget units are tokens. Profile
-/// trimming receives 25 percent of that budget, clamped to at least one token.
+/// Compartment order follows the store result. A compartment whose `start_message` does not advance past the previous `end_message` returns [`M1ComposeError::CoverageGap`], while sparse ordinal gaps are permitted; store reads and note claims return [`M1ComposeError::Store`].
+/// User profile budget units are tokens. Profile trimming receives 25 percent of that budget, clamped to at least one token.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_m1_from_claim_mirror(
     store: &McStore,

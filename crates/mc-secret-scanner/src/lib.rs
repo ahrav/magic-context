@@ -86,7 +86,8 @@ impl Scanner {
 
     /// Scans UTF-8 input under the configured profile and limits.
     ///
-    /// Returns [`ScanError`] when input or evaluation exceeds configured limits.
+    /// Returns [`ScanError`] only for input over the byte ceiling or an invalid span.
+    /// Exhausting `max_candidates` or `max_work_bytes` returns `Ok` with `ScanReport::limits_hit` set, so callers must inspect it before treating an empty finding list as clean.
     pub fn scan(&self, input: &str) -> Result<ScanReport, ScanError> {
         evaluate(
             &self.rules,

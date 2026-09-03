@@ -3,8 +3,8 @@
 //! A commit holds the store writer lock through validation, domain writes, change
 //! events, outbox rows, receipt insertion, and projection rebuilds. Any returned
 //! error rolls back the transaction. Snapshot reads use deferred transactions so
-//! the reported tip and rows come from one database snapshot. Timestamps are Unix
-//! milliseconds; commit sequences and source revisions are signed integers.
+//! the reported tip and rows come from one database snapshot.
+//! Timestamps the kernel records itself are Unix milliseconds; caller-supplied observation, event, and abandonment timestamps stay in the caller's own units, and commit sequences and source revisions are signed integers.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;

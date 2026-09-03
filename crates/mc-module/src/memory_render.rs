@@ -193,8 +193,8 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
 ///
 /// Native surfaces filter non-positive categories because callers can construct
 /// [`MirroredClaimMemory`] directly and native surfaces lack a warning renderer.
-/// Category and wrapper names are escaped for XML attributes. Claim content is
-/// escaped by [`render_claim_memory_line`].
+/// Category names are escaped for XML attributes, while `wrapper` is interpolated as written, so callers must pass a valid element name.
+/// Claim content is escaped by [`render_claim_memory_line`].
 pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
     let mut ordered = claims
         .iter()

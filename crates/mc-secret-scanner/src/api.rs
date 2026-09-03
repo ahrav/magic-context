@@ -8,7 +8,7 @@ pub const MAX_INPUT_BYTES: usize = 512 * 1024;
 /// Selects the active secret-detection rule set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanProfile {
-    /// Runs upstream rules plus the conservative overlay.
+    /// Runs only the conservative overlay rules, so upstream-only secrets are not detected.
     Conservative,
     /// Runs the comprehensive upstream rule set.
     Comprehensive,
