@@ -22,6 +22,7 @@ import {
     compareLivePair,
     liveArtifactDir,
     liveDerivativeAdmissionDiagnostics,
+    LiveSystemMismatchError,
     runLiveMetamorphicEval,
     type LiveObservation,
 } from "./live";
@@ -217,6 +218,14 @@ describe("live metamorphic orchestration", () => {
         });
         expect(injected.injectionCanaryHits.length).toBeGreaterThan(0);
         expect(injected.system).toEqual(score().system);
+        // A supplied tuple the first run record contradicts is a configuration fault, so the run stops rather
+        // than publishing a root its own scores would fail to bind to.
+        const supplied = { ...score().system!, historianModelId: "anthropic/other" };
+        await expect(runLiveMetamorphicEval([validScenario()], { ...options, system: supplied, execute: async () => observation() }))
+            .rejects.toBeInstanceOf(LiveSystemMismatchError);
+        // A supplied tuple the records agree with is published unchanged.
+        const agreed = await runLiveMetamorphicEval([validScenario()], { ...options, system: score().system, execute: async () => observation() });
+        expect(agreed.system).toEqual(score().system);
     });
 
     test("control disagreement invalidates the tier before product pairs", async () => {

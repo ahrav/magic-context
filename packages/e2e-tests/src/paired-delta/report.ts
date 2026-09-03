@@ -275,6 +275,14 @@ export function buildPairedDeltaReport(input: {
         },
         runSummary: input.runSummary,
     };
+    // A healthy coordinate completed every primary arm, so each metric map carries a value for each of them.
+    if (body.runSummary.healthyCoordinates > 0) {
+        for (const [field, metrics] of Object.entries(body.secondaryMetrics)) {
+            for (const armId of PRIMARY_ARM_IDS) {
+                if (!(armId in metrics)) throw new Error(`paired-delta-report: metric-arm-missing-${field}-${armId}`);
+            }
+        }
+    }
     return {
         schema: PAIRED_DELTA_REPORT_SCHEMA,
         body,
@@ -673,6 +681,12 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     // `exclusionCountsOf` counts every such cell, so the estimated rollouts are a subset of the exclusions. commentlint: allow(JUDGE)
     if (body.runSummary.estimatedCostRollouts > excludedRecords) {
         p.fail("report.body.runSummary.estimatedCostRollouts: exclusion-shortfall");
+    }
+    // A completed run stored every primary arm of every coordinate, and an unhealthy coordinate has at least one
+    // primary cell that did not complete, so each one contributes an exclusion. commentlint: allow(JUDGE)
+    if (body.runSummary.status === "completed" &&
+        excludedRecords < body.runSummary.plannedCoordinates - body.runSummary.healthyCoordinates) {
+        p.fail("report.body.exclusions: unhealthy-coordinate-shortfall");
     }
     // A refusal is counted at most once per planned coordinate.
     const refusedTotal = Object.values(body.runSummary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);

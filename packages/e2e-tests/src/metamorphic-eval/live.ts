@@ -140,6 +140,17 @@ function sameSystem(left: ScenarioScore, right: ScenarioScore): boolean {
     return left.system !== null && right.system !== null && canonicalJson(left.system) === canonicalJson(right.system);
 }
 
+/**
+ * A supplied system tuple that a run record contradicts is a runner configuration fault, not a scenario outcome,
+ * so the run stops instead of publishing a root the scores would fail to bind to.
+ */
+export class LiveSystemMismatchError extends Error {
+    constructor(supplied: SystemVersionTuple, observed: SystemVersionTuple) {
+        super(`live metamorphic eval: supplied system ${canonicalJson(supplied)} does not match the run record's ${canonicalJson(observed)}`);
+        this.name = "LiveSystemMismatchError";
+    }
+}
+
 function canaryHit(
     scenarioId: string,
     role: LiveRole,
@@ -268,7 +279,12 @@ export async function runLiveMetamorphicEval(
     });
     const execute: LiveScenarioExecutor = async (scenario, role, artifactDir) => {
         const observation = await executeRole(scenario, role, artifactDir);
-        observedSystem ??= observation.score.system;
+        const observed = observation.score.system;
+        const supplied = options.system ?? null;
+        if (supplied !== null && observed !== null && canonicalJson(supplied) !== canonicalJson(observed)) {
+            throw new LiveSystemMismatchError(supplied, observed);
+        }
+        observedSystem ??= observed;
         return observation;
     };
 
@@ -343,6 +359,7 @@ export async function runLiveMetamorphicEval(
         });
         observe();
     } catch (error) {
+        if (error instanceof LiveSystemMismatchError) throw error;
         const reason = getErrorMessage(error);
         entries.push({ ...controlKey, kind: "error", error: reason });
         /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. */
@@ -372,6 +389,7 @@ export async function runLiveMetamorphicEval(
                         liveArtifactDir(options.artifactRoot, pair.base.id, "baseline"),
                     );
                 } catch (error) {
+                    if (error instanceof LiveSystemMismatchError) throw error;
                     baseline = error instanceof Error ? error : new Error(getErrorMessage(error));
                 }
                 baselines.set(pair.base.id, baseline);
@@ -419,6 +437,7 @@ export async function runLiveMetamorphicEval(
                 });
             }
         } catch (error) {
+            if (error instanceof LiveSystemMismatchError) throw error;
             entries.push({ ...pair.key, kind: "error", error: getErrorMessage(error) });
         }
         observe();

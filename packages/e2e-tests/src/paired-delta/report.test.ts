@@ -325,6 +325,15 @@ describe("paired-delta report", () => {
                 finalAttemptTurnsByArm: {},
             },
         })).toThrow(/metric-arm-invalid-mc-onn/);
+        // Healthy evidence means every primary arm ran, so the builder refuses a map missing one, as the parser does.
+        expect(() => report({
+            secondaryMetrics: {
+                invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0 },
+                finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800, compaction: 900 },
+                finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000, compaction: 3500 },
+                finalAttemptTurnsByArm: { "mc-on": 4, "mc-off": 3, compaction: 3 },
+            },
+        })).toThrow(/metric-arm-missing-invalidSuccessRateByArm-compaction/);
     });
 
     it("separates a schema mismatch from a fingerprint mismatch when publishing", () => {
@@ -1112,6 +1121,12 @@ describe("parsePairedDeltaReport", () => {
             body.runSummary.status = "cost-cap-reached";
             body.exclusions = [];
         }))).toThrow(/report\.body\.runSummary\.estimatedCostRollouts: exclusion-shortfall/);
+        // A completed run recorded every unhealthy coordinate's failed primary cell, so each one is an exclusion.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.estimatedCostRollouts = 1;
+            body.runSummary.observedCostRollouts = 35;
+            body.exclusions = [{ armId: "mc-off", reasonCode: "provider-unavailable", count: 1 }];
+        }))).toThrow(/report\.body\.exclusions: unhealthy-coordinate-shortfall/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = 0.5; })))
             .toThrow(/finalAttemptTokensByArm\.mc-on: integer-invalid/);
         // A primary arm's exclusions fit within the unhealthy coordinates.
