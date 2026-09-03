@@ -1,9 +1,9 @@
 //! Content-addressed artifact ingestion and capacity accounting.
 //!
-//! Ingestion validates and redacts input before staging bytes. Publication uses
-//! no-replace filesystem operations followed by directory synchronization, then
-//! commits the SQLite reference under writer fencing. Failed staging removes its
-//! temporary file. Storage-integrity failures latch CAS ingestion closed.
+//! Ingestion validates and redacts input before staging bytes.
+//! Publication uses no-replace filesystem operations followed by directory synchronization, then commits the SQLite reference under writer fencing.
+//! Failed staging removes its temporary file best-effort: `StagedObject::drop` discards unlink and directory-sync errors, so an orphaned temporary entry can survive.
+//! Storage-integrity failures latch CAS ingestion closed.
 
 use std::fs::File;
 

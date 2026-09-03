@@ -194,8 +194,7 @@ fn legacy_tier(c: &DecayRenderCompartment) -> u8 {
 
 /// Renders one compartment at an explicit tier without applying decay or a token budget.
 ///
-/// Tiers 1 through 4 select progressively denser output. Tier 5 and larger archive the row and
-/// return an empty string.
+/// Tiers 1 through 4 select progressively sparser output; tier 4 renders only the heading. Tier 5 and larger archive the row and return an empty string.
 pub fn render_compartment_at_tier(c: &DecayRenderCompartment, tier: u8) -> String {
     render_one_compartment(c, tier)
 }

@@ -597,9 +597,8 @@ fn decode_effect(entry: &Value, index: usize) -> Result<ClaimOperationResultEffe
 
 /// Strictly decodes a stored claim-operation result envelope.
 ///
-/// Returns [`ContractError::MalformedResult`] for invalid JSON, unknown fields,
-/// unsupported versions or outcomes, malformed effects, unsafe integers, or
-/// invalid revision locators. Missing `payload` is represented as JSON null.
+/// Returns [`ContractError::MalformedResult`] for invalid JSON, unknown fields, unsupported versions or outcomes, malformed effects, unsafe integers in effect and generation fields, or invalid revision locators.
+/// `payload` is returned as parsed, so numbers nested inside it are never range-checked; a missing `payload` is represented as JSON null.
 pub fn decode_claim_operation_result(
     result_json: &str,
 ) -> Result<ClaimOperationResult, ContractError> {

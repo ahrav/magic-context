@@ -6,9 +6,9 @@
 //! and files use `0700` and `0600` permissions. Stdout and stderr drain
 //! concurrently into bounded buffers.
 //!
-//! Timeout handling sends `SIGTERM`, escalates to `SIGKILL`, and reaps the
-//! process-group leader before returning. Diagnostics contain only redacted
-//! structural data.
+//! Timeout handling sends `SIGTERM`, escalates to `SIGKILL`, and reaps the process-group leader when teardown completes within the termination grace.
+//! A leader still unreapable after that grace yields `SubprocessEnd::TeardownUnconfirmed`, so the caller must treat the group as possibly alive.
+//! Diagnostics contain only redacted structural data.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
