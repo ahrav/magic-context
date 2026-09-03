@@ -1,3 +1,9 @@
+//! Benchmark suite separates cold-cache, warm-cache, repository-shape, and
+//! adversarial inputs so setup costs do not blur kernel measurements.
+//!
+//! `MC_SCOPE_PROFILE` bypasses Criterion and repeats one named kernel for ten
+//! seconds, giving external profilers a stable sampling window.
+
 #[path = "../tests/support/applicability_fixtures.rs"]
 mod applicability_fixtures;
 #[path = "../tests/support/git_fixtures.rs"]
