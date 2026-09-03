@@ -117,8 +117,6 @@ async fn activation_opens_the_kernel_store_beside_the_cache_store() {
         0o700
     );
     assert!(daemon.handler.kernel_store_for_test().is_some());
-    let _ = &daemon.route;
-    let _ = &daemon.project;
 
     daemon.handler.shutdown().await.unwrap();
     assert_eq!(daemon.handler.kernel_state(), KernelState::Unavailable);
@@ -133,8 +131,9 @@ async fn a_second_daemon_on_the_same_root_starts_until_the_first_releases_its_le
         .await
         .unwrap();
     PrimaryComponent::activate(&second).await.unwrap();
-    // The cache store lease is held, so the kernel behind it has not opened.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The open runs in a spawned task that has not reached its blocking worker
+    // yet, and the cache store lease is held, so the kernel behind it cannot
+    // have opened.
     assert_eq!(second.kernel_state(), KernelState::Starting);
     assert!(second.kernel_store_for_test().is_none());
 
@@ -224,6 +223,184 @@ fn insert_domains(store: &mc_kernel::KernelStore, first: i64, count: i64) -> i64
         .commit_seq
 }
 
+/// Registers `projector` as a required consumer and acknowledges its own
+/// registration row, so only later domain rows count as lag.
+fn register_projector(store: &mc_kernel::KernelStore) -> i64 {
+    let registered = store
+        .commit(intent("register"), |envelope| {
+            envelope.register_outbox_consumer("projector", 1)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    store
+        .acknowledge_outbox("projector", registered, 1)
+        .unwrap();
+    registered
+}
+
+fn sanitized_kernel_block(health: &mc_host::HealthReport) -> serde_json::Value {
+    let composite = mc_host::HealthReport {
+        status: health.status,
+        detail: health.detail.clone(),
+        metrics: Some(serde_json::json!({
+            "components": {
+                "magic-context": {
+                    "status": match health.status {
+                        mc_host::HealthStatus::Ok => "ok",
+                        mc_host::HealthStatus::Degraded => "degraded",
+                        mc_host::HealthStatus::Failing => "failing",
+                    },
+                    "metrics": health.metrics.clone(),
+                }
+            }
+        })),
+    };
+    let response: serde_json::Value = serde_json::from_slice(&mc_host::host_status_response_json(
+        &composite,
+        serde_json::json!({"state": "healthy"}),
+    ))
+    .expect("status JSON");
+    response["metrics"]["components"]["magic-context"]["metrics"]["kernel"].clone()
+}
+
+/// Fields whose values depend on the run; the fixture pins their presence and
+/// type, not their value.
+const VOLATILE_KERNEL_FIELDS: &[&str] = &[
+    "sampled_at_ms",
+    "core_file_bytes",
+    "artifact_usage_bytes",
+    "artifact_cap_bytes",
+    "outbox_position_lag",
+    "oldest_unconsumed_age_ms",
+    "retained_outbox_rows",
+];
+
+/// Asserts `actual` has exactly the fixture's keys, equal stable values, and
+/// the same JSON type (null or number) on every volatile field.
+fn assert_matches_fixture(actual: &serde_json::Value, expected: &serde_json::Value, name: &str) {
+    let actual = actual
+        .as_object()
+        .unwrap_or_else(|| panic!("{name}: {actual}"));
+    let expected = expected.as_object().unwrap();
+    let mut actual_keys: Vec<_> = actual.keys().collect();
+    let mut expected_keys: Vec<_> = expected.keys().collect();
+    actual_keys.sort();
+    expected_keys.sort();
+    assert_eq!(actual_keys, expected_keys, "{name}: key set");
+    for (key, want) in expected {
+        let got = &actual[key];
+        if VOLATILE_KERNEL_FIELDS.contains(&key.as_str()) {
+            assert_eq!(
+                got.is_null(),
+                want.is_null(),
+                "{name}.{key}: {got} vs {want}"
+            );
+            assert_eq!(
+                got.is_number(),
+                want.is_number(),
+                "{name}.{key}: {got} vs {want}"
+            );
+        } else {
+            assert_eq!(got, want, "{name}.{key}");
+        }
+    }
+}
+
+/// The fixture `managed-policy.test.ts` classifies; a field renamed in Rust,
+/// the sanitizer, or TypeScript fails one side or the other.
+#[tokio::test]
+async fn sanitized_kernel_blocks_match_the_shared_readiness_fixture() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/plugin/src/shared/mc-host-lifecycle/fixtures/kernel-health-blocks.json"
+    )))
+    .unwrap();
+
+    let daemon = Daemon::start().await;
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
+    assert_matches_fixture(
+        &sanitized_kernel_block(&daemon.handler.health().await),
+        &fixture["no_required_consumer"],
+        "no_required_consumer",
+    );
+
+    let store = daemon.handler.kernel_store_for_test().unwrap();
+    register_projector(&store);
+    let acked = insert_domains(&store, 1, 1);
+    store.mark_outbox_published_through(2, 1).unwrap();
+    store.acknowledge_outbox("projector", acked, 1).unwrap();
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
+    assert_matches_fixture(
+        &sanitized_kernel_block(&daemon.handler.health().await),
+        &fixture["healthy"],
+        "healthy",
+    );
+
+    insert_domains(&store, 2, 1);
+    store.mark_outbox_published_through(3, 1).unwrap();
+    let created_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(created_at + 120_000)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert_matches_fixture(
+        &sanitized_kernel_block(&health),
+        &fixture["kernel_lagging"],
+        "kernel_lagging",
+    );
+
+    daemon.handler.shutdown().await.unwrap();
+    assert_matches_fixture(
+        &sanitized_kernel_block(&daemon.handler.health().await),
+        &fixture["kernel_unavailable"],
+        "kernel_unavailable",
+    );
+}
+
+#[tokio::test]
+async fn a_kernel_lease_held_by_another_opener_degrades_health_while_starting() {
+    let data = tempfile::tempdir().unwrap();
+    let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
+    let root = kernel_root(&descriptor);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let holder = mc_kernel::KernelStore::open(&root).unwrap();
+
+    let handler = McHandler::new();
+    PrimaryComponent::initialize(&handler, init(&descriptor))
+        .await
+        .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
+    // The cache store opens on its own; the kernel behind it stays `Starting`
+    // while the lease is held, and health says so once storage is ready.
+    let started = Instant::now();
+    let health = loop {
+        let health = handler.health().await;
+        if health.metrics.as_ref().expect("health metrics")["storage_state"] == "ready" {
+            break health;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cache store never opened: {health:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(handler.kernel_state(), KernelState::Starting);
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel store is opening")));
+    assert_eq!(kernel_block(&health)["kernel_state"], "starting");
+
+    drop(holder);
+    wait_for_state(&handler, KernelState::Ready).await;
+    handler.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
     let daemon = Daemon::start().await;
@@ -242,21 +419,13 @@ async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
     assert!(kernel["artifact_cap_bytes"].as_u64().unwrap() > 0);
     assert_eq!(kernel["retained_outbox_rows"], 0);
 
-    // Dropping the slot on shutdown republishes the phase; the sampler holds no
-    // strong reference between ticks, so the successor can take the lease.
+    // Dropping the slot on shutdown republishes the phase.
     daemon.handler.shutdown().await.unwrap();
     let after = daemon.handler.health().await;
     let kernel = kernel_block(&after);
     assert_eq!(kernel["kernel_state"], "unavailable");
     assert_eq!(kernel["unavailable_reason"], "store_unavailable");
     assert!(kernel.get("core_file_bytes").is_none());
-    let successor = McHandler::new();
-    PrimaryComponent::initialize(&successor, init(&daemon.descriptor))
-        .await
-        .unwrap();
-    PrimaryComponent::activate(&successor).await.unwrap();
-    wait_for_state(&successor, KernelState::Ready).await;
-    successor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -284,18 +453,7 @@ async fn an_empty_required_consumer_set_raises_a_daemon_health_warning() {
 async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     let daemon = Daemon::start().await;
     let store = daemon.handler.kernel_store_for_test().unwrap();
-    let registered = store
-        .commit(intent("register"), |envelope| {
-            envelope.register_outbox_consumer("projector", 1)?;
-            Ok(String::new())
-        })
-        .unwrap()
-        .commit_seq;
-    // The registration's own control row sits at position 1; acknowledging that
-    // commit leaves only the domain rows at positions 2..=10_000 unconsumed.
-    store
-        .acknowledge_outbox("projector", registered, 1)
-        .unwrap();
+    let registered = register_projector(&store);
     let mut next = 1;
     while next <= 9_999 {
         let count = (9_999 - next + 1).min(2_500);

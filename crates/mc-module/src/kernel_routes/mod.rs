@@ -265,7 +265,9 @@ impl KernelOpenCoordinator {
         policy: StoreOpenPolicy,
         cancel: CancellationToken,
     ) {
-        let started = Instant::now();
+        // The paused test clock moves this `Instant`; `std::time::Instant` would
+        // hold the window open forever under `start_paused`.
+        let started = tokio::time::Instant::now();
         let mut backoff = policy.initial_backoff;
         let mut attempt = 0usize;
         let mut waiting = false;
@@ -409,4 +411,155 @@ pub(crate) async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|_| KernelOutcome::unavailable(UnavailableReason::StoreUnavailable))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn policy(wait_window: Duration) -> StoreOpenPolicy {
+        StoreOpenPolicy {
+            wait_window,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(1),
+        }
+    }
+
+    /// Opens a kernel store in a fresh directory and returns both, so the
+    /// returned store holds the directory's lease until dropped.
+    fn held_root() -> (tempfile::TempDir, KernelStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = KernelStore::open(dir.path()).unwrap();
+        assert!(
+            matches!(KernelStore::open(dir.path()), Err(KernelError::Held)),
+            "a second opener in the same process must see Held"
+        );
+        (dir, holder)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_lease_past_the_wait_window_is_store_unavailable() {
+        let (dir, _holder) = held_root();
+        let coordinator = KernelOpenCoordinator::new();
+        let started = tokio::time::Instant::now();
+        coordinator
+            .open(
+                dir.path().to_path_buf(),
+                policy(Duration::from_secs(60)),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(coordinator.state(), KernelState::Unavailable);
+        assert_eq!(
+            coordinator.unavailable_reason(),
+            UnavailableReason::StoreUnavailable
+        );
+        assert!(coordinator.kernel_store().is_err());
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        let block = &coordinator.health_block().block;
+        assert_eq!(block.kernel_state, KernelState::Unavailable);
+        assert_eq!(
+            block.unavailable_reason,
+            Some(UnavailableReason::StoreUnavailable)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_waiting_open_is_store_unavailable() {
+        let (dir, _holder) = held_root();
+        let coordinator = Arc::new(KernelOpenCoordinator::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let cancel = cancel.clone();
+            let root = dir.path().to_path_buf();
+            async move {
+                coordinator
+                    .open(root, policy(Duration::from_secs(60)), cancel)
+                    .await
+            }
+        });
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(coordinator.state(), KernelState::Starting);
+        cancel.cancel();
+        task.await.unwrap();
+        assert_eq!(coordinator.state(), KernelState::Unavailable);
+        assert_eq!(
+            coordinator.unavailable_reason(),
+            UnavailableReason::StoreUnavailable
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_released_during_the_wait_opens_the_store() {
+        let (dir, holder) = held_root();
+        let coordinator = Arc::new(KernelOpenCoordinator::new());
+        let task = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let root = dir.path().to_path_buf();
+            async move {
+                coordinator
+                    .open(
+                        root,
+                        policy(Duration::from_secs(60)),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(coordinator.state(), KernelState::Starting);
+        drop(holder);
+        task.await.unwrap();
+        assert_eq!(coordinator.state(), KernelState::Ready);
+        assert!(coordinator.kernel_store().is_ok());
+    }
+
+    #[test]
+    fn open_failure_kind_names_exactly_the_unsupported_errors() {
+        let unsupported = [
+            KernelError::EngineUnsupported,
+            KernelError::Foreign,
+            KernelError::Inconclusive,
+            KernelError::IdentityMismatch,
+            KernelError::CorruptCanonicalRow,
+        ];
+        let store = [
+            KernelError::Held,
+            KernelError::Io,
+            KernelError::Busy,
+            KernelError::FenceLost,
+            KernelError::Conflict,
+            KernelError::InvalidInput,
+            KernelError::AdmissionPolicy,
+            KernelError::FutureSnapshot,
+            KernelError::NotFound,
+            KernelError::InvalidCheckpoint,
+            KernelError::NoRequiredConsumers,
+            KernelError::ConsumerPending,
+            KernelError::Fault,
+            KernelError::Deadline,
+            KernelError::UnsafeDestination,
+            KernelError::InvalidBackup,
+            KernelError::InvalidRestore,
+        ];
+        for error in unsupported {
+            assert_eq!(
+                open_failure_kind(error),
+                UnavailableKind::Unsupported,
+                "{error:?}"
+            );
+        }
+        for error in store {
+            assert_eq!(
+                open_failure_kind(error),
+                UnavailableKind::Store,
+                "{error:?}"
+            );
+        }
+    }
 }

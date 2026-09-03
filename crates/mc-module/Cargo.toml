@@ -76,7 +76,7 @@ harness = false
 criterion = "=0.8.2"
 proptest = "1"
 chrono-tz = "0.10"
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "test-util"] }
 # `mc-store` enables `test-support` only in dev-dependencies, so production builds exclude the feature.
 mc-store = { workspace = true, features = ["test-support"] }
 mc-kernel = { workspace = true, features = ["test-support"] }

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
 import { evaluateCompatibility } from "./compatibility";
+import kernelHealthBlocks from "./fixtures/kernel-health-blocks.json";
 import { releaseContract } from "./generated-contract";
 import {
     createManagedLifecyclePolicy,
@@ -407,6 +408,23 @@ describe("kernel readiness from host.status metrics", () => {
         expect(kernelReadiness(metricsWith({ kernel_state: "ready" }))).toEqual({
             state: "ready",
             reason: "healthy",
+        });
+    });
+
+    test("blocks a live daemon emits classify as the shared fixture names them", () => {
+        // The same fixture is asserted against mc-host's sanitized output in
+        // `crates/mc-module/tests/kernel_routes.rs`, so a field renamed on
+        // either side of the wire fails here or there.
+        const blocks: Record<string, unknown> = kernelHealthBlocks;
+        for (const reason of ["healthy", "kernel_lagging", "no_required_consumer"]) {
+            expect(kernelReadiness(metricsWith(blocks[reason]))).toEqual({
+                state: "ready",
+                reason,
+            });
+        }
+        expect(kernelReadiness(metricsWith(blocks.kernel_unavailable))).toEqual({
+            state: "unavailable",
+            reason: "kernel_unavailable",
         });
     });
 });
