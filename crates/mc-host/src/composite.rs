@@ -1,9 +1,9 @@
+//! Static composition of the direct-profile host components.
 //!
-//! The host `RouteRegistry` exclusively owns route lifecycle and channel reuse.
-//! The host `RouteRegistry` exclusively owns route reservation, liveness, closing, and finalization.
-//! The route map records only ownership of host-validated handles.
-//! A route-map entry is inserted before the child's `bind` call.
-//! A route-map entry remains until the child's `route_gone` callback returns.
+//! The host `RouteRegistry` owns route reservation, liveness, closing, finalization,
+//! and channel reuse. This module's route map records only ownership of host-validated
+//! handles. An entry is inserted before the child's `bind` call and remains until the
+//! child's `route_gone` callback returns.
 //!
 //! The direct profile's primary is `magic-context/tool_provider`.
 //! The direct profile's secondary is `synapse/management_surface`.
@@ -21,10 +21,10 @@ use crate::handler::{
     RequestCtx, RequestOutcome, ResourceDeclaration, RouteHandle, RouteIdentity, RouteTarget,
 };
 
-/// The composite reports a `ShutdownError` message's byte length, not its contents.
-/// Diagnostics report only the `ShutdownError` message's byte length under protocol V24.
-/// Reporting only the byte length prevents component detail from reaching host logs.
-/// A component may include detailed diagnostics in `ShutdownError` because host logs report only its byte length.
+/// Component shutdown failure whose contents remain private to the composite.
+///
+/// Protocol V24 diagnostics report only the message byte length, which prevents
+/// component detail from reaching host logs.
 #[derive(Debug)]
 pub struct ShutdownError(pub String);
 
@@ -36,7 +36,10 @@ impl std::fmt::Display for ShutdownError {
 
 impl std::error::Error for ShutdownError {}
 
-/// `CompositeComponent` has no shared `initialize` method because each role has a different initialization input.
+/// Component role shared by the direct-profile composition.
+///
+/// Initialization belongs to the role-specific traits because primary and secondary
+/// components receive different inputs.
 pub trait CompositeComponent: Send + Sync + 'static {
     fn manifest(&self) -> ManifestSnapshot;
 
@@ -66,6 +69,7 @@ pub trait CompositeComponent: Send + Sync + 'static {
     fn shutdown(&self) -> impl Future<Output = Result<(), ShutdownError>> + Send;
 }
 
+/// Primary component initialized with host configuration.
 pub trait PrimaryComponent: CompositeComponent {
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 
@@ -75,10 +79,11 @@ pub trait PrimaryComponent: CompositeComponent {
     }
 }
 
+/// Secondary component whose artifact may be absent or invalid.
+///
 /// A missing or invalid artifact resolves to `Ok(())` with the component disabled.
-/// An artifact-disabled component rejects `bind` with `artifact_invalid`.
-/// An artifact-disabled component remains published in the catalog.
-/// `Err` is reserved for host-fatal invariant failures.
+/// The disabled component remains in the catalog and rejects `bind` with
+/// `artifact_invalid`. `Err` is reserved for host-fatal invariant failures.
 pub trait SecondaryComponent: CompositeComponent {
     fn initialize(&self) -> impl Future<Output = Result<(), InitError>> + Send;
 
@@ -94,6 +99,7 @@ enum Child {
     Tertiary,
 }
 
+/// Fixed primary, secondary, and tertiary component composition.
 pub struct StaticComposite<P, S, B> {
     primary: P,
     secondary: S,
@@ -143,8 +149,7 @@ fn severity(status: HealthStatus) -> u8 {
     }
 }
 
-/// `catch_child_panic` converts a panic while polling `future` into `Err(payload)`.
-/// A child callback panic is returned as `Err(payload)` instead of unwinding through `catch_child_panic`.
+/// Converts a panic while polling `future` into `Err(payload)`.
 async fn catch_child_panic<F: Future>(
     future: F,
 ) -> Result<F::Output, Box<dyn std::any::Any + Send + 'static>> {
@@ -293,7 +298,6 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
             .await
             .unwrap_or_else(|_payload| panicked(&self.tertiary_id));
         // `Ok < Degraded < Failing`; equal severities use catalog order: primary, secondary, then tertiary.
-        // child.
         let component_status = |report: &HealthReport| match report.status {
             HealthStatus::Ok => "ok",
             HealthStatus::Degraded => "degraded",
@@ -325,8 +329,7 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
     }
 
     async fn shutdown(&self) {
-        // An earlier failure does not skip later children's drains.
-        // cleanly returned.
+        // An earlier failure does not skip later child drains.
         let mut failures: Vec<String> = Vec::new();
         let outcomes = [
             shutdown_failure_note(
