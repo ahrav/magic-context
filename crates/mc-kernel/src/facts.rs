@@ -23,10 +23,7 @@ pub struct KernelFacts {
     pub family_bytes: u64,
     pub minimum_required_checkpoint: Option<i64>,
     pub commit_lag: Option<i64>,
-    /// Published outbox rows the slowest required consumer has not acknowledged.
-    /// `None` when no consumer is registered, matching `commit_lag`.
-    pub outbox_position_lag: Option<i64>,
-    pub oldest_unconsumed_age_ms: Option<i64>,
+    pub outbox_lag: OutboxLag,
     pub retained_outbox_rows: u64,
     pub artifact_budget: ArtifactBudgetFacts,
 }
@@ -42,6 +39,8 @@ pub struct ArtifactBudgetFacts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxLag {
+    /// Published outbox rows the slowest required consumer has not acknowledged.
+    /// `None` when no consumer is registered.
     pub position_lag: Option<i64>,
     pub oldest_unconsumed_age_ms: Option<i64>,
     pub consumer_count: u64,
@@ -94,8 +93,7 @@ impl KernelStore {
             family_bytes,
             minimum_required_checkpoint: consumers.minimum_checkpoint,
             commit_lag,
-            outbox_position_lag: lag.position_lag,
-            oldest_unconsumed_age_ms: lag.oldest_unconsumed_age_ms,
+            outbox_lag: lag,
             retained_outbox_rows,
             artifact_budget,
         })

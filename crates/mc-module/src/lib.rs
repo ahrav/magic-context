@@ -3531,7 +3531,9 @@ impl McHandler {
                         kernel
                             .open(kernel_routes::kernel_root_for(path), policy, cancel.clone())
                             .await;
-                        if kernel.state() == kernel_routes::KernelState::Ready {
+                        if kernel.state() == kernel_routes::KernelState::Ready
+                            && kernel.background_sampler_enabled()
+                        {
                             sampler_spawn(Arc::clone(&kernel), cancel);
                         }
                     }
@@ -12013,6 +12015,12 @@ impl McHandler {
     #[cfg(feature = "test-support")]
     pub async fn sample_kernel_health_for_test(&self, now_ms: i64) {
         self.kernel.sample(now_ms).await;
+    }
+
+    /// Disabling the background sampler lets tests control published snapshots.
+    #[cfg(feature = "test-support")]
+    pub fn disable_kernel_sampler_for_test(&self) {
+        self.kernel.disable_background_sampler();
     }
 
     #[cfg(feature = "test-support")]

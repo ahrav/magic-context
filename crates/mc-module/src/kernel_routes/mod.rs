@@ -10,7 +10,7 @@ pub mod serving;
 pub(crate) mod state;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -66,6 +66,7 @@ pub(crate) struct KernelOpenCoordinator {
     unavailable_kind: AtomicU8,
     slot: Mutex<Option<Arc<KernelStore>>>,
     health: health::KernelHealthProjection,
+    background_sampler: AtomicBool,
 }
 
 impl KernelOpenCoordinator {
@@ -75,6 +76,7 @@ impl KernelOpenCoordinator {
             unavailable_kind: AtomicU8::new(UNAVAILABLE_STORE),
             slot: Mutex::new(None),
             health: health::KernelHealthProjection::new(),
+            background_sampler: AtomicBool::new(true),
         }
     }
 
@@ -85,6 +87,15 @@ impl KernelOpenCoordinator {
 
     pub(crate) fn state(&self) -> KernelState {
         KernelState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn background_sampler_enabled(&self) -> bool {
+        self.background_sampler.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn disable_background_sampler(&self) {
+        self.background_sampler.store(false, Ordering::Release);
     }
 
     /// The store a route may use, or the typed outcome the route must answer
@@ -115,6 +126,10 @@ impl KernelOpenCoordinator {
     }
 
     /// Slot first, then phase: a reader that sees `Ready` finds the store.
+    ///
+    /// Unlike `mark_unavailable`, `install` does not republish the health
+    /// block: `Ready` reaches health only from a sample that carries measured
+    /// facts.
     fn install(&self, store: KernelStore) {
         *self.slot.lock().expect("kernel store slot mutex") = Some(Arc::new(store));
         self.state

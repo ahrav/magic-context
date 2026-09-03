@@ -54,6 +54,8 @@ impl Daemon {
         let data = tempfile::tempdir().unwrap();
         let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
         let handler = McHandler::new();
+        // Disable kernel sampling so assertions observe the controlled timestamp.
+        handler.disable_kernel_sampler_for_test();
         PrimaryComponent::initialize(&handler, init(&descriptor))
             .await
             .unwrap();
@@ -365,5 +367,91 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     let value = response_json(&output);
     assert_eq!(value["kernel"]["kernel_state"], "ready");
     assert_eq!(value["kernel"]["required_consumer_count"], 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_background_sampler_publishes_facts_on_its_own() {
+    let data = tempfile::tempdir().unwrap();
+    let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
+    let handler = McHandler::new();
+    PrimaryComponent::initialize(&handler, init(&descriptor))
+        .await
+        .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
+    wait_for_state(&handler, KernelState::Ready).await;
+
+    // `Ready` reaches the health block only once the sampler has facts.
+    let started = Instant::now();
+    let kernel = loop {
+        let kernel = kernel_block(&handler.health().await);
+        if kernel["kernel_state"] == "ready" {
+            break kernel;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "sampler never published: {kernel}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(kernel["sampled_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(kernel["retained_outbox_rows"], 0);
+    assert_eq!(kernel["required_consumer_count"], 0);
+    handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_facts_sample_reports_the_kernel_unavailable_until_one_succeeds() {
+    let daemon = Daemon::start().await;
+    daemon.handler.sample_kernel_health_for_test(1_000).await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+
+    // The store only opens owner-only artifact directories.
+    let objects = kernel_root(&daemon.descriptor).join("artifacts/objects");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+    daemon.handler.sample_kernel_health_for_test(2_000).await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel store is unavailable")));
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "unavailable");
+    assert_eq!(kernel["unavailable_reason"], "store_unavailable");
+    assert_eq!(kernel["sampled_at_ms"], 2_000);
+    assert!(kernel.get("core_file_bytes").is_none());
+    assert!(kernel.get("lag_threshold_tripped").is_none());
+    // Routes are not fenced by the health projection.
+    assert_eq!(daemon.handler.kernel_state(), KernelState::Ready);
+    assert!(daemon.handler.kernel_store_for_test().is_some());
+
+    // The routed status method reports the same failure from live facts.
+    let status = daemon
+        .handler
+        .dispatch_value_for_test(
+            daemon.route,
+            serde_json::json!({"method": "status", "session_id": "session-a"}),
+        )
+        .await;
+    let mc_module::dispatch::PreparedOutcome::Response(output) = status else {
+        panic!("status responded with {status:?}");
+    };
+    let value = response_json(&output);
+    assert_eq!(value["kernel"]["kernel_state"], "unavailable");
+    assert_eq!(value["kernel"]["unavailable_reason"], "store_unavailable");
+
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o700)).unwrap();
+    daemon.handler.sample_kernel_health_for_test(3_000).await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok, "{health:?}");
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "ready");
+    assert_eq!(kernel["sampled_at_ms"], 3_000);
+    assert!(kernel.get("unavailable_reason").is_none());
+    assert_eq!(kernel["retained_outbox_rows"], 0);
     daemon.handler.shutdown().await.unwrap();
 }

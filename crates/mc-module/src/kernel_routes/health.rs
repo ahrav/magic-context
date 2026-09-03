@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use mc_kernel::{KernelFacts, KernelStore, OutboxLag, MAIN_FILE_WARN_BYTES};
+use mc_kernel::{KernelFacts, KernelStore, MAIN_FILE_WARN_BYTES};
 use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -44,15 +44,18 @@ pub struct KernelFactsBlock {
 }
 
 impl KernelFactsBlock {
-    pub fn from_facts(facts: &KernelFacts, lag: &OutboxLag) -> Self {
+    /// Every lag field, including the threshold verdict, comes from the one
+    /// outbox snapshot inside `facts`, so the displayed lag and the flag agree.
+    pub fn from_facts(facts: &KernelFacts) -> Self {
+        let lag = &facts.outbox_lag;
         Self {
             core_file_bytes: facts.main_file_bytes,
             core_file_warn: facts.main_file_bytes >= MAIN_FILE_WARN_BYTES,
             artifact_usage_bytes: facts.artifact_budget.usage_bytes,
             artifact_cap_bytes: facts.artifact_budget.cap_bytes,
             artifact_warn: facts.artifact_budget.warn,
-            outbox_position_lag: facts.outbox_position_lag,
-            oldest_unconsumed_age_ms: facts.oldest_unconsumed_age_ms,
+            outbox_position_lag: lag.position_lag,
+            oldest_unconsumed_age_ms: lag.oldest_unconsumed_age_ms,
             retained_outbox_rows: facts.retained_outbox_rows,
             required_consumer_count: lag.consumer_count,
             lag_threshold_tripped: lag_threshold_tripped(lag),
@@ -74,6 +77,25 @@ impl KernelHealthBlock {
 
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).expect("kernel health block serializes")
+    }
+
+    fn ready(sampled_at_ms: i64, facts: KernelFactsBlock) -> Self {
+        Self {
+            kernel_state: KernelState::Ready,
+            unavailable_reason: None,
+            sampled_at_ms: Some(sampled_at_ms),
+            facts: Some(facts),
+        }
+    }
+
+    /// Health must not read a failed sample as a healthy `Ready` store.
+    fn sample_failed(sampled_at_ms: i64) -> Self {
+        Self {
+            kernel_state: KernelState::Unavailable,
+            unavailable_reason: Some(UnavailableReason::StoreUnavailable),
+            sampled_at_ms: Some(sampled_at_ms),
+            facts: None,
+        }
     }
 }
 
@@ -123,8 +145,6 @@ impl KernelOpenCoordinator {
         self.health.publish(self.phase_block(sampled_at_ms));
     }
 
-    /// One sample: read facts and lag from the store on a blocking worker and
-    /// publish. A store that has gone away between ticks publishes the phase.
     pub(crate) async fn sample(&self, now_ms: i64) {
         let store = match self.kernel_store() {
             Ok(store) => store,
@@ -134,15 +154,10 @@ impl KernelOpenCoordinator {
             }
         };
         let block = match sample_facts(store, now_ms).await {
-            Ok(facts) => KernelHealthBlock {
-                kernel_state: KernelState::Ready,
-                unavailable_reason: None,
-                sampled_at_ms: Some(now_ms),
-                facts: Some(facts),
-            },
+            Ok(facts) => KernelHealthBlock::ready(now_ms, facts),
             Err(error) => {
                 eprintln!("mc-module: kernel facts sample failed: {error:?}");
-                self.phase_block(Some(now_ms))
+                KernelHealthBlock::sample_failed(now_ms)
             }
         };
         // The store may have been replaced while the worker ran; the phase wins.
@@ -173,8 +188,7 @@ async fn sample_facts(
 ) -> Result<KernelFactsBlock, mc_kernel::KernelError> {
     tokio::task::spawn_blocking(move || {
         let facts = store.facts(now_ms)?;
-        let lag = store.outbox_lag(now_ms)?;
-        Ok(KernelFactsBlock::from_facts(&facts, &lag))
+        Ok(KernelFactsBlock::from_facts(&facts))
     })
     .await
     .unwrap_or_else(|error| panic!("kernel facts sampler worker failed: {error}"))
@@ -184,14 +198,9 @@ async fn sample_facts(
 /// lock-free health path and may read the store.
 pub(crate) fn live_block(coordinator: &KernelOpenCoordinator, now_ms: i64) -> KernelHealthBlock {
     match coordinator.kernel_store() {
-        Ok(store) => match (store.facts(now_ms), store.outbox_lag(now_ms)) {
-            (Ok(facts), Ok(lag)) => KernelHealthBlock {
-                kernel_state: KernelState::Ready,
-                unavailable_reason: None,
-                sampled_at_ms: Some(now_ms),
-                facts: Some(KernelFactsBlock::from_facts(&facts, &lag)),
-            },
-            _ => coordinator.phase_block(Some(now_ms)),
+        Ok(store) => match store.facts(now_ms) {
+            Ok(facts) => KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts)),
+            Err(_) => KernelHealthBlock::sample_failed(now_ms),
         },
         Err(_) => coordinator.phase_block(Some(now_ms)),
     }

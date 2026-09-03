@@ -152,6 +152,7 @@ describe("parseDaemonResult", () => {
         for (const [state, reason] of [
             ["ready", "healthy"],
             ["ready", "kernel_lagging"],
+            ["ready", "kernel_capacity_warn"],
             ["ready", "no_required_consumer"],
             ["starting", "kernel_starting"],
             ["starting", "starting"],
@@ -169,6 +170,26 @@ describe("parseDaemonResult", () => {
         expect(() =>
             parseDaemonResult(withKernel({ state: "degraded", reason: "kernel_lagging" })),
         ).toThrow(/readiness\.kernel\.state is outside its closed set/);
+    });
+
+    test("component-only non-failing reasons are rejected as top-level verdicts", () => {
+        // `ok: true` and the paired remediation are valid for each reason.
+        for (const [reason, remediation] of [
+            ["kernel_lagging", "inspect_kernel_projector"],
+            ["kernel_capacity_warn", "inspect_storage"],
+            ["no_required_consumer", null],
+            ["synapse_unsupported", null],
+        ] as const) {
+            for (const state of ["running", "stopped"] as const) {
+                expect(() =>
+                    parseDaemonResult(
+                        JSON.stringify(
+                            validResult({ ok: true, state, reason, remediation, checks: [] }),
+                        ),
+                    ),
+                ).toThrow(/a component-only reason is not a top-level verdict/);
+            }
+        }
     });
 
     test("binds pass and fail checks to their reason classes, leaving warn and skip free", () => {
@@ -564,6 +585,7 @@ describe("reason vocabulary pins", () => {
             expect(remediationForReason(reason)).toBe(warnRemediations[reason] ?? null);
         }
         expect(remediationForReason("kernel_lagging")).toBe("inspect_kernel_projector");
+        expect(remediationForReason("kernel_capacity_warn")).toBe("inspect_storage");
         expect(remediationForReason("no_required_consumer")).toBeNull();
     });
 

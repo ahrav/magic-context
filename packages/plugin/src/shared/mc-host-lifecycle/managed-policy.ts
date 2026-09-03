@@ -65,7 +65,10 @@ function storageState(metrics: Record<string, unknown>): "ready" | "starting" | 
 }
 
 export type KernelReadiness =
-    | { state: "ready"; reason: "healthy" | "kernel_lagging" | "no_required_consumer" }
+    | {
+          state: "ready";
+          reason: "healthy" | "kernel_lagging" | "kernel_capacity_warn" | "no_required_consumer";
+      }
     | { state: "starting"; reason: "kernel_starting" }
     | { state: "unavailable"; reason: "kernel_unavailable" };
 
@@ -78,9 +81,12 @@ export function kernelReadiness(metrics: Record<string, unknown>): KernelReadine
     if (state === "starting") return { state: "starting", reason: "kernel_starting" };
     // An absent block is an unknown state and never reads as healthy.
     if (state !== "ready") return { state: "unavailable", reason: "kernel_unavailable" };
-    // A lagging projector outranks an empty required-consumer set.
+    // Warn reasons use priority order: lagging, capacity, then no required consumer.
     if (kernel?.lag_threshold_tripped === true) {
         return { state: "ready", reason: "kernel_lagging" };
+    }
+    if (kernel?.core_file_warn === true || kernel?.artifact_warn === true) {
+        return { state: "ready", reason: "kernel_capacity_warn" };
     }
     if (kernel?.required_consumer_count === 0) {
         return { state: "ready", reason: "no_required_consumer" };
