@@ -6,17 +6,22 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MIN_ARENA_BYTES: usize = MAX_FRAME_BYTES;
 
 /// Failure while planning a FIFO arena reservation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaError {
     /// Arena cannot hold one legal maximum frame.
+    #[error("arena capacity is below the protocol minimum")]
     BelowMinimumCapacity,
     /// Requested frame exceeds the wire limit.
+    #[error("frame exceeds the protocol maximum")]
     FrameTooLarge,
     /// Absolute cursors are malformed or wrapped.
+    #[error("arena cursor is invalid")]
     InvalidCursor,
     /// Current FIFO hold leaves insufficient contiguous logical capacity.
+    #[error("arena capacity is exhausted")]
     Exhausted,
     /// Offset or length arithmetic overflowed.
+    #[error("arena arithmetic overflow")]
     ArithmeticOverflow,
 }
 
@@ -25,20 +30,6 @@ impl fmt::Debug for ArenaError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for ArenaError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::BelowMinimumCapacity => "arena capacity is below the protocol minimum",
-            Self::FrameTooLarge => "frame exceeds the protocol maximum",
-            Self::InvalidCursor => "arena cursor is invalid",
-            Self::Exhausted => "arena capacity is exhausted",
-            Self::ArithmeticOverflow => "arena arithmetic overflow",
-        })
-    }
-}
-
-impl std::error::Error for ArenaError {}
 
 /// One offset-and-length region within an arena.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

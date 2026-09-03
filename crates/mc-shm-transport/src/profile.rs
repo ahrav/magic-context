@@ -566,23 +566,31 @@ impl fmt::Debug for QuarantineRecord {
 }
 
 /// Invalid target profile.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileError {
     /// Descriptor schema is unsupported.
+    #[error("target profile schema is unsupported")]
     UnsupportedSchema,
     /// Descriptor depth is zero.
+    #[error("descriptor depth is zero")]
     ZeroDescriptorDepth,
     /// Arena cannot hold one legal maximum frame.
+    #[error("arena is below protocol minimum")]
     ArenaBelowMinimum,
     /// Maximum span count is outside one through two.
+    #[error("span limit is invalid")]
     InvalidSpanLimit,
     /// Lease bound is zero or exceeds descriptor depth.
+    #[error("lease limit is invalid")]
     InvalidLeaseLimit,
     /// Candidate does not charge both directional mappings.
+    #[error("mapping charge is invalid")]
     InvalidMappingCharge,
     /// Worker charge disagrees with scheduling mode.
+    #[error("worker charge is invalid")]
     InvalidWorkerCharge,
     /// Resource charge arithmetic overflowed.
+    #[error("profile resource charge overflow")]
     ChargeOverflow,
 }
 
@@ -592,47 +600,41 @@ impl fmt::Debug for ProfileError {
     }
 }
 
-impl fmt::Display for ProfileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::UnsupportedSchema => "target profile schema is unsupported",
-            Self::ZeroDescriptorDepth => "descriptor depth is zero",
-            Self::ArenaBelowMinimum => "arena is below protocol minimum",
-            Self::InvalidSpanLimit => "span limit is invalid",
-            Self::InvalidLeaseLimit => "lease limit is invalid",
-            Self::InvalidMappingCharge => "mapping charge is invalid",
-            Self::InvalidWorkerCharge => "worker charge is invalid",
-            Self::ChargeOverflow => "profile resource charge overflow",
-        })
-    }
-}
-
-impl std::error::Error for ProfileError {}
-
 /// Host-wide admission rejection.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
     /// Physical-core topology could not be verified.
+    #[error("physical-core topology is unverified")]
     PhysicalCoresUnverified,
     /// Active workers exceed verified or configured physical cores.
+    #[error("physical-core budget exceeded")]
     PhysicalCoreBudgetExceeded,
     /// Descriptor commitment exceeds host limit.
+    #[error("host descriptor limit exceeded")]
     DescriptorLimit,
     /// Arena-byte commitment exceeds host limit.
+    #[error("host arena-byte limit exceeded")]
     ArenaByteLimit,
     /// Lease commitment exceeds host limit.
+    #[error("host lease limit exceeded")]
     LeaseLimit,
     /// Mapping commitment exceeds host limit.
+    #[error("host mapping limit exceeded")]
     MappingLimit,
     /// Mapping descriptor commitment exceeds host limit.
+    #[error("host file-descriptor limit exceeded")]
     FileDescriptorLimit,
     /// Active endpoint workers exceed host limit.
+    #[error("host worker limit exceeded")]
     WorkerLimit,
     /// Client instances exceed host limit.
+    #[error("host client-instance limit exceeded")]
     ClientInstanceLimit,
     /// Resource charge arithmetic overflowed.
+    #[error("host admission arithmetic overflow")]
     ChargeOverflow,
     /// Accounting lock was poisoned.
+    #[error("host admission accounting unavailable")]
     AccountingUnavailable,
 }
 
@@ -641,26 +643,6 @@ impl fmt::Debug for AdmissionError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for AdmissionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::PhysicalCoresUnverified => "physical-core topology is unverified",
-            Self::PhysicalCoreBudgetExceeded => "physical-core budget exceeded",
-            Self::DescriptorLimit => "host descriptor limit exceeded",
-            Self::ArenaByteLimit => "host arena-byte limit exceeded",
-            Self::LeaseLimit => "host lease limit exceeded",
-            Self::MappingLimit => "host mapping limit exceeded",
-            Self::FileDescriptorLimit => "host file-descriptor limit exceeded",
-            Self::WorkerLimit => "host worker limit exceeded",
-            Self::ClientInstanceLimit => "host client-instance limit exceeded",
-            Self::ChargeOverflow => "host admission arithmetic overflow",
-            Self::AccountingUnavailable => "host admission accounting unavailable",
-        })
-    }
-}
-
-impl std::error::Error for AdmissionError {}
 
 /// Hardware profile id the host stamps into every production grant.
 pub const MC_HOST_RING_PROFILE: &str = "mc-host-test-ring-v1";

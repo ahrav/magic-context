@@ -30,6 +30,7 @@ cortexkit-lease = { workspace = true }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no
 # lookarounds in those patterns); fancy-regex stays confined to mc-tokenizer.
 regex = { workspace = true }

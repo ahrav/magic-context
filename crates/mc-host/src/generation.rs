@@ -53,33 +53,20 @@ const CAPACITY_RESERVE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Each `GenerationError` variant maps to exactly one closed v1 reason.
 /// Callers must not derive externally visible classifications finer than the bounded static detail.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum GenerationError {
     /// `InsufficientStorage` leaves trusted selectors unchanged and removes the owned temp after preflight failure or post-preflight `ENOSPC`.
+    #[error("insufficient storage for staging")]
     InsufficientStorage,
     /// `NativePayloadInvalid` leaves `current` unchanged and selects no other generation after validation, staging-identity, exchange-repair, or checked-arithmetic failure.
-    NativePayloadInvalid {
-        detail: &'static str,
-    },
+    #[error("native payload invalid: {detail}")]
+    NativePayloadInvalid { detail: &'static str },
     /// `UnsupportedStateSchema` preserves and quarantines a profile or manifest with an unknown schema, then aborts the requested mutation or selection.
+    #[error("unsupported persisted state schema")]
     UnsupportedStateSchema,
+    #[error("{0}")]
     Instance(InstanceError),
 }
-
-impl std::fmt::Display for GenerationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InsufficientStorage => write!(f, "insufficient storage for staging"),
-            Self::NativePayloadInvalid { detail } => {
-                write!(f, "native payload invalid: {detail}")
-            }
-            Self::UnsupportedStateSchema => write!(f, "unsupported persisted state schema"),
-            Self::Instance(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for GenerationError {}
 
 impl From<InstanceError> for GenerationError {
     fn from(err: InstanceError) -> Self {
@@ -1229,6 +1216,16 @@ fn read_dir_names(dir: &OwnedFd) -> Result<Vec<String>, GenerationError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn wrapping_an_instance_error_reports_no_source() {
+        let wrapped = GenerationError::Instance(InstanceError::AlreadyRunning);
+        assert!(
+            std::error::Error::source(&wrapped).is_none(),
+            "Instance renders the inner error through Display and reports no source, \
+             so callers must not depend on the chain to reach it"
+        );
+    }
 
     fn store_at(root: &Path) -> GenerationStore {
         GenerationStore::open(Some(root)).expect("open store")

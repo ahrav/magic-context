@@ -23,26 +23,15 @@ pub use mc_core::claim_operation::{
 };
 
 /// Failure returned by memory-tool adapters.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum MemoryToolError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("claim mirror: {0}")]
     ClaimMirror(ClaimMirrorError),
+    #[error("claim intent protocol: {0}")]
     IntentProtocol(String),
 }
-
-impl std::fmt::Display for MemoryToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MemoryToolError::Store(e) => write!(f, "store: {e}"),
-            MemoryToolError::ClaimMirror(e) => write!(f, "claim mirror: {e}"),
-            MemoryToolError::IntentProtocol(reason) => {
-                write!(f, "claim intent protocol: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for MemoryToolError {}
 impl From<McStoreError> for MemoryToolError {
     fn from(e: McStoreError) -> Self {
         MemoryToolError::Store(e)

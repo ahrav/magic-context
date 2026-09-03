@@ -36,16 +36,9 @@ const OUTPUT_NAME_ALLOWLIST: &[&str] = &[
 const MAX_OUTPUT_INDEX: u64 = 7;
 
 /// Bundle validation failure that omits artifact contents from diagnostics.
-#[derive(Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("invalid synapse bundle: {0}")]
 pub struct BundleError(pub String);
-
-impl std::fmt::Display for BundleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid synapse bundle: {}", self.0)
-    }
-}
-
-impl std::error::Error for BundleError {}
 
 fn err(reason: impl Into<String>) -> BundleError {
     BundleError(reason.into())

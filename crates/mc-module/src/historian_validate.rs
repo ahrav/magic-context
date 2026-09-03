@@ -224,18 +224,11 @@ pub struct ValidatedChunk {
 }
 
 /// Validation failures are plain, serializable messages because callers include them in repair prompts and telemetry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[error("{message}")]
 pub struct HistorianValidationError {
     pub message: String,
 }
-
-impl std::fmt::Display for HistorianValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for HistorianValidationError {}
 
 fn validation_error(message: impl Into<String>) -> HistorianValidationError {
     HistorianValidationError {

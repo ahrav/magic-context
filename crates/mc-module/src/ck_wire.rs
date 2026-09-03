@@ -327,45 +327,23 @@ impl FlatProjection {
 }
 
 /// Projection failure caused by invalid identity syntax or tool-arc structure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum CkWireError {
+    #[error("message id contains reserved '#': {0}")]
     MidContainsReservedHash(String),
+    #[error("unsupported CK block {kind} at {mid}#{block_index}")]
     UnsupportedBlock {
         mid: String,
         block_index: usize,
         kind: String,
     },
+    #[error("tool_result {tool_call_id} at {mid}#{block_index} has no adjacent tool_call")]
     UnpairedToolResult {
         mid: String,
         block_index: usize,
         tool_call_id: String,
     },
 }
-
-impl std::fmt::Display for CkWireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CkWireError::MidContainsReservedHash(mid) => {
-                write!(f, "message id contains reserved '#': {mid}")
-            }
-            CkWireError::UnsupportedBlock {
-                mid,
-                block_index,
-                kind,
-            } => write!(f, "unsupported CK block {kind} at {mid}#{block_index}"),
-            CkWireError::UnpairedToolResult {
-                mid,
-                block_index,
-                tool_call_id,
-            } => write!(
-                f,
-                "tool_result {tool_call_id} at {mid}#{block_index} has no adjacent tool_call"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CkWireError {}
 
 /// Projects messages into stable blocks in input order.
 ///

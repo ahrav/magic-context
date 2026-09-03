@@ -42,82 +42,39 @@ impl ConnectionKey {
 }
 
 /// `InstanceError` never stores key bytes.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum InstanceError {
+    #[error("mc-host only conforms on Unix numeric-IPv4-loopback profiles")]
     UnsupportedPlatform,
+    #[error("no data directory: set XDG_DATA_HOME, HOME, or an explicit override")]
     NoDataDir,
+    #[error("instance {op} failed for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
+        #[source]
         source: io::Error,
     },
     /// The runtime directory, lock, or publication failed a security check.
-    Insecure {
-        what: &'static str,
-        path: PathBuf,
-    },
+    #[error("refusing insecure {what} at {}: wrong type, owner, mode, or link count", path.display())]
+    Insecure { what: &'static str, path: PathBuf },
     /// Another live host instance holds the lock.
+    #[error("another mc-host instance holds the lock")]
     AlreadyRunning,
     /// The supplied payload-manifest digest must contain 64 lowercase hexadecimal characters.
+    #[error(
+        "payload-manifest digest must be {} lowercase hex characters",
+        crate::lifecycle::PAYLOAD_MANIFEST_DIGEST_LEN
+    )]
     InvalidPayloadDigest,
     /// Unknown-schema lifecycle-state bytes are never interpreted, migrated, overwritten, or removed.
-    UnsupportedStateSchema {
-        path: PathBuf,
-    },
+    #[error("refusing to touch an unknown lifecycle state schema at {}", path.display())]
+    UnsupportedStateSchema { path: PathBuf },
     /// `NamespaceDrift` requires the holder to abort its named-namespace result when a retained descriptor no longer matches the identity resolved by its name.
-    NamespaceDrift {
-        path: PathBuf,
-    },
+    #[error("managed namespace identity drifted at {}", path.display())]
+    NamespaceDrift { path: PathBuf },
+    #[error("OS CSPRNG failure while minting credentials")]
     Random,
-}
-
-impl fmt::Display for InstanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedPlatform => write!(
-                f,
-                "mc-host only conforms on Unix numeric-IPv4-loopback profiles"
-            ),
-            Self::NoDataDir => write!(
-                f,
-                "no data directory: set XDG_DATA_HOME, HOME, or an explicit override"
-            ),
-            Self::Io { op, path, source } => {
-                write!(f, "instance {op} failed for {}: {source}", path.display())
-            }
-            Self::Insecure { what, path } => write!(
-                f,
-                "refusing insecure {what} at {}: wrong type, owner, mode, or link count",
-                path.display()
-            ),
-            Self::AlreadyRunning => write!(f, "another mc-host instance holds the lock"),
-            Self::InvalidPayloadDigest => write!(
-                f,
-                "payload-manifest digest must be {} lowercase hex characters",
-                crate::lifecycle::PAYLOAD_MANIFEST_DIGEST_LEN
-            ),
-            Self::UnsupportedStateSchema { path } => write!(
-                f,
-                "refusing to touch an unknown lifecycle state schema at {}",
-                path.display()
-            ),
-            Self::NamespaceDrift { path } => write!(
-                f,
-                "managed namespace identity drifted at {}",
-                path.display()
-            ),
-            Self::Random => write!(f, "OS CSPRNG failure while minting credentials"),
-        }
-    }
-}
-
-impl std::error::Error for InstanceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -> InstanceError {

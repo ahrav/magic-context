@@ -229,7 +229,8 @@ impl ResolvedHarnessNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("harness closure invalid: {detail}")]
 pub struct HarnessClosureError {
     detail: &'static str,
 }
@@ -240,14 +241,6 @@ impl HarnessClosureError {
         self.detail
     }
 }
-
-impl std::fmt::Display for HarnessClosureError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "harness closure invalid: {}", self.detail)
-    }
-}
-
-impl std::error::Error for HarnessClosureError {}
 
 fn invalid(detail: &'static str) -> HarnessClosureError {
     HarnessClosureError { detail }

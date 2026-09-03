@@ -25,16 +25,9 @@ use crate::handler::{
 ///
 /// Protocol V24 diagnostics report only the message byte length, which prevents
 /// component detail from reaching host logs.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
+#[error("component shutdown failed: {0}")]
 pub struct ShutdownError(pub String);
-
-impl std::fmt::Display for ShutdownError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "component shutdown failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for ShutdownError {}
 
 /// Component role shared by the direct-profile composition.
 ///

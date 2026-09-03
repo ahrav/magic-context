@@ -35,24 +35,15 @@ pub struct OrtIdentity {
 /// `Input` errors reject the affected request.
 /// `Artifact` errors disable the component.
 /// `Invariant` errors mark the component failing and prevent suspect vectors from being returned.
-#[derive(Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum InferenceError {
+    #[error("invalid inference input: {0}")]
     Input(String),
+    #[error("inference artifact failure: {0}")]
     Artifact(String),
+    #[error("inference invariant failure: {0}")]
     Invariant(String),
 }
-
-impl std::fmt::Display for InferenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Input(reason) => write!(f, "invalid inference input: {reason}"),
-            Self::Artifact(reason) => write!(f, "inference artifact failure: {reason}"),
-            Self::Invariant(reason) => write!(f, "inference invariant failure: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for InferenceError {}
 
 /// `ORT_COMMITTED` permits one process-global ORT identity because dynamic loading is first-wins; its mutex lets only one racing initializer commit.
 static ORT_COMMITTED: Mutex<Option<OrtIdentity>> = Mutex::new(None);

@@ -118,11 +118,13 @@ impl fmt::Debug for Lifecycle {
 }
 
 /// Reports rejected lifecycle transitions.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
     /// Requested edge is outside ordered shutdown.
+    #[error("invalid lifecycle transition")]
     InvalidTransition,
     /// Current state cannot transition further.
+    #[error("lifecycle state is terminal")]
     Terminal,
 }
 
@@ -131,14 +133,3 @@ impl fmt::Debug for LifecycleError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for LifecycleError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidTransition => "invalid lifecycle transition",
-            Self::Terminal => "lifecycle state is terminal",
-        })
-    }
-}
-
-impl std::error::Error for LifecycleError {}

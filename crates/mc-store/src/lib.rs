@@ -1884,9 +1884,11 @@ pub struct HistorianPublishRequest<'a> {
 
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
 /// caller can tell "another writer already committed" from "this producer is stale."
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HistorianPublishError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("publish CAS conflict: expected {expected:?}, found {found}{reason_suffix}", reason_suffix = historian_publish_reason_suffix(reason))]
     CasConflict {
         expected: Option<u64>,
         found: u64,
@@ -1896,70 +1898,33 @@ pub enum HistorianPublishError {
     /// Distinct from CasConflict so callers can abandon the run WITHOUT arming a
     /// model-failure cooldown: a fence rejection is a fast local race, not a
     /// producer failure, and an immediate retry with a fresh snapshot is valid.
-    FenceRejected {
-        reason: String,
-    },
+    #[error("publication fence rejected: {reason}")]
+    FenceRejected { reason: String },
     /// An appended historian compartment intersects an already durable range. This
     /// is a publish rejection rather than a SQLite failure so callers can abandon the
     /// stale firing and leave the session immediately reusable.
+    #[error("historian compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}")]
     CompartmentOverlap {
         existing_sequence: i64,
         incoming_start_message: i64,
         incoming_end_message: i64,
     },
+    #[error("historian publish state mismatch: expected seq {} run {} fingerprint {}, found {:?}", .expected.firing_seq, .expected.producer_run_id, .expected.chunk_fingerprint, found)]
     StateMismatch {
         expected: Box<HistorianPublishPredicate>,
         found: Box<HistorianDurableState>,
     },
-    InvalidState {
-        state: String,
-    },
+    #[error("historian publish invalid state: {state}")]
+    InvalidState { state: String },
+    #[error("serde: {0}")]
     Serde(String),
 }
 
-impl std::fmt::Display for HistorianPublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HistorianPublishError::Store(e) => write!(f, "store: {e}"),
-            HistorianPublishError::FenceRejected { reason } => {
-                write!(f, "publication fence rejected: {reason}")
-            }
-            HistorianPublishError::CompartmentOverlap {
-                existing_sequence,
-                incoming_start_message,
-                incoming_end_message,
-            } => write!(
-                f,
-                "historian compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}"
-            ),
-            HistorianPublishError::CasConflict {
-                expected,
-                found,
-                reason,
-            } => {
-                if let Some(reason) = reason {
-                    write!(
-                        f,
-                        "publish CAS conflict: expected {expected:?}, found {found}: {reason}"
-                    )
-                } else {
-                    write!(f, "publish CAS conflict: expected {expected:?}, found {found}")
-                }
-            }
-            HistorianPublishError::StateMismatch { expected, found } => write!(
-                f,
-                "historian publish state mismatch: expected seq {} run {} fingerprint {}, found {:?}",
-                expected.firing_seq, expected.producer_run_id, expected.chunk_fingerprint, found
-            ),
-            HistorianPublishError::InvalidState { state } => {
-                write!(f, "historian publish invalid state: {state}")
-            }
-            HistorianPublishError::Serde(e) => write!(f, "serde: {e}"),
-        }
-    }
+fn historian_publish_reason_suffix(reason: &Option<String>) -> String {
+    reason
+        .as_deref()
+        .map_or_else(String::new, |reason| format!(": {reason}"))
 }
-
-impl std::error::Error for HistorianPublishError {}
 
 impl From<McStoreError> for HistorianPublishError {
     fn from(e: McStoreError) -> Self {
@@ -4963,12 +4928,17 @@ pub enum StateImportPreflight {
     Duplicate { imported: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StateImportValidationError {
+    #[error("compartment seq must be strictly increasing: {current} followed {previous}")]
     SeqNotIncreasing { previous: i64, current: i64 },
+    #[error("compartment {sequence} has start_message after end_message")]
     RangeInvalid { sequence: i64 },
+    #[error("compartment {current} overlaps or precedes compartment {previous}")]
     RangesOverlap { previous: i64, current: i64 },
+    #[error("compartment {sequence} has an empty p1")]
     P1Empty { sequence: i64 },
+    #[error("compartment {sequence} end_message_id is not a parseable mid#idx")]
     EndMessageIdInvalid { sequence: i64 },
 }
 
@@ -4984,20 +4954,29 @@ impl StateImportValidationError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StateImportError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("session already has durable state")]
     SessionNotEmpty,
+    #[error("{}: {}", .0.code(), .0)]
     Validation(StateImportValidationError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ModuleStateSyncError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("shadow generation mismatch: expected {expected}, found {found}")]
     GenerationMismatch { expected: u64, found: u64 },
+    #[error("authority seq mismatch: expected {expected}, found {found}")]
     AuthoritySeqMismatch { expected: u64, found: u64 },
+    #[error("historian compartment sync busy: {}", phase.as_str())]
     HistorianBusy { phase: HistorianPhase },
+    #[error("invalid seed boundary {declared:?}: {detail}")]
     InvalidSeedBoundary { declared: String, detail: String },
+    #[error("serde: {0}")]
     Serde(String),
 }
 
@@ -5155,41 +5134,39 @@ fn prepare_state_sync(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum McStoreError {
+    #[error("store: {0}")]
     Store(StoreError),
+    #[error("durable text rejected: {0:?}")]
     Redaction(RedactionErrorKind),
     /// `store.db` carries `mc_cache` history older than the consolidated
     /// bootstrap, so this binary cannot adopt it and does not migrate it.
+    #[error("module store predates the claims cutover: store.db records mc_cache schema v{recorded_version}, and this binary composes v{bootstrap_version} from an empty schema. It is not migrated or reinterpreted. Stop every Magic Context process, move or delete store.db (and its -wal/-shm siblings) to let this binary compose a new one; project memory lives in context.db and is unaffected.")]
     PreCutoverModuleStore {
         recorded_version: u32,
         bootstrap_version: u32,
     },
     /// The on-disk row_version moved under us (a concurrent writer committed first).
     /// The caller re-loads and re-steps.
-    CasConflict {
-        expected: Option<u64>,
-        found: u64,
-    },
+    #[error("cas conflict: expected {expected:?}, found {found}")]
+    CasConflict { expected: Option<u64>, found: u64 },
     /// An authority transition was requested from the wrong durable state.
-    AuthorityStateMismatch {
-        expected: String,
-        found: String,
-    },
+    #[error("authority state mismatch: expected {expected}, found {found}")]
+    AuthorityStateMismatch { expected: String, found: String },
     /// A caller used a stale authority generation after another transition committed.
-    AuthorityGenerationMismatch {
-        expected: u64,
-        found: u64,
-    },
+    #[error("authority generation mismatch: expected {expected}, found {found}")]
+    AuthorityGenerationMismatch { expected: u64, found: u64 },
     /// The module feed advanced after a drain captured its replay bound.
-    AuthorityFeedHeadAdvanced {
-        captured: i64,
-        found: i64,
-    },
+    #[error(
+        "authority feed head advanced after drain capture: captured {captured}, found {found}"
+    )]
+    AuthorityFeedHeadAdvanced { captured: i64, found: i64 },
+    #[error("serde: {0}")]
     Serde(String),
-    MemoryDuplicateContent {
-        id: i64,
-    },
+    #[error("memory content already exists as ID {id}")]
+    MemoryDuplicateContent { id: i64 },
+    #[error("note {id} CAS conflict: expected {expected_status}@{expected_version}, found {found_status}@{found_version}")]
     NoteCasConflict {
         id: i64,
         expected_status: String,
@@ -5197,11 +5174,10 @@ pub enum McStoreError {
         found_status: String,
         found_version: i64,
     },
-    NoteOwnershipMismatch {
-        id: i64,
-        project: String,
-    },
+    #[error("note {id} is not owned by project {project}")]
+    NoteOwnershipMismatch { id: i64, project: String },
     /// An append would overlap a durable compartment range for the same session.
+    #[error("compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}")]
     CompartmentRangeOverlap {
         existing_sequence: i64,
         incoming_start_message: i64,
@@ -5209,148 +5185,41 @@ pub enum McStoreError {
     },
     /// A facade route bound to an authority-managed identity attempted to write
     /// using filesystem-path transport vocabulary instead of the domain identity.
+    #[error("{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}")]
     FacadeProjectVocabularyMismatch {
         route_project_root: String,
         authority_project: String,
         write_project: String,
         domain: String,
     },
+    #[error("invalid claim intent: {0}")]
     ClaimIntentInvalid(String),
+    #[error("claim command identity {producer}/{operation_key} was reused with a different request digest")]
     ClaimIntentIdentityConflict {
         producer: String,
         operation_key: String,
     },
+    #[error("claim intent {field} mismatch: expected {expected}, found {found}")]
     ClaimIntentBindingMismatch {
         field: &'static str,
         expected: String,
         found: String,
     },
-    ClaimIntentAuthorityFrozen {
-        state: String,
-    },
+    #[error("claim intent writes are frozen during authority state {state}")]
+    ClaimIntentAuthorityFrozen { state: String },
     /// The bound daemon route resolves to no memories authority row.
+    #[error("claim intent route has no memories authority; refusing to stage")]
     ClaimIntentRouteNotManaged,
+    #[error("claim intent {producer}/{operation_key} was not found")]
     ClaimIntentNotFound {
         producer: String,
         operation_key: String,
     },
-    ClaimIntentTransition {
-        expected: String,
-        found: String,
-    },
-    ClaimIntentResetBlocked {
-        unresolved: usize,
-    },
+    #[error("claim intent state mismatch: expected {expected}, found {found}")]
+    ClaimIntentTransition { expected: String, found: String },
+    #[error("store rebuild refused while {unresolved} claim intents remain unresolved")]
+    ClaimIntentResetBlocked { unresolved: usize },
 }
-
-impl std::fmt::Display for McStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            McStoreError::Store(e) => write!(f, "store: {e}"),
-            McStoreError::Redaction(kind) => write!(f, "durable text rejected: {kind:?}"),
-            McStoreError::PreCutoverModuleStore {
-                recorded_version,
-                bootstrap_version,
-            } => write!(
-                f,
-                "module store predates the claims cutover: store.db records mc_cache schema v{recorded_version}, and this binary composes v{bootstrap_version} from an empty schema. \
-                 It is not migrated or reinterpreted. Stop every Magic Context process, move or delete store.db (and its -wal/-shm siblings) to let this binary compose a new one; \
-                 project memory lives in context.db and is unaffected."
-            ),
-            McStoreError::CasConflict { expected, found } => {
-                write!(f, "cas conflict: expected {expected:?}, found {found}")
-            }
-            McStoreError::AuthorityStateMismatch { expected, found } => {
-                write!(
-                    f,
-                    "authority state mismatch: expected {expected}, found {found}"
-                )
-            }
-            McStoreError::AuthorityGenerationMismatch { expected, found } => {
-                write!(
-                    f,
-                    "authority generation mismatch: expected {expected}, found {found}"
-                )
-            }
-            McStoreError::AuthorityFeedHeadAdvanced { captured, found } => write!(
-                f,
-                "authority feed head advanced after drain capture: captured {captured}, found {found}"
-            ),
-            McStoreError::Serde(e) => write!(f, "serde: {e}"),
-            McStoreError::MemoryDuplicateContent { id } => {
-                write!(f, "memory content already exists as ID {id}")
-            }
-            McStoreError::NoteCasConflict {
-                id,
-                expected_status,
-                expected_version,
-                found_status,
-                found_version,
-            } => write!(
-                f,
-                "note {id} CAS conflict: expected {expected_status}@{expected_version}, found {found_status}@{found_version}"
-            ),
-            McStoreError::NoteOwnershipMismatch { id, project } => {
-                write!(f, "note {id} is not owned by project {project}")
-            }
-            McStoreError::CompartmentRangeOverlap {
-                existing_sequence,
-                incoming_start_message,
-                incoming_end_message,
-            } => write!(
-                f,
-                "compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}"
-            ),
-            McStoreError::FacadeProjectVocabularyMismatch {
-                route_project_root,
-                authority_project,
-                write_project,
-                domain,
-            } => write!(
-                f,
-                "{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}"
-            ),
-            McStoreError::ClaimIntentInvalid(reason) => {
-                write!(f, "invalid claim intent: {reason}")
-            }
-            McStoreError::ClaimIntentIdentityConflict {
-                producer,
-                operation_key,
-            } => write!(
-                f,
-                "claim command identity {producer}/{operation_key} was reused with a different request digest"
-            ),
-            McStoreError::ClaimIntentBindingMismatch {
-                field,
-                expected,
-                found,
-            } => write!(
-                f,
-                "claim intent {field} mismatch: expected {expected}, found {found}"
-            ),
-            McStoreError::ClaimIntentAuthorityFrozen { state } => {
-                write!(f, "claim intent writes are frozen during authority state {state}")
-            }
-            McStoreError::ClaimIntentRouteNotManaged => write!(
-                f,
-                "claim intent route has no memories authority; refusing to stage"
-            ),
-            McStoreError::ClaimIntentNotFound {
-                producer,
-                operation_key,
-            } => write!(f, "claim intent {producer}/{operation_key} was not found"),
-            McStoreError::ClaimIntentTransition { expected, found } => write!(
-                f,
-                "claim intent state mismatch: expected {expected}, found {found}"
-            ),
-            McStoreError::ClaimIntentResetBlocked { unresolved } => write!(
-                f,
-                "store rebuild refused while {unresolved} claim intents remain unresolved"
-            ),
-        }
-    }
-}
-impl std::error::Error for McStoreError {}
 
 impl From<mc_core::redaction::RedactionError> for McStoreError {
     fn from(error: mc_core::redaction::RedactionError) -> Self {
@@ -5373,48 +5242,6 @@ impl From<StoreError> for McStoreError {
     }
 }
 
-impl std::fmt::Display for StateImportValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SeqNotIncreasing { previous, current } => write!(
-                f,
-                "compartment seq must be strictly increasing: {current} followed {previous}"
-            ),
-            Self::RangeInvalid { sequence } => {
-                write!(
-                    f,
-                    "compartment {sequence} has start_message after end_message"
-                )
-            }
-            Self::RangesOverlap { previous, current } => write!(
-                f,
-                "compartment {current} overlaps or precedes compartment {previous}"
-            ),
-            Self::P1Empty { sequence } => {
-                write!(f, "compartment {sequence} has an empty p1")
-            }
-            Self::EndMessageIdInvalid { sequence } => write!(
-                f,
-                "compartment {sequence} end_message_id is not a parseable mid#idx"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StateImportValidationError {}
-
-impl std::fmt::Display for StateImportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Store(error) => write!(f, "store: {error}"),
-            Self::SessionNotEmpty => write!(f, "session already has durable state"),
-            Self::Validation(error) => write!(f, "{}: {error}", error.code()),
-        }
-    }
-}
-
-impl std::error::Error for StateImportError {}
-
 impl From<McStoreError> for StateImportError {
     fn from(error: McStoreError) -> Self {
         Self::Store(error)
@@ -5426,31 +5253,6 @@ impl From<StoreError> for StateImportError {
         Self::Store(McStoreError::Store(error))
     }
 }
-
-impl std::fmt::Display for ModuleStateSyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ModuleStateSyncError::Store(e) => write!(f, "store: {e}"),
-            ModuleStateSyncError::GenerationMismatch { expected, found } => write!(
-                f,
-                "shadow generation mismatch: expected {expected}, found {found}"
-            ),
-            ModuleStateSyncError::AuthoritySeqMismatch { expected, found } => write!(
-                f,
-                "authority seq mismatch: expected {expected}, found {found}"
-            ),
-            ModuleStateSyncError::HistorianBusy { phase } => {
-                write!(f, "historian compartment sync busy: {}", phase.as_str())
-            }
-            ModuleStateSyncError::InvalidSeedBoundary { declared, detail } => {
-                write!(f, "invalid seed boundary {declared:?}: {detail}")
-            }
-            ModuleStateSyncError::Serde(e) => write!(f, "serde: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ModuleStateSyncError {}
 
 impl From<McStoreError> for ModuleStateSyncError {
     fn from(e: McStoreError) -> Self {
@@ -5789,31 +5591,16 @@ fn validate_claim_result_json(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum AuthorityTransitionError {
+    #[error("expected state {expected}, found {found}")]
     State { expected: String, found: String },
+    #[error("expected generation {expected}, found {found}")]
     Generation { expected: u64, found: u64 },
+    #[error("drain coordinator token mismatch or missing")]
     CoordinatorToken,
+    #[error("drain coordinator lease expired")]
     CoordinatorLeaseExpired,
-}
-
-impl std::fmt::Display for AuthorityTransitionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::State { expected, found } => {
-                write!(f, "expected state {expected}, found {found}")
-            }
-            Self::Generation { expected, found } => {
-                write!(f, "expected generation {expected}, found {found}")
-            }
-            Self::CoordinatorToken => {
-                write!(f, "drain coordinator token mismatch or missing")
-            }
-            Self::CoordinatorLeaseExpired => {
-                write!(f, "drain coordinator lease expired")
-            }
-        }
-    }
 }
 
 fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -> String {
@@ -5829,8 +5616,6 @@ fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -
         )
     )
 }
-
-impl std::error::Error for AuthorityTransitionError {}
 
 fn map_authority_sql_error(error: StoreError) -> McStoreError {
     // cortexkit-store intentionally erases driver-specific errors at its connection

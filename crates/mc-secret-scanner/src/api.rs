@@ -212,59 +212,41 @@ impl ScanLimits {
 }
 
 /// Failure to validate embedded rules or configured limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConstructionError {
     /// Embedded upstream corpus does not match its pinned digest.
+    #[error("embedded scanner corpus digest mismatch")]
     CorpusDigestMismatch,
     /// Embedded conservative overlay does not match its pinned digest.
+    #[error("embedded scanner overlay digest mismatch")]
     OverlayDigestMismatch,
     /// Embedded rule document cannot be decoded.
+    #[error("invalid embedded scanner rule document")]
     InvalidRuleDocument,
     /// Rule identity is missing or invalid.
+    #[error("invalid embedded scanner rule identity")]
     InvalidRuleIdentity,
     /// Rule pattern cannot be compiled.
+    #[error("invalid embedded scanner rule pattern")]
     InvalidRulePattern,
     /// Rule policy is invalid.
+    #[error("invalid embedded scanner rule policy")]
     InvalidRulePolicy,
     /// One or more scan limits are zero or exceed the hard input ceiling.
+    #[error("invalid scanner limits")]
     InvalidLimits,
 }
 
-impl fmt::Display for ConstructionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::CorpusDigestMismatch => "embedded scanner corpus digest mismatch",
-            Self::OverlayDigestMismatch => "embedded scanner overlay digest mismatch",
-            Self::InvalidRuleDocument => "invalid embedded scanner rule document",
-            Self::InvalidRuleIdentity => "invalid embedded scanner rule identity",
-            Self::InvalidRulePattern => "invalid embedded scanner rule pattern",
-            Self::InvalidRulePolicy => "invalid embedded scanner rule policy",
-            Self::InvalidLimits => "invalid scanner limits",
-        })
-    }
-}
-
-impl std::error::Error for ConstructionError {}
-
 /// Failure while scanning one input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanError {
     /// Input exceeds the configured byte ceiling.
+    #[error("scanner input limit exceeded")]
     InputLimitExceeded,
     /// A matched range is out of bounds or not on UTF-8 boundaries.
+    #[error("scanner produced an invalid span")]
     InvalidSpan,
 }
-
-impl fmt::Display for ScanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InputLimitExceeded => "scanner input limit exceeded",
-            Self::InvalidSpan => "scanner produced an invalid span",
-        })
-    }
-}
-
-impl std::error::Error for ScanError {}
 
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),

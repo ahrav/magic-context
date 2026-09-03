@@ -189,6 +189,8 @@ pub enum ArtifactErrorKind {
 /// Bounded artifact failure with optional capacity or digest context.
 ///
 /// Display and debug output expose no payload bytes.
+#[derive(thiserror::Error)]
+#[error("{}", artifact_error_message(.kind, .usage, .cap, .digest))]
 pub struct ArtifactError {
     kind: ArtifactErrorKind,
     usage: Option<u64>,
@@ -251,7 +253,30 @@ impl ArtifactError {
     }
 }
 
-impl fmt::Display for ArtifactError {
+/// `Display` and `Debug` for `ArtifactError` both write through this type into the
+/// caller's `Formatter`, which avoids building an owned `String` per rendering.
+struct ArtifactErrorMessage<'a> {
+    kind: &'a ArtifactErrorKind,
+    usage: &'a Option<u64>,
+    cap: &'a Option<u64>,
+    digest: &'a Option<String>,
+}
+
+fn artifact_error_message<'a>(
+    kind: &'a ArtifactErrorKind,
+    usage: &'a Option<u64>,
+    cap: &'a Option<u64>,
+    digest: &'a Option<String>,
+) -> ArtifactErrorMessage<'a> {
+    ArtifactErrorMessage {
+        kind,
+        usage,
+        cap,
+        digest,
+    }
+}
+
+impl fmt::Display for ArtifactErrorMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
             // Two limits produce this error: what may be stored, and the shorter length
@@ -338,8 +363,6 @@ impl fmt::Debug for ArtifactError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl std::error::Error for ArtifactError {}
 
 pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
     let root_directory = File::open(root).map_err(|_| KernelError::Io)?;

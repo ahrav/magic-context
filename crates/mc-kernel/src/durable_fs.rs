@@ -11,26 +11,12 @@ use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
 static UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Filesystem failure classified by whether storage capacity is exhausted.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub(super) enum StorageError {
-    Exhausted(io::Error),
-    Other(io::Error),
-}
-
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Exhausted(source) | Self::Other(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for StorageError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Exhausted(source) | Self::Other(source) => Some(source),
-        }
-    }
+    #[error("{0}")]
+    Exhausted(#[source] io::Error),
+    #[error("{0}")]
+    Other(#[source] io::Error),
 }
 
 impl StorageError {

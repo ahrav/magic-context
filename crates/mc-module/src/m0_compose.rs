@@ -24,22 +24,14 @@ use crate::project_docs::read_project_docs_canonical;
 pub(crate) const MEMORY_MURAL_BLOCK: &str =
     "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum M0ComposeError {
+    #[error("store: {0}")]
     Store(McStoreError),
     /// The stored compartment ranges overlap or otherwise fail strict ordering.
+    #[error("{0}")]
     CoverageGap(CoverageGap),
 }
-
-impl std::fmt::Display for M0ComposeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            M0ComposeError::Store(e) => write!(f, "store: {e}"),
-            M0ComposeError::CoverageGap(g) => write!(f, "{g}"),
-        }
-    }
-}
-impl std::error::Error for M0ComposeError {}
 impl From<McStoreError> for M0ComposeError {
     fn from(e: McStoreError) -> Self {
         M0ComposeError::Store(e)

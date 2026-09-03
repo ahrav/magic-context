@@ -235,21 +235,28 @@ impl Drop for ReceiveLease<'_> {
 }
 
 /// `LeaseError` reports receive-span or completion failures.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
     /// Span pointer, count, or required segment presence is invalid.
+    #[error("receive span is invalid")]
     InvalidSpan,
     /// Declared body length and mapped span lengths disagree.
+    #[error("receive span lengths disagree")]
     LengthMismatch,
     /// Release identity belongs to another transport incarnation.
+    #[error("release identity does not match incarnation")]
     WrongIncarnation,
     /// Release identity names another lane.
+    #[error("release identity does not match lane")]
     WrongLane,
     /// Release sequence is outside the lane's valid completion state.
+    #[error("release sequence is invalid")]
     InvalidSequence,
     /// Completion was already released.
+    #[error("release is duplicated")]
     DuplicateRelease,
     /// Transport storage no longer permits lease completion.
+    #[error("transport storage is quarantined")]
     Quarantined,
 }
 
@@ -258,19 +265,3 @@ impl fmt::Debug for LeaseError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for LeaseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidSpan => "receive span is invalid",
-            Self::LengthMismatch => "receive span lengths disagree",
-            Self::WrongIncarnation => "release identity does not match incarnation",
-            Self::WrongLane => "release identity does not match lane",
-            Self::InvalidSequence => "release sequence is invalid",
-            Self::DuplicateRelease => "release is duplicated",
-            Self::Quarantined => "transport storage is quarantined",
-        })
-    }
-}
-
-impl std::error::Error for LeaseError {}

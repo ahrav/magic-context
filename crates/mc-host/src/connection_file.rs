@@ -6,7 +6,6 @@
 //! Connection key bytes never appear in formatting or errors.
 
 use std::{
-    error::Error,
     ffi::OsString,
     fmt, io,
     path::{Path, PathBuf},
@@ -99,97 +98,37 @@ impl ConnectionInfo {
 }
 
 /// Failure while opening, reading, decoding, or validating a connection file.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConnectionFileError {
-    InvalidPath {
-        path: PathBuf,
-    },
+    #[error("invalid connection file path {}", path.display())]
+    InvalidPath { path: PathBuf },
+    #[error("connection file {op} failed for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         source: io::Error,
     },
-    Insecure {
-        path: PathBuf,
-    },
-    TooLarge {
-        path: PathBuf,
-        max: usize,
-    },
-    Replaced {
-        path: PathBuf,
-    },
+    #[error("refusing insecure connection file at {}: wrong type, owner, mode, or link count", path.display())]
+    Insecure { path: PathBuf },
+    #[error("connection file {} exceeds {max} byte limit", path.display())]
+    TooLarge { path: PathBuf, max: usize },
+    #[error("connection file {} changed while reading", path.display())]
+    Replaced { path: PathBuf },
+    #[error("connection file JSON read failed for {}: {source}", path.display())]
     Json {
         path: PathBuf,
         source: serde_json::Error,
     },
-    UnsupportedSchema {
-        schema: u32,
-        supported: u32,
-    },
-    WireVersionMismatch {
-        file: u8,
-        supported: u8,
-    },
+    #[error("unsupported connection file schema {schema}; expected {supported}")]
+    UnsupportedSchema { schema: u32, supported: u32 },
+    #[error(
+        "connection file wire version {file} does not match supported wire version {supported}"
+    )]
+    WireVersionMismatch { file: u8, supported: u8 },
+    #[error("invalid connection file: {0}")]
     Invalid(&'static str),
-    InvalidKeyLength {
-        len: usize,
-        expected: usize,
-    },
-}
-
-impl fmt::Display for ConnectionFileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPath { path } => {
-                write!(f, "invalid connection file path {}", path.display())
-            }
-            Self::Io { op, path, source } => {
-                write!(f, "connection file {op} failed for {}: {source}", path.display())
-            }
-            Self::Insecure { path } => write!(
-                f,
-                "refusing insecure connection file at {}: wrong type, owner, mode, or link count",
-                path.display()
-            ),
-            Self::TooLarge { path, max } => write!(
-                f,
-                "connection file {} exceeds {max} byte limit",
-                path.display()
-            ),
-            Self::Replaced { path } => {
-                write!(f, "connection file {} changed while reading", path.display())
-            }
-            Self::Json { path, source } => write!(
-                f,
-                "connection file JSON read failed for {}: {source}",
-                path.display()
-            ),
-            Self::UnsupportedSchema { schema, supported } => write!(
-                f,
-                "unsupported connection file schema {schema}; expected {supported}"
-            ),
-            Self::WireVersionMismatch { file, supported } => write!(
-                f,
-                "connection file wire version {file} does not match supported wire version {supported}"
-            ),
-            Self::Invalid(reason) => write!(f, "invalid connection file: {reason}"),
-            Self::InvalidKeyLength { len, expected } => write!(
-                f,
-                "connection file key is {len} bytes; expected exactly {expected}"
-            ),
-        }
-    }
-}
-
-impl Error for ConnectionFileError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Json { source, .. } => Some(source),
-            _ => None,
-        }
-    }
+    #[error("connection file key is {len} bytes; expected exactly {expected}")]
+    InvalidKeyLength { len: usize, expected: usize },
 }
 
 /// Reads a connection file without following links and rejects replacement during the read.

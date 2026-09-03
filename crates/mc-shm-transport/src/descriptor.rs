@@ -426,37 +426,52 @@ impl DescriptorCounts {
 }
 
 /// Reports rejected descriptor fields or descriptor construction failures.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorError {
     /// Operating-system entropy was unavailable.
+    #[error("operating-system random source unavailable")]
     RandomSourceUnavailable,
     /// Hardware-profile identifier is empty, too long, or contains unsupported bytes.
+    #[error("hardware profile identifier is invalid")]
     InvalidHardwareProfile,
     /// Serialized fixed fields are incomplete.
+    #[error("fixed structure is truncated")]
     Truncated,
     /// Descriptor schema does not match [`DESCRIPTOR_SCHEMA_VERSION`].
+    #[error("descriptor schema is unsupported")]
     UnsupportedSchema,
     /// Release identity belongs to another transport incarnation.
+    #[error("release identity does not match incarnation")]
     WrongIncarnation,
     /// Release identity names another lane.
+    #[error("release identity does not match lane")]
     WrongLane,
     /// Sequence is zero or does not match the expected sequence.
+    #[error("release sequence is invalid")]
     InvalidSequence,
     /// Body length exceeds [`MAX_FRAME_BYTES`].
+    #[error("frame exceeds protocol maximum")]
     FrameTooLarge,
     /// Allocation length or capacity is inconsistent with the arena or body.
+    #[error("arena allocation is invalid")]
     InvalidAllocation,
     /// Span count is outside `1..=MAX_SPANS`.
+    #[error("descriptor span count is invalid")]
     InvalidSpanCount,
     /// A span extends outside the arena.
+    #[error("descriptor span is outside arena")]
     OutOfBounds,
     /// Checked descriptor arithmetic overflowed.
+    #[error("descriptor arithmetic overflow")]
     Overflow,
     /// Declared lengths disagree.
+    #[error("descriptor lengths disagree")]
     LengthMismatch,
     /// Physical spans do not describe the declared logical wrap.
+    #[error("descriptor wrap metadata is invalid")]
     InvalidWrapMetadata,
     /// Wire header version or length disagrees with the descriptor.
+    #[error("wire header disagrees with descriptor")]
     WireHeaderMismatch,
 }
 
@@ -465,27 +480,3 @@ impl fmt::Debug for DescriptorError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for DescriptorError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::RandomSourceUnavailable => "operating-system random source unavailable",
-            Self::InvalidHardwareProfile => "hardware profile identifier is invalid",
-            Self::Truncated => "fixed structure is truncated",
-            Self::UnsupportedSchema => "descriptor schema is unsupported",
-            Self::WrongIncarnation => "release identity does not match incarnation",
-            Self::WrongLane => "release identity does not match lane",
-            Self::InvalidSequence => "release sequence is invalid",
-            Self::FrameTooLarge => "frame exceeds protocol maximum",
-            Self::InvalidAllocation => "arena allocation is invalid",
-            Self::InvalidSpanCount => "descriptor span count is invalid",
-            Self::OutOfBounds => "descriptor span is outside arena",
-            Self::Overflow => "descriptor arithmetic overflow",
-            Self::LengthMismatch => "descriptor lengths disagree",
-            Self::InvalidWrapMetadata => "descriptor wrap metadata is invalid",
-            Self::WireHeaderMismatch => "wire header disagrees with descriptor",
-        })
-    }
-}
-
-impl std::error::Error for DescriptorError {}

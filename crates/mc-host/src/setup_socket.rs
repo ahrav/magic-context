@@ -92,48 +92,26 @@ pub enum PeerClose {
     ProtocolError,
 }
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum SetupError {
-    Io(io::Error),
+    #[error("setup socket I/O failed")]
+    Io(#[from] io::Error),
+    #[error("setup socket deadline expired")]
     Timeout,
+    #[error("setup socket message exceeds its bound")]
     MessageTooLarge,
+    #[error("setup socket message is invalid")]
     InvalidMessage,
+    #[error("setup socket identity does not match")]
     InvalidIdentity,
+    #[error("setup socket activation token does not match")]
     InvalidActivation,
+    #[error("setup socket descriptor transfer is incomplete")]
     MissingDescriptors,
+    #[error("setup socket transferred unexpected descriptors")]
     DuplicateDescriptors,
+    #[error("setup socket ancillary data was truncated")]
     TruncatedAncillary,
-}
-
-impl From<io::Error> for SetupError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl std::fmt::Display for SetupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Io(_) => "setup socket I/O failed",
-            Self::Timeout => "setup socket deadline expired",
-            Self::MessageTooLarge => "setup socket message exceeds its bound",
-            Self::InvalidMessage => "setup socket message is invalid",
-            Self::InvalidIdentity => "setup socket identity does not match",
-            Self::InvalidActivation => "setup socket activation token does not match",
-            Self::MissingDescriptors => "setup socket descriptor transfer is incomplete",
-            Self::DuplicateDescriptors => "setup socket transferred unexpected descriptors",
-            Self::TruncatedAncillary => "setup socket ancillary data was truncated",
-        })
-    }
-}
-
-impl std::error::Error for SetupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 /// Sends one length-prefixed grant with the fixed descriptor set in one `SCM_RIGHTS` message.
