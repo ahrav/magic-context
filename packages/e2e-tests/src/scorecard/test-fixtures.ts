@@ -22,6 +22,7 @@ import type { SystemVersionTuple } from "../historian-eval/runner";
 import { buildLaneReport, type LaneReport as HistorianReport, type ScenarioScore } from "../historian-eval/scorer";
 import { buildIncidentReport, computeSelectedSetDigest, type IncidentCaseResult, type IncidentPoolReport } from "../incident-pool/report";
 import { buildMetamorphicReport, type MetamorphicReport } from "../metamorphic-eval/report";
+import { derivativeScenarioId } from "../metamorphic-eval/transforms";
 import { PAIRED_DELTA_POLICY_GATES, PAIRED_DELTA_POLICY_SCHEMA, parsePairedDeltaPolicy, type PairedDeltaPolicy } from "../paired-delta/contract";
 import { estimateFamilyDeltas, type FamilyNoiseFloor } from "../paired-delta/estimator";
 import { buildPairedDeltaReport, type PairedDeltaReport, type SecondaryMetrics } from "../paired-delta/report";
@@ -176,8 +177,8 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
         runSummary: {
             status: "completed",
             spentUsd: 12.5,
-            observedCostRollouts: 6,
-            estimatedCostRollouts: 1,
+            observedCostRollouts: 14,
+            estimatedCostRollouts: 2,
             refusedRegretLadders: {},
             plannedCoordinates: 4,
             healthyCoordinates: 4,
@@ -185,7 +186,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
             calibrationFingerprint: null,
             ...options.runSummary,
         },
-        exclusions: [{ armId: "mc-off", reasonCode: "provider-unavailable", count: 2 }],
+        exclusions: [{ armId: "r2", reasonCode: "provider-unavailable", count: 2 }],
         secondaryMetrics: options.secondaryMetrics ?? {
             invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0, compaction: 0.2 },
             finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800, compaction: 900 },
@@ -206,21 +207,24 @@ export const HISTORIAN_SYSTEM: SystemVersionTuple = {
 };
 
 export function scenarioScoreFixture(scenarioId: string, overrides: Partial<ScenarioScore> = {}): ScenarioScore {
+    const errored = overrides.verdict === "ERROR";
     return {
         scenarioId,
         verdict: "PASS",
         failReasons: [],
         errorReason: null,
         errorDetail: null,
-        precision: 1,
-        recall: 1,
-        expectedClaimsMatched: 2,
-        expectedClaimsTotal: 2,
-        visibleClaimsMatched: 2,
-        visibleClaimsTotal: 2,
+        precision: errored ? null : 1,
+        recall: errored ? null : 1,
+        expectedClaimsMatched: errored ? 0 : 2,
+        expectedClaimsTotal: errored ? 0 : 2,
+        visibleClaimsMatched: errored ? 0 : 2,
+        visibleClaimsTotal: errored ? 0 : 2,
         falseAuthoritativeMatches: [],
         structuralFindings: [],
-        probeVerdicts: [],
+        probeVerdicts: errored
+            ? []
+            : [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }],
         system: HISTORIAN_SYSTEM,
         source: "run-record",
         ...overrides,
@@ -237,17 +241,35 @@ export function metamorphicReportFixture(options: {
     tierInvalidReason?: MetamorphicReport["tierInvalidReason"];
 } = {}): MetamorphicReport {
     const covered = options.coveredScenarioIds ?? CANARY_SCENARIO_IDS;
+    const invariants = () => [
+        { invariant: "injection-set-equality" as const, holds: true, changes: [] },
+        { invariant: "expectation-predicate-equality" as const, holds: true, changedExpectationIds: [] },
+        { invariant: "false-authoritative-set-equality" as const, holds: true, baselineMatches: [], derivativeMatches: [] },
+        { invariant: "scenario-verdict-equality" as const, holds: true, baselineVerdict: "PASS" as const, derivativeVerdict: "PASS" as const },
+    ];
     return buildMetamorphicReport({
-        entries: covered.map((scenarioId) => ({
-            scenarioId,
-            transformId: "reorder-independent-turns",
-            transformVersion: 1,
-            seed: 0,
-            kind: "scored",
-            baselineScore: scenarioScoreFixture(scenarioId),
-            derivativeScore: scenarioScoreFixture(scenarioId),
-            invariants: [{ invariant: "expected-absent-empty", holds: true, baselineMatches: [], derivativeMatches: [] }],
-        })),
+        entries: covered.flatMap((scenarioId, index) => {
+            const pair = { scenarioId, transformId: "reorder-independent-turns", transformVersion: 1, seed: 0 };
+            const product = {
+                ...pair,
+                kind: "scored" as const,
+                baselineScore: scenarioScoreFixture(scenarioId),
+                derivativeScore: scenarioScoreFixture(derivativeScenarioId(pair)),
+                invariants: invariants(),
+            };
+            return index === 0
+                ? [{
+                    scenarioId,
+                    transformId: "baseline-control" as const,
+                    transformVersion: 1,
+                    seed: 0,
+                    kind: "scored" as const,
+                    baselineScore: scenarioScoreFixture(scenarioId),
+                    derivativeScore: scenarioScoreFixture(scenarioId),
+                    invariants: invariants(),
+                }, product]
+                : [product];
+        }),
         coverage: covered.map((scenarioId) => ({ scenarioId, applied: 1, inapplicable: [], violations: [] })),
         injectionCanaryHits: options.injectionCanaryHits ?? [],
         tierInvalidReason: options.tierInvalidReason ?? null,

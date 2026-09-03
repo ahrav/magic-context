@@ -1,6 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
+import { GATE_ID_RE, REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { SCENARIO_ID_RE } from "../historian-eval/contract";
 import type { SystemVersionTuple } from "../historian-eval/runner";
@@ -8,7 +8,7 @@ import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval
 import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
-import type { PairedDeltaPolicyModel } from "../paired-delta/contract";
+import { PRIMARY_ARM_IDS, type PairedDeltaPolicyModel } from "../paired-delta/contract";
 import { PRIMARY_ENDPOINTS, type PrimaryEndpoint } from "../paired-delta/estimator";
 import { PAIRED_DELTA_REPORT_SCHEMA, type SecondaryMetrics } from "../paired-delta/report";
 
@@ -361,4 +361,4 @@ export function scorecardPolicyFingerprint(policy: ScorecardPolicy): string {
     return canonicalFingerprint(policy);
 }
 
-export { REASON_CODE_RE };
+export { GATE_ID_RE, PRIMARY_ARM_IDS, REASON_CODE_RE };
