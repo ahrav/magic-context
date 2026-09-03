@@ -418,4 +418,3 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
 export function familySections(body: ScorecardReportBody): ScoreFamilySection[] {
     return SCORE_FAMILY_IDS.map((family) => body[family]);
 }
-
