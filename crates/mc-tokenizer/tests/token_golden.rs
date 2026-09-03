@@ -1,7 +1,8 @@
-//! `encode_ordinary` must match `ai-tokenizer`'s `claude` token IDs for every fixture case.
-//! The plugin's TypeScript tokenizer generates the fixture.
+//! Golden compatibility checks against `ai-tokenizer`'s `claude` encoding.
 //!
-//! Comparing token IDs detects wrong encodings with equal token counts.
+//! The plugin's TypeScript tokenizer generates the fixture. Exact token-ID
+//! comparison detects encoding changes that token-count comparison would miss.
+//! Fixture loading fails on malformed JSON, and an empty corpus is rejected.
 
 use mc_tokenizer::{encode_ordinary, estimate_tokens};
 use serde::Deserialize;

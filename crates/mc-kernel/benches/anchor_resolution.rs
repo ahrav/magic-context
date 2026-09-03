@@ -1,11 +1,15 @@
-//! Criterion benches for the mc-kernel anchor-resolution path. commentlint: allow(JUDGE)
+//! Criterion benches for the mc-kernel anchor-resolution path.
 //!
 //! See `docs/perf/mc-store-anchor-resolution.md` for the estimand, corpus,
-//! cell table, and comparison protocol. commentlint: allow(JUDGE)
+//! cell table, and comparison protocol.
 //! Each cell asserts its intended resolution rung before timing. Fixture
 //! drift fails the benchmark instead of timing a cheaper resolution rung.
 //!
 //! Run with `cargo bench -p mc-kernel --bench anchor_resolution`.
+//!
+//! Setup and shape assertions run outside timed iterations. Fixture construction failures and
+//! resolution mismatches panic before Criterion records a misleading sample. Each cell fixes
+//! corpus size and candidate depth; durations measure wall time per operation.
 
 #[path = "../tests/support/git_fixtures.rs"]
 mod git_fixtures;
@@ -29,8 +33,8 @@ use mc_kernel::{AnchorCapture, GitCondition};
 /// state varies across cells.
 const TRACKED_FILES: usize = 100;
 
-/// ~230 bytes of deterministic content, distinct per (file, generation). commentlint: allow(JUDGE)
-/// A generation bump rewrites every line, changing the stored bytes. commentlint: allow(JUDGE)
+/// ~230 bytes of deterministic content, distinct per (file, generation).
+/// A generation bump rewrites every line, changing the stored bytes.
 fn tracked_file_body(index: usize, generation: usize) -> String {
     let mut body = String::with_capacity(256);
     for line in 0..4 {
@@ -41,9 +45,9 @@ fn tracked_file_body(index: usize, generation: usize) -> String {
     body
 }
 
-/// `materialize` rebuilds the index from the tree with default stat data; commentlint: allow(JUDGE)
-/// every snapshot therefore rehashes all tracked files to prove them commentlint: allow(JUDGE)
-/// unchanged, the worst-case stat-invalidated scan. commentlint: allow(JUDGE)
+/// `materialize` rebuilds the index from the tree with default stat data;
+/// every snapshot therefore rehashes all tracked files to prove them
+/// unchanged, the worst-case stat-invalidated scan.
 fn snapshot_fixture(modified: usize) -> (tempfile::TempDir, FixtureRepo) {
     assert!(modified <= TRACKED_FILES);
     let dir = tempfile::tempdir().expect("bench fixture dir");
@@ -73,6 +77,7 @@ fn snapshot_fixture(modified: usize) -> (tempfile::TempDir, FixtureRepo) {
     (dir, fixture)
 }
 
+/// `assert_snapshot_shape` rejects fixture drift before the snapshot cell enters its timed loop.
 fn assert_snapshot_shape(root: &std::path::Path, budget: &EvalBudget, cell: &str, dirty: usize) {
     let snapshot = snapshot_checkout(root, budget).expect("snapshot succeeds");
     assert_eq!(
@@ -96,16 +101,16 @@ fn bench_snapshot(c: &mut Criterion) {
         group.bench_function(BenchmarkId::from_parameter(&cell), |b| {
             b.iter_batched(
                 || (),
-                // Returning the snapshot as batch output keeps the drop of commentlint: allow(JUDGE)
-                // its open repository handle outside the timed section. commentlint: allow(JUDGE)
+                // Returning the snapshot as batch output keeps the drop of
+                // its open repository handle outside the timed section.
                 |()| snapshot_checkout(black_box(dir.path()), &budget).expect("snapshot succeeds"),
                 criterion::BatchSize::PerIteration,
             )
         });
     }
 
-    // One untracked 4 MiB file on top of the clean fixture: the scan hashes commentlint: allow(JUDGE)
-    // the full content to build the dirty fingerprint. commentlint: allow(JUDGE)
+    // One untracked 4 MiB file on top of the clean fixture: the scan hashes
+    // the full content to build the dirty fingerprint.
     let (dir, fixture) = snapshot_fixture(0);
     let large = "0123456789abcdef".repeat(4 * 1024 * 1024 / 16);
     write_worktree_file(&fixture.repo, "blob.bin", &large);
@@ -128,8 +133,8 @@ fn bench_snapshot(c: &mut Criterion) {
     group.finish();
 }
 
-/// One `evaluate` cell: a frozen snapshot plus the condition it times. commentlint: allow(JUDGE)
-/// The tempdir and fixture keep the repository alive for the cell's life. commentlint: allow(JUDGE)
+/// One `evaluate` cell: a frozen snapshot plus the condition it times.
+/// The tempdir and fixture keep the repository alive for the cell's life.
 struct EvaluateCell {
     _dir: tempfile::TempDir,
     _fixture: FixtureRepo,
@@ -137,6 +142,7 @@ struct EvaluateCell {
     condition: GitCondition,
 }
 
+/// `checkout` materializes `commit` before freezing the checkout used by an evaluate cell.
 fn checkout(fixture: &FixtureRepo, commit: ObjectId, budget: &EvalBudget) -> CheckoutSnapshot {
     set_head_detached(&fixture.repo, commit);
     materialize(&fixture.repo, commit);
@@ -150,9 +156,9 @@ fn reachable_from(oid: ObjectId, captures: BTreeMap<String, AnchorCapture>) -> G
     }
 }
 
-/// Appends `count` commits to `branch`, each changing only `filler.txt` commentlint: allow(JUDGE)
-/// while `constant_files` stay byte-identical; consecutive trees differ in commentlint: allow(JUDGE)
-/// exactly one path. Timestamps start at `seconds` and increment. commentlint: allow(JUDGE)
+/// Appends `count` commits to `branch`, each changing only `filler.txt`
+/// while `constant_files` stay byte-identical; consecutive trees differ in
+/// exactly one path. Timestamps start at `seconds` and increment.
 fn append_filler_commits(
     repo: &gix::Repository,
     branch: &str,
@@ -179,10 +185,10 @@ fn append_filler_commits(
     commits
 }
 
-/// Linear 64-commit history with the root commit as anchor: each cold commentlint: allow(JUDGE)
-/// evaluation walks the full ancestry from HEAD before answering Holds. commentlint: allow(JUDGE)
-/// With no captures the window rungs cannot fire; Holds proves the ancestry commentlint: allow(JUDGE)
-/// rung decided. commentlint: allow(JUDGE)
+/// Linear 64-commit history with the root commit as anchor: each cold
+/// evaluation walks the full ancestry from HEAD before answering Holds.
+/// With no captures the window rungs cannot fire; Holds proves the ancestry
+/// rung decided.
 fn exact_reachable_cell(budget: &EvalBudget) -> EvaluateCell {
     let dir = tempfile::tempdir().expect("bench fixture dir");
     let fixture = init_repo(dir.path());
@@ -213,9 +219,9 @@ fn exact_reachable_cell(budget: &EvalBudget) -> EvaluateCell {
     }
 }
 
-/// The anchor commit sits on an abandoned side branch, never merged: commentlint: allow(JUDGE)
-/// present in the odb but unreachable from HEAD. With no captures the commentlint: allow(JUDGE)
-/// window rungs are skipped; the cell times a pure negative ancestry walk. commentlint: allow(JUDGE)
+/// The anchor commit sits on an abandoned side branch, never merged:
+/// present in the odb but unreachable from HEAD. With no captures the
+/// window rungs are skipped; the cell times a pure negative ancestry walk.
 fn ancestry_negative_cell(budget: &EvalBudget) -> EvaluateCell {
     let dir = tempfile::tempdir().expect("bench fixture dir");
     let fixture = init_repo(dir.path());
@@ -262,12 +268,12 @@ fn ancestry_negative_cell(budget: &EvalBudget) -> EvaluateCell {
     }
 }
 
-/// Rebase-shaped history: the anchored commit survives on a topic ref commentlint: allow(JUDGE)
-/// (present but unreachable from HEAD, the normal post-rebase state) while commentlint: allow(JUDGE)
-/// an equivalent commit with the same diff and a new parent sits `post` commentlint: allow(JUDGE)
-/// commits deep in the first-parent window. Only the rebased commit touches commentlint: allow(JUDGE)
-/// the captured changed path; the patch-ID rung computes exactly one commentlint: allow(JUDGE)
-/// candidate identity. commentlint: allow(JUDGE)
+/// Rebase-shaped history: the anchored commit survives on a topic ref
+/// (present but unreachable from HEAD, the normal post-rebase state) while
+/// an equivalent commit with the same diff and a new parent sits `post`
+/// commits deep in the first-parent window. Only the rebased commit touches
+/// the captured changed path; the patch-ID rung computes exactly one
+/// candidate identity.
 fn patch_id_cell(pre: usize, post: usize, cell: &str, budget: &EvalBudget) -> EvaluateCell {
     assert!(
         post + 1 < CANDIDATE_WINDOW,
@@ -286,7 +292,7 @@ fn patch_id_cell(pre: usize, post: usize, cell: &str, budget: &EvalBudget) -> Ev
         2,
     );
     let capture = capture_anchor_representation(repo, anchored, budget).expect("capture builds");
-    // Advance main without touching g.txt, then re-parent the same diff. commentlint: allow(JUDGE)
+    // Advance main without touching g.txt, then re-parent the same diff.
     let mut tip = base;
     let mut advanced_f = String::from("one\n");
     for index in 0..pre {
@@ -322,8 +328,8 @@ fn patch_id_cell(pre: usize, post: usize, cell: &str, budget: &EvalBudget) -> Ev
         .tree_id()
         .expect("rebased commit has a tree")
         .detach();
-    // The capture's tree differs from the rebased tree (f.txt advanced): a commentlint: allow(JUDGE)
-    // Holds verdict cannot come from the tree-hash rung. commentlint: allow(JUDGE)
+    // The capture's tree differs from the rebased tree (f.txt advanced): a
+    // Holds verdict cannot come from the tree-hash rung.
     assert_ne!(
         capture.tree_oid.as_deref(),
         Some(rebased_tree.to_string().as_str()),
@@ -338,8 +344,8 @@ fn patch_id_cell(pre: usize, post: usize, cell: &str, budget: &EvalBudget) -> Ev
         "{cell}: anchor must stay present in the odb via the topic ref"
     );
     let ladder = ResolutionLadder::new(&snapshot, budget);
-    // Without captures the ancestry verdict stands (DoesNotHold below); commentlint: allow(JUDGE)
-    // Holds with captures therefore proves the patch-ID rung decided. commentlint: allow(JUDGE)
+    // Without captures the ancestry verdict stands (DoesNotHold below);
+    // Holds with captures therefore proves the patch-ID rung decided.
     assert_eq!(
         ladder.evaluate(&reachable_from(anchored, BTreeMap::new())),
         GitConditionOutcome::DoesNotHold { historical: false },
@@ -360,10 +366,10 @@ fn patch_id_cell(pre: usize, post: usize, cell: &str, budget: &EvalBudget) -> Ev
     }
 }
 
-/// The anchor OID is absent from the odb and the capture carries a tree commentlint: allow(JUDGE)
-/// hash but no patch identity: only the tree-hash rung can decide. The commentlint: allow(JUDGE)
-/// matching tree sits 32 commits deep in a 64-deep window; the rung still commentlint: allow(JUDGE)
-/// scans the whole window to prove the match unambiguous. commentlint: allow(JUDGE)
+/// The anchor OID is absent from the odb and the capture carries a tree
+/// hash but no patch identity: only the tree-hash rung can decide. The
+/// matching tree sits 32 commits deep in a 64-deep window; the rung still
+/// scans the whole window to prove the match unambiguous.
 fn tree_hash_cell(budget: &EvalBudget) -> EvaluateCell {
     let dir = tempfile::tempdir().expect("bench fixture dir");
     let fixture = init_repo(dir.path());
@@ -377,7 +383,7 @@ fn tree_hash_cell(budget: &EvalBudget) -> EvaluateCell {
     );
     let chain = append_filler_commits(&fixture.repo, "main", root, &[("f.txt", "one\n")], 63, 2);
     let head = *chain.last().expect("chain is non-empty");
-    // chain[62] is HEAD; chain[30] sits 32 first-parent steps deep. commentlint: allow(JUDGE)
+    // chain[62] is HEAD; chain[30] sits 32 first-parent steps deep.
     let target = chain[30];
     let target_tree = fixture
         .repo
@@ -401,8 +407,8 @@ fn tree_hash_cell(budget: &EvalBudget) -> EvaluateCell {
     captures.insert(missing.to_string(), capture);
     let snapshot = checkout(&fixture, head, budget);
     let ladder = ResolutionLadder::new(&snapshot, budget);
-    // An absent anchor with no capture answers Uncertain (no cheaper rung commentlint: allow(JUDGE)
-    // can decide); Holds with the capture proves the tree-hash rung fired. commentlint: allow(JUDGE)
+    // An absent anchor with no capture answers Uncertain (no cheaper rung
+    // can decide); Holds with the capture proves the tree-hash rung fired.
     assert_eq!(
         ladder.evaluate(&reachable_from(missing, BTreeMap::new())),
         GitConditionOutcome::Uncertain,
@@ -429,9 +435,9 @@ fn bench_evaluate(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     let budget = EvalBudget::unbounded();
 
-    // Cold cells construct the ladder inside the timed loop: one request commentlint: allow(JUDGE)
-    // builds one ladder, and construction, evaluation, and drop of the commentlint: allow(JUDGE)
-    // ladder's interior caches all belong to the per-call cost. commentlint: allow(JUDGE)
+    // Cold cells construct the ladder inside the timed loop: one request
+    // builds one ladder, and construction, evaluation, and drop of the
+    // ladder's interior caches all belong to the per-call cost.
     let exact = exact_reachable_cell(&budget);
     group.bench_function(BenchmarkId::from_parameter("exact_reachable"), |b| {
         b.iter(|| {
@@ -448,8 +454,8 @@ fn bench_evaluate(c: &mut Criterion) {
         })
     });
 
-    // Match 32 deep in a 65-deep window: 31 advance commits, the rebased commentlint: allow(JUDGE)
-    // equivalent, then 32 filler commits on top. commentlint: allow(JUDGE)
+    // Match 32 deep in a 65-deep window: 31 advance commits, the rebased
+    // equivalent, then 32 filler commits on top.
     let patch_064 = patch_id_cell(31, 32, "patch_id_rung_064", &budget);
     group.bench_function(BenchmarkId::from_parameter("patch_id_rung_064"), |b| {
         b.iter(|| {
@@ -458,8 +464,8 @@ fn bench_evaluate(c: &mut Criterion) {
         })
     });
 
-    // Match near the bottom of the CANDIDATE_WINDOW-deep window: the whole commentlint: allow(JUDGE)
-    // ~510-commit history stays inside the window, rebased at index 504. commentlint: allow(JUDGE)
+    // Match near the bottom of the CANDIDATE_WINDOW-deep window: the whole
+    // ~510-commit history stays inside the window, rebased at index 504.
     let patch_512 = patch_id_cell(4, CANDIDATE_WINDOW - 8, "patch_id_rung_512", &budget);
     group.bench_function(BenchmarkId::from_parameter("patch_id_rung_512"), |b| {
         b.iter(|| {
@@ -476,9 +482,9 @@ fn bench_evaluate(c: &mut Criterion) {
         })
     });
 
-    // Warm variant: one ladder constructed outside the loop, and repeated commentlint: allow(JUDGE)
-    // evaluations hit the interior ancestry cache instead of re-walking. commentlint: allow(JUDGE)
-    // The delta against exact_reachable quantifies the ladder's caches. commentlint: allow(JUDGE)
+    // Warm variant: one ladder constructed outside the loop, and repeated
+    // evaluations hit the interior ancestry cache instead of re-walking.
+    // The delta against exact_reachable quantifies the ladder's caches.
     let warm_ladder = ResolutionLadder::new(&exact.snapshot, &budget);
     assert_eq!(
         warm_ladder.evaluate(&exact.condition),

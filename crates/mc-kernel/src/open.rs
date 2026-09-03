@@ -35,29 +35,54 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// allocation size.
 const RESET_MARKER_MAX_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Redacted failure classes returned by kernel-store operations.
+///
+/// Variants intentionally omit paths, SQL text, and underlying error details.
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KernelError {
+    #[error("kernel store is held by another writer")]
     Held,
+    #[error("SQLite engine is unsupported for the kernel store")]
     EngineUnsupported,
+    #[error("kernel store path contains a foreign database family")]
     Foreign,
+    #[error("kernel store identity could not be established safely")]
     Inconclusive,
+    #[error("kernel store I/O failed")]
     Io,
+    #[error("kernel store lock was not acquired before the busy timeout")]
     Busy,
+    #[error("kernel store identity does not match this build")]
     IdentityMismatch,
+    #[error("kernel store writer fence was lost")]
     FenceLost,
+    #[error("kernel operation conflicts with an existing receipt")]
     Conflict,
+    #[error("kernel canonical row payload could not be decoded")]
     CorruptCanonicalRow,
+    #[error("kernel operation input is invalid")]
     InvalidInput,
+    #[error("kernel admission classification or transition is invalid")]
     AdmissionPolicy,
+    #[error("kernel snapshot is newer than the committed tip")]
     FutureSnapshot,
+    #[error("kernel object was not found")]
     NotFound,
+    #[error("outbox checkpoint is invalid")]
     InvalidCheckpoint,
+    #[error("outbox pruning requires at least one consumer")]
     NoRequiredConsumers,
+    #[error("outbox consumer has not reached the commit-log tip")]
     ConsumerPending,
+    #[error("kernel operation was interrupted")]
     Fault,
+    #[error("kernel operation exceeded its deadline")]
     Deadline,
+    #[error("backup destination is not a private local directory")]
     UnsafeDestination,
+    #[error("backup artifact failed verification")]
     InvalidBackup,
+    #[error("restore source failed verification")]
     InvalidRestore,
 }
 
@@ -68,43 +93,18 @@ impl KernelError {
     }
 }
 
-impl fmt::Display for KernelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Held => "kernel store is held by another writer",
-            Self::EngineUnsupported => "SQLite engine is unsupported for the kernel store",
-            Self::Foreign => "kernel store path contains a foreign database family",
-            Self::Inconclusive => "kernel store identity could not be established safely",
-            Self::Io => "kernel store I/O failed",
-            Self::Busy => "kernel store lock was not acquired before the busy timeout",
-            Self::IdentityMismatch => "kernel store identity does not match this build",
-            Self::FenceLost => "kernel store writer fence was lost",
-            Self::Conflict => "kernel operation conflicts with an existing receipt",
-            Self::CorruptCanonicalRow => "kernel canonical row payload could not be decoded",
-            Self::InvalidInput => "kernel operation input is invalid",
-            Self::AdmissionPolicy => "kernel admission classification or transition is invalid",
-            Self::FutureSnapshot => "kernel snapshot is newer than the committed tip",
-            Self::NotFound => "kernel object was not found",
-            Self::InvalidCheckpoint => "outbox checkpoint is invalid",
-            Self::NoRequiredConsumers => "outbox pruning requires at least one consumer",
-            Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
-            Self::Fault => "kernel operation was interrupted",
-            Self::Deadline => "kernel operation exceeded its deadline",
-            Self::UnsafeDestination => "backup destination is not a private local directory",
-            Self::InvalidBackup => "backup artifact failed verification",
-            Self::InvalidRestore => "restore source failed verification",
-        })
-    }
-}
-
 impl fmt::Debug for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }
 
-impl std::error::Error for KernelError {}
-
+/// Exclusive writer lease plus pooled SQLite connections for one kernel family.
+///
+/// One process owns the writer lease.
+/// Mutations serialize through `writer`, while reads rotate across a fixed query-only pool.
+/// A restore that cannot recover the original family poisons both paths until the store is reopened.
+/// A restore rejected before displacement, or one whose original family is recovered, leaves both paths usable.
 pub struct KernelStore {
     writer: Mutex<Connection>,
     pub(super) purge_intent_log: Mutex<File>,
@@ -131,6 +131,13 @@ impl fmt::Debug for KernelStore {
 }
 
 impl KernelStore {
+    /// Opens, validates, or bootstraps the kernel store below `root`.
+    ///
+    /// Opening acquires the exclusive writer lease, resumes interrupted restore
+    /// or quarantine work, validates SQLite identity, activates WAL, stamps the
+    /// writer fence, and runs artifact recovery. Failures use redacted
+    /// [`KernelError`] classes. A mismatched valid kernel family is quarantined;
+    /// foreign or inconclusive content is left untouched.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, KernelError> {
         let identity =
             probe_sqlite_engine_identity_off_path().map_err(|_| KernelError::EngineUnsupported)?;
@@ -240,6 +247,7 @@ impl KernelStore {
         Ok(store)
     }
 
+    /// Returns the lease epoch stamped into writer-fence transactions.
     pub fn lease_epoch(&self) -> u64 {
         self.lease_epoch
     }
@@ -268,6 +276,7 @@ impl KernelStore {
         self.acquire_within(std::slice::from_ref(&self.writer), 0, limit)
     }
 
+    /// Marks all later connection acquisition as an invalid restore.
     pub(super) fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
     }
@@ -512,6 +521,10 @@ struct FormatMarker {
     marker_digest: String,
 }
 
+/// Verifies page integrity, foreign keys, format marker, and schema identity.
+///
+/// Returns `IdentityMismatch` only for a structurally valid kernel family with
+/// different identity. Failed integrity or marker checks are inconclusive.
 pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelError> {
     let integrity_check: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -681,6 +694,10 @@ pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
         .map_err(|_| KernelError::Io)
 }
 
+/// Atomically stamps `epoch` into the singleton writer-fence row.
+///
+/// Values outside SQLite's signed integer range or a missing singleton row
+/// return `IdentityMismatch`.
 pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
     let epoch = i64::try_from(epoch).map_err(|_| KernelError::IdentityMismatch)?;
     let tx = conn
@@ -741,6 +758,7 @@ pub(super) fn family_sidecars(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
+/// Restricts the main database and existing SQLite sidecars to private access.
 pub(super) fn harden_family(path: &Path) -> Result<(), KernelError> {
     protect_file(path).map_err(|_| KernelError::Io)?;
     for sidecar in family_sidecars(path) {
@@ -968,6 +986,7 @@ pub(super) fn sync_parent(path: &Path) -> Result<(), KernelError> {
     sync_directory(parent)
 }
 
+/// Flushes directory metadata so preceding renames survive a crash.
 pub(super) fn sync_directory(path: &Path) -> Result<(), KernelError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())

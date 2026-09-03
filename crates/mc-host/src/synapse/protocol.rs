@@ -1,5 +1,4 @@
 //! Synapse validates four request operations, canonicalizes request keys across languages, and encodes responses.
-//! encoding.
 
 use std::borrow::Cow;
 
@@ -195,8 +194,7 @@ struct ResultParams<'a> {
     cursor: Option<Cow<'a, str>>,
 }
 
-/// The request decoder classifies malformed JSON and typed-deserialization failures as `schema_violation`.
-/// those carry.
+/// Decodes JSON and classifies syntax and typed-deserialization failures as `schema_violation`.
 fn decode<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, RequestError> {
     serde_json::from_slice(body).map_err(|err| schema(err.to_string()))
 }
@@ -590,6 +588,11 @@ pub(crate) fn decode_request(
     }
 }
 
+/// Validates and decodes a request without reserving its resident-memory budget.
+///
+/// Returns `schema_violation` for binary input, size or depth violations, malformed JSON, and
+/// operation-specific schema failures. Callers must reserve memory separately before retaining
+/// returned owned values.
 #[doc(hidden)]
 pub fn parse_request_unreserved(
     body: &[u8],
@@ -601,7 +604,7 @@ pub fn parse_request_unreserved(
     decode_request(body, lane, limits)
 }
 
-/// clients retry.
+/// Reports that request parsing cannot fit within host resident-memory capacity.
 pub(crate) fn unservable_body_error(
     body_len: usize,
     required: usize,
@@ -615,12 +618,12 @@ pub(crate) fn unservable_body_error(
 
 const RESERVE_PER_ITEM_BYTES: usize = 640;
 
-/// diagnostic.
+/// Covers fixed parser state and one bounded diagnostic.
 const RESERVE_ENVELOPE_BYTES: usize = 4096;
 
 const RESERVE_BODY_FACTOR: usize = 3;
 
-/// bound.
+/// Lower bound on encoded bytes charged per possible batch item.
 const RESERVE_MIN_ITEM_BODY_BYTES: usize = 64;
 
 fn body_item_bound(body_len: usize, max_batch_items: usize) -> usize {
@@ -635,7 +638,7 @@ pub(crate) fn parse_reservation_bytes(body_len: usize, limits: &SynapseLimits) -
         .checked_add(RESERVE_ENVELOPE_BYTES)
 }
 
-/// embedding space.
+/// Rejects requests that target a different model identity or permit substitution.
 fn check_constraints(
     model: &str,
     fingerprint: &str,
@@ -768,6 +771,10 @@ fn parse_result(params: ResultParams<'_>, lane: &LaneInfo) -> Result<Request, Re
     })
 }
 
+/// Hashes the canonical `embed.batch` identity in input item order.
+///
+/// The canonical JSON includes lane identity, item IDs, and content hashes, but not item text.
+/// String serialization cannot fail for Rust strings.
 pub fn canonical_request_key(lane: &LaneInfo, items: &[BatchItem]) -> String {
     let mut canonical = String::with_capacity(256);
     canonical
@@ -799,6 +806,7 @@ fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization cannot fail")
 }
 
+/// Returns the SHA-256 digest as 64 lowercase hexadecimal ASCII characters.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
@@ -819,6 +827,9 @@ fn is_lower_hex_64(value: &str) -> bool {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
+/// Serializes the ready, certified model advertised by a Synapse lane.
+///
+/// Serialization cannot fail for this JSON value.
 pub fn models_list_body(lane: &LaneInfo) -> Vec<u8> {
     let body = serde_json::json!({
         "result": {
@@ -896,7 +907,6 @@ const VECTOR_BODY_ENVELOPE: usize = 256;
 /// A page that satisfies the job table's page cap fits the reservation.
 /// The reservation charges `lane.model` at its escaped length; the manifest permits 128 unconstrained bytes, which can occupy 768 escaped bytes.
 /// TODO: Charge `next_cursor` at its escaped length.
-/// unchanged.
 pub fn vector_body_reservation(
     lane: &LaneInfo,
     items: &[VectorItemView<'_>],
@@ -919,6 +929,9 @@ pub fn vector_body_reservation(
         + VECTOR_BODY_ENVELOPE
 }
 
+/// Writes a vector result as JSON without materializing an intermediate body.
+///
+/// Preserves `items` order. Returns a serialization error when the writer fails.
 pub fn write_vector_body<W: std::io::Write>(
     out: W,
     lane: &LaneInfo,
@@ -942,6 +955,9 @@ pub fn write_vector_body<W: std::io::Write>(
     )
 }
 
+/// Serializes a nonterminal batch-job descriptor.
+///
+/// Serialization cannot fail for this JSON value.
 pub fn job_descriptor_body(
     job_id: &str,
     request_key: &str,
@@ -960,6 +976,9 @@ pub fn job_descriptor_body(
     serde_json::to_vec(&body).expect("job descriptor serializes")
 }
 
+/// Serializes a nonterminal polling response with a retry delay in milliseconds.
+///
+/// Serialization cannot fail for this JSON value.
 pub fn pending_body(job_id: &str, status: &str, retry_after_ms: u64) -> Vec<u8> {
     let body = serde_json::json!({
         "result": {

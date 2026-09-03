@@ -10,26 +10,13 @@ use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
 
 static UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug)]
+/// Filesystem failure classified by whether storage capacity is exhausted.
+#[derive(thiserror::Error, Debug)]
 pub(super) enum StorageError {
-    Exhausted(io::Error),
-    Other(io::Error),
-}
-
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Exhausted(source) | Self::Other(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for StorageError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Exhausted(source) | Self::Other(source) => Some(source),
-        }
-    }
+    #[error("{0}")]
+    Exhausted(#[source] io::Error),
+    #[error("{0}")]
+    Other(#[source] io::Error),
 }
 
 impl StorageError {
@@ -40,6 +27,7 @@ impl StorageError {
     }
 }
 
+/// Result of no-replace publication under the caller's publisher lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublishOutcome {
     Published,
@@ -88,6 +76,10 @@ fn validate_os_name(name: &OsStr) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Creates an owner-only directory relative to `parent` and syncs both descriptors.
+///
+/// The name must be one path component. Symlinks are never followed. On failure,
+/// cleanup is best effort and the original classified I/O error is returned.
 pub(super) fn create_secure_directory(parent: &File, name: &OsStr) -> Result<File, StorageError> {
     validate_os_name(name)?;
     rfs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).map_err(classify_errno)?;
@@ -123,6 +115,10 @@ pub(super) fn create_secure_directory(parent: &File, name: &OsStr) -> Result<Fil
     secured
 }
 
+/// Opens an owner-only directory without following symlinks.
+///
+/// Returns an error unless the object is a directory owned by the effective UID
+/// with mode `0700`.
 pub(super) fn open_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
     validate_name(name)?;
     let descriptor = rfs::openat(
@@ -159,6 +155,7 @@ pub(super) fn open_or_create_secure_directory(
     }
 }
 
+/// Exclusively creates a non-followed file with mode `0600`.
 pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, StorageError> {
     validate_name(name)?;
     let descriptor = rfs::openat(
@@ -209,7 +206,11 @@ pub(super) fn open_or_create_append_file(
     }
 }
 
-/// A partial prior append can leave the file without its trailing newline, so a record is separated from that remnant before new bytes are written.
+/// Appends one record and synchronizes file data and metadata.
+///
+/// A partial prior append can omit its trailing newline. In that case, this
+/// function inserts a newline before `bytes`. The caller must serialize writers
+/// because separate metadata reads and appends do not form one atomic operation.
 pub(super) fn append_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), StorageError> {
     let length = file.metadata().map_err(classify_io)?.len();
     if length > 0 {
@@ -267,9 +268,10 @@ pub(super) fn sync_directory(directory: &File) -> Result<(), StorageError> {
     sync_file(directory)
 }
 
-// Callers publishing across two directories own the barrier for both, so this
-// syncs the destination first and the source only when it is a different
-// directory.
+/// Applies a publication durability barrier to destination, then distinct source.
+///
+/// Directory identity uses device and inode numbers. Callers publishing across
+/// two directories own this barrier after publication.
 pub(super) fn sync_publish_directories_with(
     source_directory: &File,
     destination_directory: &File,
@@ -284,8 +286,10 @@ pub(super) fn sync_publish_directories_with(
     Ok(())
 }
 
-// `_locked` requires callers to serialize publishers within this process.
-// Callers own the directory barrier.
+/// Publishes `temp_name` as `final_name` without replacing an existing entry.
+///
+/// Callers must serialize publishers within this process and sync the directory
+/// after success. This function does not provide the durability barrier.
 pub(super) fn publish_noreplace_locked(
     directory: &File,
     temp_name: &str,
@@ -294,6 +298,11 @@ pub(super) fn publish_noreplace_locked(
     publish_noreplace_between_locked(directory, temp_name, directory, final_name)
 }
 
+/// Publishes across directories without replacing `final_name`.
+///
+/// Callers must hold the process-local publisher lock. The native rename path
+/// is atomic. The link fallback may return [`PublishOutcome::PublishedTempRetained`]
+/// when publication succeeded but both cleanup and rollback failed.
 pub(super) fn publish_noreplace_between_locked(
     source_directory: &File,
     temp_name: &str,
@@ -366,6 +375,11 @@ pub(super) fn temp_name(stem: &str) -> String {
     format!(".{stem}-{}.tmp", next_unique_id())
 }
 
+/// Returns a process-local identifier with a 32-bit wrapping counter.
+///
+/// Relaxed ordering is sufficient because uniqueness depends only on the atomic
+/// modification order. The clock-derived prefix reduces, but does not prove,
+/// uniqueness across process restarts.
 pub(super) fn next_unique_id() -> u64 {
     let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
     (unique_prefix() << 32) | counter

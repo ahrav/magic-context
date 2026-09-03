@@ -19,6 +19,7 @@ use crate::harness::Proof;
 
 const CANDIDATE: &str = "candidate-1";
 
+/// Returns whether `object_id` is visible for auto-injection at commit `as_of`.
 fn served(proof: &Proof, as_of: i64, object_id: &str) -> bool {
     proof
         .store()
@@ -58,6 +59,7 @@ fn admitted() -> (Proof, String, i64) {
     (proof, object_id, receipt.commit_seq)
 }
 
+/// Checks the stale-result invariant before and after reopening the same store.
 fn assert_excluded_at_tip_included_at_admission(
     proof: &mut Proof,
     object_id: &str,

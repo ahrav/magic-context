@@ -165,7 +165,6 @@ fn resolved_descriptor_is_rewound_after_verification() {
         .expect("resolve node");
 
     // A macOS child opening `/dev/fd/N` receives a duplicate descriptor with the original offset, so the handed-out descriptor must start at offset 0.
-    // A macOS child opening `/dev/fd/N` receives a duplicate descriptor with the original offset, so the handed-out descriptor must start at offset 0.
     // SAFETY: `node` owns this descriptor for the duration of the borrow.
     let inherited = unsafe { std::os::fd::BorrowedFd::borrow_raw(node.inherited_fd()) };
     let offset = rustix::fs::seek(inherited, rustix::fs::SeekFrom::Current(0))
@@ -590,7 +589,6 @@ fn native_edges_and_native_addons_must_correspond_exactly() {
     let (_temp, _source, candidate) = setup();
 
     // Validation rejects a non-`Native` dependency edge to a `NativeAddon`.
-    // qualification-side biconditional.
     let mut static_edge = candidate.clone();
     static_edge.manifest.nodes[2].dependencies = vec![
         dependency("node_modules/pi/dist/addon.node", DependencyKind::Static),
@@ -620,12 +618,7 @@ fn native_edges_and_native_addons_must_correspond_exactly() {
     );
 }
 
-/// Lexicographic path order can place `bin/node.dat` between `bin/node` and `bin/node/main.js`.
-/// Lexicographic path order can place `bin/node.dat` between `bin/node` and `bin/node/main.js`.
-/// Validation must reject a regular file that prefixes another manifest path.
-/// Validation must compare every path with its ancestor paths, not only the immediately preceding sorted entry.
-/// Validation rejects a regular file that prefixes another manifest path.
-/// Validation rejects a regular file that prefixes another manifest path.
+/// Ancestor collision checks must handle nonadjacent lexicographic paths.
 #[test]
 fn a_parent_file_collision_is_caught_across_an_intervening_sibling() {
     let (_temp, _source, candidate) = setup();
@@ -673,11 +666,7 @@ fn a_parent_file_collision_is_caught_across_an_intervening_sibling() {
     );
 }
 
-/// Validation rejects multiple dependencies that name the same target, regardless of `DependencyKind`.
-/// Dependencies with the same path but different kinds require explicit duplicate-path validation.
-/// Dependencies with the same path but different kinds require explicit duplicate-path validation.
-/// Duplicate dependency validation rejects dependencies with equal paths even when their `DependencyKind` values differ.
-/// Duplicate dependency validation rejects dependencies with equal paths even when their `DependencyKind` values differ.
+/// Dependency target paths must remain unique across different dependency kinds.
 #[test]
 fn duplicate_dependency_targets_are_rejected_across_kinds() {
     let (_temp, _source, candidate) = setup();

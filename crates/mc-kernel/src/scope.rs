@@ -1,3 +1,10 @@
+//! Scope persistence, canonicalization, and conservative set predicates.
+//!
+//! Write paths redact text before storage and append scope changes to the surrounding envelope.
+//! Predicate inputs use a closed ten-dimension vocabulary. Canonical scopes contain at most one
+//! term per dimension. Unknown graph relations and unresolvable values fail closed for matching
+//! and subsumption, while overlap intentionally over-approximates unknown pairs.
+
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
@@ -5,6 +12,10 @@ use super::envelope::{Envelope, ObjectRow, PendingChange};
 use super::redaction::{record, redact, RedactedField};
 use super::{KernelError, Sensitivity};
 
+/// Unvalidated storage representation of one scope term.
+///
+/// `operator` selects which value field is legal. Canonical decoding rejects missing values,
+/// conflicting fields, unknown operators, empty sets, invalid ranges, and invalid commit OIDs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeTermSpec {
     pub dimension: String,
@@ -20,6 +31,10 @@ pub struct ScopeTermSpec {
     pub payload: Option<String>,
 }
 
+/// Scope insertion request and ordered term rows.
+///
+/// Identifiers must be nonblank and `source_revision` must be nonnegative. Text fields pass
+/// through redaction before any row or change record is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeSpec {
     pub scope_id: String,
@@ -70,6 +85,11 @@ struct RedactedTerm {
 }
 
 impl Envelope<'_> {
+    /// Inserts one scope, its object-registry row, and its ordered terms in this transaction.
+    ///
+    /// The referenced domain must exist and remain valid. Success appends a `scope_insert`
+    /// pending change. Invalid fields return `InvalidInput`; a missing domain returns `NotFound`.
+    /// The surrounding envelope transaction owns commit or rollback.
     pub fn insert_scope(&mut self, spec: ScopeSpec) -> Result<ScopeWriteOutcome, KernelError> {
         let spec = RedactedScope::new(spec)?;
         let domain_exists = self
@@ -469,62 +489,27 @@ impl Eq for VersionSpec {}
 
 /// Why a scope failed to decode into canonical form. Malformed scopes
 /// evaluate uncertain and never match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum ScopeFormError {
+    #[error("unknown scope dimension {0:?}")]
     UnknownDimension(String),
+    #[error("unknown scope operator {0:?}")]
     UnknownOperator(String),
+    #[error("duplicate scope dimension {}", .0.as_str())]
     DuplicateDimension(Dimension),
+    #[error("scope term on {} has no value", .0.as_str())]
     MissingValue(Dimension),
+    #[error("scope term on {} sets columns its operator does not own", .0.as_str())]
     ConflictingColumns(Dimension),
+    #[error("scope term on {} has an invalid range", .0.as_str())]
     InvalidRange(Dimension),
+    #[error("scope term on {} has an unparseable version range", .0.as_str())]
     InvalidVersionRange(Dimension),
+    #[error("scope term on {} has an invalid git OID", .0.as_str())]
     InvalidOid(Dimension),
+    #[error("scope term on {} has an empty set", .0.as_str())]
     EmptySet(Dimension),
 }
-
-impl std::fmt::Display for ScopeFormError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownDimension(value) => write!(f, "unknown scope dimension {value:?}"),
-            Self::UnknownOperator(value) => write!(f, "unknown scope operator {value:?}"),
-            Self::DuplicateDimension(dimension) => {
-                write!(f, "duplicate scope dimension {}", dimension.as_str())
-            }
-            Self::MissingValue(dimension) => {
-                write!(f, "scope term on {} has no value", dimension.as_str())
-            }
-            Self::ConflictingColumns(dimension) => write!(
-                f,
-                "scope term on {} sets columns its operator does not own",
-                dimension.as_str()
-            ),
-            Self::InvalidRange(dimension) => {
-                write!(
-                    f,
-                    "scope term on {} has an invalid range",
-                    dimension.as_str()
-                )
-            }
-            Self::InvalidVersionRange(dimension) => write!(
-                f,
-                "scope term on {} has an unparseable version range",
-                dimension.as_str()
-            ),
-            Self::InvalidOid(dimension) => {
-                write!(
-                    f,
-                    "scope term on {} has an invalid git OID",
-                    dimension.as_str()
-                )
-            }
-            Self::EmptySet(dimension) => {
-                write!(f, "scope term on {} has an empty set", dimension.as_str())
-            }
-        }
-    }
-}
-
-impl std::error::Error for ScopeFormError {}
 
 /// Canonical scope: at most one term per dimension, ordered by dimension.
 /// The only constructor is `from_term_specs`, so every value of this type
@@ -584,6 +569,7 @@ impl CanonicalScope {
         }
     }
 
+    /// Iterates present terms in `Dimension::ALL` order.
     pub fn terms(&self) -> impl Iterator<Item = (Dimension, &TermValue)> {
         let mut present = self.present;
         std::iter::from_fn(move || {
@@ -788,10 +774,12 @@ pub struct ScopeMatchContext {
 }
 
 impl ScopeMatchContext {
+    /// Creates a context with no resolved dimension values or checkout commit.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets one resolved dimension value and caches its version coercion, if parseable.
     pub fn with_value(mut self, dimension: Dimension, value: impl Into<String>) -> Self {
         let value = value.into();
         self.coerced[dimension.index()] = VersionReading::parse(&value);
@@ -799,6 +787,10 @@ impl ScopeMatchContext {
         self
     }
 
+    /// Sets the checkout commit used by `git_reachable` terms.
+    ///
+    /// This builder does not validate OID syntax. Graph-oracle resolution determines whether the
+    /// value can participate in a match.
     pub fn with_head_commit(mut self, oid: impl Into<String>) -> Self {
         self.head_commit = Some(oid.into());
         self
@@ -852,6 +844,12 @@ fn req_names_prerelease(req: &semver::VersionReq) -> bool {
         .any(|comparator| !comparator.pre.is_empty())
 }
 
+/// Coerces semantic and platform-style version text into a comparable semantic version.
+///
+/// Prerelease text moves to build metadata unless a requirement explicitly names a prerelease.
+/// The first one to three numeric components form the comparable version.
+/// A four-component platform version such as `10.0.19041.1` truncates to `10.0.19041`.
+/// Invalid or empty input returns `None`.
 pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     VersionReading::parse(raw).map(|reading| reading.comparable)
 }

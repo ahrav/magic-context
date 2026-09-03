@@ -1,3 +1,9 @@
+//! Lossless sidecar metadata for decoding and re-encoding harness messages.
+//!
+//! Decoding stamps native origins and content fingerprints onto wire blocks. Encoding
+//! aligns surviving blocks to native metadata with an order-preserving maximum-score
+//! walk, preferring exact origin matches over fingerprint-only matches.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -8,8 +14,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ck_wire::{CkIngressMessage, CkWireBlock};
 
-/// ExtractedBoundary records a decoded compaction marker from a harness transcript.
+/// Compaction marker decoded from a harness transcript.
 ///
+/// `ordinal` is the harness message order. Optional part and entry indices identify a
+/// boundary nested within that message. `raw` preserves provider fields verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedBoundary {
     pub harness: String,
@@ -22,6 +30,7 @@ pub struct ExtractedBoundary {
     pub raw: Value,
 }
 
+/// Decoded messages plus metadata required for lossless re-encoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedHarnessMessages {
     pub messages: Vec<CkIngressMessage>,
@@ -30,6 +39,10 @@ pub struct DecodedHarnessMessages {
     pub sidecar: DecodeSidecar,
 }
 
+/// Harness metadata indexed by message ID with a separate decode-order list.
+///
+/// Repeated message IDs replace metadata without changing their first-seen position.
+/// `mid_pins` retains stable-key assignments across encode cycles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodeSidecar {
     pub harness: String,
@@ -51,6 +64,7 @@ impl DecodeSidecar {
         }
     }
 
+    /// Inserts or replaces message metadata while preserving first-seen order.
     pub fn remember_message(&mut self, mid: String, meta: HarnessMessageMeta) {
         if !self.messages.contains_key(&mid) {
             self.order.push(mid.clone());
@@ -62,6 +76,7 @@ impl DecodeSidecar {
         self.messages.get(mid).map(Arc::as_ref)
     }
 
+    /// Returns metadata at zero-based decode order `index`.
     pub fn message_for_index(&self, index: usize) -> Option<&HarnessMessageMeta> {
         self.order
             .get(index)
@@ -105,6 +120,7 @@ pub struct BlockMeta {
     pub raw: Value,
 }
 
+/// Order-preserving block-to-metadata alignment and native-part retention sets.
 pub(crate) struct MatchedBlockMetas<'a> {
     pub(crate) by_block: Vec<Option<&'a BlockMeta>>,
     retained_native_indices: BTreeSet<usize>,
@@ -112,6 +128,10 @@ pub(crate) struct MatchedBlockMetas<'a> {
 }
 
 impl MatchedBlockMetas<'_> {
+    /// Removes native parts whose decoded blocks were removed.
+    ///
+    /// Parts with no decoded metadata remain because the sidecar cannot prove they
+    /// correspond to a deleted block. Relative order of retained parts is unchanged.
     pub(crate) fn remove_unretained_native_parts<T>(&self, parts: Vec<T>) -> Vec<T> {
         parts
             .into_iter()
@@ -145,6 +165,7 @@ impl AlignmentScore {
     }
 }
 
+/// Hashes decoded content after removing codec-owned identity metadata.
 pub(crate) fn decoded_block_fingerprint(block: &CkWireBlock) -> String {
     let mut canonical = block.clone();
     canonical.provider_extras.remove(BLOCK_IDENTITY_NAMESPACE);
@@ -152,6 +173,7 @@ pub(crate) fn decoded_block_fingerprint(block: &CkWireBlock) -> String {
     stable_hash(&serde_json::to_value(canonical).unwrap_or(Value::Null))
 }
 
+/// Stores a block's decoded origin and pre-mutation fingerprint in provider extras.
 pub(crate) fn stamp_block_identity(
     block: &mut CkWireBlock,
     block_index: usize,
@@ -219,6 +241,11 @@ fn alignment_candidate(
         .then_some(false)
 }
 
+/// Aligns blocks with metadata without reordering either sequence.
+///
+/// Exact stamped origins score above fingerprint-only or positional matches. Dynamic
+/// programming maximizes origin matches first and total matches second. Each block and
+/// metadata row appears in at most one pair. Time and memory are `O(blocks * metas)`.
 pub(crate) fn match_block_metas<'a>(
     blocks: &[CkWireBlock],
     metas: &'a [BlockMeta],
@@ -280,12 +307,19 @@ pub(crate) fn match_block_metas<'a>(
     }
 }
 
+/// Returns the full lowercase SHA-256 digest of `serde_json`-serialized bytes.
+///
+/// Serialization failure hashes an empty byte sequence.
 pub fn stable_hash(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let digest = Sha256::digest(bytes);
     hex_prefix(&digest, digest.len())
 }
 
+/// Returns up to `chars` lowercase hexadecimal characters from serialized JSON's SHA-256 digest.
+///
+/// Serialization failure hashes an empty byte sequence. Requests above 64 characters
+/// return the full 64-character digest.
 pub fn stable_hash_prefix(value: &Value, chars: usize) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let digest = Sha256::digest(bytes);
@@ -303,6 +337,9 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
     out
 }
 
+/// Selects metadata by explicit harness ID, then by decode order for nonsynthetic messages.
+///
+/// Synthetic messages never use the positional fallback.
 pub fn meta_for_ck<'a>(
     sidecar: &'a DecodeSidecar,
     msg: &'a crate::ck_wire::CkWireMessage,
@@ -319,6 +356,7 @@ pub fn meta_for_ck<'a>(
         })
 }
 
+/// Recognizes either supported boolean marker for a synthetic native part.
 pub(crate) fn is_synthetic_part(part: &Value) -> bool {
     part.get("synthetic")
         .and_then(Value::as_bool)

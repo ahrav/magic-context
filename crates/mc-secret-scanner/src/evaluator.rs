@@ -714,7 +714,6 @@ fn add_work(total: &mut usize, amount: usize, limit: usize) -> Result<(), Abort>
 // Corpus and overlay lists spell each keyword and suppressor in lowercase and
 // uppercase by hand, so a case-sensitive search misses the mixed-case spelling
 // of both: it drops a secret keyed `ApiKey` and reports a value of `ChangeMe`.
-// commentlint: allow(JUDGE)
 fn contains_charged_ignore_case(
     haystack: &[u8],
     needle: &[u8],
@@ -1080,7 +1079,6 @@ fn is_blank_with_escapes(text: &str) -> bool {
 // Hex-encoded credentials are also `0x`-prefixed, so a longer digit run stays a
 // candidate: an Ethereum private key carries 64 hex digits. Modes, masks, and
 // flags fit inside this bound.
-// commentlint: allow(JUDGE)
 const MAX_RADIX_SCALAR_DIGITS: usize = 8;
 
 // A separator only counts between digits, so `1_000` is a literal while `_1`,

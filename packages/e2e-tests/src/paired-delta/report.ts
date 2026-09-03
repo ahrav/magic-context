@@ -1160,7 +1160,7 @@ export function publishCalibrationRecord(
 /**
  * Whether a noise row could have come from real observations.
  *
- * A primary endpoint delta is one of `{-1, 0, 1}`, so `n` observations are a count triple over those three values, and the row's spread fixes which values occur: 0 means one value, 1 means two adjacent values, 2 means both endpoints. The sample variance of every such triple is enumerated and the row must match one. A floor alone still admits values between reachable ones — three observations spanning 2 produce only 1 or 4/3, and a claimed 1.01 would clear a floor of 1 and derive a smaller pool than the genuine 4/3 pilot. The relationship is checked rather than the discrete observations retained, since the record is a summary by design. commentlint: allow(JUDGE)
+ * A primary endpoint delta is one of `{-1, 0, 1}`, so `n` observations are a count triple over those three values, and the row's spread fixes which values occur: 0 means one value, 1 means two adjacent values, 2 means both endpoints. The sample variance of every such triple is enumerated and the row must match one. A floor alone still admits values between reachable ones — three observations spanning 2 produce only 1 or 4/3, and a claimed 1.01 would clear a floor of 1 and derive a smaller pool than the genuine 4/3 pilot. The relationship is checked rather than the discrete observations retained, since the record is a summary by design.
  */
 function arithmeticallyReachable(noise: CalibrationFamilyNoise): boolean {
     const n = noise.observationCount;
@@ -1207,7 +1207,7 @@ const MAX_ENDPOINT_SPREAD = 2;
 /** Observations per series a reader will enumerate over. At `replicateCount: 3` a family of five scenarios yields 15; the weekly cost budget cannot reach a small fraction of this. */
 const MAX_CALIBRATION_OBSERVATIONS = 1_024;
 
-/** Relative slack for the writer's floating-point variance — it sums squared deviations from a rounded mean and can land one ulp off the closed form — and far below the gap between any two reachable variances, which is at least `1/(n(n-1))`. commentlint: allow(JUDGE) */
+/** Relative slack for the writer's floating-point variance — it sums squared deviations from a rounded mean and can land one ulp off the closed form — and far below the gap between any two reachable variances, which is at least `1/(n(n-1))`. */
 const VARIANCE_TOLERANCE = 1e-9;
 
 export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecord {
@@ -1270,7 +1270,7 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         !Number.isSafeInteger(noise.observationCount) || noise.observationCount > maxObservations)) {
         throw new Error("paired-delta-calibration: observation-count-exceeds-depth");
     }
-    /** The depth sum is the record's own claim, so it bounds nothing on its own; a fixed ceiling does. `reachableVariances` visits `n²/2` count pairs, and at the ceiling that is about half a million, well inside a preflight's budget and two orders of magnitude above any pilot this lane can afford. commentlint: allow(JUDGE) */
+    /** The depth sum is the record's own claim, so it bounds nothing on its own; a fixed ceiling does. `reachableVariances` visits `n²/2` count pairs, and at the ceiling that is about half a million, well inside a preflight's budget and two orders of magnitude above any pilot this lane can afford. */
     if (measured.some((noise) => noise.observationCount > MAX_CALIBRATION_OBSERVATIONS)) {
         throw new Error("paired-delta-calibration: observation-count-exceeds-ceiling");
     }
@@ -1301,11 +1301,11 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
             record.decisions.familyCount,
         )
         : null;
-    /** The declared depth exactly: `buildCalibrationRecord` records `replicateCount` per scenario, and the decisions check above already refused a count below 1, so a floor here would reject a record the writer built correctly at depth 1. commentlint: allow(JUDGE) */
+    /** The declared depth exactly: `buildCalibrationRecord` records `replicateCount` per scenario, and the decisions check above already refused a count below 1, so a floor here would reject a record the writer built correctly at depth 1. */
     const depth = record.decisions.replicateCount;
     /** Per scenario, not per family: a family with two scenarios is satisfied by one of them at full depth if only the aggregate is checked. */
     const perScenario = record.scenarioDepth as Record<string, number> | null | undefined;
-    /** Exactly the declared depth, not at least it: the rollout matrix holds `replicateCount` coordinates per scenario and the store keeps one record per coordinate, so a larger depth describes observations the writer cannot have made, and inflating every depth and `observationCount` together clears the family-sum cross-check while the larger `n` admits a smaller variance. commentlint: allow(JUDGE) */
+    /** Exactly the declared depth, not at least it: the rollout matrix holds `replicateCount` coordinates per scenario and the store keeps one record per coordinate, so a larger depth describes observations the writer cannot have made, and inflating every depth and `observationCount` together clears the family-sum cross-check while the larger `n` admits a smaller variance. */
     const depthPerScenario = perScenario !== null && perScenario !== undefined &&
         typeof perScenario === "object" &&
         Object.keys(perScenario).length > 0 &&

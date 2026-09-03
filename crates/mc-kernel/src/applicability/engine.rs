@@ -44,7 +44,7 @@ pub enum ApplicabilityState {
     /// The object's scope does not match the query context.
     OutOfScope,
     /// Unresolvable anchor, ambiguity, malformed scope, missing context, or
-    /// exhausted budget — never presented as current.
+    /// exhausted budget. This state is never presented as current.
     Uncertain,
     /// Uncommitted paths overlap the object's affected paths.
     DirtyTreeUncertain,
@@ -72,9 +72,7 @@ impl ApplicabilityState {
         self != Self::Current
     }
 
-    /// The durable applicability append stores this observation kind.
-    /// Inverse of [`Self::label`], so a stored label and its observation kind
-    /// are checked against one mapping rather than a naming convention.
+    /// Parses a state label emitted by [`Self::label`].
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "current" => Some(Self::Current),
@@ -88,6 +86,7 @@ impl ApplicabilityState {
         }
     }
 
+    /// Returns the observation kind stored by the durable applicability append.
     pub fn observation_kind(self) -> &'static str {
         match self {
             Self::Current => OBSERVATION_KIND_CURRENT,
@@ -102,8 +101,8 @@ impl ApplicabilityState {
 }
 
 /// One retrieval candidate: identity plus the frozen rows the engine
-/// classifies. The caller (retrieval, kh8.6) loads rows; the engine never
-/// reads the store.
+/// classifies. The retrieval caller loads the rows; the engine never reads
+/// the store.
 #[derive(Debug, Clone, Default)]
 pub struct ApplicabilityCandidate {
     pub object_id: String,
@@ -111,7 +110,9 @@ pub struct ApplicabilityCandidate {
     /// Lifecycle invalidation is orthogonal to applicability: an
     /// invalidated object is excluded before evaluation runs.
     pub lifecycle_invalidated: bool,
+    /// Optional scope predicates evaluated against the query context.
     pub scope_terms: Option<Vec<ScopeTermSpec>>,
+    /// Optional anchor condition evaluated against the checkout.
     pub anchor: Option<AnchorRowSpec>,
     /// Object applicability payload (affected paths, cheap checks).
     pub payload: Option<Vec<u8>>,
@@ -160,9 +161,12 @@ pub struct EvaluationStats {
     pub graph_operations: u64,
 }
 
+/// Applicability verdicts and counters for one candidate batch.
 #[derive(Debug, Clone)]
 pub struct BatchEvaluation {
+    /// Candidate verdicts in input order.
     pub objects: Vec<ObjectApplicability>,
+    /// Cache and repository-access counters for the batch.
     pub stats: EvaluationStats,
 }
 

@@ -177,45 +177,24 @@ pub enum GitCondition {
 
 /// Why an anchor row failed to decode. Undecodable anchors evaluate
 /// uncertain, never current.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum AnchorDecodeError {
+    #[error("unknown anchor kind {0:?}")]
     UnknownKind(String),
+    #[error("anchor kind {} has no value", .0.as_str())]
     MissingValue(AnchorKind),
+    #[error("anchor kind {} has values in columns it does not own", .0.as_str())]
     ConflictingColumns(AnchorKind),
+    #[error("anchor kind {} has an invalid git OID", .0.as_str())]
     InvalidOid(AnchorKind),
     /// Two capture representations name the same commit.
+    #[error("anchor payload holds two captures for one commit")]
     DuplicateCapture,
+    #[error("anchor platform version range is unparseable")]
     InvalidVersionRange,
+    #[error("anchor wall-clock interval is not half-open")]
     InvalidInterval,
 }
-
-impl std::fmt::Display for AnchorDecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownKind(value) => write!(f, "unknown anchor kind {value:?}"),
-            Self::MissingValue(kind) => {
-                write!(f, "anchor kind {} has no value", kind.as_str())
-            }
-            Self::ConflictingColumns(kind) => write!(
-                f,
-                "anchor kind {} has values in columns it does not own",
-                kind.as_str()
-            ),
-            Self::InvalidOid(kind) => {
-                write!(f, "anchor kind {} has an invalid git OID", kind.as_str())
-            }
-            Self::DuplicateCapture => {
-                write!(f, "anchor payload holds two captures for one commit")
-            }
-            Self::InvalidVersionRange => {
-                f.write_str("anchor platform version range is unparseable")
-            }
-            Self::InvalidInterval => f.write_str("anchor wall-clock interval is not half-open"),
-        }
-    }
-}
-
-impl std::error::Error for AnchorDecodeError {}
 
 fn decode_captures(
     payload: Option<&[u8]>,

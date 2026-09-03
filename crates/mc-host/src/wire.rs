@@ -17,7 +17,7 @@
 //! Every envelope version preserves `len` and `ver` meanings and offsets.
 //! `decode_header` enforces the fixed meanings and offsets of `len` and `ver`.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -59,6 +59,7 @@ pub enum FrameType {
 }
 
 impl FrameType {
+    /// Returns `None` for bytes not assigned by protocol version 2.
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             0 => Self::Request,
@@ -202,100 +203,41 @@ impl EnvelopeHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     /// The input contains fewer than `FROZEN_PREFIX_LEN` bytes, so the decoder cannot read `len` or `ver`.
-    TooShortForPrefix {
-        have: usize,
-    },
+    #[error("header shorter than frozen prefix: have {have} bytes")]
+    TooShortForPrefix { have: usize },
     /// `ver` is not a version this build understands.
-    UnsupportedVersion {
-        ver: u8,
-    },
+    #[error("unsupported envelope version {ver}")]
+    UnsupportedVersion { ver: u8 },
     /// The input specifies a known version but contains fewer than that version's header bytes.
-    TooShortForHeader {
-        have: usize,
-        need: usize,
-    },
-    UnknownFrameType {
-        byte: u8,
-    },
+    #[error("header too short for version: have {have} bytes, need {need}")]
+    TooShortForHeader { have: usize, need: usize },
+    #[error("unknown frame type byte {byte}")]
+    UnknownFrameType { byte: u8 },
     /// A reserved flag bit (6-7) is set.
-    ReservedFlagBits {
-        flags: u8,
-    },
+    #[error("reserved flag bits set in flags 0b{flags:08b}")]
+    ReservedFlagBits { flags: u8 },
     /// Priority bits 1-2 hold the reserved value `0b11`.
-    ReservedPriorityBits {
-        flags: u8,
-    },
+    #[error("reserved priority bits set in flags 0b{flags:08b}")]
+    ReservedPriorityBits { flags: u8 },
     /// Admission bits 4-5 hold the reserved value `0b11`.
-    ReservedAdmissionClass {
-        flags: u8,
-    },
+    #[error("reserved admission class set in flags 0b{flags:08b}")]
+    ReservedAdmissionClass { flags: u8 },
     /// `AdmissionClass::Sheddable` cannot be set on a frame type that must be delivered.
-    SheddableIllegalFrameType {
-        ty: FrameType,
-        flags: u8,
-    },
+    #[error("SHEDDABLE admission class is illegal on {ty:?} in flags 0b{flags:08b}")]
+    SheddableIllegalFrameType { ty: FrameType, flags: u8 },
     /// Channel 0 carried an epoch other than its reserved epoch 0.
-    NonzeroEpochOnControlChannel {
-        epoch: u32,
-    },
+    #[error("control channel carried nonzero epoch {epoch}")]
+    NonzeroEpochOnControlChannel { epoch: u32 },
     /// A routed channel carried epoch 0, which is reserved for channel 0.
-    ZeroEpochOnRoutedChannel {
-        channel: u16,
-    },
+    #[error("routed channel {channel} carried zero epoch")]
+    ZeroEpochOnRoutedChannel { channel: u16 },
     /// Pure-header frames require a zero-length body.
-    PureHeaderFrameWithBody {
-        ty: FrameType,
-        len: u32,
-    },
+    #[error("pure-header frame {ty:?} declared non-zero body length {len}")]
+    PureHeaderFrameWithBody { ty: FrameType, len: u32 },
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooShortForPrefix { have } => {
-                write!(f, "header shorter than frozen prefix: have {have} bytes")
-            }
-            Self::UnsupportedVersion { ver } => write!(f, "unsupported envelope version {ver}"),
-            Self::TooShortForHeader { have, need } => {
-                write!(
-                    f,
-                    "header too short for version: have {have} bytes, need {need}"
-                )
-            }
-            Self::UnknownFrameType { byte } => write!(f, "unknown frame type byte {byte}"),
-            Self::ReservedFlagBits { flags } => {
-                write!(f, "reserved flag bits set in flags 0b{flags:08b}")
-            }
-            Self::ReservedPriorityBits { flags } => {
-                write!(f, "reserved priority bits set in flags 0b{flags:08b}")
-            }
-            Self::ReservedAdmissionClass { flags } => {
-                write!(f, "reserved admission class set in flags 0b{flags:08b}")
-            }
-            Self::SheddableIllegalFrameType { ty, flags } => write!(
-                f,
-                "SHEDDABLE admission class is illegal on {ty:?} in flags 0b{flags:08b}"
-            ),
-            Self::NonzeroEpochOnControlChannel { epoch } => {
-                write!(f, "control channel carried nonzero epoch {epoch}")
-            }
-            Self::ZeroEpochOnRoutedChannel { channel } => {
-                write!(f, "routed channel {channel} carried zero epoch")
-            }
-            Self::PureHeaderFrameWithBody { ty, len } => {
-                write!(
-                    f,
-                    "pure-header frame {ty:?} declared non-zero body length {len}"
-                )
-            }
-        }
-    }
-}
-
-impl Error for DecodeError {}
 
 /// The frozen prefix makes `ver` available before the full header length is known.
 fn header_len_for_version(ver: u8) -> Option<usize> {
@@ -305,9 +247,11 @@ fn header_len_for_version(ver: u8) -> Option<usize> {
     }
 }
 
-/// frozen-prefix discipline:
+/// Decodes and validates one envelope header.
 ///
-/// `decode_header` returns a typed [`DecodeError`] instead of panicking on malformed input.
+/// Only the first version-specific header bytes are read; trailing body bytes are ignored.
+/// Malformed input returns a typed [`DecodeError`] without panicking. Validation covers version,
+/// frame type, reserved flags, admission class, channel epoch, and pure-header body length.
 pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     if bytes.len() < FROZEN_PREFIX_LEN {
         return Err(DecodeError::TooShortForPrefix { have: bytes.len() });
@@ -373,8 +317,10 @@ pub const MAX_BODY_LEN: u32 = MAX_FRAME_BODY_LEN;
 
 pub const MAX_CONTROL_BODY_LEN: u32 = 65_536;
 
+/// Shared byte-counting budget for concurrent ingress work.
 ///
-/// wait.
+/// Charges hold semaphore permits until dropped. [`ByteBudget::charge`] waits for capacity;
+/// [`ByteBudget::try_charge`] returns immediately and never acquires a partial charge.
 #[derive(Clone)]
 pub struct ByteBudget {
     semaphore: Arc<Semaphore>,
@@ -382,6 +328,12 @@ pub struct ByteBudget {
 }
 
 impl ByteBudget {
+    /// Fixes capacity for the lifetime of this budget and all its clones.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the platform-converted count exceeds Tokio's semaphore permit limit.
+    /// A target whose `usize` is narrower than `max_bytes` truncates the value first, so an out-of-range request can yield a smaller capacity, including zero, instead of panicking.
     pub fn new(max_bytes: u64) -> Self {
         let capacity = max_bytes as usize;
         Self {
@@ -394,6 +346,10 @@ impl ByteBudget {
         self.capacity
     }
 
+    /// Waits until exactly `bytes` permits can be acquired.
+    ///
+    /// Cancellation before completion acquires no permits. This type never closes its semaphore,
+    /// so the internal closed-semaphore expectation is an invariant.
     pub async fn charge(&self, bytes: u32) -> ByteCharge {
         let permit = self
             .semaphore
@@ -406,6 +362,10 @@ impl ByteBudget {
         }
     }
 
+    /// Tries to acquire exactly `bytes` permits without waiting.
+    ///
+    /// Returns `None` when `bytes` exceeds `u32`, exceeds total capacity, or is not currently
+    /// available. A zero-byte request succeeds with an unbacked charge.
     pub fn try_charge(&self, bytes: usize) -> Option<ByteCharge> {
         let bytes = u32::try_from(bytes).ok()?;
         if bytes == 0 {
@@ -504,6 +464,7 @@ impl FrameId {
     }
 }
 
+/// Reports a body length that the frame protocol cannot encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeError {
     pub body_len: usize,
@@ -540,6 +501,10 @@ pub fn encode_frame(
     Ok(buf)
 }
 
+/// Prepends a wire-v2 header to an owned body.
+///
+/// Returns [`EncodeError`] when the body exceeds [`MAX_FRAME_BODY_LEN`]. This encoder assumes the
+/// caller supplies protocol-valid flags and channel epoch values; decoding performs validation.
 pub fn encode_owned_frame(
     ty: FrameType,
     flags: Flags,
@@ -575,6 +540,10 @@ pub fn encode_owned_frame(
 /// the body.
 const SPLIT_WRITE_MIN_BODY: usize = 16 * 1024;
 
+/// Encodes small bodies contiguously and large bodies as a header and unchanged tail.
+///
+/// Bodies below 16 KiB use the contiguous representation. Bodies above
+/// [`MAX_FRAME_BODY_LEN`] return [`EncodeError`].
 pub fn encode_split_frame(
     ty: FrameType,
     flags: Flags,

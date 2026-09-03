@@ -1,5 +1,9 @@
+//! Runs OpenCode as a hardened Broca subprocess.
 //!
-//! Each run uses a private per-run `OPENCODE_DB`, inline zero-tool-agent config, disabled project config, the Broca-child guard, and a stdin prompt; it never accesses the user's database or project-controlled config.
+//! Each run uses a private `OPENCODE_DB`, inline configuration for one zero-tool
+//! agent, disabled project configuration, the Broca child guard, and a prompt on
+//! standard input. Runs do not access the user's database or project-controlled
+//! configuration.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -16,19 +20,25 @@ use super::subprocess::{
 };
 use crate::harness_closure::ValidatedHarnessClosure;
 
-/// `MAGIC_CONTEXT_BROCA_CHILD_ENV` makes a Broca child exit plugin initialization before migration, database access, hooks, timers, or RPC startup.
-/// `packages/plugin/src/index.ts`.
+/// Environment guard that stops Broca children before plugin initialization.
+///
+/// `packages/plugin/src/index.ts` checks this value before configuration
+/// migration, database access, hooks, timers, or RPC startup.
 pub const MAGIC_CONTEXT_BROCA_CHILD_ENV: &str = "MAGIC_CONTEXT_BROCA_CHILD";
 
-/// `OPENCODE_BROCA_AGENT` names the inline-config agent selected by `--agent`.
+/// Inline agent name selected with `--agent`.
 pub const OPENCODE_BROCA_AGENT: &str = "broca";
 
+/// Trusted runtime closure used to launch OpenCode.
 #[derive(Clone, Debug)]
 pub struct OpenCodeRuntime {
+    /// Validated closure containing the executable.
     pub closure: Arc<ValidatedHarnessClosure>,
+    /// Node descriptor for the OpenCode executable.
     pub executable_node: String,
 }
 
+/// [`LlmExecutionBackend`] adapter for `opencode run`.
 pub struct OpenCodeBackend {
     runtime: OpenCodeRuntime,
     limits: SubprocessLimits,
@@ -36,10 +46,12 @@ pub struct OpenCodeBackend {
 }
 
 impl OpenCodeBackend {
+    /// Creates a backend with default subprocess limits.
     pub fn new(runtime: OpenCodeRuntime, env: EnvSnapshot) -> Self {
         Self::with_limits(runtime, env, SubprocessLimits::default())
     }
 
+    /// Creates a backend with explicit subprocess limits.
     pub fn with_limits(
         runtime: OpenCodeRuntime,
         env: EnvSnapshot,
@@ -60,8 +72,7 @@ impl LlmExecutionBackend for OpenCodeBackend {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BackendFuture {
-        // A harness mismatch must fail rather than run under OpenCode with OpenCode-specific provider aliases and credentials.
-        // credentials.
+        // Reject harness mismatches before using OpenCode-specific credentials.
         if request.harness != Harness::OpenCode {
             let terminal = backend::harness_mismatch(Harness::OpenCode, request.harness);
             return Box::pin(async move { terminal });
@@ -83,7 +94,7 @@ impl LlmExecutionBackend for OpenCodeBackend {
 fn inline_config(request: &BackendRequest) -> String {
     let mut agent = serde_json::json!({
         "mode": "primary",
-        // zero-tool contract.
+        // The wildcard disables every tool for this agent.
         "tools": { "*": false },
         "temperature": request.temperature,
     });
@@ -120,7 +131,8 @@ async fn run_opencode(
         }
     };
     let config_content = inline_config(&request);
-    // Reject configurations over `MAX_OPENCODE_CONFIG_BYTES` before spawning because Linux limits one environment string to `MAX_ARG_STRLEN` (~128 KiB), and exceeding that limit makes `exec(2)` fail with `E2BIG`.
+    // Linux limits one environment string to `MAX_ARG_STRLEN`, about 128 KiB.
+    // Reject oversized configuration before `exec(2)` can fail with `E2BIG`.
     if config_content.len() > MAX_OPENCODE_CONFIG_BYTES {
         return BackendTerminal::Failed(BackendError {
             class: ErrorClass::Permanent,
@@ -141,7 +153,7 @@ async fn run_opencode(
     let args = vec![
         "run".to_owned(),
         "--model".to_owned(),
-        // `OpenCodeBackend` passes the canonical `provider/model` to OpenCode unchanged and performs no alias mapping.
+        // OpenCode receives the canonical `provider/model` without alias mapping.
         format!("{}/{}", request.provider, request.model),
         "--agent".to_owned(),
         OPENCODE_BROCA_AGENT.to_owned(),
@@ -169,8 +181,7 @@ async fn run_opencode(
         OsString::from("OPENCODE_CONFIG_CONTENT"),
         OsString::from(config_content),
     ));
-    // `OpenCodeBackend` never reads project configuration, `.opencode/` directories, or local rule files.
-    // behavior.
+    // Keep project configuration, `.opencode/` directories, and local rule files unread.
     child_env.push((
         OsString::from("OPENCODE_DISABLE_PROJECT_CONFIG"),
         OsString::from("1"),
@@ -187,14 +198,13 @@ async fn run_opencode(
         env: child_env,
         working_dir: dir.path().to_path_buf(),
         stdin: request.prompt.clone().into_bytes(),
-        // The closure directory descriptor is absent because no argument references it.
-        // The harness receives a rename-immune handle for writing into the validated closure tree.
-        // The harness receives a rename-immune handle for writing into the validated closure tree.
+        // Inherit only the executable descriptor. No argument references the closure
+        // directory, and exposing it would allow writes into the validated closure tree.
         inherit_fds: vec![executable_node.inherited_fd()],
     };
 
-    // The OpenCode CLI closes its streams and exits when the run finishes, so EOF and the drain grace bound the tail without a terminal probe.
-    // The OpenCode CLI closes its streams and exits when the run finishes, so EOF and the drain grace bound the tail without a terminal probe.
+    // OpenCode closes its streams and exits after the run. EOF and the drain grace
+    // bound the tail without a terminal probe.
     let result = match subprocess::run(spec, &limits, &cancel, None).await {
         Ok(result) => result,
         Err(err) => {
@@ -205,8 +215,8 @@ async fn run_opencode(
         }
     };
 
-    // `finalize` trusts a transcript only after a clean end and maps every abnormal end to one canonical failure regardless of printed output.
-    // `finalize` trusts a transcript only after a clean end and maps every abnormal end to one canonical failure regardless of printed output.
+    // Trust transcript output only after a clean end. `finalize` maps every
+    // abnormal end to one canonical failure regardless of printed output.
     let parsed = subprocess::parse_clean_transcript(&result, &events, parse_opencode_transcript);
     subprocess::finalize(
         HarnessName::OpenCode,
@@ -217,10 +227,13 @@ async fn run_opencode(
     )
 }
 
-/// The parser accepts only `step_start`, `text`, `step_finish`, and `error`; it rejects `tool_use` because a tool invocation violates the zero-tool contract.
-/// The parser accepts only `step_start`, `text`, `step_finish`, and `error`; it rejects `tool_use` because a tool invocation violates the zero-tool contract.
-/// The parser accepts only `step_start`, `text`, `step_finish`, and `error`; it rejects `tool_use` because a tool invocation violates the zero-tool contract.
-/// The parser reports structural rejection details without quoting the input line.
+/// Parses the closed `opencode run --format json` event vocabulary.
+///
+/// The parser accepts `step_start`, `text`, `step_finish`, and `error`. It
+/// recognizes and rejects `tool_use` because this path promises a zero-tool
+/// transform. It rejects malformed JSON, non-UTF-8 input, unknown events or
+/// finish reasons, contradictory terminals, and missing terminals without
+/// quoting input lines in errors.
 fn parse_opencode_transcript(
     stdout: &[u8],
 ) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
@@ -234,8 +247,7 @@ fn parse_opencode_transcript(
         let Ok(text) = std::str::from_utf8(line) else {
             return Err(format!("non-utf8 output at line {line_no}"));
         };
-        // The parser bounds the scan before constructing the DOM because an unbounded node graph would escape the charged capture budget.
-        // The parser bounds the scan before constructing the DOM because an unbounded node graph would escape the charged capture budget.
+        // Bound node count before constructing a DOM that could exceed the capture budget.
         if !subprocess::json_nodes_within_bound(text) {
             return Err(format!("json structure too large at line {line_no}"));
         }
@@ -247,16 +259,14 @@ fn parse_opencode_transcript(
         };
         match event_type {
             "step_start" => {}
-            // A tool invocation violates the zero-tool contract, so the transform must not publish its text.
-            // A tool invocation violates the zero-tool contract, so the transform must not publish its text.
+            // Reject tool execution before publishing any associated text.
             "tool_use" => {
                 return Err(format!(
                     "tool_use event in a tool-less run at line {line_no}"
                 ));
             }
             "text" => {
-                // The transcript rejects content after a terminal because completed or failed runs cannot grow their answer.
-                // The transcript rejects content after a terminal because completed or failed runs cannot grow their answer.
+                // Completed or failed runs cannot add text after their terminal event.
                 if terminal.is_some() {
                     return Err(format!("text event after the terminal at line {line_no}"));
                 }
@@ -304,7 +314,11 @@ fn parse_opencode_transcript(
     Ok((events, terminal))
 }
 
-/// The provider's error name is the diagnostic code.
+/// Maps one OpenCode error event to a classified backend failure.
+///
+/// Status, retryability, and bounded retry delay determine the failure class.
+/// The provider's sanitized error name becomes the diagnostic code. Provider
+/// message text guides classification but never enters the returned message.
 fn error_terminal(value: &serde_json::Value) -> BackendTerminal {
     let error = value.get("error");
     let name = error

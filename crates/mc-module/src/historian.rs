@@ -158,57 +158,24 @@ pub enum FireOutcome {
     Busy(HistorianDurableState),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HistorianStateError {
-    InvalidRange {
-        from_ordinal: u64,
-        to_ordinal: u64,
-    },
+    #[error("historian invalid chunk range: from {from_ordinal} is after to {to_ordinal}")]
+    InvalidRange { from_ordinal: u64, to_ordinal: u64 },
+    #[error("historian invalid transition: event {event} cannot run from {from}", from = from.as_str())]
     InvalidTransition {
         from: HistorianPhase,
         event: &'static str,
     },
-    MissingProducerIds {
-        firing_seq: u64,
-    },
-    FingerprintMismatch {
-        expected: String,
-        found: String,
-    },
+    #[error("historian firing {firing_seq} is missing producer ids needed for reattach/publish")]
+    MissingProducerIds { firing_seq: u64 },
+    #[error("historian chunk fingerprint mismatch: expected {expected}, found {found}")]
+    FingerprintMismatch { expected: String, found: String },
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("publish: {0}")]
     Publish(HistorianPublishError),
 }
-
-impl fmt::Display for HistorianStateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HistorianStateError::InvalidRange {
-                from_ordinal,
-                to_ordinal,
-            } => write!(
-                f,
-                "historian invalid chunk range: from {from_ordinal} is after to {to_ordinal}"
-            ),
-            HistorianStateError::InvalidTransition { from, event } => write!(
-                f,
-                "historian invalid transition: event {event} cannot run from {}",
-                from.as_str()
-            ),
-            HistorianStateError::MissingProducerIds { firing_seq } => write!(
-                f,
-                "historian firing {firing_seq} is missing producer ids needed for reattach/publish"
-            ),
-            HistorianStateError::FingerprintMismatch { expected, found } => write!(
-                f,
-                "historian chunk fingerprint mismatch: expected {expected}, found {found}"
-            ),
-            HistorianStateError::Store(e) => write!(f, "store: {e}"),
-            HistorianStateError::Publish(e) => write!(f, "publish: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for HistorianStateError {}
 
 impl From<McStoreError> for HistorianStateError {
     fn from(e: McStoreError) -> Self {
@@ -589,8 +556,7 @@ pub enum RestartAction {
         producer_run_id: String,
         /// The durable state records the harness under which the run started.
         /// Reattach uses the durable state's harness binding, not the resuming route's binding.
-        /// Broca scopes run identity by the durable harness binding.
-        /// harness, session).
+        /// Broca scopes run identity by project root, durable harness, and session.
         producer_harness: Option<String>,
         firing_seq: u64,
         chunk_fingerprint: String,
@@ -918,7 +884,6 @@ pub struct HistorianReattachRequest<'a> {
 
 /// `MC_CHILD_SESSION_PREFIX` marks producer sessions as self-owned.
 /// Re-transforming a producer request prepends m0/m1 framing and violates the expected `[system, user]` shape.
-/// Re-transforming a producer request violates the expected `[system, user]` shape.
 pub const MC_CHILD_SESSION_PREFIX: &str = "mc-historian:";
 
 /// `completion_wait_budget` covers one historian run and one timeout recovery re-drain.
@@ -944,7 +909,6 @@ pub fn wrapup_round_wait_budget() -> Duration {
 /// Emergency95 can wait for an active run and then refire inline, requiring two 660-second completion waits.
 /// `MAX_EMERGENCY_REQUEST_BUDGET` includes a 180-second margin beyond two 660-second completion waits.
 /// The timeout path forwards the raw request array and discards the transform result.
-/// the consumers.
 pub const MAX_EMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(1500);
 
 /// Build the llm-runner session id owned by Magic Context for one historian firing.
@@ -1147,7 +1111,6 @@ fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
 }
 
 /// The caller persists the durable transition before invoking `log_cleanup_failure`.
-/// transition.
 fn log_cleanup_failure(
     session_id: &str,
     operation: &str,
@@ -1165,6 +1128,7 @@ where
     log_cleanup_failure(session_id, "close", &producer.close().await);
 }
 
+/// Returns true only when cancellation proves the provider run stopped.
 ///
 /// Fallback requires proof that cancellation stopped the provider run because a second run may be billable.
 /// The supervisor acquires its command permit before calling `run.cancel.cancel()`.
@@ -1692,7 +1656,7 @@ fn idle_after_success(firing_seq: u64) -> HistorianDurableState {
     }
 }
 
-/// model-failure cooldown.
+/// Fence rejection clears the matching run without delaying a fresh snapshot retry.
 fn abandon_matching_run_without_cooldown(
     store: &McStore,
     session_id: &str,
@@ -3223,7 +3187,7 @@ mod tests {
             .contains("producer output"));
     }
 
-    /// start.
+    /// An unconfirmed cancellation cannot authorize another billable run.
     #[tokio::test]
     async fn unconfirmed_cancellation_stops_the_fallback_chain() {
         let dir = tempfile::tempdir().unwrap();

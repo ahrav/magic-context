@@ -6,6 +6,7 @@ use super::{
     redaction_type_for_key, Detection, Redaction, RedactionError, RedactionErrorKind, DETECTOR_ID,
 };
 
+/// Stable classification and replacement text for a provider-specific rule.
 struct RuleLabel {
     secret_type: &'static str,
     replacement: &'static str,
@@ -66,6 +67,13 @@ struct Replacement {
     replacement: String,
 }
 
+/// Replaces all finding spans and reports one detection per overlapping cluster.
+///
+/// Detection offsets and lengths are UTF-8 byte positions in `input`. Findings
+/// may arrive in any order. Keyed labels win provider labels, which win generic
+/// labels. Returns [`RedactionErrorKind::InvalidSpan`] when any span is not a
+/// valid string range, and [`RedactionErrorKind::UnknownRule`] for an
+/// unclassified conservative-overlay rule.
 pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, RedactionError> {
     let mut replacements = Vec::with_capacity(findings.len());
     for finding in findings {
@@ -141,6 +149,10 @@ fn describe(
     })
 }
 
+/// Renders replacements sorted by start, descending end, then precedence.
+///
+/// Touching spans remain separate. Transitively overlapping spans form one
+/// maximal cluster whose full byte union is replaced once.
 fn render(input: &str, mut replacements: Vec<Replacement>) -> Result<Redaction, RedactionError> {
     let mut text = String::with_capacity(input.len());
     let mut detections = Vec::with_capacity(replacements.len());

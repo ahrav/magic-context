@@ -1,4 +1,8 @@
-//! Test-only directly linked mc-host process fixture.
+//! Runs a test-only, directly linked `mc-host` process on Unix.
+//!
+//! A line-delimited JSON control socket selects deterministic backend outcomes.
+//! Control lines are capped at 64 KiB, socket and state paths are owner-only,
+//! and blocked calls are released in FIFO registration order.
 
 #![forbid(unsafe_code)]
 
@@ -41,6 +45,10 @@ mod unix {
         Failure,
     }
 
+    /// Monotonic counters shared by backend futures and control connections.
+    ///
+    /// Sequential consistency keeps snapshots easy to interpret across threads;
+    /// snapshots are observations, not atomic multi-counter transactions.
     #[derive(Default)]
     struct BackendCounters {
         started: AtomicU64,
@@ -359,6 +367,7 @@ mod unix {
         Counters(CounterSnapshot),
     }
 
+    /// One control frame after draining through its newline or end of stream.
     enum BoundedLine {
         Line(Vec<u8>),
         Oversized,

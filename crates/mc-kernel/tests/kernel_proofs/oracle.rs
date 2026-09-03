@@ -1,6 +1,10 @@
 //! Proofs that the canonical-state oracle discriminates: equal states digest
 //! equal under the right profile, and each normalization step is exercised by
 //! a negative control that would pass if the step were skipped.
+//!
+//! Each proof mutates an isolated `tempfile` root and compares table-level digests. Helper
+//! failures panic because every setup step is part of the proof. Clock values are Unix
+//! milliseconds; polling avoids assumptions about timer resolution.
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
@@ -20,8 +24,7 @@ use crate::fixtures::{deletion, domain, ingest, intent, now_ms, root_domain, sta
 /// deletions, so barrier ids appear in relational columns and JSON payloads alike.
 ///
 /// A successful ingest releases its reservation row, and no consumer is abandoned here, so
-/// `artifact_ingestion_reservations` and `consumer_abandonments` end empty. Fixtures that
-/// populate those two domains are tracked in `magic-context-s9k5`.
+/// `artifact_ingestion_reservations` and `consumer_abandonments` end empty.
 fn seed(root: &Path) -> KernelStore {
     let store = KernelStore::open(root).unwrap();
     store
@@ -51,12 +54,14 @@ fn seed(root: &Path) -> KernelStore {
     store
 }
 
+/// Opens the proof database with foreign-key enforcement disabled for deliberate corruption.
 fn writable(root: &Path) -> Connection {
     let connection = Connection::open(root.join("core.sqlite")).unwrap();
     connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
     connection
 }
 
+/// Returns barrier identities in delete commit order so mutations remain deterministic.
 fn barrier_ids(root: &Path) -> Vec<String> {
     writable(root)
         .prepare("SELECT barrier_id FROM deletion_backfill_barriers ORDER BY delete_commit_seq")

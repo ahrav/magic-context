@@ -1,3 +1,10 @@
+//! Exercises Linux CPU-topology classification and the finite atomic
+//! ping-pong handshake against synthetic sysfs trees.
+//!
+//! Fixture helpers panic on filesystem setup failures. The live affinity tests
+//! skip when fewer than two CPUs are available; all other cases are host
+//! topology independent.
+
 #[path = "../benches/support/linux_topology.rs"]
 mod linux_topology;
 
@@ -115,7 +122,7 @@ fn classifies_cross_numa_pair_and_preserves_order() {
     let topo = read_topology(dir.path()).unwrap();
     validate_pair(&topo, &allowed(&[0, 4]), (0, 4), Class::CrossNuma).unwrap();
     // Pair roles are ordered; `(4, 0)` and `(0, 4)` are distinct valid pairs.
-    // deterministic lowest-first.
+    // Automatic selection remains deterministic and lowest-first.
     validate_pair(&topo, &allowed(&[0, 4]), (4, 0), Class::CrossNuma).unwrap();
     assert_eq!(
         auto_select(&topo, &allowed(&[0, 4]), Class::CrossNuma),

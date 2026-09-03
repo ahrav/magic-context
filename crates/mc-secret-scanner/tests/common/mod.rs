@@ -1,7 +1,10 @@
+//! Shared digest helper for secret-scanner integration fixtures.
+
 use sha2::{Digest, Sha256};
 
-/// Lowercase hex SHA-256, matching the digest spelling the manifest and
-/// `SOURCE-INVENTORY.md` record.
+/// Returns a 64-character lowercase hexadecimal SHA-256 digest.
+///
+/// This spelling matches manifests and `SOURCE-INVENTORY.md`.
 pub fn digest_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()

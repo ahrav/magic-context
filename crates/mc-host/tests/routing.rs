@@ -1,3 +1,9 @@
+//! The module tests end-to-end routing, including control validation, route ownership, and cleanup.
+//!
+//! Each async operation must complete within [`BUDGET`]. Tests verify that
+//! rejected control requests do not reach handlers and route retirement emits
+//! exactly one cleanup event.
+
 mod support;
 
 use std::collections::HashSet;
@@ -11,7 +17,12 @@ use support::{BindPolicy, Event, TestHost, LINKED_MODULE_ID, MODULE_VERSION};
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
 
-/// A control request produces exactly one terminal frame.
+/// Sends one control request and returns its sole terminal frame.
+///
+/// # Panics
+///
+/// Panics when sending fails, no correlated frame arrives within [`BUDGET`],
+/// or any unrelated frame precedes the terminal frame.
 async fn control_once(
     client: &mut raw_client::RawClient,
     body: serde_json::Value,
@@ -476,7 +487,6 @@ async fn closed_route_requests_are_unknown_and_cleanup_is_idempotent() {
         .expect("duplicate goodbye");
 
     // `Cancel` and duplicate `Goodbye` leave the connection usable.
-    // corruption.
     let frame = control_once(&mut client, serde_json::json!({"op": "catalog.list"})).await;
     assert_eq!(frame.ty, TY_RESPONSE);
 

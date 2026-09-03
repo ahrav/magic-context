@@ -56,8 +56,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// `nearest_rank` returns an observed sample rather than an interpolated value.
-/// packages/plugin/scripts/retrieval-benchmark/timing.ts).
+/// Returns the nearest-rank observed sample without interpolation.
+///
+/// Input must already be sorted. Returns `None` for empty input or a percentile
+/// outside `(0, 100]`.
 pub fn nearest_rank(sorted: &[u64], percentile: f64) -> Option<u64> {
     if sorted.is_empty() || !(percentile > 0.0 && percentile <= 100.0) {
         return None;
@@ -171,8 +173,9 @@ pub fn tail_publishable(successful_observations: u64) -> bool {
     successful_observations >= TAIL_SAMPLE_FLOOR
 }
 
-/// `LatencySummary` uses nearest-rank percentiles; `p999_ns` is `None` below `TAIL_SAMPLE_FLOOR`.
-/// headline suppressed).
+/// Nearest-rank latency summary in nanoseconds.
+///
+/// `p999_ns` is `None` below [`TAIL_SAMPLE_FLOOR`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LatencySummary {
     pub count: u64,
@@ -185,6 +188,9 @@ pub struct LatencySummary {
 }
 
 impl LatencySummary {
+    /// Sorts `samples` in place and summarizes them.
+    ///
+    /// Returns `None` when `samples` is empty.
     pub fn from_unsorted(mut samples: Vec<u64>) -> Option<Self> {
         samples.sort_unstable();
         let count = samples.len() as u64;
@@ -314,8 +320,7 @@ const WARMUP_WINDOW_DIVISOR: u64 = 10;
 pub enum WindowClass {
     /// `Warmup` classifies requests opened inside the window's warmup prefix.
     Warmup,
-    /// `Measured` classifies requests opened at or after the warmup boundary and before the window end.
-    /// window end.
+    /// Requests opened at or after warmup and before window end.
     Measured,
     /// `AfterWindow` classifies requests whose first wire send lands at or after the window end.
     /// A closed-loop worker can pass its pre-dispatch boundary test yet send its first wire call after the window closes.
@@ -368,7 +373,7 @@ impl HoldWindow {
         }
     }
 
-    /// already outside.
+    /// Classifies `opened_ns`; timestamps before `start_ns` are also warmup.
     pub fn classify(&self, opened_ns: u64) -> WindowClass {
         if opened_ns < self.warmup_end_ns {
             WindowClass::Warmup
@@ -386,6 +391,7 @@ impl HoldWindow {
             .unwrap_or(record.actual_first_send_ns)
     }
 
+    /// Stamps logical rows and their attempts with a common window class.
     ///
     /// A measured request that settles after `end_ns` was in flight when the window closed.
     /// Recording a post-window outcome as a completion or timeout understates censoring and inflates the completed rate.
@@ -673,8 +679,10 @@ pub fn validate_synapse_ledgers(
     }
 }
 
+/// Deterministic SplitMix64 generator for reproducible retry timing.
 ///
-/// SplitMix64 avalanches each draw so adjacent `seed ^ logical_id` values do not synchronize first retry delays.
+/// SplitMix64 avalanches each draw so adjacent `seed ^ logical_id` values do
+/// not synchronize first retry delays.
 #[derive(Debug, Clone)]
 pub struct DeterministicRng(u64);
 
@@ -683,6 +691,7 @@ impl DeterministicRng {
         Self(seed)
     }
 
+    /// Returns a deterministic uniform value in `[0, 1)`.
     pub fn unit(&mut self) -> f64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut value = self.0;
@@ -703,19 +712,17 @@ impl DeterministicRng {
     }
 }
 
-/// `POLL_DELAY_MULTIPLIER` must match `SYNAPSE_POLL_DELAY_MULTIPLIER`.
-/// `SYNAPSE_POLL_MIN_DELAY_MS` in
-/// `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts`,
-/// invalidating client-faithfulness.
+/// Poll-delay multiplier matching `SYNAPSE_POLL_DELAY_MULTIPLIER` in
+/// `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts`.
 pub const POLL_DELAY_MULTIPLIER: f64 = 1.6;
 pub const POLL_MIN_DELAY_MS: u64 = 10;
 
 pub const QUEUE_FULL_MAX_ATTEMPTS: u32 = 64;
 
-/// `next_delay_ms` escalates after each call.
-/// The first pending reply waits the jittered fast-first seed.
-/// Later pending replies use the escalated delay, capped by `served_cap_ms`.
-/// uncapped.
+/// Returns current poll delay in milliseconds, then escalates caller state.
+///
+/// Returned delay is capped by `served_cap_ms`, with [`POLL_MIN_DELAY_MS`] as
+/// the lower bound for that cap.
 pub fn pending_poll_delay_ms(next_delay_ms: &mut f64, served_cap_ms: u64) -> f64 {
     let current = *next_delay_ms;
     *next_delay_ms = (current * POLL_DELAY_MULTIPLIER).max(POLL_MIN_DELAY_MS as f64);
@@ -780,8 +787,7 @@ impl SynapseVariant {
         matches!(self, Self::C | Self::APlusC)
     }
 
-    /// Fast-poll arms use the jittered fast-first delay for their first pending reply.
-    /// the plugin.
+    /// Returns jittered first-poll delay for fast-poll variants.
     pub fn initial_pending_delay_ms(self, rng: &mut DeterministicRng) -> Option<f64> {
         self.fast_polls().then(|| rng.first_poll_delay_ms())
     }

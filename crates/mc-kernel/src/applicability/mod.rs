@@ -1,7 +1,7 @@
 //! Applicability engine: resolves anchors and scopes against a live checkout.
 //!
 //! The pure algebra lives in `kernel::scope` and `kernel::anchor`; this
-//! module owns the IO edges — gitoxide checkout access and envelope commits.
+//! module owns the IO edges: gitoxide checkout access and envelope commits.
 //! All git access goes through `gix`; the kernel never spawns a subprocess.
 
 mod cache;
@@ -44,9 +44,13 @@ pub use resolve::{
 /// One batch evaluation request against a checkout path.
 #[derive(Debug, Clone)]
 pub struct ApplicabilityRequest<'a> {
+    /// Worktree or repository path to snapshot.
     pub checkout_path: &'a Path,
+    /// Query values used by anchor resolution.
     pub query: &'a QueryContext,
+    /// Dimension values and graph oracle used by scope matching.
     pub scope_context: &'a ScopeMatchContext,
+    /// Objects to classify in this batch.
     pub candidates: &'a [ApplicabilityCandidate],
     /// Actor recorded on repair commits.
     pub actor: &'a str,
@@ -56,10 +60,12 @@ pub struct ApplicabilityRequest<'a> {
 
 /// Batch verdict: one labeled status per candidate. Domain outcomes
 /// (including every uncertainty) live inside; only store failures surface
-/// as errors — a corrupt store never renders as a mere "uncertain" label.
+/// as errors. A corrupt store never renders as a mere "uncertain" label.
 #[derive(Debug, Clone)]
 pub struct ApplicabilityReport {
+    /// Candidate verdicts in request order.
     pub objects: Vec<ObjectApplicability>,
+    /// Cache and repository work performed by evaluation.
     pub stats: EvaluationStats,
 }
 
@@ -106,16 +112,16 @@ const BLOCK_FENCE_ATTEMPTS: usize = 2;
 impl ApplicabilityEngine {
     /// The one entry point retrieval consumers use: snapshot the checkout
     /// once, classify the batch, and perform read repair for stale and
-    /// clearing classifications. kh8.6 composes the result as an input
-    /// predicate; no visibility policy lives here.
+    /// clearing classifications. Admission uses the classifications as an
+    /// input predicate; no visibility policy lives here.
     ///
     /// A checkout that cannot be snapshotted (unreadable, unborn HEAD,
-    /// budget exhausted) classifies every candidate uncertain — that is a
+    /// budget exhausted) classifies every candidate uncertain. This is a
     /// domain outcome, not a store failure.
     ///
-    /// An object whose durable block this request could not clear reports commentlint: allow(JUDGE)
-    /// uncertain rather than current: the block still stands for every other commentlint: allow(JUDGE)
-    /// reader, so a current label here would auto-inject a blocked object. commentlint: allow(JUDGE)
+    /// An object whose durable block this request could not clear reports
+    /// uncertain rather than current: the block still stands for every other
+    /// reader, so a current label here would auto-inject a blocked object.
     pub fn evaluate(
         &self,
         store: &KernelStore,

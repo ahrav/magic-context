@@ -76,7 +76,7 @@ class MemoryStore implements RolloutStore {
     }
 }
 
-/** `findIndex` returns -1 for an absent arm and `splice(-1, 1)` then removes the last record, so the test would exercise a different arm and could pass for the wrong reason. commentlint: allow(JUDGE) */
+/** `findIndex` returns -1 for an absent arm and `splice(-1, 1)` then removes the last record, so the test would exercise a different arm and could pass for the wrong reason. */
 function storedRecord(armId: ArmId): RolloutRecord {
     return {
         schema: "paired-delta-rollout/v1",
@@ -114,7 +114,7 @@ function storedRecord(armId: ArmId): RolloutRecord {
     };
 }
 
-/** Mode bits do not restrain root, so a test that stages a filesystem failure with them would exercise the success path instead. Windows has no `getuid`. commentlint: allow(JUDGE) */
+/** Mode bits do not restrain root, so a test that stages a filesystem failure with them would exercise the success path instead. Windows has no `getuid`. */
 function skipWhenPermissionsDoNotApply(): boolean {
     return process.getuid?.() === 0;
 }

@@ -1,5 +1,9 @@
-//! JobTable retains bounded process-local batch jobs with deterministic idempotency, ephemeral retention, opaque incarnation-fenced identifiers, and replayable boundary-checked result cursors.
+//! Bounded process-local storage for asynchronous Synapse batch jobs.
 //!
+//! [`JobTable`] provides deterministic idempotency, ephemeral result retention,
+//! incarnation-fenced job identifiers, and replayable page-boundary cursors. One mutex
+//! serializes state transitions. Large vector drops and byte-charge releases occur
+//! after that mutex is released.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,19 +17,25 @@ use crate::wire::ByteCharge;
 pub(crate) const MAX_ITEM_ID_BYTES: usize = 256;
 pub(crate) const CONTENT_SHA256_BYTES: usize = 64;
 
+/// One input item retained until its job starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchItem {
+    /// Caller-defined item identifier, preserved in result order.
     pub id: String,
+    /// Hexadecimal content digest copied into the corresponding result.
     pub content_sha256: String,
+    /// Text passed to inference.
     pub text: String,
 }
 
+/// Stable description returned for an already retained idempotency key.
 #[derive(Debug, Clone)]
 pub struct JobDescriptor {
     pub job_id: String,
     pub status: &'static str,
 }
 
+/// Result of attempting to admit an idempotent batch job.
 pub enum AdmitOutcome {
     /// Same retained key with a byte-identical canonical payload.
     Existing(JobDescriptor),
@@ -41,6 +51,7 @@ pub enum AdmitOutcome {
     Closed,
 }
 
+/// Current state or result page for a polled job.
 pub enum PollOutcome {
     /// Unknown, foreign-incarnation, expired, or evicted job.
     Restarted,
@@ -57,6 +68,7 @@ pub enum PollOutcome {
     BadCursor,
 }
 
+/// One page of ready vectors in original request order.
 pub struct ResultPage {
     /// Shared backing keeps concurrent polls from copying retained vectors
     /// before their output reservations are acquired.
@@ -136,6 +148,12 @@ struct Jobs {
     closed: bool,
 }
 
+/// Thread-safe table of queued, running, and retained completed jobs.
+///
+/// Sequence numbers increase within one process incarnation. Public job identifiers
+/// include a random incarnation prefix, so identifiers from previous processes do not
+/// resolve. Completed jobs are evicted by age when count or retained-byte limits are
+/// exceeded.
 pub struct JobTable {
     limits: SynapseLimits,
     incarnation: String,
@@ -192,8 +210,7 @@ pub(crate) fn job_input_bytes(key: &str, items: &[BatchItem]) -> usize {
     bytes
 }
 
-/// The removal path releases `ByteCharge`s and drops `Job`s after releasing the table guard so retained vectors are freed outside the lock.
-/// The removal path drops `Job`s after releasing the table guard so retained vectors are freed outside the lock.
+/// Defers `ByteCharge` release and `Job` destruction until after the table guard drops.
 #[derive(Default)]
 struct Released {
     jobs: Vec<Job>,
@@ -243,6 +260,11 @@ impl JobTable {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Creates an empty table with a fresh random process incarnation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operating system random source cannot provide the incarnation.
     pub fn new(limits: SynapseLimits) -> Self {
         let mut nonce = [0u8; 8];
         // The incarnation fence must be unpredictable across restarts so stale job IDs cannot name live jobs.
@@ -300,8 +322,12 @@ impl JobTable {
         self.admit_charged(key, items, dimensions, &mut ByteCharge::none())
     }
 
-    /// `admit_charged` transfers `charge` only when it returns `Admitted`; all other outcomes leave it with the caller.
-    /// charge.
+    /// Admits a batch and transfers its input-byte charge on success.
+    ///
+    /// `charge` transfers only when this returns [`AdmitOutcome::Admitted`]. Every
+    /// other outcome leaves the charge with the caller. Identical retained requests
+    /// replay their descriptor, conflicting payloads fail, and retryable failures may
+    /// be replaced only after all capacity checks pass.
     pub(crate) fn admit_charged(
         &self,
         key: String,
@@ -397,6 +423,9 @@ impl JobTable {
         }
     }
 
+    /// Atomically changes a queued job to running and returns its ordered inputs.
+    ///
+    /// Returns `None` when `seq` is absent or no longer queued.
     pub fn start(&self, seq: u64) -> Option<Vec<BatchItem>> {
         let mut jobs = self.lock_jobs();
         let job = jobs.by_seq.get_mut(&seq)?;
@@ -408,6 +437,12 @@ impl JobTable {
         Some(items)
     }
 
+    /// Pairs inference vectors with input metadata by request position.
+    ///
+    /// Vectors must match input count and configured dimensions.
+    /// A mismatch records an `artifact_invalid` failure unless the job already completed;
+    /// a missing job is left unchanged. Ready vectors retain request order and may
+    /// trigger eviction of older completed jobs.
     pub fn publish_ready(&self, seq: u64, vectors: Vec<Vec<f32>>) {
         // Convert vectors before locking so large inference results do not block admission, polling, or shutdown bookkeeping.
         let vectors: Vec<Arc<[f32]>> = vectors.into_iter().map(Arc::from).collect();
@@ -458,6 +493,7 @@ impl JobTable {
         self.enforce_retention(&mut jobs, Some(seq), &mut released);
     }
 
+    /// Records a terminal failure unless the job is absent or already completed.
     pub fn publish_failed(&self, seq: u64, code: String, message: String) {
         // `released` drops after `jobs`, so its permits are released outside the table lock.
         let mut released = Released::default();
@@ -492,6 +528,11 @@ impl JobTable {
         self.enforce_retention(jobs, Some(seq), released);
     }
 
+    /// Polls a job and optionally resumes at a previously issued page boundary.
+    ///
+    /// Unknown, expired, evicted, or foreign-incarnation identifiers return
+    /// [`PollOutcome::Restarted`]. Cursors must name this job and an exact computed
+    /// boundary. Pages preserve request order and share retained vector allocations.
     pub fn poll(&self, job_id: &str, key: &str, cursor: Option<&str>) -> PollOutcome {
         // `released` drops after `jobs`, so its permits are released outside the table lock.
         let mut released = Released::default();
@@ -547,8 +588,7 @@ impl JobTable {
         }
     }
 
-    /// Accept a cursor only when it names this job and its offset is a page boundary; allow previously served pages to be retried after a lost response.
-    /// Allow an already-served page so a client can retry after a lost response.
+    /// Accepts only this job's page boundaries, including already served pages for retries.
     fn parse_cursor(&self, cursor: &str, seq: u64, boundaries: &[usize]) -> Option<usize> {
         let (job_id, offset) = cursor.rsplit_once(':')?;
         if self.parse_job_id(job_id) != Some(seq) {
@@ -558,15 +598,15 @@ impl JobTable {
         boundaries.contains(&offset).then_some(offset)
     }
 
-    /// Reserve worst-case JSON bytes for one `f32` component: sign, up to nine significant digits, exponent, and separator.
+    /// Worst-case JSON bytes for one `f32`: sign, digits, exponent, and separator.
     const ENCODED_BYTES_PER_COMPONENT: usize = 16;
-    /// Charge the fixed JSON envelope for each vector item.
-    /// quotes, separators).
+    /// Fixed JSON envelope charge for each vector item, in bytes.
     const ENCODED_ITEM_OVERHEAD: usize = 64;
 
-    /// Overestimate each result item's JSON size because undercounting can produce a page that exceeds its byte limit.
-    /// Undercounting can create a page whose JSON body exceeds the frame limit; no cursor can serve that page.
-    /// `encoded_item_cost` is an upper bound on one item's serialized bytes.
+    /// Returns an upper bound, in bytes, for one result item's JSON encoding.
+    ///
+    /// Arithmetic overflow returns `usize::MAX`. Overestimation is deliberate because
+    /// undercounting could create a page that exceeds the frame limit.
     pub(crate) fn encoded_item_cost(vector_len: usize, id: &str, hash: &str) -> usize {
         debug_assert!(
             hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -651,7 +691,6 @@ impl JobTable {
                 .map(|job| job.seq);
             let Some(seq) = oldest else {
                 // Evicting the protected job prevents a single oversized result from permanently exceeding a cap.
-                // Evicting the protected job prevents a single oversized result from permanently exceeding a cap.
                 let Some(seq) = keep else { return };
                 released.job(Self::remove(jobs, seq));
                 return;
@@ -668,6 +707,9 @@ impl JobTable {
         Some(job)
     }
 
+    /// Permanently closes admission and removes jobs that have not started.
+    ///
+    /// Running and completed jobs remain until publication, eviction, expiry, or clear.
     pub fn close_admission(&self) {
         // Declare `released` before `jobs` so shutdown releases charges after dropping the table lock.
         let mut released = Released::default();
@@ -684,6 +726,7 @@ impl JobTable {
         }
     }
 
+    /// Removes every job and releases all retained byte charges after unlocking.
     pub fn clear(&self) {
         // Declare `released` before `jobs` so drained jobs free after the table lock.
         let mut released = Released::default();
@@ -875,7 +918,7 @@ mod tests {
         assert_eq!(budget.available(), POOL);
     }
 
-    /// permanent `queue_full`.
+    /// Expiry releases retained charges; it does not turn retryable failures into permanent `queue_full` responses.
     #[test]
     fn sweep_releases_expired_charges_without_a_request_path() {
         const POOL: usize = 1_000_000;
@@ -947,7 +990,7 @@ mod tests {
             "the failed job's retained charge was released with its eviction"
         );
 
-        // re-running inference.
+        // A permanent failure replays without re-running inference.
         jobs.publish_failed(
             retry_seq,
             "schema_violation".to_owned(),

@@ -2,7 +2,7 @@
 
 mod scanner;
 
-use std::{fmt, sync::LazyLock};
+use std::sync::LazyLock;
 
 use mc_secret_scanner::{
     ConstructionError, LimitExhausted, ScanError, ScanLimits, ScanProfile, Scanner,
@@ -92,6 +92,9 @@ const LABEL_AFFIXES: &[&str] = &[
 /// Longest word in the three vocabularies plus a plural suffix bounds cover-scan spans.
 const MAX_VOCABULARY_WORD_BYTES: usize = "authorization".len() + 1;
 
+/// One scanner finding in the original UTF-8 input.
+///
+/// `offset` and `length` are byte counts, not character counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
     pub detector_id: &'static str,
@@ -100,12 +103,14 @@ pub struct Detection {
     pub length: usize,
 }
 
+/// Redacted text plus findings whose spans refer to the original input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redaction {
     pub text: String,
     pub detections: Vec<Detection>,
 }
 
+/// Stable classification for scanner construction, limit, span, and policy failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedactionErrorKind {
     Construction,
@@ -120,7 +125,9 @@ pub enum RedactionErrorKind {
     SecretDetected,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Redaction failure that omits input and secret material from diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}", redaction_error_message(.kind))]
 pub struct RedactionError {
     pub(crate) kind: RedactionErrorKind,
 }
@@ -132,21 +139,17 @@ impl RedactionError {
     }
 }
 
-impl fmt::Display for RedactionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self.kind {
-            RedactionErrorKind::Construction => "secret redactor construction failed",
-            RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
-            RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
-            RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
-            RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
-            RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
-            RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
-        })
+fn redaction_error_message(kind: &RedactionErrorKind) -> &'static str {
+    match kind {
+        RedactionErrorKind::Construction => "secret redactor construction failed",
+        RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
+        RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
+        RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
+        RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
+        RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
+        RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
     }
 }
-
-impl std::error::Error for RedactionError {}
 
 impl From<ConstructionError> for RedactionError {
     fn from(_: ConstructionError) -> Self {
@@ -166,11 +169,13 @@ impl From<ScanError> for RedactionError {
     }
 }
 
+/// Produces deterministic redaction output.
 pub struct Redactor {
     scanner: Scanner,
 }
 
 impl Redactor {
+    /// Uses default scanner limits and reports construction failure without input data.
     pub fn new() -> Result<Self, RedactionError> {
         Self::with_limits(ScanLimits::default())
     }
@@ -181,6 +186,7 @@ impl Redactor {
         })
     }
 
+    /// Returns no partial output when scanning exhausts a limit or yields an invalid span.
     pub fn redact(&self, input: &str) -> Result<Redaction, RedactionError> {
         let report = self.scanner.scan(input)?;
         if let Some(limit) = report.limits_hit {
@@ -216,6 +222,7 @@ const _: () = {
 static TRANSACTION_REDACTOR: LazyLock<Result<Redactor, RedactionError>> =
     LazyLock::new(|| Redactor::with_limits(TRANSACTION_SCAN_LIMITS));
 
+/// Replaces the whole field when scanner construction or scanning fails.
 pub fn redact_durable_text(input: &str) -> Redaction {
     redact_with(&REDACTOR, input)
 }
@@ -439,11 +446,13 @@ fn key_names_a_secret(key: &str) -> bool {
         })
 }
 
+/// Recognizes both supported redaction marker shapes without validating labels.
 #[must_use]
 pub fn contains_redaction_token(text: &str) -> bool {
     text.contains("_REDACTED>") || text.contains("<REDACTED:")
 }
 
+/// Maximum UTF-8 byte length of a key-derived redaction label.
 pub const MAX_REDACTION_LABEL_BYTES: usize = 64;
 
 fn redaction_type_for_key(key: &str) -> String {

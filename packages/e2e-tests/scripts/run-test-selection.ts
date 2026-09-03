@@ -111,11 +111,11 @@ export function pairedDeltaUnitFiles(root: string = E2E_ROOT): string[] {
         cwd: root,
         onlyFiles: true,
     })];
-    /** Checked before the helper file is appended: a literal entry would make the total length nonzero forever, so a glob that stopped matching would leave this lane green while running neither the frozen-pool nor the scenario contracts. commentlint: allow(JUDGE) */
+    /** Checked before the helper file is appended: a literal entry would make the total length nonzero forever, so a glob that stopped matching would leave this lane green while running neither the frozen-pool nor the scenario contracts. */
     if (laneFiles.length === 0) throw new Error("paired delta unit selection is empty");
     const files = [
         ...laneFiles,
-        /** The freeze script's only consumer today, and the `scripts/*.test.ts` glob above reaches this file only through `incident-regression-pool`, which `needs` the plugin checks and skips when they fail. Naming it here keeps the helper's symlink and cleanup guards covered by a job with no `needs`. commentlint: allow(JUDGE) */
+        /** The freeze script's only consumer today, and the `scripts/*.test.ts` glob above reaches this file only through `incident-regression-pool`, which `needs` the plugin checks and skips when they fail. Naming it here keeps the helper's symlink and cleanup guards covered by a job with no `needs`. */
         "scripts/atomic-json-write.test.ts",
     ].sort();
     return assertPresent(files, root);

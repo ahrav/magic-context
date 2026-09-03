@@ -35,7 +35,7 @@ const fileByScenarioId = new Map(
     ]),
 );
 
-/** The path is derived from the id by slug convention, so a file moved into a subdirectory or renamed away from its id resolves to a path that does not exist. Checked here, where the scenario is still in hand, rather than left to surface as a bare `ENOENT` from the digest. commentlint: allow(JUDGE) */
+/** The path is derived from the id by slug convention, so a file moved into a subdirectory or renamed away from its id resolves to a path that does not exist. Checked here, where the scenario is still in hand, rather than left to surface as a bare `ENOENT` from the digest. */
 function assertImplementationFile(
     scenarioId: string,
     implementationFile: string,
@@ -64,15 +64,15 @@ function semanticInput(declaration: ScenarioDeclaration): unknown {
     return { contract: "paired-delta-scenario/v1", ...serializable };
 }
 
-/** Lane-owned files only, and that boundary is a correctness requirement rather than a tradeoff. A digest input must change only when the pool's own meaning changes; hashing a file the pool does not own breaks that, because `pull_request` CI evaluates the merge commit, so any upstream edit to a shared file makes every entry drift on a branch that touched no scenario — and it fails in CI while passing locally, which is the least debuggable shape available. Shared primitives are guarded by their own tests and by every lane that uses them, not by this fingerprint. Deliberately coarse within the boundary: over-triggering a refreeze costs one command, under-triggering hides a semantic change. commentlint: allow(JUDGE) */
+/** Lane-owned files only, and that boundary is a correctness requirement rather than a tradeoff. A digest input must change only when the pool's own meaning changes; hashing a file the pool does not own breaks that, because `pull_request` CI evaluates the merge commit, so any upstream edit to a shared file makes every entry drift on a branch that touched no scenario — and it fails in CI while passing locally, which is the least debuggable shape available. Shared primitives are guarded by their own tests and by every lane that uses them, not by this fingerprint. Deliberately coarse within the boundary: over-triggering a refreeze costs one command, under-triggering hides a semantic change. */
 const LANE_VALIDATION_FILES = [
     "src/paired-delta/contract.ts",
     "src/paired-delta/scenarios/support.ts",
-    /** Where every declaration is passed through `parseScenarioDeclaration`; dropping that call would admit unvalidated declarations while leaving every other digest input byte-identical. commentlint: allow(JUDGE) */
+    /** Where every declaration is passed through `parseScenarioDeclaration`; dropping that call would admit unvalidated declarations while leaving every other digest input byte-identical. */
     "src/paired-delta/scenarios/index.ts",
 ] as const;
 
-/** Read once per root rather than once per scenario: these files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. commentlint: allow(JUDGE) */
+/** Read once per root rather than once per scenario: these files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. */
 const laneBytesByRoot = new Map<string, ReadonlyArray<readonly [string, Buffer]>>();
 
 function laneValidationBytes(root: string): ReadonlyArray<readonly [string, Buffer]> {

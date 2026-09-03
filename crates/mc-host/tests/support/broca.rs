@@ -1,6 +1,5 @@
 //! This module provides a deterministic scriptable backend and a real-loopback composite host for Broca tests.
 //! The composite host uses a real loopback with a `BrocaComponent` tertiary.
-//! `BrocaComponent`.
 
 #![allow(dead_code)]
 
@@ -17,11 +16,14 @@ use mc_host::{CancellationToken, StaticComposite};
 
 use super::raw_client::{self, RawFrame};
 
+/// Canonical project root supplied to Broca test requests.
 pub const ROOT: &str = "/workspace/project";
+/// Maximum wall-clock wait for one expected test frame.
 pub const BUDGET: Duration = Duration::from_secs(5);
 
 type RunFn = dyn Fn(BackendRequest, EventSink, CancellationToken) -> BackendFuture + Send + Sync;
 
+/// Deterministic backend that records starts and delegates execution to a test closure.
 pub struct ScriptedBackend {
     starts: AtomicUsize,
     cancels: Arc<AtomicUsize>,
@@ -113,7 +115,9 @@ impl ScriptedBackend {
         (backend, gate)
     }
 
-    /// cancellation.
+    /// Returns a backend that remains gated even after cancellation.
+    ///
+    /// Releasing a permit lets one execution emit `text` and complete.
     pub fn gated_ignoring_cancel(text: &'static str) -> (Arc<Self>, Arc<tokio::sync::Semaphore>) {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let run_gate = Arc::clone(&gate);
@@ -250,8 +254,9 @@ pub fn send_params(prompt: &str, system: Option<&str>, model: &str) -> serde_jso
     params
 }
 
-/// The helper returns every `StreamData` body in order, followed by the transport terminal frame.
-/// The helper returns every `StreamData` body in order, followed by the transport terminal frame.
+/// Returns every `StreamData` body in arrival order, followed by the transport terminal frame.
+///
+/// Frames for other correlations and ping frames are skipped. Panics if no matching frame arrives within [`BUDGET`].
 pub async fn drain_subscribe(
     client: &mut raw_client::RawClient,
     corr: u64,

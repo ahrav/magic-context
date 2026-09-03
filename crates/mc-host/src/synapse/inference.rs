@@ -1,5 +1,9 @@
-//! This CPU-only backend owns dynamic ORT initialization and performs a structural startup probe and semantic certification against the bundle corpus.
-//! corpus.
+//! CPU-only embedding backend with certified ONNX Runtime loading.
+//!
+//! Loading verifies executable bytes, constructs the model, runs a structural probe, and
+//! certifies output semantics against the bundle corpus before returning a serving backend.
+//! One process-global runtime identity is allowed because ONNX Runtime initialization is
+//! first-wins.
 
 #[cfg(target_os = "linux")]
 use std::io::Write;
@@ -31,24 +35,15 @@ pub struct OrtIdentity {
 /// `Input` errors reject the affected request.
 /// `Artifact` errors disable the component.
 /// `Invariant` errors mark the component failing and prevent suspect vectors from being returned.
-#[derive(Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum InferenceError {
+    #[error("invalid inference input: {0}")]
     Input(String),
+    #[error("inference artifact failure: {0}")]
     Artifact(String),
+    #[error("inference invariant failure: {0}")]
     Invariant(String),
 }
-
-impl std::fmt::Display for InferenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Input(reason) => write!(f, "invalid inference input: {reason}"),
-            Self::Artifact(reason) => write!(f, "inference artifact failure: {reason}"),
-            Self::Invariant(reason) => write!(f, "inference invariant failure: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for InferenceError {}
 
 /// `ORT_COMMITTED` permits one process-global ORT identity because dynamic loading is first-wins; its mutex lets only one racing initializer commit.
 static ORT_COMMITTED: Mutex<Option<OrtIdentity>> = Mutex::new(None);
@@ -167,6 +162,15 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Loads and certifies a bundle against the requested ONNX Runtime identity.
+    ///
+    /// On Linux, runtime bytes are hash-verified, copied to a sealed memfd, and committed once
+    /// per process. A later load must name the same path and SHA-256 identity. The returned
+    /// backend has passed both structural and corpus certification.
+    ///
+    /// Returns `Artifact` for invalid bundle or runtime material and `Invariant` if shared
+    /// initialization state is poisoned. Non-Linux targets return `Artifact` because secure
+    /// runtime staging requires Linux.
     pub fn load(bundle: VerifiedBundle, ort: &OrtIdentity) -> Result<Self, InferenceError> {
         ensure_ort(ort)?;
 
@@ -241,8 +245,14 @@ impl Backend {
         Ok(backend)
     }
 
-    /// embed blocks while running native inference over one ordered page of texts.
-    /// embed returns one finite, unit-norm vector with `dims` components for each input text.
+    /// Runs native inference over one ordered page of texts.
+    ///
+    /// This call blocks and serializes model access with a mutex. Output order matches input
+    /// order. Each vector has the manifest dimension, finite components, and L2 norm within
+    /// `NORM_TOLERANCE` of 1.0.
+    ///
+    /// Returns `Input` for an empty page, empty text, tokenization failure, or zero-token text.
+    /// Returns `Invariant` for poisoned model state, inference failure, or invalid output.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if texts.is_empty() {
             return Err(InferenceError::Input("no texts to embed".to_owned()));
@@ -313,9 +323,10 @@ impl Backend {
         Ok(())
     }
 
-    /// certify uses a corpus that detects incorrect output selection, pooling, and truncation.
-    /// certify rejects structurally healthy models with semantically incorrect output.
-    /// load rejects semantically wrong models before returning a backend that can serve vectors.
+    /// Rejects models whose corpus vectors differ by more than the corpus tolerance.
+    ///
+    /// The corpus detects incorrect output selection, pooling, and truncation. `load` calls this
+    /// before exposing the backend.
     fn certify(&self, corpus: &Corpus) -> Result<(), InferenceError> {
         for item in &corpus.items {
             let got = self.embed(&[item.text.as_str()])?;

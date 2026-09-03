@@ -1,5 +1,9 @@
-//! Separate input-size benchmarks distinguish scaling changes from
-//! constant-factor changes.
+//! Input-size benchmarks for compression, tokenization, history truncation,
+//! boundary selection, reduction selection, and decay rendering.
+//!
+//! Corpus sizes are bytes. History and rendering budgets are token counts.
+//! Each benchmark constructs and validates inputs outside its timed closure so
+//! measurements isolate the kernel under test.
 
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;

@@ -1,3 +1,10 @@
+//! Loss-aware conversion between Pi session JSON and canonical wire messages.
+//!
+//! Decoding preserves native entries and block metadata in a sidecar. Encoding reuses unchanged
+//! native JSON, matches edited blocks by stable identity, removes deleted native parts, and keeps
+//! provider-specific signatures and tool identifiers. Compaction entries become boundary metadata
+//! rather than messages. Unknown supported entry and block shapes remain opaque.
+
 use serde_json::{json, Value};
 
 use super::json::{media_kind, opaque_arc, set_string, set_value, string_field, synth_tool_id};
@@ -13,14 +20,26 @@ use super::sidecar::{
     ExtractedBoundary, HarnessMessageMeta, MatchedBlockMetas,
 };
 
+/// One Pi session entry represented as unvalidated JSON.
 pub type PiSessionEntryJson = Value;
 
 const HARNESS: &str = "pi";
 
+/// Decodes Pi entries without metadata from an earlier observation.
+///
+/// Message ordinals are one-based among emitted messages. Compaction entries update the extracted
+/// boundary and emit no message. Unsupported ordinary entries are skipped, while recognized custom
+/// entries are retained as opaque user messages.
 pub fn decode_pi(entries: &[PiSessionEntryJson]) -> DecodedHarnessMessages {
     decode_pi_with_sidecar(entries, None)
 }
 
+/// Decodes Pi entries and inherits stable message-ID pins from `prior`.
+///
+/// Existing pins prevent a later response ID from replacing an ID chosen on first sight. Block
+/// metadata retains native indexes, identifiers, raw JSON, and content fingerprints for loss-aware
+/// re-encoding. A prior sidecar from another harness is not rejected; callers must provide the Pi
+/// sidecar associated with these entries.
 pub fn decode_pi_with_sidecar(
     entries: &[PiSessionEntryJson],
     prior: Option<&DecodeSidecar>,
@@ -126,6 +145,11 @@ pub fn decode_pi_with_sidecar(
     }
 }
 
+/// Encodes canonical messages as Pi session entries using retained native metadata when available.
+///
+/// Unchanged matched messages replay their raw JSON. Edited blocks keep matched native extras;
+/// deleted blocks remove their native parts. Messages with no metadata use Pi's current JSON shape.
+/// Empty retained messages that cannot produce an entry are omitted. Output order follows `messages`.
 pub fn encode_pi(messages: &[CkWireMessage], sidecar: &DecodeSidecar) -> Vec<PiSessionEntryJson> {
     messages
         .iter()

@@ -13,12 +13,14 @@ pub(crate) use alignment::{
     rebuild_alignment_tx, rebuild_alignment_with_writer, ALIGNMENT_DEPENDENCY_KIND,
 };
 
+/// Human-readable content stored with a decision.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DecisionPayload {
     pub summary: String,
     pub rationale: String,
 }
 
+/// Complete input for inserting a versioned decision and its object identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionSpec {
     pub decision_id: String,
@@ -36,6 +38,7 @@ pub struct DecisionSpec {
     pub sensitivity: Sensitivity,
 }
 
+/// Human-readable classification and optional versioned detail for an observation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ObservationPayload {
     pub summary: String,
@@ -47,6 +50,7 @@ pub struct ObservationPayload {
     pub detail: Option<String>,
 }
 
+/// Directed dependency recorded with an observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationDependencySpec {
     pub dependency_object_id: String,
@@ -54,6 +58,7 @@ pub struct ObservationDependencySpec {
     pub dependency_payload: Option<String>,
 }
 
+/// Complete input for inserting a versioned observation and its dependencies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationSpec {
     pub observation_id: String,
@@ -65,6 +70,7 @@ pub struct ObservationSpec {
     pub evidence_id: Option<String>,
     pub observation_kind: String,
     pub payload: ObservationPayload,
+    /// Observation timestamp in caller-defined epoch units preserved by storage.
     pub observed_at: i64,
     pub dependencies: Vec<ObservationDependencySpec>,
     pub source_kind: String,
@@ -73,19 +79,23 @@ pub struct ObservationSpec {
     pub sensitivity: Sensitivity,
 }
 
+/// Human-readable content attached to a decision event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecisionEventPayload {
     pub summary: String,
 }
 
+/// Input for appending one event to a decision's ordered event stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionEventSpec {
     pub event_kind: String,
     pub payload: DecisionEventPayload,
     pub evidence_id: Option<String>,
+    /// Event timestamp in caller-defined epoch units preserved by storage.
     pub recorded_at: i64,
 }
 
+/// Stable identifiers returned after a decision write commits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecisionWriteOutcome {
     pub decision_id: String,
@@ -93,11 +103,13 @@ pub struct DecisionWriteOutcome {
 }
 
 impl DecisionWriteOutcome {
+    /// Serializes the string-only outcome; serialization cannot fail for these fields.
     pub fn result_json(&self) -> String {
         serde_json::to_string(self).expect("string-only outcome is serializable")
     }
 }
 
+/// Stable identifiers returned after an observation write commits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservationWriteOutcome {
     pub observation_id: String,
@@ -105,11 +117,13 @@ pub struct ObservationWriteOutcome {
 }
 
 impl ObservationWriteOutcome {
+    /// Serializes the string-only outcome; serialization cannot fail for these fields.
     pub fn result_json(&self) -> String {
         serde_json::to_string(self).expect("string-only outcome is serializable")
     }
 }
 
+/// Decision identity and ordinal assigned by storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecisionEventOutcome {
     pub decision_id: String,
@@ -117,11 +131,13 @@ pub struct DecisionEventOutcome {
 }
 
 impl DecisionEventOutcome {
+    /// Serializes the string-and-integer outcome; serialization cannot fail for these fields.
     pub fn result_json(&self) -> String {
         serde_json::to_string(self).expect("string and integer outcome is serializable")
     }
 }
 
+/// Object identity returned after a retirement write commits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirementOutcome {
     pub object_id: String,
@@ -129,6 +145,7 @@ pub struct RetirementOutcome {
 }
 
 impl RetirementOutcome {
+    /// Serializes the string-only outcome; serialization cannot fail for these fields.
     pub fn result_json(&self) -> String {
         serde_json::to_string(self).expect("string-only outcome is serializable")
     }

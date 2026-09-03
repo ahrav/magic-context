@@ -1,6 +1,6 @@
 //! O3, git-branch applicability: `ResolutionLadder::evaluate` agrees with an
-//! independent breadth-first reachability oracle for every (anchor, head)
-//! pair over random commit DAGs with merges and a disconnected root. Patch-id
+//! independent reachability oracle for every `(anchor, head)` pair over random
+//! commit DAGs with merges and a disconnected root. Patch-id
 //! fallback through `ApplicabilityEngine::evaluate` and duplicate-patch-id
 //! ambiguity are proven in the sibling anchor-resolution and acceptance
 //! files, which the registry cites; this module owns the graph property.
@@ -24,9 +24,10 @@ use crate::git_fixtures::{commit_snapshot, init_repo, materialize, set_head_deta
 
 const SEED: [u8; 32] = *b"kernel-proofs-o3-branch-reach-01";
 
-/// Parent choices per commit as abstract indices; commit `i` resolves each
-/// choice modulo `i`, so shrinking any prefix still yields a valid DAG. A
-/// `None` first parent starts a new root.
+/// Parent choices per commit as abstract indices.
+///
+/// Commit `i` resolves each choice modulo `i`, so every edge points to an earlier commit and
+/// shrinking any prefix still yields an acyclic graph. A `None` first parent starts a new root.
 #[derive(Debug, Clone)]
 struct Shape {
     parents: Vec<(Option<u8>, Option<u8>)>,
@@ -49,8 +50,10 @@ struct Dag {
 }
 
 impl Dag {
-    /// Resolves the shape into real commits: at most two merges, the first
-    /// commit always a root.
+    /// Resolves the shape into real commits with at most two merge commits.
+    ///
+    /// Commit timestamps increase by one second from the Unix epoch. Each commit uses its own ref
+    /// so disconnected roots can coexist in one fixture repository.
     fn build(repo: &gix::Repository, shape: &Shape) -> Self {
         let mut commits = Vec::new();
         let mut parents: Vec<Vec<usize>> = Vec::new();
@@ -87,8 +90,9 @@ impl Dag {
         Self { commits, parents }
     }
 
-    /// Ancestors of `head` including itself, by breadth-first walk over the
-    /// parent lists recorded at build time.
+    /// Returns the transitive parent closure of `head`, including `head`.
+    ///
+    /// The ordered set makes oracle membership independent of Git traversal order.
     fn ancestors(&self, head: usize) -> BTreeSet<usize> {
         let mut seen = BTreeSet::from([head]);
         let mut queue = vec![head];
@@ -103,8 +107,14 @@ impl Dag {
     }
 }
 
-/// Checks every pair and returns `(merges, roots)` of the built DAG so the
-/// property can prove its generator reached merges and disconnected roots.
+/// Checks every anchor, head, and valid window-end combination.
+///
+/// Returns `(merges, roots)` so the property can prove the deterministic sample exercised merges
+/// and disconnected components.
+///
+/// # Panics
+///
+/// Panics when fixture construction fails or the resolution ladder disagrees with the oracle.
 fn run(shape: &Shape) -> (usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());

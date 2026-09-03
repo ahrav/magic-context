@@ -1,3 +1,8 @@
+//! Transactional writes for decision and observation slices.
+//!
+//! Inputs are redacted before persistence. Each successful write updates typed rows, object
+//! registry state, redaction metadata, and the envelope change list in one transaction.
+
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Serialize;
 
@@ -91,6 +96,10 @@ struct StoredEventPayload<'a> {
 }
 
 impl Envelope<'_> {
+    /// Inserts a live decision and its registry and redaction records.
+    ///
+    /// Returns `InvalidInput` for invalid required fields or payload serialization, `NotFound`
+    /// for missing live parents, and mapped storage errors for constraint or I/O failures.
     pub fn insert_decision(
         &mut self,
         spec: DecisionSpec,
@@ -108,6 +117,10 @@ impl Envelope<'_> {
         Ok(outcome)
     }
 
+    /// Inserts a live observation after validating every declared dependency.
+    ///
+    /// Alignment dependencies must reference live decisions; other dependencies may reference
+    /// any live registered object. Validation finishes before registry insertion.
     pub fn insert_observation(
         &mut self,
         spec: ObservationSpec,
@@ -126,6 +139,10 @@ impl Envelope<'_> {
     }
 
     /// Appends to a live decision and allocates its next ordinal inside this envelope.
+    ///
+    /// Ordinals increase from the current maximum under the envelope transaction. Concurrent
+    /// writers are serialized by that transaction. Missing decisions or evidence return
+    /// `NotFound`; negative timestamps and empty event kinds return `InvalidInput`.
     pub fn append_decision_event(
         &mut self,
         decision_id: &str,
@@ -201,6 +218,10 @@ impl Envelope<'_> {
         })
     }
 
+    /// Replaces a live decision while preserving domain and source identity.
+    ///
+    /// Source revision must increase. The old object is invalidated before the replacement and
+    /// linked to its successor in the same transaction. Lost authority demotes dependents.
     pub fn correct_decision(
         &mut self,
         replaced_object_id: &str,
@@ -250,6 +271,10 @@ impl Envelope<'_> {
         Ok(outcome)
     }
 
+    /// Replaces a live observation while preserving domain and source identity.
+    ///
+    /// Source revision must increase. The old object invalidation, replacement insertion, and
+    /// successor link share the envelope transaction.
     pub fn correct_observation(
         &mut self,
         replaced_object_id: &str,
@@ -292,10 +317,12 @@ impl Envelope<'_> {
         Ok(outcome)
     }
 
+    /// Invalidates a live decision and demotes dependents if its authority is lost.
     pub fn retire_decision(&mut self, object_id: &str) -> Result<RetirementOutcome, KernelError> {
         self.retire_slice_object(object_id, "decision", "decisions")
     }
 
+    /// Invalidates a live observation without deleting its historical row.
     pub fn retire_observation(
         &mut self,
         object_id: &str,

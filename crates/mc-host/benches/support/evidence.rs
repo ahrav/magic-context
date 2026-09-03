@@ -1,11 +1,11 @@
-//! complete-only aggregation.
+//! Persists benchmark attempts and aggregates complete, compatible evidence.
 //!
-//! Rules: refuse a preexisting attempt directory, write sidecars before
-//! summary fields, checksum every sidecar, and atomically move `running`
-//! to exactly one terminal state. Histograms merge only within one arm
-//! whose complete manifests share schema, workload, build, host, and arm
-//! identifiers. Paired gaps join the atomic-floor and serial-ring arms only
-//! when build, host, ordered CPU pair, and run block all match.
+//! Attempt creation refuses preexisting directories. A terminal manifest is valid
+//! only when all referenced sidecars exist and carry SHA-256 digests. Manifest
+//! publication uses an atomic rename and yields exactly one terminal manifest.
+//! Histogram merges require matching schema, workload, build, host, arm, and
+//! collection configuration. Paired gaps require matching build, host, ordered CPU
+//! pair, topology class, and run block.
 
 #![allow(dead_code)]
 
@@ -53,10 +53,10 @@ pub struct BuildId {
     pub commit: String,
     pub rustc: String,
     pub profile: String,
-    /// `binary` is a hash prefix of the measured executable.
-    /// `commit`, `rustc`, and `profile` cannot distinguish builds that differ in inherited codegen settings.
-    /// Missing `binary` fields deserialize as an empty string.
-    /// field existed.
+    /// Hash prefix of the measured executable.
+    ///
+    /// `commit`, `rustc`, and `profile` cannot distinguish builds that differ in
+    /// inherited codegen settings. Missing fields deserialize as an empty string.
     #[serde(default)]
     pub binary: String,
 }
@@ -87,6 +87,9 @@ impl Default for HistogramConfig {
 }
 
 impl HistogramConfig {
+    /// Builds an empty nanosecond histogram with this configuration.
+    ///
+    /// Returns an error when bounds or significant figures are invalid.
     pub fn build(&self) -> Result<Histogram<u64>, String> {
         Histogram::new_with_bounds(self.low_ns, self.high_ns, self.sigfigs)
             .map_err(|err| format!("histogram bounds: {err}"))
@@ -163,6 +166,10 @@ impl Attempt {
         &mut self.manifest
     }
 
+    /// Writes `bytes` under the attempt directory and records its SHA-256 digest.
+    ///
+    /// Returns an error when the sidecar cannot be written. Callers must pass a
+    /// relative file name to keep the sidecar inside the attempt directory.
     pub fn add_sidecar(&mut self, file: &str, bytes: &[u8]) -> Result<(), String> {
         let path = self.dir.join(file);
         std::fs::write(&path, bytes).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -181,7 +188,10 @@ impl Attempt {
         self.add_sidecar(file, &bytes)
     }
 
-    /// Finalization moves an attempt from `running` to exactly one terminal state.
+    /// Moves an attempt from `running` to one terminal state and returns its manifest path.
+    ///
+    /// Panics when `state` is [`State::Running`]. Returns an error when serialization,
+    /// writing, or the atomic rename fails.
     pub fn finalize(mut self, state: State) -> Result<PathBuf, String> {
         assert!(
             !matches!(state, State::Running),
@@ -252,8 +262,10 @@ pub struct LoadedAttempt {
     pub manifest: Manifest,
 }
 
-/// Loads every finalized attempt under a run directory. Attempts with only a running manifest are in flight or were interrupted before finalization.
-/// not loaded.
+/// Loads finalized attempts under a run directory in lexicographic directory order.
+///
+/// Attempts with only a running manifest are omitted. Returns an error for directory
+/// enumeration, file I/O, JSON decoding, or any unsupported manifest schema.
 pub fn load_attempts(run_dir: &Path) -> Result<Vec<LoadedAttempt>, String> {
     let mut out = Vec::new();
     let entries =
@@ -316,9 +328,11 @@ pub fn compatible(a: &Manifest, b: &Manifest) -> bool {
     same_environment(a, b) && a.collection == b.collection
 }
 
-/// `require_declared` prevents reads that would bypass `verify_sidecars`, which verifies only manifest-declared sidecars.
-/// `verify_sidecars` verifies only sidecars declared in the manifest, so reading an undeclared file bypasses verification.
-/// An edited manifest could drop a declaration, pair an altered file with an altered scalar, and still verify.
+/// Requires `file` to appear exactly once in the manifest.
+///
+/// This prevents reads from bypassing [`verify_sidecars`], which can verify only
+/// declared sidecars. An edited manifest could otherwise remove a declaration and
+/// pair altered file data with an altered scalar.
 pub fn require_declared(attempt: &LoadedAttempt, file: &str) -> Result<(), String> {
     match attempt
         .manifest
@@ -344,7 +358,11 @@ pub fn read_histogram(attempt: &LoadedAttempt, file: &str) -> Result<Histogram<u
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
-/// Return an error instead of a partial merge when a complete attempt is incompatible or has a corrupt sidecar.
+/// Merges the named histogram from every complete attempt for `arm`.
+///
+/// Returns an error instead of a partial merge when no attempt exists, histogram
+/// configuration is absent or inconsistent, environments differ, sidecar validation
+/// fails, decoding fails, or histogram addition fails. Values and bounds use nanoseconds.
 pub fn merge_arm_histograms(
     attempts: &[LoadedAttempt],
     arm: &ArmId,
@@ -556,6 +574,9 @@ pub fn counterbalanced_schedule(blocks: u32, arms: &[String]) -> Vec<Vec<String>
         .collect()
 }
 
+/// Sorts `values` in place and returns their median.
+///
+/// Returns `None` for an empty slice. Panics when any comparison encounters NaN.
 pub fn median(values: &mut [f64]) -> Option<f64> {
     if values.is_empty() {
         return None;

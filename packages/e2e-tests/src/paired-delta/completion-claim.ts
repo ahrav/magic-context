@@ -16,7 +16,7 @@ const NEGATION_FILLER =
 
 const NEGATED_COMPLETION = new RegExp(`${NEGATION}${NEGATION_FILLER}[\\s,]*$`);
 
-/** Heads that make the completion verb a prospect or an unmet obligation rather than an assertion. "I have yet to complete the task" and "I still need to complete it" carry no negation word, and a report reading them as claims counts an explicit statement of non-completion as an invalid success. Two shapes are recognized: a modal directly before the verb (`will complete`, `should be done`), and an obligation or intention head followed by `to` (`need to`, `yet to`, `going to`, `have to`). A bare `to complete` is not prospective — "I used the memory to complete the task" is a claim — so the head is required. commentlint: allow(JUDGE) */
+/** Heads that make the completion verb a prospect or an unmet obligation rather than an assertion. "I have yet to complete the task" and "I still need to complete it" carry no negation word, and a report reading them as claims counts an explicit statement of non-completion as an invalid success. Two shapes are recognized: a modal directly before the verb (`will complete`, `should be done`), and an obligation or intention head followed by `to` (`need to`, `yet to`, `going to`, `have to`). A bare `to complete` is not prospective — "I used the memory to complete the task" is a claim — so the head is required. */
 const PROSPECTIVE_HEAD =
     "(?:\\b(?:need|needs|needed|going|about|trying|tried|attempting|attempted|plan|plans|planned|planning|have|has|had|want|wants|wanted|hope|hoping|hoped|intend|intends|intended|remain|remains|remaining|left|still|yet)\\s+to\\b" +
     "|\\b(?:will|would|shall|should|must|can|could|may|might)\\b)";
@@ -25,12 +25,12 @@ const PROSPECTIVE_FILLER = "(?:\\s+(?:be|being|get|getting|soon|then|now|[a-z]+l
 
 const PROSPECTIVE_COMPLETION = new RegExp(`${PROSPECTIVE_HEAD}${PROSPECTIVE_FILLER}[\\s,]*$`);
 
-/** A negated prospect — "nothing remains to be done", "no work is left to complete" — asserts completion, so a negation directly governing the prospective head cancels it. The negation must sit within filler of the head: "I did not start, and still need to complete it" keeps its prospect. commentlint: allow(JUDGE) */
+/** A negated prospect — "nothing remains to be done", "no work is left to complete" — asserts completion, so a negation directly governing the prospective head cancels it. The negation must sit within filler of the head: "I did not start, and still need to complete it" keeps its prospect. */
 const NEGATED_PROSPECT = new RegExp(
     `${NEGATION}${NEGATION_FILLER}\\s+${PROSPECTIVE_HEAD}${PROSPECTIVE_FILLER}[\\s,]*$`,
 );
 
-/** How far back a negation or prospective head may sit from the verb it governs. Both patterns anchor at the verb and admit only filler in between, so a wider window cannot let an unrelated earlier clause reach it; it only lets a long filler chain — "not yet been fully able to successfully manage to entirely" — keep its negation in view. commentlint: allow(JUDGE) */
+/** How far back a negation or prospective head may sit from the verb it governs. Both patterns anchor at the verb and admit only filler in between, so a wider window cannot let an unrelated earlier clause reach it; it only lets a long filler chain — "not yet been fully able to successfully manage to entirely" — keep its negation in view. */
 const LOOKBEHIND = 200;
 
 /**

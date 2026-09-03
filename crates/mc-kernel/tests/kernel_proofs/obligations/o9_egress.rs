@@ -3,9 +3,9 @@
 //! references) domain against a spec written independently of the code
 //! path, the spec's own monotone restriction when a reference is added, the
 //! unknown and dereferenced cases, and the admission surface hiding
-//! sensitive rows on remote-capable surfaces and secret rows everywhere. commentlint: allow(JUDGE)
-//! A daemon gate that turns these decisions into refused requests is a commentlint: allow(JUDGE)
-//! separate surface with its own row. commentlint: allow(JUDGE)
+//! sensitive rows on remote-capable surfaces and secret rows everywhere.
+//! A daemon gate that turns these decisions into refused requests is a
+//! separate surface with its own row.
 
 use mc_kernel::{
     ArtifactDestination, ArtifactEligibility, ArtifactHandle, EligibilityDeniedReason, EventKind,
@@ -19,7 +19,7 @@ use crate::harness::Proof;
 
 /// Every (sensitivity, egress class) a reference can carry; the matrix
 /// indexes into this so its keys stay `Ord` without deriving on kernel types.
-/// Adding a variant to either vocabulary widens this product. commentlint: allow(JUDGE)
+/// Adding a variant to either vocabulary widens this product.
 const CLASS_COUNT: usize = Sensitivity::ALL.len() * ProviderEgress::ALL.len();
 const CLASSES: [(Sensitivity, ProviderEgress); CLASS_COUNT] = classes();
 
@@ -130,7 +130,7 @@ fn eligibility_matrix_is_exhaustive() {
     });
     let sets = reference_sets();
     // The closed-form multiset count keeps a widened vocabulary from silently
-    // shrinking the matrix. commentlint: allow(JUDGE)
+    // shrinking the matrix.
     let classes = CLASSES.len();
     assert_eq!(
         sets.len(),
@@ -158,8 +158,8 @@ fn eligibility_matrix_is_exhaustive() {
     assert!(allowed > 0);
 }
 
-/// The merged-reference fold reads rows in query order, and `expected` reads commentlint: allow(JUDGE)
-/// the set with `any`, so every ordering owes the same decision. commentlint: allow(JUDGE)
+/// The merged-reference fold reads rows in query order, and `expected` reads
+/// the set with `any`, so every ordering owes the same decision.
 #[test]
 fn eligibility_ignores_the_order_references_were_ingested_in() {
     let mut proof = Proof::open();
@@ -190,14 +190,14 @@ fn eligibility_ignores_the_order_references_were_ingested_in() {
             }
         }
     }
-    // These assertions require sets whose classes differ, the only ones with commentlint: allow(JUDGE)
-    // more than one ordering. commentlint: allow(JUDGE)
+    // These assertions require sets whose classes differ, the only ones with
+    // more than one ordering.
     assert!(reordered > 0);
 }
 
-/// The stored class each live row carries, as the policy states it: the commentlint: allow(JUDGE)
-/// strictest sensitivity present, and local-only if any reference is. The commentlint: allow(JUDGE)
-/// matches force a new variant in either vocabulary through here. commentlint: allow(JUDGE)
+/// The stored class each live row carries, as the policy states it: the
+/// strictest sensitivity present, and local-only if any reference is. The
+/// matches force a new variant in either vocabulary through here.
 fn stored_class(references: &[usize]) -> (&'static str, &'static str) {
     let classes = references
         .iter()
@@ -223,10 +223,10 @@ fn stored_class(references: &[usize]) -> (&'static str, &'static str) {
     (sensitivity, egress)
 }
 
-/// Ingest rewrites every live row for the digest to the merged class, so they commentlint: allow(JUDGE)
-/// all carry the strictest one. That invariant, not the read-side fold, is what commentlint: allow(JUDGE)
-/// makes a decision independent of which rows a query returns or in what commentlint: allow(JUDGE)
-/// order. commentlint: allow(JUDGE)
+/// Ingest rewrites every live row for the digest to the merged class, so they
+/// all carry the strictest one. That invariant, not the read-side fold, is what
+/// makes a decision independent of which rows a query returns or in what
+/// order.
 #[test]
 fn merging_a_reference_rewrites_every_live_row_to_the_restrictive_class() {
     let mut proof = Proof::open();
@@ -269,10 +269,10 @@ fn merging_a_reference_rewrites_every_live_row_to_the_restrictive_class() {
     }
 }
 
-/// The matrix stops at three references, but production merges and folds every commentlint: allow(JUDGE)
-/// live row and permits arbitrarily many. Each case puts the restrictive class commentlint: allow(JUDGE)
-/// past that edge, and the control asserts the answer differs from the one the commentlint: allow(JUDGE)
-/// leading permissive references alone would give. commentlint: allow(JUDGE)
+/// The matrix stops at three references, but production merges and folds every
+/// live row and permits arbitrarily many. Each case puts the restrictive class
+/// past that edge, and the control asserts the answer differs from the one the
+/// leading permissive references alone would give.
 #[test]
 fn a_restrictive_reference_past_the_matrix_edge_still_governs() {
     let mut proof = Proof::open();
@@ -281,7 +281,7 @@ fn a_restrictive_reference_past_the_matrix_edge_still_governs() {
         Ok(String::new())
     });
     // Class 0 is (Normal, RemoteAllowed), the only fully permissive class; the
-    // restrictive classes are one of each denial kind. commentlint: allow(JUDGE)
+    // restrictive classes are one of each denial kind.
     let permissive = 0;
     let cases = [(3usize, 1usize), (3, 2), (3, 4), (5, 1), (5, 2), (5, 4)];
     for (point, (leading, restrictive)) in cases.into_iter().enumerate() {
@@ -306,10 +306,10 @@ fn a_restrictive_reference_past_the_matrix_edge_still_governs() {
     }
 }
 
-/// A property of the written policy itself, holding for `expected` and commentlint: allow(JUDGE)
-/// matching the exhaustive matrix, which together prove it for production. commentlint: allow(JUDGE)
-/// `reference_sets` starts at one reference, so the first-reference transition commentlint: allow(JUDGE)
-/// is out of scope here and covered below. commentlint: allow(JUDGE)
+/// A property of the written policy itself, holding for `expected` and
+/// matching the exhaustive matrix, which together prove it for production.
+/// `reference_sets` starts at one reference, so the first-reference transition
+/// is out of scope here and covered below.
 #[test]
 fn expected_policy_never_widens_when_a_reference_joins_a_referenced_artifact() {
     let mut widened = 0;
@@ -339,9 +339,9 @@ fn expected_policy_never_widens_when_a_reference_joins_a_referenced_artifact() {
     assert!(narrowed > 0);
 }
 
-/// The unreferenced case is unknown, not permissive, so it denies remote. The commentlint: allow(JUDGE)
-/// first reference widens remote exactly when it proves the artifact normal and commentlint: allow(JUDGE)
-/// remote-allowed, and narrows local exactly when it proves it secret. commentlint: allow(JUDGE)
+/// The unreferenced case is unknown, not permissive, so it denies remote. The
+/// first reference widens remote exactly when it proves the artifact normal and
+/// remote-allowed, and narrows local exactly when it proves it secret.
 #[test]
 fn the_first_reference_widens_remote_only_for_a_remote_allowed_normal_class() {
     use ArtifactEligibility::Allowed;
@@ -442,10 +442,10 @@ fn tombstone_denies_before_any_reference_is_consulted() {
     }
 }
 
-/// Expected admission visibility, stated as the policy rather than read from commentlint: allow(JUDGE)
-/// `surface_visibility`: secret is hidden everywhere, sensitive only reaches commentlint: allow(JUDGE)
-/// explicit user search, normal reaches every surface. Both matches are commentlint: allow(JUDGE)
-/// exhaustive, so a new variant in either vocabulary must be classified here. commentlint: allow(JUDGE)
+/// Expected admission visibility, stated as the policy rather than read from
+/// `surface_visibility`: secret is hidden everywhere, sensitive only reaches
+/// explicit user search, normal reaches every surface. Both matches are
+/// exhaustive, so a new variant in either vocabulary must be classified here.
 fn expected_visibility(sensitivity: Sensitivity, surface: Surface) -> Option<SurfaceVisibility> {
     let reaches_automatic_surfaces = match sensitivity {
         Sensitivity::Normal => true,
@@ -469,8 +469,8 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
         envelope.insert_domain(root_domain())?;
         Ok(String::new())
     });
-    // One subject per sensitivity, admitted by the same observed-code event, so commentlint: allow(JUDGE)
-    // any surface difference is the sensitivity gate. commentlint: allow(JUDGE)
+    // One subject per sensitivity, admitted by the same observed-code event, so
+    // any surface difference is the sensitivity gate.
     let subjects = Sensitivity::ALL
         .iter()
         .enumerate()
@@ -495,8 +495,8 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
     }
     proof.restart();
     let tip = proof.tip();
-    // An absent row is also what a never-admitted object yields, so every commentlint: allow(JUDGE)
-    // subject must be known at the tip for `None` to mean hidden. commentlint: allow(JUDGE)
+    // An absent row is also what a never-admitted object yields, so every
+    // subject must be known at the tip for `None` to mean hidden.
     let known = proof.store().known_as_of(tip).unwrap();
     for &(index, _) in &subjects {
         let object_id = format!("object-{index}");
@@ -515,8 +515,8 @@ fn admission_hides_sensitive_subjects_on_remote_capable_surfaces() {
             .find(|row| row.object.object_id == object_id)
             .map(|row| row.visibility)
     };
-    // These assertions require the matrix to contain both a visible and a commentlint: allow(JUDGE)
-    // hidden cell, so the comparison below discriminates. commentlint: allow(JUDGE)
+    // These assertions require the matrix to contain both a visible and a
+    // hidden cell, so the comparison below discriminates.
     let cells = || {
         subjects.iter().flat_map(|&(index, sensitivity)| {
             Surface::ALL

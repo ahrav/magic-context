@@ -9,11 +9,10 @@ use sha2::{Digest, Sha256};
 use super::checkout::{CheckoutSnapshot, EvalBudget, WorktreeEntry};
 use super::payloads::CheckSpec;
 
+/// Maximum config bytes read for one cheap check.
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
-/// Typed verdict of one cheap check. `Unsupported` is a first-class
-/// outcome — the evaluator maps it to uncertain rather than inventing a
-/// pass or fail (KTD8: no speculative resolver trait).
+/// The evaluator maps `Unsupported` to uncertain rather than pass or fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
     Passed,
@@ -53,10 +52,10 @@ enum Resolved {
     RegularFile,
     /// Resolved beneath the worktree and definitely not there.
     Absent,
-    /// Present, and established to be a shape no check can read: a directory, commentlint: allow(JUDGE)
-    /// socket, device, or FIFO. No regular file is at this path, which is as commentlint: allow(JUDGE)
-    /// definite an answer about the declared file as absence — unlike a commentlint: allow(JUDGE)
-    /// symlink, whose unfollowed target could be one. commentlint: allow(JUDGE)
+    /// Present, and established to be a shape no check can read: a directory,
+    /// socket, device, or FIFO. No regular file is at this path, which is as
+    /// definite an answer about the declared file as absence — unlike a
+    /// symlink, whose unfollowed target could be one.
     NotAFile(String),
     /// Nothing was read: the spelling leaves the worktree, or an inspection
     /// failed, or a symlink was refused rather than followed.
@@ -75,11 +74,11 @@ impl Resolved {
 
 /// Single authority on what one batch observed in the worktree.
 ///
-/// The object cache key and the check that produces a verdict both read commentlint: allow(JUDGE)
-/// through here, so a cached verdict can never describe bytes its key does commentlint: allow(JUDGE)
-/// not. Reading the live filesystem twice would let a path change between the commentlint: allow(JUDGE)
-/// two reads and revert afterwards, storing a verdict under a key no later commentlint: allow(JUDGE)
-/// request reproduces. commentlint: allow(JUDGE)
+/// The object cache key and the check that produces a verdict both read
+/// through here, so a cached verdict can never describe bytes its key does
+/// not. Reading the live filesystem twice would let a path change between the
+/// two reads and revert afterwards, storing a verdict under a key no later
+/// request reproduces.
 #[derive(Debug, Default)]
 pub struct CheckCache {
     resolved: HashMap<String, Resolved>,
@@ -157,11 +156,11 @@ pub fn check_observation(
 /// Reads through a descriptor walk that follows no symlink at any level, and
 /// sizes the file by that descriptor.
 ///
-/// A pathname re-resolved after a containment check can escape: a concurrent commentlint: allow(JUDGE)
-/// checkout that replaces an ancestor directory with a symlink redirects every commentlint: allow(JUDGE)
-/// later pathname operation, and `NOFOLLOW` guards only the final component. commentlint: allow(JUDGE)
-/// FIFOs can block reads and character devices such as `/dev/zero` produce commentlint: allow(JUDGE)
-/// valid UTF-8 indefinitely, both of which the open refuses. commentlint: allow(JUDGE)
+/// A pathname re-resolved after a containment check can escape: a concurrent
+/// checkout that replaces an ancestor directory with a symlink redirects every
+/// later pathname operation, and `NOFOLLOW` guards only the final component.
+/// FIFOs can block reads and character devices such as `/dev/zero` produce
+/// valid UTF-8 indefinitely, both of which the open refuses.
 fn read_bounded(snapshot: &CheckoutSnapshot, path: &str) -> ConfigRead {
     let file = match snapshot.open_worktree_regular(path) {
         Ok(Some(file)) => file,

@@ -1639,7 +1639,7 @@ fn load_subject_facts(
 
 /// Object subjects include source history because `visible_as_of` evaluates both
 /// histories. Skipping source history lets a later object decision override a
-/// newer source rejection and restore visibility. commentlint: allow(JUDGE)
+/// newer source rejection and restore visibility.
 fn load_prior_decision(
     envelope: &Envelope<'_>,
     facts: &SubjectFacts,
@@ -1962,8 +1962,9 @@ fn validate_trigger(
                 None => Ok(None),
             }
         }
-        // kh8.4 owns the passing-artifact writer. A bare evidence reference cannot
-        // establish that contract, so enforcement remains closed until that seam exists.
+        // No writer records a passing artifact for an enforcement event, and a
+        // bare evidence reference cannot establish that contract, so enforcement
+        // resolves closed.
         EventKind::Enforce => Ok(None),
         _ => Ok(Some(None)),
     }

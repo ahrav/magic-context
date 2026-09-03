@@ -1,12 +1,17 @@
+//! Deterministic fixtures for in-process module tests.
 //!
+//! Builders retain storage ownership and emit wire-compatible JSON without
+//! starting provider or host processes.
 
 use serde_json::{json, Value};
 
+/// `StoreFixture` keeps backing directory alive for `store`.
 pub struct StoreFixture {
     pub dir: tempfile::TempDir,
     pub store: mc_store::McStore,
 }
 
+/// Builds a module-isolated SQLite descriptor rooted at `path`.
 pub fn descriptor(path: &std::path::Path) -> cortexkit_store_types::StorageDescriptor {
     cortexkit_store_types::StorageDescriptor {
         module_id: "magic-context-test".to_string(),
@@ -24,6 +29,7 @@ use crate::ck_wire::{
 use crate::decay_render::DecayRenderCompartment;
 use crate::injection::build_synthetic_todo_pair;
 
+/// Complete input set for one in-process transform fixture.
 #[derive(Debug, Clone)]
 pub struct InProcessFixture {
     pub session_id: String,
@@ -34,6 +40,7 @@ pub struct InProcessFixture {
 }
 
 impl InProcessFixture {
+    /// Renders a single-batch state-import message.
     pub fn state_import(&self) -> Value {
         json!({
             "kind": "state_import",
@@ -53,6 +60,7 @@ impl InProcessFixture {
         })
     }
 
+    /// Renders a version-2 owned-runner transform request.
     pub fn handle_transform(&self) -> Value {
         json!({
             "kind": "transform",
@@ -80,6 +88,7 @@ impl FixtureBuilder {
         StoreFixture { dir, store }
     }
 
+    /// Builds a two-message session with one compartment boundary.
     pub fn session_with_boundary() -> InProcessFixture {
         let session_id = "fixture-boundary".to_string();
         let messages = vec![
@@ -95,6 +104,7 @@ impl FixtureBuilder {
         }
     }
 
+    /// Builds a boundary session with summary and ordinal metadata.
     pub fn tagged_session() -> InProcessFixture {
         let mut fixture = Self::session_with_boundary();
         fixture.session_id = "fixture-tagged".to_string();
@@ -103,6 +113,7 @@ impl FixtureBuilder {
         fixture
     }
 
+    /// Builds a boundary session with one frozen text reduction.
     pub fn frozen_reductions() -> InProcessFixture {
         let mut fixture = Self::session_with_boundary();
         fixture.session_id = "fixture-frozen-reductions".to_string();
@@ -114,6 +125,9 @@ impl FixtureBuilder {
         fixture
     }
 
+    /// Builds a session containing a synthetic active-task tool pair.
+    ///
+    /// Panics if fixed task JSON does not produce a valid pair.
     pub fn synthetic_todo_armed() -> InProcessFixture {
         let mut fixture = Self::session_with_boundary();
         fixture.session_id = "fixture-todo".to_string();

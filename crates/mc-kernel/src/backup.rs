@@ -1,3 +1,8 @@
+//! Creates self-contained SQLite backups and restores them with crash recovery.
+//!
+//! Backup publication uses descriptor-relative filesystem operations. Restore
+//! stages and verifies bytes before displacing the live database family.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -55,20 +60,29 @@ const LOCAL_FILESYSTEMS: &[u64] = &[
     0x0000_3434, // NILFS
 ];
 
+/// Parameters for one bounded backup operation.
 #[derive(Debug, Clone)]
 pub struct BackupRequest {
+    /// Private directory that receives the published backup.
     pub destination_directory: PathBuf,
+    /// The backup checks `deadline` before the writer lock and around capture, copy, and verification.
+    /// Destination validation runs before the first check, and publication with its directory sync runs after the last, so a backup can finish after `deadline`.
     pub deadline: Instant,
+    /// Optional expiration time for evidence pins created by the capture.
     pub capture_pin_expires_at: Option<i64>,
 }
 
+/// Identity and retention metadata for a published backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupManifest {
+    /// Highest commit sequence present in the artifact.
     pub captured_commit_seq: i64,
     /// Evidence active at `captured_commit_seq`. Rows invalidated earlier are in the
     /// artifact but are neither listed nor pinned.
     pub evidence_refs: Vec<String>,
+    /// Highest sensitivity stored in the captured database.
     pub max_sensitivity: Sensitivity,
+    /// Pin that protects referenced evidence until release or expiration.
     pub capture_pin_id: Option<String>,
     /// The requested directory joined with the published name. Publication goes
     /// through a validated descriptor, so this resolves to the artifact unless the
@@ -76,11 +90,15 @@ pub struct BackupManifest {
     pub destination_path: PathBuf,
 }
 
+/// Restore interruption points used by crash-recovery proofs.
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreFault {
+    /// Fail after publishing the marker but before moving the live family.
     BeforeDisplace,
+    /// Fail after moving the live family into recovery storage.
     AfterDisplace,
+    /// Fail after displacement and force rollback recovery to fail.
     RecoveryFailure,
 }
 
@@ -101,6 +119,7 @@ struct CaptureState {
 }
 
 impl KernelStore {
+    /// Captures and atomically publishes a verified database backup.
     pub fn backup(&self, request: BackupRequest) -> Result<BackupManifest, KernelError> {
         self.backup_inner(request, false, None, None)
     }
@@ -257,6 +276,7 @@ impl KernelStore {
         result
     }
 
+    /// Releases an active backup capture pin and all evidence references it owns.
     pub fn release_capture_pin(
         &self,
         capture_pin_id: &str,
@@ -289,6 +309,7 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
+    /// Expires due capture pins and prunes references past the reclaim grace period.
     pub fn run_capture_pin_maintenance(&self, now_ms: i64) -> Result<(), KernelError> {
         let mut writer = self.lock_writer()?;
         let tx = writer
@@ -323,6 +344,7 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
+    /// Verifies and installs a backup, returning its captured commit sequence.
     pub fn restore(&self, backup_path: impl AsRef<Path>) -> Result<i64, KernelError> {
         self.restore_inner(backup_path.as_ref(), None, None)
     }
@@ -589,11 +611,13 @@ fn filesystem_name_is_unsafe(name: &str) -> bool {
     !matches!(name, "apfs" | "hfs" | "tmpfs")
 }
 
+/// Applies the Linux destination-filesystem allowlist in tests.
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub fn filesystem_is_unsafe_for_test(fs_type: u64) -> bool {
     filesystem_is_unsafe(fs_type)
 }
 
+/// Applies the macOS destination-filesystem allowlist in tests.
 #[cfg(all(target_os = "macos", feature = "test-support"))]
 pub fn filesystem_name_is_unsafe_for_test(name: &str) -> bool {
     filesystem_name_is_unsafe(name)
@@ -603,6 +627,7 @@ fn owner_is_current(uid: u32) -> bool {
     uid == rustix::process::geteuid().as_raw()
 }
 
+/// Reports whether `uid` matches the effective process owner.
 #[cfg(feature = "test-support")]
 pub fn owner_is_current_for_test(uid: u32) -> bool {
     owner_is_current(uid)
@@ -844,6 +869,7 @@ fn max_stored_sensitivity(tx: &rusqlite::Transaction<'_>) -> Result<Sensitivity,
     })
 }
 
+/// Lists tables whose rows contribute to backup sensitivity classification.
 #[cfg(feature = "test-support")]
 pub fn sensitivity_bearing_tables_for_test(conn: &mut Connection) -> Vec<String> {
     let tx = conn.transaction().expect("transaction");
@@ -937,6 +963,7 @@ fn verify_database(
     Ok(commit_seq)
 }
 
+/// Verifies backup identity and commit sequence before `deadline`.
 #[cfg(feature = "test-support")]
 pub fn verify_backup_with_deadline_for_test(
     path: &Path,

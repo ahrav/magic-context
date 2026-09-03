@@ -1,3 +1,9 @@
+//! Integration checks for performance-runner scheduling and accounting.
+//!
+//! Time values use elapsed durations unless a histogram assertion names
+//! nanoseconds. Tests spawn an in-process host and may fail if local scheduling
+//! cannot complete configured measurement windows.
+
 #![allow(clippy::duplicate_mod)]
 
 #[path = "support/perf_measurement.rs"]
@@ -12,8 +18,7 @@ mod ring;
 #[path = "support/echo_host.rs"]
 mod echo_host;
 
-// `ipc_budget`'s collection machinery is unused.
-// unused here.
+// Only scheduling helpers and constants are used from the benchmark module.
 #[path = "../benches/ipc_budget.rs"]
 #[allow(dead_code)]
 mod ipc_budget;
