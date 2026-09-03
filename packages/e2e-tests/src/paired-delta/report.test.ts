@@ -970,7 +970,7 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.analysis: lane-binding-mismatch/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.regret.providerMixed = []; })))
             .toThrow(/report\.body\.regret\.providerMixed: analysis-mismatch/);
-        expect(() => parsePairedDeltaReport(forge((body) => { body.regret.raw[0]!.retrieval = 9; })))
+        expect(() => parsePairedDeltaReport(forge((body) => { body.regret.raw[0]!.retrieval = 0.9; })))
             .toThrow(/report\.body\.regret\.raw: analysis-mismatch/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.invalidSuccessRateByArm["mc-on"] = 1.5; })))
             .toThrow(/invalidSuccessRateByArm\.mc-on: number-invalid/);
@@ -1040,6 +1040,14 @@ describe("parsePairedDeltaReport", () => {
             body.exclusions = [];
             body.runSummary.evidenceComplete = true;
         }))).not.toThrow();
+        // Deltas are differences of values in [0, 1].
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.families[0]!.pointEstimate = 2; })))
+            .toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.pointEstimate: number-invalid/);
+        // Every exclusion is a final record the two cost counters also count.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.observedCostRollouts = 27;
+            body.runSummary.estimatedCostRollouts = 0;
+        }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: exclusion-shortfall/);
         // A primary arm's exclusions fit within the unhealthy coordinates.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.exclusions.find(({ armId }) => armId === "compaction")!.count = 4;

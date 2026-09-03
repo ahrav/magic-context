@@ -2552,6 +2552,12 @@ describe("buildLaneReport", () => {
         overMatched.scenarios[0]!.visibleClaimsMatched = 99;
         expect(() => parseLaneReport(overMatched))
             .toThrow(/report\.scenarios\[0\]\.visibleClaimsMatched: integer-invalid/);
+        // Each matched expectation pairs with a distinct matching visible claim.
+        const overExpected = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        overExpected.scenarios[0]!.visibleClaimsMatched = 1;
+        overExpected.scenarios[0]!.precision = 0.5;
+        expect(() => parseLaneReport(overExpected))
+            .toThrow(/report\.scenarios\[0\]\.expectedClaimsMatched: integer-invalid/);
         const skewedPrecision = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
         skewedPrecision.scenarios[0]!.precision = 0.5;
         expect(() => parseLaneReport(skewedPrecision))

@@ -296,6 +296,14 @@ function finiteNumber(value: unknown, label: string): number {
     return value as number;
 }
 
+// Every primary delta is a difference of two binary outcomes and every regret delta a difference of two
+// fractions, so estimates, bounds, and raw deltas all lie in [-1, 1].
+function deltaNumber(value: unknown, label: string): number {
+    const result = finiteNumber(value, label);
+    if (result < -1 || result > 1) p.fail(`${label}: number-invalid`);
+    return result;
+}
+
 function nonNegativeNumber(value: unknown, label: string): number {
     const result = finiteNumber(value, label);
     if (result < 0) p.fail(`${label}: number-invalid`);
@@ -305,8 +313,8 @@ function nonNegativeNumber(value: unknown, label: string): number {
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
     p.exact(value, ["lower", "upper"], label);
-    const lower = finiteNumber(value.lower, `${label}.lower`);
-    const upper = finiteNumber(value.upper, `${label}.upper`);
+    const lower = deltaNumber(value.lower, `${label}.lower`);
+    const upper = deltaNumber(value.upper, `${label}.upper`);
     // `bootstrapInterval` reads both bounds from one sorted sample, so it cannot invert them. An inverted
     // interval would also read as excluding zero and let a resolution check pass.
     if (lower > upper) p.fail(`${label}: interval-invalid`);
@@ -318,7 +326,14 @@ function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string;
     const hasEndpoint = Object.hasOwn(value, "endpoint");
     p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
     const floorValue = nonNegativeNumber(value.value, `${label}.value`);
-    const interval = parseInterval(value.interval, `${label}.interval`);
+    // A floor's interval is [0, spread], and a spread of deltas in [-1, 1] reaches 2, so it is not a delta.
+    const rawInterval = p.record(value.interval, `${label}.interval`);
+    p.exact(rawInterval, ["lower", "upper"], `${label}.interval`);
+    const interval = {
+        lower: finiteNumber(rawInterval.lower, `${label}.interval.lower`),
+        upper: finiteNumber(rawInterval.upper, `${label}.interval.upper`),
+    };
+    if (interval.lower > interval.upper) p.fail(`${label}.interval: interval-invalid`);
     if (interval.lower < 0 || interval.lower > floorValue || floorValue > interval.upper) {
         p.fail(`${label}.interval: interval-invalid`);
     }
@@ -347,7 +362,7 @@ function parseFamilyEstimate(
     const noise = p.record(value.noise, `${label}.noise`);
     p.exact(noise, ["label", "floor"], `${label}.noise`);
     const familyId = p.string(value.familyId, `${label}.familyId`);
-    const pointEstimate = finiteNumber(value.pointEstimate, `${label}.pointEstimate`);
+    const pointEstimate = deltaNumber(value.pointEstimate, `${label}.pointEstimate`);
     const isPrimary = (PRIMARY_ENDPOINTS as readonly DeltaEndpoint[]).includes(endpoint);
     // `noise.floor` is allowed only for primary endpoints.
     if (!isPrimary && noise.floor !== null) p.fail(`${label}.noise.floor: floor-owner-mismatch`);
@@ -397,7 +412,7 @@ function parseEndpointEstimates(
         p.unique(families.map(({ familyId }) => familyId), `${itemLabel}.families`);
         const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
-        const pointEstimate = finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
+        const pointEstimate = deltaNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
         const interval = parseInterval(value.interval, `${itemLabel}.interval`);
         const resolution = p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${itemLabel}.resolution`);
         const familyMeans = families.map((family) => family.pointEstimate);
@@ -439,7 +454,7 @@ function parseRawRegretRecords(raw: unknown, label: string): FamilyDeltaAnalysis
             coordinateId: p.string(item.coordinateId, `${itemLabel}.coordinateId`),
             familyId: p.string(item.familyId, `${itemLabel}.familyId`),
             endpoint: p.enumeration(item.endpoint, REGRET_ENDPOINTS, `${itemLabel}.endpoint`),
-            delta: finiteNumber(item.delta, `${itemLabel}.delta`),
+            delta: deltaNumber(item.delta, `${itemLabel}.delta`),
             inferential: false as const,
         };
     });
@@ -600,7 +615,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
                 p.exact(item, ["coordinateId", "familyId", "retrieval", "formation", "representation", "label"], label);
                 if (item.label !== "raw-non-inferential") p.fail(`${label}.label: literal-invalid`);
                 const rung = (field: "retrieval" | "formation" | "representation"): number | null =>
-                    item[field] === null ? null : finiteNumber(item[field], `${label}.${field}`);
+                    item[field] === null ? null : deltaNumber(item[field], `${label}.${field}`);
                 return {
                     coordinateId: p.string(item.coordinateId, `${label}.coordinateId`),
                     familyId: p.string(item.familyId, `${label}.familyId`),
@@ -662,6 +677,13 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     // estimate, so each one carries at least one observed rollout per primary arm.
     if (body.runSummary.observedCostRollouts < PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates) {
         p.fail("report.body.runSummary.observedCostRollouts: healthy-coordinate-shortfall");
+    }
+    // Exclusions are counted from the same final record array the two cost counters partition, and an excluded
+    // record is never one of a healthy coordinate's primary records.
+    const excludedRecords = body.exclusions.reduce((sum, { count }) => sum + count, 0);
+    if (body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts <
+        PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates + excludedRecords) {
+        p.fail("report.body.runSummary.observedCostRollouts: exclusion-shortfall");
     }
     // A refusal is counted at most once per planned coordinate.
     const refusedTotal = Object.values(body.runSummary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);

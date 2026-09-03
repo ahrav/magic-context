@@ -1886,6 +1886,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const visibleClaimsTotal = p.integer(value.visibleClaimsTotal, `${label}.visibleClaimsTotal`);
     if (expectedClaimsMatched > expectedClaimsTotal) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
     if (visibleClaimsMatched > visibleClaimsTotal) p.fail(`${label}.visibleClaimsMatched: integer-invalid`);
+    // `maximumGoldMatching` pairs each matched expectation with a distinct visible claim that matches it.
+    if (expectedClaimsMatched > visibleClaimsMatched) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
     // `buildLaneReport` carries scenarios through unchanged, so its rebuild cannot reach these fields.
     if (precision !== (visibleClaimsTotal === 0 ? null : visibleClaimsMatched / visibleClaimsTotal)) {
         p.fail(`${label}.precision: derived-mismatch`);
