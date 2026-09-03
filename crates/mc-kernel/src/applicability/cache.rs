@@ -1,14 +1,17 @@
-//! Two-generation bounded cache, following the token-cache rotation
-//! pattern: when the current generation fills, it becomes the previous
-//! generation and hits promote entries back into current. Process-local,
-//! never persisted — the durable record is the observations log.
+//! Bounded two-generation cache using token-cache rotation.
+//!
+//! When the current generation fills, it becomes the previous generation.
+//! Hits promote previous-generation entries into the current generation. The
+//! cache remains process-local; the observations log is the durable record.
 
 use std::borrow::Borrow;
 use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::{BuildHasher, Hash};
 
-/// Per-generation entry cap. Two full generations bound total residency;
-/// anchor resolutions and object classifications are small values.
+/// Per-generation entry cap.
+///
+/// Two full generations bound total residency. Anchor resolutions and object
+/// classifications are small values.
 pub(super) const GENERATION_CAP: usize = 16_384;
 
 pub(super) struct TwoGenerationCache<K, V, S = RandomState> {

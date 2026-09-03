@@ -38,8 +38,11 @@ pub const CLAIM_MIRROR_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimMirrorLifecycle {
+    /// Claim participates in current retrieval.
     Active,
+    /// Claim remains committed but is not active.
     Archived,
+    /// Claim is retained in the mirror like `Archived`, so callers still receive it and filter non-active rows themselves.
     Retired,
 }
 
@@ -66,11 +69,17 @@ impl ClaimMirrorLifecycle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimMirrorChangeKind {
+    /// Claim content or attributes changed.
     Upsert,
+    /// Supporting evidence changed.
     Evidence,
+    /// Lifecycle state changed.
     Lifecycle,
+    /// Applicability state changed.
     Applicability,
+    /// Verification state changed.
     Verification,
+    /// Derivation state changed.
     Derivation,
 }
 
@@ -79,17 +88,29 @@ pub enum ClaimMirrorChangeKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommittedClaimMirrorRow {
+    /// Stable public claim identifier.
     pub public_claim_id: String,
+    /// Owning project identifier.
     pub project_id: i64,
+    /// Public claim revision and content digest locator.
     pub revision_locator: String,
+    /// Committed claim text.
     pub content: String,
+    /// Lowercase SHA-256 digest of `content`.
     pub content_digest: String,
+    /// Authoritative claim attributes object.
     pub attributes: Value,
+    /// Authoritative lifecycle state.
     pub lifecycle: ClaimMirrorLifecycle,
+    /// Authoritative applicability object.
     pub applicability: Value,
+    /// Authoritative policy object.
     pub policy: Value,
+    /// Optional source label safe for display.
     pub provenance_label: Option<String>,
+    /// Project generation represented by this row.
     pub project_generation: i64,
+    /// Policy generation represented by this row.
     pub policy_generation: i64,
 }
 
@@ -98,9 +119,13 @@ pub struct CommittedClaimMirrorRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMirrorSnapshot {
+    /// Input schema version.
     pub mirror_version: u32,
+    /// Complete project and policy generation vector.
     pub vector: SnapshotVector,
+    /// Last included source effect ID for each project.
     pub project_checkpoints: BTreeMap<i64, i64>,
+    /// Complete committed claim set.
     pub claims: Vec<CommittedClaimMirrorRow>,
 }
 
@@ -110,13 +135,21 @@ pub struct ClaimMirrorSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMirrorEffect {
+    /// Globally ordered source effect ID.
     pub effect_id: i64,
+    /// Previous source effect ID for this project.
     pub previous_project_effect_id: i64,
+    /// Nonempty unique source effect key.
     pub effect_key: String,
+    /// Project changed by this effect.
     pub project_id: i64,
+    /// Resulting project generation.
     pub generation: i64,
+    /// Source change category.
     pub change_kind: ClaimMirrorChangeKind,
+    /// Claim changed by this effect.
     pub public_claim_id: String,
+    /// Revision locator named by this effect.
     pub revision_locator: String,
     /// `None` means the claim is absent from the committed mirror view. This is
     /// how policy-only revocation removes an otherwise unchanged revision.
@@ -127,65 +160,100 @@ pub struct ClaimMirrorEffect {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMirrorReceiptGroup {
+    /// Input schema version.
     pub mirror_version: u32,
+    /// Stable source receipt identifier.
     pub receipt_id: i64,
+    /// Effect count declared by the source receipt.
     pub expected_effect_count: usize,
+    /// Complete generation vector after applying the receipt.
     pub vector: SnapshotVector,
+    /// Contiguous effects in source effect-ID order.
     pub effects: Vec<ClaimMirrorEffect>,
 }
 
 /// Committed generation and source-outbox checkpoint for one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimMirrorProjectState {
+    /// Latest mirrored project generation.
     pub project_generation: i64,
+    /// Latest mirrored policy generation.
     pub policy_generation: i64,
+    /// Last applied source effect ID for this project.
     pub acked_effect_id: i64,
 }
 
 /// Current mirror incarnation, workspace epoch, and per-project progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimMirrorState {
+    /// Stored mirror schema version.
     pub mirror_version: u32,
+    /// Stored generation-vector schema version.
     pub vector_version: u32,
+    /// Database incarnation fenced by this mirror.
     pub database_incarnation_id: String,
+    /// Workspace epoch fenced by this mirror.
     pub workspace_epoch: String,
+    /// Progress keyed by project ID.
     pub projects: BTreeMap<i64, ClaimMirrorProjectState>,
 }
 
 /// Result of applying or replaying one complete receipt group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimMirrorApplyResult {
+    /// Whether an identical receipt had already been applied.
     pub replayed: bool,
+    /// Number of effects applied by this call.
     pub applied_effect_count: usize,
 }
 
 /// Validation, fencing, or storage failure from committed-mirror operations.
 #[derive(Debug)]
 pub enum ClaimMirrorError {
+    /// Underlying durable-store failure.
     Store(cortexkit_store::StoreError),
+    /// Invalid snapshot or receipt input.
     Invalid(String),
+    /// Durable text violated redaction policy.
     Redaction(mc_core::redaction::RedactionErrorKind),
+    /// Incremental receipt arrived before a full seed.
     NotSeeded,
+    /// Input targeted a different database incarnation.
     IncarnationMismatch {
+        /// Incarnation accepted by current state.
         expected: String,
+        /// Incarnation carried by the input.
         found: String,
     },
+    /// Input generation did not follow stored project state.
     GenerationMismatch {
+        /// Project with the mismatch.
         project_id: i64,
+        /// Required next generation.
         expected: i64,
+        /// Generation carried by the input.
         found: i64,
     },
+    /// Effect predecessor did not match the stored project checkpoint.
     CheckpointMismatch {
+        /// Project with the mismatch.
         project_id: i64,
+        /// Stored predecessor effect ID.
         expected: i64,
+        /// Predecessor effect ID carried by the input.
         found: i64,
     },
+    /// A receipt ID was replayed with different canonical bytes.
     ReceiptConflict {
+        /// Conflicting receipt identifier.
         receipt_id: i64,
     },
+    /// Reset cannot proceed while claim intents remain unresolved.
     ResetBlocked {
+        /// Number of unresolved intents.
         unresolved: usize,
     },
+    /// Existing mirror state requires the explicit rebuild transition.
     ResetRequired,
 }
 

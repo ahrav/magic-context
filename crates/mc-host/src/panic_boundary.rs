@@ -1,4 +1,8 @@
-//! This module redacts panic diagnostics while handler callbacks execute.
+//! Redacts panic diagnostics only while host handler callbacks are actively polled.
+//!
+//! One process-wide hook delegates panics outside callback polls to the previous hook.
+//! Poll depth is thread-local, so a pending callback cannot redact a different task's
+//! panic after control returns to the executor.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -33,6 +37,10 @@ fn callback_is_polling() -> bool {
         .unwrap_or(false)
 }
 
+/// Installs the process-wide redacting panic hook once.
+///
+/// Concurrent calls are serialized by [`Once`]. Replacing the panic hook elsewhere
+/// after this call disables this module's redaction.
 pub fn install() {
     INSTALL_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
@@ -46,12 +54,18 @@ pub fn install() {
     });
 }
 
+/// Runs a synchronous callback with panic diagnostics redacted on this thread.
+///
+/// Panics from `callback` propagate unchanged after the hook emits the fixed diagnostic.
 pub fn redact_sync<T>(callback: impl FnOnce() -> T) -> T {
     let _guard = CallbackPollGuard::enter();
     callback()
 }
 
-/// A callback future that returns `Poll::Pending` cannot suppress an unrelated task's panic on the same worker.
+/// Polls a callback future with diagnostics redacted during each poll.
+///
+/// Redaction ends whenever the future returns `Poll::Pending`, so unrelated tasks on
+/// the same worker retain normal panic diagnostics. Panics from the future propagate.
 pub async fn redact<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {

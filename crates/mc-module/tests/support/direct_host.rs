@@ -1,3 +1,5 @@
+//! Direct-host process fixtures and protocol helpers for integration tests.
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -59,6 +61,7 @@ fn fixture_binary() -> PathBuf {
     binary
 }
 
+/// `FixtureProcess` owns one direct-host fixture process and its captured output streams.
 pub struct FixtureProcess {
     child: Option<Child>,
     root: PathBuf,
@@ -338,6 +341,7 @@ impl Drop for FixtureProcess {
     }
 }
 
+/// `CapturedOutput` contains output collected after a fixture process exits.
 pub struct CapturedOutput {
     pub stdout: String,
     pub stderr: String,
@@ -371,6 +375,7 @@ pub async fn request_json(client: &Client, route: RouteHandle, body: Value) -> V
     serde_json::from_slice(&response.body).expect("response JSON")
 }
 
+/// `wait_for_store` polls module status until the fixture reports an open store or the shared budget expires.
 pub async fn wait_for_store(client: &Client, route: RouteHandle, session: &str) -> Value {
     let deadline = Instant::now() + BUDGET;
     loop {

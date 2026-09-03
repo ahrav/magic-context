@@ -1,3 +1,6 @@
+//! Installation requires an empty, unstamped database and runs in one
+//! immediate transaction. Component order contributes to the persisted digest.
+
 use crate::sqlite_runtime::{
     compute_marker_digest_for_application_id, DIRECT_FORMAT_EPOCH, MC_APPLICATION_ID,
 };
@@ -250,6 +253,12 @@ const fn component_names_match() -> bool {
 
 const _: () = assert!(component_names_match());
 
+/// Applies connection settings required before kernel schema access.
+///
+/// Must run outside a transaction. The busy timeout is installed before WAL
+/// mode because switching journal mode may wait for the write lock. Returns
+/// `InvalidQuery` for an active transaction, a rejected SQLite runtime, or
+/// failure to enter WAL mode. PRAGMA failures propagate.
 pub fn apply_kernel_connection_profile(
     conn: &mut Connection,
     busy_timeout_ms: i64,
@@ -280,9 +289,11 @@ pub fn apply_kernel_connection_profile(
     Ok(())
 }
 
-/// Enforce kernel-only synchronous (FULL or EXTRA) and trusted_schema (off)
-/// requirements in addition to the shared SQLite contract. Returns every
-/// violation (empty = pass).
+/// Checks kernel requirements in addition to the shared SQLite contract.
+///
+/// Returns every detected violation in check order. An empty vector means the
+/// connection uses FULL or EXTRA synchronization, disables trusted schema, and
+/// enables recursive triggers. PRAGMA query failures propagate.
 pub fn verify_kernel_connection_contract(
     conn: &Connection,
     min_busy_timeout_ms: i64,
@@ -314,6 +325,12 @@ fn is_well_formed_incarnation_id(incarnation: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
+/// Atomically installs a fresh kernel schema and immutable format marker.
+///
+/// `incarnation` must be 32 lowercase hexadecimal characters. `created_at` is
+/// stored unchanged in the marker. The database must contain no user schema
+/// objects and have zero application and user version stamps. Any validation,
+/// SQL, digest, or commit failure rolls back the transaction.
 pub fn apply_kernel_schema(
     conn: &mut Connection,
     incarnation: &str,
@@ -379,6 +396,8 @@ pub fn apply_kernel_schema_with_fault_hook_for_test<F: FnOnce() -> rusqlite::Res
     apply_schema(conn, incarnation, created_at, hook)
 }
 
+/// Returns known table names in declared component order, then unknown tables
+/// in lexical order. Missing declared tables are omitted.
 pub fn kernel_schema_inventory(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name")?;
     let actual = stmt
@@ -411,6 +430,10 @@ pub fn kernel_schema_object_inventory(
     inventory
 }
 
+/// Computes lowercase SHA-256 over ordered non-internal schema objects.
+///
+/// Each object's type, name, table name, and SQL text is NUL-delimited. Objects
+/// with null SQL and names beginning with `sqlite_` do not contribute.
 pub fn kernel_schema_digest(conn: &Connection) -> rusqlite::Result<String> {
     let mut stmt = conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND sql IS NOT NULL ORDER BY type,name")?;
     let mut rows = stmt.query([])?;

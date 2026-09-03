@@ -1,3 +1,10 @@
+//! Crash-resumable garbage collection for content-addressed artifact objects.
+//!
+//! Reclamation first records durable `Reclaiming` state under the writer lock,
+//! unlinks the object while retaining that lock, then removes reclaim metadata.
+//! Times passed to this module are Unix epoch milliseconds. Referenced artifacts
+//! receive a 14-day grace period; unreferenced filesystem orphans receive one hour.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::time::UNIX_EPOCH;
@@ -124,6 +131,11 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
+    /// Scans artifact objects and attempts every candidate eligible at `now`.
+    ///
+    /// `now` is Unix epoch milliseconds. Fence loss and injected faults stop the
+    /// pass. Other candidate failures increment `failed_candidates` and collection
+    /// continues. `reclaimed_bytes` saturates at [`u64::MAX`].
     pub(crate) fn run_artifact_gc(
         &self,
         now: i64,
@@ -219,8 +231,11 @@ impl KernelStore {
         Ok(removed.then_some(bytes))
     }
 
-    /// Resumes durable reclaim rows without scanning the object tree, using the
-    /// writer so opening a store takes no read-pool snapshot.
+    /// Resumes durable reclaim rows without scanning the object tree.
+    ///
+    /// `now` is Unix epoch milliseconds. The writer connection avoids taking a
+    /// read-pool snapshot while opening a store. Invalid digests and ordinary
+    /// per-candidate failures are skipped; fence loss stops recovery.
     pub(crate) fn run_artifact_recovery(&self, now: i64) -> Result<(), KernelError> {
         // Promotion runs first: it moves reservations abandoned by a dead writer
         // into `Reclaiming`, which is the state the snapshot below collects.
@@ -536,6 +551,7 @@ fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
     Ok(objects)
 }
 
+/// Returns total bytes occupied by regular files under the artifact object tree.
 pub(crate) fn object_usage(store: &KernelStore) -> Result<u64, KernelError> {
     let objects = store
         .open_objects_directory()

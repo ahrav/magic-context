@@ -48,6 +48,10 @@ pub struct ClosureManifest {
     pub nodes: Vec<ClosureNode>,
 }
 
+/// One regular file committed by a closure manifest.
+///
+/// `size_bytes` is the exact file length in bytes. `sha256` is lowercase
+/// hexadecimal. Dependencies must be uniquely sorted by target path.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureNode {
@@ -61,6 +65,7 @@ pub struct ClosureNode {
     pub dependencies: Vec<ClosureDependency>,
 }
 
+/// Directed dependency on another manifest node.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureDependency {
@@ -72,6 +77,7 @@ pub struct ClosureDependency {
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+/// Security and launch role assigned to a manifest node.
 pub enum NodeKind {
     Interpreter,
     Executable,
@@ -117,10 +123,12 @@ impl std::fmt::Debug for ValidatedHarnessClosure {
 }
 
 impl ValidatedHarnessClosure {
+    /// Returns the lowercase SHA-256 digest of canonical manifest bytes.
     pub fn digest(&self) -> &str {
         &self.digest
     }
 
+    /// Returns the manifest whose complete file tree was validated.
     pub fn manifest(&self) -> &ClosureManifest {
         &self.manifest
     }
@@ -162,6 +170,7 @@ impl ValidatedHarnessClosure {
     }
 }
 
+/// Returns an inherited-descriptor path suitable for execution.
 ///
 /// Opening Linux `/proc/self/fd/N` performs a fresh open of the underlying inode at offset 0, and symlink resolution recovers the object's real pathname.
 /// macOS `/dev/fd/N` neither opens the inode at offset 0 nor resolves to the object's real pathname.
@@ -203,10 +212,12 @@ impl ResolvedHarnessNode {
         }
     }
 
+    /// Returns the ordinary pathname retained for loaders that need a containing directory.
     pub fn closure_path(&self) -> &Path {
         &self.closure_path
     }
 
+    /// Returns the raw descriptor that must remain open while descriptor paths are used.
     pub fn inherited_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
@@ -224,6 +235,7 @@ pub struct HarnessClosureError {
 }
 
 impl HarnessClosureError {
+    /// Returns a stable diagnostic describing the rejected closure invariant.
     pub fn detail(&self) -> &'static str {
         self.detail
     }
@@ -241,7 +253,10 @@ fn invalid(detail: &'static str) -> HarnessClosureError {
     HarnessClosureError { detail }
 }
 
-/// `digest` returns the SHA-256 of the validated canonical manifest encoding.
+/// Returns the SHA-256 of the validated canonical manifest encoding.
+///
+/// Returns an error when manifest invariants fail, serialization fails, or the
+/// canonical encoding exceeds 16 MiB.
 pub fn manifest_digest(manifest: &ClosureManifest) -> Result<String, HarnessClosureError> {
     validate_manifest(manifest)?;
     let bytes = canonical_manifest(manifest)?;
@@ -284,6 +299,11 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Validates schema, bounds, ordering, launch roots, edge kinds, and reachability.
+///
+/// Paths and dependency targets must be uniquely sorted. All nodes must be
+/// reachable from a launch root or extension. Returns the first violated
+/// invariant as [`HarnessClosureError`].
 pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosureError> {
     if manifest.schema != CLOSURE_SCHEMA {
         return Err(invalid("unsupported manifest schema"));
@@ -536,6 +556,12 @@ impl HarnessClosureStore {
         })
     }
 
+    /// Copies and verifies a candidate, then publishes it without replacing an existing digest.
+    ///
+    /// Concurrent publishers converge on the same validated closure. On success,
+    /// file contents and the containing store directory have crossed an `fsync`
+    /// boundary. Returns an error for invalid manifests, insecure source paths,
+    /// content mismatch, or filesystem failure.
     pub fn materialize(
         &self,
         candidate: &ClosureCandidate,
@@ -579,6 +605,10 @@ impl HarnessClosureStore {
         self.validate(&digest)
     }
 
+    /// Deletes staging trees and unprotected digest-named closures.
+    ///
+    /// Unknown non-digest entries are left untouched. Directory deletion is
+    /// durable when this method returns successfully.
     pub fn prune(&self, protected: &BTreeSet<String>) -> Result<(), HarnessClosureError> {
         for name in list_names(&self.root_fd)? {
             if protected.contains(&name) {
@@ -592,6 +622,10 @@ impl HarnessClosureStore {
         fsync(&self.root_fd).map_err(|_| invalid("closure store fsync failed"))
     }
 
+    /// Revalidates a complete retained closure and keeps its `files/` descriptor open.
+    ///
+    /// Validation rejects symlinks, extra entries, missing nodes, wrong ownership
+    /// or modes, multiple hard links, noncanonical manifests, and byte mismatches.
     pub fn validate(&self, digest: &str) -> Result<ValidatedHarnessClosure, HarnessClosureError> {
         validate_hash(digest)?;
         let dir_fd = open_owned_dir(&self.root_fd, digest)?;

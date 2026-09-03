@@ -1,3 +1,7 @@
+//! Exercises shared-memory connection cleanup after clean close, `SIGKILL`,
+//! capacity rejection, and daemon replacement. Tests serialize because they
+//! measure process-wide descriptors, mappings, threads, and resident bytes.
+
 #![cfg(unix)]
 
 mod support;

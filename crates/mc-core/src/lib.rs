@@ -1,7 +1,7 @@
+//! Chooses cache-pass work from caller-computed conversation state.
 //!
-//! This crate makes origin-agnostic classification decisions.
-//! The `mc-module` crate performs rendering and I/O.
-//! The cache core freezes supplied rendered units and does not select them.
+//! Classification is independent of provider origin. This crate does not parse
+//! provider bytes, render content, perform I/O, or inspect frozen units.
 
 #![forbid(unsafe_code)]
 
@@ -66,17 +66,29 @@ pub struct ClassifierInput {
     pub bust_opportunity: bool,
 }
 
+/// Pass selected from persisted shape, epoch state, and pending deltas.
+///
+/// `Reject` identifies an unrecognized persisted shape and never authorizes
+/// clearing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassPlan {
+    /// Rebuild all rendered units.
     Hard,
+    /// Clear the recognized legacy baseline, then rebuild all rendered units.
     MigrateHard,
+    /// Re-render pending deltas during an independent bust opportunity.
     Soft,
+    /// Preserve frozen units and postpone pending work.
     Defer,
+    /// Refuse an unrecognized persisted shape without mutating it.
     Reject(&'static str),
 }
 
+/// Selects one pass without rendering or mutating state.
 ///
-/// in `cortexkit-cache-core`):
+/// Check order defines precedence. Bootstrap and recognized migration shapes
+/// precede unknown-shape rejection. Hard triggers precede reconciliation, which
+/// precedes soft deltas. This function does not panic or perform I/O.
 pub fn classify(input: &ClassifierInput) -> PassPlan {
     if !input.initialized {
         return PassPlan::Hard;

@@ -3,6 +3,10 @@ use rusqlite::{Transaction, TransactionBehavior};
 use super::{DecisionPayload, ObservationPayload};
 use crate::{KernelError, KernelStore, Sensitivity};
 
+/// Decision visible at a requested commit sequence.
+///
+/// Optional identifiers preserve nullable database relationships. `created_commit_seq` is the
+/// sequence that introduced the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionRow {
     pub decision_id: String,
@@ -17,6 +21,10 @@ pub struct DecisionRow {
     pub sensitivity: Sensitivity,
 }
 
+/// Observation visible at a requested commit sequence.
+///
+/// `observed_at` is the stored observation timestamp. `created_commit_seq` orders the row in the
+/// commit history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationRow {
     pub observation_id: String,
@@ -32,6 +40,10 @@ pub struct ObservationRow {
     pub sensitivity: Sensitivity,
 }
 
+/// Point-in-time decision and observation view.
+///
+/// Rows are ordered lexicographically by their IDs. `known_as_of` records the requested commit
+/// sequence, while `tip` records the latest commit visible in the same read transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SliceSnapshot {
     pub known_as_of: i64,
@@ -41,6 +53,12 @@ pub struct SliceSnapshot {
 }
 
 impl KernelStore {
+    /// Reads decisions and observations live at `requested` from one deferred transaction.
+    ///
+    /// Returns [`KernelError::InvalidInput`] for a negative sequence,
+    /// [`KernelError::FutureSnapshot`] when `requested` exceeds the transaction's current tip,
+    /// [`KernelError::CorruptCanonicalRow`] for invalid stored JSON payloads, and
+    /// [`KernelError::Io`] for lock, SQLite, conversion, or commit failures.
     pub fn slice_as_of(&self, requested: i64) -> Result<SliceSnapshot, KernelError> {
         let mut reader = self.lock_reader()?;
         let tx = reader
@@ -52,6 +70,7 @@ impl KernelStore {
     }
 }
 
+/// Loads one snapshot from the caller's transaction so tip and rows share a database view.
 pub(super) fn load_slice(
     tx: &Transaction<'_>,
     requested: i64,
@@ -65,6 +84,7 @@ pub(super) fn load_slice(
     })
 }
 
+/// Returns the transaction-visible tip after validating `requested` against the commit range.
 pub(super) fn snapshot_tip(tx: &Transaction<'_>, requested: i64) -> Result<i64, KernelError> {
     if requested < 0 {
         return Err(KernelError::InvalidInput);
@@ -82,6 +102,7 @@ pub(super) fn snapshot_tip(tx: &Transaction<'_>, requested: i64) -> Result<i64, 
     Ok(tip)
 }
 
+/// Loads decisions live at `requested`, ordered by `decision_id`.
 pub(super) fn load_decisions(
     tx: &Transaction<'_>,
     requested: i64,
@@ -126,6 +147,7 @@ pub(super) fn load_decisions(
     Ok(rows)
 }
 
+/// Loads observations live at `requested`, ordered by `observation_id`.
 pub(super) fn load_observations(
     tx: &Transaction<'_>,
     requested: i64,

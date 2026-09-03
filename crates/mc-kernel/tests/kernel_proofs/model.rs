@@ -54,6 +54,7 @@ pub enum Op {
     RebuildAlignment,
 }
 
+/// One generated operation and the perturbations applied after or around it.
 #[derive(Debug, Clone)]
 pub struct Step {
     pub op: Op,
@@ -62,6 +63,7 @@ pub struct Step {
     pub fault_then_retry: bool,
 }
 
+/// Builds shrinkable model steps with weighted operation selection.
 pub fn step() -> impl Strategy<Value = Step> {
     let op = prop_oneof![
         3 => Just(Op::InsertDomain),
@@ -163,12 +165,18 @@ enum Applied {
     Repeat(Box<dyn Fn(&Proof)>),
 }
 
+/// Counts perturbations exercised by a completed model run.
 pub struct Outcome {
+    /// Number of envelope intents replayed after their first commit.
     pub duplicates_replayed: usize,
+    /// Number of supported operations first driven through a fault hook.
     pub faults_injected: usize,
 }
 
-/// Runs `steps` clean in A and perturbed in B and asserts the two agree.
+/// Runs `steps` clean in root A and perturbed in root B, then asserts equal canonical state.
+///
+/// Operations execute in slice order. This function panics on any kernel error, reference-model
+/// mismatch, failed idempotency check, or cross-root digest difference.
 pub fn run(steps: &[Step]) -> Outcome {
     let staged_at = crate::fixtures::now_ms();
     let mut clean = Proof::open();

@@ -11,22 +11,29 @@ pub const MC_APPLICATION_ID: u32 = 0x4D43_5458;
 /// `DIRECT_FORMAT_EPOCH` sets `PRAGMA user_version` to `1` for the direct format.
 pub const DIRECT_FORMAT_EPOCH: i64 = 1;
 
+/// Required table name for direct-format marker rows.
 pub const DIRECT_FORMAT_MARKER_TABLE: &str = "mc_format_marker";
 
+/// Domain-separation prefix for direct-format marker digests.
 pub const FORMAT_MARKER_DIGEST_PROTOCOL: &str = "mc-direct-format-marker-v1";
 
+/// Domain-separation prefix for schema manifest digests.
 pub const SCHEMA_MANIFEST_PROTOCOL: &str = "mc-schema-manifest-v1";
 
 /// Minimum supported SQLite release, carrying the complete WAL-reset race fix
 /// (<https://www.sqlite.org/wal.html#walresetbug>).
 pub const MIN_SUPPORTED_SQLITE_VERSION: [u64; 3] = [3, 51, 3];
 
+/// SQLite build identity used by the runtime compatibility gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteEngineIdentity {
+    /// Version returned by `sqlite_version()`.
     pub sqlite_version: String,
+    /// Source identity returned by `sqlite_source_id()`.
     pub sqlite_source_id: String,
 }
 
+/// Reads both values required by the runtime compatibility gate.
 pub fn read_sqlite_engine_identity(conn: &Connection) -> rusqlite::Result<SqliteEngineIdentity> {
     conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
         Ok(SqliteEngineIdentity {
@@ -36,15 +43,20 @@ pub fn read_sqlite_engine_identity(conn: &Connection) -> rusqlite::Result<Sqlite
     })
 }
 
+/// Isolates identity probing from store connections by using in-memory SQLite.
 pub fn probe_sqlite_engine_identity_off_path() -> rusqlite::Result<SqliteEngineIdentity> {
     let conn = Connection::open_in_memory()?;
     read_sqlite_engine_identity(&conn)
 }
 
+/// Formats three numeric components without normalization.
 pub fn format_dotted_version(version: [u64; 3]) -> String {
     format!("{}.{}.{}", version[0], version[1], version[2])
 }
 
+/// Parses the version forms accepted by the compatibility gate.
+///
+/// Missing patch numbers become zero.
 pub fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;
@@ -160,6 +172,7 @@ pub fn compute_schema_manifest_digest(components: &[(String, Vec<String>, Vec<St
     sha256_hex(&lines.join("\n"))
 }
 
+/// Binds marker fields to the canonical [`MC_APPLICATION_ID`].
 pub fn compute_marker_digest(
     format_epoch: i64,
     database_incarnation_id: &str,
@@ -175,6 +188,7 @@ pub fn compute_marker_digest(
     )
 }
 
+/// Hashes marker fields as fixed, newline-separated protocol lines.
 pub fn compute_marker_digest_for_application_id(
     application_id: u32,
     format_epoch: i64,

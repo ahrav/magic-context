@@ -9,6 +9,7 @@ use crate::descriptor::{
     FrameDescriptor, Incarnation, ReleaseIdentity, MAX_SPANS, WIRE_V2_HEADER_BYTES,
 };
 
+/// Exact encoded descriptor input length accepted by [`frame_descriptor`], in bytes.
 pub const FRAME_DESCRIPTOR_BYTES: usize =
     2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8 + 8 + 8 + 1 + 32;
 
@@ -18,8 +19,12 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(buffer)
 }
 
+/// Decodes one fixed-width frame descriptor and checks its validation invariants.
 ///
-/// Successful validation rejects descriptors whose spans exceed the arena bound.
+/// Returns `false` for a wrong input length or rejected descriptor. Successful validation proves
+/// that span count is in range, every span ends within the arena, span lengths sum to body length,
+/// and a different lane identity is rejected. Internal assertions panic if validation violates
+/// those invariants.
 pub fn frame_descriptor(bytes: &[u8]) -> bool {
     if bytes.len() != FRAME_DESCRIPTOR_BYTES {
         return false;
@@ -93,7 +98,9 @@ pub fn frame_descriptor(bytes: &[u8]) -> bool {
     accepted
 }
 
+/// Decodes a provider ring grant and verifies byte-exact canonical round-trip encoding.
 ///
+/// Returns `false` when decoding fails. Panics if an accepted grant re-encodes differently.
 pub fn provider_grant(bytes: &[u8]) -> bool {
     if let Ok(grant) = RingGrant::decode_slice(bytes) {
         assert_eq!(
@@ -107,8 +114,12 @@ pub fn provider_grant(bytes: &[u8]) -> bool {
     }
 }
 
+/// Snapshots and validates a provider sample prefix against its allocation length and identity.
 ///
-/// Successful validation yields a body range inside the allocation; bytes past the declared body remain outside the range.
+/// Returns `false` when snapshotting or validation fails. Successful validation proves the body
+/// range starts after the prefix and remains inside `bytes`; trailing allocation bytes stay outside
+/// that range. Internal assertions panic if validation violates these invariants or accepts a
+/// different lane identity.
 pub fn provider_sample(bytes: &[u8]) -> bool {
     let Ok(prefix) = SamplePrefix::snapshot(bytes) else {
         return false;

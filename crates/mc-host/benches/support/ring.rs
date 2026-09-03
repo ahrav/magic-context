@@ -96,21 +96,34 @@ fn record(histogram: &mut Histogram<u64>, outcomes: &mut OutcomeCounts, value_ns
     }
 }
 
+/// Configuration for sequential request/response latency measurement.
 #[derive(Debug, Clone)]
 pub struct SerialConfig {
+    /// Untimed requests issued before measurement.
     pub warmup_ops: u64,
+    /// Timed requests. Must be nonzero.
     pub measured_ops: u64,
+    /// Nanosecond histogram configuration.
     pub histogram: HistogramConfig,
 }
 
+/// Results from sequential latency measurement.
 #[derive(Debug)]
 pub struct SerialResult {
+    /// Issue-to-completion latency in nanoseconds for successful responses.
     pub histogram: Histogram<u64>,
+    /// Terminal outcome counts for measured requests.
     pub outcomes: OutcomeCounts,
+    /// Number of measured requests issued.
     pub scheduled: u64,
+    /// Wall-clock duration of measured requests.
     pub elapsed: Duration,
 }
 
+/// Runs sequential latency measurement against `publication`.
+///
+/// Returns an error for zero measured operations, setup failures, invalid
+/// histogram configuration, or failed warmup validation.
 pub fn run_serial(publication: &Path, cfg: &SerialConfig) -> Result<SerialResult, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -155,23 +168,37 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
     })
 }
 
+/// Configuration for fixed-rate open-loop measurement.
 #[derive(Debug, Clone)]
 pub struct OpenLoopConfig {
+    /// Scheduled requests per second. Valid range is 1 through 1,000,000,000.
     pub rate_per_sec: u64,
+    /// Unmeasured schedule prefix.
     pub warmup: Duration,
+    /// Measured schedule duration. Must be nonzero.
     pub measure: Duration,
+    /// Maximum concurrent request tasks. Must be nonzero.
     pub inflight_cap: usize,
+    /// Nanosecond histogram configuration.
     pub histogram: HistogramConfig,
 }
 
+/// Results from fixed-rate open-loop measurement.
 #[derive(Debug)]
 pub struct OpenLoopResult {
+    /// Scheduled-slot-to-completion latency in nanoseconds.
     pub sched_to_completion: Histogram<u64>,
+    /// Actual-issue-to-completion latency in nanoseconds.
     pub issue_to_completion: Histogram<u64>,
+    /// Scheduled-slot-to-actual-issue lag in nanoseconds.
     pub scheduler_lag: Histogram<u64>,
+    /// One terminal outcome per measured scheduled slot.
     pub outcomes: OutcomeCounts,
+    /// Measured slots, including slots missed at the in-flight cap.
     pub scheduled_slots: u64,
+    /// Wall-clock duration including warmup and drain.
     pub elapsed: Duration,
+    /// Whether failure or unresolved drain work ended complete accounting.
     pub truncated: bool,
 }
 
@@ -220,6 +247,10 @@ fn record_completion(
     }
 }
 
+/// Runs fixed-rate open-loop measurement against `publication`.
+///
+/// Returns an error for invalid rate, window, or concurrency settings and for
+/// setup, histogram, or request-task failures.
 pub fn run_open_loop(publication: &Path, cfg: &OpenLoopConfig) -> Result<OpenLoopResult, String> {
     if cfg.measure.is_zero() {
         return Err("open-loop arm requires a nonzero measurement window".to_owned());
@@ -362,10 +393,14 @@ async fn run_open_loop_inner(
     })
 }
 
+/// Configuration for closed-loop throughput measurement.
 #[derive(Debug, Clone)]
 pub struct ThroughputConfig {
+    /// Constant request concurrency. Must be nonzero.
     pub depth: usize,
+    /// Warmup duration. Must be nonzero.
     pub warmup: Duration,
+    /// Measurement duration. Must be nonzero.
     pub measure: Duration,
 }
 
@@ -391,6 +426,10 @@ fn spawn_request(
     requests.spawn(async move { request(client, route).await });
 }
 
+/// Runs closed-loop throughput measurement against `publication`.
+///
+/// Returns an error for invalid configuration, setup failure, request-task
+/// failure, invalid warmup response, or incomplete drain.
 pub fn run_throughput(
     publication: &Path,
     cfg: &ThroughputConfig,
@@ -504,6 +543,7 @@ async fn run_throughput_inner(
     })
 }
 
+/// Reusable sequential round-trip probe with one route and runtime.
 pub struct SerialProbe {
     runtime: tokio::runtime::Runtime,
     client: Arc<mc_host::Client>,
@@ -511,6 +551,7 @@ pub struct SerialProbe {
 }
 
 impl SerialProbe {
+    /// Connects a probe, bounded by the 30-second setup budget.
     pub fn connect(publication: &Path) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -524,6 +565,9 @@ impl SerialProbe {
         })
     }
 
+    /// Runs `n` sequential validated round trips and returns wall-clock duration.
+    ///
+    /// Returns an error on the first non-success terminal outcome.
     pub fn roundtrips(&mut self, n: u64) -> Result<Duration, String> {
         let client = Arc::clone(&self.client);
         let route = self.route;

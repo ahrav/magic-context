@@ -1,3 +1,10 @@
+//! Creates and tears down N-API views over shared-memory bytes.
+//!
+//! Each external `ArrayBuffer` keeps one strong N-API reference until callers
+//! detach the buffer and delete the reference. Release flags use acquire and
+//! release ordering so finalizers observe successful detachment across threads.
+//! Diagnostic counters are process-wide; the creation failpoint is thread-local.
+
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -57,6 +64,12 @@ fn check(status: sys::napi_status, message: &'static str) -> Result<()> {
     }
 }
 
+/// Creates a zero-copy `Uint8Array` and a strong reference to its backing
+/// external `ArrayBuffer`.
+///
+/// Caller must keep `data..data + len` mapped until [`detach`] succeeds and the
+/// returned reference is consumed by [`delete_ref`]. On failure after ArrayBuffer
+/// creation, this function attempts detachment before returning the N-API error.
 pub(crate) fn create_external_view<'env>(
     env: &'env Env,
     data: *mut u8,
@@ -183,6 +196,8 @@ pub(crate) fn delete_ref(env: &Env, external: ExternalRef) -> Result<()> {
     Ok(())
 }
 
+/// Attempts every detachment even after one fails, then returns one aggregate
+/// error. References remain live until [`delete_all`] consumes them.
 pub(crate) fn detach_all(env: &Env, refs: &[ExternalRef]) -> Result<()> {
     let mut failed = false;
     for reference in refs {
@@ -200,6 +215,8 @@ pub(crate) fn detach_all(env: &Env, refs: &[ExternalRef]) -> Result<()> {
     }
 }
 
+/// Attempts to delete every reference even after one deletion fails.
+/// Successful deletions decrement the process-wide active-reference counter.
 pub(crate) fn delete_all(env: &Env, refs: Vec<ExternalRef>) -> Result<()> {
     let mut failed = false;
     for reference in refs {

@@ -1,4 +1,7 @@
-//! Setup-handshake transcript shared by `mc-host` and `mc-shm-native`, so the two handshake implementations cannot desynchronize.
+//! Setup-handshake transcript shared by `mc-host` and `mc-shm-native`.
+//!
+//! Shared constants, proof construction, and committed vectors keep both
+//! handshake implementations synchronized.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -27,7 +30,11 @@ pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
 /// Role string a connecting peer presents.
 pub const DEFAULT_CLIENT_ROLE: &str = "client";
 
-/// Including `daemon_ver` in the MAC prevents peers without the key from altering the reported daemon version. The length prefix keeps the version boundary unambiguous, so no two distinct (version, id) pairs produce the same MAC input.
+/// Computes a domain-separated handshake proof.
+///
+/// Binding `daemon_ver` prevents peers without the key from altering the
+/// reported daemon version. Its length prefix makes the boundary between
+/// version and daemon ID unambiguous.
 pub fn compute_proof(
     key: &[u8],
     domain: &str,
@@ -49,7 +56,9 @@ pub fn compute_proof(
     mac.finalize().into_bytes().into()
 }
 
-/// Committed proof vectors, exposed outside `cfg(test)` so both ends assert against these literals rather than against their own output.
+/// Committed proof vectors used by both handshake implementations.
+///
+/// Exposed outside `cfg(test)` so both ends assert shared literals rather than their own output.
 pub mod vectors {
     use super::{DAEMON_ID_LEN, NONCE_LEN, PROOF_LEN};
 

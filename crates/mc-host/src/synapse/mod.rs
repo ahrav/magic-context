@@ -37,19 +37,26 @@ pub const SYNAPSE_MODULE_ID: &str = "synapse";
 pub struct SynapseLimits {
     /// `max_waiting_queries` limits queries waiting behind the one running query.
     /// When `max_waiting_queries` is zero, one query may run and every concurrent query is rejected immediately.
-    /// rejected immediately.
     pub max_waiting_queries: usize,
     pub max_queued_jobs: usize,
+    /// Resident-byte budget charged by queued batch inputs.
     pub max_queued_request_bytes: u64,
     pub max_retained_jobs: usize,
+    /// Resident-byte budget charged by retained vector results.
     pub max_retained_result_bytes: u64,
     pub max_batch_items: usize,
+    /// Aggregate UTF-8 byte bound applied across batch item text.
     pub max_batch_text_bytes: usize,
+    /// UTF-8 byte bound applied to each query or batch item.
     pub max_text_bytes: usize,
     pub max_page_vectors: usize,
+    /// Encoded-byte bound applied to each vector result page.
     pub max_page_encoded_bytes: usize,
+    /// Completed and failed jobs remain pollable for this duration.
     pub retention: std::time::Duration,
+    /// Clients receive this millisecond delay when batch results remain pending.
     pub retry_after_ms: u64,
+    /// Clients receive this millisecond delay when query admission is full.
     pub query_retry_after_ms: u64,
 }
 
@@ -173,6 +180,7 @@ struct ReadyLane {
     lane: LaneInfo,
 }
 
+/// Catalog and health state of the local embedding lane.
 #[derive(Debug, Clone)]
 pub enum SynapseStatus {
     Ready(LaneInfo),
@@ -202,7 +210,6 @@ struct SynapseInner {
     cpu: Arc<tokio::sync::Semaphore>,
     /// One running query plus at most `max_waiting_queries` waiters may use the serialized CPU lane.
     /// Admission is a non-blocking count: it decides whether a query may wait, not where it enters the queue.
-    /// whether a query may wait at all, never where in the queue it lands.
     /// Batch work is bounded separately by the job table.
     query_admission: Arc<tokio::sync::Semaphore>,
     /// The component owns every started native call through shutdown.
@@ -211,11 +218,13 @@ struct SynapseInner {
     closing: CancellationToken,
 }
 
+/// Composite component that serves one certified, serialized CPU embedding lane.
 pub struct SynapseComponent {
     inner: Arc<SynapseInner>,
 }
 
 impl SynapseComponent {
+    /// Defers bundle loading and ORT initialization until component activation.
     pub fn new(config: Option<SynapseConfig>) -> Self {
         let limits = config
             .as_ref()
@@ -241,6 +250,7 @@ impl SynapseComponent {
         }
     }
 
+    /// Keeps catalog identity disabled with `reason` on hosts without Synapse support.
     pub fn unsupported(reason: &'static str) -> Self {
         let limits = SynapseLimits::default();
         Self {
@@ -297,6 +307,7 @@ impl SynapseComponent {
         })
     }
 
+    /// Returns a cloned state snapshot without waiting for activation.
     pub fn status(&self) -> SynapseStatus {
         match &*self.inner.state.lock().expect("synapse state lock") {
             LaneState::Ready(lane) => SynapseStatus::Ready(lane.lane.clone()),
@@ -317,8 +328,10 @@ impl SynapseComponent {
         }
     }
 
+    /// Runs inference synchronously against the ready lane.
+    ///
     /// `Invariant` errors mark the lane failing before returning, so later callers cannot obtain vectors from a suspect backend.
-    /// backend.
+    /// A non-ready lane returns `InferenceError::Artifact`.
     pub fn embed_blocking(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         let Some(lane) = self.ready_lane() else {
             let reason = match self.status() {
@@ -461,9 +474,9 @@ fn app_error(code: &str, message: &str) -> RequestOutcome {
     RequestOutcome::error(code, message)
 }
 
+/// Converts a deadline race into the queued or running timeout message.
 ///
-/// `expired_query` treats every non-`Timeout` result as an expired running query.
-/// drift apart.
+/// Every non-`Timeout` result is treated as an expired running query.
 fn expired_query(result: Option<&Result<Vec<Vec<f32>>, QueryFault>>) -> RequestOutcome {
     match result {
         Some(Err(QueryFault::Timeout)) => {
@@ -553,8 +566,7 @@ impl SynapseComponent {
                     return;
                 }
                 // A closed receiver cancels queued calls before native work starts.
-                // Once the permit is held, the native call runs even if the receiver closes.
-                // completion regardless.
+                // Once the permit is held, the native call runs to completion even if the receiver closes.
                 () = tx.closed() => return,
                 () = tokio::time::sleep_until(deadline) => {
                     let _ = tx.send(Err(QueryFault::Timeout));
@@ -839,7 +851,6 @@ impl CompositeComponent for SynapseComponent {
     }
 
     fn resources(&self) -> crate::handler::ResourceDeclaration {
-        //
         if self.inner.config.is_none() && self.ready_lane().is_none() {
             return crate::handler::ResourceDeclaration::default();
         }
@@ -876,7 +887,6 @@ impl CompositeComponent for SynapseComponent {
             return app_error("queue_full", "the parse reservation bound is unsatisfiable");
         };
         // A reservation above `capacity` remains unadmittable after draining.
-        // Bodies exceeding `capacity` require a size rejection instead of `queue_full`.
         // Reservations exceeding `capacity` require a size rejection instead of `queue_full`.
         let capacity = ctx.resident_capacity();
         if reservation_bytes > capacity {
@@ -978,7 +988,6 @@ impl CompositeComponent for SynapseComponent {
 
     /// Shutdown closes admission and cancels queued wrappers before joining every started native call through its incarnation.
     /// Shutdown never aborts a started native call.
-    /// native call.
     async fn shutdown(&self) -> Result<(), crate::composite::ShutdownError> {
         self.inner.closing.cancel();
         self.inner.jobs.close_admission();

@@ -1,12 +1,14 @@
+//! Shared subprocess runner for the OpenCode and Pi harnesses.
 //!
-//! OpenCode and Pi use this runner to prevent their subprocess-security behavior from diverging.
-//! The runner does not invoke a shell and uses a dedicated Unix process group.
-//! The runner uses a dedicated Unix process group as the cancellation unit and snapshots the daemon-startup environment.
-//! The runner removes host launch-identity variables from its environment snapshot and delivers prompts over stdin.
-//! The runner creates temp directories and files with `0700` and `0600` permissions and drains stdout and stderr concurrently with bounded buffers.
-//! On timeout, the runner terminates the process group gracefully, then escalates to `SIGKILL`.
-//! The runner reaps the process-group leader before reporting completion and emits only redacted structural diagnostics.
-//! only.
+//! The runner invokes no shell. It uses a dedicated Unix process group as the
+//! cancellation unit and snapshots the daemon-startup environment without host
+//! launch-identity variables. Prompts travel over stdin. Private directories
+//! and files use `0700` and `0600` permissions. Stdout and stderr drain
+//! concurrently into bounded buffers.
+//!
+//! Timeout handling sends `SIGTERM`, escalates to `SIGKILL`, and reaps the process-group leader when teardown completes within the termination grace.
+//! A leader still unreapable after that grace yields `SubprocessEnd::TeardownUnconfirmed`, so the caller must treat the group as possibly alive.
+//! Diagnostics contain only redacted structural data.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -46,13 +48,11 @@ pub struct EnvSnapshot {
 
 /// This cap rejects credential values larger than 16 KiB.
 pub const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
-/// This cap limits the combined byte length of an admitted credential set.
-/// contract's `harness_unavailable.row_cap_bytes`.
+/// This cap matches the release contract's `harness_unavailable.row_cap_bytes`.
 pub const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
 /// Every credential fingerprint includes this key-derivation domain.
 pub const CREDENTIAL_FINGERPRINT_DOMAIN: &str = "subc-broca-credential-v1";
-/// This identifier fixes the credential-fingerprint pre-image layout.
-/// `credential_fingerprint.canonicalization`.
+/// This identifier fixes the release contract's `credential_fingerprint.canonicalization`.
 pub const CREDENTIAL_FINGERPRINT_CANONICALIZATION: &str = "harness-provider-name-length-value/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +91,6 @@ impl EnvSnapshot {
     /// The constructor builds a bounded snapshot from explicit startup variables.
     /// Each variable is charged its string bytes plus `ENV_ENTRY_OVERHEAD_BYTES`, so many short variables cannot bypass the ceiling through per-entry container overhead.
     ///
-    ///
     /// [`ENV_ENTRY_OVERHEAD_BYTES`]: super::config::ENV_ENTRY_OVERHEAD_BYTES
     /// [`MAX_ENV_SNAPSHOT_BYTES`]: super::config::MAX_ENV_SNAPSHOT_BYTES
     pub fn capture_from(vars: impl IntoIterator<Item = (OsString, OsString)>) -> io::Result<Self> {
@@ -117,8 +116,7 @@ impl EnvSnapshot {
         Ok(snapshot)
     }
 
-    /// Snapshots never carry `SUBC_MODULE_ID` or `SUBC_LAUNCH_NONCE`.
-    /// Snapshots exclude `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` regardless of construction path.
+    /// Excludes `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` regardless of construction path.
     pub fn from_vars(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         let vars = vars
             .into_iter()
@@ -208,8 +206,7 @@ impl std::fmt::Debug for EnvSnapshot {
     }
 }
 
-/// `ExecutionBounds` applies to one harness run.
-/// fast.
+/// Resource and timing limits for one harness run.
 #[derive(Clone, Debug)]
 pub struct SubprocessLimits {
     /// `timeout` terminates an elapsed run and maps it to one failed terminal.
@@ -250,7 +247,7 @@ pub struct SubprocessSpec {
     pub inherit_fds: Vec<RawFd>,
 }
 
-/// child output.
+/// Describes how the child process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubprocessEnd {
     Exited(i32),
@@ -277,8 +274,7 @@ pub enum ProbeSignal {
     Quiet,
     /// `Decisive` prevents later output from changing the terminal classification.
     Decisive,
-    /// A retryable terminal failure arms the drain grace so a final failure retains its classification; ProbeSignal::Continues before the grace expires restores the full deadline.
-    /// deadline.
+    /// A retryable terminal failure arms the drain grace so a final failure retains its classification; `ProbeSignal::Continues` before the grace expires restores the full deadline.
     Provisional,
     /// ProbeSignal::Continues indicates that new work began, so provisional drain arming was premature.
     Continues,
@@ -423,8 +419,7 @@ pub async fn run(
     tokio::pin!(deadline);
     let mut terminal_seen = false;
     let mut arming_revocable = false;
-    // Bytes before `probed_to` have already been probed.
-    // line is inspected exactly once no matter how the reads chunk it.
+    // Bytes before `probed_to` have already been probed, so each line is inspected exactly once regardless of read boundaries.
     let mut probed_to = 0usize;
 
     let abnormal = loop {
@@ -522,7 +517,6 @@ pub async fn run(
                 // A fenced `KILL` only signals; the code retains the process-group fence until the sweep completes to prevent signaling a recycled pgid.
                 // The teardown succeeds only after the process group is observed gone.
                 // The teardown checks member disappearance while the unreaped leader pins the pgid.
-                // the pgid.
                 group_gone =
                     signalled && wait_other_members_gone(group, limits.termination_grace).await;
                 child
@@ -583,7 +577,7 @@ fn kill_group(
     }
 }
 
-/// against reuse.
+/// Records whether an exited leader still fences its process-group ID against reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaderExit {
     Running,
@@ -609,8 +603,7 @@ async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Durat
             | rustix::process::WaitIdOptions::NOHANG;
         match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
             Ok(Some(_)) => return LeaderExit::ExitedFenced,
-            // `NotWaitable` proves that the leader exited.
-            // deadline decides.
+            // `NotWaitable` proves that the leader exited without a zombie fence.
             Err(rustix::io::Errno::CHILD | rustix::io::Errno::SRCH) => {
                 return LeaderExit::ExitedUnfenced
             }
@@ -648,9 +641,7 @@ fn kill_group_fenced(
 }
 
 /// Callers must keep the leader unreaped so its zombie prevents pgid recycling during the poll.
-/// Callers must keep the leader unreaped so its zombie prevents pgid recycling during the poll.
-/// pgid.
-/// Return `false` on deadline expiry; scan failures leave teardown unproven and continue polling.
+/// Returns `false` on deadline expiry. Scan failures leave teardown unproven and continue polling.
 async fn wait_other_members_gone(group: Option<rustix::process::Pid>, budget: Duration) -> bool {
     let Some(pid) = group else { return true };
     let pgid = pid.as_raw_nonzero().get();
@@ -1082,7 +1073,6 @@ fn contains_status_code(haystack: &str, code: &str) -> bool {
 pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
 /// The parser extracts only explicit retry delays from provider failure text and clamps them to [`MAX_RETRY_AFTER_SECS`].
-///
 pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     let lower = text.to_ascii_lowercase();
     let mut saw_verb = false;
@@ -1187,8 +1177,7 @@ pub(crate) fn json_nodes_within_bound(text: &str) -> bool {
     true
 }
 
-/// The wire admits provider codes only if they match `[A-Za-z0-9_.-]{1,64}`.
-/// forwarded.
+/// Returns a provider code only when it matches `[A-Za-z0-9_.-]{1,64}`.
 pub(crate) fn sanitized_provider_code(code: &str) -> Option<String> {
     (!code.is_empty()
         && code.len() <= 64
@@ -1254,8 +1243,7 @@ pub(crate) fn finalize(
     merge_cleanup(terminal, cleanup)
 }
 
-/// The crash-orphan registry stores one file per live harness process group.
-/// replacement host can kill groups a crashed predecessor left behind.
+/// The crash-orphan registry stores one file per live harness process group so a replacement host can kill groups left by a crashed predecessor.
 ///
 /// `pdeathsig` terminates only the group leader; provider and extension descendants can survive it.
 /// Descendants can survive the host and continue executing after the leader exits.
@@ -1276,8 +1264,7 @@ pub mod group_registry {
         proc_stat_fields(pid).map(|fields| fields.map(|(_, start)| start))
     }
 
-    /// A zombie counts as dead because an unreaped crashed host can retain its PID and start time.
-    /// holding runs.
+    /// A zombie counts as dead because an unreaped crashed host can retain its PID and start time without running work.
     fn proc_live_start_time(pid: i32) -> io::Result<Option<u64>> {
         Ok(proc_stat_fields(pid)?.and_then(|(state, start)| (state != 'Z').then_some(start)))
     }
@@ -1319,7 +1306,6 @@ pub mod group_registry {
     /// Exclude the leader because its unreaped zombie retains the PGID but cannot execute work.
     /// The deliberately unreaped zombie's `/proc` entry still names the PGID.
     /// The zombie prevents PGID reuse but cannot execute work.
-    /// surviving member.
     pub(crate) fn group_has_other_members(pgid: i32) -> io::Result<bool> {
         scan_group_members(pgid, Some(pgid))
     }
@@ -1510,11 +1496,9 @@ pub mod group_registry {
                 // Matching `leader_pid` and `leader_start` identifies the recorded leader.
                 Some(start) if start == entry.leader_start => true,
                 // A reused leader PID proves the recorded group is gone: a PID used as a PGID cannot be reallocated while group members remain.
-                // provably gone.
                 Some(_) => false,
                 // The leader was reaped (pdeathsig kills only the leader).
                 // Surviving members retain the PGID, so they are descendants of the recorded run.
-                // recorded run.
                 None => group_has_members(entry.leader_pid)?,
             };
             if group_live {
@@ -1600,12 +1584,10 @@ pub mod group_registry {
         Ok(root)
     }
 
-    /// `sweep_orphaned_run_dirs` removes a directory only after proving that its recorded owner is gone.
-    /// (R17/R19).
+    /// `sweep_orphaned_run_dirs` removes a directory only after proving that its recorded owner is gone (R17/R19).
     ///
     /// The sweep uses the recorded PID and start time to avoid deleting a live owner's directory.
-    /// The sweep leaves unverifiable directories in place because deleting a live run's private files would break that run.
-    /// disk cost.
+    /// It leaves unverifiable directories in place because deleting a live run's private files would break that run.
     pub fn sweep_orphaned_run_dirs() -> io::Result<usize> {
         let root = private_run_root()?;
         let current_boot = owner_boot_tag()?;

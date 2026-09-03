@@ -1,5 +1,8 @@
+//! Pure scheduling, lifecycle reduction, and selection policy for smart-note checks.
 //!
-//! Cron matching uses the supplied timezone's wall clock.
+//! Timestamps and intervals use Unix epoch milliseconds. Cron matching uses the
+//! supplied timezone's wall clock. Reducers clone input state and return updated
+//! state without I/O.
 
 use chrono::{Datelike, TimeZone, Timelike};
 use serde::Deserialize;
@@ -201,8 +204,9 @@ fn next_due_at_ms<Tz: TimeZone>(
     next_occurrence(&cron, after_ms, max_search_ms, tz)
 }
 
-/// `is_valid_smart_note_cron` returns whether `expression` parses as a five-field numeric cron expression.
-/// 5-field grammar.
+/// Returns whether `expression` follows the supported five-field numeric cron grammar.
+///
+/// Names and macros are unsupported. Sunday accepts both `0` and `7`.
 pub fn is_valid_smart_note_cron(expression: &str) -> bool {
     parse_cron(expression).is_some()
 }
@@ -210,6 +214,11 @@ pub fn is_valid_smart_note_cron(expression: &str) -> bool {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
+/// Computes the next check time in Unix epoch milliseconds.
+///
+/// Invalid, empty, or matchless cron expressions use the one-hour default interval.
+/// The interval is clamped to five minutes through 24 hours, then receives stable
+/// note/hash jitter of at most 10 percent or 60 seconds, whichever is smaller.
 pub fn next_smart_note_check_due_at<Tz: TimeZone>(
     cron: Option<&str>,
     now: i64,
@@ -319,7 +328,10 @@ pub struct SmartNoteReduction {
     pub surfaced: bool,
 }
 
-/// Backoff after the Nth consecutive failure: min(24h, 5 * 2^(N-1)) minutes.
+/// Returns exponential failure backoff in milliseconds.
+///
+/// The schedule is `min(24 hours, 5 * 2^(N-1) minutes)`. Counts below one behave as
+/// one; counts above ten remain capped at 24 hours.
 pub fn evaluation_backoff_ms(failure_count: i64) -> i64 {
     // 5 * 2^9 already exceeds the 24h cap, so larger exponents can saturate.
     let exponent = (failure_count - 1).clamp(0, 9);
@@ -614,6 +626,10 @@ fn reduce_fallback(
     }
 }
 
+/// Reduces a lifecycle snapshot without mutating it.
+///
+/// `now` is Unix epoch milliseconds. `surfaced` is true only when this call marks the
+/// note ready.
 pub fn reduce_smart_note_evaluation<Tz: TimeZone>(
     pre: &SmartNoteLifecycleState,
     outcome: &SmartNoteEvaluationOutcome,
@@ -637,7 +653,7 @@ pub fn reduce_smart_note_evaluation<Tz: TimeZone>(
 pub struct SmartNoteSelectionSnapshot {
     pub id: i64,
     pub status: String,
-    /// already compiled.
+    /// External compiler status used to suppress already compiled handoff notes.
     pub compile_status: Option<String>,
     pub created_at: i64,
     /// Only artifact presence affects selection, so the snapshot avoids copying artifact bodies for every pending note on every acquisition poll.
@@ -656,7 +672,10 @@ fn eligible(note: &SmartNoteSelectionSnapshot, retina_handoff: bool) -> bool {
         && (!retina_handoff || note.compile_status.as_deref() != Some("compiled"))
 }
 
-/// due first.
+/// Selects due compiled checks by due time, then note ID.
+///
+/// `now` and stored times use Unix epoch milliseconds. A zero `limit` still returns
+/// at most one note.
 pub fn get_due_compiled_smart_note_checks(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -679,6 +698,9 @@ pub fn get_due_compiled_smart_note_checks(
     selected
 }
 
+/// Selects compilation candidates by creation time, then note ID.
+///
+/// A zero `limit` still returns at most one note.
 pub fn get_smart_notes_needing_compilation(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -701,6 +723,11 @@ pub fn get_smart_notes_needing_compilation(
     selected
 }
 
+/// Selects liveness candidates by false-since time, then note ID.
+///
+/// `now` and stored times use Unix epoch milliseconds.
+/// Both staleness comparisons are inclusive, so a note exactly at the maximum false duration or the liveness recheck interval is already a candidate.
+/// A zero `limit` still returns at most one note.
 pub fn get_stale_compiled_smart_notes(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -727,6 +754,9 @@ pub fn get_stale_compiled_smart_notes(
     selected
 }
 
+/// Selects fallback candidates with never-checked notes first, then check time and ID.
+///
+/// A zero `limit` still returns at most one note.
 pub fn get_fallback_smart_notes(
     notes: &[SmartNoteSelectionSnapshot],
     limit: usize,
@@ -787,8 +817,7 @@ const NONBILLABLE_CYCLE_PROFILE: &[(SmartNotePhase, usize)] = &[
     (SmartNotePhase::Liveness, NONBILLABLE_PHASE_QUOTA),
 ];
 
-///
-/// cursor.
+/// Durable cursor and remaining quota for one phase-ordered selection cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SmartNoteSelectionCycle {
     mode: SmartNoteCycleMode,
@@ -817,7 +846,11 @@ fn cycle_profile(mode: SmartNoteCycleMode) -> &'static [(SmartNotePhase, usize)]
     }
 }
 
-/// Empty or exhausted phases advance without transferring unused quota.
+/// Selects one note from the earliest nonempty phase with quota remaining.
+///
+/// Phase order is due, compile, liveness, fallback in full mode and due, liveness in
+/// nonbillable mode. Empty or exhausted phases advance without transferring quota.
+/// Returned cursor state applies only after the caller commits the claim.
 pub(crate) fn select_smart_note_evaluation_cycle(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
@@ -1463,8 +1496,7 @@ mod tests {
 
     #[test]
     fn next_occurrence_survives_extreme_instants() {
-        // `i64::MIN` must not underflow the minute-floor multiplication, and `i64::MAX` must not overflow the cap; both return no occurrence.
-        // debug-build panic.
+        // Extreme timestamps return no occurrence instead of overflowing in debug builds.
         let utc = chrono::Utc;
         assert_eq!(
             next_due_at_ms("* * * * *", i64::MIN, MAX_SEARCH_MS, &utc),

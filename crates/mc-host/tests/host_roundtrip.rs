@@ -1,5 +1,4 @@
-//! The independent raw client verifies end-to-end composition over real loopback.
-//! pieces compose.
+//! End-to-end host composition tests using an independent raw client over loopback.
 
 mod support;
 
@@ -14,6 +13,7 @@ use support::{mode_body, TestHandler, TestHost, LINKED_MODULE_ID};
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
 
+/// Exercises catalog, routing, unary, streaming, cancellation, and shutdown on one connection.
 #[tokio::test]
 async fn the_full_profile_composes_over_one_connection() {
     let host = TestHost::start().await;
@@ -142,6 +142,7 @@ async fn the_full_profile_composes_over_one_connection() {
     assert!(handler.handler_dropped());
 }
 
+/// Verifies restart rotation rejects old credentials and channel handles.
 #[tokio::test]
 async fn restart_rotates_credentials_and_invalidates_old_state() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -201,6 +202,7 @@ async fn restart_rotates_credentials_and_invalidates_old_state() {
     second.shutdown_gracefully().await;
 }
 
+/// Verifies concurrent clients receive only their own terminal responses.
 #[tokio::test]
 async fn concurrent_clients_settle_independently() {
     let host = TestHost::start().await;
@@ -262,6 +264,7 @@ async fn concurrent_clients_settle_independently() {
     host.shutdown_gracefully().await;
 }
 
+/// Verifies a degraded-storage error leaves the route usable.
 #[tokio::test]
 async fn degraded_storage_is_an_application_error_not_a_disconnect() {
     let host = TestHost::start().await;

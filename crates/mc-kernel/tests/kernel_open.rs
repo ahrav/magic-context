@@ -1,3 +1,9 @@
+//! Integration tests for kernel open, fencing, quarantine, and file modes.
+//!
+//! Tests verify that conclusive mismatches are quarantined, inconclusive or
+//! foreign families remain untouched, and each successful reopen advances the
+//! writer fence.
+
 use mc_kernel::schema::{
     apply_kernel_connection_profile, apply_kernel_schema, kernel_schema_digest,
     KERNEL_APPLICATION_ID,

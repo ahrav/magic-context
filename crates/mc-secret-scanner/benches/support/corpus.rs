@@ -2,13 +2,16 @@
 // benches. Duplicated in both bench targets because Cargo bench targets
 // cannot share a private module across crates.
 
+/// Deterministic generator used to keep benchmark corpora reproducible.
 pub struct Lcg(u64);
 
 impl Lcg {
+    /// Creates a generator, normalizing zero to the nonzero state `1`.
     pub fn new(seed: u64) -> Self {
         Self(seed.max(1))
     }
 
+    /// Advances the generator and returns its high-order output bits.
     pub fn next_u32(&mut self) -> u32 {
         self.0 = self
             .0
@@ -17,6 +20,11 @@ impl Lcg {
         (self.0 >> 33) as u32
     }
 
+    /// Selects a deterministic element from a nonempty slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `items` is empty.
     pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[(self.next_u32() as usize) % items.len()]
     }

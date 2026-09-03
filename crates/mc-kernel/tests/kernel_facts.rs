@@ -1,5 +1,9 @@
 #![cfg(feature = "test-support")]
 
+//! Storage facts distinguish SQLite main-file bytes from total database-family
+//! bytes. Consumer lag uses commit-sequence counts, and age values use elapsed
+//! milliseconds from the caller-supplied clock.
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
