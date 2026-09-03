@@ -1062,6 +1062,15 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
         }))).toThrow(/report\.body\.analysis\.rawRegretRecords: ladder-prefix-missing-/);
+        // A raw regret endpoint has its aggregate estimate.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.providerMixedRegret = body.analysis.providerMixedRegret.filter(({ endpoint }) => endpoint !== "formation");
+            body.regret.providerMixed = body.analysis.providerMixedRegret;
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords\[\d+\]\.endpoint: aggregate-required/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.plannedCoordinates = 0;
+            body.runSummary.healthyCoordinates = 0;
+        }))).toThrow(/report\.body\.runSummary\.plannedCoordinates: integer-invalid/);
         // A calibrated floor's interval is exactly [0, value].
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;

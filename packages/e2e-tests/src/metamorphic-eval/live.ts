@@ -20,7 +20,7 @@ import {
     CONTROL_TRANSFORM_ID,
     CONTROL_TRANSFORM_VERSION,
     buildMetamorphicReport,
-    rejectReservedTransformIds,
+    requireRepresentableRunOptions,
     type InjectionCanaryHit,
     type MetamorphicInvariantVerdict,
     type MetamorphicReport,
@@ -136,6 +136,13 @@ export function liveDerivativeAdmissionDiagnostics(
     return diagnostics.sort();
 }
 
+function scoredSystem(entries: readonly MetamorphicReportEntry[]): SystemVersionTuple | null {
+    for (const entry of entries) {
+        if (entry.kind === "scored" && entry.baselineScore.system !== null) return entry.baselineScore.system;
+    }
+    return null;
+}
+
 function sameSystem(left: ScenarioScore, right: ScenarioScore): boolean {
     return left.system !== null && right.system !== null && canonicalJson(left.system) === canonicalJson(right.system);
 }
@@ -211,8 +218,8 @@ export async function runLiveMetamorphicEval(
 ): Promise<MetamorphicReport> {
     if (scenarios.length === 0) throw new Error("live metamorphic eval needs at least one scenario");
     const transforms = options.transforms ?? TRANSFORMS;
-    rejectReservedTransformIds(transforms);
     const seeds = options.seeds ?? DETERMINISTIC_SEEDS;
+    requireRepresentableRunOptions(transforms, seeds);
     const prepared = buildPairs(scenarios, transforms, seeds);
     const entries = [...prepared.entries];
     const injectionCanaryHits: InjectionCanaryHit[] = [];
@@ -221,7 +228,9 @@ export async function runLiveMetamorphicEval(
             entries,
             coverage: prepared.coverage,
             injectionCanaryHits,
-            system: options.system ?? null,
+            // Every run-record score carries the resolved system, and the parser requires the root to name it,
+            // so a caller that omits the option gets the system the scores agree on.
+            system: options.system ?? scoredSystem(entries),
             ...(tierInvalidReason === undefined ? {} : { tierInvalidReason }),
         });
     const observe = (

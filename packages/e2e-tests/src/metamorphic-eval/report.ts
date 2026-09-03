@@ -14,10 +14,20 @@ export const CONTROL_TRANSFORM_ID = "baseline-control";
 export const CONTROL_TRANSFORM_VERSION = 1;
 export const CONTROL_SEED = 0;
 
-/** The parser classifies an entry by this id alone, so no product transform may claim it. */
-export function rejectReservedTransformIds(transforms: readonly { id: string }[]): void {
+/**
+ * Rejects run options the report contract cannot represent before any entry is built.
+ *
+ * The parser classifies an entry by the control id alone, so no product transform may claim it, and a pair key
+ * carries its seed as a bounded integer, so a seed the transform would refuse must not reach an error entry.
+ */
+export function requireRepresentableRunOptions(transforms: readonly { id: string }[], seeds: readonly number[]): void {
     if (transforms.some(({ id }) => id === CONTROL_TRANSFORM_ID)) {
         throw new Error(`metamorphic-eval: transform id "${CONTROL_TRANSFORM_ID}" is reserved for the control pair`);
+    }
+    for (const seed of seeds) {
+        if (!Number.isSafeInteger(seed) || seed < 0 || seed > MAX_TRANSFORM_SEED) {
+            throw new Error(`metamorphic-eval: seed ${String(seed)} is outside the unsigned 32-bit range`);
+        }
     }
 }
 
@@ -562,7 +572,11 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // Both runners build a scenario's coverage row around its canary collection, so a hit names a covered
     // scenario; the control roles are the exception, since the control scenario has no row.
     for (const [index, hit] of report.injectionCanaryHits.entries()) {
-        if (hit.role === "control-a" || hit.role === "control-b") continue;
+        if (hit.role === "control-a" || hit.role === "control-b") {
+            // Only the live runner runs controls, and it publishes the system it ran them on.
+            if (report.system === null) p.fail(`report.injectionCanaryHits[${index}]: control-role-requires-live-report`);
+            continue;
+        }
         if (!covered.has(hit.scenarioId)) p.fail(`report.injectionCanaryHits[${index}]: coverage-row-required`);
     }
     const sources = new Set(report.entries.flatMap((entry) => entry.kind === "scored" ? [entry.baselineScore.source] : []));

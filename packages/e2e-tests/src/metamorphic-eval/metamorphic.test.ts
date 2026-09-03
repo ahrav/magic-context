@@ -390,6 +390,11 @@ describe("deterministic metamorphic runner", () => {
             entry.derivativeScore.system = systemTuple();
         }
         expect(() => parseMetamorphicReport(identityless)).toThrow(/report\.system: report-system-mismatch/);
+        // Control roles exist only in a live report, which names the system it ran.
+        const strayControl = structuredClone(report);
+        strayControl.injectionCanaryHits.push({ scenarioId: "hse-control", role: "control-a", transformId: null, transformVersion: null, seed: null });
+        expect(() => parseMetamorphicReport(strayControl))
+            .toThrow(/report\.injectionCanaryHits\[0\]: control-role-requires-live-report/);
         // A canary hit names a covered scenario.
         const strayHit = structuredClone(report);
         strayHit.injectionCanaryHits.push({ scenarioId: "hse-nowhere", role: "baseline", transformId: null, transformVersion: null, seed: 1 });
@@ -418,6 +423,13 @@ describe("deterministic metamorphic runner", () => {
         expect(metamorphicExitCode(mixedSource)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(mixedSource))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-source-mismatch`));
+    });
+
+    test("refuses a seed the transforms would reject before building any entry", () => {
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { seeds: [0x1_0000_0000] }))
+            .toThrow(/seed 4294967296 is outside the unsigned 32-bit range/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), id: "baseline-control" }] }))
+            .toThrow(/reserved for the control pair/);
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {

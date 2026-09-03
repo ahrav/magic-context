@@ -1862,12 +1862,13 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         // `compareProbeAnswer` passes only a non-null answer that matches: for an exact probe, `expected`
         // itself after entity decoding and normalization; for a claim-id probe, one of the ` | `-joined ids in
         // `expected`. The answer type is not archived, so a pass must satisfy one of the two.
-        if (outcome === "pass") {
-            if (actual === null) p.fail(`${probeLabel}.outcome: derived-mismatch`);
-            const answer = normalizeContent(decodeXmlEntities(actual as string));
-            const exactMatch = answer === normalizeContent(decodeXmlEntities(expected));
-            const claimMatch = expected.split(" | ").some((id) => normalizeContent(id) === normalizeContent(actual as string));
-            if (!exactMatch && !claimMatch) p.fail(`${probeLabel}.outcome: derived-mismatch`);
+        // The answer type is not archived, so the two rules are applied jointly: a pass must satisfy one, and a
+        // fail must satisfy neither.
+        const matches = actual !== null && (
+            normalizeContent(decodeXmlEntities(actual)) === normalizeContent(decodeXmlEntities(expected)) ||
+            expected.split(" | ").some((id) => normalizeContent(id) === normalizeContent(actual)));
+        if ((outcome === "pass") !== matches && outcome !== "error-trimmed") {
+            p.fail(`${probeLabel}.outcome: derived-mismatch`);
         }
         return {
             probeId: p.string(probe.probeId, `${probeLabel}.probeId`),

@@ -639,7 +639,8 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             observedCostRollouts: p.integer(summary.observedCostRollouts, "report.body.runSummary.observedCostRollouts"),
             estimatedCostRollouts: p.integer(summary.estimatedCostRollouts, "report.body.runSummary.estimatedCostRollouts"),
             refusedRegretLadders: parseRefusedRegretLadders(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
-            plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates"),
+            // A dispatch plans a non-empty selection at a positive replicate depth.
+            plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates", 1),
             healthyCoordinates: p.integer(summary.healthyCoordinates, "report.body.runSummary.healthyCoordinates"),
             evidenceComplete: p.boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
             calibrationFingerprint: summary.calibrationFingerprint === null
@@ -711,6 +712,13 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         // depth counted over complete-primary coordinates. Variance validity is not recoverable here.
         if (body.runSummary.status !== "completed" || body.runSummary.healthyCoordinates !== body.runSummary.plannedCoordinates) {
             p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
+        }
+    }
+    // The estimator emits an aggregate for every endpoint present in the observations.
+    const aggregateEndpoints = new Set([...body.analysis.liveRegret, ...body.analysis.providerMixedRegret].map(({ endpoint }) => endpoint));
+    for (const [index, record] of body.analysis.rawRegretRecords.entries()) {
+        if (!aggregateEndpoints.has(record.endpoint)) {
+            p.fail(`report.body.analysis.rawRegretRecords[${index}].endpoint: aggregate-required`);
         }
     }
     // A coordinate either refused its ladder or produced raw regret records, never both.

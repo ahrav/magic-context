@@ -2610,6 +2610,13 @@ describe("buildLaneReport", () => {
         wrongPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "no" }];
         expect(() => parseLaneReport(wrongPass))
             .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        const wrongFail = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(wrongFail.scenarios[0]!, {
+            verdict: "FAIL", failReasons: ["probe"],
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "yes" }],
+        });
+        expect(() => parseLaneReport(wrongFail))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
         // A probe passes only on a non-null answer.
         const answerlessPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         answerlessPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: null }];
