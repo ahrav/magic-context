@@ -13,10 +13,14 @@ import {
 } from "../historian-eval/scorer";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { containsInjectionCanary } from "./injection-canary";
-import { compareInvariants } from "./invariants";
+import { compareScoreInvariants, injectionSetInvariant } from "./invariants";
 import { admitPair } from "./pairs";
 import {
+    CONTROL_SEED,
+    CONTROL_TRANSFORM_ID,
+    CONTROL_TRANSFORM_VERSION,
     buildMetamorphicReport,
+    requireRepresentableRunOptions,
     type InjectionCanaryHit,
     type MetamorphicInvariantVerdict,
     type MetamorphicReport,
@@ -63,8 +67,6 @@ interface ApplicablePair {
     derivative: TurnTransform;
 }
 
-const CONTROL_TRANSFORM_ID = "baseline-control";
-
 function sortedUnique(values: readonly string[]): string[] {
     return [...new Set(values)].sort();
 }
@@ -73,40 +75,14 @@ export function compareLivePair(
     baseline: LiveObservation,
     derivative: LiveObservation,
 ): MetamorphicInvariantVerdict[] {
-    const expectationIds = sortedUnique([
-        ...Object.keys(baseline.expectationMatches),
-        ...Object.keys(derivative.expectationMatches),
-    ]);
-    const changedExpectationIds = expectationIds.filter(
-        (id) => baseline.expectationMatches[id] !== derivative.expectationMatches[id],
-    );
-    const baselineMatches = sortedUnique(baseline.score.falseAuthoritativeMatches);
-    const derivativeMatches = sortedUnique(derivative.score.falseAuthoritativeMatches);
-
     return [
-        compareInvariants(
-            baseline.injectedClaims,
-            derivative.injectedClaims,
+        injectionSetInvariant(baseline.injectedClaims, derivative.injectedClaims),
+        ...compareScoreInvariants(
             baseline.score,
             derivative.score,
-        )[0]!,
-        {
-            invariant: "expectation-predicate-equality",
-            holds: changedExpectationIds.length === 0,
-            changedExpectationIds,
-        },
-        {
-            invariant: "false-authoritative-set-equality",
-            holds: JSON.stringify(baselineMatches) === JSON.stringify(derivativeMatches),
-            baselineMatches,
-            derivativeMatches,
-        },
-        {
-            invariant: "scenario-verdict-equality",
-            holds: baseline.score.verdict === derivative.score.verdict,
-            baselineVerdict: baseline.score.verdict,
-            derivativeVerdict: derivative.score.verdict,
-        },
+            baseline.expectationMatches,
+            derivative.expectationMatches,
+        ),
     ];
 }
 
@@ -136,6 +112,17 @@ export function liveDerivativeAdmissionDiagnostics(
 
 function sameSystem(left: ScenarioScore, right: ScenarioScore): boolean {
     return left.system !== null && right.system !== null && canonicalJson(left.system) === canonicalJson(right.system);
+}
+
+/**
+ * A supplied system tuple that a run record contradicts is a runner configuration fault, not a scenario outcome,
+ * so the run stops instead of publishing a root the scores would fail to bind to.
+ */
+export class LiveSystemMismatchError extends Error {
+    constructor(supplied: SystemVersionTuple, observed: SystemVersionTuple) {
+        super(`live metamorphic eval: supplied system ${canonicalJson(supplied)} does not match the run record's ${canonicalJson(observed)}`);
+        this.name = "LiveSystemMismatchError";
+    }
 }
 
 function canaryHit(
@@ -210,15 +197,21 @@ export async function runLiveMetamorphicEval(
     if (scenarios.length === 0) throw new Error("live metamorphic eval needs at least one scenario");
     const transforms = options.transforms ?? TRANSFORMS;
     const seeds = options.seeds ?? DETERMINISTIC_SEEDS;
+    requireRepresentableRunOptions(scenarios, transforms, seeds);
     const prepared = buildPairs(scenarios, transforms, seeds);
     const entries = [...prepared.entries];
     const injectionCanaryHits: InjectionCanaryHit[] = [];
+    // The first run-record system any role resolves, so a report cut short before its first scored pair
+    // still names the system it ran on.
+    let observedSystem: SystemVersionTuple | null = null;
     const finish = (tierInvalidReason?: MetamorphicReport["tierInvalidReason"]): MetamorphicReport =>
         buildMetamorphicReport({
             entries,
             coverage: prepared.coverage,
             injectionCanaryHits,
-            system: options.system ?? null,
+            // Every run-record score carries the resolved system, and the parser requires the root to name it,
+            // so a caller that omits the option gets the system the scores agree on.
+            system: options.system ?? observedSystem,
             ...(tierInvalidReason === undefined ? {} : { tierInvalidReason }),
         });
     const observe = (
@@ -246,7 +239,7 @@ export async function runLiveMetamorphicEval(
 
     observe();
 
-    const execute: LiveScenarioExecutor = options.execute ?? (async (scenario, _role, artifactDir) => {
+    const executeRole: LiveScenarioExecutor = options.execute ?? (async (scenario, _role, artifactDir) => {
         const record = await runScenario(scenario, {
             mode: options.mode,
             artifactDir,
@@ -258,13 +251,28 @@ export async function runLiveMetamorphicEval(
             injectedClaims: record.injectedClaims,
         };
     });
+    /** Turns an executor failure into the error a report entry records; a system mismatch is a runner fault and propagates. */
+    const entryError = (error: unknown): Error => {
+        if (error instanceof LiveSystemMismatchError) throw error;
+        return error instanceof Error ? error : new Error(getErrorMessage(error));
+    };
+    const execute: LiveScenarioExecutor = async (scenario, role, artifactDir) => {
+        const observation = await executeRole(scenario, role, artifactDir);
+        const observed = observation.score.system;
+        const supplied = options.system ?? null;
+        if (supplied !== null && observed !== null && canonicalJson(supplied) !== canonicalJson(observed)) {
+            throw new LiveSystemMismatchError(supplied, observed);
+        }
+        observedSystem ??= observed;
+        return observation;
+    };
 
     const controlScenario = scenarios[0]!;
     const controlKey: PairKey = {
         scenarioId: controlScenario.id,
         transformId: CONTROL_TRANSFORM_ID,
-        transformVersion: 1,
-        seed: 0,
+        transformVersion: CONTROL_TRANSFORM_VERSION,
+        seed: CONTROL_SEED,
     };
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;
@@ -330,7 +338,7 @@ export async function runLiveMetamorphicEval(
         });
         observe();
     } catch (error) {
-        const reason = getErrorMessage(error);
+        const reason = entryError(error).message;
         entries.push({ ...controlKey, kind: "error", error: reason });
         /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. */
         if (controlA === null || controlB === null) {
@@ -359,7 +367,7 @@ export async function runLiveMetamorphicEval(
                         liveArtifactDir(options.artifactRoot, pair.base.id, "baseline"),
                     );
                 } catch (error) {
-                    baseline = error instanceof Error ? error : new Error(getErrorMessage(error));
+                    baseline = entryError(error);
                 }
                 baselines.set(pair.base.id, baseline);
                 if (!(baseline instanceof Error)) {
@@ -396,6 +404,9 @@ export async function runLiveMetamorphicEval(
             }
             if (!sameSystem(baseline.score, derivative.score)) {
                 entries.push({ ...pair.key, kind: "error", error: "pair system tuple mismatch" });
+            } else if (observedSystem !== null && canonicalJson(baseline.score.system) !== canonicalJson(observedSystem)) {
+                // The report names the first tuple observed, and its parser binds every scored pair to that root.
+                entries.push({ ...pair.key, kind: "error", error: "pair system tuple differs from the control run" });
             } else {
                 entries.push({
                     ...pair.key,
@@ -406,7 +417,7 @@ export async function runLiveMetamorphicEval(
                 });
             }
         } catch (error) {
-            entries.push({ ...pair.key, kind: "error", error: getErrorMessage(error) });
+            entries.push({ ...pair.key, kind: "error", error: entryError(error).message });
         }
         observe();
     }

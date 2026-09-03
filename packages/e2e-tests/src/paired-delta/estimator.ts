@@ -13,6 +13,10 @@ import {
 import type { RunHealth } from "./contract";
 
 export const MIN_BOOTSTRAP_RESAMPLES = 2000;
+/** Bounds the work a resample count can demand of a reader that replays the bootstrap; the policy uses 5000. */
+export const MAX_BOOTSTRAP_RESAMPLES = 100_000;
+/** Bounds observations times resamples, the sampling work one estimate or its replay performs. */
+export const MAX_BOOTSTRAP_WORK = 20_000_000;
 // `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
 export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
@@ -114,7 +118,7 @@ export interface FamilyDeltaAnalysis extends LaneBinding {
     rawRegretRecords: RawRegretRecord[];
 }
 
-function mean(values: readonly number[]): number {
+export function mean(values: readonly number[]): number {
     return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
@@ -149,8 +153,33 @@ function floorKey(familyId: string, endpoint: PrimaryEndpoint | undefined): stri
     return tupleKey(familyId, endpoint);
 }
 
-function includesZero(interval: Interval): boolean {
+export function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
+}
+
+/** A delta no larger than its family's calibrated floor is not separable from measured noise. */
+export function noiseLabel(pointEstimate: number, floor: FamilyNoiseFloor | null): NoiseComparison {
+    if (floor === null) return "no-noise-floor";
+    return Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
+}
+
+/**
+ * Resolution over the family estimates alone, which is why the consumer can recompute it.
+ *
+ * An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor
+ * family leaves the endpoint unresolved.
+ */
+export function endpointResolution(
+    families: readonly { noise: { label: NoiseComparison } }[],
+    interval: Interval,
+    minimumAnalyzableFamilyCount: number,
+): "resolved" | "unresolved" {
+    return families.length >= minimumAnalyzableFamilyCount &&
+        families.length >= 2 &&
+        !includesZero(interval) &&
+        !families.some(({ noise }) => noise.label === "inside-floor")
+        ? "resolved"
+        : "unresolved";
 }
 
 function estimateEndpoint(
@@ -192,9 +221,7 @@ function estimateEndpoint(
                 : noiseFloors.get(floorKey(familyId, primary)) ??
                     noiseFloors.get(floorKey(familyId, undefined)) ??
                     null;
-            const label: NoiseComparison = floor === null
-                ? "no-noise-floor"
-                : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
+            const label = noiseLabel(pointEstimate, floor);
             return {
                 familyId,
                 pointEstimate,
@@ -209,24 +236,52 @@ function estimateEndpoint(
             };
         });
     const familyMeans = families.map(({ pointEstimate }) => pointEstimate);
-    const interval = bootstrapInterval(
-        familyMeans,
-        bootstrapResamples,
-        bootstrapSeed ^ fnv1a32(endpoint),
-    );
+    const interval = endpointInterval(endpoint, familyMeans, { bootstrapResamples, bootstrapSeed });
     /** An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor family leaves the endpoint unresolved. */
-    const insideFloor = families.some(({ noise }) => noise.label === "inside-floor");
     return {
         endpoint,
         pointEstimate: mean(familyMeans),
         interval,
         familyCount: families.length,
-        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval) &&
-            !insideFloor
-            ? "resolved"
-            : "unresolved",
+        resolution: endpointResolution(families, interval, minimumAnalyzableFamilyCount),
         families,
     };
+}
+
+/** The aggregate interval over a set of family means, which a reader recomputes from the published means and settings. */
+export function endpointInterval(
+    endpoint: DeltaEndpoint,
+    familyMeans: readonly number[],
+    settings: { bootstrapResamples: number; bootstrapSeed: number },
+): Interval {
+    return bootstrapInterval(familyMeans, settings.bootstrapResamples, settings.bootstrapSeed ^ fnv1a32(endpoint));
+}
+
+/**
+ * Recomputes one regret endpoint's estimate from its archived raw records.
+ *
+ * A regret rung takes no noise floor, and `estimateFamilyDeltas` includes every regret observation, so the
+ * archived records, seed, and resample count determine the estimate exactly.
+ */
+export function estimateRegretEndpoint(
+    endpoint: RegretEndpoint,
+    records: readonly RawRegretRecord[],
+    settings: { minimumAnalyzableFamilyCount: number; bootstrapResamples: number; bootstrapSeed: number },
+): EndpointEstimate {
+    return estimateEndpoint(
+        endpoint,
+        records.filter((record) => record.endpoint === endpoint).map((record) => ({
+            coordinateId: record.coordinateId,
+            familyId: record.familyId,
+            endpoint: record.endpoint,
+            delta: record.delta,
+            runHealth: "completed",
+        })),
+        new Map(),
+        settings.minimumAnalyzableFamilyCount,
+        settings.bootstrapResamples,
+        settings.bootstrapSeed,
+    );
 }
 
 export function estimateFamilyDeltas(input: {
@@ -250,11 +305,14 @@ export function estimateFamilyDeltas(input: {
     ) {
         throw new PairedDeltaEstimatorError("bootstrap-seed-invalid");
     }
-    if (
-        !Number.isSafeInteger(input.bootstrapResamples) ||
-        input.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES
-    ) {
+    if (!Number.isSafeInteger(input.bootstrapResamples) || input.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES) {
         throw new PairedDeltaEstimatorError("bootstrap-resamples-too-small");
+    }
+    if (input.bootstrapResamples > MAX_BOOTSTRAP_RESAMPLES) {
+        throw new PairedDeltaEstimatorError("bootstrap-resamples-too-large");
+    }
+    if (input.observations.length * input.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+        throw new PairedDeltaEstimatorError("bootstrap-work-too-large");
     }
     if (!/^[0-9a-f]{64}$/.test(input.lane.poolManifestFingerprint)) {
         throw new PairedDeltaEstimatorError("lane-pool-manifest-fingerprint-invalid");
@@ -285,7 +343,14 @@ export function estimateFamilyDeltas(input: {
                 `observation: unanalyzable-${observation.coordinateId}`,
             );
         }
-        if (!Number.isFinite(observation.delta)) {
+        // Both identifiers name report rows the parser admits only as non-blank strings.
+        if (observation.familyId.trim().length === 0 || observation.coordinateId.trim().length === 0) {
+            throw new PairedDeltaEstimatorError(
+                `observation: identifier-blank-${observation.coordinateId}`,
+            );
+        }
+        // A delta is a difference of two values in [0, 1], which is also the bound the report parser applies.
+        if (!Number.isFinite(observation.delta) || observation.delta < -1 || observation.delta > 1) {
             throw new PairedDeltaEstimatorError(
                 `observation: delta-invalid-${observation.coordinateId}`,
             );

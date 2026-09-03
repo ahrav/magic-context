@@ -1,10 +1,11 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
+import { REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { SCENARIO_ID_RE } from "../historian-eval/contract";
 import type { SystemVersionTuple } from "../historian-eval/runner";
 import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval/scorer";
+import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
 import type { PairedDeltaPolicyModel } from "../paired-delta/contract";
@@ -154,32 +155,14 @@ export type PolicyModel = PairedDeltaPolicyModel;
 
 export type SystemProjection = SystemVersionTuple;
 
-/** `_systemProjectionKeysComplete` fails to compile when a `SystemProjection` field is missing from this tuple. */
-const SYSTEM_PROJECTION_KEYS = [
-    "repoCommitSha",
-    "bunVersion",
-    "opencodeVersion",
-    "historianModelId",
-    "probeModelId",
-    "parserImpl",
-    "chunkTokenBudget",
-] as const satisfies readonly (keyof SystemProjection)[];
-type MissingSystemProjectionKey = Exclude<keyof SystemProjection, (typeof SYSTEM_PROJECTION_KEYS)[number]>;
-const _systemProjectionKeysComplete: MissingSystemProjectionKey extends never ? true : never = true;
-void _systemProjectionKeysComplete;
-
 export type ReleaseFingerprintsProjection = BenchmarkReport["semantic"]["releaseFingerprints"];
 
-/** `_releaseFingerprintsKeysComplete` fails to compile when a `ReleaseFingerprintsProjection` field is missing from this tuple. */
-const RELEASE_FINGERPRINTS_KEYS = [
-    "corpus",
-    "judgments",
-    "syntheticProfiles",
-    "manifest",
-] as const satisfies readonly (keyof ReleaseFingerprintsProjection)[];
-type MissingReleaseFingerprintsKey = Exclude<keyof ReleaseFingerprintsProjection, (typeof RELEASE_FINGERPRINTS_KEYS)[number]>;
-const _releaseFingerprintsKeysComplete: MissingReleaseFingerprintsKey extends never ? true : never = true;
-void _releaseFingerprintsKeysComplete;
+const RELEASE_FINGERPRINTS_KEYS = vocabulary<keyof ReleaseFingerprintsProjection>({
+    corpus: true,
+    judgments: true,
+    syntheticProfiles: true,
+    manifest: true,
+});
 
 export type LaneIdentity =
     | { kind: "identityless" }
@@ -243,18 +226,7 @@ function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[],
 }
 
 function parseSystemProjection(raw: unknown, label: string): SystemProjection {
-    const value = record(raw, label);
-    exact(value, SYSTEM_PROJECTION_KEYS, label);
-    if (value.parserImpl !== "ts") fail(`${label}.parserImpl: enum-invalid`);
-    return {
-        repoCommitSha: string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: string(value.probeModelId, `${label}.probeModelId`),
-        parserImpl: "ts",
-        chunkTokenBudget: value.chunkTokenBudget === null ? null : integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
-    };
+    return parseSystemVersionTuple(p, raw, label) ?? fail(`${label}: object-required`);
 }
 
 function parseIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {
