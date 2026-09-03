@@ -719,3 +719,25 @@ fn byte_detection_handles_multibyte_characters_split_by_window_capacity() {
         Ok(true)
     );
 }
+
+#[test]
+fn a_finding_in_the_shared_overlap_counts_once_against_the_limit() {
+    let secret_line = format!("token={AWS_KEY}");
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // Inside both windows and clear of both edge margins.
+    let (text, offset) = text_with_line_at(
+        window - WINDOW_OVERLAP_BYTES + 2 * EDGE_MARGIN_BYTES,
+        &secret_line,
+        window + window / 2,
+    );
+    assert!(offset + secret_line.len() + EDGE_MARGIN_BYTES < window);
+    // One secret can be several raw findings (a keyed rule and a provider rule
+    // over the same bytes), so measure that count on a one-window text first.
+    let (single, _) = text_with_line_at(1024, &secret_line, 8 * 1024);
+    let per_secret = (1..=8)
+        .find(|&limit| redact_windowed_durable_text(&single, limit).is_ok())
+        .unwrap();
+    let redaction = redact_windowed_durable_text(&text, per_secret).unwrap();
+    assert_eq!(redaction.detections.len(), 1, "{:?}", redaction.detections);
+    assert_eq!(redaction.detections[0].offset, offset + "token=".len());
+}

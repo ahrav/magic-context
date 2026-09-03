@@ -194,19 +194,107 @@ impl Redactor {
 
     /// Returns no partial output when scanning exhausts a limit or yields an invalid span.
     pub fn redact(&self, input: &str) -> Result<Redaction, RedactionError> {
-        let findings = self.window_findings(input, 0, true)?;
+        let findings = WindowScan::new(self).findings(input, 0, true)?;
         scanner::render(input, scanner::describe_findings(input, &findings, 0)?)
     }
 
-    /// `start` is the window's byte offset in the full input; `is_last` indicates whether the window reaches its end.
-    /// Findings within [`EDGE_MARGIN_BYTES`] of an artificial edge are left to the neighbouring window.
-    fn window_findings(
+    /// Findings are counted before cluster merging; exceeding `max_findings` returns before describing the offending window or scanning later ones.
+    pub fn redact_windowed(
         &self,
+        input: &str,
+        max_findings: usize,
+    ) -> Result<Redaction, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        let mut replacements = Vec::new();
+        for (start, end) in scan_windows(input) {
+            let window = window(input, start, end)?;
+            let findings = scan.findings(window, start, end == input.len())?;
+            if replacements.len().saturating_add(findings.len()) > max_findings {
+                return Err(RedactionError {
+                    kind: RedactionErrorKind::FindingLimit,
+                });
+            }
+            replacements.extend(scanner::describe_findings(window, &findings, start)?);
+        }
+        scanner::render(input, replacements)
+    }
+
+    /// Verdict-only counterpart of [`Self::redact_windowed`]: stops at the first finding and renders no output.
+    pub fn detect_windowed(&self, input: &str) -> Result<bool, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        for (start, end) in scan_windows(input) {
+            if !scan
+                .findings(window(input, start, end)?, start, end == input.len())?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Detects findings in bytes that need not be UTF-8.
+    ///
+    /// Scans text produced by `String::from_utf8_lossy`, one window at a time,
+    /// because invalid bytes expand to three-byte replacement characters.
+    pub fn detect_windowed_bytes(&self, bytes: &[u8]) -> Result<bool, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        let mut buffer = String::with_capacity(MAX_REDACTABLE_BYTES.min(bytes.len() + 3));
+        // Byte offset of `buffer[0]` in the lossy text; zero marks the text's real left edge.
+        let mut start = 0usize;
+        for chunk in bytes.utf8_chunks() {
+            let mut valid = chunk.valid();
+            while !valid.is_empty() {
+                let take = char_floor(valid, MAX_REDACTABLE_BYTES - buffer.len());
+                if take == 0 {
+                    if scan.slide(&mut buffer, &mut start)? {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                buffer.push_str(&valid[..take]);
+                valid = &valid[take..];
+            }
+            if !chunk.invalid().is_empty() {
+                if buffer.len() + char::REPLACEMENT_CHARACTER.len_utf8() > MAX_REDACTABLE_BYTES
+                    && scan.slide(&mut buffer, &mut start)?
+                {
+                    return Ok(true);
+                }
+                buffer.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+        Ok(!scan.findings(&buffer, start, true)?.is_empty())
+    }
+}
+
+/// One pass of overlapping windows over a text, in ascending order of `start`.
+///
+/// Each absolute byte position is claimed by exactly one window, so a finding
+/// that two windows both see whole is reported once. Findings within
+/// [`EDGE_MARGIN_BYTES`] of an artificial edge are left to the neighbouring window.
+struct WindowScan<'a> {
+    redactor: &'a Redactor,
+    /// Absolute end of the range earlier windows have claimed.
+    claimed_to: usize,
+}
+
+impl<'a> WindowScan<'a> {
+    const fn new(redactor: &'a Redactor) -> Self {
+        Self {
+            redactor,
+            claimed_to: 0,
+        }
+    }
+
+    /// `start` is the window's byte offset in the full input; `is_last` indicates whether the window reaches its end.
+    fn findings(
+        &mut self,
         window: &str,
         start: usize,
         is_last: bool,
     ) -> Result<Vec<Finding>, RedactionError> {
-        let mut report = self.scanner.scan(window)?;
+        let mut report = self.redactor.scanner.scan(window)?;
         if let Some(limit) = report.limits_hit {
             return Err(RedactionError {
                 kind: match limit {
@@ -222,81 +310,19 @@ impl Redactor {
         } else {
             window.len().saturating_sub(EDGE_MARGIN_BYTES)
         };
+        let claimed_to = self.claimed_to.saturating_sub(start);
         report.findings.retain(|finding| {
-            finding.full_span.start() >= keep_from && finding.full_span.end() <= keep_to
+            finding.full_span.start() >= keep_from
+                && finding.full_span.end() <= keep_to
+                && finding.full_span.end() > claimed_to
         });
+        self.claimed_to = start + keep_to;
         Ok(report.findings)
     }
 
-    /// Findings are counted before cluster merging; exceeding `max_findings` returns before describing the offending window or scanning later ones.
-    pub fn redact_windowed(
-        &self,
-        input: &str,
-        max_findings: usize,
-    ) -> Result<Redaction, RedactionError> {
-        let mut replacements = Vec::new();
-        for (start, end) in scan_windows(input) {
-            let window = window(input, start, end)?;
-            let findings = self.window_findings(window, start, end == input.len())?;
-            if replacements.len().saturating_add(findings.len()) > max_findings {
-                return Err(RedactionError {
-                    kind: RedactionErrorKind::FindingLimit,
-                });
-            }
-            replacements.extend(scanner::describe_findings(window, &findings, start)?);
-        }
-        scanner::render(input, replacements)
-    }
-
-    /// Verdict-only counterpart of [`Self::redact_windowed`]: stops at the first finding and renders no output.
-    pub fn detect_windowed(&self, input: &str) -> Result<bool, RedactionError> {
-        for (start, end) in scan_windows(input) {
-            if !self
-                .window_findings(window(input, start, end)?, start, end == input.len())?
-                .is_empty()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Detects findings in bytes that need not be UTF-8.
-    ///
-    /// Scans text produced by `String::from_utf8_lossy`, one window at a time,
-    /// because invalid bytes expand to three-byte replacement characters.
-    pub fn detect_windowed_bytes(&self, bytes: &[u8]) -> Result<bool, RedactionError> {
-        let mut buffer = String::with_capacity(MAX_REDACTABLE_BYTES.min(bytes.len() + 3));
-        // Byte offset of `buffer[0]` in the lossy text; zero marks the text's real left edge.
-        let mut start = 0usize;
-        for chunk in bytes.utf8_chunks() {
-            let mut valid = chunk.valid();
-            while !valid.is_empty() {
-                let take = char_floor(valid, MAX_REDACTABLE_BYTES - buffer.len());
-                if take == 0 {
-                    if self.slide_window(&mut buffer, &mut start)? {
-                        return Ok(true);
-                    }
-                    continue;
-                }
-                buffer.push_str(&valid[..take]);
-                valid = &valid[take..];
-            }
-            if !chunk.invalid().is_empty() {
-                if buffer.len() + char::REPLACEMENT_CHARACTER.len_utf8() > MAX_REDACTABLE_BYTES
-                    && self.slide_window(&mut buffer, &mut start)?
-                {
-                    return Ok(true);
-                }
-                buffer.push(char::REPLACEMENT_CHARACTER);
-            }
-        }
-        Ok(!self.window_findings(&buffer, start, true)?.is_empty())
-    }
-
     /// Returns whether the scanned window held a finding.
-    fn slide_window(&self, buffer: &mut String, start: &mut usize) -> Result<bool, RedactionError> {
-        if !self.window_findings(buffer, *start, false)?.is_empty() {
+    fn slide(&mut self, buffer: &mut String, start: &mut usize) -> Result<bool, RedactionError> {
+        if !self.findings(buffer, *start, false)?.is_empty() {
             return Ok(true);
         }
         let cut = char_floor(buffer, buffer.len().saturating_sub(WINDOW_OVERLAP_BYTES));
