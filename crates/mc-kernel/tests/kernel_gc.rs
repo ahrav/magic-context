@@ -502,15 +502,28 @@ fn facts_unless_abandons_the_artifact_walk_once_cancelled() {
     assert_eq!(complete.artifact_budget.usage_bytes, 6);
     assert_eq!(complete, store.facts(1).unwrap());
 
-    // The walk polls before every top-level entry, so a cancellation raised
-    // after the first poll still ends the walk without a total.
+    // The walk polls before every entry at both levels, so a cancellation
+    // raised after the first poll still ends the walk without a total.
     let polls = std::cell::Cell::new(0_u32);
     let cancelled = || {
         polls.set(polls.get() + 1);
         polls.get() > 1
     };
     assert_eq!(store.facts_unless(1, &cancelled).unwrap(), None);
-    assert!(polls.get() >= 2, "walk stopped after {} polls", polls.get());
+    assert_eq!(polls.get(), 2, "walk stopped at the first true poll");
+    // Two objects in distinct shards: a full walk polls the two shard entries,
+    // the `.`/`..` entries at each level, and every object.
+    let polls = std::cell::Cell::new(0_u32);
+    let counting = || {
+        polls.set(polls.get() + 1);
+        false
+    };
+    assert!(store.facts_unless(1, &counting).unwrap().is_some());
+    assert!(
+        polls.get() >= 4,
+        "only {} polls for two shards",
+        polls.get()
+    );
     assert_eq!(store.facts_unless(1, &|| true).unwrap(), None);
 }
 

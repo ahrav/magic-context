@@ -943,7 +943,7 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
 ///
 /// Symlinks and other file types do not contribute. Entries removed during the
 /// walk are skipped. The sum saturates at [`u64::MAX`]. `cancelled` is polled
-/// before each top-level entry; a true result returns `None`.
+/// before every entry at both levels; a true result returns `None`.
 pub(super) fn regular_file_bytes(
     objects: &File,
     cancelled: &dyn Fn() -> bool,
@@ -980,6 +980,9 @@ pub(super) fn regular_file_bytes(
             Err(error) => return Err(error),
         };
         for shard_entry in rfs::Dir::read_from(&shard).map_err(classify_errno)? {
+            if cancelled() {
+                return Ok(None);
+            }
             let shard_entry = shard_entry.map_err(classify_errno)?;
             let shard_name = shard_entry.file_name();
             if is_dot_entry(shard_name) {
