@@ -46,6 +46,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
+/// Provider extras retain provider-scoped fields outside the typed CK wire model.
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
 static NEXT_TAG_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
@@ -153,6 +154,7 @@ impl Serialize for CkWireMessage {
 }
 
 impl CkWireMessage {
+    /// Builds a typed message without retained ingress JSON.
     pub fn from_parts(
         role: impl Into<String>,
         content: Vec<CkWireBlock>,
@@ -170,6 +172,7 @@ impl CkWireMessage {
         }
     }
 
+    /// Builds a synthetic user message containing one text block.
     pub fn synthetic_user_text(text: impl Into<String>) -> Self {
         Self::from_parts(
             "user",
@@ -183,6 +186,7 @@ impl CkWireMessage {
         )
     }
 
+    /// Drops retained ingress JSON so serialization uses typed fields.
     pub fn mark_modified(&mut self) {
         self.original = None;
     }
@@ -244,6 +248,7 @@ impl Serialize for CkWireBlock {
 }
 
 impl CkWireBlock {
+    /// Builds a typed block without provider extras or retained ingress JSON.
     pub fn bare(kind: CkKind) -> Self {
         Self {
             kind,
@@ -252,6 +257,7 @@ impl CkWireBlock {
         }
     }
 
+    /// Builds a typed block with provider extras and no retained ingress JSON.
     pub fn with_provider_extras(kind: CkKind, provider_extras: ProviderExtras) -> Self {
         Self {
             kind,

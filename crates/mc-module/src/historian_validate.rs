@@ -29,7 +29,6 @@ pub struct ChunkLine {
     pub ordinal: u64,
     /// message_id is the last flat block's `<mid>#<index>` ID.
     /// message_id is empty only when the raw message has no flat blocks.
-    /// compartment boundary.
     pub message_id: String,
     /// anchorable is true only when message_id names a real flat block.
     /// A compartment must end on an anchorable block to avoid impossible coverage boundaries.
@@ -1160,7 +1159,6 @@ fn attr_importance_regex() -> &'static Regex {
 }
 
 /// Self-closing tier tags represent empty tiers.
-/// Mismatched closing digits terminate an opened tier.
 /// Mismatched closing digits terminate an opened tier.
 fn tier_open_regexes() -> &'static [Regex; 4] {
     static RE: OnceLock<[Regex; 4]> = OnceLock::new();

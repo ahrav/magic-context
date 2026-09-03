@@ -24,22 +24,21 @@ use crate::routing::CloseDecision;
 use crate::runtime::HostShared;
 use crate::wire::{encode_owned_frame, pure_header_flags, FrameId};
 
-/// The pending-request map contains only consumer-originated requests; host Pings use a separate namespace.
+/// Identifies a consumer-originated pending request by channel, epoch, and correlation.
+///
+/// Host pings use a separate correlation namespace.
 pub type PendingKey = (u16, u32, u64);
 
 /// Off-reader rejections reach this bound only when global pending capacity is exhausted and egress is contended.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
+/// Tracks one host-originated ping from enqueue through write completion and response.
 ///
-/// The reader accepts a Pong only when it observes the Pong at or after the Ping's `written_at`.
-/// The writer sets `written_at` immediately after `write_all` returns.
-///
-/// The reader accepts a Pong observed at or after `written_at` even if it locks `pings` before the writer.
-/// The reader discards a Pong observed before `written_at` because the Ping write had not completed.
-///
-/// Comparing against write start would admit pre-answers; requiring a mutex transition before the Pong would drop legitimate answers.
-/// A peer can answer after receiving the bytes without reading them; no observer can distinguish that answer from a real answer.
-/// The writer's per-frame stall deadline catches a peer that stops draining its socket.
+/// The reader accepts a pong only when it observes the pong at or after `written_at`.
+/// The writer sets `written_at` immediately after `write_all` returns. A pong observed
+/// before that point remains pending until the write-completion hook can compare times.
+/// Comparing against write start would admit pre-answers. Requiring a mutex transition
+/// before the pong would drop legitimate answers.
 pub struct PingProbe {
     pub flags: u8,
     pub sent: Instant,
@@ -47,8 +46,11 @@ pub struct PingProbe {
     pub answered_at: Option<Instant>,
 }
 
+/// Cancellation and terminal-settlement state for one pending request.
 pub struct PendingEntry {
+    /// Cancels handler work for this request.
     pub cancel: CancellationToken,
+    /// Coordinates the request's single terminal outcome.
     pub settlement: Arc<crate::dispatch::Settlement>,
 }
 
@@ -369,7 +371,6 @@ async fn read_loop<H: McHostHandler>(
             InboundEvent::Rejected(RejectedFrame { corr }) => {
                 // `read_loop` uses `RejectedFrame.corr` because the header provides a trustworthy correlation even when declared-body drain fails (protocol §7.1).
                 // `read_loop` emits no-permit rejections off-reader so contended egress cannot block queued Pongs during declared-body drain.
-                // be drained.
                 if corr <= watermark {
                     return ReadExit::Peer;
                 }
@@ -460,7 +461,6 @@ async fn read_loop<H: McHostHandler>(
                                     // A Ping queued behind large frames can receive a Pong before it is written.
                                     // A Pong received before write completion must not be rejected as late.
                                     // The write-completion hook evaluates stored Pongs against the completion instant.
-                                    // completion instant.
                                     None => probe.answered_at = Some(now),
                                 }
                             }
@@ -656,7 +656,6 @@ async fn handle_control<H: McHostHandler>(
             // The read loop must not wait for bind callbacks because they may be slow.
             // The wrapper must be abort-exempt because it owns its route's cleanup.
             // Rejected or close-raced binds must emit `route-gone` exactly once.
-            // self-bounded.
             let shared_task = Arc::clone(shared);
             let gen_task = Arc::clone(gen);
             shared.spawn_lifecycle(gen.read_tasks.track_future(async move {

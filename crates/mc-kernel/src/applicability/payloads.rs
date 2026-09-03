@@ -57,8 +57,11 @@ pub struct ObjectApplicabilitySpec {
 /// `Undecodable` carries the JSON or schema error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadDecode {
+    /// No payload was stored.
     Absent,
+    /// Payload decoded with the current schema.
     Present(ObjectApplicabilitySpec),
+    /// Payload JSON or schema was invalid.
     Undecodable(String),
 }
 
@@ -71,6 +74,7 @@ impl Default for ObjectApplicabilitySpec {
 }
 
 impl ObjectApplicabilitySpec {
+    /// Creates a specification tagged with the current object schema.
     pub fn new(affected_paths: Vec<String>, checks: Vec<CheckSpec>) -> Self {
         Self {
             schema: OBJECT_APPLICABILITY_SCHEMA.to_string(),
@@ -83,6 +87,7 @@ impl ObjectApplicabilitySpec {
         serde_json::to_vec(self).expect("object applicability payload is serializable")
     }
 
+    /// Rejects unknown schema tags instead of interpreting them as the current shape.
     pub fn decode(payload: Option<&[u8]>) -> PayloadDecode {
         let Some(payload) = payload else {
             return PayloadDecode::Absent;
