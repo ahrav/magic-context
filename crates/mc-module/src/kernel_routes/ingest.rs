@@ -176,11 +176,17 @@ fn is_sha256_hex(value: &str) -> bool {
     is_lower_hex(value, 64)
 }
 
+/// An empty artifact is declared as zero bytes in zero pages and completes at
+/// `begin`; every other layout needs at least one byte per page and at most
+/// [`PAGE_BYTES_MAX`] bytes per page.
 fn layout_is_possible(total_bytes: u64, page_count: u32) -> bool {
     if page_count > PAGE_COUNT_MAX {
         return false;
     }
     let page_count = u64::from(page_count);
+    if total_bytes == 0 {
+        return page_count == 0;
+    }
     page_count >= 1 && page_count <= total_bytes && total_bytes <= page_count * PAGE_BYTES_MAX
 }
 
@@ -213,6 +219,16 @@ impl Upload {
 
     fn is_complete(&self) -> bool {
         self.pages.len() == self.page_count as usize && self.received_bytes == self.total_bytes
+    }
+
+    /// Whether `other` declares the same upload: the same layout, digest, and
+    /// ingestion request. Only such a `begin` may resume this upload's pages.
+    fn declares_same(&self, other: &Upload) -> bool {
+        self.upload_id == other.upload_id
+            && self.total_bytes == other.total_bytes
+            && self.page_count == other.page_count
+            && self.payload_digest == other.payload_digest
+            && self.request == other.request
     }
 }
 
@@ -258,7 +274,10 @@ impl UploadCoordinator {
     ) -> Result<BeginOutcome, BeginRejection> {
         self.evict_stale(now);
         if let Some(existing) = self.uploads.get(&route) {
-            if existing.upload_id == upload.upload_id {
+            // A `begin` that reuses the id but changes the declaration is a
+            // new upload: resuming it would ingest the retained pages under
+            // the earlier request's evidence id, class, and retention.
+            if existing.declares_same(&upload) {
                 return Ok(BeginOutcome::Resumed(existing.progress()));
             }
             self.take(route);
@@ -384,6 +403,20 @@ impl UploadCoordinator {
             .remove(&route)
             .ok_or(InvalidReason::UploadNotFound)
     }
+
+    /// Puts back an upload `take_complete` handed out whose finish work failed
+    /// retryably, so a later `finish` retries without the pages being resent.
+    /// The upload's reservation is still charged; the caller keeps it charged
+    /// when the upload is held again and releases it when the upload comes
+    /// back because the route has begun another one in the meantime.
+    fn restore(&mut self, route: RouteHandle, mut upload: Upload, now: Instant) -> Option<Upload> {
+        if self.uploads.contains_key(&route) {
+            return Some(upload);
+        }
+        upload.last_activity = now;
+        self.uploads.insert(route, upload);
+        None
+    }
 }
 
 /// Releases an upload's staging reservation when dropped. The guard travels
@@ -396,29 +429,49 @@ struct StagingReservation {
     bytes: u64,
 }
 
+impl StagingReservation {
+    /// Hands the charge back to an upload the coordinator holds again.
+    fn keep(mut self) {
+        self.bytes = 0;
+    }
+}
+
 impl Drop for StagingReservation {
     fn drop(&mut self) {
         self.kernel.uploads().release(self.bytes);
     }
 }
 
+enum FinishOutcome {
+    Ingested(ArtifactHandle),
+    /// The payload or the request is wrong; the pages are dropped.
+    Refused(KernelOutcome),
+    /// The store could not take the artifact right now; the pages come back
+    /// so the route can hold them for a retry.
+    Retry(KernelOutcome, Box<Upload>),
+}
+
 /// Concatenates the pages in index order and ingests the result when it
 /// hashes to the declared digest; the mismatch leaves nothing in the kernel.
-fn finish_upload(store: &KernelStore, upload: Upload) -> Result<ArtifactHandle, KernelOutcome> {
+fn finish_upload(store: &KernelStore, upload: Upload) -> FinishOutcome {
     let mut payload = Vec::with_capacity(usize::try_from(upload.total_bytes).unwrap_or(0));
-    for page in upload.pages.into_values() {
+    for page in upload.pages.values() {
         payload.extend_from_slice(&page.bytes);
     }
     if sha256_hex(&payload) != upload.payload_digest {
-        return Err(KernelOutcome::invalid(InvalidReason::PayloadDigest));
+        return FinishOutcome::Refused(KernelOutcome::invalid(InvalidReason::PayloadDigest));
     }
     let request = ArtifactIngestRequest {
         payload,
-        ..upload.request
+        ..upload.request.clone()
     };
-    store
-        .ingest_artifact(request)
-        .map_err(|error| KernelOutcome::from(error.kind()))
+    match store.ingest_artifact(request) {
+        Ok(handle) => FinishOutcome::Ingested(handle),
+        Err(error) if error.is_retriable() => {
+            FinishOutcome::Retry(KernelOutcome::from(error.kind()), Box::new(upload))
+        }
+        Err(error) => FinishOutcome::Refused(KernelOutcome::from(error.kind())),
+    }
 }
 
 impl McHandler {
@@ -598,21 +651,30 @@ impl McHandler {
             bytes: upload.total_bytes,
         };
         let store = scope.store;
-        let finished = blocking(move || {
-            let finished = finish_upload(&store, upload);
-            drop(reservation);
-            finished
-        })
-        .await;
+        // The reservation rides in the worker's result: a handler cancelled
+        // here drops that result on the worker, and the guard releases there.
+        let finished = blocking(move || (finish_upload(&store, upload), reservation)).await;
         match finished {
-            Ok(Ok(handle)) => kernel_response(
+            Ok((FinishOutcome::Ingested(handle), _reservation)) => kernel_response(
                 &KernelOutcome::Available,
                 json!({
                     "upload_id": parsed.upload_id,
                     "handle": {"digest": handle.digest, "evidence_id": handle.evidence_id},
                 }),
             ),
-            Ok(Err(outcome)) | Err(outcome) => state_only(outcome),
+            Ok((FinishOutcome::Refused(outcome), _reservation)) => state_only(outcome),
+            Ok((FinishOutcome::Retry(outcome, upload), reservation)) => {
+                if self
+                    .kernel
+                    .uploads()
+                    .restore(channel, *upload, Instant::now())
+                    .is_none()
+                {
+                    reservation.keep();
+                }
+                state_only(outcome)
+            }
+            Err(outcome) => state_only(outcome),
         }
     }
 }
@@ -712,9 +774,16 @@ mod tests {
         assert!(layout_is_possible(PAGE_BYTES_MAX * 4 + 1, 5));
         assert!(!layout_is_possible(PAGE_BYTES_MAX + 1, 1));
         assert!(!layout_is_possible(MAX_PAYLOAD_BYTES as u64, 1));
+        assert!(layout_is_possible(0, 0));
         assert!(!layout_is_possible(0, 1));
         assert!(!layout_is_possible(5, 0));
         assert!(!layout_is_possible(5, 6));
+        assert!(layout_is_possible(PAGE_COUNT_MAX as u64, PAGE_COUNT_MAX));
+        assert!(!layout_is_possible(
+            PAGE_COUNT_MAX as u64 + 1,
+            PAGE_COUNT_MAX + 1
+        ));
+        assert!(UPLOAD_ALLOWANCE_BYTES <= PAGE_COUNT_MAX as u64 * PAGE_BYTES_MAX);
     }
 
     #[test]
@@ -800,6 +869,37 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_upload_keeps_its_pages_and_yields_to_a_newer_begin() {
+        let mut uploads = UploadCoordinator::default();
+        let now = Instant::now();
+        started(uploads.begin(route(1), upload("u", 2, 1, b"ab"), now));
+        uploads.stage(route(1), "u", 0, page(b"ab"), now).unwrap();
+        let complete = uploads.take_complete(route(1), "u").unwrap();
+        assert!(uploads.restore(route(1), complete, now).is_none());
+        assert_eq!(
+            (uploads.budget().total_bytes, uploads.budget().pending),
+            (2, 1)
+        );
+        let again = uploads.take_complete(route(1), "u").unwrap();
+        assert_eq!(again.pages.len(), 1);
+
+        // The route began another upload while the finish work ran, so the
+        // finished one comes back and its reservation is the caller's to drop.
+        started(uploads.begin(route(1), upload("v", 3, 1, b"xyz"), now));
+        let returned = uploads.restore(route(1), again, now).unwrap();
+        assert_eq!(returned.upload_id, "u");
+        assert_eq!(
+            (uploads.budget().total_bytes, uploads.budget().pending),
+            (5, 2)
+        );
+        uploads.release(returned.total_bytes);
+        assert_eq!(
+            (uploads.budget().total_bytes, uploads.budget().pending),
+            (3, 1)
+        );
+    }
+
+    #[test]
     fn begin_resumes_the_same_upload_and_replaces_a_different_one() {
         let mut uploads = UploadCoordinator::default();
         let now = Instant::now();
@@ -815,6 +915,13 @@ mod tests {
         assert_eq!(
             (uploads.budget().total_bytes, uploads.budget().pending),
             (6, 1)
+        );
+        // The same id declaring other bytes is a replacement, not a resume.
+        started(uploads.begin(route(1), upload("u", 6, 3, b"abcxyz"), now));
+        assert_eq!(
+            uploads.stage(route(1), "u", 0, page(b"ax"), now).unwrap()["received_pages"],
+            1,
+            "a retained page would have refused a different digest at index 0"
         );
 
         started(uploads.begin(route(1), upload("v", 10, 1, b""), now));

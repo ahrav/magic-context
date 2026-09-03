@@ -2030,6 +2030,36 @@ async fn egress_gate_requires_the_owning_object_to_be_live_and_unsuperseded() {
         json!("allowed")
     );
     assert_eq!(recorder.requests(), 2);
+
+    // Retiring the cited evidence withdraws the citation even though the
+    // owner stays live; without live metadata the local verdict alone would
+    // still be `allowed`.
+    daemon
+        .store()
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("retire-evidence"),
+            identity: ArtifactDeletionIdentity::EvidenceId("evidence-sensitive".to_string()),
+            kind: ArtifactDeletionKind::Delete,
+            operator_id: None,
+            target_locator: None,
+            reason: None,
+            deleted_at: 43,
+        })
+        .unwrap();
+    assert!(is_live(&daemon.store(), "decision-object-4"));
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-4"
+            )
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 2);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -2704,6 +2734,33 @@ async fn a_second_begin_replaces_or_resumes_and_only_the_pending_cap_is_queue_fu
     assert!(resumed["page_bytes_max"].as_u64().unwrap() >= 16 * MIB as u64);
     assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
 
+    // The same id with another declaration is a new upload, not a resume:
+    // the retained page would otherwise be ingested under the new request.
+    let mut redeclared = ingest_begin_request(&daemon.project, "second", &replacement, 1);
+    redeclared["request"]["asserted_sensitivity"] = json!("sensitive");
+    let redeclared = daemon.call(daemon.route, redeclared).await;
+    assert_state(&redeclared, "available", None);
+    assert_eq!(redeclared["upload_id"], "second");
+    assert!(redeclared.get("received_pages").is_none(), "{redeclared}");
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
+    assert_state(
+        &daemon.ingest_finish(daemon.route, "second").await,
+        "invalid",
+        Some("page_index"),
+    );
+    // Re-beginning `second` starts a fresh upload, so resend page 0 before finishing.
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "second", &replacement, 1)
+            .await,
+        "available",
+        None,
+    );
+    daemon
+        .ingest_page(daemon.route, "second", 0, &replacement)
+        .await;
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
+
     // Three more routes fill the handler-wide pending cap of four.
     let mut routes = Vec::new();
     for channel in 20..23u16 {
@@ -2803,6 +2860,18 @@ async fn begin_refuses_layouts_and_digests_the_kernel_could_never_accept() {
         .ingest_paged(daemon.route, "lower", &payload, 64)
         .await;
     assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    // An empty artifact is zero bytes in zero pages and finishes at once.
+    assert_state(
+        &daemon.ingest_begin(daemon.route, "empty", b"", 0).await,
+        "available",
+        None,
+    );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 1));
+    let empty = daemon.ingest_finish(daemon.route, "empty").await;
+    assert_state(&empty, "available", None);
+    assert_eq!(empty["handle"]["digest"], sha256_hex(b""));
     assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
     daemon.handler.shutdown().await.unwrap();
 }

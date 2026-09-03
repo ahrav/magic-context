@@ -113,7 +113,7 @@ pub struct ObjectState {
     pub object: ObjectRow,
     pub scope_id: Option<String>,
     /// The digest of the artifact the row's `evidence_id` cites; `None` when
-    /// the row cites no evidence or the evidence row is gone.
+    /// the row cites no evidence or the evidence row is gone or invalidated.
     pub artifact_digest: Option<String>,
     pub latest_change_commit_seq: Option<i64>,
 }
@@ -1374,6 +1374,7 @@ pub(super) fn load_object_state(
              LEFT JOIN observations obs ON obs.object_id=o.object_id
              LEFT JOIN evidence_meta em
                     ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
+                   AND em.invalidated_commit_seq IS NULL
              WHERE o.object_id=?1"
         ),
         [object_id],
