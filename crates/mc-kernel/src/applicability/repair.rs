@@ -179,9 +179,7 @@ impl RepairIntent {
         })
     }
 
-    /// `target` carries the classified object's own domain and sensitivity,
-    /// read inside the repair transaction.
-    /// The observation kind this repair would append.
+    /// Returns the observation kind this repair would append.
     pub fn observation_kind(&self) -> &'static str {
         self.kind
     }
@@ -400,7 +398,9 @@ pub fn commit_read_repair(
 /// (object, checkout) at `known_as_of`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectionBlock {
+    /// Kind of the latest applicability observation.
     pub observation_kind: String,
+    /// Commit sequence of the latest applicability observation.
     pub commit_seq: i64,
     /// Blocked unless the latest observation records `applicability.current`.
     pub blocked: bool,
@@ -443,6 +443,7 @@ impl InjectionBlock {
         }
     }
 
+    /// Returns the dedup generation for appending `kind`.
     pub fn generation_for(&self, kind: &str) -> i64 {
         let transition = if self.observation_kind == kind {
             self.prior_kind_commit_seq

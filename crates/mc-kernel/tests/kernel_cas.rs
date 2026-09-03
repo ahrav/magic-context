@@ -1,3 +1,5 @@
+//! These tests cover artifact ingestion, policy, durability, and filesystem hardening.
+
 #![cfg(feature = "test-support")]
 
 use std::fs;
