@@ -1974,18 +1974,17 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     } else {
         // `assembleScore` clears both on any non-error score. The one exception is an aborted record whose
         // claims still matched an expected-absent predicate: `scoreRunRecord` keeps the abort's reason on
-        // that FAIL, and its reasons are exactly `false-authoritative`.
+        // that FAIL, and its reasons are exactly `false-authoritative`. The reason is part of the shape, so a
+        // FAIL that drops it is an ordinary scored FAIL and gets no exemption below.
         const abortedFalseAuthoritative = source === "run-record" && verdict === "FAIL" &&
-            failReasons.length === 1 && failReasons[0] === "false-authoritative";
-        if (errorReason !== null || errorDetail !== null) {
-            if (!abortedFalseAuthoritative) p.fail(`${label}.errorReason: derived-mismatch`);
-            // `errorScore` sets both fields from the record's error, whose reason is a string.
-            if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
-            // That FAIL is `errorScore` with the matches spliced in, so every other fact stays empty.
-            if (precision !== null || recall !== null || expectedClaimsMatched !== 0 || expectedClaimsTotal !== 0 ||
-                visibleClaimsMatched !== 0 || visibleClaimsTotal !== 0 || structuralFindings.length > 0) {
-                p.fail(`${label}: error-shape-invalid`);
-            }
+            failReasons.length === 1 && failReasons[0] === "false-authoritative" && errorReason !== null;
+        if ((errorReason !== null || errorDetail !== null) && !abortedFalseAuthoritative) {
+            p.fail(`${label}.errorReason: derived-mismatch`);
+        }
+        // That FAIL is `errorScore` with the matches spliced in, so every other fact stays empty.
+        if (abortedFalseAuthoritative && (precision !== null || recall !== null || expectedClaimsMatched !== 0 ||
+            expectedClaimsTotal !== 0 || visibleClaimsMatched !== 0 || visibleClaimsTotal !== 0 || structuralFindings.length > 0)) {
+            p.fail(`${label}: error-shape-invalid`);
         }
         // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
         // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.

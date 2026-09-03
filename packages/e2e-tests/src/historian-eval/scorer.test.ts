@@ -2576,7 +2576,12 @@ describe("buildLaneReport", () => {
             failReasons: ["false-authoritative"], probeVerdicts: [], errorReason: "harness-crash", errorDetail: "boom",
         });
         expect(() => parseLaneReport(abortedFa)).toThrow(/report\.scenarios\[1\]: error-shape-invalid/);
+        // Clearing the abort's reason does not make the counts admissible: without the reason the score is an
+        // ordinary FAIL, which must carry its probe evidence.
+        Object.assign(abortedFa.scenarios[1]!, { errorReason: null, errorDetail: null });
+        expect(() => parseLaneReport(abortedFa)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: probes-required/);
         Object.assign(abortedFa.scenarios[1]!, {
+            errorReason: "harness-crash", errorDetail: "boom",
             precision: null, recall: null, expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,
         });
         expect(() => parseLaneReport(abortedFa)).toThrow(/^report: derived-mismatch/);

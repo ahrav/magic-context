@@ -237,6 +237,12 @@ export function buildPairedDeltaReport(input: {
     if (input.runSummary.status === "usage-unmeasured" && input.runSummary.estimatedCostRollouts === 0) {
         throw new Error("paired-delta-report: status-evidence-required");
     }
+    // A run ends `completed` only if every planned coordinate stored every primary arm.
+    if (input.runSummary.status === "completed" &&
+        input.runSummary.observedCostRollouts + input.runSummary.estimatedCostRollouts <
+            input.runSummary.plannedCoordinates * PRIMARY_ARM_IDS.length) {
+        throw new Error("paired-delta-report: completed-run-shortfall");
+    }
     // Rungs run in order and stop at the first failure, so a later regret delta exists only with every earlier one.
     const rungsByCoordinate = new Map<string, Set<string>>();
     for (const record of input.analysis.rawRegretRecords) {
@@ -463,11 +469,15 @@ function parseEndpointEstimates(
         const interval = parseInterval(value.interval, `${itemLabel}.interval`);
         const resolution = p.enumeration(value.resolution, DELTA_RESOLUTIONS, `${itemLabel}.resolution`);
         const familyMeans = families.map((family) => family.pointEstimate);
+        // The aggregate interval is a bootstrap over the published family means with the published settings, so
+        // the work that replay performs is bounded before anything is recomputed.
+        if (familyMeans.length * settings.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+            p.fail(`${itemLabel}.families: bootstrap-work-too-large`);
+        }
         // Using the estimator's `mean` prevents last-bit drift during recomputation.
         if (pointEstimate !== mean(familyMeans)) {
             p.fail(`${itemLabel}.pointEstimate: derived-mismatch`);
         }
-        // The aggregate interval is a bootstrap over the published family means with the published settings.
         if (canonicalJson(interval) !== canonicalJson(endpointInterval(endpoint, familyMeans, settings))) {
             p.fail(`${itemLabel}.interval: derived-mismatch`);
         }

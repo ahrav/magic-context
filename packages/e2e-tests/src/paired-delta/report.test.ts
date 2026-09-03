@@ -356,6 +356,10 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: true },
         })).toThrow(/evidence-complete-mismatch/);
+        // A completed run stored every primary arm of every planned coordinate.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, observedCostRollouts: 27, estimatedCostRollouts: 0 },
+        })).toThrow(/completed-run-shortfall/);
         // A calibration run is complete only over a completed, fully healthy matrix.
         expect(() => report({
             runSummary: { ...report().body.runSummary, evidenceComplete: true },
@@ -1232,6 +1236,16 @@ describe("parsePairedDeltaReport", () => {
             second!.families[0]!.familyId = "a\u0000b";
             second!.families[1]!.familyId = "c";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        // The aggregate replay is bounded by families times resamples before it starts.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.bootstrapResamples = 100_000;
+            const endpoint = body.analysis.endpoints[0]!;
+            const template = endpoint.families.at(-1)!;
+            for (let index = 0; index < 300; index += 1) {
+                endpoint.families.push({ ...template, familyId: `${template.familyId}-z${String(index).padStart(4, "0")}` });
+            }
+            endpoint.familyCount = endpoint.families.length;
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families: bootstrap-work-too-large/);
         // The aggregate interval is a bootstrap over the published family means, so it cannot be rewritten.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const estimate = body.analysis.endpoints[0]!;
