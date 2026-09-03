@@ -635,7 +635,16 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             }
         } else {
             if (controls.length !== 1 || controls[0]!.kind !== "scored") p.fail("report.tierInvalidReason: deadline-prefix-invalid");
-            if (!report.coverage.some((row) => row.applied > (backed.get(row.scenarioId) ?? 0))) {
+            // An error entry may be an admission failure, which `applied` does not count, so only a scored or
+            // stage-not-scored entry proves an admitted pair finished; a finished green run has one per applied
+            // coordinate, and a pre-empted run is short at least one.
+            const finished = new Map<string, number>();
+            for (const entry of report.entries) {
+                if (entry.kind !== "scored" && entry.kind !== "stage-not-scored") continue;
+                if (isControl(entry)) continue;
+                finished.set(entry.scenarioId, (finished.get(entry.scenarioId) ?? 0) + 1);
+            }
+            if (!report.coverage.some((row) => row.applied > (finished.get(row.scenarioId) ?? 0))) {
                 p.fail("report.tierInvalidReason: deadline-prefix-invalid");
             }
         }

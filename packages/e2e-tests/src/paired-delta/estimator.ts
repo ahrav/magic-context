@@ -236,11 +236,7 @@ function estimateEndpoint(
             };
         });
     const familyMeans = families.map(({ pointEstimate }) => pointEstimate);
-    const interval = bootstrapInterval(
-        familyMeans,
-        bootstrapResamples,
-        bootstrapSeed ^ fnv1a32(endpoint),
-    );
+    const interval = endpointInterval(endpoint, familyMeans, { bootstrapResamples, bootstrapSeed });
     /** An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor family leaves the endpoint unresolved. */
     return {
         endpoint,
@@ -250,6 +246,15 @@ function estimateEndpoint(
         resolution: endpointResolution(families, interval, minimumAnalyzableFamilyCount),
         families,
     };
+}
+
+/** The aggregate interval over a set of family means, which a reader recomputes from the published means and settings. */
+export function endpointInterval(
+    endpoint: DeltaEndpoint,
+    familyMeans: readonly number[],
+    settings: { bootstrapResamples: number; bootstrapSeed: number },
+): Interval {
+    return bootstrapInterval(familyMeans, settings.bootstrapResamples, settings.bootstrapSeed ^ fnv1a32(endpoint));
 }
 
 /**

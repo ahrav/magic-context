@@ -26,7 +26,7 @@ import type {
     RawRegretRecord,
     RegretEndpoint,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_SEED, MAX_BOOTSTRAP_WORK, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_SEED, MAX_BOOTSTRAP_WORK, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointInterval, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -435,8 +435,9 @@ function parseEndpointEstimates(
     raw: unknown,
     label: string,
     allowed: readonly DeltaEndpoint[],
-    minimumAnalyzableFamilyCount: number,
+    settings: { minimumAnalyzableFamilyCount: number; bootstrapResamples: number; bootstrapSeed: number },
 ): EndpointEstimate[] {
+    const { minimumAnalyzableFamilyCount } = settings;
     const estimates = p.array(raw, label).map((entry, index) => {
         const itemLabel = `${label}[${index}]`;
         const value = p.record(entry, itemLabel);
@@ -465,6 +466,10 @@ function parseEndpointEstimates(
         // Using the estimator's `mean` prevents last-bit drift during recomputation.
         if (pointEstimate !== mean(familyMeans)) {
             p.fail(`${itemLabel}.pointEstimate: derived-mismatch`);
+        }
+        // The aggregate interval is a bootstrap over the published family means with the published settings.
+        if (canonicalJson(interval) !== canonicalJson(endpointInterval(endpoint, familyMeans, settings))) {
+            p.fail(`${itemLabel}.interval: derived-mismatch`);
         }
         // The endpoint rule is recomputable because each term is published. The per-family rule is not:
         // the report does not carry the per-family observation count.
@@ -537,7 +542,13 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     const analyzableFamilyCount = p.integer(value.analyzableFamilyCount, `${label}.analyzableFamilyCount`);
     const evidenceSufficient = p.boolean(value.evidenceSufficient, `${label}.evidenceSufficient`);
     if (evidenceSufficient !== analyzableFamilyCount >= minimumAnalyzableFamilyCount) p.fail(`${label}.evidenceSufficient: derived-mismatch`);
-    const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, minimumAnalyzableFamilyCount);
+    const settings = {
+        minimumAnalyzableFamilyCount,
+        bootstrapSeed: p.boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
+        // Bounded above as well: the regret estimates are replayed with this count before the fingerprint is read.
+        bootstrapResamples: p.boundedInteger(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_RESAMPLES),
+    };
+    const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, settings);
     if (endpoints.length > 0) {
         if (endpoints.length !== PRIMARY_ENDPOINTS.length) p.fail(`${label}.endpoints: paired-endpoints-required`);
         // Family ids are free-form here, so a separator-joined key could be forged by embedding the
@@ -556,15 +567,14 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, `${label}.pinnedSnapshotId`),
         policyFingerprint: p.hex64(value.policyFingerprint, `${label}.policyFingerprint`),
         pairedFactsFingerprint: p.hex64(value.pairedFactsFingerprint, `${label}.pairedFactsFingerprint`),
-        bootstrapSeed: p.boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
-        // Bounded above as well: the regret estimates are replayed with this count before the fingerprint is read.
-        bootstrapResamples: p.boundedInteger(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_RESAMPLES),
+        bootstrapSeed: settings.bootstrapSeed,
+        bootstrapResamples: settings.bootstrapResamples,
         minimumAnalyzableFamilyCount,
         analyzableFamilyCount,
         evidenceSufficient,
         endpoints,
-        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`, LIVE_REGRET_ENDPOINTS, minimumAnalyzableFamilyCount),
-        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`, PROVIDER_MIXED_REGRET_ENDPOINTS, minimumAnalyzableFamilyCount),
+        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`, LIVE_REGRET_ENDPOINTS, settings),
+        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`, PROVIDER_MIXED_REGRET_ENDPOINTS, settings),
         rawRegretRecords: rawRegret,
     };
 }

@@ -1,3 +1,5 @@
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import { describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1410,6 +1412,18 @@ describe("live metamorphic control tier", () => {
         // The pair whose derivative the deadline pre-empted has no entry yet.
         live.entries.splice(scoredIndex + 1, 1);
         expect(parseMetamorphicReport(JSON.parse(JSON.stringify(live)))).toEqual(live);
+        // A transform that threw during admission leaves an error entry `applied` does not count, so that entry
+        // must not read as the pre-empted pair having finished.
+        const admissionError = structuredClone(live);
+        const preempted = admissionError.coverage.find((row) => row.applied > 0)!;
+        admissionError.entries.push({
+            scenarioId: preempted.scenarioId, transformId: "zzz-throwing-transform", transformVersion: 1, seed: 0,
+            kind: "error", error: "admission threw",
+        });
+        const entryKey = (entry: MetamorphicReportEntry): string =>
+            canonicalJson([entry.scenarioId, entry.transformId, entry.transformVersion, entry.seed]);
+        admissionError.entries.sort((left, right) => compareCodeUnits(entryKey(left), entryKey(right)));
+        expect(() => parseMetamorphicReport(JSON.parse(JSON.stringify(admissionError)))).not.toThrow();
         // A tier-valid live report ran its controls only because a product pair was admitted, so the control
         // alone, with every product entry deleted, is not a shape the runner emits.
         const controlOnly = structuredClone(live);

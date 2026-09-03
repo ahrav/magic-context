@@ -1158,7 +1158,7 @@ describe("parsePairedDeltaReport", () => {
             family.pointEstimate += 0.05;
             estimate.pointEstimate = estimate.families.reduce((sum, { pointEstimate }) => sum + pointEstimate, 0) / estimate.families.length;
             body.regret.providerMixed = body.analysis.providerMixedRegret;
-        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\]: derived-mismatch/);
+        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\](\.interval)?: derived-mismatch/);
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.providerMixedRegret[0]!.families[0]!;
             family.interval = { lower: family.pointEstimate - 0.01, upper: family.pointEstimate + 0.01 };
@@ -1232,6 +1232,11 @@ describe("parsePairedDeltaReport", () => {
             second!.families[0]!.familyId = "a\u0000b";
             second!.families[1]!.familyId = "c";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        // The aggregate interval is a bootstrap over the published family means, so it cannot be rewritten.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const estimate = body.analysis.endpoints[0]!;
+            estimate.interval = { lower: estimate.interval.lower + 0.01, upper: estimate.interval.upper + 0.01 };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.interval: derived-mismatch/);
         // A family cannot be `resolved` over an interval that includes zero.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;
