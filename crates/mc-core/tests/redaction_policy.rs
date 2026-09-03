@@ -610,7 +610,7 @@ fn windowed_redaction_stops_at_the_finding_limit_instead_of_replacing() {
     }
     assert_eq!(
         redact_windowed_durable_text(&text, 8).map_err(|error| error.kind()),
-        Err(RedactionErrorKind::FindingLimit)
+        Err(RedactionErrorKind::DetectionLimit)
     );
     assert_eq!(detect_windowed_durable_text(&text), Ok(true));
 }
@@ -731,13 +731,11 @@ fn a_finding_in_the_shared_overlap_counts_once_against_the_limit() {
         window + window / 2,
     );
     assert!(offset + secret_line.len() + EDGE_MARGIN_BYTES < window);
-    // One secret can be several raw findings (a keyed rule and a provider rule
-    // over the same bytes), so measure that count on a one-window text first.
+    // One secret is several raw findings (a keyed rule and a provider rule over
+    // the same bytes) but one detection, and the limit counts detections.
     let (single, _) = text_with_line_at(1024, &secret_line, 8 * 1024);
-    let per_secret = (1..=8)
-        .find(|&limit| redact_windowed_durable_text(&single, limit).is_ok())
-        .unwrap();
-    let redaction = redact_windowed_durable_text(&text, per_secret).unwrap();
+    assert!(redact_windowed_durable_text(&single, 1).is_ok());
+    let redaction = redact_windowed_durable_text(&text, 1).unwrap();
     assert_eq!(redaction.detections.len(), 1, "{:?}", redaction.detections);
     assert_eq!(redaction.detections[0].offset, offset + "token=".len());
 }

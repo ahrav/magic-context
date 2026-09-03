@@ -119,8 +119,8 @@ pub enum RedactionErrorKind {
     WorkLimit,
     /// A candidate's full match exceeded `mc_secret_scanner::MAX_MATCH_BYTES`, so the scan stopped instead of dropping it.
     MatchLimit,
-    /// A windowed scan accumulated more findings than its caller allows.
-    FindingLimit,
+    /// A windowed scan accumulated more detections than its caller allows.
+    DetectionLimit,
     InvalidSpan,
     UnknownRule,
     /// A field that must stay verbatim was found to hold a secret, so the
@@ -150,7 +150,7 @@ fn redaction_error_message(kind: &RedactionErrorKind) -> &'static str {
         RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
         RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
         RedactionErrorKind::MatchLimit => "secret scan match length limit exceeded",
-        RedactionErrorKind::FindingLimit => "secret scan finding limit exceeded",
+        RedactionErrorKind::DetectionLimit => "secret scan detection limit exceeded",
         RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
         RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
         RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
@@ -198,23 +198,24 @@ impl Redactor {
         scanner::render(input, scanner::describe_findings(input, &findings, 0)?)
     }
 
-    /// Findings are counted before cluster merging; exceeding `max_findings` returns before describing the offending window or scanning later ones.
+    /// Detections are counted after overlapping findings merge; exceeding `max_detections` returns before scanning later windows or rendering.
     pub fn redact_windowed(
         &self,
         input: &str,
-        max_findings: usize,
+        max_detections: usize,
     ) -> Result<Redaction, RedactionError> {
         let mut scan = WindowScan::new(self);
         let mut replacements = Vec::new();
         for (start, end) in scan_windows(input) {
             let window = window(input, start, end)?;
             let findings = scan.findings(window, start, end == input.len())?;
-            if replacements.len().saturating_add(findings.len()) > max_findings {
+            replacements.extend(scanner::describe_findings(window, &findings, start)?);
+            replacements = scanner::merge(replacements);
+            if replacements.len() > max_detections {
                 return Err(RedactionError {
-                    kind: RedactionErrorKind::FindingLimit,
+                    kind: RedactionErrorKind::DetectionLimit,
                 });
             }
-            replacements.extend(scanner::describe_findings(window, &findings, start)?);
         }
         scanner::render(input, replacements)
     }
@@ -462,12 +463,12 @@ pub fn redact_transaction_durable_text(input: &str) -> Redaction {
 /// Windowed redaction for content that is stored as itself, so no placeholder may stand in for the input on failure; callers must refuse the write on `Err`.
 pub fn redact_windowed_durable_text(
     input: &str,
-    max_findings: usize,
+    max_detections: usize,
 ) -> Result<Redaction, RedactionError> {
     REDACTOR
         .as_ref()
         .map_err(|error| *error)
-        .and_then(|redactor| redactor.redact_windowed(input, max_findings))
+        .and_then(|redactor| redactor.redact_windowed(input, max_detections))
 }
 
 /// Windowed detection verdict; `Err` means the scan could not prove the input secret-free.

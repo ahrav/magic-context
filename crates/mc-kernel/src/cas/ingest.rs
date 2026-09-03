@@ -7,7 +7,7 @@
 
 use std::fs::File;
 
-use mc_core::redaction::Detection;
+use mc_core::redaction::{Detection, RedactionError, RedactionErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rustix::fs::{self as rfs, AtFlags, OFlags};
 use serde::Serialize;
@@ -28,7 +28,7 @@ use crate::durable_fs::{
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
 use crate::redaction::{
-    identity, payload_has_secret, record, redact_lossy, redact_payload, PayloadScan, RedactedField,
+    identity, payload_has_secret, record, redact_lossy, redact_payload, RedactedField,
 };
 use crate::{KernelError, KernelStore, Sensitivity};
 
@@ -131,23 +131,20 @@ impl PreparedArtifact {
 
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = match redact_payload(text, MAX_PAYLOAD_DETECTIONS) {
-                    PayloadScan::Redacted(redaction) => redaction,
-                    PayloadScan::TooManyFindings => {
-                        return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
-                    }
-                    PayloadScan::Unprovable => {
-                        return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
-                    }
-                };
+                let redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
+                    .map_err(|error| ArtifactError::new(scan_failure(error)))?;
                 let bytes = redaction.text.as_bytes().to_vec();
                 (redaction, bytes, true)
             }
             Err(_) => {
                 // Lossy decoding expands invalid bytes to three-byte U+FFFD sequences;
                 // payload_has_secret scans bounded windows to avoid materializing a lossy-decoded payload.
-                if payload_has_secret(&request.payload).unwrap_or(true) {
-                    return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                match payload_has_secret(&request.payload) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                    }
+                    Err(error) => return Err(ArtifactError::new(scan_failure(error))),
                 }
                 (
                     RedactedField {
@@ -197,6 +194,24 @@ impl PreparedArtifact {
             artifact_reference,
             redaction_metadata,
         })
+    }
+}
+
+/// A payload is refused when its scan cannot vouch for it. Only a match the
+/// scanner saw but could not describe counts as a secret; every other failure
+/// means the scan did not cover the payload, which is reported as such so an
+/// operator is not told a secret was found when the scan merely stopped.
+fn scan_failure(error: RedactionError) -> ArtifactErrorKind {
+    match error.kind() {
+        RedactionErrorKind::DetectionLimit => ArtifactErrorKind::DetectionLimit,
+        RedactionErrorKind::MatchLimit => ArtifactErrorKind::UnredactableSecret,
+        RedactionErrorKind::Construction
+        | RedactionErrorKind::InputLimit
+        | RedactionErrorKind::CandidateLimit
+        | RedactionErrorKind::WorkLimit
+        | RedactionErrorKind::InvalidSpan
+        | RedactionErrorKind::UnknownRule
+        | RedactionErrorKind::SecretDetected => ArtifactErrorKind::ScanIncomplete,
     }
 }
 

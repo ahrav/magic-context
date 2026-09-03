@@ -1,6 +1,6 @@
 use mc_core::redaction::{
     detect_windowed_durable_bytes, redact_durable_text, redact_windowed_durable_text, Detection,
-    RedactionError, RedactionErrorKind,
+    RedactionError,
 };
 use rusqlite::{params, Transaction};
 
@@ -25,31 +25,18 @@ pub(super) fn redact_lossy(value: &str) -> RedactedField {
     }
 }
 
-/// Outcome of scanning an artifact payload, which is stored as itself rather
-/// than as a redacted field.
-pub(super) enum PayloadScan {
-    Redacted(RedactedField),
-    /// The payload can be redacted but holds more findings than `max_findings`.
-    TooManyFindings,
-    /// The scan could not prove the payload secret-free, so it must not be stored.
-    Unprovable,
-}
-
 /// Artifact payloads may exceed `MAX_REDACTABLE_BYTES`, so they scan in
 /// overlapping windows. Unlike [`redact_lossy`], a scan failure is reported
 /// rather than replaced by a placeholder: the payload bytes are the artifact,
 /// so a placeholder would silently become the stored content.
-pub(super) fn redact_payload(value: &str, max_findings: usize) -> PayloadScan {
-    match redact_windowed_durable_text(value, max_findings) {
-        Ok(redaction) => PayloadScan::Redacted(RedactedField {
-            text: redaction.text,
-            detections: redaction.detections,
-        }),
-        Err(error) if error.kind() == RedactionErrorKind::FindingLimit => {
-            PayloadScan::TooManyFindings
-        }
-        Err(_) => PayloadScan::Unprovable,
-    }
+pub(super) fn redact_payload(
+    value: &str,
+    max_detections: usize,
+) -> Result<RedactedField, RedactionError> {
+    redact_windowed_durable_text(value, max_detections).map(|redaction| RedactedField {
+        text: redaction.text,
+        detections: redaction.detections,
+    })
 }
 
 /// Whether a payload that will be stored verbatim holds a recognized secret;

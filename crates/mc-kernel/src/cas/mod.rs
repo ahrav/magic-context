@@ -181,6 +181,8 @@ pub enum ArtifactErrorKind {
     AlignmentRebuild,
     ReclaimInProgress,
     UnredactableSecret,
+    /// The secret scan stopped before covering the whole payload, so the payload is refused unscanned rather than stored unproven.
+    ScanIncomplete,
     DetectionLimit,
     TextFieldTooLong,
     InvalidInput,
@@ -326,6 +328,9 @@ impl fmt::Display for ArtifactErrorMessage<'_> {
             }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::ScanIncomplete => {
+                formatter.write_str("artifact payload could not be fully scanned for secrets")
+            }
             ArtifactErrorKind::TextFieldTooLong => write!(
                 formatter,
                 "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"
