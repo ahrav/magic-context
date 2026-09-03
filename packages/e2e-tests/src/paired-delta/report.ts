@@ -218,10 +218,16 @@ export function buildPairedDeltaReport(input: {
     requirePolicyBoundEstimatorSettings(policy.policy, input.analysis);
     // `calibrationNoiseFloors` is the only floor producer: it names the endpoint and writes `{ lower: 0,
     // upper: value }` for a value under 2, and the parser admits no other floor shape.
+    // A calibration fingerprint requires every analyzed family to have a noise floor.
     for (const endpoint of input.analysis.endpoints) {
         for (const family of endpoint.families) {
             const floor = family.noise.floor;
-            if (floor === null) continue;
+            if (floor === null) {
+                if (input.runSummary.calibrationFingerprint !== null) {
+                    throw new Error(`paired-delta-report: noise-floor-required-${family.familyId}`);
+                }
+                continue;
+            }
             if (floor.endpoint === undefined) {
                 throw new Error(`paired-delta-report: noise-floor-endpoint-missing-${family.familyId}`);
             }

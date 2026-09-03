@@ -353,7 +353,19 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, refusedRegretLadders: { vibes: 1 } },
         })).toThrow(/refusal-reason-invalid-vibes/);
+        // A calibration fingerprint requires every primary family to include a noise floor.
+        const floorlessFamily = report().body.analysis.endpoints[0]!.families[0]!;
         expect(() => report({
+            runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: false },
+        })).toThrow(new RegExp(`noise-floor-required-${floorlessFamily.familyId}`));
+        const flooredAnalysis = structuredClone(report().body.analysis);
+        for (const endpoint of flooredAnalysis.endpoints) {
+            for (const family of endpoint.families) {
+                family.noise = { label: "inside-floor", floor: { endpoint: endpoint.endpoint as "mc-on-vs-mc-off" | "mc-on-vs-compaction", familyId: family.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
+            }
+        }
+        expect(() => report({
+            analysis: flooredAnalysis,
             runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: true },
         })).toThrow(/evidence-complete-mismatch/);
         // A completed run stored every primary arm of every planned coordinate.
@@ -365,6 +377,7 @@ describe("paired-delta report", () => {
             runSummary: { ...report().body.runSummary, evidenceComplete: true },
         })).toThrow(/evidence-complete-mismatch/);
         expect(() => report({
+            analysis: flooredAnalysis,
             runSummary: { ...report().body.runSummary, calibrationFingerprint: "calibration-2026", evidenceComplete: false },
         })).toThrow(/calibration-fingerprint-invalid/);
         // Only a calibration floor shape is publishable: `[0, value]` with a value under 2.
@@ -1121,6 +1134,13 @@ describe("parsePairedDeltaReport", () => {
             body.runSummary.calibrationFingerprint = H1;
             body.runSummary.evidenceComplete = !body.runSummary.evidenceComplete;
         }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
+        // A calibration fingerprint requires every primary family to include a noise floor.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.calibrationFingerprint = H1;
+            body.runSummary.evidenceComplete = body.analysis.evidenceSufficient
+                && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
+            expect(body.analysis.endpoints[0]!.families[0]!.noise.floor).toBeNull();
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor: floor-required/);
         // A calibration report derives completeness from calibration validity, which the body does not carry,
         // but validity needs a completed run over a full matrix, so a partial matrix cannot be complete.
         expect(() => parsePairedDeltaReport(forge((body) => {
