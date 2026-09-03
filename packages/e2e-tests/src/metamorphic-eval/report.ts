@@ -8,8 +8,10 @@ import { MAX_TRANSFORM_SEED } from "./transforms";
 
 export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
-/** Transform id of the live stability pair, whose two roles are both runs of the base scenario. */
+/** Pair key of the live stability pair, whose two roles are both runs of the base scenario. */
 export const CONTROL_TRANSFORM_ID = "baseline-control";
+export const CONTROL_TRANSFORM_VERSION = 1;
+export const CONTROL_SEED = 0;
 
 export interface PairKey {
     scenarioId: string;
@@ -358,9 +360,8 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             }
             // `applyTransform` names the derivative scenario after its pair, so the id is derivable. The
             // control pair scores two runs of the base scenario and keeps that id on both roles.
-            // The reserved control pair has fixed coordinates: transformVersion 1 and seed 0.
             const isControlPair = pair.transformId === CONTROL_TRANSFORM_ID;
-            if (isControlPair && (pair.transformVersion !== 1 || pair.seed !== 0)) {
+            if (isControlPair && (pair.transformVersion !== CONTROL_TRANSFORM_VERSION || pair.seed !== CONTROL_SEED)) {
                 p.fail(`${label}: control-pair-coordinates-invalid`);
             }
             // The control pair requires a run-record baseline score.
@@ -378,7 +379,6 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             // Each producer emits a fixed invariant set, so a missing row hides a failure rather than omitting evidence.
             const expected = INVARIANTS_BY_SOURCE[baselineScore.source];
             const actual = invariants.map(({ invariant }) => invariant);
-            p.unique(actual, `${label}.invariants`);
             if (canonicalJson([...actual].sort()) !== canonicalJson([...expected].sort())) {
                 p.fail(`${label}.invariants: invariant-set-mismatch`);
             }
@@ -541,6 +541,12 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // resolves its tuple before running and exits without a report when it cannot.
     if (sources.has("raw-output") && report.system !== null) p.fail("report.system: report-system-mismatch");
     if (sources.has("run-record") && report.system === null) p.fail("report.system: report-system-mismatch");
+    // The raw-output scorer stamps `system: null` on every score it produces.
+    for (const [index, entry] of report.entries.entries()) {
+        if (entry.kind === "scored" && entry.baselineScore.source === "raw-output" && entry.baselineScore.system !== null) {
+            p.fail(`report.entries[${index}]: report-system-mismatch`);
+        }
+    }
     if (report.system !== null) {
         const rootSystem = canonicalJson(report.system);
         for (const [index, entry] of report.entries.entries()) {

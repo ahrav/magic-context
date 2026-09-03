@@ -23,7 +23,7 @@ import type {
     Interval,
     RawRegretRecord,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, includesZero, mean } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, includesZero, mean, noiseLabel } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -291,24 +291,10 @@ const RUN_STATUSES = vocabulary<PairedDeltaRunResult["status"]>({
 
 const p = makeContractPrimitives(PairedDeltaContractError);
 
-function finiteNumber(value: unknown, label: string): number {
-    if (typeof value !== "number" || !Number.isFinite(value)) p.fail(`${label}: number-invalid`);
-    return value as number;
-}
-
 // Every primary delta is a difference of two binary outcomes and every regret delta a difference of two
 // fractions, so estimates, bounds, and raw deltas all lie in [-1, 1].
-function deltaNumber(value: unknown, label: string): number {
-    const result = finiteNumber(value, label);
-    if (result < -1 || result > 1) p.fail(`${label}: number-invalid`);
-    return result;
-}
-
-function nonNegativeNumber(value: unknown, label: string): number {
-    const result = finiteNumber(value, label);
-    if (result < 0) p.fail(`${label}: number-invalid`);
-    return result;
-}
+const deltaNumber = (value: unknown, label: string): number => p.number(value, label, { minimum: -1, maximum: 1 });
+const nonNegativeNumber = (value: unknown, label: string): number => p.number(value, label, { minimum: 0 });
 
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
@@ -326,17 +312,14 @@ function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string;
     const hasEndpoint = Object.hasOwn(value, "endpoint");
     p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
     const floorValue = nonNegativeNumber(value.value, `${label}.value`);
-    // A floor's interval is [0, spread], and a spread of deltas in [-1, 1] reaches 2, so it is not a delta.
+    // `calibrationNoiseFloors` is the only producer and always writes `{ lower: 0, upper: value }`.
     const rawInterval = p.record(value.interval, `${label}.interval`);
     p.exact(rawInterval, ["lower", "upper"], `${label}.interval`);
     const interval = {
-        lower: finiteNumber(rawInterval.lower, `${label}.interval.lower`),
-        upper: finiteNumber(rawInterval.upper, `${label}.interval.upper`),
+        lower: p.number(rawInterval.lower, `${label}.interval.lower`),
+        upper: p.number(rawInterval.upper, `${label}.interval.upper`),
     };
-    if (interval.lower > interval.upper) p.fail(`${label}.interval: interval-invalid`);
-    if (interval.lower < 0 || interval.lower > floorValue || floorValue > interval.upper) {
-        p.fail(`${label}.interval: interval-invalid`);
-    }
+    if (interval.lower !== 0 || interval.upper !== floorValue) p.fail(`${label}.interval: derived-mismatch`);
     const familyId = p.string(value.familyId, `${label}.familyId`);
     // `familyId` and `endpoint` must identify the series this floor applies to.
     if (familyId !== owner.familyId) p.fail(`${label}.familyId: floor-owner-mismatch`);
@@ -367,22 +350,19 @@ function parseFamilyEstimate(
     // `noise.floor` is allowed only for primary endpoints.
     if (!isPrimary && noise.floor !== null) p.fail(`${label}.noise.floor: floor-owner-mismatch`);
     const floor = noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`, { familyId, endpoint });
-    const noiseLabel = p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`);
-    const derivedLabel = floor === null
-        ? "no-noise-floor"
-        : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
-    if (noiseLabel !== derivedLabel) p.fail(`${label}.noise.label: derived-mismatch`);
+    const noiseLabelValue = p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`);
+    if (noiseLabelValue !== noiseLabel(pointEstimate, floor)) p.fail(`${label}.noise.label: derived-mismatch`);
     const interval = parseInterval(value.interval, `${label}.interval`);
     const resolution = p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`);
     // Zero-crossing intervals, inside-floor noise, and insufficient endpoint families each require
     // `unresolved`. The unpublished per-family observation count only blocks proving the converse.
     if (
         resolution === "resolved" &&
-        (includesZero(interval) || noiseLabel === "inside-floor" || endpointFamilyCount < minimumAnalyzableFamilyCount)
+        (includesZero(interval) || noiseLabelValue === "inside-floor" || endpointFamilyCount < minimumAnalyzableFamilyCount)
     ) {
         p.fail(`${label}.resolution: derived-mismatch`);
     }
-    return { familyId, pointEstimate, interval, resolution, noise: { label: noiseLabel, floor } };
+    return { familyId, pointEstimate, interval, resolution, noise: { label: noiseLabelValue, floor } };
 }
 
 // `allowed` is the estimator's bucket for this array: primary, live-regret, or provider-mixed-regret endpoints only.
@@ -422,13 +402,9 @@ function parseEndpointEstimates(
         }
         // The endpoint rule is recomputable because each term is published. The per-family rule is not:
         // the report does not carry the per-family observation count.
-        const derivedResolution = families.length >= minimumAnalyzableFamilyCount &&
-            families.length >= 2 &&
-            !includesZero(interval) &&
-            !families.some((family) => family.noise.label === "inside-floor")
-            ? "resolved"
-            : "unresolved";
-        if (resolution !== derivedResolution) p.fail(`${itemLabel}.resolution: derived-mismatch`);
+        if (resolution !== endpointResolution(families, interval, minimumAnalyzableFamilyCount)) {
+            p.fail(`${itemLabel}.resolution: derived-mismatch`);
+        }
         return {
             endpoint,
             pointEstimate,
@@ -551,6 +527,11 @@ function parseArmMetrics(raw: unknown, label: string, maximum = Number.POSITIVE_
 }
 
 
+function mirroredEstimates(raw: unknown, label: string, parsed: EndpointEstimate[]): EndpointEstimate[] {
+    if (canonicalFingerprint(raw) !== canonicalFingerprint(parsed)) p.fail(`${label}: analysis-mismatch`);
+    return parsed;
+}
+
 const REFUSED_REGRET_REASONS = vocabulary<NonNullable<PairedDeltaRunResult["coordinates"][number]["regret"]>["refusedReason"] & string>({
     "base-fingerprint-mismatch": true,
     "intervention-mismatch": true,
@@ -607,8 +588,10 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm"),
         },
         regret: {
-            live: parseEndpointEstimates(regret.live, "report.body.regret.live", LIVE_REGRET_ENDPOINTS, analysis.minimumAnalyzableFamilyCount),
-            providerMixed: parseEndpointEstimates(regret.providerMixed, "report.body.regret.providerMixed", PROVIDER_MIXED_REGRET_ENDPOINTS, analysis.minimumAnalyzableFamilyCount),
+            // The builder publishes the analysis arrays here verbatim, so the raw views are compared against the
+            // parsed analysis rather than parsed a second time.
+            live: mirroredEstimates(regret.live, "report.body.regret.live", analysis.liveRegret),
+            providerMixed: mirroredEstimates(regret.providerMixed, "report.body.regret.providerMixed", analysis.providerMixedRegret),
             raw: p.array(regret.raw, "report.body.regret.raw").map((entry, index) => {
                 const label = `report.body.regret.raw[${index}]`;
                 const item = p.record(entry, label);
@@ -703,12 +686,6 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
     if (rawCoordinates.size > body.runSummary.plannedCoordinates) {
         p.fail("report.body.analysis.rawRegretRecords: exceeds-plan");
-    }
-    if (canonicalFingerprint(body.regret.live) !== canonicalFingerprint(body.analysis.liveRegret)) {
-        p.fail("report.body.regret.live: analysis-mismatch");
-    }
-    if (canonicalFingerprint(body.regret.providerMixed) !== canonicalFingerprint(body.analysis.providerMixedRegret)) {
-        p.fail("report.body.regret.providerMixed: analysis-mismatch");
     }
     if (canonicalFingerprint(body.regret.raw) !== canonicalFingerprint(rawRegretLadder(body.analysis.rawRegretRecords))) {
         p.fail("report.body.regret.raw: analysis-mismatch");

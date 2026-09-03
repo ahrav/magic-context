@@ -153,6 +153,31 @@ export function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
 }
 
+/** A delta no larger than its family's calibrated floor is not separable from measured noise. */
+export function noiseLabel(pointEstimate: number, floor: FamilyNoiseFloor | null): NoiseComparison {
+    if (floor === null) return "no-noise-floor";
+    return Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
+}
+
+/**
+ * Resolution over the family estimates alone, which is why the consumer can recompute it.
+ *
+ * An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor
+ * family leaves the endpoint unresolved.
+ */
+export function endpointResolution(
+    families: readonly { noise: { label: NoiseComparison } }[],
+    interval: Interval,
+    minimumAnalyzableFamilyCount: number,
+): "resolved" | "unresolved" {
+    return families.length >= minimumAnalyzableFamilyCount &&
+        families.length >= 2 &&
+        !includesZero(interval) &&
+        !families.some(({ noise }) => noise.label === "inside-floor")
+        ? "resolved"
+        : "unresolved";
+}
+
 function estimateEndpoint(
     endpoint: DeltaEndpoint,
     observations: readonly FamilyDeltaObservation[],
@@ -192,9 +217,7 @@ function estimateEndpoint(
                 : noiseFloors.get(floorKey(familyId, primary)) ??
                     noiseFloors.get(floorKey(familyId, undefined)) ??
                     null;
-            const label: NoiseComparison = floor === null
-                ? "no-noise-floor"
-                : Math.abs(pointEstimate) <= floor.value ? "inside-floor" : "outside-floor";
+            const label = noiseLabel(pointEstimate, floor);
             return {
                 familyId,
                 pointEstimate,
@@ -215,16 +238,12 @@ function estimateEndpoint(
         bootstrapSeed ^ fnv1a32(endpoint),
     );
     /** An aggregate cannot clear measured noise that one of its own families sits inside, so a single inside-floor family leaves the endpoint unresolved. */
-    const insideFloor = families.some(({ noise }) => noise.label === "inside-floor");
     return {
         endpoint,
         pointEstimate: mean(familyMeans),
         interval,
         familyCount: families.length,
-        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval) &&
-            !insideFloor
-            ? "resolved"
-            : "unresolved",
+        resolution: endpointResolution(families, interval, minimumAnalyzableFamilyCount),
         families,
     };
 }

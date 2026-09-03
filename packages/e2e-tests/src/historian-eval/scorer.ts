@@ -167,6 +167,11 @@ export function expectationGoldMatchPredicates(
  *
  * Distinctness prevents one visible claim from satisfying multiple expectations and inflating recall.
  */
+/** A claim ratio is undefined over an empty denominator rather than zero. */
+export function claimRatio(matched: number, total: number): number | null {
+    return total === 0 ? null : matched / total;
+}
+
 function maximumGoldMatching(
     expected: readonly ExpectedClaim[],
     visible: ReadonlyArray<{ category: string; content: string }>,
@@ -247,8 +252,8 @@ function scoreFacts(
     const matchedVisible = visible.filter((item) => expected.some((claim) => matchesGold(claim, item)));
     const falseAuthoritativeMatches = falseAuthoritativeMatchesIn(scenario, visible);
     return {
-        precision: visible.length === 0 ? null : matchedVisible.length / visible.length,
-        recall: expected.length === 0 ? null : matchedExpectedCount / expected.length,
+        precision: claimRatio(matchedVisible.length, visible.length),
+        recall: claimRatio(matchedExpectedCount, expected.length),
         expectedClaimsMatched: matchedExpectedCount,
         expectedClaimsTotal: expected.length,
         visibleClaimsMatched: matchedVisible.length,
@@ -1839,9 +1844,7 @@ export class HistorianReportError extends Error {
 const p = makeContractPrimitives(HistorianReportError);
 
 function parseRatio(value: unknown, label: string): number | null {
-    if (value === null) return null;
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) p.fail(`${label}: ratio-invalid`);
-    return value as number;
+    return value === null ? null : p.number(value, label, { minimum: 0, maximum: 1 });
 }
 
 function parseNullableText(value: unknown, label: string): string | null {
@@ -1889,12 +1892,10 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     // `maximumGoldMatching` pairs each matched expectation with a distinct visible claim that matches it.
     if (expectedClaimsMatched > visibleClaimsMatched) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
     // `buildLaneReport` carries scenarios through unchanged, so its rebuild cannot reach these fields.
-    if (precision !== (visibleClaimsTotal === 0 ? null : visibleClaimsMatched / visibleClaimsTotal)) {
-        p.fail(`${label}.precision: derived-mismatch`);
-    }
+    if (precision !== claimRatio(visibleClaimsMatched, visibleClaimsTotal)) p.fail(`${label}.precision: derived-mismatch`);
     // A run whose every attempt failed reports a null recall over a nonzero expectation count, so recall is
     // checked only where it is stated.
-    if (recall !== null && (expectedClaimsTotal === 0 || recall !== expectedClaimsMatched / expectedClaimsTotal)) {
+    if (recall !== null && recall !== claimRatio(expectedClaimsMatched, expectedClaimsTotal)) {
         p.fail(`${label}.recall: derived-mismatch`);
     }
     const source = p.enumeration(value.source, SCORE_SOURCES, `${label}.source`);
@@ -1921,8 +1922,18 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const errorDetail = parseNullableText(value.errorDetail, `${label}.errorDetail`);
     if (verdict === "ERROR") {
         if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
-        // Every ERROR is built by `errorScore`, which always names its reason.
+        // Every ERROR is built by `errorScore`, which always names its reason and carries no evidence. The
+        // rebuild cannot see these fields because the builder sets ERROR scores aside before aggregating.
         if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
+        const evidenceless = precision === null && recall === null &&
+            expectedClaimsMatched === 0 && expectedClaimsTotal === 0 &&
+            visibleClaimsMatched === 0 && visibleClaimsTotal === 0 &&
+            falseAuthoritativeMatches.length === 0 && structuralFindings.length === 0;
+        // The trimmed-probe ERROR keeps the probe verdicts that led to it.
+        if (!evidenceless) p.fail(`${label}: error-shape-invalid`);
+        if (probeVerdicts.length > 0 && !probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
+            p.fail(`${label}.probeVerdicts: error-shape-invalid`);
+        }
     } else {
         // `assembleScore` clears both on any non-error score. The one exception is an aborted record whose
         // claims still matched an expected-absent predicate: `scoreRunRecord` keeps the abort's reason on

@@ -16,7 +16,9 @@ import { containsInjectionCanary } from "./injection-canary";
 import { compareInvariants } from "./invariants";
 import { admitPair } from "./pairs";
 import {
+    CONTROL_SEED,
     CONTROL_TRANSFORM_ID,
+    CONTROL_TRANSFORM_VERSION,
     buildMetamorphicReport,
     type InjectionCanaryHit,
     type MetamorphicInvariantVerdict,
@@ -262,8 +264,8 @@ export async function runLiveMetamorphicEval(
     const controlKey: PairKey = {
         scenarioId: controlScenario.id,
         transformId: CONTROL_TRANSFORM_ID,
-        transformVersion: 1,
-        seed: 0,
+        transformVersion: CONTROL_TRANSFORM_VERSION,
+        seed: CONTROL_SEED,
     };
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;

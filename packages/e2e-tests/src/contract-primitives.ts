@@ -33,6 +33,8 @@ export interface ContractPrimitives {
     hex64(value: unknown, label: string): string;
     enumeration<T extends string>(value: unknown, allowed: readonly T[], label: string): T;
     array(value: unknown, label: string): unknown[];
+    /** A finite number, optionally bounded on either side. */
+    number(value: unknown, label: string, bounds?: { minimum?: number; maximum?: number }): number;
     integer(value: unknown, label: string, minimum?: number): number;
     /** An integer constrained on both sides, for a field whose producer has a published upper bound. */
     boundedInteger(value: unknown, label: string, minimum: number, maximum: number): number;
@@ -99,6 +101,14 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return value;
     }
 
+    function numberValue(value: unknown, label: string, bounds: { minimum?: number; maximum?: number } = {}): number {
+        if (typeof value !== "number" || !Number.isFinite(value)) fail(`${label}: number-invalid`);
+        const result = value as number;
+        if (bounds.minimum !== undefined && result < bounds.minimum) fail(`${label}: number-invalid`);
+        if (bounds.maximum !== undefined && result > bounds.maximum) fail(`${label}: number-invalid`);
+        return result;
+    }
+
     function integer(value: unknown, label: string, minimum = 0): number {
         if (!Number.isSafeInteger(value) || (value as number) < minimum) fail(`${label}: integer-invalid`);
         return value as number;
@@ -125,5 +135,5 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return values;
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, integer, boundedInteger, countRecord, unique, idArray };
+    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, idArray };
 }

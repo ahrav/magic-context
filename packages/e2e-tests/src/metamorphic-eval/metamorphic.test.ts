@@ -252,6 +252,14 @@ describe("deterministic metamorphic runner", () => {
         expect(() => parseMetamorphicReport(crossSystem))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-system-mismatch`));
 
+        // The raw-output scorer stamps a null tuple, so a matching pair of forged tuples is still not its output.
+        const forgedTuples = structuredClone(report);
+        const forgedTupleEntry = forgedTuples.entries[scoredIndex]!;
+        if (forgedTupleEntry.kind !== "scored") throw new Error("unreachable");
+        forgedTupleEntry.baselineScore.system = systemTuple();
+        forgedTupleEntry.derivativeScore.system = systemTuple();
+        expect(() => parseMetamorphicReport(forgedTuples))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: report-system-mismatch`));
         // Equal tuples parse, including the null pair this runner produces.
         expect(report.entries[scoredIndex]).toMatchObject({ baselineScore: { system: null }, derivativeScore: { system: null } });
         expect(() => parseMetamorphicReport(report)).not.toThrow();

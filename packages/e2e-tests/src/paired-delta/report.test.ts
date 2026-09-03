@@ -1040,6 +1040,11 @@ describe("parsePairedDeltaReport", () => {
             body.exclusions = [];
             body.runSummary.evidenceComplete = true;
         }))).not.toThrow();
+        // A calibrated floor's interval is exactly [0, value].
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.noise.floor = { endpoint: "mc-on-vs-compaction", familyId: family.familyId, value: 0.5, interval: { lower: 0.1, upper: 0.5 } };
+        }))).toThrow(/noise\.floor\.interval: derived-mismatch/);
         // Deltas are differences of values in [0, 1].
         expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.families[0]!.pointEstimate = 2; })))
             .toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.pointEstimate: number-invalid/);
@@ -1078,14 +1083,14 @@ describe("parsePairedDeltaReport", () => {
                 endpoint: "mc-on-vs-mc-off",
                 familyId: "fam-somebody-else",
                 value: 0.5,
-                interval: { lower: 0, upper: 1 },
+                interval: { lower: 0, upper: 0.5 },
             };
         }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.familyId: floor-owner-mismatch/);
         // One endpoint-less floor record serves both endpoints, so two shapes for one family is impossible.
         expect(() => parsePairedDeltaReport(forge((body) => {
             for (const [index, endpoint] of body.analysis.endpoints.entries()) {
                 const family = endpoint.families[0]!;
-                family.noise.floor = { familyId: family.familyId, value: 10 + index, interval: { lower: 0, upper: 20 } };
+                family.noise.floor = { familyId: family.familyId, value: 10 + index, interval: { lower: 0, upper: 10 + index } };
                 family.noise.label = "inside-floor";
                 family.resolution = "unresolved";
             }
@@ -1100,7 +1105,7 @@ describe("parsePairedDeltaReport", () => {
         // An unscoped floor is the fallback for both endpoints, so the other one cannot read as having none.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;
-            family.noise.floor = { familyId: family.familyId, value: 10, interval: { lower: 0, upper: 20 } };
+            family.noise.floor = { familyId: family.familyId, value: 10, interval: { lower: 0, upper: 10 } };
             family.noise.label = "inside-floor";
             family.resolution = "unresolved";
             body.analysis.endpoints[0]!.resolution = "unresolved";
@@ -1113,7 +1118,7 @@ describe("parsePairedDeltaReport", () => {
                 endpoint: "mc-on-vs-mc-off",
                 familyId: family.familyId,
                 value: 0.5,
-                interval: { lower: 0, upper: 1 },
+                interval: { lower: 0, upper: 0.5 },
             };
         }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.endpoint: floor-owner-mismatch/);
     });

@@ -2489,6 +2489,7 @@ describe("buildLaneReport", () => {
             expectedClaimsTotal: 0,
             visibleClaimsMatched: 0,
             visibleClaimsTotal: 0,
+            probeVerdicts: [],
         };
         const report = buildLaneReport([passScore("hse-a"), fa, errored], { releaseVersion: "v2.0.0" });
         expect(parseLaneReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
@@ -2509,6 +2510,12 @@ describe("buildLaneReport", () => {
         const reasonlessError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         reasonlessError.scenarios[2]!.errorReason = null;
         expect(() => parseLaneReport(reasonlessError)).toThrow(/report\.scenarios\[2\]\.errorReason: derived-mismatch/);
+        // `errorScore` carries no evidence, and the rebuild sets ERROR scores aside before it aggregates.
+        const evidencedError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(evidencedError.scenarios[2]!, {
+            precision: 1, recall: 1, expectedClaimsMatched: 10, expectedClaimsTotal: 10, visibleClaimsMatched: 10, visibleClaimsTotal: 10,
+        });
+        expect(() => parseLaneReport(evidencedError)).toThrow(/report\.scenarios\[2\]: error-shape-invalid/);
         // An aborted record whose claims matched an expected-absent predicate keeps the abort's reason on its FAIL.
         const abortedFa = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         Object.assign(abortedFa.scenarios[1]!, {
